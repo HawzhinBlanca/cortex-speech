@@ -11,7 +11,7 @@
     {"source":"cortex-speech-app/src-tauri/src/wav2vec2_asr.rs","selector":"wav2vec2_real_clip_is_kurdish","scope":"model-evidence","authority":"model-evidence"},
     {"source":"cortex-speech-app/src-tauri/src/wer.rs","selector":"emit_crossval_vectors","scope":"diagnostic-tool","authority":"non-certifying-generator"},
     {"source":"cortex-speech-app/src-tauri/tests/audiobook_smoke.rs","selector":"audiobook_mp3_decode_and_chunk_plan","scope":"owner-product","authority":"owner-real-media-rust"},
-    {"source":"cortex-speech-app/src-tauri/tests/audiobook_smoke.rs","selector":"audiobook_mp3_fingerprint_reimport_not_duplicate","scope":"owner-product","authority":"owner-real-media-rust"},
+    {"source":"cortex-speech-app/src-tauri/tests/audiobook_smoke.rs","selector":"audiobook_mp3_fingerprint_reimport_is_idempotency_conflict","scope":"owner-product","authority":"owner-real-media-rust"},
     {"source":"cortex-speech-app/src-tauri/tests/audiobook_smoke.rs","selector":"streaming_decoder_matches_the_direct_decoder_on_real_long_audio","scope":"owner-product","authority":"owner-real-media-rust"},
     {"source":"cortex-speech-app/src-tauri/tests/batch_asr.rs","selector":"test_batch_asr_sample","scope":"model-evidence","authority":"model-evidence"},
     {"source":"cortex-speech-app/src-tauri/tests/gold_wer_eval.rs","selector":"compare_300m_vs_1b","scope":"model-evidence","authority":"model-evidence"},

@@ -386,7 +386,7 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
                 return err_reply(
                     503,
                     &format!("Review is temporarily paused: controlled hidden-check history is invalid ({error})"),
-                )
+                );
             }
         }
     } else {
@@ -644,7 +644,7 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
                             return err_reply(
                                 503,
                                 &format!("Review is temporarily paused: pilot policy identity failed ({error})"),
-                            )
+                            );
                         }
                     };
                     let candidate_ids: Vec<String> = checks.iter().map(|(segment, _)| segment.id.clone()).collect();
@@ -1445,7 +1445,7 @@ pub(super) fn api_playback_finalize(
                     "coverageRatio": receipt.coverage_ratio,
                     "duplicate": true,
                 }),
-            )
+            );
         }
         Ok(None) => {}
         Err(error) => return playback_error_reply(&error.to_string()),

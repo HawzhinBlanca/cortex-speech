@@ -441,6 +441,77 @@ fn resume_of_an_empty_or_moved_source_fails_without_consuming_the_successor_jour
 }
 
 #[test]
+fn single_file_lost_response_adopts_exact_human_authority_and_refuses_later_source_drift() {
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
+    let db = pipeline.open_db().unwrap();
+    db.initialize().unwrap();
+    let source = dir.path().join("lost-response.wav");
+
+    let write_wav = |sample: i16| {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&source, spec).unwrap();
+        for _ in 0..16_000 {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+    };
+    write_wav(1_000);
+
+    let mut canonical = crate::fingerprint::StreamingIdentity::new();
+    crate::audio::decode_pcm_windows(&source, crate::audio::DECODE_WINDOW_MS, |window| {
+        canonical.push(&window.pcm, window.sample_rate);
+        Ok(())
+    })
+    .unwrap();
+    let identity = canonical.finish();
+    let machine = SpeechSegment {
+        id: "lost-response-authority".into(),
+        audio_path: source.to_string_lossy().into_owned(),
+        raw_transcript: "دەقی پشتڕاستکراو".into(),
+        duration_ms: 1_000,
+        alignment_json: Some(
+            crate::chunking::SegmentSourceMeta {
+                source_start_ms: 0,
+                source_end_ms: 1_000,
+                chunk_index: 0,
+                chunk_count: 1,
+            }
+            .to_alignment_json(),
+        ),
+        ..SpeechSegment::default()
+    };
+    db.insert_segment(&machine).unwrap();
+    db.set_audio_identity(&machine.audio_path, &identity).unwrap();
+    db.record_human_decision(&machine.id, "accept", None, None).unwrap();
+    let durable = db.get_segment_by_id(&machine.id).unwrap().unwrap();
+
+    // A fresh in-memory fingerprint index models a process restart or a lost IPC response. Durable
+    // human authority is sufficient even when no champion registry is available, and the retry must
+    // return the existing ID rather than entering engine preflight or minting another row.
+    let adopted = pipeline.process_single_file(&source, &db).expect("adopt exact durable result");
+    assert_eq!(adopted.iter().map(|segment| segment.id.as_str()).collect::<Vec<_>>(), [durable.id.as_str()]);
+    assert_eq!(db.segment_count().unwrap(), 1, "idempotent retry must not duplicate durable truth");
+
+    // Reusing the same filename for replacement bytes is not idempotency. It must hard-stop before
+    // deleting, re-transcribing or relabeling the incumbent human-owned row.
+    write_wav(2_000);
+    let error = pipeline
+        .process_single_file(&source, &db)
+        .expect_err("changed bytes at an existing source path must refuse adoption")
+        .to_string();
+    assert!(error.contains("current audio identity does not match"), "unexpected source-drift error: {error}");
+    assert_eq!(db.segment_count().unwrap(), 1);
+    let unchanged = db.get_segment_by_id(&durable.id).unwrap().unwrap();
+    assert_eq!(unchanged.raw_transcript, durable.raw_transcript);
+    assert_eq!(unchanged.human_decision, durable.human_decision);
+}
+
+#[test]
 fn cloned_pipeline_workers_share_one_lazy_runtime_and_refuse_database_identity_drift() {
     let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
     let worker = pipeline.clone();
@@ -567,6 +638,98 @@ fn test_pipeline_with_settings(settings: AppSettings) -> (super::ProcessingPipel
 }
 
 #[test]
+fn durable_batch_draft_requires_single_owner_and_exact_champion_identity() {
+    let settings = AppSettings { auto_normalize: true, verbalize_numbers: false, ..AppSettings::default() };
+    let (pipeline, _dir) = test_pipeline_with_settings(settings);
+    let draft = super::TranscriptionDraft {
+        raw_text: "دەقی 12".into(),
+        final_text: "دەقی 12".into(),
+        confidence: Some(0.91),
+        confidence_source: Some("external_provider".into()),
+        model_version_id: Some("champion-v1".into()),
+        deployment_sha256: Some("a".repeat(64)),
+        cloud_call: false,
+    };
+    let prepared = pipeline.prepare_batch_champion_draft(draft.clone()).expect("valid champion draft");
+    assert_eq!(prepared.raw_transcript, draft.raw_text);
+    assert_eq!(prepared.model_version_id, "champion-v1");
+    assert_eq!(prepared.deployment_sha256, "a".repeat(64));
+    assert!(prepared.normalized_transcript.is_some());
+    assert_eq!(prepared.normalizer_version.as_deref(), Some(crate::normalizer::NORMALIZER_VERSION));
+
+    let identity_free = super::TranscriptionDraft { deployment_sha256: None, ..draft.clone() };
+    assert!(pipeline.prepare_batch_champion_draft(identity_free).is_err());
+    let blank = super::TranscriptionDraft { raw_text: "   ".into(), ..draft.clone() };
+    assert!(pipeline.prepare_batch_champion_draft(blank).is_err());
+    let placeholder = super::TranscriptionDraft { raw_text: "[Pending WSL 7B ASR]".into(), ..draft };
+    assert!(pipeline.prepare_batch_champion_draft(placeholder).is_err());
+}
+
+#[test]
+fn durable_batch_and_bound_drafts_retain_refined_final_when_auto_normalize_is_disabled() {
+    let settings = AppSettings { auto_normalize: false, ..AppSettings::default() };
+    let (pipeline, _dir) = test_pipeline_with_settings(settings);
+    let draft = super::TranscriptionDraft {
+        raw_text: "دەقی خام".into(),
+        final_text: "دەقی کۆتایی".into(),
+        confidence: None,
+        confidence_source: Some("external_provider".into()),
+        model_version_id: Some("champion-v1".into()),
+        deployment_sha256: Some("b".repeat(64)),
+        cloud_call: true,
+    };
+    for prepared in [
+        pipeline.prepare_batch_champion_draft(draft.clone()).expect("durable batch champion draft"),
+        pipeline.prepare_bound_champion_draft(draft).expect("source-bound champion draft"),
+    ] {
+        assert_eq!(prepared.raw_transcript, "دەقی خام", "immutable champion raw must remain verbatim");
+        assert_eq!(prepared.normalized_transcript.as_deref(), Some("دەقی کۆتایی"));
+        assert_eq!(prepared.normalizer_version.as_deref(), Some(super::MACHINE_REVIEW_FINAL_VERSION));
+    }
+}
+
+#[test]
+fn champion_draft_avoids_a_fake_derived_value_when_raw_and_final_are_identical() {
+    let settings = AppSettings { auto_normalize: false, ..AppSettings::default() };
+    let (pipeline, _dir) = test_pipeline_with_settings(settings);
+    let prepared = pipeline
+        .prepare_bound_champion_draft(super::TranscriptionDraft {
+            raw_text: "دەقی یەکسان".into(),
+            final_text: "دەقی یەکسان".into(),
+            confidence: None,
+            confidence_source: Some("external_provider".into()),
+            model_version_id: Some("champion-v1".into()),
+            deployment_sha256: Some("c".repeat(64)),
+            cloud_call: false,
+        })
+        .expect("identity-bound champion draft");
+    assert!(prepared.normalized_transcript.is_none());
+    assert!(prepared.normalizer_version.is_none());
+}
+
+#[test]
+fn champion_draft_persists_normalized_final_with_the_real_normalizer_marker() {
+    let settings = AppSettings { auto_normalize: true, verbalize_numbers: true, ..AppSettings::default() };
+    let (pipeline, _dir) = test_pipeline_with_settings(settings);
+    let raw = "ساڵی ٥";
+    let prepared = pipeline
+        .prepare_bound_champion_draft(super::TranscriptionDraft {
+            raw_text: raw.into(),
+            final_text: raw.into(),
+            confidence: None,
+            confidence_source: Some("external_provider".into()),
+            model_version_id: Some("champion-v1".into()),
+            deployment_sha256: Some("d".repeat(64)),
+            cloud_call: false,
+        })
+        .expect("normalizing champion draft");
+    let derived = prepared.normalized_transcript.as_deref().expect("configured normalization is durable");
+    assert_ne!(derived, raw, "fixture must prove raw and normalized review text differ");
+    assert_eq!(prepared.raw_transcript, raw, "normalization must not rewrite the champion hypothesis");
+    assert_eq!(prepared.normalizer_version.as_deref(), Some(crate::normalizer::NORMALIZER_VERSION));
+}
+
+#[test]
 fn existing_transcription_binding_rejects_cross_segment_path_and_pcm_drift() {
     let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
     let db_path = dir.path().join("db.sqlite");
@@ -673,6 +836,93 @@ fn batch_transcription_binding_single_flights_one_shared_recording() {
     assert!(entries.values().all(|entry| entry.get().is_some()), "the verifier cell must be initialized");
 }
 
+#[test]
+fn bound_and_import_draft_only_success_preserve_segment_and_hypothesis_rows() {
+    let settings = AppSettings {
+        asr_model_size: AsrModelSize::CTC300M,
+        use_finetuned_asr: false,
+        multi_engine_hypotheses: true,
+        ..AppSettings::default()
+    };
+    let (pipeline, dir) = test_pipeline_with_settings(settings);
+    let db_path = dir.path().join("db.sqlite");
+    let db = Database::open(db_path.to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    let wav = dir.path().join("bound-draft.wav");
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&wav, spec).unwrap();
+    for sample in 0..16_000 {
+        writer.write_sample::<i16>((sample % 503) as i16).unwrap();
+    }
+    writer.finalize().unwrap();
+
+    let segment_id = "bound-draft-only";
+    db.insert_segment(&SpeechSegment {
+        id: segment_id.into(),
+        audio_path: wav.to_string_lossy().into_owned(),
+        raw_transcript: "incumbent transcript".into(),
+        normalized_transcript: Some("incumbent normalized".into()),
+        duration_ms: 1_000,
+        confidence: Some(0.42),
+        confidence_source: Some("historical".into()),
+        model_version_id: Some("historical-model".into()),
+        ..SpeechSegment::default()
+    })
+    .unwrap();
+    let content_hash = crate::export_bundle::current_canonical_pcm_blake3(&wav).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+            rusqlite::params![segment_id, content_hash],
+        )
+        .unwrap();
+    insert_hypothesis(&db, segment_id, "historical-model", "durable prior vote");
+
+    let selected_model = pipeline.local_asr_model_id().to_string();
+    pipeline.cache.set(
+        &wav,
+        crate::cache::CacheEntry {
+            audio_hash: String::new(),
+            raw_transcript: "new isolated draft".into(),
+            normalized_transcript: None,
+            created_at: chrono::Utc::now(),
+            model_id: selected_model.clone(),
+        },
+    );
+
+    let source = pipeline
+        .bind_existing_transcription_source(segment_id, Some(wav.to_str().unwrap()), None)
+        .expect("bind exact source");
+    let segment_before = serde_json::to_value(db.get_segment_by_id(segment_id).unwrap()).unwrap();
+    let hypotheses_before = serde_json::to_value(db.get_hypotheses_for_segment(segment_id).unwrap()).unwrap();
+
+    let draft = pipeline.transcribe_bound_draft_only(&source, None).expect("draft from the exact bound source");
+
+    assert_eq!(draft.raw_text, "new isolated draft");
+    assert_eq!(draft.model_version_id.as_deref(), Some(selected_model.as_str()));
+    let import_draft = pipeline
+        .transcribe_import_draft_only(segment_id, wav.to_str().unwrap(), None, None)
+        .expect("an import id collision still produces only an isolated draft");
+    assert_eq!(import_draft.raw_text, "new isolated draft");
+    assert_eq!(import_draft.model_version_id.as_deref(), Some(selected_model.as_str()));
+    assert_eq!(
+        serde_json::to_value(db.get_segment_by_id(segment_id).unwrap()).unwrap(),
+        segment_before,
+        "neither bound nor import draft inference may mutate speech_segments"
+    );
+    assert_eq!(
+        serde_json::to_value(db.get_hypotheses_for_segment(segment_id).unwrap()).unwrap(),
+        hypotheses_before,
+        "neither bound nor import draft inference may attach hypotheses to a colliding id"
+    );
+}
+
 fn test_pipeline_for_status() -> (super::ProcessingPipeline, tempfile::TempDir) {
     test_pipeline_with_settings(AppSettings::default())
 }
@@ -759,6 +1009,34 @@ fn source_record_for_audio(
         transcript_text: transcript_text.to_string(),
         created_at: None,
     }
+}
+
+#[test]
+fn source_reference_refuses_same_path_audio_mutation_during_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let audio = dir.path().join("source.wav");
+    std::fs::write(&audio, b"audio-before-cloud-generation").unwrap();
+    let before = super::source_audio_identity(&audio).unwrap();
+
+    // Same path and even same byte length are insufficient identity. This models a recorder or
+    // synchronization process replacing the source while the remote transcript request is active.
+    std::fs::write(&audio, b"audio-after--cloud-generation").unwrap();
+    let error = super::source_reference::verified_post_generation_source_identity(&audio, Some(&before))
+        .expect_err("a transcript must not be bound to bytes that changed during generation");
+
+    assert!(error.to_string().contains("Audio source changed while generating"));
+}
+
+#[test]
+fn source_reference_refuses_post_generation_identity_without_a_pre_generation_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let audio = dir.path().join("source.wav");
+    std::fs::write(&audio, b"post-generation-audio").unwrap();
+
+    let error = super::source_reference::verified_post_generation_source_identity(&audio, None)
+        .expect_err("post-generation bytes alone cannot prove which bytes the cloud request read");
+
+    assert!(error.to_string().contains("Cannot establish audio identity before generating"));
 }
 
 #[test]
@@ -1148,8 +1426,7 @@ fn configured_source_reference_failure_is_fatal_before_chunking() {
         .expect_err("configured source reference failure must be fatal");
 
     let message = err.to_string();
-    assert!(message.contains("All whole-file reference transcript models failed"));
-    assert!(message.contains("gemini-2.5-pro"));
+    assert!(message.contains("Cannot establish audio identity before generating or reusing"));
     assert!(!message.contains("gemini-2.5-flash"), "the retired Flash route must never be attempted: {message}");
 }
 
@@ -1184,9 +1461,7 @@ fn stale_source_reference_failure_is_fatal_before_chunking() {
         .expect_err("partial source reference failure must be fatal");
 
     let message = err.to_string();
-    assert!(message.contains("All whole-file reference transcript models failed before chunking"));
-    assert!(message.contains("incomplete source-reference evidence"));
-    assert!(message.contains("gemini-2.5-pro"));
+    assert!(message.contains("Cannot establish audio identity before generating or reusing"));
     assert!(!message.contains("gemini-2.5-flash"), "the retired Flash route must never be attempted: {message}");
 }
 
@@ -1282,8 +1557,7 @@ fn empty_source_reference_file_is_not_reused() {
         .expect_err("empty saved reference file must not be reused");
 
     let message = err.to_string();
-    assert!(message.contains("All whole-file reference transcript models failed before chunking"));
-    assert!(message.contains("Cannot inspect audio file"));
+    assert!(message.contains("Cannot establish audio identity before generating or reusing"));
 }
 
 #[test]

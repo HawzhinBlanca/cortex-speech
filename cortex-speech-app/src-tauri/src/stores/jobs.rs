@@ -1,7 +1,7 @@
 //! Durable job, interrupted-import and tracked-export access.
 
-use crate::database_runtime::{begin_mutation, DatabaseRuntime};
-use crate::db::ImportJob;
+use crate::database_runtime::{DatabaseRuntime, MutationGuard};
+use crate::db::{DiscardImportJobOutcome, ImportJob};
 use crate::error::{AppError, AppResult};
 use crate::eval::{FinetunePackResult, GoldEvalExport};
 use crate::export_audio::{AudioExportOptions, AudioExportResult};
@@ -21,8 +21,16 @@ impl JobStore {
         Self { runtime }
     }
 
-    fn lock(&self, operation: &str) -> std::sync::MutexGuard<'_, crate::db::Database> {
-        self.runtime.lock().unwrap_or_else(|poisoned| {
+    fn begin_mutation(&self) -> AppResult<MutationGuard<'_>> {
+        self.runtime.begin_mutation().map_err(AppError::Other)
+    }
+
+    fn lock_after_mutation(
+        &self,
+        operation: &str,
+        mutation: &MutationGuard<'_>,
+    ) -> std::sync::MutexGuard<'_, crate::db::Database> {
+        self.runtime.lock_after_mutation(mutation).unwrap_or_else(|poisoned| {
             tracing::warn!(operation, "Recovering poisoned database lock during a job write");
             poisoned.into_inner()
         })
@@ -32,34 +40,34 @@ impl JobStore {
         self.runtime.open_read()?.find_interrupted_import_job()
     }
 
-    pub(crate) fn discard_interrupted_import(&self, job_id: &str) -> AppResult<()> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("discard_interrupted_import").discard_import_job(job_id)
+    pub(crate) fn discard_interrupted_import(&self, job_id: &str) -> AppResult<DiscardImportJobOutcome> {
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("discard_interrupted_import", &mutation).discard_import_job(job_id)
     }
 
     pub(crate) fn begin_import(&self, directory: &str, total_files: usize) -> AppResult<String> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("begin_import").begin_import_job(directory, total_files)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("begin_import", &mutation).begin_import_job(directory, total_files)
     }
 
     pub(crate) fn handoff_import_for_resume(&self, prior_job_id: &str) -> AppResult<String> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("handoff_import_for_resume").handoff_import_job_for_resume(prior_job_id)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("handoff_import_for_resume", &mutation).handoff_import_job_for_resume(prior_job_id)
     }
 
     pub(crate) fn continue_import(&self, job_id: &str, directory: &str, total_files: usize) -> AppResult<()> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("continue_import").continue_import_job(job_id, directory, total_files)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("continue_import", &mutation).continue_import_job(job_id, directory, total_files)
     }
 
     pub(crate) fn mark_import_file_done(&self, job_id: &str, path: &str) -> AppResult<()> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("mark_import_file_done").mark_import_file_done(job_id, path)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("mark_import_file_done", &mutation).mark_import_file_done(job_id, path)
     }
 
     pub(crate) fn complete_import(&self, job_id: &str) -> AppResult<()> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("complete_import").complete_import_job(job_id)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("complete_import", &mutation).complete_import_job(job_id)
     }
 
     pub(crate) fn list_recent(&self, limit: i64) -> AppResult<Vec<Job>> {
@@ -73,8 +81,8 @@ impl JobStore {
         error_code: &str,
         work: impl FnOnce(&crate::db::Database) -> AppResult<T>,
     ) -> AppResult<T> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock(kind).run_tracked(job_id, kind, error_code, work)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation(kind, &mutation).run_tracked(job_id, kind, error_code, work)
     }
 
     pub(crate) fn export_dataset(&self, job_id: &str, path: &Path, format: &ExportFormat) -> AppResult<()> {
@@ -178,8 +186,50 @@ mod tests {
         assert_eq!(interrupted.dir, "C:/audio");
         assert_eq!(interrupted.completed_paths, vec!["C:/audio/a.wav"]);
 
-        store.discard_interrupted_import(&interrupted.id).unwrap();
+        assert_eq!(store.discard_interrupted_import(&interrupted.id).unwrap(), DiscardImportJobOutcome::Discarded);
         assert!(store.find_interrupted_import().unwrap().is_none());
+    }
+
+    #[test]
+    fn interrupted_import_discard_is_an_exact_compare_and_delete() {
+        let (_directory, store) = store_with_jobs();
+        let current = store.find_interrupted_import().unwrap().unwrap();
+
+        assert_eq!(store.discard_interrupted_import("stale-import-job").unwrap(), DiscardImportJobOutcome::Changed);
+        assert_eq!(store.find_interrupted_import().unwrap().unwrap().id, current.id);
+        assert_eq!(store.discard_interrupted_import(&current.id).unwrap(), DiscardImportJobOutcome::Discarded);
+        assert_eq!(store.discard_interrupted_import(&current.id).unwrap(), DiscardImportJobOutcome::NotFound);
+    }
+
+    #[test]
+    fn interrupted_import_discard_refuses_ambiguous_running_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ambiguous-journal.db");
+        let database = Database::open(path.to_str().unwrap()).unwrap();
+        database.initialize().unwrap();
+        let first = database.begin_import_job("C:/first", 1).unwrap();
+        database
+            .connection()
+            .execute(
+                "INSERT INTO import_jobs (id, dir, total_files, status) VALUES ('second-running', 'C:/second', 1, 'running')",
+                [],
+            )
+            .unwrap();
+        let store = JobStore::new(DatabaseRuntime::new(database));
+
+        let error =
+            store.discard_interrupted_import("second-running").expect_err("multiple running journals must fail closed");
+        assert!(error.to_string().contains("expected one running job"));
+        let database = store.runtime.lock().unwrap();
+        let running: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM import_jobs WHERE status = 'running'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(running, 2, "an ambiguous refusal must preserve every recovery record");
+        assert!(database
+            .connection()
+            .query_row("SELECT EXISTS(SELECT 1 FROM import_jobs WHERE id = ?1)", [first], |row| row.get::<_, bool>(0))
+            .unwrap());
     }
 
     #[test]

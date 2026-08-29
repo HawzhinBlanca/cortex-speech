@@ -1459,6 +1459,37 @@ mod tests {
     }
 
     #[test]
+    fn non_16khz_window_resampling_is_not_a_whole_buffer_identity_protocol() {
+        // Characterization for import identity: the FIR and sinc resamplers need neighboring source
+        // samples. Splitting a 44.1 kHz source resets that context at every boundary, so concatenated
+        // canonical windows are intentionally NOT byte-identical to one whole-buffer resample. Import,
+        // retry and later source verification must therefore all choose one fixed window protocol;
+        // switching based on review chunk settings turns unchanged audio into a false replacement.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("route-change-44k.wav");
+        write_tone_wav(&path, 44_100, 2.0, 1);
+
+        let (whole_rate, whole_pcm) = decode_to_pcm(&path).expect("whole-buffer decode");
+        let whole_hash = crate::fingerprint::AudioFingerprint::content_hash(&whole_pcm, whole_rate);
+
+        let mut windowed = crate::fingerprint::StreamingIdentity::new();
+        let mut windows = 0usize;
+        decode_pcm_windows(&path, 500, |window| {
+            windows += 1;
+            windowed.push(&window.pcm, window.sample_rate);
+            Ok(())
+        })
+        .expect("windowed decode");
+        let windowed_hash = windowed.finish().content;
+
+        assert!(windows > 1, "fixture must cross a resampling boundary");
+        assert_ne!(
+            whole_hash, windowed_hash,
+            "a route-sensitive identity test must expose the 44.1 kHz boundary-state difference"
+        );
+    }
+
+    #[test]
     fn normalize_pcm_rms_moves_level_toward_the_target() {
         // A quiet tone normalised to a louder target must get louder, and the waveform shape must
         // survive: normalisation may not invert, clip, or NaN the signal.

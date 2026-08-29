@@ -98,6 +98,7 @@ class CoverageEvidenceTests(unittest.TestCase):
         self.assertTrue(
             all(
                 domain.metrics["lines"].required_percent == 95.0
+                and domain.metrics["functions"].required_percent == 90.0
                 and domain.metrics["branches"].required_percent == 90.0
                 for domain in verdict.critical_domains.values()
             )
@@ -129,6 +130,17 @@ class CoverageEvidenceTests(unittest.TestCase):
         verdict = gate.parse_llvm_coverage(json.dumps(document).encode())
         self.assertFalse(verdict.passed)
         self.assertTrue(any("critical review lines coverage" in row for row in verdict.failures))
+
+        document = json.loads(llvm_payload())
+        review = next(
+            row
+            for row in document["data"][0]["files"]
+            if row["filename"] == "src-tauri/src/review_campaign.rs"
+        )
+        review["summary"]["functions"] = {"count": 10000, "covered": 1, "percent": 0.01}
+        verdict = gate.parse_llvm_coverage(json.dumps(document).encode())
+        self.assertFalse(verdict.passed)
+        self.assertTrue(any("critical review functions coverage" in row for row in verdict.failures))
 
         document = json.loads(llvm_payload())
         duplicate = dict(document["data"][0]["files"][0])

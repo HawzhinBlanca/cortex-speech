@@ -4,7 +4,7 @@
 
 use crate::database_runtime::DatabaseRuntime;
 use crate::db::RecordingRights;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
 #[derive(Clone)]
 pub(crate) struct RightsStore {
@@ -16,19 +16,20 @@ impl RightsStore {
         Self { runtime }
     }
 
-    fn lock(&self, operation: &str) -> std::sync::MutexGuard<'_, crate::db::Database> {
-        self.runtime.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!(operation, "Recovering poisoned database lock during a rights write");
-            poisoned.into_inner()
-        })
-    }
-
     pub(crate) fn declare_recording(&self, audio_path: &str, rights: &RecordingRights) -> AppResult<usize> {
-        self.lock("set_recording_rights").set_recording_rights(audio_path, rights)
+        let mutation = self.runtime.begin_mutation().map_err(AppError::Other)?;
+        self.runtime
+            .lock_after_mutation(&mutation)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_recording_rights(audio_path, rights)
     }
 
     pub(crate) fn revoke_recording(&self, audio_path: &str) -> AppResult<usize> {
-        self.lock("revoke_recording_consent").revoke_recording(audio_path)
+        let mutation = self.runtime.begin_mutation().map_err(AppError::Other)?;
+        self.runtime
+            .lock_after_mutation(&mutation)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .revoke_recording(audio_path)
     }
 
     pub(crate) fn list_recordings(&self) -> AppResult<Vec<(String, usize, RecordingRights)>> {

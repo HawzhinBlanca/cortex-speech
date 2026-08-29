@@ -1,15 +1,96 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { get } from 'svelte/store';
 import ReviewMode from '../../src/lib/ReviewMode.svelte';
 import { searchQuery, segments, selectedSegmentId } from '../../src/lib/stores/segmentStore';
 import { defaultSettings, settings } from '../../src/lib/stores/settingsStore';
-import { showReviewInbox } from '../../src/lib/stores/uiStore';
+import { showConfirmDialog, showReviewInbox } from '../../src/lib/stores/uiStore';
 import type { SpeechSegment } from '../../src/lib/types';
 import { ckb } from '../../src/lib/i18n/ckb';
 import { flushReviewDrafts } from '../../src/lib/reviewDraftFlush';
+import { sharedDurableReviewUndo } from '../../src/lib/durableReviewUndo.svelte';
+import { createReviewModeQueueController } from '../../src/lib/reviewModeQueue.svelte';
 
 const MEDIA_GRANT_ID = '2f2d9b66-8566-4d1c-8c14-e18d006b776f';
 const NEXT_MEDIA_GRANT_ID = '52a492d4-14d8-4e24-9f5d-bc44221b48c1';
+const UNDO_PAYLOAD_HASH = 'a'.repeat(64);
+
+type UndoDecision = 'accept' | 'edit' | 'reject';
+type DecisionUndoTarget = {
+  kind: 'decision';
+  effectEventId: number;
+  segmentId: string;
+  decision: UndoDecision;
+  sourceOperationId: string;
+  sourcePayloadHash: string;
+  databaseGeneration: number;
+};
+type FlagUndoTarget = {
+  kind: 'flag';
+  effectEventId: number;
+  segmentId: string;
+  sourceOperationId: string;
+  sourcePayloadHash: string;
+  priorRevision: number;
+  flagRevision: number;
+  flagKind: {
+    kind: 'technicalUnusable';
+    reason: 'decodeFailed' | 'missingFile' | 'permissionDenied' | 'corruptContainer';
+  };
+  databaseGeneration: number;
+};
+type UndoTarget = DecisionUndoTarget | FlagUndoTarget;
+type UndoAvailability =
+  | { status: 'available'; target: UndoTarget }
+  | { status: 'none' }
+  | {
+      status: 'blocked';
+      reason:
+        | 'legacyHistory'
+        | 'latestDecisionUndone'
+        | 'latestFlagUndone'
+        | 'decisionShadowed'
+        | 'flagShadowed';
+    };
+
+let undoAvailability: UndoAvailability;
+
+function undoTarget(
+  segmentId: string,
+  decision: UndoDecision,
+  sourceOperationId: string,
+  effectEventId = 101,
+): DecisionUndoTarget {
+  return {
+    kind: 'decision',
+    effectEventId,
+    segmentId,
+    decision,
+    sourceOperationId: sourceOperationId,
+    sourcePayloadHash: UNDO_PAYLOAD_HASH,
+    databaseGeneration: 1,
+  };
+}
+
+function technicalFlagUndoTarget(
+  segmentId: string,
+  sourceOperationId: string,
+  priorRevision: number,
+  reason: FlagUndoTarget['flagKind']['reason'],
+  effectEventId = 202,
+): FlagUndoTarget {
+  return {
+    kind: 'flag',
+    effectEventId,
+    segmentId,
+    sourceOperationId,
+    sourcePayloadHash: 'c'.repeat(64),
+    priorRevision,
+    flagRevision: priorRevision + 1,
+    flagKind: { kind: 'technicalUnusable', reason },
+    databaseGeneration: 1,
+  };
+}
 
 const mocks = vi.hoisted(() => ({
   getSegmentsPage: vi.fn(),
@@ -17,8 +98,10 @@ const mocks = vi.hoisted(() => ({
   getSegment: vi.fn(),
   getSegmentConsensus: vi.fn(),
   getDatasetStats: vi.fn(),
+  getDatasetCertificate: vi.fn(),
   getWaveform: vi.fn(),
   alignSegment: vi.fn(),
+  transcribeSegment: vi.fn(),
   recordPlaybackReceipt: vi.fn(),
   recordHumanDecision: vi.fn(),
   commitReviewV1: vi.fn(),
@@ -26,7 +109,8 @@ const mocks = vi.hoisted(() => ({
   getReviewDraftV1: vi.fn(),
   saveReviewDraftV1: vi.fn(),
   deleteReviewDraftV1: vi.fn(),
-  undoHumanDecision: vi.fn(),
+  getDesktopReviewUndoAvailabilityV1: vi.fn(),
+  undoDesktopReviewActionV1: vi.fn(),
   updateSegmentMetadataV1: vi.fn(),
   registerMediaAsset: vi.fn(),
   registerReviewMediaAsset: vi.fn(),
@@ -74,6 +158,16 @@ function segment(): SpeechSegment {
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function installPlayableMediaStub() {
   Object.defineProperty(HTMLMediaElement.prototype, 'paused', {
     configurable: true,
@@ -92,8 +186,10 @@ function installPlayableMediaStub() {
 }
 
 let activePlaybackRevision = 0;
+let removedReviewSegmentIds: Set<string>;
 
 async function hearCurrentAudio() {
+  await waitFor(() => expect(sharedDurableReviewUndo.state.status).not.toBe('loading'));
   const audio = document.querySelector('audio');
   expect(audio).not.toBeNull();
   await waitFor(() => expect(audio!.getAttribute('src')).toBeTruthy());
@@ -139,16 +235,33 @@ function decisionCommit(
 describe('ReviewMode windowed queue', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    Object.assign(sharedDurableReviewUndo.state, {
+      status: 'loading',
+      target: null,
+      operationId: null,
+      blockedReason: null,
+      errorCode: null,
+      inFlight: false,
+      truthWriteInFlight: false,
+      truthWriteAmbiguous: false,
+      truthProjectionPending: false,
+      projectionOutcome: null,
+    });
+    undoAvailability = { status: 'none' };
+    removedReviewSegmentIds = new Set();
     segments.set([]);
     selectedSegmentId.set(null);
     searchQuery.set('');
     settings.set({ ...defaultSettings });
     showReviewInbox.set(false);
+    showConfirmDialog.set(null);
     activePlaybackRevision = 0;
     mocks.cancelDesktopPlaybackSessionV1.mockResolvedValue(true);
     mocks.getSegmentConsensus.mockResolvedValue({ models: [], words: [] });
     mocks.getDatasetStats.mockResolvedValue({ totalSegments: 1, verifiedCount: 0 });
+    mocks.getDatasetCertificate.mockResolvedValue({ threshold: 0.35 });
     mocks.getWaveform.mockResolvedValue([0.1, 0.4, 0.2]);
+    mocks.transcribeSegment.mockResolvedValue(undefined);
     mocks.recordPlaybackReceipt.mockImplementation(async () => ({
       playbackReceiptId: '11111111-1111-4111-8111-111111111111',
       segmentId: 'review-1',
@@ -183,14 +296,17 @@ describe('ReviewMode windowed queue', () => {
           cursor,
           focused: true,
         });
+        const projected = page.items.filter(
+          (item: SpeechSegment) => !removedReviewSegmentIds.has(item.id),
+        );
         return {
-          items: page.items.map((item: SpeechSegment) => ({
+          items: projected.map((item: SpeechSegment) => ({
             segment: item,
             baseRevision: page.revisions?.[item.id] ?? 0,
             eligible: true,
             disabledReason: null,
           })),
-          total: page.total,
+          total: Math.max(0, page.total - (page.items.length - projected.length)),
           nextCursor: page.nextCursor,
           scopeLabel: scope.kind,
           focusNarrowed: page.focusNarrowed === true,
@@ -199,8 +315,9 @@ describe('ReviewMode windowed queue', () => {
     );
     mocks.commitReviewV1.mockImplementation(
       async (request: {
+        operationId: string;
         segmentId: string;
-        decision: 'accept' | 'edit' | 'reject';
+        decision: UndoDecision;
         transcript: string | null;
       }) => {
         const legacy = await mocks.recordHumanDecision(
@@ -208,6 +325,16 @@ describe('ReviewMode windowed queue', () => {
           request.decision,
           request.transcript,
         );
+        removedReviewSegmentIds.add(request.segmentId);
+        undoAvailability = {
+          status: 'available',
+          target: undoTarget(
+            request.segmentId,
+            request.decision,
+            request.operationId,
+            legacy.effectEventId,
+          ),
+        };
         return {
           segmentId: legacy.segmentId,
           committedRevision: legacy.decidedRevision,
@@ -218,15 +345,28 @@ describe('ReviewMode windowed queue', () => {
     );
     mocks.markSegmentUnusableV1.mockImplementation(
       async (request: {
+        operationId: string;
         segmentId: string;
         baseRevision: number;
         reason: 'decodeFailed' | 'missingFile' | 'permissionDenied' | 'corruptContainer';
-      }) => ({
-        segmentId: request.segmentId,
-        committedRevision: request.baseRevision + 1,
-        reason: request.reason,
-        effectId: 'flag-effect:202',
-      }),
+      }) => {
+        removedReviewSegmentIds.add(request.segmentId);
+        undoAvailability = {
+          status: 'available',
+          target: technicalFlagUndoTarget(
+            request.segmentId,
+            request.operationId,
+            request.baseRevision,
+            request.reason,
+          ),
+        };
+        return {
+          segmentId: request.segmentId,
+          committedRevision: request.baseRevision + 1,
+          reason: request.reason,
+          effectId: 'flag-effect:202',
+        };
+      },
     );
     mocks.getReviewDraftV1.mockResolvedValue(null);
     mocks.saveReviewDraftV1.mockImplementation(
@@ -238,10 +378,20 @@ describe('ReviewMode windowed queue', () => {
       }),
     );
     mocks.deleteReviewDraftV1.mockResolvedValue(true);
-    mocks.undoHumanDecision.mockResolvedValue({
-      status: 'applied',
-      restoredRevision: 2,
-      segment: segment(),
+    mocks.getDesktopReviewUndoAvailabilityV1.mockImplementation(async () => undoAvailability);
+    mocks.undoDesktopReviewActionV1.mockImplementation(async (target: UndoTarget) => {
+      removedReviewSegmentIds.delete(target.segmentId);
+      undoAvailability = {
+        status: 'blocked',
+        reason: target.kind === 'flag' ? 'latestFlagUndone' : 'latestDecisionUndone',
+      };
+      return {
+        status: 'applied',
+        effectKind: target.kind,
+        effectEventId: target.effectEventId,
+        restoredRevision: 2,
+        segment: { ...segment(), id: target.segmentId },
+      };
     });
     mocks.updateSegmentMetadataV1.mockResolvedValue(undefined);
     mocks.registerMediaAsset.mockResolvedValue({ id: MEDIA_GRANT_ID });
@@ -305,16 +455,33 @@ describe('ReviewMode windowed queue', () => {
 
   it('undoes by immutable effect id and applies only the authoritative server row', async () => {
     const original = segment();
-    mocks.getSegmentsPage.mockResolvedValue({
-      items: [{ ...original, alignmentJson: null, evidenceJson: null }],
-      total: 1,
+    const restored = { ...original, rawTranscript: 'authoritative restored text' };
+    let projectionRows: SpeechSegment[] = [
+      { ...original, alignmentJson: null, evidenceJson: null },
+    ];
+    let authoritativeRow = original;
+    mocks.getSegmentsPage.mockImplementation(async () => ({
+      items: projectionRows,
+      total: projectionRows.length,
       nextCursor: null,
+    }));
+    mocks.getSegment.mockImplementation(async () => authoritativeRow);
+    mocks.recordHumanDecision.mockImplementation(async (id, action, text) => {
+      projectionRows = [];
+      return decisionCommit({ ...original, id }, action, text);
     });
-    mocks.getSegment.mockResolvedValue(original);
-    mocks.undoHumanDecision.mockResolvedValue({
-      status: 'applied',
-      restoredRevision: 2,
-      segment: { ...original, rawTranscript: 'authoritative restored text' },
+    mocks.undoDesktopReviewActionV1.mockImplementation(async (target: UndoTarget) => {
+      authoritativeRow = restored;
+      projectionRows = [{ ...restored, alignmentJson: null, evidenceJson: null }];
+      removedReviewSegmentIds.delete(target.segmentId);
+      undoAvailability = { status: 'blocked', reason: 'latestDecisionUndone' };
+      return {
+        status: 'applied',
+        effectKind: target.kind,
+        effectEventId: target.effectEventId,
+        restoredRevision: 2,
+        segment: restored,
+      };
     });
 
     render(ReviewMode);
@@ -322,14 +489,195 @@ describe('ReviewMode windowed queue', () => {
     await hearCurrentAudio();
     await fireEvent.click(screen.getByRole('button', { name: ckb['review.markBad'] }));
     expect(await screen.findByTestId('review-terminal')).toBeInTheDocument();
+    await waitFor(() => expect(sharedDurableReviewUndo.state.status).toBe('ready'));
+    expect(sharedDurableReviewUndo.state.target).toEqual(
+      expect.objectContaining({ effectEventId: 101, segmentId: original.id, decision: 'reject' }),
+    );
 
     await fireEvent.keyDown(window, { key: 'Backspace', code: 'Backspace' });
-    await waitFor(() =>
-      expect(mocks.undoHumanDecision).toHaveBeenCalledWith(101, expect.any(String)),
+    await waitFor(() => expect(mocks.undoDesktopReviewActionV1).toHaveBeenCalledTimes(1));
+    const [target, operationId] = mocks.undoDesktopReviewActionV1.mock.calls[0];
+    expect(target).toEqual({
+      kind: 'decision',
+      effectEventId: 101,
+      segmentId: original.id,
+      decision: 'reject',
+      sourceOperationId: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      ),
+      sourcePayloadHash: UNDO_PAYLOAD_HASH,
+      databaseGeneration: 1,
+    });
+    expect(operationId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
     );
     expect(await screen.findByTestId('review-action-bar')).toBeInTheDocument();
     expect(screen.getByRole('textbox')).toHaveValue('authoritative restored text');
     expect(mocks.updateSegmentMetadataV1).not.toHaveBeenCalled();
+  });
+
+  it('retries an ambiguous undo with the exact same inverse operation', async () => {
+    const original = segment();
+    const restored = { ...original, rawTranscript: 'restored after retry' };
+    let projectionRows: SpeechSegment[] = [
+      { ...original, alignmentJson: null, evidenceJson: null },
+    ];
+    let authoritativeRow = original;
+    mocks.getSegmentsPage.mockImplementation(async () => ({
+      items: projectionRows,
+      total: projectionRows.length,
+      nextCursor: null,
+    }));
+    mocks.getSegment.mockImplementation(async () => authoritativeRow);
+    mocks.recordHumanDecision.mockImplementation(async (id, action, text) => {
+      projectionRows = [];
+      return decisionCommit({ ...original, id }, action, text);
+    });
+    mocks.undoDesktopReviewActionV1
+      .mockRejectedValueOnce(new Error('response lost after durable inverse'))
+      .mockImplementationOnce(async (target: UndoTarget) => {
+        authoritativeRow = restored;
+        projectionRows = [{ ...restored, alignmentJson: null, evidenceJson: null }];
+        removedReviewSegmentIds.delete(target.segmentId);
+        undoAvailability = { status: 'blocked', reason: 'latestDecisionUndone' };
+        return {
+          status: 'applied',
+          effectKind: target.kind,
+          effectEventId: target.effectEventId,
+          restoredRevision: 2,
+          segment: restored,
+        };
+      });
+
+    render(ReviewMode);
+    expect(await screen.findByTestId('review-action-bar')).toBeInTheDocument();
+    await hearCurrentAudio();
+    await fireEvent.click(screen.getByRole('button', { name: ckb['review.markBad'] }));
+    expect(await screen.findByTestId('review-terminal')).toBeInTheDocument();
+    await waitFor(() => expect(sharedDurableReviewUndo.state.status).toBe('ready'));
+
+    await fireEvent.keyDown(window, { key: 'Backspace', code: 'Backspace' });
+    await waitFor(() => expect(mocks.undoDesktopReviewActionV1).toHaveBeenCalledTimes(1));
+    const first = mocks.undoDesktopReviewActionV1.mock.calls[0];
+    expect(screen.getByTestId('review-terminal')).toBeInTheDocument();
+
+    await fireEvent.keyDown(window, { key: 'Backspace', code: 'Backspace' });
+    await waitFor(() => expect(mocks.undoDesktopReviewActionV1).toHaveBeenCalledTimes(2));
+    expect(mocks.undoDesktopReviewActionV1.mock.calls[1]).toEqual(first);
+    expect(first[0]).toEqual(
+      undoTarget(original.id, 'reject', first[0].sourceOperationId, first[0].effectEventId),
+    );
+    expect(first[1]).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(await screen.findByTestId('review-action-bar')).toBeInTheDocument();
+    expect(screen.getByRole('textbox')).toHaveValue('restored after retry');
+  });
+
+  it('keeps the current review selected when navigation hydration fails', async () => {
+    const first = segment();
+    const second = {
+      ...segment(),
+      id: 'review-2',
+      audioPath: 'C:\\audio\\review-2.wav',
+      rawTranscript: 'second transcript',
+    };
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [
+        { ...first, alignmentJson: null, evidenceJson: null },
+        { ...second, alignmentJson: null, evidenceJson: null },
+      ],
+      total: 2,
+      nextCursor: null,
+    });
+    mocks.getSegment.mockImplementation(async (id: string) => {
+      if (id === first.id) return first;
+      throw new Error('second clip hydration failed');
+    });
+
+    render(ReviewMode);
+    expect(await screen.findByRole('textbox')).toHaveValue(first.rawTranscript);
+    await fireEvent.keyDown(window, { key: 'ArrowRight', code: 'ArrowRight' });
+
+    await waitFor(() => expect(mocks.getSegment).toHaveBeenCalledWith(second.id));
+    expect(screen.getByRole('textbox')).toHaveValue(first.rawTranscript);
+    expect(screen.getByTestId('review-source-file')).toHaveTextContent('review.wav');
+  });
+
+  it('drops a navigation hydration when durable truth authority starts before it resolves', async () => {
+    const first = segment();
+    const second = {
+      ...segment(),
+      id: 'review-2',
+      audioPath: 'C:\\audio\\review-2.wav',
+      rawTranscript: 'second transcript',
+    };
+    const lateSecond = deferred<SpeechSegment>();
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [
+        { ...first, alignmentJson: null, evidenceJson: null },
+        { ...second, alignmentJson: null, evidenceJson: null },
+      ],
+      total: 2,
+      nextCursor: null,
+      revisions: { [first.id]: 0, [second.id]: 0 },
+    });
+    mocks.getSegment.mockImplementation((id: string) =>
+      id === first.id ? Promise.resolve(first) : lateSecond.promise,
+    );
+
+    render(ReviewMode);
+    expect(await screen.findByRole('textbox')).toHaveValue(first.rawTranscript);
+    await fireEvent.keyDown(window, { key: 'ArrowRight', code: 'ArrowRight' });
+    await waitFor(() => expect(mocks.getSegment).toHaveBeenCalledWith(second.id));
+
+    Object.assign(sharedDurableReviewUndo.state, {
+      status: 'failed',
+      truthWriteInFlight: false,
+      truthWriteAmbiguous: true,
+      truthProjectionPending: false,
+    });
+    lateSecond.resolve(second);
+    await lateSecond.promise;
+    await Promise.resolve();
+
+    expect(screen.getByRole('textbox')).toHaveValue(first.rawTranscript);
+    expect(screen.getByTestId('review-source-file')).toHaveTextContent('review.wav');
+  });
+
+  it('lets a newer stay-on-current intent cancel an older in-flight next hydration', async () => {
+    const first = segment();
+    const second = {
+      ...segment(),
+      id: 'review-2',
+      audioPath: 'C:\\audio\\review-2.wav',
+      rawTranscript: 'second transcript',
+    };
+    const lateSecond = deferred<SpeechSegment>();
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [
+        { ...first, alignmentJson: null, evidenceJson: null },
+        { ...second, alignmentJson: null, evidenceJson: null },
+      ],
+      total: 2,
+      nextCursor: null,
+      revisions: { [first.id]: 0, [second.id]: 0 },
+    });
+    mocks.getSegment.mockImplementation((id: string) =>
+      id === first.id ? Promise.resolve(first) : lateSecond.promise,
+    );
+
+    render(ReviewMode);
+    expect(await screen.findByRole('textbox')).toHaveValue(first.rawTranscript);
+    await fireEvent.keyDown(window, { key: 'ArrowRight', code: 'ArrowRight' });
+    await waitFor(() => expect(mocks.getSegment).toHaveBeenCalledWith(second.id));
+    await fireEvent.keyDown(window, { key: 'ArrowLeft', code: 'ArrowLeft' });
+    lateSecond.resolve(second);
+    await lateSecond.promise;
+    await Promise.resolve();
+
+    expect(screen.getByRole('textbox')).toHaveValue(first.rawTranscript);
+    expect(screen.getByTestId('review-source-file')).toHaveTextContent('review.wav');
   });
 
   it('never exposes a lightweight row before its chunk metadata is hydrated', async () => {
@@ -363,6 +711,146 @@ describe('ReviewMode windowed queue', () => {
     resolveHydration(full);
     expect(await screen.findByTestId('review-action-bar')).toBeInTheDocument();
     expect(mocks.alignSegment).not.toHaveBeenCalled();
+  });
+
+  it('keeps the current hydration receipt when a retired same-row hydration resolves last', async () => {
+    const rowId = 'same-row-reloaded';
+    const hydrationOne = deferred<SpeechSegment>();
+    const hydrationTwo = deferred<SpeechSegment>();
+    let pageCall = 0;
+    let hydrationCall = 0;
+    mocks.getReviewPageV1.mockImplementation(async () => {
+      pageCall += 1;
+      const baseRevision = pageCall === 1 ? 1 : 2;
+      return {
+        items: [
+          {
+            segment: {
+              ...segment(),
+              id: rowId,
+              speakerId: pageCall === 1 ? 'page-one' : 'page-two',
+            },
+            baseRevision,
+            eligible: true,
+            disabledReason: null,
+          },
+        ],
+        total: 1,
+        nextCursor: null,
+        scopeLabel: 'pending',
+        focusNarrowed: false,
+      };
+    });
+    mocks.getSegment.mockImplementation(async () => {
+      hydrationCall += 1;
+      if (hydrationCall === 1) return hydrationOne.promise;
+      if (hydrationCall === 2) return hydrationTwo.promise;
+      return { ...segment(), id: rowId, speakerId: 'current-authority' };
+    });
+
+    const queue = createReviewModeQueueController();
+    await expect(queue.load(true)).resolves.toBe(true);
+    const stale = queue.hydrate(rowId);
+    await waitFor(() => expect(mocks.getSegment).toHaveBeenCalledTimes(1));
+
+    await expect(queue.load(true)).resolves.toBe(true);
+    const current = queue.hydrate(rowId);
+    await waitFor(() => expect(mocks.getSegment).toHaveBeenCalledTimes(2));
+    hydrationTwo.resolve({ ...segment(), id: rowId, speakerId: 'current-authority' });
+    await expect(current).resolves.not.toBeNull();
+    const currentReceipt = queue.projectionReceipt();
+    expect(currentReceipt).not.toBeNull();
+    expect(queue.current()).toMatchObject({ id: rowId, speakerId: 'current-authority' });
+
+    hydrationOne.resolve({ ...segment(), id: rowId, speakerId: 'retired-authority' });
+    await expect(stale).resolves.toBeNull();
+    expect(queue.current()).toMatchObject({ id: rowId, speakerId: 'current-authority' });
+    expect(queue.projectionReceipt()).toBe(currentReceipt);
+
+    const reconciliationReceipt = await queue.reloadProjection();
+    expect(reconciliationReceipt).not.toBeNull();
+    expect(queue.projectionReceipt()).toBe(reconciliationReceipt);
+    expect(queue.current()).toMatchObject({ id: rowId, speakerId: 'current-authority' });
+  });
+
+  it('never publishes a disposed queue hydration after its replacement global row', async () => {
+    const rowId = 'disposed-hydration';
+    const lateHydration = deferred<SpeechSegment>();
+    mocks.getReviewPageV1.mockResolvedValue({
+      items: [
+        {
+          segment: { ...segment(), id: rowId, rawTranscript: 'page snapshot' },
+          baseRevision: 4,
+          eligible: true,
+          disabledReason: null,
+        },
+      ],
+      total: 1,
+      nextCursor: null,
+      scopeLabel: 'pending',
+      focusNarrowed: false,
+    });
+    mocks.getSegment.mockReturnValue(lateHydration.promise);
+
+    const queue = createReviewModeQueueController();
+    await expect(queue.load(true)).resolves.toBe(true);
+    const stale = queue.hydrate(rowId);
+    await vi.waitFor(() => expect(mocks.getSegment).toHaveBeenCalledOnce());
+    queue.dispose();
+
+    const replacement = {
+      ...segment(),
+      id: rowId,
+      rawTranscript: 'replacement authority',
+      speakerId: 'replacement-surface',
+    };
+    segments.set([replacement]);
+    lateHydration.resolve({
+      ...segment(),
+      id: rowId,
+      rawTranscript: 'stale pre-unmount authority',
+      speakerId: 'destroyed-surface',
+    });
+
+    await expect(stale).resolves.toBeNull();
+    expect(get(segments)).toEqual([replacement]);
+    expect(queue.current()).toBeNull();
+    expect(queue.projectionReceipt()).toBeNull();
+  });
+
+  it('never publishes a re-transcription read that completes after ReviewMode unmounts', async () => {
+    const full = segment();
+    const lateReload = deferred<SpeechSegment>();
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [{ ...full, alignmentJson: null, evidenceJson: null }],
+      total: 1,
+      nextCursor: null,
+      revisions: { [full.id]: 0 },
+    });
+    mocks.getSegment.mockResolvedValueOnce(full).mockReturnValueOnce(lateReload.promise);
+
+    const view = render(ReviewMode);
+    expect(await screen.findByRole('textbox')).toHaveValue(full.rawTranscript);
+    await fireEvent.click(screen.getByRole('button', { name: ckb['review.retranscribeChampion'] }));
+    await waitFor(() => expect(mocks.transcribeSegment).toHaveBeenCalledOnce());
+    await waitFor(() => expect(mocks.getSegment).toHaveBeenCalledTimes(2));
+
+    view.unmount();
+    const replacement = {
+      ...full,
+      rawTranscript: 'replacement surface authority',
+      speakerId: 'replacement-surface',
+    };
+    segments.set([replacement]);
+    lateReload.resolve({
+      ...full,
+      rawTranscript: 'stale re-transcription authority',
+      speakerId: 'destroyed-surface',
+    });
+    await lateReload.promise;
+    await Promise.resolve();
+
+    expect(get(segments)).toEqual([replacement]);
   });
 
   it('never installs an old same-id hydration under a newer review revision', async () => {
@@ -476,6 +964,164 @@ describe('ReviewMode windowed queue', () => {
     expect(screen.getByRole('button', { name: ckb['review.acceptAsIs'] })).toBeDisabled();
     expect(screen.getByRole('button', { name: ckb['review.saveNext'] })).toBeDisabled();
     expect(screen.getByRole('button', { name: ckb['review.markBad'] })).toBeDisabled();
+  });
+
+  it('allows Backspace to undo a technical flag while its prior draft remains conflicted', async () => {
+    const flagged = {
+      ...segment(),
+      id: 'technical-flag-with-draft',
+      verdict: 'escalated',
+      rationale: 'private technical evidence is backend-only',
+      escalated: true,
+    };
+    let currentRevision = 5;
+    let serverRow: SpeechSegment = flagged;
+    mocks.getSegmentsPage.mockImplementation(async () => ({
+      items: [serverRow],
+      total: 1,
+      nextCursor: null,
+      revisions: { [flagged.id]: currentRevision },
+    }));
+    mocks.getSegment.mockImplementation(async () => serverRow);
+    mocks.getReviewDraftV1.mockResolvedValue({
+      segmentId: flagged.id,
+      baseRevision: 4,
+      text: 'ڕەشنووسی پارێزراوی پێش نیشانکردن',
+      updatedAt: '2026-08-28T12:00:00.000Z',
+    });
+    const target = technicalFlagUndoTarget(
+      flagged.id,
+      '77777777-7777-4777-8777-777777777777',
+      4,
+      'corruptContainer',
+      202,
+    );
+    undoAvailability = { status: 'available', target };
+    mocks.undoDesktopReviewActionV1.mockImplementationOnce(async (received: UndoTarget) => {
+      currentRevision = 6;
+      serverRow = { ...flagged, verdict: null, rationale: null, escalated: false };
+      undoAvailability = { status: 'blocked', reason: 'latestFlagUndone' };
+      return {
+        status: 'applied',
+        effectKind: 'flag',
+        effectEventId: received.effectEventId,
+        restoredRevision: currentRevision,
+        segment: serverRow,
+      };
+    });
+
+    render(ReviewMode);
+    expect(await screen.findByText(ckb['review.draftConflictTitle'])).toBeInTheDocument();
+    const undo = screen.getByRole('button', { name: ckb['review.undoLast'] });
+    expect(undo).toBeEnabled();
+    await fireEvent.keyDown(window, { key: 'Backspace', code: 'Backspace' });
+
+    await waitFor(() => expect(mocks.undoDesktopReviewActionV1).toHaveBeenCalledOnce());
+    expect(mocks.undoDesktopReviewActionV1).toHaveBeenCalledWith(
+      target,
+      expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      ),
+    );
+    await waitFor(() =>
+      expect(sharedDurableReviewUndo.state).toMatchObject({
+        status: 'blocked',
+        blockedReason: 'latestFlagUndone',
+      }),
+    );
+    expect(mocks.undoDesktopReviewActionV1).toHaveBeenCalledOnce();
+    expect(mocks.deleteReviewDraftV1).not.toHaveBeenCalled();
+    expect(mocks.saveReviewDraftV1).not.toHaveBeenCalled();
+    expect(screen.getByText('ڕەشنووسی پارێزراوی پێش نیشانکردن')).toBeInTheDocument();
+  });
+
+  it('discards a stale draft only after a global confirmation for the exact revision', async () => {
+    const full = segment();
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [{ ...full, alignmentJson: null, evidenceJson: null }],
+      total: 1,
+      nextCursor: null,
+      revisions: { [full.id]: 3 },
+    });
+    mocks.getSegment.mockResolvedValue(full);
+    mocks.getReviewDraftV1.mockResolvedValue({
+      segmentId: full.id,
+      baseRevision: 2,
+      text: 'ڕەشنووسی کۆن',
+      updatedAt: '2026-08-25T12:00:00.000Z',
+    });
+
+    render(ReviewMode);
+    expect(await screen.findByText(ckb['review.draftConflictTitle'])).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: ckb['review.discardLocalDraft'] }));
+
+    const cancelledConfirmation = get(showConfirmDialog);
+    expect(cancelledConfirmation).toMatchObject({
+      title: ckb['review.discardDraftConfirmTitle'],
+      message: ckb['review.discardDraftConfirmMessage'],
+      confirmLabel: ckb['review.discardLocalDraft'],
+      danger: true,
+    });
+    expect(mocks.deleteReviewDraftV1).not.toHaveBeenCalled();
+    showConfirmDialog.set(null);
+    cancelledConfirmation?.onCancel?.();
+    expect(mocks.deleteReviewDraftV1).not.toHaveBeenCalled();
+    expect(screen.getByText(ckb['review.draftConflictTitle'])).toBeInTheDocument();
+
+    await fireEvent.click(screen.getByRole('button', { name: ckb['review.discardLocalDraft'] }));
+    const confirmed = get(showConfirmDialog);
+    expect(confirmed).not.toBeNull();
+    showConfirmDialog.set(null);
+    await confirmed?.onConfirm();
+
+    await waitFor(() => expect(mocks.deleteReviewDraftV1).toHaveBeenCalledWith(full.id, 2));
+    expect(screen.queryByText(ckb['review.draftConflictTitle'])).not.toBeInTheDocument();
+    expect(screen.getByRole('textbox')).toHaveValue(full.rawTranscript);
+    expect(screen.getByRole('button', { name: ckb['review.acceptAsIs'] })).not.toBeDisabled();
+  });
+
+  it('refuses a stale draft confirmation after the selected review authority changes', async () => {
+    const first = { ...segment(), rawTranscript: 'first authoritative transcript' };
+    const second = {
+      ...segment(),
+      id: 'review-2',
+      audioPath: 'C:\\audio\\review-2.wav',
+      rawTranscript: 'second authoritative transcript',
+    };
+    mocks.getSegmentsPage.mockImplementation(async ({ query }: { query?: string | null }) => {
+      const selected = query === 'second' ? second : first;
+      return {
+        items: [{ ...selected, alignmentJson: null, evidenceJson: null }],
+        total: 1,
+        nextCursor: null,
+        revisions: { [selected.id]: selected.id === first.id ? 3 : 9 },
+      };
+    });
+    mocks.getSegment.mockImplementation(async (id: string) => (id === first.id ? first : second));
+    mocks.getReviewDraftV1.mockImplementation(async (id: string) =>
+      id === first.id
+        ? {
+            segmentId: first.id,
+            baseRevision: 2,
+            text: 'stale local correction',
+            updatedAt: '2026-08-25T12:00:00.000Z',
+          }
+        : null,
+    );
+
+    render(ReviewMode);
+    expect(await screen.findByText(ckb['review.draftConflictTitle'])).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: ckb['review.discardLocalDraft'] }));
+    const staleConfirmation = get(showConfirmDialog);
+    expect(staleConfirmation).not.toBeNull();
+
+    searchQuery.set('second');
+    await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue(second.rawTranscript));
+    showConfirmDialog.set(null);
+    await staleConfirmation?.onConfirm();
+
+    expect(mocks.deleteReviewDraftV1).not.toHaveBeenCalled();
+    expect(screen.getByRole('textbox')).toHaveValue(second.rawTranscript);
   });
 
   it('blocks every truth action and shortcut until draft recovery has succeeded', async () => {
@@ -760,6 +1406,11 @@ describe('ReviewMode windowed queue', () => {
     });
     mocks.commitReviewV1.mockImplementation(async (request) => {
       order.push('commit');
+      removedReviewSegmentIds.add(request.segmentId);
+      undoAvailability = {
+        status: 'available',
+        target: undoTarget(request.segmentId, request.decision, request.operationId, 303),
+      };
       return {
         segmentId: request.segmentId,
         committedRevision: request.baseRevision + 1,
@@ -778,6 +1429,222 @@ describe('ReviewMode windowed queue', () => {
     await waitFor(() => expect(mocks.commitReviewV1).toHaveBeenCalledTimes(1));
     expect(order).toEqual(['draft', 'receipt', 'commit']);
     expect(mocks.saveReviewDraftV1).toHaveBeenCalledWith(full.id, 0, 'دەقی دەستکاری‌کراوی نوێ');
+  });
+
+  it('freezes every transcript mutation through the writer and projection barrier without new draft IPC', async () => {
+    const full = segment();
+    const submittedText = 'دەقی دەستکاری‌کراوی جێگیر';
+    const commit = deferred<{
+      segmentId: string;
+      committedRevision: number;
+      authoritativeTranscript: string;
+      decisionId: string;
+    }>();
+    const projection = deferred<{
+      items: never[];
+      total: number;
+      nextCursor: null;
+      scopeLabel: string;
+      focusNarrowed: boolean;
+    }>();
+    let reviewPageCall = 0;
+    mocks.getReviewPageV1.mockImplementation(async () => {
+      reviewPageCall += 1;
+      if (reviewPageCall === 1) {
+        return {
+          items: [
+            {
+              segment: { ...full, alignmentJson: null, evidenceJson: null },
+              baseRevision: 0,
+              eligible: true,
+              disabledReason: null,
+            },
+          ],
+          total: 1,
+          nextCursor: null,
+          scopeLabel: 'pending',
+          focusNarrowed: false,
+        };
+      }
+      return projection.promise;
+    });
+    mocks.getSegment.mockResolvedValue(full);
+    mocks.commitReviewV1.mockImplementation(async (request) => {
+      undoAvailability = {
+        status: 'available',
+        target: undoTarget(request.segmentId, request.decision, request.operationId, 707),
+      };
+      return commit.promise;
+    });
+
+    render(ReviewMode);
+    const editor = await screen.findByRole('textbox');
+    await waitFor(() => expect(mocks.getReviewDraftV1).toHaveBeenCalledWith(full.id));
+    await hearCurrentAudio();
+    await fireEvent.input(editor, { target: { value: submittedText } });
+    await fireEvent.click(screen.getByRole('button', { name: ckb['review.saveNext'] }));
+    await waitFor(() => expect(mocks.commitReviewV1).toHaveBeenCalledTimes(1));
+
+    const draftWritesAtCommit = mocks.saveReviewDraftV1.mock.calls.length;
+    const reset = screen.getByRole('button', { name: ckb['review.reset'] });
+    const wordChip = document.querySelector<HTMLButtonElement>('[data-chip="0"]');
+    expect(wordChip).not.toBeNull();
+
+    const assertMutationBarrier = async (attemptedText: string) => {
+      expect(editor).toBeDisabled();
+      expect(reset).toBeDisabled();
+      expect(wordChip).toBeDisabled();
+      await fireEvent.input(editor, { target: { value: attemptedText } });
+      await fireEvent.dblClick(wordChip!);
+      await fireEvent.click(reset);
+      await flushReviewDrafts();
+      expect(screen.queryByRole('textbox', { name: ckb['review.editWordAria'] })).toBeNull();
+      expect(get(showConfirmDialog)).toBeNull();
+      expect(mocks.saveReviewDraftV1).toHaveBeenCalledTimes(draftWritesAtCommit);
+      expect(mocks.deleteReviewDraftV1).not.toHaveBeenCalled();
+    };
+
+    await assertMutationBarrier('writer-stage-clobber');
+
+    commit.resolve({
+      segmentId: full.id,
+      committedRevision: 1,
+      authoritativeTranscript: submittedText,
+      decisionId: 'effect:707',
+    });
+    await waitFor(() => expect(reviewPageCall).toBe(2));
+    await waitFor(() => expect(sharedDurableReviewUndo.state.truthProjectionPending).toBe(true));
+
+    await assertMutationBarrier('projection-stage-clobber');
+
+    projection.resolve({
+      items: [],
+      total: 0,
+      nextCursor: null,
+      scopeLabel: 'pending',
+      focusNarrowed: false,
+    });
+    await waitFor(() => expect(screen.queryByRole('textbox')).not.toBeInTheDocument());
+    expect(mocks.commitReviewV1.mock.calls[0][0]).toMatchObject({
+      segmentId: full.id,
+      transcript: submittedText,
+      decision: 'edit',
+    });
+  });
+
+  it('invalidates a pre-open word editor when a truth lease begins', async () => {
+    const full = segment();
+    const submittedText = 'دەقی جێگیر بۆ ناردن';
+    const commit = deferred<{
+      segmentId: string;
+      committedRevision: number;
+      authoritativeTranscript: string;
+      decisionId: string;
+    }>();
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [{ ...full, alignmentJson: null, evidenceJson: null }],
+      total: 1,
+      nextCursor: null,
+      revisions: { [full.id]: 0 },
+    });
+    mocks.getSegment.mockResolvedValue(full);
+    mocks.commitReviewV1.mockImplementation(async (request) => {
+      removedReviewSegmentIds.add(request.segmentId);
+      undoAvailability = {
+        status: 'available',
+        target: undoTarget(request.segmentId, request.decision, request.operationId, 708),
+      };
+      return commit.promise;
+    });
+
+    render(ReviewMode);
+    const editor = await screen.findByRole('textbox');
+    await waitFor(() => expect(mocks.getReviewDraftV1).toHaveBeenCalledWith(full.id));
+    await hearCurrentAudio();
+    await fireEvent.input(editor, { target: { value: submittedText } });
+
+    const wordChip = document.querySelector<HTMLButtonElement>('[data-chip="0"]');
+    expect(wordChip).not.toBeNull();
+    await fireEvent.dblClick(wordChip!);
+    const wordInput = await screen.findByRole('textbox', { name: ckb['review.editWordAria'] });
+
+    await fireEvent.click(screen.getByRole('button', { name: ckb['review.saveNext'] }));
+    await waitFor(() => expect(mocks.commitReviewV1).toHaveBeenCalledTimes(1));
+    const draftWritesAtCommit = mocks.saveReviewDraftV1.mock.calls.length;
+
+    expect(editor).toBeDisabled();
+    await waitFor(() => expect(wordInput).not.toBeInTheDocument());
+    await fireEvent.input(wordInput, { target: { value: 'دەقی گۆڕدراوی درەنگ' } });
+    await fireEvent.keyDown(wordInput, { key: 'Enter', code: 'Enter' });
+    await flushReviewDrafts();
+
+    expect(mocks.saveReviewDraftV1).toHaveBeenCalledTimes(draftWritesAtCommit);
+    expect(mocks.deleteReviewDraftV1).not.toHaveBeenCalled();
+
+    commit.resolve({
+      segmentId: full.id,
+      committedRevision: 1,
+      authoritativeTranscript: submittedText,
+      decisionId: 'effect:708',
+    });
+    await waitFor(() => expect(screen.queryByRole('textbox')).not.toBeInTheDocument());
+    expect(mocks.commitReviewV1.mock.calls[0][0]).toMatchObject({ transcript: submittedText });
+  });
+
+  it('invalidates an exact reset confirmation captured before the truth lease', async () => {
+    const full = segment();
+    const submittedText = 'دەقی کاتی ناردن';
+    const commit = deferred<{
+      segmentId: string;
+      committedRevision: number;
+      authoritativeTranscript: string;
+      decisionId: string;
+    }>();
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [{ ...full, alignmentJson: null, evidenceJson: null }],
+      total: 1,
+      nextCursor: null,
+      revisions: { [full.id]: 0 },
+    });
+    mocks.getSegment.mockResolvedValue(full);
+    mocks.commitReviewV1.mockImplementation(async (request) => {
+      removedReviewSegmentIds.add(request.segmentId);
+      undoAvailability = {
+        status: 'available',
+        target: undoTarget(request.segmentId, request.decision, request.operationId, 709),
+      };
+      return commit.promise;
+    });
+
+    render(ReviewMode);
+    const editor = await screen.findByRole('textbox');
+    await waitFor(() => expect(mocks.getReviewDraftV1).toHaveBeenCalledWith(full.id));
+    await hearCurrentAudio();
+    await fireEvent.input(editor, { target: { value: submittedText } });
+
+    const reset = screen.getByRole('button', { name: ckb['review.reset'] });
+    await fireEvent.click(reset);
+    const preLeaseReset = get(showConfirmDialog);
+    expect(preLeaseReset).not.toBeNull();
+
+    await fireEvent.click(screen.getByRole('button', { name: ckb['review.saveNext'] }));
+    await waitFor(() => expect(mocks.commitReviewV1).toHaveBeenCalledTimes(1));
+    const draftWritesAtCommit = mocks.saveReviewDraftV1.mock.calls.length;
+    expect(reset).toBeDisabled();
+
+    await preLeaseReset?.onConfirm();
+    await flushReviewDrafts();
+    expect(mocks.saveReviewDraftV1).toHaveBeenCalledTimes(draftWritesAtCommit);
+    expect(mocks.deleteReviewDraftV1).not.toHaveBeenCalled();
+
+    commit.resolve({
+      segmentId: full.id,
+      committedRevision: 1,
+      authoritativeTranscript: submittedText,
+      decisionId: 'effect:709',
+    });
+    await waitFor(() => expect(screen.queryByRole('textbox')).not.toBeInTheDocument());
+    expect(mocks.commitReviewV1.mock.calls[0][0]).toMatchObject({ transcript: submittedText });
   });
 
   it('cannot discard a typed correction through Accept or the A shortcut', async () => {
@@ -1122,11 +1989,250 @@ describe('ReviewMode windowed queue', () => {
     await waitFor(() => expect(mocks.commitReviewV1).toHaveBeenCalledTimes(1));
   });
 
-  it.each([
-    'PLAYBACK_SESSION_EXPIRED',
-    'PLAYBACK_EVIDENCE_CHANGED',
-    'PLAYBACK_MEDIA_GRANT_UNAVAILABLE',
-  ])(
+  it('refuses a mismatched playback-finalization response and retries the immutable evidence', async () => {
+    const full = segment();
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [{ ...full, alignmentJson: null, evidenceJson: null }],
+      total: 1,
+      nextCursor: null,
+      revisions: { [full.id]: 0 },
+    });
+    mocks.getSegment.mockResolvedValue(full);
+    mocks.recordPlaybackReceipt.mockResolvedValueOnce({
+      playbackReceiptId: 'wrong-receipt',
+      segmentId: 'wrong-segment',
+      segmentRevision: 99,
+      uniquePlayedMs: 900,
+      clipDurationMs: 1_000,
+      coverageRatio: 0.9,
+    });
+
+    render(ReviewMode);
+    expect(await screen.findByTestId('review-action-bar')).toBeInTheDocument();
+    await hearCurrentAudio();
+    const accept = screen.getByRole('button', { name: new RegExp(ckb['review.acceptAsIs']) });
+    await fireEvent.click(accept);
+    await waitFor(() => expect(mocks.recordPlaybackReceipt).toHaveBeenCalledTimes(1));
+    expect(mocks.commitReviewV1).not.toHaveBeenCalled();
+    await waitFor(() => expect(accept).not.toBeDisabled());
+
+    await fireEvent.click(accept);
+    await waitFor(() => expect(mocks.recordPlaybackReceipt).toHaveBeenCalledTimes(2));
+    expect(mocks.recordPlaybackReceipt.mock.calls[1][0]).toEqual(
+      mocks.recordPlaybackReceipt.mock.calls[0][0],
+    );
+    await waitFor(() => expect(mocks.commitReviewV1).toHaveBeenCalledTimes(1));
+  });
+
+  it('keeps exact review state and scope through a held then ambiguous decision response', async () => {
+    const full = segment();
+    const second = {
+      ...segment(),
+      id: 'review-2',
+      audioPath: 'C:\\audio\\review-2.wav',
+      rawTranscript: 'second transcript',
+    };
+    const commit = deferred<{
+      segmentId: string;
+      committedRevision: number;
+      authoritativeTranscript: string;
+      decisionId: string;
+    }>();
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [
+        { ...full, alignmentJson: null, evidenceJson: null },
+        { ...second, alignmentJson: null, evidenceJson: null },
+      ],
+      total: 2,
+      nextCursor: null,
+      revisions: { [full.id]: 0, [second.id]: 0 },
+    });
+    mocks.getSegment.mockImplementation(async (id: string) => (id === full.id ? full : second));
+    mocks.commitReviewV1.mockReturnValue(commit.promise);
+
+    render(ReviewMode);
+    expect(await screen.findByTestId('review-action-bar')).toBeInTheDocument();
+    await hearCurrentAudio();
+    const editor = screen.getByRole('textbox');
+    const exactText = 'دەقی دەستکاری‌کراوی پارێزراو';
+    await fireEvent.input(editor, { target: { value: exactText } });
+    editor.focus();
+    await fireEvent.keyDown(editor, { key: 'Enter', code: 'Enter', ctrlKey: true });
+    await waitFor(() => expect(mocks.commitReviewV1).toHaveBeenCalledTimes(1));
+    const first = mocks.commitReviewV1.mock.calls[0][0];
+    const suspectToggle = screen.getByTestId('suspect-first-toggle');
+    const audio = document.querySelector('audio')!;
+
+    const assertScopeBarrier = async (scopeAttempt: string) => {
+      const pageCalls = mocks.getReviewPageV1.mock.calls.length;
+      const legacyPageCalls = mocks.getSegmentsPage.mock.calls.length;
+      const exactFocus = document.activeElement;
+      const exactSrc = audio.getAttribute('src');
+      const exactTime = audio.currentTime;
+      const exactPaused = audio.paused;
+      const authorityCalls = mocks.beginDesktopPlaybackSessionV1.mock.calls.length;
+      const play = screen.getByRole('button', { name: ckb['audio.play'] });
+      const replayButton = screen.getByRole('button', { name: ckb['review.replay'] });
+      const seek = screen.getByRole('slider', { name: ckb['audio.seek'] });
+      const waveform = screen.getByRole('slider', { name: ckb['waveform.audioTimeline'] });
+      expect(suspectToggle).toBeDisabled();
+      expect(suspectToggle).toHaveAttribute('aria-describedby', 'review-scope-disabled-reason');
+      expect(play).toBeDisabled();
+      expect(replayButton).toBeDisabled();
+      expect(seek).toBeDisabled();
+      expect(waveform).toHaveAttribute('aria-disabled', 'true');
+      searchQuery.set(scopeAttempt);
+      await fireEvent.click(suspectToggle);
+      await fireEvent.click(play);
+      await fireEvent.click(replayButton);
+      await fireEvent.keyDown(window, { key: ' ', code: 'Space' });
+      await fireEvent.keyDown(window, { key: 'r', code: 'KeyR' });
+      await fireEvent.keyDown(window, { key: 'ArrowRight', code: 'ArrowRight' });
+      await fireEvent.keyDown(waveform, { key: 'ArrowRight', code: 'ArrowRight' });
+      await fireEvent.pointerDown(waveform, { clientX: 300, pointerId: 1 });
+      await Promise.resolve();
+      expect(mocks.getReviewPageV1).toHaveBeenCalledTimes(pageCalls);
+      expect(mocks.getSegmentsPage).toHaveBeenCalledTimes(legacyPageCalls);
+      expect(suspectToggle).toHaveAttribute('aria-pressed', 'false');
+      expect(screen.getByRole('textbox')).toHaveValue(exactText);
+      expect(screen.getByTestId('review-source-file')).toHaveTextContent('review.wav');
+      expect(audio.getAttribute('src')).toBe(exactSrc);
+      expect(audio.currentTime).toBe(exactTime);
+      expect(audio.paused).toBe(exactPaused);
+      expect(mocks.beginDesktopPlaybackSessionV1).toHaveBeenCalledTimes(authorityCalls);
+      expect(document.activeElement).toBe(exactFocus);
+    };
+
+    await assertScopeBarrier('held writer scope');
+    commit.reject(new Error('response lost after durable commit'));
+    await waitFor(() => expect(sharedDurableReviewUndo.state.truthWriteAmbiguous).toBe(true));
+    await assertScopeBarrier('ambiguous writer scope');
+
+    const accept = screen.getByRole('button', { name: new RegExp(ckb['review.acceptAsIs']) });
+    expect(accept).toBeDisabled();
+    await fireEvent.click(accept);
+    expect(mocks.commitReviewV1).toHaveBeenCalledTimes(1);
+    expect(first).toMatchObject({
+      operationId: expect.any(String),
+      playbackReceiptId: '11111111-1111-4111-8111-111111111111',
+      segmentId: full.id,
+      transcript: exactText,
+    });
+    expect(mocks.recordPlaybackReceipt).toHaveBeenCalledOnce();
+  });
+
+  it('hard-stops a wrong-segment commit response with zero speculative queue reloads', async () => {
+    const full = segment();
+    const response = deferred<{
+      segmentId: string;
+      committedRevision: number;
+      authoritativeTranscript: string;
+      decisionId: string;
+    }>();
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [{ ...full, alignmentJson: null, evidenceJson: null }],
+      total: 1,
+      nextCursor: null,
+      revisions: { [full.id]: 0 },
+    });
+    mocks.getSegment.mockResolvedValue(full);
+    mocks.commitReviewV1.mockReturnValue(response.promise);
+
+    render(ReviewMode);
+    const editor = await screen.findByRole('textbox');
+    await hearCurrentAudio();
+    const exactText = 'exact correction retained after malformed success';
+    await fireEvent.input(editor, { target: { value: exactText } });
+    editor.focus();
+    await fireEvent.keyDown(editor, { key: 'Enter', code: 'Enter', ctrlKey: true });
+    await waitFor(() => expect(mocks.commitReviewV1).toHaveBeenCalledOnce());
+
+    const pageCalls = mocks.getReviewPageV1.mock.calls.length;
+    const legacyPageCalls = mocks.getSegmentsPage.mock.calls.length;
+    const exactFocus = document.activeElement;
+    const audio = document.querySelector('audio')!;
+    const exactAudio = {
+      src: audio.getAttribute('src'),
+      time: audio.currentTime,
+      paused: audio.paused,
+    };
+    response.resolve({
+      segmentId: 'wrong-segment',
+      committedRevision: 1,
+      authoritativeTranscript: 'wrong-segment transcript',
+      decisionId: 'effect:999',
+    });
+
+    await waitFor(() => expect(sharedDurableReviewUndo.state.truthWriteAmbiguous).toBe(true));
+    expect(mocks.getReviewPageV1).toHaveBeenCalledTimes(pageCalls);
+    expect(mocks.getSegmentsPage).toHaveBeenCalledTimes(legacyPageCalls);
+    expect(screen.getByRole('textbox')).toHaveValue(exactText);
+    expect(screen.getByTestId('review-source-file')).toHaveTextContent('review.wav');
+    expect(audio.getAttribute('src')).toBe(exactAudio.src);
+    expect(audio.currentTime).toBe(exactAudio.time);
+    expect(audio.paused).toBe(exactAudio.paused);
+    expect(document.activeElement).toBe(exactFocus);
+  });
+
+  it.each(['NO_PLAYBACK_EVIDENCE', 'PLAYBACK_EVIDENCE_CHANGED'])(
+    'retires commit-time %s authority and requires a fresh listen plus operation',
+    async (code) => {
+      const full = segment();
+      mocks.getSegmentsPage.mockResolvedValue({
+        items: [{ ...full, alignmentJson: null, evidenceJson: null }],
+        total: 1,
+        nextCursor: null,
+        revisions: { [full.id]: 0 },
+      });
+      mocks.getSegment.mockResolvedValue(full);
+      let issuance = 0;
+      mocks.beginDesktopPlaybackSessionV1.mockImplementation(
+        async (segmentId: string, _mediaGrantId: string, expectedRevision: number) => ({
+          playbackReceiptId: `receipt-commit-attempt-${++issuance}`,
+          segmentId,
+          segmentRevision: expectedRevision,
+          clipDurationMs: 1_000,
+          expiresAtMs: Date.now() + 60_000,
+        }),
+      );
+      mocks.recordPlaybackReceipt.mockImplementation(
+        async (request: { playbackReceiptId: string }) => ({
+          playbackReceiptId: request.playbackReceiptId,
+          segmentId: full.id,
+          segmentRevision: 0,
+          uniquePlayedMs: 900,
+          clipDurationMs: 1_000,
+          coverageRatio: 0.9,
+        }),
+      );
+      mocks.commitReviewV1.mockRejectedValueOnce({
+        schema: 1,
+        code,
+        message: 'private backend detail',
+        retryable: true,
+        suggestedAction: 'reloadClip',
+      });
+
+      render(ReviewMode);
+      expect(await screen.findByTestId('review-action-bar')).toBeInTheDocument();
+      await hearCurrentAudio();
+      const accept = screen.getByRole('button', { name: new RegExp(ckb['review.acceptAsIs']) });
+      await fireEvent.click(accept);
+      await waitFor(() => expect(mocks.commitReviewV1).toHaveBeenCalledTimes(1));
+      const first = mocks.commitReviewV1.mock.calls[0][0];
+      await waitFor(() => expect(mocks.beginDesktopPlaybackSessionV1).toHaveBeenCalledTimes(2));
+
+      await hearCurrentAudio();
+      await fireEvent.click(accept);
+      await waitFor(() => expect(mocks.commitReviewV1).toHaveBeenCalledTimes(2));
+      const second = mocks.commitReviewV1.mock.calls[1][0];
+      expect(second.operationId).not.toBe(first.operationId);
+      expect(second.playbackReceiptId).not.toBe(first.playbackReceiptId);
+      expect(mocks.recordPlaybackReceipt).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it.each(['PLAYBACK_EVIDENCE_CHANGED'])(
     'retires a proven non-commit %s and succeeds only after a fresh grant/session listen',
     async (code) => {
       const full = segment();
@@ -1151,10 +2257,7 @@ describe('ReviewMode windowed queue', () => {
         .mockRejectedValueOnce({
           schema: 1,
           code,
-          message:
-            code === 'PLAYBACK_SESSION_EXPIRED'
-              ? 'the 30-minute session expired'
-              : 'the source or grant changed',
+          message: 'the source or grant changed',
           retryable: true,
           suggestedAction: 'reloadClip',
         })
@@ -1189,7 +2292,7 @@ describe('ReviewMode windowed queue', () => {
     },
   );
 
-  it('never copies a saved clip into another editor when navigation wins the decision race', async () => {
+  it('freezes navigation during a truth write and advances only from the authoritative reload', async () => {
     const first = segment();
     const second: SpeechSegment = {
       ...segment(),
@@ -1232,13 +2335,15 @@ describe('ReviewMode windowed queue', () => {
       ),
     );
 
-    // Keyboard navigation remains available while the slow decision call is in flight.
+    // A truth write owns renderer-wide selection authority until the backend outcome and every
+    // projection have settled. A shortcut cannot move the editor underneath that immutable intent.
     await fireEvent.keyDown(window, { key: 'ArrowRight', code: 'ArrowRight' });
-    await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue(second.rawTranscript));
+    expect(screen.getByRole('textbox')).toHaveValue(first.rawTranscript);
 
     resolveDecision(decisionCommit(first, 'accept', first.rawTranscript));
     await waitFor(() => expect(mocks.updateSegmentMetadataV1).not.toHaveBeenCalled());
-    expect(screen.getByRole('textbox')).toHaveValue(second.rawTranscript);
+    await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue(second.rawTranscript));
+    expect(screen.getByTestId('review-source-file')).toHaveTextContent('review-2.wav');
   });
 
   it('keeps navigation drafts in session memory and never persists them without a decision', async () => {
@@ -1316,7 +2421,7 @@ describe('ReviewMode windowed queue', () => {
     await waitFor(() => expect(mocks.getSegment).toHaveBeenCalledTimes(2));
   });
   it('falls through a BLANK annotated column to the champion raw draft', async () => {
-    // VERBATIM LAW precedence is human ▸ annotated ▸ raw, and a blank annotated column is ABSENT.
+    // Verbatim review precedence is human annotation ▸ champion raw, and blank optionals are ABSENT.
     // `??` only falls through on null, so a whitespace-only annotated row masked the champion draft
     // and opened an EMPTY editor — the reviewer then retypes (or accepts) text nobody drafted.
     // Fail-before: the editor holds '   ' here.
@@ -1333,8 +2438,30 @@ describe('ReviewMode windowed queue', () => {
     expect(screen.getByRole('textbox')).toHaveValue(blank.rawTranscript);
   });
 
-  it('still prefers a real annotated (human) transcript over the raw draft', async () => {
-    const annotated = { ...segment(), annotatedTranscript: 'دەقی مرۆیی' };
+  it('does not let a durable machine refinement replace the champion raw review draft', async () => {
+    const refined = {
+      ...segment(),
+      rawTranscript: 'دەقی خامی چەمپیۆن',
+      normalizedTranscript: 'دەقی کۆتایی ڕێکخراو',
+    };
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [{ ...refined, alignmentJson: null, evidenceJson: null }],
+      total: 1,
+      nextCursor: null,
+    });
+    mocks.getSegment.mockResolvedValue(refined);
+
+    render(ReviewMode);
+    expect(await screen.findByTestId('review-action-bar')).toBeInTheDocument();
+    expect(screen.getByRole('textbox')).toHaveValue(refined.rawTranscript);
+  });
+
+  it('still prefers a real annotated human transcript over every machine projection', async () => {
+    const annotated = {
+      ...segment(),
+      normalizedTranscript: 'دەقی کۆتایی ماشین',
+      annotatedTranscript: 'دەقی مرۆیی',
+    };
     mocks.getSegmentsPage.mockResolvedValue({
       items: [{ ...annotated, alignmentJson: null, evidenceJson: null }],
       total: 1,
@@ -1375,7 +2502,7 @@ describe('ReviewMode windowed queue', () => {
     expect(mocks.updateSegmentMetadataV1).not.toHaveBeenCalled();
   });
 
-  it('requires an explicit technical reason, retains the clip on failure, and advances only after a verified unusable commit', async () => {
+  it('requires an explicit technical reason, retains the clip on a definitive failure, and advances only after a verified unusable commit', async () => {
     const failed = {
       ...segment(),
       id: 'unplayable-1',
@@ -1400,19 +2527,31 @@ describe('ReviewMode windowed queue', () => {
       return { id: NEXT_MEDIA_GRANT_ID };
     });
     mocks.markSegmentUnusableV1
-      .mockRejectedValueOnce(new Error('transport response lost'))
-      .mockResolvedValueOnce({
-        segmentId: 'wrong-segment',
-        committedRevision: 5,
-        reason: 'missingFile',
-        effectId: 'flag-effect:202',
+      .mockRejectedValueOnce({
+        schema: 1,
+        code: 'WRITE_REJECTED',
+        message: 'the backend proved no write occurred',
+        retryable: true,
       })
-      .mockImplementationOnce(async (request) => ({
-        segmentId: request.segmentId,
-        committedRevision: request.baseRevision + 1,
-        reason: request.reason,
-        effectId: 'flag-effect:202',
-      }));
+      .mockImplementationOnce(async (request) => {
+        removedReviewSegmentIds.add(request.segmentId);
+        undoAvailability = {
+          status: 'available',
+          target: technicalFlagUndoTarget(
+            request.segmentId,
+            request.operationId,
+            request.baseRevision,
+            request.reason,
+            202,
+          ),
+        };
+        return {
+          segmentId: request.segmentId,
+          committedRevision: request.baseRevision + 1,
+          reason: request.reason,
+          effectId: 'flag-effect:202',
+        };
+      });
 
     render(ReviewMode);
     expect(await screen.findByTestId('review-technical-unusable')).toBeInTheDocument();
@@ -1425,15 +2564,30 @@ describe('ReviewMode windowed queue', () => {
     await fireEvent.keyDown(reason, { key: 'ArrowDown', code: 'ArrowDown' });
     expect(screen.getByTestId('review-source-file')).toHaveTextContent('gone.wav');
     await fireEvent.change(reason, { target: { value: 'missingFile' } });
-    // A technical disposition clears the revision-bound draft atomically. It must not silently erase
-    // a visible correction: the reviewer explicitly resets it before the action becomes available.
+    // A technical disposition preserves revision-bound drafts. A visible correction still requires
+    // explicit reset here so the reviewer cannot accidentally classify a clip while editing it.
     expect(mark).toBeDisabled();
     expect(mark).toHaveAttribute(
       'aria-describedby',
       'review-unusable-help review-reject-disabled-reason',
     );
     await fireEvent.click(screen.getByRole('button', { name: ckb['review.reset'] }));
-    expect(mark).toBeEnabled();
+    const resetConfirmation = get(showConfirmDialog);
+    expect(resetConfirmation).toMatchObject({
+      title: ckb['review.resetConfirmTitle'],
+      message: ckb['review.resetConfirmMessage'],
+      confirmLabel: ckb['review.resetConfirmAction'],
+      danger: true,
+    });
+    expect(mark).toBeDisabled();
+    expect(mocks.deleteReviewDraftV1).not.toHaveBeenCalled();
+    showConfirmDialog.set(null);
+    await resetConfirmation?.onConfirm();
+    await waitFor(() => expect(mark).toBeEnabled());
+    expect(editor).toHaveValue(failed.rawTranscript);
+    // The edit never reached its debounce deadline, so the coordinator proves the already-durable
+    // no-draft baseline locally instead of issuing a redundant native deletion.
+    expect(mocks.deleteReviewDraftV1).not.toHaveBeenCalled();
 
     mark.focus();
     await fireEvent.click(mark);
@@ -1444,18 +2598,11 @@ describe('ReviewMode windowed queue', () => {
     expect(mocks.recordPlaybackReceipt).not.toHaveBeenCalled();
     expect(mocks.commitReviewV1).not.toHaveBeenCalled();
 
-    await fireEvent.click(mark);
-    await waitFor(() => expect(mocks.markSegmentUnusableV1).toHaveBeenCalledTimes(2));
-    expect(editor).toHaveValue(failed.rawTranscript);
-    expect(document.activeElement).toBe(mark);
-    expect(screen.getByTestId('review-source-file')).toHaveTextContent('gone.wav');
-
     mocks.saveReviewDraftV1.mockClear();
     await fireEvent.click(mark);
-    await waitFor(() => expect(mocks.markSegmentUnusableV1).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(mocks.markSegmentUnusableV1).toHaveBeenCalledTimes(2));
     const first = mocks.markSegmentUnusableV1.mock.calls[0][0];
     const replay = mocks.markSegmentUnusableV1.mock.calls[1][0];
-    const verifiedRetry = mocks.markSegmentUnusableV1.mock.calls[2][0];
     expect(first).toEqual({
       operationId: expect.stringMatching(
         /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
@@ -1465,10 +2612,96 @@ describe('ReviewMode windowed queue', () => {
       reason: 'missingFile',
     });
     expect(replay).toEqual(first);
-    expect(verifiedRetry).toEqual(first);
     await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue(next.rawTranscript));
     expect(screen.getByTestId('review-source-file')).toHaveTextContent('next.wav');
     await new Promise((resolve) => setTimeout(resolve, 550));
     expect(mocks.saveReviewDraftV1).not.toHaveBeenCalled();
   });
+
+  it.each(['STALE_REVISION', 'HUMAN_TRUTH_ALREADY_COMMITTED', 'SEGMENT_NOT_FOUND'])(
+    'reloads %s technical-unusable authority and retries with the new revision and a new operation identity',
+    async (refusalCode) => {
+      const failed = {
+        ...segment(),
+        id: 'unplayable-stale-1',
+        audioPath: 'C:\\audio\\stale-gone.wav',
+        rawTranscript: 'ڕەشنووسی پارێزراو',
+      };
+      const next = {
+        ...segment(),
+        id: 'unplayable-stale-next-2',
+        audioPath: 'C:\\audio\\stale-next.wav',
+        rawTranscript: 'پارچەی دواتر',
+      };
+      let failedRevision = 4;
+      mocks.getSegmentsPage.mockImplementation(async () => ({
+        items: [failed, next],
+        total: 2,
+        nextCursor: null,
+        revisions: { [failed.id]: failedRevision, [next.id]: 9 },
+      }));
+      mocks.getSegment.mockImplementation(async (id: string) => (id === failed.id ? failed : next));
+      mocks.registerReviewMediaAsset.mockImplementation(async (path: string) => {
+        if (path === failed.audioPath) throw new Error('file missing');
+        return { id: NEXT_MEDIA_GRANT_ID };
+      });
+      mocks.markSegmentUnusableV1
+        .mockImplementationOnce(async () => {
+          failedRevision = 5;
+          throw {
+            schema: 1,
+            code: refusalCode,
+            message: 'This clip changed; reload it before marking it unusable.',
+            retryable: false,
+            suggestedAction: 'reloadClip',
+            details: { expectedRevision: 4, currentRevision: 5 },
+          };
+        })
+        .mockImplementationOnce(async (request) => {
+          removedReviewSegmentIds.add(request.segmentId);
+          undoAvailability = {
+            status: 'available',
+            target: technicalFlagUndoTarget(
+              request.segmentId,
+              request.operationId,
+              request.baseRevision,
+              request.reason,
+              203,
+            ),
+          };
+          return {
+            segmentId: request.segmentId,
+            committedRevision: request.baseRevision + 1,
+            reason: request.reason,
+            effectId: 'flag-effect:203',
+          };
+        });
+
+      render(ReviewMode);
+      expect(await screen.findByTestId('review-technical-unusable')).toBeInTheDocument();
+      await fireEvent.change(screen.getByLabelText(ckb['review.unusable.reasonLabel']), {
+        target: { value: 'missingFile' },
+      });
+      await fireEvent.click(screen.getByRole('button', { name: ckb['review.unusable.mark'] }));
+
+      await waitFor(() => expect(mocks.getSegmentsPage).toHaveBeenCalledTimes(2));
+      await waitFor(() =>
+        expect(screen.getByTestId('review-source-file')).toHaveTextContent('stale-gone.wav'),
+      );
+      expect(sharedDurableReviewUndo.state.truthWriteAmbiguous).toBe(false);
+
+      await fireEvent.change(screen.getByLabelText(ckb['review.unusable.reasonLabel']), {
+        target: { value: 'missingFile' },
+      });
+      await fireEvent.click(screen.getByRole('button', { name: ckb['review.unusable.mark'] }));
+
+      await waitFor(() => expect(mocks.markSegmentUnusableV1).toHaveBeenCalledTimes(2));
+      const first = mocks.markSegmentUnusableV1.mock.calls[0][0];
+      const retry = mocks.markSegmentUnusableV1.mock.calls[1][0];
+      expect(first).toMatchObject({ segmentId: failed.id, baseRevision: 4, reason: 'missingFile' });
+      expect(retry).toMatchObject({ segmentId: failed.id, baseRevision: 5, reason: 'missingFile' });
+      expect(retry.operationId).not.toBe(first.operationId);
+      await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue(next.rawTranscript));
+    },
+  );
 });

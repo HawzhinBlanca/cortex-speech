@@ -66,10 +66,9 @@ function blockedAgentReportFixture() {
     agentRunId: 'run-blocked-1',
     source: 'file',
     status: 'completed',
-    audioPaths: ['C:\\audio\\long.wav'],
-    segmentIds: ['seg-1'],
     summary: {
       totalSegments: 1,
+      agenticReadiness: null,
       sourceReferences: [],
       sourceReferenceRequired: false,
       requiredSourceReferenceModels: [],
@@ -94,14 +93,12 @@ function blockedAgentReportFixture() {
         {
           stage: 'dataset_promotion',
           status: 'blocked',
-          summary: '1 training-ready machine segment still lacks multi-model coverage.',
+          detailCode: 'blocked',
           blockerCount: 1,
-          blockers: ['seg-1'],
         },
       ],
     },
-    juryReport: null,
-    error: null,
+    errorCode: null,
     createdAt: '2026-06-16T12:00:00Z',
   };
 }
@@ -200,12 +197,10 @@ describe('App desktop runtime guard', () => {
     const hfExport = await screen.findByTestId('hf-export-btn');
 
     await waitFor(() =>
-      expect(hfExport).toHaveAttribute(
-        'title',
-        expect.stringContaining(
-          '1 training-ready machine segment still lacks multi-model coverage.',
-        ),
-      ),
+      expect(hfExport).toHaveAttribute('title', expect.stringContaining('1 blocker(s)')),
+    );
+    expect(hfExport.getAttribute('title')).not.toContain(
+      'training-ready machine segment still lacks multi-model coverage',
     );
     expect(invokeMock).toHaveBeenCalledWith('list_agent_stage_events', {
       runId: 'run-blocked-1',

@@ -841,6 +841,27 @@ mod tests {
     const TEST_CHAMPION: &str = "omniasr-7b-pool-export-test";
     const RAW: &str = "دەقی چامپیۆن";
 
+    fn rollback_fixture_to(db: &Database, target_version: i64) {
+        let expected = crate::migrations::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > target_version)
+            .rev()
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>();
+        assert_eq!(crate::migrations::rollback(db, expected.len()).unwrap(), expected);
+        assert_eq!(crate::migrations::get_current_version(db).unwrap(), target_version);
+    }
+
+    fn upgrade_fixture_from(db: &Database, source_version: i64) {
+        let expected = crate::migrations::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > source_version)
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>();
+        assert_eq!(crate::migrations::run_migrations(db).unwrap(), expected);
+        assert_eq!(crate::migrations::get_current_version(db).unwrap(), crate::migrations::max_supported_version());
+    }
+
     fn write_master(path: &Path, milliseconds: usize, seed: usize) {
         let spec = hound::WavSpec {
             channels: 1,
@@ -922,7 +943,7 @@ mod tests {
         )
         .unwrap();
         db.connection().execute("UPDATE model_versions SET status='champion' WHERE id=?1", [TEST_CHAMPION]).unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        rollback_fixture_to(&db, 59);
         let mut duplicate_segment = reviewed_segment("duplicate", &duplicate_master, 500, 1_500, false);
         duplicate_segment.annotated_transcript = None;
         duplicate_segment.verdict = None;
@@ -941,7 +962,7 @@ mod tests {
                 .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id=?2", [audio_hash, &segment.id])
                 .unwrap();
         }
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        upgrade_fixture_from(&db, 59);
         let pool = review_pool::activate(
             &db,
             "123e4567-e89b-42d3-a456-426614174070",

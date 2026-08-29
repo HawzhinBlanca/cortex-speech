@@ -51,8 +51,8 @@ import uuid
 from dataclasses import asdict, dataclass
 from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Callable, Iterator, Sequence
+from pathlib import Path, PurePosixPath
+from typing import Callable, Iterator, NoReturn, Sequence
 
 _VERIFY_SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _VERIFY_SCRIPT_DIR not in sys.path:
@@ -110,39 +110,296 @@ ACTIVE_RELEASE_POINTER = "active-private-production-release.json"
 _RUNTIME_EXE_CONFIGURED = False
 _RUNTIME_EXE_ERROR = None
 _WINDOWS_RELEASE_AUTHORITY: dict[str, object] | None = None
+_STAGED_OWNER_CANDIDATE_AUTHORITY: dict[str, object] | None = None
 _ACTIVE_WORKER_PROFILE: str | None = None
 _ACTIVE_WORKER_RUN_TOKEN: str | None = None
 
 
-def validate_active_release_runtime(manifest, release_root):
-    """Return the exact immutable app binary, or fail closed on pointer/hash/SHA drift."""
-    if not isinstance(manifest, dict) or manifest.get("schema") != 1:
-        raise ValueError("active release pointer is not a schema-1 object")
-    directory_value = manifest.get("directory")
-    exe_value = manifest.get("appExe")
-    expected_hash = manifest.get("appSha256")
-    expected_git_sha = manifest.get("appGitSha")
-    if not all(isinstance(value, str) and value for value in (directory_value, exe_value, expected_hash, expected_git_sha)):
-        raise ValueError("active release pointer lacks app path/hash/git authority")
-    if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
-        raise ValueError("active release app hash is not canonical SHA-256")
-    if not re.fullmatch(r"[0-9a-f]{40}", expected_git_sha):
-        raise ValueError("active release app git SHA is not canonical")
+def _is_exact_integer(value: object, expected: int) -> bool:
+    """Reject Python's bool-as-int alias at every integer-valued proof boundary."""
 
+    return isinstance(value, int) and not isinstance(value, bool) and value == expected
+
+
+def _private_production_release_module():
+    """Load the checked-in release validator without copying its security contract here."""
+
+    name = "cortex_verify10_private_production_release"
+    existing = sys.modules.get(name)
+    if existing is not None:
+        return existing
+    source = APP / "scripts" / "release_private_production.py"
+    spec = importlib.util.spec_from_file_location(name, source)
+    if spec is None or spec.loader is None:
+        raise EvidenceError("private-production release validator cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def _stable_file_identity(path: Path, label: str) -> tuple[str, int, bytes]:
+    """Hash one regular non-symlink file while detecting replacement during the read."""
+
+    if path.is_symlink():
+        raise ValueError(f"{label} must not be a symlink")
+    resolved = path.resolve(strict=True)
+    if not resolved.is_file():
+        raise ValueError(f"{label} is not a regular file")
+    digest = hashlib.sha256()
+    payload = bytearray()
+    with resolved.open("rb") as handle:
+        opened = os.fstat(handle.fileno())
+        while block := handle.read(1024 * 1024):
+            digest.update(block)
+            payload.extend(block)
+        closed = os.fstat(handle.fileno())
+    current = resolved.stat()
+    opened_identity = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+    current_identity = (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+    if opened_identity != (
+        closed.st_dev,
+        closed.st_ino,
+        closed.st_size,
+        closed.st_mtime_ns,
+    ) or opened_identity != current_identity:
+        raise ValueError(f"{label} changed while its identity was being captured")
+    if opened.st_size <= 0:
+        raise ValueError(f"{label} is empty")
+    return digest.hexdigest(), opened.st_size, bytes(payload)
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def _strict_release_artifact_path(
+    value: object,
+    expected: Path,
+    directory: Path,
+    label: str,
+) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"release manifest {label} path is missing")
+    supplied = Path(value)
+    if not supplied.is_absolute() or ".." in supplied.parts or supplied.is_symlink():
+        raise ValueError(f"release manifest {label} path is not canonical")
+    resolved = supplied.resolve(strict=True)
+    if resolved != expected or resolved.parent != expected.parent:
+        raise ValueError(f"release manifest {label} path is not the exact staged artifact")
+    try:
+        resolved.relative_to(directory)
+    except ValueError as error:
+        raise ValueError(f"release manifest {label} escapes its immutable release directory") from error
+    return resolved
+
+
+def _validated_private_release_manifest(
+    manifest: object,
+    release_root: Path,
+    *,
+    expected_sha: str | None = None,
+) -> tuple[dict[str, object], Path, dict[str, object]]:
+    """Validate one exact schema-69 release and derive its immutable candidate identity."""
+
+    release = _private_production_release_module()
+    if not isinstance(manifest, dict):
+        raise ValueError("private-production release manifest is not an object")
     root = Path(release_root).resolve(strict=True)
-    directory = Path(directory_value).resolve(strict=True)
-    exe = Path(exe_value).resolve(strict=True)
-    if directory.parent != root or exe.parent != directory or exe.name.casefold() != "cortex-speech-app.exe":
-        raise ValueError("active release app path escapes its immutable release directory")
-    blob = exe.read_bytes()
-    actual_hash = hashlib.sha256(blob).hexdigest()
-    if actual_hash != expected_hash:
-        raise ValueError(f"active release app hash drifted ({actual_hash[:12]}… != {expected_hash[:12]}…)")
-    marker = re.search(rb"CORTEX_BUILD_SHA:([0-9a-fA-F]{7,40}|unknown)", blob)
-    baked_sha = marker.group(1).decode("ascii").casefold() if marker else None
-    if baked_sha is None or not (expected_git_sha.startswith(baked_sha) or baked_sha.startswith(expected_git_sha)):
-        raise ValueError("active release app binary does not carry its manifest git SHA")
-    return exe
+    try:
+        release.validate_manifest(manifest, expected_root=root)
+    except Exception as error:  # canonical validator exposes its own typed ReleaseError
+        raise ValueError(f"private-production release manifest is invalid: {error}") from error
+
+    if not _is_exact_integer(manifest.get("schema"), 2) or not _is_exact_integer(
+        manifest.get("expectedDatabaseSchema"), 69
+    ):
+        raise ValueError("private-production release is not the exact schema-2/schema-69 contract")
+    source_sha = manifest.get("appGitSha")
+    if not isinstance(source_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", source_sha):
+        raise ValueError("private-production release source SHA is not canonical")
+    if expected_sha is not None and source_sha != expected_sha:
+        raise ValueError("private-production release belongs to another Git commit")
+
+    directory = Path(str(manifest["directory"])).resolve(strict=True)
+    if directory.parent != root or directory.is_symlink():
+        raise ValueError("private-production release directory is not a direct immutable-root child")
+    if str(Path(str(manifest["directory"]))) != str(directory):
+        raise ValueError("private-production release directory path is not canonical")
+    release_id = manifest.get("releaseId")
+    if not isinstance(release_id, str) or directory.name != release_id:
+        raise ValueError("private-production release ID does not match its directory")
+
+    expected_paths = {
+        "appExe": directory / "cortex-speech-app.exe",
+        "poolAdminExe": directory / "pool_admin.exe",
+        "watchdogScript": directory / "scripts" / "ops" / "cortex-watchdog.ps1",
+        "dedupManifest": directory / str(release.DEDUP_MANIFEST_FILE),
+        "schemaContract": directory / str(release.SCHEMA_CONTRACT_RELATIVE_PATH),
+    }
+    resolved_paths = {
+        field: _strict_release_artifact_path(manifest.get(field), expected, directory, field)
+        for field, expected in expected_paths.items()
+    }
+
+    app_sha, app_bytes, baked_sha = _binary_identity(resolved_paths["appExe"])
+    if app_sha != manifest.get("appSha256"):
+        raise ValueError("private-production application executable hash drifted")
+    if baked_sha != source_sha:
+        raise ValueError("private-production application executable does not embed the exact full Git SHA")
+
+    pool_sha, pool_bytes, _ = _binary_identity(resolved_paths["poolAdminExe"])
+    watchdog_sha, watchdog_bytes, _ = _binary_identity(resolved_paths["watchdogScript"])
+    dedup_file_sha, dedup_bytes, _ = _binary_identity(resolved_paths["dedupManifest"])
+    contract_sha, contract_bytes, _ = _binary_identity(resolved_paths["schemaContract"])
+    if pool_sha != manifest.get("poolAdminSha256"):
+        raise ValueError("private-production pool-admin executable hash drifted")
+    if watchdog_sha != manifest.get("watchdogSha256"):
+        raise ValueError("private-production watchdog hash drifted")
+    if contract_sha != manifest.get("schemaContractSha256"):
+        raise ValueError("private-production schema-contract hash drifted")
+    operations_sha = release.operations_bundle_sha256(directory)
+    if operations_sha != manifest.get("operationsSha256"):
+        raise ValueError("private-production operations bundle hash drifted")
+
+    expected_release_id = (
+        f"{source_sha[:12]}-{app_sha[:12]}-{operations_sha[:12]}-"
+        f"{contract_sha[:12]}-{str(manifest['dedupManifestSha256'])[:12]}"
+    )
+    if release_id != expected_release_id:
+        raise ValueError("private-production release ID is not derived from its exact authorities")
+    candidate = {
+        "schema": 1,
+        "type": "StagedOwnerCandidateAuthorityV1",
+        "phase": "pre-deployment",
+        "certificationEligible": False,
+        "releaseId": release_id,
+        "manifestRelativePath": f"{release_id}/{release.RELEASE_MANIFEST_FILE}",
+        "sourceGitSha": source_sha,
+        "expectedDatabaseSchema": 69,
+        "schemaContractId": manifest.get("schemaContractId"),
+        "artifacts": {
+            "applicationExecutable": {
+                "relativePath": "cortex-speech-app.exe",
+                "sha256": app_sha,
+                "bytes": app_bytes,
+                "buildGitSha": baked_sha,
+            },
+            "poolAdminExecutable": {
+                "relativePath": "pool_admin.exe",
+                "sha256": pool_sha,
+                "bytes": pool_bytes,
+            },
+            "watchdogScript": {
+                "relativePath": "scripts/ops/cortex-watchdog.ps1",
+                "sha256": watchdog_sha,
+                "bytes": watchdog_bytes,
+            },
+            "operationsBundle": {
+                "relativePath": ".",
+                "sha256": operations_sha,
+            },
+            "dedupManifest": {
+                "relativePath": str(release.DEDUP_MANIFEST_FILE),
+                "declaredSha256": manifest.get("dedupManifestSha256"),
+                "fileSha256": dedup_file_sha,
+                "bytes": dedup_bytes,
+            },
+            "schemaContract": {
+                "relativePath": str(release.SCHEMA_CONTRACT_RELATIVE_PATH),
+                "id": manifest.get("schemaContractId"),
+                "sha256": contract_sha,
+                "bytes": contract_bytes,
+            },
+        },
+    }
+    return manifest, resolved_paths["appExe"], candidate
+
+
+def validate_active_release_runtime(
+    manifest: object,
+    release_root: Path,
+    *,
+    expected_sha: str | None = None,
+) -> Path:
+    """Return the exact schema-69 active app binary, or fail closed on any release drift."""
+
+    validated, executable, _candidate = _validated_private_release_manifest(
+        manifest,
+        release_root,
+        expected_sha=expected_sha,
+    )
+    directory = Path(str(validated["directory"])).resolve(strict=True)
+    sealed_manifest = directory / "release-manifest.json"
+    if sealed_manifest.is_symlink():
+        raise ValueError("active release manifest must not be a symlink")
+    sealed_value = _load_json_without_duplicate_keys(sealed_manifest)
+    if sealed_value != validated:
+        raise ValueError("active release pointer differs from its sealed release manifest")
+    return executable
+
+
+def validate_staged_owner_candidate_manifest(
+    manifest_path: Path,
+    *,
+    expected_sha: str,
+    release_root: Path | None = None,
+) -> dict[str, object]:
+    """Measure a staged release manifest that can authorize only pre-deployment proof."""
+
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_sha):
+        raise EvidenceError("staged owner candidate requires the exact lowercase full Git SHA")
+    if release_root is None:
+        _appdata, localappdata = _canonical_live_data_roots()
+        release_root = localappdata / "CortexSpeech" / "private-production-releases"
+    root = Path(release_root).resolve(strict=True)
+    supplied = Path(manifest_path)
+    if supplied.is_symlink() or not supplied.is_absolute() or ".." in supplied.parts:
+        raise EvidenceError("staged candidate manifest path must be an absolute non-symlink path")
+    resolved = supplied.resolve(strict=True)
+    if str(supplied) != str(resolved):
+        raise EvidenceError("staged candidate manifest path must be canonical and alias-free")
+    if resolved.name != "release-manifest.json" or resolved.parent.parent != root:
+        raise EvidenceError("staged candidate manifest is outside the canonical release root")
+    manifest_sha, manifest_bytes, payload = _stable_file_identity(
+        resolved, "staged candidate release manifest"
+    )
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON number {token!r}")
+            ),
+        )
+    except (UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise EvidenceError(f"staged candidate release manifest is unreadable: {error}") from error
+    try:
+        _validated, _executable, candidate = _validated_private_release_manifest(
+            value,
+            root,
+            expected_sha=expected_sha,
+        )
+    except Exception as error:
+        raise EvidenceError(f"staged candidate release is invalid: {error}") from error
+    if Path(str(value["directory"])).resolve(strict=True) != resolved.parent:
+        raise EvidenceError("staged candidate manifest does not live in its release directory")
+    candidate = {
+        **candidate,
+        "manifestSha256": manifest_sha,
+        "manifestBytes": manifest_bytes,
+    }
+    _validate_staged_candidate_authority(candidate)
+    return candidate
 
 
 def configure_runtime_exe():
@@ -161,10 +418,12 @@ def configure_runtime_exe():
     if not pointer.is_file():
         return
     try:
-        manifest = json.loads(pointer.read_text(encoding="utf-8"))
+        manifest = _load_json_without_duplicate_keys(pointer)
+        if not isinstance(manifest, dict):
+            raise ValueError("active release pointer is not an object")
         release_root = Path(localappdata) / "CortexSpeech" / "private-production-releases"
         os.environ["CORTEX_APP_EXE"] = str(validate_active_release_runtime(manifest, release_root))
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+    except (EvidenceError, OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         _RUNTIME_EXE_ERROR = f"active immutable release pointer is invalid: {error}"
 
 
@@ -760,8 +1019,11 @@ def _probe_champion_7b():
     pointer = Path(appdata) / "cortex-speech" / "champion.json" if appdata else None
     if pointer and pointer.is_file():
         try:
-            pinned = _json.loads(pointer.read_text(encoding="utf-8"))["champions"]["omniasr-7b"]["deploymentSha256"]
-        except (ValueError, KeyError, OSError) as exc:
+            pointer_value = _load_json_without_duplicate_keys(pointer)
+            if not isinstance(pointer_value, dict):
+                raise ValueError("champion pointer is not an object")
+            pinned = pointer_value["champions"]["omniasr-7b"]["deploymentSha256"]
+        except (EvidenceError, ValueError, KeyError, OSError) as exc:
             return f"live champion.json is unreadable ({exc}) — cannot verify the served identity"
         served = reply.get("deploymentSha256")
         if served != pinned:
@@ -1269,6 +1531,20 @@ class GateStep:
     argv: tuple[str, ...]
 
 
+@dataclass
+class GateRunMetadata:
+    """Structured attempt authority returned by a gate worker.
+
+    Human-readable logs remain diagnostic evidence, but certification must not infer whether a
+    retry happened by scraping prose.  One worker invocation is always the first attempt; the only
+    supported retry is the explicitly non-certifying diagnostic re-run.
+    """
+
+    attempt_count: int = 1
+    retry_count: int = 0
+    retry_reasons: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True)
 class GateSpec:
     """The complete, hashable execution contract for one verifier gate.
@@ -1345,6 +1621,31 @@ def _command_steps(command: str) -> tuple[GateStep, ...]:
     return tuple(GateStep(_command_argv(part.strip())) for part in parts)
 
 
+EXTERNAL_REVIEW_GATE_IDS = frozenset(
+    {
+        # These gates prove the separately operated Couch/reviewer service.  They remain part of
+        # windows-product/full-charter, but cannot make a one-user local workstation verdict depend
+        # on remote links, paid-review queues, or a live reviewer campaign.  Owner-product retains
+        # the shared database/schema gates plus its real local review/champion/recovery workflows.
+        "spot-check-pool",
+        "reviewer-queues-live",
+        "review-compensation-readiness",
+        "review-mode-certification",
+        "reviewer-links-live",
+        "playback-enforcement-readiness",
+        "supervision-live",
+    }
+)
+OWNER_PRODUCT_EXCLUDED_GATE_IDS = EXTERNAL_REVIEW_GATE_IDS | frozenset(
+    {
+        # Remote repository administration protects a public release process; it is not runtime
+        # evidence for one exact local executable on the owner's PC. The clean-tree/full-SHA gates
+        # remain mandatory, and windows-product/full-charter still require branch protection.
+        "branch-protection",
+    }
+)
+
+
 def _profiles_for_gate(name: str, tier: int) -> frozenset[str]:
     # Every verdict, including model-only evidence, names one exact release commit.  A checkout
     # digest records dirty bytes for diagnostics but does not turn them into committed source.
@@ -1363,16 +1664,19 @@ def _profiles_for_gate(name: str, tier: int) -> frozenset[str]:
     }
     if name in model_gates:
         profiles.add(PROFILE_MODEL)
-    owner_product_gate = name not in model_gates or name in {
+    product_gate = name not in model_gates or name in {
+        "license-compat",
         "dataset-duplicates",
         "review-serving-provenance",
         "fuzz-smoke",
     }
-    if owner_product_gate:
+    if product_gate:
         # Windows certification is layered on the owner/core product, not an alternate shallow
         # profile.  The prior tier<=1 shortcut let a signed shell bypass database/review truth,
         # champion operation, and the durability/export kill drills entirely.
-        profiles.update({PROFILE_OWNER, PROFILE_WINDOWS})
+        profiles.add(PROFILE_WINDOWS)
+        if name not in OWNER_PRODUCT_EXCLUDED_GATE_IDS:
+            profiles.add(PROFILE_OWNER)
     return frozenset(profiles)
 
 
@@ -1461,6 +1765,7 @@ REDACTED_PATH_ENVIRONMENT = frozenset(
 
 LIVE_AUTHORITY_GATE_IDS = frozenset(
     {
+        "owner-workstation-health-live",
         "spot-check-pool",
         "dataset-duplicates",
         "snapshot-immutability",
@@ -1481,7 +1786,22 @@ LIVE_AUTHORITY_GATE_IDS = frozenset(
 
 AUTHORITY_MODE_LIVE = "windows-known-folders-live"
 AUTHORITY_MODE_DIAGNOSTIC = "diagnostic-caller-overrides"
-AUTHORITY_MODES = frozenset({AUTHORITY_MODE_LIVE, AUTHORITY_MODE_DIAGNOSTIC})
+AUTHORITY_MODE_STAGED_CANDIDATE = "staged-owner-candidate"
+AUTHORITY_MODES = frozenset(
+    {AUTHORITY_MODE_LIVE, AUTHORITY_MODE_DIAGNOSTIC, AUTHORITY_MODE_STAGED_CANDIDATE}
+)
+RELEASE_PHASE_ROUTINE = "routine"
+RELEASE_PHASE_PREDEPLOYMENT = "pre-deployment"
+RELEASE_PHASE_POSTDEPLOYMENT = "post-deployment"
+RELEASE_PHASE_POST_COLD_REBOOT = "post-cold-reboot"
+OWNER_RELEASE_PHASES = frozenset(
+    {
+        RELEASE_PHASE_ROUTINE,
+        RELEASE_PHASE_PREDEPLOYMENT,
+        RELEASE_PHASE_POSTDEPLOYMENT,
+        RELEASE_PHASE_POST_COLD_REBOOT,
+    }
+)
 RUN_AUTHORITY_NAME = "live-authority.json"
 ROAMING_APP_DATA_FOLDER_ID = "3eb685db-65f9-4cf6-a03a-e3ef65729f3d"
 LOCAL_APP_DATA_FOLDER_ID = "f1b32785-6fba-4fcf-9d55-7b8e7f157091"
@@ -1529,6 +1849,12 @@ GATE_ENVIRONMENT_BY_ID: dict[str, tuple[str, ...]] = {
         "CORTEX_HEARTBEAT_MAX_MS",
     ),
     "jobs-runtime": ("CORTEX_APP_EXE", "CORTEX_DEBUG_PORT"),
+    # ``check_exe_freshness.py`` reads this exact environment variable. In live mode the
+    # verifier strips it so the immutable active pointer remains authoritative; staged-candidate
+    # mode installs only the manifest-validated candidate path, allowing the pre-deployment run to
+    # measure the binary it actually names instead of silently falling back to the repo build.
+    "exe-freshness": ("CORTEX_APP_EXE",),
+    "playback-enforcement-readiness": ("CORTEX_APP_EXE",),
     # This is a verifier-owned fail-closed switch, never a caller preference. Without it the
     # ignored Rust preflight reports a missing live champion as a successful skipped test.
     "champion-7b-preflight": ("CORTEX_REQUIRE_7B",),
@@ -1543,6 +1869,14 @@ GATE_ARTIFACT_REQUIREMENTS_BY_ID: dict[str, tuple[str, ...]] = {
     "known-defect-ledger-evidence": ("known-defect-ledger.json",),
     "timeout-calibration-evidence": ("timeout-calibration-baselines.json",),
     "verifier-fault-campaign-evidence": ("verifier-fault-campaigns.json",),
+    "coverage-and-mutation-evidence": ("coverage-and-mutation-thresholds.json",),
+    "schema-clone-and-restore-evidence": ("schema-clone-and-restore-campaign.json",),
+    "concurrency-performance-memory-evidence": (
+        "concurrency-performance-and-memory-campaign.json",
+    ),
+    "owner-workflow-recovery-evidence": ("owner-workflow-and-recovery-campaign.json",),
+    "owner-deployment-reboot-evidence": ("owner-deployment-reboot-runs.json",),
+    "owner-field-sessions-evidence": ("owner-field-sessions.json",),
 }
 
 RUST_COVERAGE_ENVIRONMENT_ALLOWLIST = GATE_BASE_ENVIRONMENT
@@ -1604,18 +1938,190 @@ def _redacted_path_digest(path: Path) -> str:
     return hashlib.sha256(normalized).hexdigest()
 
 
+def _canonical_json_bytes(value: object) -> bytes:
+    """Canonical JSON that preserves JSON number/boolean type distinctions."""
+
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _json_values_exact(left: object, right: object) -> bool:
+    try:
+        return _canonical_json_bytes(left) == _canonical_json_bytes(right)
+    except (TypeError, ValueError):
+        return False
+
+
 def _document_digest(document: dict[str, object]) -> str:
-    canonical = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    canonical = _canonical_json_bytes(document)
     return hashlib.sha256(canonical).hexdigest()
+
+
+def _validate_staged_candidate_authority(value: object) -> dict[str, object]:
+    expected_fields = {
+        "schema",
+        "type",
+        "phase",
+        "certificationEligible",
+        "releaseId",
+        "manifestRelativePath",
+        "manifestSha256",
+        "manifestBytes",
+        "sourceGitSha",
+        "expectedDatabaseSchema",
+        "schemaContractId",
+        "artifacts",
+    }
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise EvidenceError("staged candidate authority has a non-canonical envelope")
+    release_id = value.get("releaseId")
+    source_sha = value.get("sourceGitSha")
+    manifest_sha = value.get("manifestSha256")
+    manifest_bytes = value.get("manifestBytes")
+    if (
+        not _is_exact_integer(value.get("schema"), 1)
+        or value.get("type") != "StagedOwnerCandidateAuthorityV1"
+        or value.get("phase") != RELEASE_PHASE_PREDEPLOYMENT
+        or value.get("certificationEligible") is not False
+        or not isinstance(release_id, str)
+        or not re.fullmatch(r"[0-9a-f]{12}(?:-[0-9a-f]{12}){4}", release_id)
+        or not isinstance(source_sha, str)
+        or not re.fullmatch(r"[0-9a-f]{40}", source_sha)
+        or not isinstance(manifest_sha, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", manifest_sha)
+        or not isinstance(manifest_bytes, int)
+        or isinstance(manifest_bytes, bool)
+        or manifest_bytes <= 0
+        or not _is_exact_integer(value.get("expectedDatabaseSchema"), 69)
+        or value.get("schemaContractId")
+        != "cortex-private-production-schema-65-to-69-v1"
+        or value.get("manifestRelativePath")
+        != f"{release_id}/release-manifest.json"
+    ):
+        raise EvidenceError("staged candidate authority has an invalid release identity")
+    artifacts = value.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != {
+        "applicationExecutable",
+        "poolAdminExecutable",
+        "watchdogScript",
+        "operationsBundle",
+        "dedupManifest",
+        "schemaContract",
+    }:
+        raise EvidenceError("staged candidate authority has an incomplete artifact inventory")
+
+    expected_simple = {
+        "applicationExecutable": ("cortex-speech-app.exe", True),
+        "poolAdminExecutable": ("pool_admin.exe", False),
+        "watchdogScript": ("scripts/ops/cortex-watchdog.ps1", False),
+    }
+    for role, (relative, carries_sha) in expected_simple.items():
+        artifact = artifacts.get(role)
+        fields = {"relativePath", "sha256", "bytes"} | ({"buildGitSha"} if carries_sha else set())
+        if (
+            not isinstance(artifact, dict)
+            or set(artifact) != fields
+            or artifact.get("relativePath") != relative
+            or not re.fullmatch(r"[0-9a-f]{64}", str(artifact.get("sha256", "")))
+            or not isinstance(artifact.get("bytes"), int)
+            or isinstance(artifact.get("bytes"), bool)
+            or int(artifact["bytes"]) <= 0
+            or (carries_sha and artifact.get("buildGitSha") != source_sha)
+        ):
+            raise EvidenceError(f"staged candidate {role} authority is malformed")
+    operations = artifacts.get("operationsBundle")
+    if (
+        not isinstance(operations, dict)
+        or set(operations) != {"relativePath", "sha256"}
+        or operations.get("relativePath") != "."
+        or not re.fullmatch(r"[0-9a-f]{64}", str(operations.get("sha256", "")))
+    ):
+        raise EvidenceError("staged candidate operations-bundle authority is malformed")
+    dedup = artifacts.get("dedupManifest")
+    if (
+        not isinstance(dedup, dict)
+        or set(dedup) != {"relativePath", "declaredSha256", "fileSha256", "bytes"}
+        or dedup.get("relativePath") != "review-pool-dedup-manifest.json"
+        or not re.fullmatch(r"[0-9a-f]{64}", str(dedup.get("declaredSha256", "")))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(dedup.get("fileSha256", "")))
+        or not isinstance(dedup.get("bytes"), int)
+        or isinstance(dedup.get("bytes"), bool)
+        or int(dedup["bytes"]) <= 0
+    ):
+        raise EvidenceError("staged candidate dedup-manifest authority is malformed")
+    contract = artifacts.get("schemaContract")
+    if (
+        not isinstance(contract, dict)
+        or set(contract) != {"relativePath", "id", "sha256", "bytes"}
+        or contract.get("relativePath") != "scripts/private_production_schema_contract.v1.json"
+        or contract.get("id") != value.get("schemaContractId")
+        or not re.fullmatch(r"[0-9a-f]{64}", str(contract.get("sha256", "")))
+        or not isinstance(contract.get("bytes"), int)
+        or isinstance(contract.get("bytes"), bool)
+        or int(contract["bytes"]) <= 0
+    ):
+        raise EvidenceError("staged candidate schema-contract authority is malformed")
+    expected_release_id = (
+        f"{source_sha[:12]}-{str(artifacts['applicationExecutable']['sha256'])[:12]}-"
+        f"{str(operations['sha256'])[:12]}-{str(contract['sha256'])[:12]}-"
+        f"{str(dedup['declaredSha256'])[:12]}"
+    )
+    if release_id != expected_release_id:
+        raise EvidenceError("staged candidate release ID does not match its bound authorities")
+    return value
+
+
+def _revalidate_staged_candidate_authority(
+    value: object,
+    *,
+    release_root: Path | None = None,
+) -> tuple[dict[str, object], Path]:
+    candidate = _validate_staged_candidate_authority(value)
+    if release_root is None:
+        _appdata, localappdata = _canonical_live_data_roots()
+        release_root = localappdata / "CortexSpeech" / "private-production-releases"
+    root = Path(release_root).resolve(strict=True)
+    manifest_path = root / str(candidate["manifestRelativePath"])
+    observed = validate_staged_owner_candidate_manifest(
+        manifest_path,
+        expected_sha=str(candidate["sourceGitSha"]),
+        release_root=root,
+    )
+    if observed != candidate:
+        raise EvidenceError("staged candidate changed after its verifier authority was captured")
+    app = root / str(candidate["releaseId"]) / str(
+        candidate["artifacts"]["applicationExecutable"]["relativePath"]
+    )
+    return candidate, app.resolve(strict=True)
 
 
 def _run_authority_document(
     *,
     diagnostic_overrides: bool,
     caller_environment: dict[str, str] | None = None,
+    staged_candidate: dict[str, object] | None = None,
+    release_phase: str = RELEASE_PHASE_ROUTINE,
 ) -> dict[str, object]:
     caller = dict(os.environ if caller_environment is None else caller_environment)
-    mode = AUTHORITY_MODE_DIAGNOSTIC if diagnostic_overrides else AUTHORITY_MODE_LIVE
+    if release_phase not in OWNER_RELEASE_PHASES:
+        raise EvidenceError(f"unknown owner release phase {release_phase!r}")
+    if staged_candidate is not None:
+        _validate_staged_candidate_authority(staged_candidate)
+        if diagnostic_overrides:
+            raise EvidenceError("staged candidate authority cannot be combined with diagnostic overrides")
+        if release_phase != RELEASE_PHASE_PREDEPLOYMENT:
+            raise EvidenceError("a staged candidate run must be the pre-deployment phase")
+        mode = AUTHORITY_MODE_STAGED_CANDIDATE
+    else:
+        if release_phase == RELEASE_PHASE_PREDEPLOYMENT:
+            raise EvidenceError("pre-deployment phase requires a staged candidate manifest")
+        if diagnostic_overrides and release_phase != RELEASE_PHASE_ROUTINE:
+            raise EvidenceError("diagnostic live authority cannot claim a deployment phase")
+        mode = AUTHORITY_MODE_DIAGNOSTIC if diagnostic_overrides else AUTHORITY_MODE_LIVE
     if diagnostic_overrides:
         appdata_value = caller.get("APPDATA")
         localappdata_value = caller.get("LOCALAPPDATA")
@@ -1649,10 +2155,12 @@ def _run_authority_document(
         and _redacted_path_digest(Path(observed)) != _redacted_path_digest(authoritative)
     )
     document: dict[str, object] = {
-        "schema": 1,
-        "type": "LiveAuthorityV1",
+        "schema": 2,
+        "type": "OwnerWorkstationRunAuthorityV2",
         "mode": mode,
-        "certificationEligible": not diagnostic_overrides,
+        "certificationEligible": mode == AUTHORITY_MODE_LIVE,
+        "releasePhase": release_phase,
+        "stagedCandidate": staged_candidate,
         "roots": {
             "roamingAppData": {
                 "source": root_source,
@@ -1696,11 +2204,28 @@ def _run_authority_document(
     return {**document, "authorityDigest": _document_digest(document)}
 
 
-def _prepare_run_authority(diagnostic_overrides: bool) -> dict[str, object]:
+def _prepare_run_authority(
+    diagnostic_overrides: bool,
+    *,
+    expected_sha: str | None = None,
+    staged_candidate_manifest: Path | None = None,
+    release_phase: str = RELEASE_PHASE_ROUTINE,
+) -> dict[str, object]:
+    global _RUNTIME_EXE_CONFIGURED, _RUNTIME_EXE_ERROR, _STAGED_OWNER_CANDIDATE_AUTHORITY
+    expected_sha = _full_git_sha() if expected_sha is None else expected_sha
     caller = dict(os.environ)
+    staged_candidate = None
+    if staged_candidate_manifest is not None:
+        staged_candidate = validate_staged_owner_candidate_manifest(
+            staged_candidate_manifest,
+            expected_sha=expected_sha,
+        )
+        release_phase = RELEASE_PHASE_PREDEPLOYMENT
     document = _run_authority_document(
         diagnostic_overrides=diagnostic_overrides,
         caller_environment=caller,
+        staged_candidate=staged_candidate,
+        release_phase=release_phase,
     )
     if not diagnostic_overrides:
         appdata, localappdata = _canonical_live_data_roots()
@@ -1710,17 +2235,29 @@ def _prepare_run_authority(diagnostic_overrides: bool) -> dict[str, object]:
         os.environ["LOCALAPPDATA"] = str(localappdata)
         for name in LIVE_AUTHORITY_OVERRIDE_ENVIRONMENT:
             os.environ.pop(name, None)
+    _STAGED_OWNER_CANDIDATE_AUTHORITY = staged_candidate
+    if staged_candidate is not None:
+        _candidate, executable = _revalidate_staged_candidate_authority(staged_candidate)
+        os.environ["CORTEX_APP_EXE"] = str(executable)
+        _RUNTIME_EXE_CONFIGURED = True
+        _RUNTIME_EXE_ERROR = None
     return document
 
 
 def _validate_run_authority(value: object) -> tuple[str, str]:
-    if not isinstance(value, dict) or value.get("schema") != 1 or value.get("type") != "LiveAuthorityV1":
+    if (
+        not isinstance(value, dict)
+        or not _is_exact_integer(value.get("schema"), 2)
+        or value.get("type") != "OwnerWorkstationRunAuthorityV2"
+    ):
         raise EvidenceError("proof live authority has the wrong schema/type")
     if set(value) != {
         "schema",
         "type",
         "mode",
         "certificationEligible",
+        "releasePhase",
+        "stagedCandidate",
         "roots",
         "targets",
         "callerOverrides",
@@ -1736,6 +2273,22 @@ def _validate_run_authority(value: object) -> tuple[str, str]:
         raise EvidenceError("proof live-authority digest is invalid")
     if value.get("certificationEligible") is not (mode == AUTHORITY_MODE_LIVE):
         raise EvidenceError("proof live-authority eligibility contradicts its mode")
+    release_phase = value.get("releasePhase")
+    staged_candidate = value.get("stagedCandidate")
+    if release_phase not in OWNER_RELEASE_PHASES:
+        raise EvidenceError("proof live authority has an invalid release phase")
+    if mode == AUTHORITY_MODE_STAGED_CANDIDATE:
+        candidate = _validate_staged_candidate_authority(staged_candidate)
+        if (
+            release_phase != RELEASE_PHASE_PREDEPLOYMENT
+            or candidate.get("phase") != release_phase
+            or candidate.get("certificationEligible") is not False
+        ):
+            raise EvidenceError("staged candidate run authority has a contradictory phase")
+    elif staged_candidate is not None or release_phase == RELEASE_PHASE_PREDEPLOYMENT:
+        raise EvidenceError("non-candidate run authority carries staged candidate identity")
+    if mode == AUTHORITY_MODE_DIAGNOSTIC and release_phase != RELEASE_PHASE_ROUTINE:
+        raise EvidenceError("diagnostic run authority claims a deployment phase")
     roots = value.get("roots")
     targets = value.get("targets")
     overrides = value.get("callerOverrides")
@@ -1787,7 +2340,7 @@ def _validate_run_authority(value: object) -> tuple[str, str]:
         or not set(root_differences) <= {"APPDATA", "LOCALAPPDATA"}
     ):
         raise EvidenceError("proof live authority has a malformed caller-override inventory")
-    if mode == AUTHORITY_MODE_LIVE:
+    if mode in {AUTHORITY_MODE_LIVE, AUTHORITY_MODE_STAGED_CANDIDATE}:
         expected_roots = {
             "roamingAppData": ROAMING_APP_DATA_FOLDER_ID,
             "localAppData": LOCAL_APP_DATA_FOLDER_ID,
@@ -1799,9 +2352,9 @@ def _validate_run_authority(value: object) -> tuple[str, str]:
                 or root.get("source") != "windows-known-folder"
                 or root.get("knownFolderId") != folder_id
             ):
-                raise EvidenceError("certifying live authority is not Windows Known Folder bound")
+                raise EvidenceError("workstation run authority is not Windows Known Folder bound")
         if overrides.get("policy") != "ignored":
-            raise EvidenceError("certifying live authority activated caller overrides")
+            raise EvidenceError("workstation run authority activated caller overrides")
     else:
         for name in ("roamingAppData", "localAppData"):
             root = roots[name]
@@ -1867,6 +2420,128 @@ _ARCHITECTURE_ARTIFACT = "architecture-contract.json"
 _KNOWN_DEFECT_ARTIFACT = "known-defect-ledger.json"
 _TIMEOUT_CALIBRATION_ARTIFACT = "timeout-calibration-baselines.json"
 _FAULT_CAMPAIGNS_ARTIFACT = "verifier-fault-campaigns.json"
+_COVERAGE_MUTATION_ARTIFACT = "coverage-and-mutation-thresholds.json"
+_SCHEMA_RESTORE_ARTIFACT = "schema-clone-and-restore-campaign.json"
+_CONCURRENCY_PERFORMANCE_ARTIFACT = "concurrency-performance-and-memory-campaign.json"
+_OWNER_WORKFLOW_ARTIFACT = "owner-workflow-and-recovery-campaign.json"
+_OWNER_DEPLOYMENT_ARTIFACT = "owner-deployment-reboot-runs.json"
+_OWNER_FIELD_SESSIONS_ARTIFACT = "owner-field-sessions.json"
+
+OWNER_EVIDENCE_SOURCE_MANIFEST = "campaign-manifest.json"
+OWNER_EVIDENCE_SOURCE_EVENTS = "campaign-events.jsonl"
+OWNER_EVIDENCE_FRESH_SECONDS = 7 * 24 * 60 * 60
+OWNER_FIELD_EVIDENCE_FRESH_SECONDS = 30 * 24 * 60 * 60
+UNSUPPORTED_UNBACKED_EVIDENCE = "UNSUPPORTED_UNBACKED_EVIDENCE"
+
+
+def _reject_unbacked_owner_evidence(class_id: str, missing_authority: str) -> NoReturn:
+    """Refuse a syntactically convincing projection that cannot be replayed from raw authority.
+
+    These evidence classes deliberately remain red until the verifier can independently derive the
+    claimed observation from raw runner/database/process/session bytes.  A hash over a document that
+    merely *says* a campaign passed is tamper-evident after publication, but it is not evidence that
+    the campaign happened.
+    """
+
+    raise EvidenceError(
+        f"{UNSUPPORTED_UNBACKED_EVIDENCE}: {class_id} has no independently replayable "
+        f"{missing_authority} authority"
+    )
+
+
+OWNER_EVIDENCE_CLASS_GATE_IDS: dict[str, str] = {
+    "coverage-and-mutation-thresholds": "coverage-and-mutation-evidence",
+    "schema-clone-and-restore-campaign": "schema-clone-and-restore-evidence",
+    "concurrency-performance-and-memory-campaign": "concurrency-performance-memory-evidence",
+    "owner-workflow-and-recovery-campaign": "owner-workflow-recovery-evidence",
+    "owner-deployment-reboot-runs": "owner-deployment-reboot-evidence",
+    "owner-field-sessions": "owner-field-sessions-evidence",
+}
+OWNER_EVIDENCE_CLASS_ARTIFACTS: dict[str, str] = {
+    "coverage-and-mutation-thresholds": _COVERAGE_MUTATION_ARTIFACT,
+    "schema-clone-and-restore-campaign": _SCHEMA_RESTORE_ARTIFACT,
+    "concurrency-performance-and-memory-campaign": _CONCURRENCY_PERFORMANCE_ARTIFACT,
+    "owner-workflow-and-recovery-campaign": _OWNER_WORKFLOW_ARTIFACT,
+    "owner-deployment-reboot-runs": _OWNER_DEPLOYMENT_ARTIFACT,
+    "owner-field-sessions": _OWNER_FIELD_SESSIONS_ARTIFACT,
+}
+OWNER_EVIDENCE_SOURCE_TYPES: dict[str, str] = {
+    "coverage-and-mutation-thresholds": "CoverageMutationCampaignV1",
+    "schema-clone-and-restore-campaign": "SchemaCloneRestoreCampaignV1",
+    "concurrency-performance-and-memory-campaign": "ConcurrencyPerformanceCampaignV1",
+    "owner-workflow-and-recovery-campaign": "OwnerWorkflowRecoveryCampaignV1",
+    "owner-deployment-reboot-runs": "OwnerDeploymentRebootCampaignV1",
+    "owner-field-sessions": "OwnerFieldSessionCampaignV1",
+}
+OWNER_PROOF_BUNDLE_ARTIFACTS = (
+    "owner-proof/manifest.v1.json",
+    "owner-proof/owner_proof_input_contract.v1.json",
+    "owner-proof/media/A1-0001_PODCAST-001.mp4",
+    "owner-proof/media/A1-0001_PODCAST-001.mov",
+    "owner-proof/media/Lamofull00086400_A01.flac",
+    "owner-proof/audiobook/audiobook-long.mp3",
+    "owner-proof/db-authorities/scale-production-derived-schema60.db",
+    "owner-proof/db-authorities/current-campaign-exact-schema65.db",
+    "owner-proof/db-derived/scale-current-schema69.db",
+    "owner-proof/tools/owner_proof_db.exe",
+    "owner-proof/tools/owner_proof_db.rs",
+)
+OWNER_EVIDENCE_RAW_ARTIFACTS: dict[str, tuple[str, ...]] = {
+    "coverage-and-mutation-thresholds": (
+        OWNER_EVIDENCE_SOURCE_EVENTS,
+        "rust/rust-coverage-manifest.json",
+        "rust/rust-coverage.llvm.json",
+        "rust/events.jsonl",
+        "rust/worker.log",
+        "frontend/frontend-coverage-contract.v1.json",
+        "frontend/frontend-coverage-evidence.json",
+        "frontend/frontend-coverage-raw-manifest.json",
+        "frontend/frontend-coverage-raw.v1.bin",
+        "frontend/coverage-summary.json",
+        "frontend/coverage-final.json",
+        "mutation/owner-mutation-raw-manifest.json",
+        "mutation/owner-mutation-raw.v1.bin",
+        "mutation/backend-mutation.json",
+        "mutation/frontend-mutation.json",
+    ),
+    "schema-clone-and-restore-campaign": (
+        OWNER_EVIDENCE_SOURCE_EVENTS,
+        "schema-clone-and-restore.json",
+        *OWNER_PROOF_BUNDLE_ARTIFACTS,
+    ),
+    "concurrency-performance-and-memory-campaign": (
+        OWNER_EVIDENCE_SOURCE_EVENTS,
+        "concurrency-performance-and-memory.json",
+        *OWNER_PROOF_BUNDLE_ARTIFACTS,
+    ),
+    "owner-workflow-and-recovery-campaign": (
+        OWNER_EVIDENCE_SOURCE_EVENTS,
+        "owner-workflow-and-recovery.json",
+        *OWNER_PROOF_BUNDLE_ARTIFACTS,
+    ),
+    "owner-deployment-reboot-runs": (
+        OWNER_EVIDENCE_SOURCE_EVENTS,
+        "owner-deployment-and-reboot.json",
+        *tuple(
+            f"phases/{phase}/{name}"
+            for phase in ("pre-deployment", "post-deployment", "post-cold-reboot")
+            for name in (
+                "manifest.json",
+                "product-attestation.json",
+                "events.jsonl",
+                "environment.json",
+                "gate-registry.json",
+                RUN_AUTHORITY_NAME,
+                "evidence-contract.json",
+            )
+        ),
+    ),
+    "owner-field-sessions": (
+        OWNER_EVIDENCE_SOURCE_EVENTS,
+        "owner-field-sessions.jsonl",
+        "owner-field-session-summary.json",
+    ),
+}
 
 
 def _load_json_without_duplicate_keys(path: Path) -> object:
@@ -1879,8 +2554,14 @@ def _load_json_without_duplicate_keys(path: Path) -> object:
         return result
 
     try:
-        return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=pairs_hook)
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        return json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=pairs_hook,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON number {token!r}")
+            ),
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         raise EvidenceError(f"cannot read strict JSON authority {path}: {error}") from error
 
 
@@ -2241,6 +2922,76 @@ def _fn_verifier_fault_campaign_evidence() -> bool:
     return report.get("passed") is True
 
 
+def _failed_owner_class_evidence(class_id: str, error: BaseException) -> dict[str, object]:
+    """Emit the same canonical envelope as a passing owner campaign, but durably red.
+
+    Missing observational input is not an exception to the evidence contract.  The worker must
+    still publish the required artifact so the proof records *why* the class is absent; the gate
+    status remains FAIL and the class is derived as FAILED_VALIDATION rather than being guessed.
+    """
+
+    environment = _environment_document()
+    measured_at = utc_now()
+    return {
+        "schema": 1,
+        "type": "OwnerEvidenceClassAttestationV1",
+        "classId": class_id,
+        "fullGitSha": _full_git_sha(),
+        "gateRegistryHash": gate_registry_hash(),
+        "checkoutStateDigest": _checkout_state_digest(),
+        "environment": environment,
+        "environmentDigest": _document_digest(environment),
+        "profile": _ACTIVE_WORKER_PROFILE,
+        "measuredAt": measured_at,
+        "expiresAt": measured_at,
+        "immutableAuthority": "exact-git-commit",
+        "sourceRunToken": None,
+        "sourceManifestSha256": None,
+        "machineArtifacts": [],
+        "observations": {},
+        "passed": False,
+        "failures": [str(error)],
+    }
+
+
+def _fn_owner_evidence_class(class_id: str) -> bool:
+    artifact_name = OWNER_EVIDENCE_CLASS_ARTIFACTS[class_id]
+    artifact_path = LOG_DIR / artifact_name
+    try:
+        report = _build_owner_class_evidence(
+            class_id,
+            profile=_require_active_worker_profile(),
+        )
+    except (EvidenceError, OSError, UnicodeError, ValueError) as error:
+        report = _failed_owner_class_evidence(class_id, error)
+    atomic_write_json(artifact_path, report)
+    return report.get("passed") is True
+
+
+def _fn_coverage_mutation_evidence() -> bool:
+    return _fn_owner_evidence_class("coverage-and-mutation-thresholds")
+
+
+def _fn_schema_clone_restore_evidence() -> bool:
+    return _fn_owner_evidence_class("schema-clone-and-restore-campaign")
+
+
+def _fn_concurrency_performance_memory_evidence() -> bool:
+    return _fn_owner_evidence_class("concurrency-performance-and-memory-campaign")
+
+
+def _fn_owner_workflow_recovery_evidence() -> bool:
+    return _fn_owner_evidence_class("owner-workflow-and-recovery-campaign")
+
+
+def _fn_owner_deployment_reboot_evidence() -> bool:
+    return _fn_owner_evidence_class("owner-deployment-reboot-runs")
+
+
+def _fn_owner_field_sessions_evidence() -> bool:
+    return _fn_owner_evidence_class("owner-field-sessions")
+
+
 # (name, tier, kind, payload, cwd, env_probe, charter_ref)
 #   kind "fn"  -> payload is a callable returning bool
 #   kind "cmd" -> payload is a shell command string
@@ -2266,6 +3017,7 @@ GATES = [
     ("challenger-loop", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_challenger_loop.py"}"', APP, None, "Gate D of docs/PLAN_TRUE_10.md. The retrain flywheel's danger is not that a challenger LOSES — a REJECT is a good outcome and passes this gate — it is a run that LOOKS finished: a record saying 'trained' for training that never happened, a verdict with no snapshot behind it, or a PROMOTE whose own numbers do not support it. Checks the chain (train_challenger / build_eval_slices / promotion_gate) is present and audits every run record and verdict on disk for internal consistency. SKIP-ENV until a canary has actually run: wiring is not evidence, and a gate that says OK for an unrun loop is the flattering kind."),
     ("reviewer-queues-live", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_reviewer_queues_live.py"}"', APP, None, "Every reviewer holding a live link has clips they are ALLOWED to review. MEASURED 2026-08-17: two independent bugs made five of eight reviewers' queues empty while the owner was paying them, and each hid the other. The 1,031 recovered clips were relinked into D:\\Kurdish Corpora\\sorani\\ZarPodcast while dialect.rs still mapped only their pre-recovery path, so they were UNMAPPED and the dialect check fails closed; meanwhile the roster file carried a \"_comment\" string, which a strict HashMap<String, Vec<String>> parse rejects outright, and that failure path is \"unrestricted\" — so the protection was simultaneously off for everyone. Every row, every JSON file and every Rust function read correctly in isolation; only computing what each NAMED reviewer would actually be served exposes it. supervision-live cannot: the server answers 200 for an empty queue."),
     ("review-serving-provenance", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_review_serving_provenance.py"}"', APP, None, "Honesty at the SERVING path, on the LIVE db: annotated_transcript is human-only, and every untouched clip serves the champion's own transcript. MEASURED 2026-08-12: 348 rows held machine text in the human field, so the phone review page served a stale paraphrase while the fresh champion drafts sat invisible — reviewers corrected words the speaker never said. Write-path checks passed the whole time; only reading the row the server actually serves catches this class."),
+    ("owner-workstation-health-live", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_owner_workstation_health_live.py"}"', APP, None, "Owner-only live safety: the current watchdog is enabled and wake-safe, an active immutable release owns its exact watchdog script, and the data drive retains at least the locked snapshot/WAL reserve. Remote reviewer links, queues, and compensation are deliberately outside this gate."),
     ("typecheck", 1, "cmd", "npm run typecheck", APP, None, "svelte-check + tsc"),
     ("lint-js", 1, "cmd", "npm run lint", APP, None, "eslint"),
     ("clippy", 1, "cmd", f'cargo clippy --manifest-path "{MANIFEST}" --all-targets --all-features -- -D warnings', REPO_ROOT, None, "Engineering rigor: strict Clippy across every target and feature"),
@@ -2273,6 +3025,7 @@ GATES = [
     ("runtime-asset-integrity", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "fetch_models.py"}" --check', APP, None, "SHA-256 of every required runtime-support asset plus every optional ASR artifact already present. Missing optional 300M/1B/MMS is healthy; a partial or mismatched optional installation is RED. The externally served WSL7B identity is proven separately at the serving path."),
     ("test-frontend", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "assert_ran.py"}" --min 400 --kind vitest -- npm test', APP, None, "Full Vitest suite with a current anti-vacuity floor. MEASURED 2026-08-26: 404 tests passed; the 400 floor permits a small intentional consolidation while failing closed if a suite, include pattern, or discovery root silently disappears. `assert_ran` also fails when it cannot parse the test-count line."),
     ("frontend-coverage", 1, "cmd", "npm run test:coverage", APP, None, "Fail-closed complete frontend coverage: V8 must report at least 85% statements/lines and 80% branches/functions across every shipped TypeScript and Svelte source file. Passing test count, lazy loading, and untested advanced workspaces do not waive the global contract; JSON summary evidence is retained beside the human-readable table."),
+    ("coverage-and-mutation-evidence", 1, "fn", _fn_coverage_mutation_evidence, None, None, "Fail-closed evidence consumer for exact-source Rust/frontend coverage and backend/frontend mutation. A projected summary cannot pass: certification remains red until native runner output, exact command/tool authority, and independently replayable frontend coverage inputs are copied and rederived."),
     ("test-rust", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "assert_ran.py"}" --min 1700 --kind cargo -- cargo test --manifest-path "{MANIFEST}" --all-targets --all-features --jobs 4', REPO_ROOT, None, "All-target/all-feature Rust suite: Sorani goldens, restore and review authority, WER parity, holdout hash, ONNX manifest and proof metadata. MEASURED 2026-08-26: the library target alone discovered 1,717 tests after the final restore additions; the 1,700 floor fails closed on material discovery loss while allowing a small intentional consolidation."),
     ("durable-decision-latency", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "assert_ran.py"}" --min 1 --kind cargo -- cargo test --manifest-path "{MANIFEST}" --lib db::tests::the_durability_cost_per_decision_is_measured_not_assumed -- --ignored --exact --nocapture --test-threads=1', REPO_ROOT, None, "Reviewer-visible durability latency is measured alone, with the exact 250 ms/decision threshold retained in Rust. The parallel library suite runs hundreds of unrelated FULL/fsync SQLite tests at once and measured ~310 ms here while the identical isolated path measured 1.5 ms; cross-test disk contention is not product latency. This mandatory, anti-vacuity gate keeps the benchmark isolated without letting it disappear or silently match zero tests."),
     ("audit", 1, "cmd", "npm audit --omit=dev && npm ls --all", APP, None, "npm supply chain. `npm ls --all` is the second half deliberately: MEASURED 2026-08-06, `npm audit` reported 0 vulnerabilities while the INSTALLED tree was structurally invalid (ELSPROBLEMS: a hoisted picomatch@2 could not satisfy the `^3 || ^4` peer fdir asks for). A clean audit says 'no KNOWN CVE in what resolved'; it says nothing about whether the tree resolved correctly at all. Both halves, or the gate only proves half of supply chain."),
@@ -2303,6 +3056,11 @@ GATES = [
     ("heartbeat-runtime", 3, "cmd", f'node "{APP / "scripts" / "heartbeat_probe.cjs"}"', APP, _probe_ipc_harness, "Main-thread safety PROVEN AT RUNTIME: get_settings latency while slow commands run concurrently. The static test_command_main_thread_policy/test_ui_thread_blocking_audit pin the source shape; this measures the actual UI responsiveness they exist to protect."),
     ("bench-budget", 3, "cmd", f'"{sys.executable}" "{APP / "scripts" / "bench_gate.py"}"', APP, _probe_bench, "Criterion wall-clock regression budget against a COMMITTED baseline (docs/bench_baseline.json). The charter asks for this via github-action-benchmark on every PR; that CI clause is NOT satisfied here and stays open - this enforces the budget on the reference machine, where the charter's latency numbers are defined. Per-bench thresholds derived from measured run-to-run noise, and benches too noisy to gate are NAMED every run rather than given a pass-anything limit."),
     ("jobs-runtime", 3, "cmd", f'node "{APP / "scripts" / "jobs_probe.cjs"}"', APP, _probe_exe, "Durable Job Supervisor at runtime: a REAL export_dataset run is recorded in get_jobs and reaches 'succeeded' - the run_tracked bracketing proven end to end, not only in unit tests."),
+    ("schema-clone-and-restore-evidence", 3, "fn", _fn_schema_clone_restore_evidence, None, None, "Fail-closed schema campaign requirement. Summary hashes are non-authoritative; this gate remains UNSUPPORTED_UNBACKED_EVIDENCE until it can replay raw databases, snapshots, migration journals, and human-truth digests."),
+    ("concurrency-performance-memory-evidence", 3, "fn", _fn_concurrency_performance_memory_evidence, None, None, "Fail-closed concurrency/performance requirement. Self-authored latency arrays cannot certify; raw fixed-command process/browser traces and the final hammered database are mandatory."),
+    ("owner-workflow-recovery-evidence", 3, "fn", _fn_owner_workflow_recovery_evidence, None, None, "Fail-closed real-media workflow/recovery requirement. It remains red until application/process journals, durable operation rows, database snapshots, and actual export bytes can be independently replayed."),
+    ("owner-deployment-reboot-evidence", 3, "fn", _fn_owner_deployment_reboot_evidence, None, None, "Fail-closed deployment/reboot requirement. Control manifests alone do not prove activation or a cold reboot; complete proof artifacts, OS boot identity, and the deployment journal are required."),
+    ("owner-field-sessions-evidence", 3, "fn", _fn_owner_field_sessions_evidence, None, None, "Fail-closed owner field requirement. A self-generated hash chain is not automatic-use proof; each session must bind to application-authored events and durable decision/playback rows before this gate can pass."),
     ("durability-drill", 3, "cmd", _drill_cmd("durability_writer", "durability_drill.py", "--cycles 25"), APP, None, "Crash durability PROVEN, not asserted: 25 hard kills of the real writer (production Database::open_with_retry + insert_segment) across write-phase and boot-phase, verifying integrity_check ok, zero LOST journaled edits, a contiguous id space and a row count that never decreases. The single reliability property daily review depends on - the app dying must never cost work that was saved. It existed and NOTHING ran it (found 2026-08-02 by asking which scripts no gate references); an unrun drill is a claim."),
     ("export-kill-drill", 3, "cmd", _drill_cmd("export_writer", "export_kill_drill.py", "--cycles 15"), APP, None, "Atomic-write design under real kills: 15 mid-export TerminateProcess cycles proving every JOURNALED export parses complete with the full row count, and that NO final .json is ever torn (atomic temp+fsync+rename in atomic_file.rs is the design under test). Scope honesty: process kill, not power loss. Same find as the durability drill - written, never run."),
 ]
@@ -2364,14 +3122,28 @@ def _gate_environment(
     }
     environment["CORTEX_GATE"] = "1"
     environment.update(GATE_FORCED_ENVIRONMENT_BY_ID.get(gate.id, {}))
-    if gate.id in LIVE_AUTHORITY_GATE_IDS and authority_mode == AUTHORITY_MODE_LIVE:
+    if gate.id in LIVE_AUTHORITY_GATE_IDS and authority_mode in {
+        AUTHORITY_MODE_LIVE,
+        AUTHORITY_MODE_STAGED_CANDIDATE,
+    }:
+        for name in LIVE_AUTHORITY_OVERRIDE_ENVIRONMENT:
+            if authority_mode == AUTHORITY_MODE_LIVE or name != "CORTEX_APP_EXE":
+                environment.pop(name, None)
         appdata, localappdata = _canonical_live_data_roots()
         environment["APPDATA"] = str(appdata)
         environment["LOCALAPPDATA"] = str(localappdata)
         leaked = sorted(set(LIVE_AUTHORITY_OVERRIDE_ENVIRONMENT) & set(environment))
+        if authority_mode == AUTHORITY_MODE_STAGED_CANDIDATE:
+            leaked = [name for name in leaked if name != "CORTEX_APP_EXE"]
+            if "CORTEX_APP_EXE" in gate.environment_allowlist and not environment.get(
+                "CORTEX_APP_EXE"
+            ):
+                raise EvidenceError(
+                    f"staged candidate gate {gate.id} has no verifier-selected executable"
+                )
         if leaked:
             raise EvidenceError(
-                f"certifying live gate {gate.id} inherited caller authority: {', '.join(leaked)}"
+                f"workstation gate {gate.id} inherited caller authority: {', '.join(leaked)}"
             )
     environment.setdefault("PYTHONUTF8", "1")
     environment.setdefault("PYTHONIOENCODING", "utf-8")
@@ -2447,7 +3219,7 @@ def _validate_gate_environment_authority(
     authority_mode: str,
     run_authority_digest: str,
 ) -> dict[str, object]:
-    if not isinstance(value, dict) or value.get("schema") != 1:
+    if not isinstance(value, dict) or not _is_exact_integer(value.get("schema"), 1):
         raise EvidenceError(f"gate {gate.id} has no environment-authority binding")
     if set(value) != {
         "schema",
@@ -2489,14 +3261,23 @@ def _validate_gate_environment_authority(
         permitted.update(LIVE_AUTHORITY_OVERRIDE_ENVIRONMENT)
     if not set(names) <= permitted:
         raise EvidenceError(f"gate {gate.id} effective environment escaped its allowlist")
-    if gate.id in LIVE_AUTHORITY_GATE_IDS and authority_mode == AUTHORITY_MODE_LIVE:
+    if gate.id in LIVE_AUTHORITY_GATE_IDS and authority_mode in {
+        AUTHORITY_MODE_LIVE,
+        AUTHORITY_MODE_STAGED_CANDIDATE,
+    }:
         leaked = sorted(set(names) & set(LIVE_AUTHORITY_OVERRIDE_ENVIRONMENT))
+        if authority_mode == AUTHORITY_MODE_STAGED_CANDIDATE:
+            leaked = [name for name in leaked if name != "CORTEX_APP_EXE"]
+            if "CORTEX_APP_EXE" in gate.environment_allowlist and "CORTEX_APP_EXE" not in names:
+                raise EvidenceError(
+                    f"staged candidate gate {gate.id} omits its verifier-selected executable"
+                )
         if leaked:
             raise EvidenceError(
-                f"certifying live gate {gate.id} contains caller authority: {', '.join(leaked)}"
+                f"workstation gate {gate.id} contains caller authority: {', '.join(leaked)}"
             )
         if not {"APPDATA", "LOCALAPPDATA"} <= set(names):
-            raise EvidenceError(f"certifying live gate {gate.id} omits Windows data roots")
+            raise EvidenceError(f"workstation gate {gate.id} omits Windows data roots")
     for item in bindings:
         if item.get("name") in {"GH_TOKEN", "GITHUB_TOKEN"}:
             if set(item) != {"name", "redactedSecretPresent"} or item.get(
@@ -2550,6 +3331,7 @@ VERIFIER_FAULT_CAMPAIGN_FRESH_SECONDS = 72 * 60 * 60
 VERIFIER_FAULT_CAMPAIGN_TIMEOUT_SECONDS = 30 * 60
 VERIFIER_FAULT_CAMPAIGN_ROOT = LOG_DIR / "verifier-fault-campaigns"
 VERIFIER_FAULT_CAMPAIGN_LOCK = LOG_DIR / "verifier-fault-campaign.lease.json"
+OWNER_EVIDENCE_AUTHORITY_ROOT = LOG_DIR / "owner-evidence-authorities"
 VERIFIER_FAULT_CAMPAIGN_MANIFEST = "verifier-fault-campaign-manifest.json"
 VERIFIER_FAULT_CAMPAIGN_START = "campaign-start.json"
 VERIFIER_FAULT_CAMPAIGN_LOG = "unittest.log"
@@ -2631,6 +3413,12 @@ os.environ["CORTEX_GATE"] = "1"
 # produced no verdict at all. Only the one actually observed is listed — adding speculative codes
 # would widen a retry path on no evidence.
 ABNORMAL_EXIT_CODES = frozenset({3221226505})  # 0xC0000409 STATUS_STACK_BUFFER_OVERRUN
+ALLOWED_DIAGNOSTIC_RETRY_REASONS = frozenset(
+    {
+        "LNK1104 linker file-lock flake",
+        *(f"OS-terminated before verdict (exit {code})" for code in ABNORMAL_EXIT_CODES),
+    }
+)
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 _node_report_opts = f"--report-on-fatalerror --report-directory={LOG_DIR}"
@@ -2764,6 +3552,34 @@ def _attempt_log_path(name: str, attempt: int) -> Path:
     return LOG_DIR / f"{name}.attempt-{attempt}.{stamp}.{uuid.uuid4().hex[:8]}.log"
 
 
+def _effective_gate_steps(
+    name: str,
+    steps: tuple[GateStep, ...],
+    authority_mode: str,
+) -> tuple[GateStep, ...]:
+    """Resolve the one release-authority-dependent command without invoking a shell."""
+
+    if authority_mode != AUTHORITY_MODE_STAGED_CANDIDATE:
+        return steps
+    if name != "playback-enforcement-readiness":
+        return steps
+    executable = os.environ.get("CORTEX_APP_EXE")
+    if not executable:
+        raise EvidenceError("staged playback gate has no verifier-selected executable")
+    rewritten: list[GateStep] = []
+    replaced = 0
+    for step in steps:
+        argv = list(step.argv)
+        if "--active-release" in argv:
+            index = argv.index("--active-release")
+            argv[index : index + 1] = ["--exe", executable]
+            replaced += 1
+        rewritten.append(GateStep(tuple(argv)))
+    if replaced != 1:
+        raise EvidenceError("staged playback gate command has no unique active-release selector")
+    return tuple(rewritten)
+
+
 def _run_command_attempt(
     name: str,
     steps: tuple[GateStep, ...],
@@ -2776,6 +3592,7 @@ def _run_command_attempt(
 
     if timeout <= 0:
         raise ValueError(f"gate {name} has no positive timeout")
+    steps = _effective_gate_steps(name, steps, authority_mode)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = _attempt_log_path(name, attempt)
     started = time.perf_counter()
@@ -2841,8 +3658,15 @@ def run_gate(
     probe,
     timeout=3600,
     authority_mode=AUTHORITY_MODE_LIVE,
+    *,
+    metadata: GateRunMetadata | None = None,
 ):
     """Compatibility entrypoint backed by explicit argv, durable logs and process-tree cleanup."""
+
+    run_metadata = metadata if metadata is not None else GateRunMetadata()
+    run_metadata.attempt_count = 1
+    run_metadata.retry_count = 0
+    run_metadata.retry_reasons = ()
 
     if probe:
         try:
@@ -2884,6 +3708,9 @@ def run_gate(
         retry_reason = f"OS-terminated before verdict (exit {return_code})"
 
     if retry_reason is not None:
+        run_metadata.attempt_count = 2
+        run_metadata.retry_count = 1
+        run_metadata.retry_reasons = (retry_reason,)
         try:
             retry_code, retry_seconds, retry_log, retry_timed_out = _run_command_attempt(
                 name, steps, Path(cwd or REPO_ROOT), timeout, 2, authority_mode
@@ -2917,36 +3744,44 @@ def run_gate(
     )
 
 
-def write_status_md(
-    path,
-    head,
-    quick,
-    results,
-    verdict,
-    profile=PROFILE_FULL,
-    evidence_results: list[dict[str, object]] | None = None,
-):
-    """Emit the proof-local generated view of the completed gate results.
-
-    Hand-written docs that restate which gates pass go stale silently — OWNER_HANDOFF.md
-    claimed `egress-runtime` was NOT-BUILT for weeks after it shipped, and refinery-lift
-    needed the same manual correction. Under this repo's honesty law a doc asserting a
-    gate state it did not measure is exactly the failure mode to design out, so docs now
-    link here instead of restating.
-
-    It lives inside the immutable run directory and is hash-listed by ``manifest.json``. A tracked
-    generated status cannot describe its own commit: committing the embedded SHA creates a different
-    SHA. The repository therefore keeps only a static authority notice.
-    """
-    rows = "\n".join(f"| `{name}` | {status} |" for name, status, _, _ in results)
-    descoped = "\n".join(f"| `{name}` | {why} |" for name, why in DESCOPED)
-    gated = "\n".join(f"| `{name}` | {why} |" for name, why in OWNER_GATED)
-    evidence_rows = evidence_results or list(_pending_evidence_results(profile))
-    evidence_table = "\n".join(
-        f"| `{item['classId']}` | {item['status']} | {item['detail']} |"
-        for item in evidence_rows
+def _status_table_cell(value: object) -> str:
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("\r", " ")
+        .replace("\n", " ")
     )
-    body = f"""<!-- GENERATED inside an immutable proof run by scripts/verify_10.py. Do not edit. -->
+
+
+def _status_md_text(
+    head: str,
+    quick: bool,
+    results: Sequence[tuple[str, str, float, str]],
+    verdict: str,
+    profile: str,
+    evidence_results: list[dict[str, object]],
+) -> str:
+    """Return the one canonical human projection of a completed manifest verdict."""
+
+    rows = "\n".join(
+        f"| `{_status_table_cell(name)}` | {_status_table_cell(status)} |"
+        for name, status, _, _ in results
+    )
+    descoped = "\n".join(
+        f"| `{_status_table_cell(name)}` | {_status_table_cell(why)} |"
+        for name, why in DESCOPED
+    )
+    gated = "\n".join(
+        f"| `{_status_table_cell(name)}` | {_status_table_cell(why)} |"
+        for name, why in OWNER_GATED
+    )
+    evidence_table = "\n".join(
+        f"| `{_status_table_cell(item['classId'])}` | "
+        f"{_status_table_cell(item['status'])} | {_status_table_cell(item['detail'])} |"
+        for item in evidence_results
+    )
+    return f"""<!-- GENERATED inside an immutable proof run by scripts/verify_10.py. Do not edit. -->
 
 # Gate status — generated
 
@@ -2980,6 +3815,42 @@ Only class-specific validator artifacts can produce `VERIFIED`. No user-authored
 |---|---|
 {gated}
 """
+
+
+def write_status_md(
+    path,
+    head,
+    quick,
+    results,
+    verdict,
+    profile=PROFILE_FULL,
+    evidence_results: list[dict[str, object]] | None = None,
+):
+    """Emit the proof-local generated view of the completed gate results.
+
+    Hand-written docs that restate which gates pass go stale silently — OWNER_HANDOFF.md
+    claimed `egress-runtime` was NOT-BUILT for weeks after it shipped, and refinery-lift
+    needed the same manual correction. Under this repo's honesty law a doc asserting a
+    gate state it did not measure is exactly the failure mode to design out, so docs now
+    link here instead of restating.
+
+    It lives inside the immutable run directory and is hash-listed by ``manifest.json``. A tracked
+    generated status cannot describe its own commit: committing the embedded SHA creates a different
+    SHA. The repository therefore keeps only a static authority notice.
+    """
+    evidence_rows = (
+        evidence_results
+        if evidence_results is not None
+        else list(_pending_evidence_results(profile))
+    )
+    body = _status_md_text(
+        str(head),
+        bool(quick),
+        results,
+        str(verdict),
+        str(profile),
+        evidence_rows,
+    )
     atomic_write_bytes(Path(path), body.encode("utf-8"))
     print(f"\n[status-md] wrote {path}")
 
@@ -3194,15 +4065,22 @@ def _schema_authority_document(full_sha: str, working_bytes: bytes | None = None
 def _binary_identity(path: Path) -> tuple[str, int, str | None]:
     digest = hashlib.sha256()
     tail = b""
-    marker_value: str | None = None
+    marker_values: list[str] = []
     with path.open("rb") as handle:
         opened = os.fstat(handle.fileno())
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
             window = tail + chunk
-            marker = re.search(rb"CORTEX_BUILD_SHA:([0-9a-fA-F]{7,40}|unknown)", window)
-            if marker and marker_value is None:
-                marker_value = marker.group(1).decode("ascii").casefold()
+            # The overlap preserves a marker split at a chunk boundary. Ignore matches wholly in
+            # that overlap so one physical marker is never counted twice. A release identity is
+            # authoritative only when exactly one marker exists; duplicate/ambiguous markers fail
+            # closed instead of allowing whichever byte sequence happened to occur first.
+            overlap = len(tail)
+            for marker in re.finditer(
+                rb"CORTEX_BUILD_SHA:([0-9a-fA-F]{7,40}|unknown)", window
+            ):
+                if marker.end() > overlap:
+                    marker_values.append(marker.group(1).decode("ascii"))
             tail = window[-96:]
         closed = os.fstat(handle.fileno())
     current = path.stat()
@@ -3214,6 +4092,7 @@ def _binary_identity(path: Path) -> tuple[str, int, str | None]:
         current.st_mtime_ns,
     ):
         raise EvidenceError("release executable changed while its identity was being captured")
+    marker_value = marker_values[0] if len(marker_values) == 1 else None
     return digest.hexdigest(), opened.st_size, marker_value
 
 
@@ -3253,7 +4132,7 @@ def configure_windows_release_authority(
 
 
 def _authority_release_artifacts(authority: object) -> list[dict[str, object]]:
-    if not isinstance(authority, dict) or authority.get("schema") != 1:
+    if not isinstance(authority, dict) or not _is_exact_integer(authority.get("schema"), 1):
         raise EvidenceError("Windows release authority has the wrong schema")
     source = authority.get("source")
     crypto = authority.get("cryptographicValidation")
@@ -3275,20 +4154,30 @@ def _authority_release_artifacts(authority: object) -> list[dict[str, object]]:
 def _release_artifact_bindings(full_sha: str) -> list[dict[str, object]]:
     """Record only artifacts the local verifier actually observed; never infer signing."""
 
-    executable = runtime_exe()
+    staged_candidate = _STAGED_OWNER_CANDIDATE_AUTHORITY
+    if staged_candidate is not None:
+        staged_candidate, executable = _revalidate_staged_candidate_authority(staged_candidate)
+    else:
+        executable = runtime_exe()
     if not executable.is_file():
         return []
     executable_sha, executable_bytes, marker = _binary_identity(executable)
-    authority = "explicit-diagnostic" if os.environ.get("CORTEX_APP_EXE") else "build-output"
+    authority = (
+        "staged-owner-candidate"
+        if staged_candidate is not None
+        else ("explicit-diagnostic" if os.environ.get("CORTEX_APP_EXE") else "build-output")
+    )
     pointer_sha: str | None = None
     active_release_git_sha: str | None = None
     appdata = os.environ.get("APPDATA")
     localappdata = os.environ.get("LOCALAPPDATA")
-    if appdata and localappdata:
+    if staged_candidate is None and appdata and localappdata:
         pointer_path = Path(appdata) / "cortex-speech" / ACTIVE_RELEASE_POINTER
         if pointer_path.is_file():
             try:
-                pointer_value = json.loads(pointer_path.read_text(encoding="utf-8"))
+                pointer_value = _load_json_without_duplicate_keys(pointer_path)
+                if not isinstance(pointer_value, dict):
+                    raise ValueError("active release pointer is not an object")
                 release_root = Path(localappdata) / "CortexSpeech" / "private-production-releases"
                 active_executable = validate_active_release_runtime(pointer_value, release_root)
                 if (
@@ -3300,7 +4189,7 @@ def _release_artifact_bindings(full_sha: str) -> list[dict[str, object]]:
                     active_release_git_sha = str(pointer_value.get("appGitSha"))
                 elif active_executable.resolve() == executable.resolve():
                     authority = "invalid-active-release-pointer"
-            except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            except (EvidenceError, OSError, UnicodeError, ValueError, json.JSONDecodeError):
                 # The executable-freshness/live gates carry the failure.  An invalid pointer must not
                 # be promoted into an attested release identity merely because an exe still exists.
                 authority = "invalid-active-release-pointer"
@@ -3315,6 +4204,27 @@ def _release_artifact_bindings(full_sha: str) -> list[dict[str, object]]:
         "activeReleasePointerSha256": pointer_sha,
         "activeReleaseGitSha": active_release_git_sha,
     }
+    if staged_candidate is not None:
+        candidate_app = staged_candidate["artifacts"]["applicationExecutable"]
+        if (
+            executable_sha != candidate_app["sha256"]
+            or executable_bytes != candidate_app["bytes"]
+            or marker != staged_candidate["sourceGitSha"]
+            or full_sha != staged_candidate["sourceGitSha"]
+        ):
+            raise EvidenceError("staged candidate executable differs from its run authority")
+        active_binding.update(
+            {
+                "releasePhase": RELEASE_PHASE_PREDEPLOYMENT,
+                "stagedReleaseId": staged_candidate["releaseId"],
+                "stagedReleaseManifestSha256": staged_candidate["manifestSha256"],
+                "expectedDatabaseSchema": staged_candidate["expectedDatabaseSchema"],
+                "schemaContractId": staged_candidate["schemaContractId"],
+                "schemaContractSha256": staged_candidate["artifacts"]["schemaContract"][
+                    "sha256"
+                ],
+            }
+        )
     if _WINDOWS_RELEASE_AUTHORITY is None:
         return [active_binding]
 
@@ -3715,6 +4625,2965 @@ def _validate_machine_evidence_files(
     return validated
 
 
+def _safe_owner_evidence_relative(value: object, *, label: str) -> PurePosixPath:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise EvidenceError(f"{label} is not a canonical relative POSIX path")
+    relative = PurePosixPath(value)
+    reserved_windows_names = {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{index}" for index in range(1, 10)),
+        *(f"lpt{index}" for index in range(1, 10)),
+    }
+    if (
+        relative.is_absolute()
+        or relative.as_posix() != value
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or any(
+            ":" in part
+            or part.rstrip(" .") != part
+            or any(ord(character) < 32 for character in part)
+            or part.split(".", 1)[0].casefold() in reserved_windows_names
+            for part in relative.parts
+        )
+    ):
+        raise EvidenceError(f"{label} is unsafe")
+    return relative
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    """Return true for every Windows path alias that can redirect evidence bytes."""
+
+    return path.is_symlink() or (
+        hasattr(path, "is_junction") and path.is_junction()
+    )
+
+
+def _owner_evidence_path(root: Path, relative: PurePosixPath) -> Path:
+    if _is_link_or_junction(root):
+        raise EvidenceError("owner evidence campaign root is a link or junction")
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if _is_link_or_junction(cursor):
+            raise EvidenceError("owner evidence artifact path contains a link or junction")
+    candidate = cursor.resolve()
+    try:
+        candidate.relative_to(root.resolve())
+    except ValueError as error:
+        raise EvidenceError("owner evidence artifact escapes its campaign root") from error
+    return candidate
+
+
+def _owner_campaign_file_inventory(root: Path) -> set[str]:
+    if _is_link_or_junction(root):
+        raise EvidenceError("owner evidence campaign root is a link or junction")
+    inventory: set[str] = set()
+    for path in root.rglob("*"):
+        relative = path.relative_to(root).as_posix()
+        if _is_link_or_junction(path):
+            raise EvidenceError(f"owner evidence campaign contains a link: {relative}")
+        if path.is_file():
+            if path.stat().st_nlink != 1:
+                raise EvidenceError(
+                    f"owner evidence campaign contains a hard-link alias: {relative}"
+                )
+            inventory.add(relative)
+        elif not path.is_dir():
+            raise EvidenceError(f"owner evidence campaign contains a special file: {relative}")
+    return inventory
+
+
+def _copy_owner_campaign_tree(
+    source_root: Path,
+    destination_root: Path,
+    relative_names: Sequence[str],
+    *,
+    artifact_root: Path,
+) -> list[dict[str, object]]:
+    if destination_root.exists():
+        raise EvidenceError("owner evidence destination already exists")
+    try:
+        destination_root.resolve().relative_to(artifact_root.resolve())
+    except ValueError as error:
+        raise EvidenceError("owner evidence destination escapes its gate artifact root") from error
+    destination_root.mkdir(parents=True, exist_ok=False)
+    records: list[dict[str, object]] = []
+    for value in relative_names:
+        relative = _safe_owner_evidence_relative(value, label="owner evidence artifact path")
+        source = _owner_evidence_path(source_root, relative)
+        if not source.is_file() or source.is_symlink():
+            raise EvidenceError(f"owner evidence source artifact is missing: {value}")
+        destination = _owner_evidence_path(destination_root, relative)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(destination, source.read_bytes())
+        records.append(
+            {
+                "path": destination.relative_to(artifact_root).as_posix(),
+                "sha256": sha256_file(destination),
+                "bytes": destination.stat().st_size,
+            }
+        )
+    return records
+
+
+def _validate_owner_campaign_tree(
+    records: object,
+    *,
+    artifact_root: Path,
+    expected_directory: Path,
+    expected_names: Sequence[str],
+    label: str,
+) -> dict[str, Path]:
+    expected_paths = [(expected_directory / Path(name)).as_posix() for name in expected_names]
+    if not isinstance(records, list) or len(records) != len(expected_names):
+        raise EvidenceError(f"{label} machine artifact inventory is incomplete")
+    validated: dict[str, Path] = {}
+    seen: set[str] = set()
+    for record, expected_path, name in zip(records, expected_paths, expected_names, strict=True):
+        if not isinstance(record, dict) or set(record) != {"path", "sha256", "bytes"}:
+            raise EvidenceError(f"{label} machine artifact record is malformed")
+        if record.get("path") != expected_path or expected_path in seen:
+            raise EvidenceError(f"{label} machine artifact path is duplicated or substituted")
+        relative = _safe_owner_evidence_relative(expected_path, label=f"{label} artifact path")
+        candidate = _owner_evidence_path(artifact_root, relative)
+        size = record.get("bytes")
+        if (
+            not candidate.is_file()
+            or candidate.is_symlink()
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size <= 0
+            or candidate.stat().st_size != size
+            or sha256_file(candidate) != record.get("sha256")
+        ):
+            raise EvidenceError(f"{label} machine artifact is missing or hash-substituted: {name}")
+        seen.add(expected_path)
+        validated[name] = candidate
+    campaign_root = artifact_root / expected_directory
+    if _owner_campaign_file_inventory(campaign_root) != set(expected_names):
+        raise EvidenceError(f"{label} campaign directory has an omitted or unregistered artifact")
+    return validated
+
+
+def _owner_campaign_fresh_seconds(class_id: str) -> int:
+    return (
+        OWNER_FIELD_EVIDENCE_FRESH_SECONDS
+        if class_id == "owner-field-sessions"
+        else OWNER_EVIDENCE_FRESH_SECONDS
+    )
+
+
+def _validate_owner_campaign_events(
+    path: Path,
+    *,
+    manifest: dict[str, object],
+) -> None:
+    events = _strict_json_lines(path, f"{manifest['classId']} campaign journal")
+    if len(events) != 2:
+        raise EvidenceError("owner evidence campaign journal is not exactly start/end")
+    first, last = events
+    if (
+        not _is_exact_integer(first.get("schema"), 1)
+        or not _is_exact_integer(first.get("sequence"), 1)
+        or not _is_exact_integer(first.get("attemptCount"), 1)
+        or not _is_exact_integer(last.get("schema"), 1)
+        or not _is_exact_integer(last.get("sequence"), 2)
+        or not _is_exact_integer(last.get("retryCount"), 0)
+        or not _is_exact_integer(last.get("skipCount"), 0)
+    ):
+        raise EvidenceError("owner evidence campaign journal has boolean or non-integer counters")
+    expected_first = {
+        "schema": 1,
+        "sequence": 1,
+        "runToken": manifest["runToken"],
+        "event": "campaign_start",
+        "at": manifest["startedAt"],
+        "classId": manifest["classId"],
+        "profile": PROFILE_OWNER,
+        "fullGitSha": manifest["fullGitSha"],
+        "sourceTreeDigest": manifest["sourceTreeDigest"],
+        "checkoutStateDigest": manifest["checkoutStateDigest"],
+        "gateRegistryHash": manifest["gateRegistryHash"],
+        "environmentDigest": manifest["environmentDigest"],
+        "attemptCount": 1,
+        "retryPolicy": "none",
+    }
+    expected_last = {
+        "schema": 1,
+        "sequence": 2,
+        "runToken": manifest["runToken"],
+        "event": "campaign_end",
+        "at": manifest["endedAt"],
+        "classId": manifest["classId"],
+        "passed": True,
+        "failures": [],
+        "retryCount": 0,
+        "skipCount": 0,
+    }
+    if not _json_values_exact(first, expected_first) or not _json_values_exact(
+        last, expected_last
+    ):
+        raise EvidenceError("owner evidence campaign journal is stale, retried, skipped, or substituted")
+
+
+def _validate_owner_source_campaign(
+    class_id: str,
+    manifest_path: Path,
+    *,
+    expected_sha: str,
+    expected_registry_hash: str,
+    expected_checkout_digest: str,
+    expected_environment: dict[str, object],
+    require_fresh: bool,
+) -> tuple[dict[str, object], dict[str, Path], dict[str, object]]:
+    manifest_value = _load_json_without_duplicate_keys(manifest_path)
+    expected_keys = {
+        "schema",
+        "type",
+        "classId",
+        "runToken",
+        "profile",
+        "fullGitSha",
+        "sourceTreeDigest",
+        "gateRegistryHash",
+        "checkoutStateDigest",
+        "environmentDigest",
+        "startedAt",
+        "endedAt",
+        "expiresAt",
+        "attemptCount",
+        "retryCount",
+        "skipCount",
+        "artifacts",
+        "passed",
+        "failures",
+    }
+    if not isinstance(manifest_value, dict) or set(manifest_value) != expected_keys:
+        raise EvidenceError(f"{class_id} source manifest has a non-canonical envelope")
+    manifest = manifest_value
+    token = manifest.get("runToken")
+    expected_expiry_seconds = _owner_campaign_fresh_seconds(class_id)
+    started = _parse_utc(manifest.get("startedAt"), f"{class_id}.startedAt")
+    ended = _parse_utc(manifest.get("endedAt"), f"{class_id}.endedAt")
+    expires = _parse_utc(manifest.get("expiresAt"), f"{class_id}.expiresAt")
+    now = datetime.now(timezone.utc)
+    if (
+        not _is_exact_integer(manifest.get("schema"), 1)
+        or manifest.get("type") != OWNER_EVIDENCE_SOURCE_TYPES[class_id]
+        or manifest.get("classId") != class_id
+        or not isinstance(token, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", token)
+        or manifest_path.parent.name != token
+        or manifest.get("profile") != PROFILE_OWNER
+        or manifest.get("fullGitSha") != expected_sha
+        or manifest.get("sourceTreeDigest") != _source_tree_digest_for_sha(expected_sha)
+        or manifest.get("gateRegistryHash") != expected_registry_hash
+        or manifest.get("checkoutStateDigest") != expected_checkout_digest
+        or manifest.get("environmentDigest") != _document_digest(expected_environment)
+        or not _is_exact_integer(manifest.get("attemptCount"), 1)
+        or not _is_exact_integer(manifest.get("retryCount"), 0)
+        or not _is_exact_integer(manifest.get("skipCount"), 0)
+        or manifest.get("passed") is not True
+        or manifest.get("failures") != []
+        or ended <= started
+        or ended > now + timedelta(minutes=5)
+        or expires != ended + timedelta(seconds=expected_expiry_seconds)
+        or (require_fresh and now >= expires)
+    ):
+        raise EvidenceError(f"{class_id} source campaign is failed, stale, retried, skipped, or cross-authority")
+    expected_names = OWNER_EVIDENCE_RAW_ARTIFACTS[class_id]
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list) or len(artifacts) != len(expected_names):
+        raise EvidenceError(f"{class_id} source campaign artifact inventory is incomplete")
+    paths: dict[str, Path] = {}
+    for artifact, expected_name in zip(artifacts, expected_names, strict=True):
+        if not isinstance(artifact, dict) or set(artifact) != {"path", "sha256", "bytes"}:
+            raise EvidenceError(f"{class_id} source artifact record is malformed")
+        if artifact.get("path") != expected_name:
+            raise EvidenceError(f"{class_id} source artifact path is omitted, duplicated, or reordered")
+        relative = _safe_owner_evidence_relative(expected_name, label="source artifact path")
+        path = _owner_evidence_path(manifest_path.parent, relative)
+        size = artifact.get("bytes")
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size <= 0
+            or path.stat().st_size != size
+            or sha256_file(path) != artifact.get("sha256")
+        ):
+            raise EvidenceError(f"{class_id} source artifact is missing or hash-substituted")
+        paths[expected_name] = path
+    expected_inventory = {OWNER_EVIDENCE_SOURCE_MANIFEST, *expected_names}
+    if _owner_campaign_file_inventory(manifest_path.parent) != expected_inventory:
+        raise EvidenceError(f"{class_id} source campaign contains an unregistered artifact")
+    _validate_owner_campaign_events(paths[OWNER_EVIDENCE_SOURCE_EVENTS], manifest=manifest)
+    observations = _validate_owner_campaign_semantics(
+        class_id,
+        paths,
+        manifest=manifest,
+        expected_sha=expected_sha,
+        expected_checkout_digest=expected_checkout_digest,
+        require_fresh=require_fresh,
+    )
+    return manifest, paths, observations
+
+
+def _owner_campaign_candidates(
+    class_id: str,
+    *,
+    expected_sha: str,
+    expected_registry_hash: str,
+    expected_checkout_digest: str,
+    expected_environment: dict[str, object],
+) -> list[tuple[datetime, Path]]:
+    class_root = OWNER_EVIDENCE_AUTHORITY_ROOT / class_id
+    if not class_root.is_dir():
+        return []
+    candidates: list[tuple[datetime, Path]] = []
+    for directory in sorted(class_root.iterdir()):
+        if not directory.is_dir() or _is_link_or_junction(directory):
+            raise EvidenceError(f"{class_id} authority root contains an unexpected entry")
+        manifest_path = directory / OWNER_EVIDENCE_SOURCE_MANIFEST
+        if not manifest_path.is_file():
+            events_path = directory / OWNER_EVIDENCE_SOURCE_EVENTS
+            if events_path.is_file():
+                first = _first_strict_json_line(events_path, f"{class_id} incomplete campaign")
+                if (
+                    first.get("fullGitSha") == expected_sha
+                    and first.get("gateRegistryHash") == expected_registry_hash
+                    and first.get("checkoutStateDigest") == expected_checkout_digest
+                    and first.get("environmentDigest") == _document_digest(expected_environment)
+                ):
+                    raise EvidenceError(f"latest exact-authority {class_id} campaign is incomplete")
+            continue
+        value = _load_json_without_duplicate_keys(manifest_path)
+        if not isinstance(value, dict):
+            raise EvidenceError(f"{class_id} source manifest is not an object")
+        if (
+            value.get("fullGitSha") == expected_sha
+            and value.get("gateRegistryHash") == expected_registry_hash
+            and value.get("checkoutStateDigest") == expected_checkout_digest
+            and value.get("environmentDigest") == _document_digest(expected_environment)
+        ):
+            ended = _parse_utc(value.get("endedAt"), f"{class_id}.endedAt")
+            candidates.append((ended, manifest_path))
+    return sorted(candidates, key=lambda item: item[0])
+
+
+def _build_owner_class_evidence(class_id: str, *, profile: str) -> dict[str, object]:
+    if class_id not in OWNER_EVIDENCE_CLASS_GATE_IDS or profile not in PROFILES:
+        raise EvidenceError("owner evidence builder received an unknown class or profile")
+    expected_sha = _full_git_sha()
+    expected_registry_hash = gate_registry_hash()
+    expected_checkout_digest = _checkout_state_digest()
+    expected_environment = _environment_document()
+    candidates = _owner_campaign_candidates(
+        class_id,
+        expected_sha=expected_sha,
+        expected_registry_hash=expected_registry_hash,
+        expected_checkout_digest=expected_checkout_digest,
+        expected_environment=expected_environment,
+    )
+    if not candidates:
+        raise EvidenceError(f"no genuine exact-authority {class_id} campaign input exists")
+    _ended, source_manifest = candidates[-1]
+    manifest, _paths, observations = _validate_owner_source_campaign(
+        class_id,
+        source_manifest,
+        expected_sha=expected_sha,
+        expected_registry_hash=expected_registry_hash,
+        expected_checkout_digest=expected_checkout_digest,
+        expected_environment=expected_environment,
+        require_fresh=True,
+    )
+    token = str(manifest["runToken"])
+    destination = Path(MACHINE_EVIDENCE_DIRECTORY) / class_id / token
+    copied = _copy_owner_campaign_tree(
+        source_manifest.parent,
+        LOG_DIR / destination,
+        (OWNER_EVIDENCE_SOURCE_MANIFEST, *OWNER_EVIDENCE_RAW_ARTIFACTS[class_id]),
+        artifact_root=LOG_DIR,
+    )
+    report = {
+        "schema": 1,
+        "type": "OwnerEvidenceClassAttestationV1",
+        "classId": class_id,
+        "fullGitSha": expected_sha,
+        "gateRegistryHash": expected_registry_hash,
+        "checkoutStateDigest": expected_checkout_digest,
+        "environment": expected_environment,
+        "environmentDigest": _document_digest(expected_environment),
+        "profile": profile,
+        "measuredAt": manifest["endedAt"],
+        "expiresAt": manifest["expiresAt"],
+        "immutableAuthority": "exact-git-commit",
+        "sourceRunToken": token,
+        "sourceManifestSha256": sha256_file(source_manifest),
+        "machineArtifacts": copied,
+        "observations": observations,
+        "passed": True,
+        "failures": [],
+    }
+    _validate_owner_campaign_evidence_document(
+        report,
+        artifact_root=LOG_DIR,
+        class_id=class_id,
+        expected_sha=expected_sha,
+        expected_profile=profile,
+        expected_registry_hash=expected_registry_hash,
+        expected_checkout_digest=expected_checkout_digest,
+        expected_environment=expected_environment,
+    )
+    return report
+
+
+def _exact_nonnegative_int(value: object, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise EvidenceError(f"{label} must be a non-negative integer")
+    return value
+
+
+def _exact_positive_int(value: object, label: str) -> int:
+    integer = _exact_nonnegative_int(value, label)
+    if integer <= 0:
+        raise EvidenceError(f"{label} must be positive")
+    return integer
+
+
+def _finite_number(value: object, label: str, *, minimum: float | None = None) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or (minimum is not None and float(value) < minimum)
+    ):
+        raise EvidenceError(f"{label} is not a finite in-range measurement")
+    return float(value)
+
+
+def _percent(covered: int, total: int) -> float:
+    if total <= 0:
+        return 0.0
+    return math.floor((covered * 10000.0 / total) + 1e-9) / 100.0
+
+
+def _frontend_snapshot(files: Sequence[Path]) -> tuple[list[dict[str, str]], str]:
+    entries = [
+        {
+            "path": path.resolve().relative_to(APP.resolve()).as_posix(),
+            "sha256": sha256_file(path),
+        }
+        # Node's coverage authority uses Array.prototype.sort() over normalized
+        # absolute paths.  Keep the same case-sensitive lexical order here: a
+        # case-folded Windows sort places e.g. src/app.css before
+        # src/App.svelte and therefore rejects a byte-valid producer snapshot.
+        for path in sorted({path.resolve() for path in files}, key=lambda item: str(item))
+    ]
+    digest = hashlib.sha256(
+        "\n".join(f"{item['path']}\0{item['sha256']}" for item in entries).encode("utf-8")
+    ).hexdigest()
+    return entries, digest
+
+
+def _frontend_shipped_sources() -> list[Path]:
+    sources: list[Path] = []
+    for path in (APP / "src").rglob("*"):
+        if not path.is_file() or path.suffix not in {".ts", ".svelte"}:
+            continue
+        name = path.name
+        if name.endswith(".d.ts") or re.search(r"\.(?:test|spec)\.[^.]+$", name):
+            continue
+        sources.append(path)
+    return sorted(sources, key=lambda item: str(item.resolve()).casefold())
+
+
+def _frontend_campaign_inputs() -> list[Path]:
+    files: list[Path] = []
+    for directory in (APP / "src", APP / "e2e", APP / "tests"):
+        files.extend(path for path in directory.rglob("*") if path.is_file())
+    files.extend(
+        [
+            APP / "package.json",
+            APP / "package-lock.json",
+            APP / "playwright.config.ts",
+            APP / "svelte.config.js",
+            APP / "tsconfig.json",
+            APP / "vite.config.ts",
+            APP / "vitest.config.ts",
+            APP / "src-tauri" / "assets" / "couch.html",
+            APP / "scripts" / "frontend_coverage_contract.v1.json",
+            APP / "scripts" / "run_merged_frontend_coverage.mjs",
+        ]
+    )
+    if any(not path.is_file() for path in files):
+        raise EvidenceError("frontend coverage campaign input inventory is incomplete")
+    return files
+
+
+def _istanbul_coverage_summary(value: object) -> tuple[dict[str, dict[str, object]], set[str]]:
+    if not isinstance(value, dict) or not value:
+        raise EvidenceError("frontend coverage map is empty or malformed")
+    counts = {
+        "statements": [0, 0],
+        "branches": [0, 0],
+        "functions": [0, 0],
+        "lines": [0, 0],
+    }
+    observed_paths: set[str] = set()
+    for raw_path, row in value.items():
+        if not isinstance(raw_path, str) or not isinstance(row, dict):
+            raise EvidenceError("frontend coverage row is malformed")
+        canonical_keys = {"path", "statementMap", "fnMap", "branchMap", "s", "f", "b"}
+        if set(row) not in (canonical_keys, canonical_keys | {"meta"}):
+            raise EvidenceError("frontend coverage row has a non-canonical Istanbul shape")
+        meta = row.get("meta")
+        if meta is not None:
+            if not isinstance(meta, dict) or set(meta) != {
+                "lastBranch",
+                "lastFunction",
+                "lastStatement",
+                "seen",
+                "fnNames",
+            }:
+                raise EvidenceError("frontend coverage metadata has a non-canonical Istanbul shape")
+            if any(
+                not isinstance(meta.get(name), int)
+                or isinstance(meta.get(name), bool)
+                or meta.get(name) < 0
+                for name in ("lastBranch", "lastFunction", "lastStatement")
+            ) or not isinstance(meta.get("seen"), dict) or not isinstance(meta.get("fnNames"), dict):
+                raise EvidenceError("frontend coverage metadata is malformed")
+        stated_path = row.get("path")
+        if not isinstance(stated_path, str) or stated_path != raw_path:
+            raise EvidenceError("frontend coverage path authority is substituted")
+        supplied_path = Path(stated_path)
+        path = supplied_path.resolve()
+        if (
+            not supplied_path.is_absolute()
+            or ".." in supplied_path.parts
+            or str(supplied_path) != str(path)
+        ):
+            raise EvidenceError("frontend coverage path is not canonical and alias-free")
+        try:
+            relative = path.relative_to((APP / "src").resolve())
+        except ValueError as error:
+            raise EvidenceError("frontend coverage map contains a non-shipped source") from error
+        if path.suffix not in {".ts", ".svelte"}:
+            raise EvidenceError("frontend coverage map contains an unsupported source type")
+        normalized = relative.as_posix().casefold()
+        if normalized in observed_paths:
+            raise EvidenceError("frontend coverage map duplicates a source file")
+        observed_paths.add(normalized)
+        statement_map = row.get("statementMap")
+        function_map = row.get("fnMap")
+        branch_map = row.get("branchMap")
+        statement_counts = row.get("s")
+        function_counts = row.get("f")
+        branch_counts = row.get("b")
+        if not all(
+            isinstance(item, dict)
+            for item in (
+                statement_map,
+                function_map,
+                branch_map,
+                statement_counts,
+                function_counts,
+                branch_counts,
+            )
+        ):
+            raise EvidenceError("frontend coverage row omits an Istanbul map/count table")
+        if set(statement_map) != set(statement_counts) or set(function_map) != set(function_counts) or set(branch_map) != set(branch_counts):
+            raise EvidenceError("frontend coverage map/count identifiers disagree")
+        for metric, raw_counts in (("statements", statement_counts), ("functions", function_counts)):
+            values = list(raw_counts.values())
+            if any(not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in values):
+                raise EvidenceError(f"frontend {metric} counts are malformed")
+            counts[metric][1] += len(values)
+            counts[metric][0] += sum(1 for item in values if item > 0)
+        flat_branches: list[int] = []
+        for branch_id, branch_value in branch_counts.items():
+            locations = branch_map[branch_id].get("locations") if isinstance(branch_map[branch_id], dict) else None
+            if (
+                not isinstance(branch_value, list)
+                or not isinstance(locations, list)
+                or len(branch_value) != len(locations)
+                or any(not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in branch_value)
+            ):
+                raise EvidenceError("frontend branch counts are malformed")
+            flat_branches.extend(branch_value)
+        counts["branches"][1] += len(flat_branches)
+        counts["branches"][0] += sum(1 for item in flat_branches if item > 0)
+        line_counts: dict[int, int] = {}
+        for statement_id, statement in statement_map.items():
+            if not isinstance(statement, dict) or not isinstance(statement.get("start"), dict):
+                raise EvidenceError("frontend statement location is malformed")
+            line = statement["start"].get("line")
+            count = statement_counts[statement_id]
+            if not isinstance(line, int) or isinstance(line, bool) or line <= 0:
+                raise EvidenceError("frontend statement line is malformed")
+            line_counts[line] = max(line_counts.get(line, 0), count)
+        counts["lines"][1] += len(line_counts)
+        counts["lines"][0] += sum(1 for item in line_counts.values() if item > 0)
+    summary = {
+        metric: {
+            "total": total,
+            "covered": covered,
+            "skipped": 0,
+            "pct": _percent(covered, total),
+        }
+        for metric, (covered, total) in counts.items()
+    }
+    return summary, observed_paths
+
+
+def _validate_frontend_coverage_raw_authority(
+    manifest_path: Path,
+    bundle_path: Path,
+    *,
+    evidence: dict[str, object],
+    source_entries: list[dict[str, str]],
+    source_digest: str,
+    campaign_entries: list[dict[str, str]],
+    campaign_digest: str,
+) -> None:
+    """Bind the fixed raw container and producer authorities before replay is considered.
+
+    This deliberately does not elevate the coverage class to PASS: independently unpacking and
+    replaying the raw unit/Playwright/V8 inputs remains mandatory at the terminal fail-closed
+    boundary below.  It does ensure a future consumer cannot omit the raw bytes or substitute the
+    runner/configuration that created them.
+    """
+
+    value = _load_json_without_duplicate_keys(manifest_path)
+    expected_keys = {
+        "schema",
+        "type",
+        "runToken",
+        "sourceTree",
+        "campaignInputs",
+        "authorities",
+        "runtime",
+        "commands",
+        "bundle",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected_keys
+        or not _is_exact_integer(value.get("schema"), 1)
+        or value.get("type") != "FrontendCoverageRawAuthorityV1"
+        or value.get("runToken") != evidence.get("runToken")
+        or not _json_values_exact(
+            value.get("sourceTree"), {"entries": source_entries, "sha256": source_digest}
+        )
+        or not _json_values_exact(
+            value.get("campaignInputs"),
+            {"entries": campaign_entries, "sha256": campaign_digest},
+        )
+    ):
+        raise EvidenceError("frontend raw coverage authority is stale or non-canonical")
+    authority_paths = {
+        "contract": "scripts/frontend_coverage_contract.v1.json",
+        "runner": "scripts/run_merged_frontend_coverage.mjs",
+        "packageLock": "package-lock.json",
+        "vitestConfig": "vitest.config.ts",
+        "playwrightConfig": "playwright.config.ts",
+    }
+    expected_authorities = {
+        role: {
+            "path": relative,
+            "sha256": sha256_file(APP / PurePosixPath(relative)),
+        }
+        for role, relative in authority_paths.items()
+    }
+    if not _json_values_exact(value.get("authorities"), expected_authorities):
+        raise EvidenceError("frontend raw coverage producer/config authority is substituted")
+    runtime = value.get("runtime")
+    if (
+        not isinstance(runtime, dict)
+        or set(runtime) != {"node", "platform", "architecture"}
+        or any(not isinstance(runtime.get(field), str) or not runtime[field] for field in runtime)
+    ):
+        raise EvidenceError("frontend raw coverage runtime identity is malformed")
+    commands = value.get("commands")
+    if not isinstance(commands, list) or len(commands) != 2:
+        raise EvidenceError("frontend raw coverage command registry is incomplete")
+    for index, command in enumerate(commands):
+        if (
+            not isinstance(command, dict)
+            or set(command) != {"argv", "cwd", "environment", "logPath", "status", "signal"}
+            or command.get("cwd") != "."
+            or not _is_exact_integer(command.get("status"), 0)
+            or command.get("signal") is not None
+            or not isinstance(command.get("argv"), list)
+            or not command["argv"]
+            or any(not isinstance(argument, str) or not argument for argument in command["argv"])
+            or not isinstance(command.get("environment"), dict)
+            or not isinstance(command.get("logPath"), str)
+        ):
+            raise EvidenceError("frontend raw coverage command record is malformed")
+        joined = "\0".join(command["argv"])
+        if index == 0 and ("vitest" not in joined.casefold() or "--coverage" not in command["argv"]):
+            raise EvidenceError("frontend raw unit-coverage command is substituted")
+        if index == 1 and not {
+            "--project=chromium",
+            "--workers=1",
+            "--retries=0",
+            "--reporter=line,json",
+        }.issubset(set(command["argv"])):
+            raise EvidenceError("frontend raw Playwright command is retried or substituted")
+    bundle = value.get("bundle")
+    if (
+        not isinstance(bundle, dict)
+        or set(bundle) != {"format", "sha256", "bytes", "entries"}
+        or bundle.get("format") != "CORTEX_FRONTEND_COVERAGE_RAW_V1"
+        or bundle.get("sha256") != sha256_file(bundle_path)
+        or not _is_exact_integer(bundle.get("bytes"), bundle_path.stat().st_size)
+        or not isinstance(bundle.get("entries"), list)
+        or not bundle["entries"]
+    ):
+        raise EvidenceError("frontend raw coverage bundle identity is substituted")
+    with bundle_path.open("rb") as stream:
+        if stream.read(len(b"CORTEX_FRONTEND_COVERAGE_RAW_V1\n")) != b"CORTEX_FRONTEND_COVERAGE_RAW_V1\n":
+            raise EvidenceError("frontend raw coverage bundle has the wrong format marker")
+    previous_path: str | None = None
+    for row in bundle["entries"]:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"bytes", "path", "sha256"}
+            or not isinstance(row.get("path"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(row.get("sha256", "")))
+            or not isinstance(row.get("bytes"), int)
+            or isinstance(row.get("bytes"), bool)
+            or row["bytes"] < 0
+            or (previous_path is not None and row["path"] <= previous_path)
+        ):
+            raise EvidenceError("frontend raw coverage bundle index is malformed or duplicated")
+        _safe_owner_evidence_relative(row["path"], label="frontend raw bundle entry")
+        previous_path = row["path"]
+
+
+FRONTEND_COVERAGE_REPLAY_TIMEOUT_SECONDS = 600
+FRONTEND_COVERAGE_REPLAY_RUNNER = APP / "scripts" / "run_merged_frontend_coverage.mjs"
+
+
+def _validate_frontend_replay_summary(
+    value: object,
+    expected: dict[str, dict[str, object]],
+    *,
+    label: str,
+) -> None:
+    if not isinstance(value, dict) or set(value) != set(expected):
+        raise EvidenceError(f"frontend coverage replay {label} metric set is malformed")
+    for metric, expected_row in expected.items():
+        row = value[metric]
+        if not isinstance(row, dict) or set(row) != {"total", "covered", "skipped", "pct"}:
+            raise EvidenceError(f"frontend coverage replay {label}/{metric} row is malformed")
+        total = _exact_nonnegative_int(row.get("total"), f"{label}/{metric}.total")
+        covered = _exact_nonnegative_int(row.get("covered"), f"{label}/{metric}.covered")
+        skipped = _exact_nonnegative_int(row.get("skipped"), f"{label}/{metric}.skipped")
+        pct_value = row.get("pct")
+        if isinstance(pct_value, bool):
+            raise EvidenceError(f"frontend coverage replay {label}/{metric} pct is boolean")
+        pct = _finite_number(pct_value, f"{label}/{metric}.pct", minimum=0)
+        if (
+            total != expected_row["total"]
+            or covered != expected_row["covered"]
+            or skipped != expected_row["skipped"]
+            or pct != float(expected_row["pct"])
+        ):
+            raise EvidenceError(
+                f"frontend coverage replay {label}/{metric} contradicts the independently derived map"
+            )
+
+
+def _run_frontend_coverage_replay(
+    paths: dict[str, Path],
+    *,
+    evidence: dict[str, object],
+    source_digest: str,
+    campaign_digest: str,
+    summary: dict[str, dict[str, object]],
+    critical_summaries: dict[str, dict[str, dict[str, object]]],
+) -> dict[str, object]:
+    """Replay copied V8/unit authorities through the exact checked-in Node producer."""
+
+    manifest_path = paths["frontend/frontend-coverage-raw-manifest.json"]
+    bundle_path = paths["frontend/frontend-coverage-raw.v1.bin"]
+    node_executable_value = shutil.which("node")
+    try:
+        manifest_parent = manifest_path.resolve(strict=True).parent
+        bundle_parent = bundle_path.resolve(strict=True).parent
+        runner = FRONTEND_COVERAGE_REPLAY_RUNNER.resolve(strict=True)
+        node_executable = (
+            Path(node_executable_value).resolve(strict=True)
+            if node_executable_value is not None
+            else None
+        )
+    except (OSError, RuntimeError) as error:
+        raise EvidenceError("frontend coverage replay authority is absent or not canonical") from error
+    if (
+        manifest_path.name != "frontend-coverage-raw-manifest.json"
+        or bundle_path.name != "frontend-coverage-raw.v1.bin"
+        or manifest_parent != bundle_parent
+        or _is_link_or_junction(manifest_path)
+        or _is_link_or_junction(bundle_path)
+        or _is_link_or_junction(FRONTEND_COVERAGE_REPLAY_RUNNER)
+        or not runner.is_file()
+        or node_executable is None
+        or not node_executable.is_file()
+    ):
+        raise EvidenceError("frontend coverage replay inputs or runtime are substituted")
+
+    # Bind the subprocess to the same immutable bytes that this verifier inspected.  Merely
+    # comparing the child's reported hashes with the paths after it exits leaves a swap window:
+    # a different manifest/bundle can replace the validated pair during replay and become the
+    # pair that both the child and the post-run checks observe.
+    frontend_manifest_sha256 = sha256_file(manifest_path)
+    frontend_bundle_sha256 = sha256_file(bundle_path)
+    frontend_bundle_bytes = bundle_path.stat().st_size
+
+    with tempfile.TemporaryDirectory(prefix="cortex-frontend-coverage-terminal-") as temporary:
+        temporary_parent = Path(temporary).resolve(strict=True)
+        argv = [
+            str(node_executable),
+            str(runner),
+            "--replay",
+            "--manifest",
+            str(manifest_path.resolve(strict=True)),
+            "--bundle",
+            str(bundle_path.resolve(strict=True)),
+            "--temporary-parent",
+            str(temporary_parent),
+        ]
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=APP,
+                shell=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="strict",
+                timeout=FRONTEND_COVERAGE_REPLAY_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise EvidenceError("frontend coverage raw replay exceeded its explicit timeout") from error
+        except (OSError, UnicodeError) as error:
+            raise EvidenceError(
+                "frontend coverage raw replay could not produce a UTF-8 terminal result"
+            ) from error
+    if completed.returncode != 0:
+        raise EvidenceError("frontend coverage raw replay returned a nonzero status")
+    if completed.stderr:
+        raise EvidenceError("frontend coverage raw replay emitted unexpected stderr")
+    try:
+        frontend_inputs_unchanged = (
+            sha256_file(manifest_path) == frontend_manifest_sha256
+            and sha256_file(bundle_path) == frontend_bundle_sha256
+            and bundle_path.stat().st_size == frontend_bundle_bytes
+        )
+    except OSError as error:
+        raise EvidenceError("frontend coverage raw replay inputs disappeared during replay") from error
+    if not frontend_inputs_unchanged:
+        raise EvidenceError("frontend coverage raw replay inputs changed during replay")
+    try:
+        replay = json.loads(
+            completed.stdout,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON number {token!r}")
+            ),
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise EvidenceError("frontend coverage raw replay emitted malformed JSON") from error
+    canonical_stdout = (
+        json.dumps(replay, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    expected_keys = {
+        "schema",
+        "type",
+        "certificationEligible",
+        "runToken",
+        "sourceTreeSha256",
+        "campaignInputsSha256",
+        "manifestSha256",
+        "bundleSha256",
+        "fullE2ETests",
+        "instrumentedE2ETests",
+        "e2eRawFiles",
+        "e2eConvertedSourceFiles",
+        "summary",
+        "criticalDomains",
+    }
+    expected_full_e2e = _exact_nonnegative_int(evidence.get("fullE2ETests"), "fullE2ETests")
+    expected_instrumented_e2e = _exact_nonnegative_int(
+        evidence.get("instrumentedE2ETests"), "instrumentedE2ETests"
+    )
+    expected_raw_files = _exact_nonnegative_int(evidence.get("e2eRawFiles"), "e2eRawFiles")
+    expected_converted_files = _exact_nonnegative_int(
+        evidence.get("e2eConvertedSourceFiles"), "e2eConvertedSourceFiles"
+    )
+    if (
+        not isinstance(replay, dict)
+        or set(replay) != expected_keys
+        or completed.stdout != canonical_stdout
+        or not _is_exact_integer(replay.get("schema"), 1)
+        or replay.get("type") != "FrontendCoverageReplayV1"
+        or replay.get("certificationEligible") is not True
+        or replay.get("runToken") != evidence.get("runToken")
+        or replay.get("sourceTreeSha256") != source_digest
+        or replay.get("campaignInputsSha256") != campaign_digest
+        or replay.get("manifestSha256") != frontend_manifest_sha256
+        or replay.get("bundleSha256") != frontend_bundle_sha256
+        or not _is_exact_integer(replay.get("fullE2ETests"), expected_full_e2e)
+        or not _is_exact_integer(
+            replay.get("instrumentedE2ETests"), expected_instrumented_e2e
+        )
+        or not _is_exact_integer(replay.get("e2eRawFiles"), expected_raw_files)
+        or not _is_exact_integer(
+            replay.get("e2eConvertedSourceFiles"), expected_converted_files
+        )
+    ):
+        raise EvidenceError(
+            "frontend coverage raw replay terminal result is malformed or authority-substituted"
+        )
+    _validate_frontend_replay_summary(replay.get("summary"), summary, label="global")
+    replay_critical = replay.get("criticalDomains")
+    if not isinstance(replay_critical, dict) or set(replay_critical) != set(critical_summaries):
+        raise EvidenceError("frontend coverage raw replay critical-domain set is malformed")
+    for domain, domain_summary in critical_summaries.items():
+        _validate_frontend_replay_summary(
+            replay_critical[domain],
+            domain_summary,
+            label=f"critical/{domain}",
+        )
+    return replay
+
+
+OWNER_MUTATION_REPLAY_TIMEOUT_SECONDS = 600
+OWNER_MUTATION_REPLAY_RUNNER = APP / "scripts" / "run_owner_mutation_campaign.py"
+_FRONTEND_MUTATION_DOMAIN_SOURCES = {
+    "audio-state-machine": {"src/lib/audioMachine.ts"},
+    "review-truth-reducers": {
+        "src/lib/reviewCommitOperation.ts",
+        "src/lib/reviewCommitResult.ts",
+    },
+}
+
+
+def _validate_replayed_mutation_observation(
+    value: object,
+    *,
+    backend: bool,
+) -> dict[str, object]:
+    """Validate the terminal replay projection without trusting either summary report."""
+
+    label = "backend" if backend else "frontend"
+    required_domains = (
+        set(_rust_quality_module().CRITICAL_COVERAGE_DOMAINS)
+        if backend
+        else set(_FRONTEND_MUTATION_DOMAIN_SOURCES)
+    )
+    if not isinstance(value, dict) or set(value) != {"mutants", "killed", "domains"}:
+        raise EvidenceError(f"mutation raw replay {label} observation is malformed")
+    mutants = _exact_positive_int(value.get("mutants"), f"{label} replay mutants")
+    killed = _exact_nonnegative_int(value.get("killed"), f"{label} replay killed")
+    domains = value.get("domains")
+    if killed > mutants or not isinstance(domains, dict) or set(domains) != required_domains:
+        raise EvidenceError(f"mutation raw replay {label} inventory/domain set is malformed")
+    minimum = 90.0 if backend else 80.0
+    normalized_domains: dict[str, dict[str, object]] = {}
+    for domain in sorted(required_domains):
+        row = domains[domain]
+        if not isinstance(row, dict) or set(row) != {"mutants", "killed", "scorePercent"}:
+            raise EvidenceError(f"mutation raw replay {label}/{domain} row is malformed")
+        domain_mutants = _exact_positive_int(
+            row.get("mutants"), f"{label}/{domain} replay mutants"
+        )
+        domain_killed = _exact_nonnegative_int(
+            row.get("killed"), f"{label}/{domain} replay killed"
+        )
+        score_value = row.get("scorePercent")
+        if type(score_value) is not float:
+            raise EvidenceError(f"mutation raw replay {label}/{domain} score is not an exact float")
+        score = _finite_number(
+            score_value,
+            f"{label}/{domain} replay score",
+            minimum=0,
+        )
+        expected_score = domain_killed * 100.0 / domain_mutants
+        if (
+            domain_killed > domain_mutants
+            or domain_mutants > mutants
+            or domain_killed > killed
+            or score != expected_score
+            or score + 1e-12 < minimum
+        ):
+            raise EvidenceError(
+                f"mutation raw replay {label}/{domain} is contradictory or below {minimum:g}%"
+            )
+        normalized_domains[domain] = {
+            "mutants": domain_mutants,
+            "killed": domain_killed,
+            "scorePercent": score,
+        }
+    if not backend and (
+        sum(int(row["mutants"]) for row in normalized_domains.values()) != mutants
+        or sum(int(row["killed"]) for row in normalized_domains.values()) != killed
+    ):
+        raise EvidenceError("frontend mutation raw replay aggregate contradicts its disjoint domains")
+    return {
+        "mutants": mutants,
+        "killed": killed,
+        "domains": normalized_domains,
+    }
+
+
+def _run_owner_mutation_replay(
+    paths: dict[str, Path],
+    *,
+    expected_sha: str,
+    expected_checkout_digest: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Run the checked-in raw mutation replayer and validate its sole terminal JSON result."""
+
+    manifest_path = paths["mutation/owner-mutation-raw-manifest.json"]
+    bundle_path = paths["mutation/owner-mutation-raw.v1.bin"]
+    try:
+        manifest_parent = manifest_path.resolve(strict=True).parent
+        bundle_parent = bundle_path.resolve(strict=True).parent
+        runner = OWNER_MUTATION_REPLAY_RUNNER.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise EvidenceError("mutation raw replay authority is absent or not canonical") from error
+    if (
+        manifest_path.name != "owner-mutation-raw-manifest.json"
+        or bundle_path.name != "owner-mutation-raw.v1.bin"
+        or manifest_parent != bundle_parent
+        or _is_link_or_junction(manifest_path)
+        or _is_link_or_junction(bundle_path)
+        or _is_link_or_junction(OWNER_MUTATION_REPLAY_RUNNER)
+        or not runner.is_file()
+    ):
+        raise EvidenceError("mutation raw replay inputs are aliased, separated, or substituted")
+
+    raw_manifest = _load_json_without_duplicate_keys(manifest_path)
+    expected_manifest_keys = {
+        "schema",
+        "type",
+        "runToken",
+        "scope",
+        "certificationEligible",
+        "fullGitSha",
+        "checkoutStateDigest",
+        "contractSha256",
+        "campaignSha256",
+        "authorities",
+        "tools",
+        "runtime",
+        "bundle",
+    }
+    raw_bundle = raw_manifest.get("bundle") if isinstance(raw_manifest, dict) else None
+    mutation_manifest_sha256 = sha256_file(manifest_path)
+    mutation_bundle_sha256 = sha256_file(bundle_path)
+    mutation_bundle_bytes = bundle_path.stat().st_size
+    if (
+        not isinstance(raw_manifest, dict)
+        or set(raw_manifest) != expected_manifest_keys
+        or not _is_exact_integer(raw_manifest.get("schema"), 1)
+        or raw_manifest.get("type") != "OwnerMutationRawAuthorityV1"
+        or raw_manifest.get("scope") != ["backend", "frontend"]
+        or raw_manifest.get("certificationEligible") is not True
+        or raw_manifest.get("fullGitSha") != expected_sha
+        or raw_manifest.get("checkoutStateDigest") != expected_checkout_digest
+        or not isinstance(raw_bundle, dict)
+        or raw_bundle.get("sha256") != mutation_bundle_sha256
+        or not _is_exact_integer(raw_bundle.get("bytes"), mutation_bundle_bytes)
+    ):
+        raise EvidenceError(
+            "mutation raw authority is malformed, cross-SHA, dirty, partial-scope, or non-certifying"
+        )
+
+    argv = [
+        sys.executable,
+        str(runner),
+        "--output",
+        str(manifest_parent),
+        "--replay",
+    ]
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=APP,
+            shell=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=OWNER_MUTATION_REPLAY_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise EvidenceError("mutation raw replay exceeded its explicit timeout") from error
+    except (OSError, UnicodeError) as error:
+        raise EvidenceError("mutation raw replay could not produce a UTF-8 terminal result") from error
+    if completed.returncode != 0:
+        raise EvidenceError("mutation raw replay returned a nonzero status")
+    if completed.stderr:
+        raise EvidenceError("mutation raw replay emitted unexpected stderr")
+    try:
+        mutation_inputs_unchanged = (
+            sha256_file(manifest_path) == mutation_manifest_sha256
+            and sha256_file(bundle_path) == mutation_bundle_sha256
+            and bundle_path.stat().st_size == mutation_bundle_bytes
+        )
+    except OSError as error:
+        raise EvidenceError("mutation raw replay inputs disappeared during replay") from error
+    if not mutation_inputs_unchanged:
+        raise EvidenceError("mutation raw replay inputs changed during replay")
+    try:
+        replay = json.loads(
+            completed.stdout,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON number {token!r}")
+            ),
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise EvidenceError("mutation raw replay emitted malformed JSON") from error
+    canonical_stdout = json.dumps(replay, ensure_ascii=False, sort_keys=True) + "\n"
+    expected_replay_keys = {
+        "fullGitSha",
+        "scope",
+        "certificationEligible",
+        "observations",
+        "manifestSha256",
+        "bundleSha256",
+    }
+    observations = replay.get("observations") if isinstance(replay, dict) else None
+    if (
+        not isinstance(replay, dict)
+        or set(replay) != expected_replay_keys
+        or completed.stdout != canonical_stdout
+        or replay.get("fullGitSha") != expected_sha
+        or replay.get("scope") != ["backend", "frontend"]
+        or replay.get("certificationEligible") is not True
+        or replay.get("manifestSha256") != mutation_manifest_sha256
+        or replay.get("bundleSha256") != mutation_bundle_sha256
+        or not isinstance(observations, dict)
+        or set(observations) != {"backend", "frontend"}
+    ):
+        raise EvidenceError("mutation raw replay terminal result is malformed or authority-substituted")
+    replay["observations"] = {
+        "backend": _validate_replayed_mutation_observation(
+            observations["backend"], backend=True
+        ),
+        "frontend": _validate_replayed_mutation_observation(
+            observations["frontend"], backend=False
+        ),
+    }
+    return replay, raw_manifest
+
+
+def _validate_mutation_report(
+    path: Path,
+    *,
+    backend: bool,
+    expected_sha: str,
+    expected_checkout_digest: str,
+    require_fresh: bool,
+    replay: dict[str, object] | None = None,
+    raw_manifest: dict[str, object] | None = None,
+) -> dict[str, object]:
+    value = _load_json_without_duplicate_keys(path)
+    expected_keys = {
+        "schema",
+        "type",
+        "fullGitSha",
+        "sourceTreeDigest",
+        "checkoutStateDigest",
+        "startedAt",
+        "endedAt",
+        "expiresAt",
+        "attemptCount",
+        "retryCount",
+        "skipCount",
+        "tool",
+        "mutants",
+    }
+    expected_type = "BackendCriticalMutationReportV1" if backend else "FrontendReducerMutationReportV1"
+    if replay is not None or raw_manifest is not None:
+        if replay is None or raw_manifest is None:
+            raise EvidenceError(f"{expected_type} has only a partial raw replay binding")
+        expected_keys.update(
+            {
+                "rawAuthorityManifestSha256",
+                "rawAuthorityBundleSha256",
+                "observation",
+            }
+        )
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise EvidenceError(f"{expected_type} has a non-canonical envelope")
+    started = _parse_utc(value.get("startedAt"), f"{expected_type}.startedAt")
+    ended = _parse_utc(value.get("endedAt"), f"{expected_type}.endedAt")
+    expires = _parse_utc(value.get("expiresAt"), f"{expected_type}.expiresAt")
+    now = datetime.now(timezone.utc)
+    if (
+        not _is_exact_integer(value.get("schema"), 1)
+        or value.get("type") != expected_type
+        or value.get("fullGitSha") != expected_sha
+        or value.get("sourceTreeDigest") != _source_tree_digest_for_sha(expected_sha)
+        or value.get("checkoutStateDigest") != expected_checkout_digest
+        or not _is_exact_integer(value.get("attemptCount"), 1)
+        or not _is_exact_integer(value.get("retryCount"), 0)
+        or not _is_exact_integer(value.get("skipCount"), 0)
+        or ended <= started
+        or ended > now + timedelta(minutes=5)
+        or expires != ended + timedelta(seconds=OWNER_EVIDENCE_FRESH_SECONDS)
+        or (require_fresh and now >= expires)
+    ):
+        raise EvidenceError(f"{expected_type} is stale, retried, skipped, or cross-SHA")
+    tool = value.get("tool")
+    expected_tool = "cargo-mutants" if backend else "frontend-mutation-runner"
+    if (
+        not isinstance(tool, dict)
+        or set(tool) != {"name", "version", "commandRegistrySha256"}
+        or tool.get("name") != expected_tool
+        or not isinstance(tool.get("version"), str)
+        or not tool.get("version")
+        or not re.fullmatch(r"[0-9a-f]{64}", str(tool.get("commandRegistrySha256", "")))
+    ):
+        raise EvidenceError(f"{expected_type} has no exact tool/command authority")
+    mutants = value.get("mutants")
+    if not isinstance(mutants, list) or not mutants:
+        raise EvidenceError(f"{expected_type} contains no measured mutants")
+    allowed_outcomes = {"KILLED", "SURVIVED", "TIMEOUT", "BUILD_ERROR", "EXCLUDED_UNEXPLAINED"}
+    required_domains = (
+        set(_rust_quality_module().CRITICAL_COVERAGE_DOMAINS)
+        if backend
+        else set(_FRONTEND_MUTATION_DOMAIN_SOURCES)
+    )
+    by_domain: dict[str, list[str]] = {domain: [] for domain in required_domains}
+    identifiers: set[str] = set()
+    for mutant in mutants:
+        if not isinstance(mutant, dict) or set(mutant) != {"id", "domain", "sourcePath", "outcome"}:
+            raise EvidenceError(f"{expected_type} mutant row is malformed")
+        identifier = mutant.get("id")
+        domain = mutant.get("domain")
+        source_path = mutant.get("sourcePath")
+        outcome = mutant.get("outcome")
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or identifier in identifiers
+            or domain not in required_domains
+            or not isinstance(source_path, str)
+            or not source_path
+            or outcome not in allowed_outcomes
+        ):
+            raise EvidenceError(f"{expected_type} mutant identity/domain/outcome is invalid or duplicated")
+        relative = _safe_owner_evidence_relative(source_path, label="mutation source path")
+        source = _owner_evidence_path(REPO_ROOT, relative)
+        if not source.is_file():
+            raise EvidenceError(f"{expected_type} mutant source is absent from the exact checkout")
+        if backend:
+            patterns = _rust_quality_module().CRITICAL_COVERAGE_DOMAINS[str(domain)]
+            app_relative = source.relative_to(APP).as_posix()
+            if not any(PurePosixPath(app_relative).match(pattern) for pattern in patterns):
+                raise EvidenceError("backend mutant escaped its declared critical domain")
+        else:
+            app_relative = source.relative_to(APP).as_posix()
+            if app_relative not in _FRONTEND_MUTATION_DOMAIN_SOURCES[str(domain)]:
+                raise EvidenceError("frontend mutant escaped its declared critical reducer domain")
+        identifiers.add(identifier)
+        by_domain[str(domain)].append(str(outcome))
+    if any(not rows for rows in by_domain.values()):
+        raise EvidenceError(f"{expected_type} omits a mandatory mutation domain")
+    minimum = 90.0 if backend else 80.0
+    domain_results: list[dict[str, object]] = []
+    for domain in sorted(by_domain):
+        rows = by_domain[domain]
+        killed = rows.count("KILLED")
+        rate = killed * 100.0 / len(rows)
+        if rate + 1e-12 < minimum:
+            raise EvidenceError(f"{expected_type} domain {domain} is below the locked {minimum:g}% floor")
+        domain_results.append(
+            {
+                "domain": domain,
+                "mutants": len(rows),
+                "killed": killed,
+                "scorePercent": rate,
+                "requiredPercent": minimum,
+            }
+        )
+    if replay is None or raw_manifest is None:
+        _reject_unbacked_owner_evidence(
+            "coverage-and-mutation-thresholds",
+            f"native {expected_tool} inventory, per-mutant outcome, command registry, and runner log",
+        )
+    replay_observations = replay.get("observations")
+    replay_label = "backend" if backend else "frontend"
+    replay_observation = (
+        replay_observations.get(replay_label)
+        if isinstance(replay_observations, dict)
+        else None
+    )
+    raw_tools = raw_manifest.get("tools")
+    expected_version = (
+        raw_tools.get("cargoMutants" if backend else "stryker")
+        if isinstance(raw_tools, dict)
+        else None
+    )
+    if (
+        not isinstance(replay_observation, dict)
+        or value.get("rawAuthorityManifestSha256") != replay.get("manifestSha256")
+        or value.get("rawAuthorityBundleSha256") != replay.get("bundleSha256")
+        or not _json_values_exact(value.get("observation"), replay_observation)
+        or len(mutants) != replay_observation.get("mutants")
+        or sum(1 for item in mutants if item["outcome"] == "KILLED")
+        != replay_observation.get("killed")
+        or tool.get("version") != expected_version
+        or tool.get("commandRegistrySha256") != raw_manifest.get("campaignSha256")
+    ):
+        raise EvidenceError(f"{expected_type} is not an exact projection of the raw replay authority")
+    return {
+        "type": expected_type,
+        "mutants": replay_observation["mutants"],
+        "killed": replay_observation["killed"],
+        "domains": replay_observation["domains"],
+        "rawAuthorityManifestSha256": replay["manifestSha256"],
+        "rawAuthorityBundleSha256": replay["bundleSha256"],
+        "endedAt": value["endedAt"],
+        "expiresAt": value["expiresAt"],
+    }
+
+
+def _validate_coverage_mutation_semantics(
+    paths: dict[str, Path],
+    *,
+    manifest: dict[str, object],
+    expected_sha: str,
+    expected_checkout_digest: str,
+    require_fresh: bool,
+) -> dict[str, object]:
+    rust_manifest = paths["rust/rust-coverage-manifest.json"]
+    rust = _validate_rust_coverage_phase(
+        rust_manifest,
+        expected_sha=expected_sha,
+        expected_checkout_digest=expected_checkout_digest,
+        require_fresh=require_fresh,
+        require_current_environment=False,
+    )
+    if rust.get("coverage", {}).get("passed") is not True:
+        raise EvidenceError("embedded Rust coverage is below a locked global or critical-domain floor")
+    contract_path = paths["frontend/frontend-coverage-contract.v1.json"]
+    contract = _load_json_without_duplicate_keys(contract_path)
+    committed_contract = _load_json_without_duplicate_keys(
+        APP / "scripts" / "frontend_coverage_contract.v1.json"
+    )
+    committed_contract_path = APP / "scripts" / "frontend_coverage_contract.v1.json"
+    locked_thresholds = {"statements": 85, "branches": 80, "functions": 80, "lines": 85}
+    locked_critical_thresholds = {
+        "statements": 95,
+        "branches": 90,
+        "functions": 90,
+        "lines": 95,
+    }
+    locked_critical_domains = {
+        "audio-state-machine": ["src/lib/audioMachine.ts"],
+        "review-truth-reducers": [
+            "src/lib/reviewCommitOperation.ts",
+            "src/lib/reviewCommitResult.ts",
+        ],
+    }
+    if (
+        contract != committed_contract
+        or sha256_file(contract_path) != sha256_file(committed_contract_path)
+        or not isinstance(contract, dict)
+        or not _is_exact_integer(contract.get("schema"), 1)
+        or contract.get("thresholds") != locked_thresholds
+        or contract.get("criticalThresholds") != locked_critical_thresholds
+        or contract.get("criticalDomains") != locked_critical_domains
+    ):
+        raise EvidenceError("frontend coverage contract is substituted or relaxed")
+    evidence = _load_json_without_duplicate_keys(
+        paths["frontend/frontend-coverage-evidence.json"]
+    )
+    expected_evidence_keys = {
+        "schema",
+        "runToken",
+        "contractSha256",
+        "sourceTreeSha256",
+        "campaignInputsSha256",
+        "unitCoverageSha256",
+        "playwrightReportSha256",
+        "rawCoverageSha256",
+        "browserCoverageSha256",
+        "mergedCoverageSha256",
+        "rawAuthorityManifestSha256",
+        "rawAuthorityBundleSha256",
+        "shippedSourceFiles",
+        "fullE2ETests",
+        "instrumentedE2ETests",
+        "e2eRawFiles",
+        "e2eConvertedSourceFiles",
+        "semanticMapMatch",
+        "summary",
+        "criticalDomains",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != expected_evidence_keys:
+        raise EvidenceError("frontend coverage evidence has a non-canonical envelope")
+    if (
+        not _is_exact_integer(evidence.get("schema"), 1)
+        or not isinstance(evidence.get("runToken"), str)
+        or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", str(evidence.get("runToken")))
+        or evidence.get("contractSha256") != sha256_file(contract_path)
+        or evidence.get("mergedCoverageSha256")
+        != sha256_file(paths["frontend/coverage-final.json"])
+        or evidence.get("rawAuthorityManifestSha256")
+        != sha256_file(paths["frontend/frontend-coverage-raw-manifest.json"])
+        or evidence.get("rawAuthorityBundleSha256")
+        != sha256_file(paths["frontend/frontend-coverage-raw.v1.bin"])
+    ):
+        raise EvidenceError("frontend coverage evidence has no exact contract/run/merged-map identity")
+    shipped = _frontend_shipped_sources()
+    source_entries, source_digest = _frontend_snapshot(shipped)
+    campaign_entries, campaign_digest = _frontend_snapshot(_frontend_campaign_inputs())
+    if (
+        evidence.get("sourceTreeSha256") != source_digest
+        or evidence.get("campaignInputsSha256") != campaign_digest
+        or evidence.get("shippedSourceFiles") != len(shipped)
+    ):
+        raise EvidenceError("frontend coverage evidence is stale for the exact shipped source/input tree")
+    _validate_frontend_coverage_raw_authority(
+        paths["frontend/frontend-coverage-raw-manifest.json"],
+        paths["frontend/frontend-coverage-raw.v1.bin"],
+        evidence=evidence,
+        source_entries=source_entries,
+        source_digest=source_digest,
+        campaign_entries=campaign_entries,
+        campaign_digest=campaign_digest,
+    )
+    coverage_map = _load_json_without_duplicate_keys(paths["frontend/coverage-final.json"])
+    summary, observed = _istanbul_coverage_summary(coverage_map)
+    expected_sources = {
+        path.resolve().relative_to((APP / "src").resolve()).as_posix().casefold()
+        for path in shipped
+    }
+    if observed != expected_sources:
+        raise EvidenceError("frontend coverage map omits or adds a shipped source file")
+    raw_rows_by_path = {
+        Path(raw_path).resolve(): row for raw_path, row in coverage_map.items()
+    }
+    critical_summaries: dict[str, dict[str, dict[str, object]]] = {}
+    for domain, relative_sources in locked_critical_domains.items():
+        domain_map: dict[str, object] = {}
+        for relative_source in relative_sources:
+            source_path = (APP / relative_source).resolve()
+            row = raw_rows_by_path.get(source_path)
+            if row is None:
+                raise EvidenceError(
+                    f"frontend critical domain {domain} omits {relative_source}"
+                )
+            domain_map[str(source_path)] = row
+        domain_summary, domain_observed = _istanbul_coverage_summary(domain_map)
+        expected_domain_sources = {
+            (APP / relative_source)
+            .resolve()
+            .relative_to((APP / "src").resolve())
+            .as_posix()
+            .casefold()
+            for relative_source in relative_sources
+        }
+        if domain_observed != expected_domain_sources:
+            raise EvidenceError(f"frontend critical domain {domain} source set is substituted")
+        for metric, required in locked_critical_thresholds.items():
+            row = domain_summary[metric]
+            if row["total"] <= 0 or float(row["pct"]) < required:
+                raise EvidenceError(
+                    f"frontend critical {domain} {metric} is below {required}%"
+                )
+        critical_summaries[domain] = domain_summary
+    summary_document = _load_json_without_duplicate_keys(paths["frontend/coverage-summary.json"])
+    if not isinstance(summary_document, dict) or summary_document.get("total") != {
+        **summary,
+        "branchesTrue": {"total": 0, "covered": 0, "skipped": 0, "pct": 100},
+    }:
+        raise EvidenceError("frontend coverage summary is not derivable from the raw Istanbul map")
+    evidence_summary = evidence.get("summary")
+    if not isinstance(evidence_summary, dict):
+        raise EvidenceError("frontend coverage evidence omits its measured summary")
+    for metric, required in locked_thresholds.items():
+        if evidence_summary.get(metric) != summary[metric] or float(summary[metric]["pct"]) < required:
+            raise EvidenceError(f"frontend {metric} coverage is substituted or below {required}%")
+    evidence_critical = evidence.get("criticalDomains")
+    if not isinstance(evidence_critical, dict) or set(evidence_critical) != set(
+        critical_summaries
+    ):
+        raise EvidenceError("frontend critical-domain coverage evidence is incomplete")
+    for domain, domain_summary in critical_summaries.items():
+        projected = evidence_critical.get(domain)
+        if not isinstance(projected, dict) or any(
+            projected.get(metric) != domain_summary[metric]
+            for metric in locked_critical_thresholds
+        ):
+            raise EvidenceError(
+                f"frontend critical-domain coverage projection {domain} is substituted"
+            )
+    minimum_full = _exact_positive_int(contract.get("minimumFullE2ETests"), "minimumFullE2ETests")
+    minimum_instrumented = _exact_positive_int(
+        contract.get("minimumInstrumentedE2ETests"), "minimumInstrumentedE2ETests"
+    )
+    if (
+        _exact_nonnegative_int(evidence.get("fullE2ETests"), "fullE2ETests") < minimum_full
+        or _exact_nonnegative_int(evidence.get("instrumentedE2ETests"), "instrumentedE2ETests")
+        < minimum_instrumented
+        or _exact_nonnegative_int(evidence.get("e2eRawFiles"), "e2eRawFiles")
+        != evidence.get("instrumentedE2ETests")
+        or _exact_nonnegative_int(
+            evidence.get("e2eConvertedSourceFiles"), "e2eConvertedSourceFiles"
+        )
+        < _exact_positive_int(
+            contract.get("minimumE2EConvertedSourceFiles"), "minimumE2EConvertedSourceFiles"
+        )
+    ):
+        raise EvidenceError("frontend coverage anti-vacuity inventory is incomplete")
+    semantic = evidence.get("semanticMapMatch")
+    if not isinstance(semantic, dict) or set(semantic) != {"statements", "functions", "branches"}:
+        raise EvidenceError("frontend coverage semantic-map evidence is incomplete")
+    for metric in ("statements", "functions", "branches"):
+        row = semantic[metric]
+        if not isinstance(row, dict) or set(row) != {
+            "incomingItems",
+            "matchedItems",
+            "unmatchedItems",
+            "pct",
+        }:
+            raise EvidenceError("frontend semantic-map row is malformed")
+        incoming = _exact_positive_int(row.get("incomingItems"), f"{metric}.incomingItems")
+        matched = _exact_nonnegative_int(row.get("matchedItems"), f"{metric}.matchedItems")
+        unmatched = _exact_nonnegative_int(row.get("unmatchedItems"), f"{metric}.unmatchedItems")
+        pct = _finite_number(row.get("pct"), f"{metric}.pct", minimum=0)
+        expected_pct = round(matched * 100.0 / incoming, 4)
+        if matched + unmatched != incoming or pct != expected_pct:
+            raise EvidenceError("frontend semantic-map projection is not arithmetically derivable")
+    frontend_replay = _run_frontend_coverage_replay(
+        paths,
+        evidence=evidence,
+        source_digest=source_digest,
+        campaign_digest=campaign_digest,
+        summary=summary,
+        critical_summaries=critical_summaries,
+    )
+    replay, raw_mutation_manifest = _run_owner_mutation_replay(
+        paths,
+        expected_sha=expected_sha,
+        expected_checkout_digest=expected_checkout_digest,
+    )
+    backend = _validate_mutation_report(
+        paths["mutation/backend-mutation.json"],
+        backend=True,
+        expected_sha=expected_sha,
+        expected_checkout_digest=expected_checkout_digest,
+        require_fresh=require_fresh,
+        replay=replay,
+        raw_manifest=raw_mutation_manifest,
+    )
+    frontend = _validate_mutation_report(
+        paths["mutation/frontend-mutation.json"],
+        backend=False,
+        expected_sha=expected_sha,
+        expected_checkout_digest=expected_checkout_digest,
+        require_fresh=require_fresh,
+        replay=replay,
+        raw_manifest=raw_mutation_manifest,
+    )
+    expirations = [
+        _parse_utc(rust["expiresAt"], "rust coverage expiry"),
+        _parse_utc(backend["expiresAt"], "backend mutation expiry"),
+        _parse_utc(frontend["expiresAt"], "frontend mutation expiry"),
+    ]
+    if _parse_utc(manifest["expiresAt"], "coverage campaign expiry") > min(expirations):
+        raise EvidenceError("coverage/mutation campaign outlives a prerequisite authority")
+    return {
+        "rustCoverage": rust["coverage"],
+        "frontendCoverage": summary,
+        "frontendCoverageReplay": {
+            "manifestSha256": frontend_replay["manifestSha256"],
+            "bundleSha256": frontend_replay["bundleSha256"],
+            "e2eRawFiles": frontend_replay["e2eRawFiles"],
+        },
+        "backendMutation": backend,
+        "frontendMutation": frontend,
+    }
+
+
+def _validate_owner_proof_binding(
+    paths: dict[str, Path],
+    *,
+    expected_sha: str,
+) -> dict[str, object]:
+    manifest_path = paths["owner-proof/manifest.v1.json"]
+    contract_path = paths["owner-proof/owner_proof_input_contract.v1.json"]
+    contract = _load_json_without_duplicate_keys(contract_path)
+    committed = _load_json_without_duplicate_keys(
+        APP / "scripts" / "owner_proof_input_contract.v1.json"
+    )
+    if (
+        contract != committed
+        or sha256_file(contract_path)
+        != sha256_file(APP / "scripts" / "owner_proof_input_contract.v1.json")
+        or not isinstance(contract, dict)
+        or not _is_exact_integer(contract.get("schema"), 1)
+    ):
+        raise EvidenceError("owner proof-input contract is not the exact checked-in authority")
+    manifest = _load_json_without_duplicate_keys(manifest_path)
+    expected_keys = {
+        "schema",
+        "bundleId",
+        "releaseGitSha",
+        "contractSha256",
+        "helperSha256",
+        "helperSourceSha256",
+        "helperBuild",
+        "files",
+        "sourcePreservation",
+        "databases",
+        "safety",
+    }
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != expected_keys
+        or not _is_exact_integer(manifest.get("schema"), 1)
+        or manifest.get("bundleId") != "cortex-owner-product-proof-inputs-v1"
+        or manifest.get("releaseGitSha") != expected_sha
+        or manifest.get("contractSha256") != sha256_file(contract_path)
+        or not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get("helperSha256", "")))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get("helperSourceSha256", "")))
+    ):
+        raise EvidenceError("owner proof-input manifest is stale, substituted, or non-canonical")
+    files = manifest.get("files")
+    required_roles = {
+        "proof-input-contract",
+        "real-media-mp4",
+        "real-media-mov",
+        "real-media-flac",
+        "long-audiobook-mp3",
+        "scale-database-authority",
+        "campaign-database-authority",
+        "scale-database-derived-current",
+        "database-migration-helper",
+        "database-migration-helper-source",
+    }
+    if not isinstance(files, list):
+        raise EvidenceError("owner proof-input manifest omits its file inventory")
+    roles: dict[str, dict[str, object]] = {}
+    paths_seen: set[str] = set()
+    for item in files:
+        if not isinstance(item, dict) or set(item) != {
+            "role",
+            "relativePath",
+            "sha256",
+            "sizeBytes",
+            "readOnlyHashBound",
+        }:
+            raise EvidenceError("owner proof-input file row is malformed")
+        role = item.get("role")
+        relative = item.get("relativePath")
+        if (
+            not isinstance(role, str)
+            or role in roles
+            or not isinstance(relative, str)
+            or relative in paths_seen
+            or not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", "")))
+            or _exact_positive_int(item.get("sizeBytes"), f"owner proof {role} size") <= 0
+            or item.get("readOnlyHashBound") is not True
+        ):
+            raise EvidenceError("owner proof-input file identity is invalid or duplicated")
+        _safe_owner_evidence_relative(relative, label=f"owner proof {role} path")
+        roles[role] = item
+        paths_seen.add(relative)
+    if set(roles) != required_roles:
+        raise EvidenceError("owner proof-input manifest file-role inventory is not exact")
+    bundle_root = manifest_path.parent
+    if _is_link_or_junction(manifest_path) or _is_link_or_junction(bundle_root):
+        raise EvidenceError("owner proof-input manifest path is a link or junction")
+    bundle_root.resolve(strict=True)
+    for role, item in roles.items():
+        relative = _safe_owner_evidence_relative(
+            item["relativePath"], label=f"owner proof {role} path"
+        )
+        candidate = _owner_evidence_path(bundle_root, relative)
+        if (
+            not candidate.is_file()
+            or candidate.is_symlink()
+            or candidate.stat().st_nlink != 1
+            or candidate.stat().st_size != item["sizeBytes"]
+            or sha256_file(candidate) != item["sha256"]
+        ):
+            raise EvidenceError(
+                f"owner proof-input file {role} is absent or differs from its manifest"
+            )
+    contract_entry = roles["proof-input-contract"]
+    if (
+        _owner_evidence_path(
+            bundle_root,
+            _safe_owner_evidence_relative(
+                contract_entry["relativePath"], label="owner proof contract path"
+            ),
+        )
+        != contract_path.resolve(strict=True)
+        or contract_entry.get("sha256") != sha256_file(contract_path)
+    ):
+        raise EvidenceError("owner proof-input manifest substituted its contract file")
+    source_contracts = contract.get("files")
+    if not isinstance(source_contracts, list):
+        raise EvidenceError("owner proof-input contract omits its source-file inventory")
+    source_by_role = {
+        item.get("role"): item for item in source_contracts if isinstance(item, dict)
+    }
+    if len(source_by_role) != len(source_contracts):
+        raise EvidenceError("owner proof-input contract has a malformed or duplicate source role")
+    for role, spec in source_by_role.items():
+        entry = roles.get(str(role))
+        if (
+            entry is None
+            or entry.get("relativePath") != spec.get("relativePath")
+            or entry.get("sha256") != spec.get("sha256")
+            or (
+                "sizeBytes" in spec
+                and entry.get("sizeBytes") != spec.get("sizeBytes")
+            )
+        ):
+            raise EvidenceError(f"owner proof-input file {role} differs from the locked contract")
+    if (
+        roles["scale-database-derived-current"].get("relativePath")
+        != contract.get("databaseContracts", {}).get("scale", {}).get("derivedRelativePath")
+        or roles["database-migration-helper"].get("relativePath") != "tools/owner_proof_db.exe"
+        or roles["database-migration-helper-source"].get("relativePath")
+        != "tools/owner_proof_db.rs"
+        or manifest.get("helperSha256")
+        != roles["database-migration-helper"].get("sha256")
+        or manifest.get("helperSourceSha256")
+        != roles["database-migration-helper-source"].get("sha256")
+    ):
+        raise EvidenceError("owner proof-input derived/helper authority is substituted")
+    helper_source = _git_file_bytes(
+        expected_sha, "cortex-speech-app/src-tauri/src/bin/owner_proof_db.rs"
+    )
+    if hashlib.sha256(helper_source).hexdigest() != manifest.get("helperSourceSha256"):
+        raise EvidenceError("owner proof-input helper source is not the exact release commit blob")
+    database_contracts = contract.get("databaseContracts")
+    if (
+        not isinstance(database_contracts, dict)
+        or not _is_exact_integer(
+            database_contracts.get("scale", {}).get("targetSchemaVersion"), 69
+        )
+        or not _is_exact_integer(
+            database_contracts.get("campaignExact", {}).get("schemaVersion"), 65
+        )
+    ):
+        raise EvidenceError("owner proof-input database contract is not schema 65→69")
+    return {
+        "bundleManifestSha256": sha256_file(manifest_path),
+        "contractSha256": sha256_file(contract_path),
+        "releaseGitSha": expected_sha,
+        "roles": sorted(required_roles),
+        "scaleSegments": database_contracts["scale"]["segmentCount"],
+        "campaignSegments": database_contracts["campaignExact"]["segmentCount"],
+    }
+
+
+SCHEMA_CAMPAIGN_PHASES = (
+    "fresh-schema69-install",
+    "schema65-to69-live-sized-clone",
+    "schema69-reopen",
+    "interrupted-migration-recovery",
+    "future-schema-refusal",
+    "local-snapshot-isolated-restore",
+    "offsite-snapshot-isolated-restore",
+)
+
+
+def _validate_schema_restore_semantics(
+    paths: dict[str, Path],
+    *,
+    expected_sha: str,
+    expected_run_token: str | None = None,
+) -> dict[str, object]:
+    proof = _validate_owner_proof_binding(paths, expected_sha=expected_sha)
+    report = _load_json_without_duplicate_keys(paths["schema-clone-and-restore.json"])
+    expected_keys = {
+        "schema",
+        "type",
+        "fullGitSha",
+        "runToken",
+        "attemptCount",
+        "retryCount",
+        "skipCount",
+        "sourceSchema",
+        "targetSchema",
+        "sourceSegmentCount",
+        "cloneSegmentCount",
+        "authoritativeTruthDigest",
+        "phases",
+        "snapshots",
+        "passed",
+        "failures",
+    }
+    if not isinstance(report, dict) or set(report) != expected_keys:
+        raise EvidenceError("schema clone/restore report has a non-canonical envelope")
+    truth_digest = report.get("authoritativeTruthDigest")
+    report_token = report.get("runToken")
+    source_segments = _exact_positive_int(
+        report.get("sourceSegmentCount"), "schema campaign source segment count"
+    )
+    clone_segments = _exact_positive_int(
+        report.get("cloneSegmentCount"), "schema campaign clone segment count"
+    )
+    if (
+        not _is_exact_integer(report.get("schema"), 1)
+        or report.get("type") != "SchemaCloneRestoreMeasurementsV1"
+        or report.get("fullGitSha") != expected_sha
+        or not isinstance(report_token, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", report_token)
+        or (expected_run_token is not None and report_token != expected_run_token)
+        or not _is_exact_integer(report.get("attemptCount"), 1)
+        or not _is_exact_integer(report.get("retryCount"), 0)
+        or not _is_exact_integer(report.get("skipCount"), 0)
+        or not _is_exact_integer(report.get("sourceSchema"), 65)
+        or not _is_exact_integer(report.get("targetSchema"), 69)
+        or source_segments != proof["campaignSegments"]
+        or clone_segments != source_segments
+        or not isinstance(truth_digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", truth_digest)
+        or report.get("passed") is not True
+        or report.get("failures") != []
+    ):
+        raise EvidenceError("schema clone/restore report is failed, retried, skipped, or substituted")
+    phases = report.get("phases")
+    if not isinstance(phases, list) or len(phases) != len(SCHEMA_CAMPAIGN_PHASES):
+        raise EvidenceError("schema clone/restore campaign omits a required phase")
+    normalized: list[dict[str, object]] = []
+    for phase, expected_id in zip(phases, SCHEMA_CAMPAIGN_PHASES, strict=True):
+        if not isinstance(phase, dict) or set(phase) != {
+            "id",
+            "status",
+            "attemptCount",
+            "retryCount",
+            "skipCount",
+            "schemaBefore",
+            "schemaAfter",
+            "quickCheck",
+            "integrityCheck",
+            "foreignKeyViolations",
+            "segmentCount",
+            "truthDigest",
+            "restoreGeneration",
+            "databaseSha256",
+        }:
+            raise EvidenceError("schema clone/restore phase is malformed")
+        schema_before = _exact_nonnegative_int(phase.get("schemaBefore"), f"{expected_id}.schemaBefore")
+        schema_after = _exact_nonnegative_int(phase.get("schemaAfter"), f"{expected_id}.schemaAfter")
+        expected_schemas = {
+            "fresh-schema69-install": (0, 69),
+            "schema65-to69-live-sized-clone": (65, 69),
+            "schema69-reopen": (69, 69),
+            "interrupted-migration-recovery": (65, 69),
+            "future-schema-refusal": (70, 70),
+            "local-snapshot-isolated-restore": (69, 69),
+            "offsite-snapshot-isolated-restore": (69, 69),
+        }[expected_id]
+        expected_segments = 0 if expected_id == "fresh-schema69-install" else report["sourceSegmentCount"]
+        if (
+            phase.get("id") != expected_id
+            or phase.get("status") != "PASS"
+            or not _is_exact_integer(phase.get("attemptCount"), 1)
+            or not _is_exact_integer(phase.get("retryCount"), 0)
+            or not _is_exact_integer(phase.get("skipCount"), 0)
+            or (schema_before, schema_after) != expected_schemas
+            or phase.get("quickCheck") != "ok"
+            or phase.get("integrityCheck") != "ok"
+            or not _is_exact_integer(phase.get("foreignKeyViolations"), 0)
+            or not _is_exact_integer(phase.get("segmentCount"), expected_segments)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(phase.get("databaseSha256", "")))
+        ):
+            raise EvidenceError(f"schema clone/restore phase {expected_id} failed its exact contract")
+        if expected_id == "fresh-schema69-install":
+            if phase.get("truthDigest") != hashlib.sha256(b"").hexdigest():
+                raise EvidenceError("fresh schema phase published non-empty human truth")
+        elif phase.get("truthDigest") != truth_digest:
+            raise EvidenceError(f"schema clone/restore phase {expected_id} changed authoritative truth")
+        generation = _exact_nonnegative_int(
+            phase.get("restoreGeneration"), f"{expected_id}.restoreGeneration"
+        )
+        if expected_id in {
+            "local-snapshot-isolated-restore",
+            "offsite-snapshot-isolated-restore",
+        } and generation <= 0:
+            raise EvidenceError("isolated restore did not advance the restore generation")
+        normalized.append({"id": expected_id, "databaseSha256": phase["databaseSha256"]})
+    snapshots = report.get("snapshots")
+    if not isinstance(snapshots, list) or len(snapshots) != 2:
+        raise EvidenceError("schema campaign requires one local and one offsite snapshot")
+    volume_ids: set[str] = set()
+    for snapshot, expected_kind in zip(snapshots, ("local", "offsite"), strict=True):
+        if not isinstance(snapshot, dict) or set(snapshot) != {
+            "kind",
+            "volumeIdentitySha256",
+            "manifestSha256",
+            "databaseSha256",
+            "schema",
+            "segmentCount",
+            "truthDigest",
+        }:
+            raise EvidenceError("schema campaign snapshot row is malformed")
+        volume = snapshot.get("volumeIdentitySha256")
+        if (
+            snapshot.get("kind") != expected_kind
+            or not re.fullmatch(r"[0-9a-f]{64}", str(volume or ""))
+            or volume in volume_ids
+            or not re.fullmatch(r"[0-9a-f]{64}", str(snapshot.get("manifestSha256", "")))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(snapshot.get("databaseSha256", "")))
+            or not _is_exact_integer(snapshot.get("schema"), 69)
+            or not _is_exact_integer(snapshot.get("segmentCount"), source_segments)
+            or snapshot.get("truthDigest") != truth_digest
+        ):
+            raise EvidenceError("schema campaign snapshot is stale, same-volume, or substituted")
+        volume_ids.add(str(volume))
+    _reject_unbacked_owner_evidence(
+        "schema-clone-and-restore-campaign",
+        "database/snapshot bytes, migration process journal, and independently recomputed truth",
+    )
+    return {
+        "ownerProof": proof,
+        "sourceSchema": 65,
+        "targetSchema": 69,
+        "segmentCount": report["sourceSegmentCount"],
+        "truthDigest": truth_digest,
+        "phases": normalized,
+        "snapshotVolumeIdentities": sorted(volume_ids),
+    }
+
+
+def _p95(values: object, label: str, *, minimum_samples: int = 20) -> float:
+    if not isinstance(values, list) or len(values) < minimum_samples:
+        raise EvidenceError(f"{label} has fewer than {minimum_samples} raw samples")
+    measured = sorted(_finite_number(value, label, minimum=0) for value in values)
+    return measured[max(0, math.ceil(0.95 * len(measured)) - 1)]
+
+
+def _validate_concurrency_performance_semantics(
+    paths: dict[str, Path],
+    *,
+    expected_sha: str,
+    expected_run_token: str | None = None,
+) -> dict[str, object]:
+    proof = _validate_owner_proof_binding(paths, expected_sha=expected_sha)
+    report = _load_json_without_duplicate_keys(
+        paths["concurrency-performance-and-memory.json"]
+    )
+    expected_keys = {
+        "schema",
+        "type",
+        "fullGitSha",
+        "runToken",
+        "attemptCount",
+        "retryCount",
+        "skipCount",
+        "fixedSeed",
+        "hammer",
+        "frontend",
+        "passed",
+        "failures",
+    }
+    if not isinstance(report, dict) or set(report) != expected_keys:
+        raise EvidenceError("concurrency/performance report has a non-canonical envelope")
+    report_token = report.get("runToken")
+    if (
+        not _is_exact_integer(report.get("schema"), 1)
+        or report.get("type") != "ConcurrencyPerformanceMeasurementsV1"
+        or report.get("fullGitSha") != expected_sha
+        or not isinstance(report_token, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", report_token)
+        or (expected_run_token is not None and report_token != expected_run_token)
+        or not _is_exact_integer(report.get("attemptCount"), 1)
+        or not _is_exact_integer(report.get("retryCount"), 0)
+        or not _is_exact_integer(report.get("skipCount"), 0)
+        or not _is_exact_integer(report.get("fixedSeed"), 3_232_997_711)
+        or report.get("passed") is not True
+        or report.get("failures") != []
+    ):
+        raise EvidenceError("concurrency/performance report is failed, retried, skipped, or seed-substituted")
+    hammer = report.get("hammer")
+    hammer_keys = {
+        "segmentCount",
+        "durationSeconds",
+        "reviewWorkers",
+        "importWorkers",
+        "backupWorkers",
+        "expectedWrites",
+        "committedWrites",
+        "lockFailures",
+        "lostWrites",
+        "staleClobbers",
+        "invalidRestoreAdmissions",
+        "integrityCheck",
+        "foreignKeyViolations",
+        "durableDecisionMilliseconds",
+        "queueMilliseconds",
+    }
+    if not isinstance(hammer, dict) or set(hammer) != hammer_keys:
+        raise EvidenceError("concurrency hammer measurements are malformed")
+    expected_writes = _exact_positive_int(hammer.get("expectedWrites"), "hammer.expectedWrites")
+    committed_writes = _exact_positive_int(
+        hammer.get("committedWrites"), "hammer.committedWrites"
+    )
+    decision_samples = hammer.get("durableDecisionMilliseconds")
+    queue_samples = hammer.get("queueMilliseconds")
+    if (
+        expected_writes < 1_000
+        or not isinstance(decision_samples, list)
+        or not isinstance(queue_samples, list)
+        or len(decision_samples) != committed_writes
+        or len(queue_samples) != committed_writes
+    ):
+        raise EvidenceError("concurrency hammer latency traces do not close over every committed write")
+    decision_p95 = _p95(
+        decision_samples,
+        "durableDecisionMilliseconds",
+        minimum_samples=1_000,
+    )
+    queue_p95 = _p95(queue_samples, "queueMilliseconds", minimum_samples=1_000)
+    if (
+        not _is_exact_integer(hammer.get("segmentCount"), 50_000)
+        or _finite_number(hammer.get("durationSeconds"), "hammer.durationSeconds", minimum=1800)
+        < 1800
+        or any(
+            _exact_positive_int(hammer.get(key), f"hammer.{key}") <= 0
+            for key in ("reviewWorkers", "importWorkers", "backupWorkers")
+        )
+        or expected_writes != committed_writes
+        or any(
+            not _is_exact_integer(hammer.get(key), 0)
+            for key in (
+                "lockFailures",
+                "lostWrites",
+                "staleClobbers",
+                "invalidRestoreAdmissions",
+                "foreignKeyViolations",
+            )
+        )
+        or hammer.get("integrityCheck") != "ok"
+        or decision_p95 > 500
+        or queue_p95 > 750
+    ):
+        raise EvidenceError("50,000-segment concurrency hammer violates a locked integrity/latency budget")
+    frontend = report.get("frontend")
+    frontend_keys = {
+        "segmentCount",
+        "decisionCount",
+        "initialJavaScriptGzipBytes",
+        "initialCssGzipBytes",
+        "coldShellInteractiveMilliseconds",
+        "reviewUsableMilliseconds",
+        "searchFilterMilliseconds",
+        "actionFeedbackMilliseconds",
+        "sameSourceAudioMilliseconds",
+        "newSourceAudioMilliseconds",
+        "interactionTaskMilliseconds",
+        "scrollFramesPerSecond",
+        "retainedHeapStartBytes",
+        "retainedHeapEndBytes",
+        "residentListPages",
+        "residentPrefetchedClips",
+    }
+    if not isinstance(frontend, dict) or set(frontend) != frontend_keys:
+        raise EvidenceError("100,000-segment frontend measurements are malformed")
+    decision_count = _exact_positive_int(frontend.get("decisionCount"), "frontend decision count")
+    latency_trace_names = (
+        "searchFilterMilliseconds",
+        "actionFeedbackMilliseconds",
+        "sameSourceAudioMilliseconds",
+        "newSourceAudioMilliseconds",
+        "interactionTaskMilliseconds",
+        "scrollFramesPerSecond",
+    )
+    if any(
+        not isinstance(frontend.get(name), list)
+        or len(frontend[name]) != decision_count
+        for name in latency_trace_names
+    ):
+        raise EvidenceError("frontend performance traces do not close over every soak decision")
+    search_p95 = _p95(
+        frontend.get("searchFilterMilliseconds"),
+        "searchFilterMilliseconds",
+        minimum_samples=1_000,
+    )
+    action_p95 = _p95(
+        frontend.get("actionFeedbackMilliseconds"),
+        "actionFeedbackMilliseconds",
+        minimum_samples=1_000,
+    )
+    same_audio_p95 = _p95(
+        frontend.get("sameSourceAudioMilliseconds"),
+        "sameSourceAudioMilliseconds",
+        minimum_samples=1_000,
+    )
+    new_audio_p95 = _p95(
+        frontend.get("newSourceAudioMilliseconds"),
+        "newSourceAudioMilliseconds",
+        minimum_samples=1_000,
+    )
+    tasks = frontend.get("interactionTaskMilliseconds")
+    fps = frontend.get("scrollFramesPerSecond")
+    if (
+        not isinstance(tasks, list)
+        or len(tasks) < 1_000
+        or not isinstance(fps, list)
+        or len(fps) < 1_000
+    ):
+        raise EvidenceError("frontend long-task/FPS traces are incomplete")
+    max_task = max(_finite_number(value, "interaction task", minimum=0) for value in tasks)
+    min_fps = min(_finite_number(value, "scroll FPS", minimum=0) for value in fps)
+    heap_start = _exact_nonnegative_int(frontend.get("retainedHeapStartBytes"), "heap start")
+    heap_end = _exact_nonnegative_int(frontend.get("retainedHeapEndBytes"), "heap end")
+    heap_growth = heap_end - heap_start
+    if (
+        not _is_exact_integer(frontend.get("segmentCount"), 100_000)
+        or decision_count != 1_000
+        or _exact_positive_int(
+            frontend.get("initialJavaScriptGzipBytes"), "initial JavaScript gzip bytes"
+        )
+        > 125 * 1024
+        or _exact_positive_int(
+            frontend.get("initialCssGzipBytes"), "initial CSS gzip bytes"
+        )
+        > 15 * 1024
+        or _finite_number(
+            frontend.get("coldShellInteractiveMilliseconds"), "cold shell", minimum=0
+        )
+        > 1_000
+        or _finite_number(frontend.get("reviewUsableMilliseconds"), "review usable", minimum=0)
+        > 1_500
+        or search_p95 > 150
+        or action_p95 > 100
+        or same_audio_p95 > 250
+        or new_audio_p95 > 750
+        or max_task > 50
+        or min_fps < 55
+        or heap_growth >= 20 * 1024 * 1024
+        or _exact_nonnegative_int(frontend.get("residentListPages"), "resident list pages") > 3
+        or _exact_nonnegative_int(
+            frontend.get("residentPrefetchedClips"), "resident prefetched clips"
+        )
+        > 3
+    ):
+        raise EvidenceError("100,000-segment UI or 1,000-decision memory budget is violated")
+    _reject_unbacked_owner_evidence(
+        "concurrency-performance-and-memory-campaign",
+        "fixed-command runner log, final database, and raw browser/process trace",
+    )
+    return {
+        "ownerProof": proof,
+        "fixedSeed": report["fixedSeed"],
+        "hammer": {
+            "segments": 50_000,
+            "durationSeconds": float(hammer["durationSeconds"]),
+            "writes": committed_writes,
+            "durableDecisionP95Milliseconds": decision_p95,
+            "queueP95Milliseconds": queue_p95,
+        },
+        "frontend": {
+            "segments": 100_000,
+            "decisions": 1_000,
+            "initialJavaScriptGzipBytes": frontend["initialJavaScriptGzipBytes"],
+            "initialCssGzipBytes": frontend["initialCssGzipBytes"],
+            "searchP95Milliseconds": search_p95,
+            "actionP95Milliseconds": action_p95,
+            "sameSourceAudioP95Milliseconds": same_audio_p95,
+            "newSourceAudioP95Milliseconds": new_audio_p95,
+            "maximumInteractionTaskMilliseconds": max_task,
+            "minimumScrollFramesPerSecond": min_fps,
+            "retainedHeapGrowthBytes": heap_growth,
+        },
+    }
+
+
+OWNER_WORKFLOW_STEPS = (
+    "import-real-media",
+    "champion-transcription",
+    "listen-complete-clip",
+    "correct-transcript",
+    "commit-decision",
+    "exact-undo",
+    "recommit-decision",
+    "validate-library",
+    "export-verified-result",
+    "restart-application",
+    "byte-check-export",
+)
+OWNER_RECOVERY_DRILLS = (
+    "wsl-unavailable-hard-stop",
+    "wrong-model-hard-stop",
+    "champion-process-crash",
+    "disk-full",
+    "corrupt-database",
+    "lost-commit-response",
+    "kill-during-write",
+    "kill-during-export",
+    "isolated-restore-recovery",
+)
+
+
+def _validate_owner_workflow_semantics(
+    paths: dict[str, Path],
+    *,
+    expected_sha: str,
+    expected_run_token: str | None = None,
+) -> dict[str, object]:
+    proof = _validate_owner_proof_binding(paths, expected_sha=expected_sha)
+    report = _load_json_without_duplicate_keys(paths["owner-workflow-and-recovery.json"])
+    expected_keys = {
+        "schema",
+        "type",
+        "fullGitSha",
+        "runToken",
+        "attemptCount",
+        "retryCount",
+        "skipCount",
+        "executable",
+        "databaseSchema",
+        "champion",
+        "mediaRoles",
+        "workflowSteps",
+        "recoveryDrills",
+        "truthInvariants",
+        "exportBeforeRestartSha256",
+        "exportAfterRestartSha256",
+        "passed",
+        "failures",
+    }
+    if not isinstance(report, dict) or set(report) != expected_keys:
+        raise EvidenceError("owner workflow/recovery report has a non-canonical envelope")
+    executable = report.get("executable")
+    champion = report.get("champion")
+    report_token = report.get("runToken")
+    if (
+        not _is_exact_integer(report.get("schema"), 1)
+        or report.get("type") != "OwnerWorkflowRecoveryMeasurementsV1"
+        or report.get("fullGitSha") != expected_sha
+        or not isinstance(report_token, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", report_token)
+        or (expected_run_token is not None and report_token != expected_run_token)
+        or not _is_exact_integer(report.get("attemptCount"), 1)
+        or not _is_exact_integer(report.get("retryCount"), 0)
+        or not _is_exact_integer(report.get("skipCount"), 0)
+        or not _is_exact_integer(report.get("databaseSchema"), 69)
+        or report.get("passed") is not True
+        or report.get("failures") != []
+        or not isinstance(executable, dict)
+        or set(executable) != {"sha256", "bytes", "buildGitSha"}
+        or not re.fullmatch(r"[0-9a-f]{64}", str(executable.get("sha256", "")))
+        or _exact_positive_int(executable.get("bytes"), "workflow executable bytes") <= 0
+        or executable.get("buildGitSha") != expected_sha
+        or not isinstance(champion, dict)
+        or set(champion) != {
+            "modelId",
+            "deploymentSha256",
+            "servedDeploymentSha256",
+            "exactIdentityMatched",
+            "hardStopBeforeTruthOnMismatch",
+        }
+        or champion.get("modelId") != "omniasr-7b"
+        or not re.fullmatch(r"[0-9a-f]{64}", str(champion.get("deploymentSha256", "")))
+        or champion.get("servedDeploymentSha256") != champion.get("deploymentSha256")
+        or champion.get("exactIdentityMatched") is not True
+        or champion.get("hardStopBeforeTruthOnMismatch") is not True
+    ):
+        raise EvidenceError("owner workflow/recovery identity or exact champion contract failed")
+    required_media = ["real-media-mp4", "real-media-mov", "real-media-flac"]
+    if report.get("mediaRoles") != required_media:
+        raise EvidenceError("owner workflow did not exercise every locked real-media format")
+    steps = report.get("workflowSteps")
+    if not isinstance(steps, list) or len(steps) != len(OWNER_WORKFLOW_STEPS):
+        raise EvidenceError("owner workflow omits a mandatory step")
+    operation_ids: set[str] = set()
+    for step, expected_id in zip(steps, OWNER_WORKFLOW_STEPS, strict=True):
+        if not isinstance(step, dict) or set(step) != {
+            "id",
+            "status",
+            "attemptCount",
+            "retryCount",
+            "skipCount",
+            "operationId",
+            "artifactSha256",
+        }:
+            raise EvidenceError("owner workflow step is malformed")
+        operation_id = step.get("operationId")
+        if (
+            step.get("id") != expected_id
+            or step.get("status") != "PASS"
+            or not _is_exact_integer(step.get("attemptCount"), 1)
+            or not _is_exact_integer(step.get("retryCount"), 0)
+            or not _is_exact_integer(step.get("skipCount"), 0)
+            or not isinstance(operation_id, str)
+            or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", operation_id)
+            or operation_id in operation_ids
+            or not re.fullmatch(r"[0-9a-f]{64}", str(step.get("artifactSha256", "")))
+        ):
+            raise EvidenceError(f"owner workflow step {expected_id} is skipped, retried, or duplicated")
+        operation_ids.add(operation_id)
+    drills = report.get("recoveryDrills")
+    if not isinstance(drills, list) or len(drills) != len(OWNER_RECOVERY_DRILLS):
+        raise EvidenceError("owner workflow omits a mandatory recovery drill")
+    drill_ids: set[str] = set()
+    for drill, expected_id in zip(drills, OWNER_RECOVERY_DRILLS, strict=True):
+        if not isinstance(drill, dict) or set(drill) != {
+            "id",
+            "status",
+            "attemptCount",
+            "retryCount",
+            "skipCount",
+            "hardStoppedBeforeTruth",
+            "draftRetained",
+            "databaseIntegrity",
+            "lostDecisions",
+            "duplicateDecisions",
+        }:
+            raise EvidenceError("owner recovery drill is malformed")
+        if (
+            drill.get("id") != expected_id
+            or expected_id in drill_ids
+            or drill.get("status") != "PASS"
+            or not _is_exact_integer(drill.get("attemptCount"), 1)
+            or not _is_exact_integer(drill.get("retryCount"), 0)
+            or not _is_exact_integer(drill.get("skipCount"), 0)
+            or drill.get("databaseIntegrity") != "ok"
+            or not _is_exact_integer(drill.get("lostDecisions"), 0)
+            or not _is_exact_integer(drill.get("duplicateDecisions"), 0)
+        ):
+            raise EvidenceError(f"owner recovery drill {expected_id} failed or is not no-retry")
+        if expected_id in {"wsl-unavailable-hard-stop", "wrong-model-hard-stop"}:
+            if drill.get("hardStoppedBeforeTruth") is not True:
+                raise EvidenceError(f"owner recovery drill {expected_id} published partial truth")
+        elif drill.get("draftRetained") is not True:
+            raise EvidenceError(f"owner recovery drill {expected_id} lost its editable owner draft")
+        drill_ids.add(expected_id)
+    invariants = report.get("truthInvariants")
+    if not isinstance(invariants, dict) or set(invariants) != {
+        "lostDecisions",
+        "duplicateDecisions",
+        "misattributedDecisions",
+        "unpaidExternalDecisions",
+        "silentCorruptions",
+        "placeholderTruthRows",
+    } or any(not _is_exact_integer(value, 0) for value in invariants.values()):
+        raise EvidenceError("owner workflow violates a zero-loss/duplication/corruption invariant")
+    before = report.get("exportBeforeRestartSha256")
+    after = report.get("exportAfterRestartSha256")
+    if not isinstance(before, str) or not re.fullmatch(r"[0-9a-f]{64}", before) or after != before:
+        raise EvidenceError("owner workflow export is not byte-identical after restart")
+    _reject_unbacked_owner_evidence(
+        "owner-workflow-and-recovery-campaign",
+        "application/process journal, operation rows, database snapshots, and exported bytes",
+    )
+    return {
+        "ownerProof": proof,
+        "executable": executable,
+        "databaseSchema": 69,
+        "champion": champion,
+        "workflowStepIds": list(OWNER_WORKFLOW_STEPS),
+        "recoveryDrillIds": list(OWNER_RECOVERY_DRILLS),
+        "exportSha256": before,
+    }
+
+
+def _field_session_record_hash(record: dict[str, object]) -> str:
+    unsigned = {key: value for key, value in record.items() if key != "recordHash"}
+    return hashlib.sha256(
+        json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _validate_owner_field_session_semantics(
+    paths: dict[str, Path],
+    *,
+    expected_sha: str,
+) -> dict[str, object]:
+    records = _strict_json_lines(paths["owner-field-sessions.jsonl"], "owner field session ledger")
+    if len(records) != 30:
+        raise EvidenceError("owner field evidence requires exactly thirty genuine session records")
+    expected_record_keys = {
+        "schema",
+        "type",
+        "sessionId",
+        "ordinal",
+        "fullGitSha",
+        "executableSha256",
+        "databaseSchema",
+        "startedAt",
+        "endedAt",
+        "durableDecisionCount",
+        "playbackCount",
+        "retryCount",
+        "skipCount",
+        "dataLossCount",
+        "duplicateDecisionCount",
+        "misattributedDecisionCount",
+        "silentCorruptionCount",
+        "incidents",
+        "previousHash",
+        "recordHash",
+    }
+    previous_hash = "0" * 64
+    executable_sha: str | None = None
+    session_ids: set[str] = set()
+    utc_dates: set[str] = set()
+    prior_end: datetime | None = None
+    first_start: str | None = None
+    last_end: str | None = None
+    total_decisions = 0
+    for ordinal, record in enumerate(records, start=1):
+        if set(record) != expected_record_keys:
+            raise EvidenceError("owner field session record has a non-canonical envelope")
+        started = _parse_utc(record.get("startedAt"), f"owner session {ordinal}.startedAt")
+        ended = _parse_utc(record.get("endedAt"), f"owner session {ordinal}.endedAt")
+        session_id = record.get("sessionId")
+        current_executable = record.get("executableSha256")
+        incidents = record.get("incidents")
+        if (
+            not _is_exact_integer(record.get("schema"), 1)
+            or record.get("type") != "AutomaticOwnerFieldSessionV1"
+            or not _is_exact_integer(record.get("ordinal"), ordinal)
+            or record.get("fullGitSha") != expected_sha
+            or not isinstance(session_id, str)
+            or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", session_id)
+            or session_id in session_ids
+            or not isinstance(current_executable, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", current_executable)
+            or not _is_exact_integer(record.get("databaseSchema"), 69)
+            or ended <= started
+            or (prior_end is not None and started < prior_end)
+            or not _is_exact_integer(record.get("retryCount"), 0)
+            or not _is_exact_integer(record.get("skipCount"), 0)
+            or not isinstance(incidents, list)
+            or incidents
+            or any(
+                not _is_exact_integer(record.get(key), 0)
+                for key in (
+                    "dataLossCount",
+                    "duplicateDecisionCount",
+                    "misattributedDecisionCount",
+                    "silentCorruptionCount",
+                )
+            )
+            or record.get("previousHash") != previous_hash
+            or record.get("recordHash") != _field_session_record_hash(record)
+        ):
+            raise EvidenceError("owner field session is duplicated, retried, cross-SHA, or incident-bearing")
+        decisions = _exact_positive_int(
+            record.get("durableDecisionCount"), f"owner session {ordinal} decisions"
+        )
+        _exact_positive_int(record.get("playbackCount"), f"owner session {ordinal} playback")
+        if executable_sha is None:
+            executable_sha = current_executable
+        elif executable_sha != current_executable:
+            raise EvidenceError("owner field sessions span multiple executable identities")
+        session_ids.add(session_id)
+        utc_dates.add(str(record["startedAt"])[:10])
+        previous_hash = str(record["recordHash"])
+        prior_end = ended
+        first_start = first_start or str(record["startedAt"])
+        last_end = str(record["endedAt"])
+        total_decisions += decisions
+    if len(utc_dates) != 30:
+        raise EvidenceError("owner field sessions are not thirty distinct daily-use dates")
+    summary = _load_json_without_duplicate_keys(paths["owner-field-session-summary.json"])
+    expected_summary = {
+        "schema": 1,
+        "type": "OwnerFieldSessionSummaryV1",
+        "fullGitSha": expected_sha,
+        "sessionCount": 30,
+        "distinctUtcDates": 30,
+        "firstStartedAt": first_start,
+        "lastEndedAt": last_end,
+        "totalDurableDecisions": total_decisions,
+        "executableSha256": executable_sha,
+        "databaseSchema": 69,
+        "finalRecordHash": previous_hash,
+        "passed": True,
+        "failures": [],
+    }
+    if (
+        not isinstance(summary, dict)
+        or not _is_exact_integer(summary.get("schema"), 1)
+        or not _is_exact_integer(summary.get("sessionCount"), 30)
+        or not _is_exact_integer(summary.get("distinctUtcDates"), 30)
+        or not _is_exact_integer(summary.get("totalDurableDecisions"), total_decisions)
+        or not _is_exact_integer(summary.get("databaseSchema"), 69)
+        or summary != expected_summary
+    ):
+        raise EvidenceError("owner field session summary is not derivable from its hash-chained ledger")
+    _reject_unbacked_owner_evidence(
+        "owner-field-sessions",
+        "application-authored session journal bound to durable database decision/playback rows",
+    )
+    return {
+        "sessionCount": 30,
+        "distinctUtcDates": 30,
+        "firstStartedAt": first_start,
+        "lastEndedAt": last_end,
+        "totalDurableDecisions": total_decisions,
+        "executableSha256": executable_sha,
+        "databaseSchema": 69,
+        "finalRecordHash": previous_hash,
+    }
+
+
+OWNER_DEPLOYMENT_PHASES = ("pre-deployment", "post-deployment", "post-cold-reboot")
+
+
+def _validate_deployment_phase_control(
+    phase: dict[str, object],
+    *,
+    paths: dict[str, Path],
+    expected_sha: str,
+    expected_registry_hash: str,
+    expected_checkout_digest: str,
+    expected_environment: dict[str, object],
+    expected_executable_sha256: str,
+    expected_executable_bytes: int,
+) -> dict[str, object]:
+    phase_id = str(phase["id"])
+    prefix = f"phases/{phase_id}/"
+    manifest_path = paths[prefix + "manifest.json"]
+    attestation_path = paths[prefix + "product-attestation.json"]
+    events_path = paths[prefix + "events.jsonl"]
+    manifest = _load_json_without_duplicate_keys(manifest_path)
+    if not isinstance(manifest, dict):
+        raise EvidenceError(f"deployment phase {phase_id} manifest is not an object")
+    token = phase.get("proofRunToken")
+    if (
+        not isinstance(token, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", token)
+        or not _is_exact_integer(manifest.get("schema"), 1)
+        or manifest.get("complete") is not True
+        or manifest.get("runToken") != token
+        or manifest.get("fullGitSha") != expected_sha
+        or manifest.get("sourceTreeDigest") != _source_tree_digest_for_sha(expected_sha)
+        or manifest.get("checkoutStateDigest") != expected_checkout_digest
+        or manifest.get("profile") != PROFILE_OWNER
+        or manifest.get("quick") is not False
+        or manifest.get("gateRegistryHash") != expected_registry_hash
+        or manifest.get("environment") != expected_environment
+        or manifest.get("staleTakeover") != {"occurred": False, "abandonedRunToken": None}
+    ):
+        raise EvidenceError(f"deployment phase {phase_id} proof manifest is stale or cross-authority")
+    started = _parse_utc(manifest.get("startedAt"), f"deployment phase {phase_id}.startedAt")
+    ended = _parse_utc(manifest.get("endedAt"), f"deployment phase {phase_id}.endedAt")
+    if ended <= started:
+        raise EvidenceError(f"deployment phase {phase_id} proof has an inverted time range")
+    if ended > datetime.now(timezone.utc) + timedelta(minutes=5):
+        raise EvidenceError(f"deployment phase {phase_id} proof completion is in the future")
+    if (
+        phase.get("manifestSha256") != sha256_file(manifest_path)
+        or phase.get("productAttestationSha256") != sha256_file(attestation_path)
+    ):
+        raise EvidenceError(f"deployment phase {phase_id} control artifact hash is substituted")
+    registry = _load_json_without_duplicate_keys(paths[prefix + "gate-registry.json"])
+    environment = _load_json_without_duplicate_keys(paths[prefix + "environment.json"])
+    evidence_contract = _load_json_without_duplicate_keys(paths[prefix + "evidence-contract.json"])
+    run_authority = _load_json_without_duplicate_keys(paths[prefix + RUN_AUTHORITY_NAME])
+    authority_mode, _authority_digest = _validate_run_authority(run_authority)
+    expected_authority_mode = (
+        AUTHORITY_MODE_STAGED_CANDIDATE
+        if phase_id == RELEASE_PHASE_PREDEPLOYMENT
+        else AUTHORITY_MODE_LIVE
+    )
+    if (
+        registry != gate_registry_document()
+        or environment != expected_environment
+        or evidence_contract != evidence_contract_document()
+        or run_authority != manifest.get("runAuthority")
+        or authority_mode != expected_authority_mode
+        or not isinstance(run_authority, dict)
+        or run_authority.get("releasePhase") != phase_id
+        or manifest.get("evidenceContractHash") != evidence_contract_hash()
+    ):
+        raise EvidenceError(f"deployment phase {phase_id} control authority is substituted")
+    _validate_product_attestation(attestation_path, manifest_path, manifest)
+    schema_authority = manifest.get("schemaAuthority")
+    if not isinstance(schema_authority, dict) or not _is_exact_integer(
+        schema_authority.get("latestVersion"), 69
+    ):
+        raise EvidenceError(f"deployment phase {phase_id} is not schema-69 compatible")
+    release_artifacts = manifest.get("releaseArtifacts")
+    if not isinstance(release_artifacts, list):
+        raise EvidenceError(f"deployment phase {phase_id} omits release artifacts")
+    application = [
+        item
+        for item in release_artifacts
+        if isinstance(item, dict) and item.get("role") == "application-executable"
+    ]
+    if len(application) != 1:
+        raise EvidenceError(f"deployment phase {phase_id} has no unique application executable")
+    app = application[0]
+    if (
+        app.get("sha256") != expected_executable_sha256
+        or app.get("bytes") != expected_executable_bytes
+        or app.get("buildGitSha") != expected_sha
+        or app.get("matchesFullGitSha") is not True
+        or app.get("authority") != phase.get("releaseAuthority")
+    ):
+        raise EvidenceError(f"deployment phase {phase_id} executable identity is substituted")
+    if phase_id == RELEASE_PHASE_PREDEPLOYMENT:
+        staged_candidate = _validate_staged_candidate_authority(
+            run_authority.get("stagedCandidate")
+        )
+        if (
+            app.get("releasePhase") != RELEASE_PHASE_PREDEPLOYMENT
+            or app.get("stagedReleaseId") != staged_candidate.get("releaseId")
+            or app.get("stagedReleaseManifestSha256")
+            != phase.get("deployedReleaseManifestSha256")
+            or staged_candidate.get("manifestSha256")
+            != phase.get("deployedReleaseManifestSha256")
+        ):
+            raise EvidenceError(
+                "pre-deployment proof does not bind the measured staged release manifest"
+            )
+    results = manifest.get("results")
+    selected_ids = [gate.id for gate in GATES if PROFILE_OWNER in gate.profiles]
+    if (
+        not isinstance(results, list)
+        or [item.get("gateId") if isinstance(item, dict) else None for item in results]
+        != selected_ids
+    ):
+        raise EvidenceError(f"deployment phase {phase_id} omits or reorders a verifier gate")
+    allowed_incomplete = {
+        "timeout-calibration-evidence",
+        "owner-deployment-reboot-evidence",
+        "owner-field-sessions-evidence",
+    }
+    for result in results:
+        if not isinstance(result, dict):
+            raise EvidenceError(f"deployment phase {phase_id} gate result is malformed")
+        gate_id = str(result.get("gateId"))
+        if (
+            not _is_exact_integer(result.get("attemptCount"), 1)
+            or not _is_exact_integer(result.get("retryCount"), 0)
+            or result.get("retryReasons") != []
+            or result.get("status") in {PASS_AFTER_RETRY, SKIP_ENV, NOT_RUN_QUICK}
+            or (gate_id not in allowed_incomplete and result.get("status") != PASS)
+            or (gate_id in allowed_incomplete and result.get("status") not in {PASS, FAIL})
+        ):
+            raise EvidenceError(f"deployment phase {phase_id} contains a retry, skip, or workload failure")
+    events = _strict_json_lines(events_path, f"deployment phase {phase_id} journal")
+    if not events:
+        raise EvidenceError(f"deployment phase {phase_id} journal is empty")
+    for sequence, event in enumerate(events, start=1):
+        if (
+            not _is_exact_integer(event.get("schema"), 1)
+            or not _is_exact_integer(event.get("sequence"), sequence)
+            or event.get("runToken") != token
+        ):
+            raise EvidenceError(f"deployment phase {phase_id} journal identity is invalid")
+    if (
+        events[0].get("event") != "run_start"
+        or events[-1].get("event") != "run_end"
+        or any(
+            event.get("event") in {"retry", "abandonment", "publication_failure"}
+            for event in events
+        )
+    ):
+        raise EvidenceError(f"deployment phase {phase_id} journal is incomplete or recovered")
+    return {
+        "id": phase_id,
+        "proofRunToken": token,
+        "manifestSha256": sha256_file(manifest_path),
+        "productAttestationSha256": sha256_file(attestation_path),
+        "releaseAuthority": phase["releaseAuthority"],
+        "bootIdentitySha256": phase["bootIdentitySha256"],
+        "deployedReleaseManifestSha256": phase["deployedReleaseManifestSha256"],
+        "startedAt": str(manifest["startedAt"]),
+        "endedAt": str(manifest["endedAt"]),
+    }
+
+
+def _validate_owner_deployment_semantics(
+    paths: dict[str, Path],
+    *,
+    manifest: dict[str, object],
+    expected_sha: str,
+    expected_checkout_digest: str,
+) -> dict[str, object]:
+    report = _load_json_without_duplicate_keys(paths["owner-deployment-and-reboot.json"])
+    expected_keys = {
+        "schema",
+        "type",
+        "fullGitSha",
+        "runToken",
+        "attemptCount",
+        "retryCount",
+        "skipCount",
+        "executableSha256",
+        "executableBytes",
+        "databaseSchema",
+        "phases",
+        "passed",
+        "failures",
+    }
+    if not isinstance(report, dict) or set(report) != expected_keys:
+        raise EvidenceError("owner deployment/reboot report has a non-canonical envelope")
+    executable_sha = report.get("executableSha256")
+    executable_bytes = _exact_positive_int(report.get("executableBytes"), "deployment executable bytes")
+    report_token = report.get("runToken")
+    expected_run_token = manifest.get("runToken")
+    if (
+        not _is_exact_integer(report.get("schema"), 1)
+        or report.get("type") != "OwnerDeploymentRebootMeasurementsV1"
+        or report.get("fullGitSha") != expected_sha
+        or not isinstance(report_token, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", report_token)
+        or (expected_run_token is not None and report_token != expected_run_token)
+        or not _is_exact_integer(report.get("attemptCount"), 1)
+        or not _is_exact_integer(report.get("retryCount"), 0)
+        or not _is_exact_integer(report.get("skipCount"), 0)
+        or not isinstance(executable_sha, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", executable_sha)
+        or not _is_exact_integer(report.get("databaseSchema"), 69)
+        or report.get("passed") is not True
+        or report.get("failures") != []
+    ):
+        raise EvidenceError("owner deployment/reboot report is failed, retried, skipped, or cross-SHA")
+    phases = report.get("phases")
+    if not isinstance(phases, list) or len(phases) != 3:
+        raise EvidenceError("owner deployment/reboot report does not contain exactly three phases")
+    normalized: list[dict[str, object]] = []
+    seen_tokens: set[str] = set()
+    for phase, expected_id, expected_authority in zip(
+        phases,
+        OWNER_DEPLOYMENT_PHASES,
+        ("staged-owner-candidate", "active-immutable-release", "active-immutable-release"),
+        strict=True,
+    ):
+        if not isinstance(phase, dict) or set(phase) != {
+            "id",
+            "proofRunToken",
+            "manifestSha256",
+            "productAttestationSha256",
+            "releaseAuthority",
+            "bootIdentitySha256",
+            "deployedReleaseManifestSha256",
+        }:
+            raise EvidenceError("owner deployment phase row is malformed")
+        if (
+            phase.get("id") != expected_id
+            or phase.get("releaseAuthority") != expected_authority
+            or not re.fullmatch(r"[0-9a-f]{64}", str(phase.get("bootIdentitySha256", "")))
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(phase.get("deployedReleaseManifestSha256", ""))
+            )
+            or phase.get("proofRunToken") in seen_tokens
+        ):
+            raise EvidenceError("owner deployment phase is duplicated, reordered, or authority-substituted")
+        normalized.append(
+            _validate_deployment_phase_control(
+                phase,
+                paths=paths,
+                expected_sha=expected_sha,
+                expected_registry_hash=str(manifest["gateRegistryHash"]),
+                expected_checkout_digest=expected_checkout_digest,
+                expected_environment=_environment_document(),
+                expected_executable_sha256=executable_sha,
+                expected_executable_bytes=executable_bytes,
+            )
+        )
+        seen_tokens.add(str(phase["proofRunToken"]))
+    boot_ids = [str(phase["bootIdentitySha256"]) for phase in normalized]
+    release_manifests = {
+        str(phase["deployedReleaseManifestSha256"]) for phase in normalized
+    }
+    if boot_ids[0] != boot_ids[1] or boot_ids[2] in {boot_ids[0], boot_ids[1]}:
+        raise EvidenceError("owner deployment campaign does not prove a distinct cold reboot")
+    if len(release_manifests) != 1:
+        raise EvidenceError("owner deployment phases do not bind one exact release manifest")
+    if all("startedAt" in phase and "endedAt" in phase for phase in normalized):
+        phase_ranges = [
+            (
+                _parse_utc(phase["startedAt"], f"{phase['id']}.startedAt"),
+                _parse_utc(phase["endedAt"], f"{phase['id']}.endedAt"),
+            )
+            for phase in normalized
+        ]
+        if any(
+            current_end > next_start
+            for (_current_start, current_end), (next_start, _next_end) in zip(
+                phase_ranges, phase_ranges[1:]
+            )
+        ):
+            raise EvidenceError("owner deployment proof phases overlap or are chronologically reordered")
+        if "startedAt" in manifest and "endedAt" in manifest:
+            campaign_start = _parse_utc(manifest["startedAt"], "deployment campaign.startedAt")
+            campaign_end = _parse_utc(manifest["endedAt"], "deployment campaign.endedAt")
+            if campaign_start != phase_ranges[0][0] or campaign_end != phase_ranges[-1][1]:
+                raise EvidenceError("owner deployment campaign time range is not derived from its proof runs")
+    _reject_unbacked_owner_evidence(
+        "owner-deployment-reboot-runs",
+        "complete proof bundles plus OS boot identity and deployment/activation journal",
+    )
+    return {
+        "executableSha256": executable_sha,
+        "executableBytes": executable_bytes,
+        "databaseSchema": 69,
+        "phases": normalized,
+    }
+
+
+def _validate_owner_campaign_semantics(
+    class_id: str,
+    paths: dict[str, Path],
+    *,
+    manifest: dict[str, object],
+    expected_sha: str,
+    expected_checkout_digest: str,
+    require_fresh: bool,
+) -> dict[str, object]:
+    if class_id == "coverage-and-mutation-thresholds":
+        return _validate_coverage_mutation_semantics(
+            paths,
+            manifest=manifest,
+            expected_sha=expected_sha,
+            expected_checkout_digest=expected_checkout_digest,
+            require_fresh=require_fresh,
+        )
+    if class_id == "schema-clone-and-restore-campaign":
+        return _validate_schema_restore_semantics(
+            paths,
+            expected_sha=expected_sha,
+            expected_run_token=str(manifest["runToken"]),
+        )
+    if class_id == "concurrency-performance-and-memory-campaign":
+        return _validate_concurrency_performance_semantics(
+            paths,
+            expected_sha=expected_sha,
+            expected_run_token=str(manifest["runToken"]),
+        )
+    if class_id == "owner-workflow-and-recovery-campaign":
+        return _validate_owner_workflow_semantics(
+            paths,
+            expected_sha=expected_sha,
+            expected_run_token=str(manifest["runToken"]),
+        )
+    if class_id == "owner-deployment-reboot-runs":
+        return _validate_owner_deployment_semantics(
+            paths,
+            manifest=manifest,
+            expected_sha=expected_sha,
+            expected_checkout_digest=expected_checkout_digest,
+        )
+    if class_id == "owner-field-sessions":
+        observations = _validate_owner_field_session_semantics(paths, expected_sha=expected_sha)
+        if (
+            observations.get("firstStartedAt") != manifest.get("startedAt")
+            or observations.get("lastEndedAt") != manifest.get("endedAt")
+        ):
+            raise EvidenceError(
+                "owner field campaign time range is not derived from its thirty session records"
+            )
+        return observations
+    raise EvidenceError(f"no owner campaign semantic validator exists for {class_id}")
+
+
+def _validate_owner_campaign_evidence_document(
+    value: dict[str, object],
+    *,
+    artifact_root: Path,
+    class_id: str,
+    expected_sha: str,
+    expected_profile: str | None,
+    expected_registry_hash: str | None,
+    expected_checkout_digest: str | None,
+    expected_environment: dict[str, object] | None,
+) -> None:
+    expected_keys = {
+        "schema",
+        "type",
+        "classId",
+        "fullGitSha",
+        "gateRegistryHash",
+        "checkoutStateDigest",
+        "environment",
+        "environmentDigest",
+        "profile",
+        "measuredAt",
+        "expiresAt",
+        "immutableAuthority",
+        "sourceRunToken",
+        "sourceManifestSha256",
+        "machineArtifacts",
+        "observations",
+        "passed",
+        "failures",
+    }
+    if set(value) != expected_keys or value.get("type") != "OwnerEvidenceClassAttestationV1":
+        raise EvidenceError(f"{class_id} evidence has a non-canonical envelope")
+    if expected_profile not in PROFILES or value.get("profile") != expected_profile:
+        raise EvidenceError(f"{class_id} evidence is bound to another profile")
+    measured, expires = _validate_campaign_artifact_authority(
+        value,
+        class_id=class_id,
+        expected_registry_hash=expected_registry_hash,
+        expected_checkout_digest=expected_checkout_digest,
+        expected_environment=expected_environment,
+    )
+    token = value.get("sourceRunToken")
+    source_hash = value.get("sourceManifestSha256")
+    if (
+        value.get("fullGitSha") != expected_sha
+        or not isinstance(token, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", token)
+        or not isinstance(source_hash, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", source_hash)
+    ):
+        raise EvidenceError(f"{class_id} evidence has no immutable source campaign identity")
+    expected_directory = Path(MACHINE_EVIDENCE_DIRECTORY) / class_id / token
+    expected_names = (
+        OWNER_EVIDENCE_SOURCE_MANIFEST,
+        *OWNER_EVIDENCE_RAW_ARTIFACTS[class_id],
+    )
+    files = _validate_owner_campaign_tree(
+        value.get("machineArtifacts"),
+        artifact_root=artifact_root,
+        expected_directory=expected_directory,
+        expected_names=expected_names,
+        label=class_id,
+    )
+    source_manifest = files[OWNER_EVIDENCE_SOURCE_MANIFEST]
+    if sha256_file(source_manifest) != source_hash:
+        raise EvidenceError(f"{class_id} source manifest hash is substituted")
+    manifest, _paths, observations = _validate_owner_source_campaign(
+        class_id,
+        source_manifest,
+        expected_sha=expected_sha,
+        expected_registry_hash=str(expected_registry_hash),
+        expected_checkout_digest=str(expected_checkout_digest),
+        expected_environment=dict(expected_environment or {}),
+        require_fresh=True,
+    )
+    if (
+        value.get("observations") != observations
+        or _parse_utc(manifest["endedAt"], f"{class_id} source endedAt") != measured
+        or _parse_utc(manifest["expiresAt"], f"{class_id} source expiresAt") != expires
+    ):
+        raise EvidenceError(f"{class_id} evidence projection is not derived from its machine artifacts")
+
+
 def _require_active_worker_profile() -> str:
     if _ACTIVE_WORKER_PROFILE not in PROFILES:
         raise EvidenceError("evidence validator has no exact active worker profile")
@@ -3739,7 +7608,13 @@ def _strict_json_lines(path: Path, label: str) -> list[dict[str, object]]:
             return value
 
         try:
-            parsed = json.loads(raw, object_pairs_hook=pairs_hook)
+            parsed = json.loads(
+                raw,
+                object_pairs_hook=pairs_hook,
+                parse_constant=lambda token: (_ for _ in ()).throw(
+                    ValueError(f"non-finite JSON number {token!r}")
+                ),
+            )
         except (json.JSONDecodeError, ValueError) as error:
             raise EvidenceError(f"{label} line {line_number} is not strict JSON: {error}") from error
         if not isinstance(parsed, dict):
@@ -3765,7 +7640,13 @@ def _strict_first_json_line(path: Path, label: str) -> dict[str, object]:
         return value
 
     try:
-        parsed = json.loads(raw, object_pairs_hook=pairs_hook)
+        parsed = json.loads(
+            raw,
+            object_pairs_hook=pairs_hook,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON number {token!r}")
+            ),
+        )
     except (json.JSONDecodeError, ValueError) as error:
         raise EvidenceError(f"{label} first event is not strict JSON: {error}") from error
     if not isinstance(parsed, dict):
@@ -3894,7 +7775,7 @@ def _validate_fault_campaign_manifest(
         raise EvidenceError("fault campaign manifest has a non-canonical schema-1 envelope")
     token = value.get("runToken")
     if (
-        value.get("schema") != 1
+        not _is_exact_integer(value.get("schema"), 1)
         or value.get("type") != "VerifierFaultCampaignV1"
         or value.get("complete") is not True
         or not isinstance(token, str)
@@ -3920,12 +7801,20 @@ def _validate_fault_campaign_manifest(
     started = _parse_utc(value.get("startedAt"), "fault campaign startedAt")
     ended = _parse_utc(value.get("endedAt"), "fault campaign endedAt")
     expires = _parse_utc(value.get("expiresAt"), "fault campaign expiresAt")
-    if ended < started or expires != ended + timedelta(seconds=VERIFIER_FAULT_CAMPAIGN_FRESH_SECONDS):
+    now = datetime.now(timezone.utc)
+    if (
+        ended <= started
+        or ended > now + timedelta(minutes=5)
+        or expires != ended + timedelta(seconds=VERIFIER_FAULT_CAMPAIGN_FRESH_SECONDS)
+    ):
         raise EvidenceError("fault campaign chronology or expiry is invalid")
-    if require_fresh and datetime.now(timezone.utc) >= expires:
+    if require_fresh and now >= expires:
         raise EvidenceError("fault campaign is stale")
-    if value.get("attemptCount") != 1 or value.get("retryCount") != 0:
+    if not _is_exact_integer(value.get("attemptCount"), 1) or not _is_exact_integer(
+        value.get("retryCount"), 0
+    ):
         raise EvidenceError("fault campaign used a retry or has an ambiguous attempt count")
+    _exact_nonnegative_int(value.get("exitCode"), "fault campaign exitCode")
     command = value.get("command")
     if command != {
         "argv": _verifier_fault_campaign_command(),
@@ -3953,7 +7842,12 @@ def _validate_fault_campaign_manifest(
         "attemptCount": 1,
         "retryPolicy": "none",
     }
-    if start != expected_start:
+    if (
+        not _json_values_exact(start, expected_start)
+        or not isinstance(start, dict)
+        or not _is_exact_integer(start.get("schema"), 1)
+        or not _is_exact_integer(start.get("attemptCount"), 1)
+    ):
         raise EvidenceError("fault campaign start authority is missing or substituted")
 
     artifacts = value.get("artifacts")
@@ -3964,8 +7858,8 @@ def _validate_fault_campaign_manifest(
         raise EvidenceError("fault campaign journal is incomplete or contains an unexpected event")
     for sequence, event in enumerate(events, start=1):
         if (
-            event.get("schema") != 1
-            or event.get("sequence") != sequence
+            not _is_exact_integer(event.get("schema"), 1)
+            or not _is_exact_integer(event.get("sequence"), sequence)
             or event.get("runToken") != token
         ):
             raise EvidenceError("fault campaign journal identity or sequence is invalid")
@@ -3978,7 +7872,7 @@ def _validate_fault_campaign_manifest(
         or first.get("checkoutStateDigest") != expected_checkout_digest
         or first.get("gateRegistryHash") != expected_registry_hash
         or first.get("environmentDigest") != value.get("environmentDigest")
-        or first.get("attemptCount") != 1
+        or not _is_exact_integer(first.get("attemptCount"), 1)
         or first.get("retryPolicy") != "none"
     ):
         raise EvidenceError("fault campaign journal has no matching machine start event")
@@ -3987,8 +7881,8 @@ def _validate_fault_campaign_manifest(
         or last.get("at") != value.get("endedAt")
         or last.get("exitCode") != value.get("exitCode")
         or last.get("passed") is not value.get("passed")
-        or last.get("retryCount") != 0
-        or last.get("failureCount") != len(value.get("failures", []))
+        or not _is_exact_integer(last.get("retryCount"), 0)
+        or not _is_exact_integer(last.get("failureCount"), len(value.get("failures", [])))
     ):
         raise EvidenceError("fault campaign journal has no matching terminal event")
 
@@ -4302,7 +8196,7 @@ def _validate_timeout_baseline_manifest(
         raise EvidenceError("timeout baseline journal contains a retry, takeover, or publication failure")
     started = _parse_utc(events[0].get("at"), "timeout baseline startedAt")
     ended = _parse_utc(events[-1].get("at"), "timeout baseline endedAt")
-    if ended < started:
+    if ended < started or ended > datetime.now(timezone.utc) + timedelta(minutes=5):
         raise EvidenceError("timeout baseline has reversed chronology")
     expires = ended + timedelta(seconds=TIMEOUT_CALIBRATION_FRESH_SECONDS)
     if datetime.now(timezone.utc) >= expires:
@@ -4797,6 +8691,7 @@ def _rust_coverage_command_registry() -> dict[str, object]:
         "criticalDomainThresholds": {
             "lines": 95.0,
             "regions": 95.0,
+            "functions": 90.0,
             "branches": 90.0,
         },
         "criticalDomainPatterns": {
@@ -5032,10 +8927,7 @@ def _validate_rust_coverage_phase(
     require_fresh: bool,
     require_current_environment: bool,
 ) -> dict[str, object]:
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise EvidenceError(f"Rust coverage prerequisite manifest cannot be read: {error}") from error
+    manifest = _load_json_without_duplicate_keys(manifest_path)
     exact_fields = {
         "schema",
         "type",
@@ -5063,11 +8955,11 @@ def _validate_rust_coverage_phase(
         or not isinstance(token, str)
         or not re.fullmatch(r"[0-9a-f]{32}", token)
         or phase_dir.name != token
-        or manifest.get("schema") != 1
+        or not _is_exact_integer(manifest.get("schema"), 1)
         or manifest.get("type") != "RustCoveragePrerequisiteV1"
         or manifest.get("complete") is not True
-        or manifest.get("exitCode") != 0
-        or manifest.get("attemptCount") != 1
+        or not _is_exact_integer(manifest.get("exitCode"), 0)
+        or not _is_exact_integer(manifest.get("attemptCount"), 1)
     ):
         raise EvidenceError("Rust coverage prerequisite has invalid completion/run identity")
     if (
@@ -5083,7 +8975,7 @@ def _validate_rust_coverage_phase(
     started = _parse_utc(manifest.get("startedAt"), "coverage phase startedAt")
     ended = _parse_utc(manifest.get("endedAt"), "coverage phase endedAt")
     expires = _parse_utc(manifest.get("expiresAt"), "coverage phase expiresAt")
-    if ended < started or expires != ended + timedelta(seconds=RUST_COVERAGE_FRESH_SECONDS):
+    if ended <= started or expires != ended + timedelta(seconds=RUST_COVERAGE_FRESH_SECONDS):
         raise EvidenceError("Rust coverage prerequisite has invalid duration/freshness authority")
     now = datetime.now(timezone.utc)
     if ended > now + timedelta(minutes=5):
@@ -5094,7 +8986,9 @@ def _validate_rust_coverage_phase(
     if manifest.get("commandRegistry") != registry:
         raise EvidenceError("Rust coverage prerequisite command registry was substituted")
     environment = manifest.get("environment")
-    if not isinstance(environment, dict) or environment.get("schema") != 1:
+    if not isinstance(environment, dict) or not _is_exact_integer(
+        environment.get("schema"), 1
+    ):
         raise EvidenceError("Rust coverage prerequisite environment is malformed")
     coverage_toolchain = environment.get("coverageToolchain")
     if coverage_toolchain != _expected_rust_coverage_toolchain_identity():
@@ -5152,21 +9046,16 @@ def _validate_rust_coverage_phase(
     if report.get("artifactSha256") != artifact_by_path[RUST_COVERAGE_ARTIFACT_NAME]["sha256"]:
         raise EvidenceError("Rust coverage report does not bind its LLVM artifact")
 
-    try:
-        events = [
-            json.loads(line)
-            for line in (phase_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise EvidenceError(f"Rust coverage prerequisite journal cannot be read: {error}") from error
+    events = _strict_json_lines(
+        phase_dir / "events.jsonl", "Rust coverage prerequisite journal"
+    )
     if len(events) < 2:
         raise EvidenceError("Rust coverage prerequisite journal is incomplete")
     for sequence, event in enumerate(events, start=1):
         if (
             not isinstance(event, dict)
-            or event.get("schema") != 1
-            or event.get("sequence") != sequence
+            or not _is_exact_integer(event.get("schema"), 1)
+            or not _is_exact_integer(event.get("sequence"), sequence)
             or event.get("runToken") != token
         ):
             raise EvidenceError("Rust coverage prerequisite journal identity/sequence is invalid")
@@ -5178,7 +9067,7 @@ def _validate_rust_coverage_phase(
         or first.get("commandRegistryHash") != registry["registrySha256"]
         or first.get("at") != manifest.get("startedAt")
         or last.get("event") != "phase_end"
-        or last.get("exitCode") != 0
+        or not _is_exact_integer(last.get("exitCode"), 0)
         or last.get("artifactSha256") != report["artifactSha256"]
         or last.get("at") != manifest.get("endedAt")
         or any(event.get("event") in {"retry", "abandonment"} for event in events)
@@ -5193,10 +9082,7 @@ def _validate_latest_rust_coverage_pointer(
     expected_sha: str,
     expected_checkout_digest: str,
 ) -> dict[str, object]:
-    try:
-        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise EvidenceError(f"latest Rust coverage pointer cannot be read: {error}") from error
+    pointer = _load_json_without_duplicate_keys(pointer_path)
     if not isinstance(pointer, dict) or set(pointer) != {
         "schema",
         "type",
@@ -5216,7 +9102,7 @@ def _validate_latest_rust_coverage_pointer(
     except ValueError as error:
         raise EvidenceError("latest Rust coverage pointer escapes its immutable root") from error
     if (
-        pointer.get("schema") != 1
+        not _is_exact_integer(pointer.get("schema"), 1)
         or pointer.get("type") != "RustCoveragePrerequisitePointerV1"
         or pointer.get("state") != "COMPLETED"
         or pointer.get("fullGitSha") != expected_sha
@@ -5557,6 +9443,7 @@ def gate_worker_main(
     LOG_DIR = result_path.parent
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     started = utc_now()
+    run_metadata = GateRunMetadata()
     status, seconds, detail = run_gate(
         gate.id,
         gate.kind,
@@ -5565,6 +9452,7 @@ def gate_worker_main(
         gate.environment_probe,
         timeout=gate.timeout_seconds,
         authority_mode=authority_mode,
+        metadata=run_metadata,
     )
     artifacts = []
     artifact_paths = {
@@ -5608,6 +9496,9 @@ def gate_worker_main(
         "status": status,
         "seconds": round(seconds, 3),
         "detail": str(detail),
+        "attemptCount": run_metadata.attempt_count,
+        "retryCount": run_metadata.retry_count,
+        "retryReasons": list(run_metadata.retry_reasons),
         "artifacts": artifacts,
         "environmentAuthority": environment_authority,
     }
@@ -5623,15 +9514,46 @@ def _validate_worker_result(
     authority_mode: str,
     run_authority_digest: str,
     expected_environment_authority: dict[str, object],
-) -> tuple[str, float, str, list[dict[str, object]], dict[str, object]]:
+) -> tuple[
+    str,
+    float,
+    str,
+    list[dict[str, object]],
+    dict[str, object],
+    dict[str, object],
+]:
     try:
-        result = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        result = _load_json_without_duplicate_keys(path)
+    except EvidenceError as error:
         raise EvidenceError(f"gate {gate.id} has no readable worker result: {error}") from error
-    if not isinstance(result, dict) or result.get("schema") != 1:
+    required_fields = {
+        "schema",
+        "runToken",
+        "gateId",
+        "startedAt",
+        "endedAt",
+        "status",
+        "seconds",
+        "detail",
+        "attemptCount",
+        "retryCount",
+        "retryReasons",
+        "artifacts",
+        "environmentAuthority",
+    }
+    if (
+        not isinstance(result, dict)
+        or set(result) != required_fields
+        or isinstance(result.get("schema"), bool)
+        or result.get("schema") != 1
+    ):
         raise EvidenceError(f"gate {gate.id} worker result has the wrong schema")
     if result.get("runToken") != run_token or result.get("gateId") != gate.id:
         raise EvidenceError(f"gate {gate.id} worker result is bound to another run/gate")
+    worker_started = _parse_utc(result.get("startedAt"), f"gate {gate.id} worker startedAt")
+    worker_ended = _parse_utc(result.get("endedAt"), f"gate {gate.id} worker endedAt")
+    if worker_ended < worker_started:
+        raise EvidenceError(f"gate {gate.id} worker result has reversed chronology")
     environment_authority = _validate_gate_environment_authority(
         result.get("environmentAuthority"),
         gate,
@@ -5647,17 +9569,78 @@ def _validate_worker_result(
     seconds = result.get("seconds")
     detail = result.get("detail")
     artifacts = result.get("artifacts")
-    if not isinstance(seconds, (int, float)) or seconds < 0 or not isinstance(detail, str):
+    attempt_count = result.get("attemptCount")
+    retry_count = result.get("retryCount")
+    retry_reasons = result.get("retryReasons")
+    if (
+        not isinstance(seconds, (int, float))
+        or isinstance(seconds, bool)
+        or not math.isfinite(float(seconds))
+        or seconds < 0
+        or not isinstance(detail, str)
+    ):
         raise EvidenceError(f"gate {gate.id} worker result has invalid timing/detail")
+    if (
+        isinstance(attempt_count, bool)
+        or not isinstance(attempt_count, int)
+        or attempt_count not in {1, 2}
+        or isinstance(retry_count, bool)
+        or not isinstance(retry_count, int)
+        or retry_count != attempt_count - 1
+        or not isinstance(retry_reasons, list)
+        or len(retry_reasons) != retry_count
+        or any(reason not in ALLOWED_DIAGNOSTIC_RETRY_REASONS for reason in retry_reasons)
+    ):
+        raise EvidenceError(f"gate {gate.id} worker result has invalid attempt/retry authority")
+    if (status == PASS_AFTER_RETRY) != (retry_count == 1):
+        raise EvidenceError(f"gate {gate.id} retry status contradicts its attempt authority")
+    if retry_count and status in {PASS, SKIP_ENV, NOT_BUILT}:
+        raise EvidenceError(f"gate {gate.id} concealed a retry behind status {status}")
+    if retry_count and gate.retry_policy != "diagnostic-once":
+        raise EvidenceError(f"gate {gate.id} retried contrary to its registry policy")
     if not isinstance(artifacts, list):
         raise EvidenceError(f"gate {gate.id} worker result has no artifact list")
     checked: list[dict[str, object]] = []
+    observed_paths: set[str] = set()
+    artifact_root = path.parent.resolve()
     for artifact in artifacts:
-        if not isinstance(artifact, dict) or not isinstance(artifact.get("path"), str):
+        if (
+            not isinstance(artifact, dict)
+            or set(artifact) != {"path", "sha256", "bytes"}
+            or not isinstance(artifact.get("path"), str)
+        ):
             raise EvidenceError(f"gate {gate.id} worker artifact is malformed")
-        artifact_path = path.parent / str(artifact["path"])
-        if not artifact_path.is_file() or sha256_file(artifact_path) != artifact.get("sha256"):
+        relative = Path(str(artifact["path"]))
+        relative_text = str(relative)
+        unresolved_artifact_path = path.parent / relative
+        artifact_path = unresolved_artifact_path.resolve()
+        try:
+            artifact_path.relative_to(artifact_root)
+        except ValueError as error:
+            raise EvidenceError(f"gate {gate.id} worker artifact escapes its directory") from error
+        size = artifact.get("bytes")
+        if (
+            relative.is_absolute()
+            or relative_text in {"", ".", "worker.log", "worker-result.json"}
+            or relative_text != artifact["path"]
+            or ".." in relative.parts
+            or relative_text in observed_paths
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or any(
+                (path.parent.joinpath(*relative.parts[:part_count])).is_symlink()
+                for part_count in range(
+                    1,
+                    len(relative.parts) + 1,
+                )
+            )
+            or not artifact_path.is_file()
+            or artifact_path.stat().st_size != size
+            or sha256_file(artifact_path) != artifact.get("sha256")
+        ):
             raise EvidenceError(f"gate {gate.id} worker artifact hash mismatch: {artifact_path}")
+        observed_paths.add(relative_text)
         checked.append(artifact)
     required_outputs = set(gate.artifact_requirements) - {"attempt-log", "worker-result"}
     observed_outputs = {str(artifact["path"]) for artifact in checked}
@@ -5666,7 +9649,18 @@ def _validate_worker_result(
             f"gate {gate.id} passed without required artifacts: "
             + ", ".join(sorted(required_outputs - observed_outputs))
         )
-    return str(status), float(seconds), detail, checked, environment_authority
+    return (
+        str(status),
+        float(seconds),
+        detail,
+        checked,
+        environment_authority,
+        {
+            "attemptCount": attempt_count,
+            "retryCount": retry_count,
+            "retryReasons": list(retry_reasons),
+        },
+    )
 
 
 def _run_gate_worker(
@@ -5679,7 +9673,14 @@ def _run_gate_worker(
     profile: str | None = None,
     authority_mode: str,
     run_authority_digest: str,
-) -> tuple[str, float, str, list[dict[str, object]], dict[str, object]]:
+) -> tuple[
+    str,
+    float,
+    str,
+    list[dict[str, object]],
+    dict[str, object],
+    dict[str, object],
+]:
     worker_profile = profile or (
         PROFILE_OWNER if PROFILE_OWNER in gate.profiles else sorted(gate.profiles)[0]
     )
@@ -5720,6 +9721,11 @@ def _run_gate_worker(
     ]
     process = None
     job = None
+    attempt_authority: dict[str, object] = {
+        "attemptCount": 0,
+        "retryCount": 0,
+        "retryReasons": [],
+    }
     last_journal_heartbeat = 0.0
     try:
         with worker_log.open("x", encoding="utf-8", errors="replace", buffering=1) as log:
@@ -5729,6 +9735,7 @@ def _run_gate_worker(
                 log=log,
                 env=worker_environment,
             )
+            attempt_authority["attemptCount"] = 1
             lease.update_gate(gate.id, process.pid)
 
             def heartbeat() -> None:
@@ -5742,7 +9749,7 @@ def _run_gate_worker(
             return_code, timed_out = wait_isolated(
                 process,
                 job,
-                timeout=gate.timeout_seconds + 45,
+                timeout=gate.timeout_seconds,
                 heartbeat=heartbeat,
             )
             log.flush()
@@ -5772,7 +9779,7 @@ def _run_gate_worker(
             detail=detail,
             environmentDigest=environment_digest,
         )
-        return FAIL, 0.0, detail, [], environment_authority
+        return FAIL, 0.0, detail, [], environment_authority, attempt_authority
 
     worker_artifact = {
         "path": str(worker_log.relative_to(run_dir)),
@@ -5780,7 +9787,7 @@ def _run_gate_worker(
         "bytes": worker_log.stat().st_size,
     }
     if timed_out:
-        detail = f"worker exceeded hard timeout {gate.timeout_seconds + 45}s"
+        detail = f"worker exceeded declared hard timeout {gate.timeout_seconds}s"
         journal.append(
             "gate_end",
             gate=gate.id,
@@ -5790,10 +9797,11 @@ def _run_gate_worker(
         )
         return (
             FAIL,
-            float(gate.timeout_seconds + 45),
+            float(gate.timeout_seconds),
             detail,
             [worker_artifact],
             environment_authority,
+            attempt_authority,
         )
     if return_code != 0:
         detail = f"worker exited {return_code} without a trustworthy verdict"
@@ -5804,9 +9812,23 @@ def _run_gate_worker(
             detail=detail,
             environmentDigest=environment_digest,
         )
-        return FAIL, 0.0, detail, [worker_artifact], environment_authority
+        return (
+            FAIL,
+            0.0,
+            detail,
+            [worker_artifact],
+            environment_authority,
+            attempt_authority,
+        )
     try:
-        status, seconds, detail, artifacts, environment_authority = _validate_worker_result(
+        (
+            status,
+            seconds,
+            detail,
+            artifacts,
+            environment_authority,
+            attempt_authority,
+        ) = _validate_worker_result(
             result_path,
             gate,
             run_token,
@@ -5824,13 +9846,22 @@ def _run_gate_worker(
         }
         for artifact in artifacts
     )
-    normalized.append(
-        {
-            "path": str(result_path.relative_to(run_dir)),
-            "sha256": sha256_file(result_path),
-            "bytes": result_path.stat().st_size,
-        }
-    )
+    if result_path.is_file():
+        normalized.append(
+            {
+                "path": str(result_path.relative_to(run_dir)),
+                "sha256": sha256_file(result_path),
+                "bytes": result_path.stat().st_size,
+            }
+        )
+    for retry_index, reason in enumerate(attempt_authority["retryReasons"], start=2):
+        journal.append(
+            "retry",
+            gate=gate.id,
+            attempt=retry_index,
+            reason=reason,
+            environmentDigest=environment_digest,
+        )
     journal.append(
         "gate_end",
         gate=gate.id,
@@ -5839,7 +9870,14 @@ def _run_gate_worker(
         detail=detail,
         environmentDigest=environment_digest,
     )
-    return status, seconds, detail, normalized, environment_authority
+    return (
+        status,
+        seconds,
+        detail,
+        normalized,
+        environment_authority,
+        attempt_authority,
+    )
 
 
 def _manifest_artifacts(run_dir: Path) -> list[dict[str, object]]:
@@ -5889,6 +9927,57 @@ EVIDENCE_VALIDATOR_GATES: dict[str, tuple[str, tuple[str, ...], str]] = {
         ("clean-source-tree", "known-defect-ledger-evidence"),
         _KNOWN_DEFECT_ARTIFACT,
     ),
+    "coverage-and-mutation-thresholds": (
+        "coverage-and-mutation-evidence",
+        (
+            "clean-source-tree",
+            "frontend-coverage",
+            "coverage-and-mutation-evidence",
+        ),
+        _COVERAGE_MUTATION_ARTIFACT,
+    ),
+    "schema-clone-and-restore-campaign": (
+        "schema-clone-and-restore-evidence",
+        (
+            "clean-source-tree",
+            "test-rust",
+            "schema-clone-and-restore-evidence",
+        ),
+        _SCHEMA_RESTORE_ARTIFACT,
+    ),
+    "concurrency-performance-and-memory-campaign": (
+        "concurrency-performance-memory-evidence",
+        (
+            "clean-source-tree",
+            "test-rust",
+            "frontend-coverage",
+            "concurrency-performance-memory-evidence",
+        ),
+        _CONCURRENCY_PERFORMANCE_ARTIFACT,
+    ),
+    "owner-workflow-and-recovery-campaign": (
+        "owner-workflow-recovery-evidence",
+        (
+            "clean-source-tree",
+            "real-app-e2e",
+            "champion-7b-preflight",
+            "owner-real-media-rust",
+            "durability-drill",
+            "export-kill-drill",
+            "owner-workflow-recovery-evidence",
+        ),
+        _OWNER_WORKFLOW_ARTIFACT,
+    ),
+    "owner-deployment-reboot-runs": (
+        "owner-deployment-reboot-evidence",
+        ("clean-source-tree", "owner-deployment-reboot-evidence"),
+        _OWNER_DEPLOYMENT_ARTIFACT,
+    ),
+    "owner-field-sessions": (
+        "owner-field-sessions-evidence",
+        ("clean-source-tree", "owner-field-sessions-evidence"),
+        _OWNER_FIELD_SESSIONS_ARTIFACT,
+    ),
 }
 
 
@@ -5917,7 +10006,12 @@ def _validate_campaign_artifact_authority(
         raise EvidenceError(f"{class_id} evidence is bound to another registry, checkout, or environment")
     measured = _parse_utc(value.get("measuredAt"), f"{class_id}.measuredAt")
     expires = _parse_utc(value.get("expiresAt"), f"{class_id}.expiresAt")
-    if expires <= measured or datetime.now(timezone.utc) >= expires:
+    now = datetime.now(timezone.utc)
+    if (
+        measured > now + timedelta(minutes=5)
+        or expires <= measured
+        or now >= expires
+    ):
         raise EvidenceError(f"{class_id} evidence is stale")
     return measured, expires
 
@@ -6062,7 +10156,8 @@ def _validate_fault_campaign_evidence_document(
         ended = _parse_utc(campaign.get("endedAt"), f"fault campaign {index}.endedAt")
         expires = _parse_utc(campaign.get("expiresAt"), f"fault campaign {index}.expiresAt")
         if (
-            ended < started
+            ended <= started
+            or ended > datetime.now(timezone.utc) + timedelta(minutes=5)
             or expires != ended + timedelta(seconds=VERIFIER_FAULT_CAMPAIGN_FRESH_SECONDS)
             or datetime.now(timezone.utc) >= expires
             or (previous_end is not None and started < previous_end)
@@ -6070,7 +10165,9 @@ def _validate_fault_campaign_evidence_document(
             raise EvidenceError("verifier fault campaigns are stale, overlapping, or misordered")
         previous_end = ended
         expirations.append(expires)
-        if campaign.get("attemptCount") != 1 or campaign.get("retryCount") != 0:
+        if not _is_exact_integer(campaign.get("attemptCount"), 1) or not _is_exact_integer(
+            campaign.get("retryCount"), 0
+        ):
             raise EvidenceError("verifier fault campaign contains a retry")
         test_results = campaign.get("testResults")
         expected_tests = [
@@ -6122,7 +10219,7 @@ def _validate_embedded_timeout_baseline(
     if not isinstance(manifest, dict):
         raise EvidenceError("timeout baseline manifest is not an object")
     if (
-        manifest.get("schema") != 1
+        not _is_exact_integer(manifest.get("schema"), 1)
         or manifest.get("complete") is not True
         or manifest.get("runToken") != token
         or manifest.get("fullGitSha") != expected_sha
@@ -6189,8 +10286,8 @@ def _validate_embedded_timeout_baseline(
     events = _strict_json_lines(files["events.jsonl"], "embedded timeout baseline journal")
     for sequence, event in enumerate(events, start=1):
         if (
-            event.get("schema") != 1
-            or event.get("sequence") != sequence
+            not _is_exact_integer(event.get("schema"), 1)
+            or not _is_exact_integer(event.get("sequence"), sequence)
             or event.get("runToken") != token
         ):
             raise EvidenceError("timeout baseline embedded journal identity is invalid")
@@ -6346,6 +10443,7 @@ def _validate_timeout_calibration_evidence_document(
         expires = _parse_utc(baseline.get("expiresAt"), f"timeout baseline {index}.expiresAt")
         if (
             ended < started
+            or ended > datetime.now(timezone.utc) + timedelta(minutes=5)
             or expires != ended + timedelta(seconds=TIMEOUT_CALIBRATION_FRESH_SECONDS)
             or datetime.now(timezone.utc) >= expires
             or (previous_end is not None and started < previous_end)
@@ -6354,8 +10452,8 @@ def _validate_timeout_calibration_evidence_document(
         previous_end = ended
         expirations.append(expires)
         if (
-            baseline.get("attemptCount") != 1
-            or baseline.get("retryCount") != 0
+            not _is_exact_integer(baseline.get("attemptCount"), 1)
+            or not _is_exact_integer(baseline.get("retryCount"), 0)
             or baseline.get("staleTakeover") is not False
         ):
             raise EvidenceError("timeout baseline contains a retry, takeover, or ambiguous attempt")
@@ -6456,9 +10554,9 @@ def _validate_class_evidence_artifact(
             raise EvidenceError("architecture evidence does not pass the Rust module contract")
         if (
             not isinstance(ipc, dict)
-            or ipc.get("handwrittenCount") != 0
-            or ipc.get("dynamicCount") != 0
-            or ipc.get("noncanonicalErrorCount") != 0
+            or not _is_exact_integer(ipc.get("handwrittenCount"), 0)
+            or not _is_exact_integer(ipc.get("dynamicCount"), 0)
+            or not _is_exact_integer(ipc.get("noncanonicalErrorCount"), 0)
             or not isinstance(ipc.get("generatedCount"), int)
             or isinstance(ipc.get("generatedCount"), bool)
             or ipc.get("generatedCount", 0) <= 0
@@ -6489,6 +10587,17 @@ def _validate_class_evidence_artifact(
         _validate_timeout_calibration_evidence_document(
             value,
             artifact_root=path.parent,
+            expected_sha=expected_sha,
+            expected_profile=expected_profile,
+            expected_registry_hash=expected_registry_hash,
+            expected_checkout_digest=expected_checkout_digest,
+            expected_environment=expected_environment,
+        )
+    elif class_id in OWNER_EVIDENCE_CLASS_GATE_IDS:
+        _validate_owner_campaign_evidence_document(
+            value,
+            artifact_root=path.parent,
+            class_id=class_id,
             expected_sha=expected_sha,
             expected_profile=expected_profile,
             expected_registry_hash=expected_registry_hash,
@@ -6638,7 +10747,7 @@ def _validate_evidence_results(
             expected_checkout_digest=expected_checkout_digest,
             expected_environment=expected_environment,
         )
-    if value != expected:
+    if not _json_values_exact(value, expected):
         raise EvidenceError(
             "certification evidence classes were omitted, substituted, reordered, or self-asserted; "
             "implemented results must be rederived from exact validator artifacts and unimplemented "
@@ -6650,7 +10759,7 @@ def _validate_evidence_results(
 def _validate_schema_authority(
     value: object, expected_sha: str, proof_root: Path, *, eligible: bool
 ) -> None:
-    if not isinstance(value, dict) or value.get("schema") != 1:
+    if not isinstance(value, dict) or not _is_exact_integer(value.get("schema"), 1):
         raise EvidenceError("product proof has no schema-1 migration authority")
     relative = MIGRATION_CATALOG.relative_to(REPO_ROOT).as_posix()
     committed = _git_file_bytes(expected_sha, relative)
@@ -6714,7 +10823,12 @@ def _validate_schema_authority(
 
 
 def _validate_release_artifacts(
-    profile: str, value: object, expected_sha: str, *, eligible: bool
+    profile: str,
+    value: object,
+    expected_sha: str,
+    *,
+    eligible: bool,
+    run_authority: object | None = None,
 ) -> list[dict[str, object]]:
     if not isinstance(value, list):
         raise EvidenceError("product proof has no release-artifact bindings")
@@ -6741,6 +10855,41 @@ def _validate_release_artifacts(
         roles.append(role)
     if len(roles) != len(set(roles)):
         raise EvidenceError("product proof contains duplicate release-artifact roles")
+    authority_mode = None
+    staged_candidate = None
+    if run_authority is not None:
+        authority_mode, _authority_digest = _validate_run_authority(run_authority)
+        if authority_mode == AUTHORITY_MODE_STAGED_CANDIDATE:
+            staged_candidate = _validate_staged_candidate_authority(
+                run_authority.get("stagedCandidate")
+                if isinstance(run_authority, dict)
+                else None
+            )
+    if staged_candidate is not None:
+        if eligible or profile != PROFILE_OWNER:
+            raise EvidenceError("staged candidate artifacts may authorize only owner pre-deployment proof")
+        candidate_app = staged_candidate["artifacts"]["applicationExecutable"]
+        expected_candidate_binding = {
+            "role": "application-executable",
+            "name": "cortex-speech-app.exe",
+            "sha256": candidate_app["sha256"],
+            "bytes": candidate_app["bytes"],
+            "buildGitSha": expected_sha,
+            "matchesFullGitSha": True,
+            "authority": "staged-owner-candidate",
+            "activeReleasePointerSha256": None,
+            "activeReleaseGitSha": None,
+            "releasePhase": RELEASE_PHASE_PREDEPLOYMENT,
+            "stagedReleaseId": staged_candidate["releaseId"],
+            "stagedReleaseManifestSha256": staged_candidate["manifestSha256"],
+            "expectedDatabaseSchema": 69,
+            "schemaContractId": staged_candidate["schemaContractId"],
+            "schemaContractSha256": staged_candidate["artifacts"]["schemaContract"][
+                "sha256"
+            ],
+        }
+        if value != [expected_candidate_binding]:
+            raise EvidenceError("staged candidate release artifacts differ from run authority")
     missing = sorted(set(PROFILE_REQUIRED_RELEASE_ARTIFACT_ROLES[profile]) - set(roles))
     if eligible and missing:
         raise EvidenceError(f"certifying proof omits release-artifact roles: {', '.join(missing)}")
@@ -6906,10 +11055,7 @@ def _validate_windows_release_authority_binding(
         or sha256_file(authority_path) != digest
     ):
         raise EvidenceError("proof Windows release-authority bytes are missing or changed")
-    try:
-        authority = json.loads(authority_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise EvidenceError(f"proof Windows release authority cannot be read: {error}") from error
+    authority = _load_json_without_duplicate_keys(authority_path)
     if not isinstance(authority, dict) or set(authority) != {
         "schema",
         "type",
@@ -6949,6 +11095,7 @@ def _revalidate_latest_release_executable(
     profile: str,
     value: list[dict[str, object]],
     expected_sha: str,
+    run_authority: object | None = None,
 ) -> None:
     """Re-observe mutable deployment state when consuming ``latest-proof``.
 
@@ -6970,6 +11117,38 @@ def _revalidate_latest_release_executable(
         (artifact for artifact in value if artifact.get("role") == "application-executable"),
         None,
     )
+    authority_mode = None
+    if run_authority is not None:
+        authority_mode, _authority_digest = _validate_run_authority(run_authority)
+    if authority_mode == AUTHORITY_MODE_STAGED_CANDIDATE:
+        if profile != PROFILE_OWNER or not isinstance(run_authority, dict):
+            raise EvidenceError("staged candidate latest-proof has an invalid profile/authority")
+        candidate, executable = _revalidate_staged_candidate_authority(
+            run_authority.get("stagedCandidate")
+        )
+        executable_sha, executable_bytes, marker = _binary_identity(executable)
+        expected = {
+            "role": "application-executable",
+            "name": "cortex-speech-app.exe",
+            "sha256": executable_sha,
+            "bytes": executable_bytes,
+            "buildGitSha": marker,
+            "matchesFullGitSha": marker == expected_sha,
+            "authority": "staged-owner-candidate",
+            "activeReleasePointerSha256": None,
+            "activeReleaseGitSha": None,
+            "releasePhase": RELEASE_PHASE_PREDEPLOYMENT,
+            "stagedReleaseId": candidate["releaseId"],
+            "stagedReleaseManifestSha256": candidate["manifestSha256"],
+            "expectedDatabaseSchema": candidate["expectedDatabaseSchema"],
+            "schemaContractId": candidate["schemaContractId"],
+            "schemaContractSha256": candidate["artifacts"]["schemaContract"]["sha256"],
+        }
+        if not _json_values_exact(recorded, expected):
+            raise EvidenceError(
+                "latest-proof staged candidate or release manifest changed after measurement"
+            )
+        return
     observed = next(
         (
             artifact
@@ -7065,12 +11244,9 @@ def _validate_product_attestation(
     manifest_path: Path,
     manifest: dict[str, object],
 ) -> dict[str, object]:
-    try:
-        attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise EvidenceError(f"product attestation cannot be read: {error}") from error
+    attestation = _load_json_without_duplicate_keys(attestation_path)
     expected = _product_attestation_document(manifest_path, manifest)
-    if attestation != expected:
+    if not isinstance(attestation, dict) or not _json_values_exact(attestation, expected):
         raise EvidenceError("product attestation is missing, stale, or substituted")
     return attestation
 
@@ -7090,11 +11266,23 @@ def _safe_pointer_target(pointer_path: Path, relative_value: object, label: str)
 
 
 def _validate_latest_proof(path: Path, expected_sha: str | None = None) -> dict[str, object]:
-    try:
-        pointer = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise EvidenceError(f"latest-proof pointer cannot be read: {error}") from error
-    if not isinstance(pointer, dict) or pointer.get("schema") != 1:
+    pointer = _load_json_without_duplicate_keys(path)
+    if (
+        not isinstance(pointer, dict)
+        or set(pointer)
+        != {
+            "schema",
+            "runToken",
+            "fullGitSha",
+            "profile",
+            "manifest",
+            "manifestSha256",
+            "productAttestation",
+            "productAttestationSha256",
+        }
+        or isinstance(pointer.get("schema"), bool)
+        or pointer.get("schema") != 1
+    ):
         raise EvidenceError("latest-proof pointer has the wrong schema")
     expected_sha = _full_git_sha() if expected_sha is None else expected_sha
     full_sha = pointer.get("fullGitSha")
@@ -7140,6 +11328,7 @@ def _validate_latest_proof(path: Path, expected_sha: str | None = None) -> dict[
         str(manifest["profile"]),
         manifest["releaseArtifacts"],
         full_sha,
+        manifest.get("runAuthority"),
     )
     _validate_product_attestation(attestation_path, manifest_path, manifest)
     return manifest
@@ -7182,7 +11371,7 @@ def _require_certifying_manifest(
         raise EvidenceError("proof used quick mode and cannot authorize a release")
     if (
         manifest.get("certificationEligible") is not True
-        or manifest.get("exitCode") != 0
+        or not _is_exact_integer(manifest.get("exitCode"), 0)
         or manifest.get("requiredEvidencePending") != []
     ):
         raise EvidenceError("proof is complete but not certification-eligible")
@@ -7203,6 +11392,10 @@ def _require_certifying_manifest(
         diagnostic_authority_overrides=(
             _validate_run_authority(manifest.get("runAuthority"))[0]
             == AUTHORITY_MODE_DIAGNOSTIC
+        ),
+        staged_candidate=(
+            _validate_run_authority(manifest.get("runAuthority"))[0]
+            == AUTHORITY_MODE_STAGED_CANDIDATE
         ),
     )[1]
     if manifest.get("verdict") != expected_verdict:
@@ -7233,10 +11426,7 @@ def _require_detached_certifying_proof(
     manifest_path = manifest_path.resolve(strict=True)
     if manifest_path.name != "manifest.json":
         raise EvidenceError("detached proof authority must be named manifest.json")
-    try:
-        envelope = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise EvidenceError(f"detached proof manifest cannot be read: {error}") from error
+    envelope = _load_json_without_duplicate_keys(manifest_path)
     token = envelope.get("runToken") if isinstance(envelope, dict) else None
     if not isinstance(token, str) or not token or manifest_path.parent.name != token:
         raise EvidenceError("detached proof directory does not match its run token")
@@ -7274,11 +11464,41 @@ def _validate_completed_manifest(
     *,
     require_current_live_authority: bool = False,
 ) -> dict[str, object]:
-    try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise EvidenceError(f"completed proof manifest cannot be read: {error}") from error
-    if not isinstance(manifest, dict) or manifest.get("schema") != 1:
+    manifest = _load_json_without_duplicate_keys(path)
+    manifest_fields = {
+        "schema",
+        "complete",
+        "runToken",
+        "fullGitSha",
+        "sourceTreeDigest",
+        "checkoutStateDigest",
+        "profile",
+        "quick",
+        "environment",
+        "runAuthority",
+        "gateRegistryHash",
+        "evidenceContractHash",
+        "certificationEvidence",
+        "results",
+        "verdict",
+        "exitCode",
+        "certificationEligible",
+        "requiredEvidencePending",
+        "schemaAuthority",
+        "releaseArtifacts",
+        "windowsReleaseAuthority",
+        "rustCoveragePrerequisite",
+        "modelAttestation",
+        "knownDefectDigest",
+        "staleTakeover",
+        "artifacts",
+    }
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != manifest_fields
+        or isinstance(manifest.get("schema"), bool)
+        or manifest.get("schema") != 1
+    ):
         raise EvidenceError("completed proof manifest has the wrong schema")
     if manifest.get("fullGitSha") != expected_sha or manifest.get("runToken") != expected_token:
         raise EvidenceError("completed proof manifest is bound to another source/run")
@@ -7303,13 +11523,10 @@ def _validate_completed_manifest(
     environment_path = path.parent / "environment.json"
     run_authority_path = path.parent / RUN_AUTHORITY_NAME
     evidence_contract_path = path.parent / EVIDENCE_CONTRACT_NAME
-    try:
-        registry = json.loads(registry_path.read_text(encoding="utf-8"))
-        stored_environment = json.loads(environment_path.read_text(encoding="utf-8"))
-        stored_run_authority = json.loads(run_authority_path.read_text(encoding="utf-8"))
-        stored_evidence_contract = json.loads(evidence_contract_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise EvidenceError(f"proof registry/environment cannot be read: {error}") from error
+    registry = _load_json_without_duplicate_keys(registry_path)
+    stored_environment = _load_json_without_duplicate_keys(environment_path)
+    stored_run_authority = _load_json_without_duplicate_keys(run_authority_path)
+    stored_evidence_contract = _load_json_without_duplicate_keys(evidence_contract_path)
     if registry != gate_registry_document():
         raise EvidenceError("proof gate registry differs from the verifier registry")
     canonical_registry = json.dumps(
@@ -7322,7 +11539,22 @@ def _validate_completed_manifest(
     if stored_run_authority != manifest.get("runAuthority"):
         raise EvidenceError("proof live-authority document differs from the manifest")
     authority_mode, run_authority_digest = _validate_run_authority(stored_run_authority)
-    if require_current_live_authority and authority_mode == AUTHORITY_MODE_LIVE:
+    candidate_executable: Path | None = None
+    if authority_mode == AUTHORITY_MODE_STAGED_CANDIDATE:
+        if profile != PROFILE_OWNER:
+            raise EvidenceError("staged candidate proof is not an owner-product proof")
+        staged_candidate, candidate_executable = _revalidate_staged_candidate_authority(
+            stored_run_authority.get("stagedCandidate")
+        )
+        if (
+            staged_candidate.get("sourceGitSha") != expected_sha
+            or stored_run_authority.get("releasePhase") != RELEASE_PHASE_PREDEPLOYMENT
+        ):
+            raise EvidenceError("staged candidate proof names another source or release phase")
+    if require_current_live_authority and authority_mode in {
+        AUTHORITY_MODE_LIVE,
+        AUTHORITY_MODE_STAGED_CANDIDATE,
+    }:
         expected_live_authority = _run_authority_document(
             diagnostic_overrides=False,
             caller_environment={},
@@ -7345,6 +11577,8 @@ def _validate_completed_manifest(
     allowed_statuses = {PASS, PASS_AFTER_RETRY, FAIL, SKIP_ENV, NOT_BUILT, NOT_RUN_QUICK}
     result_artifacts: list[dict[str, object]] = []
     result_environment_digests: dict[str, str] = {}
+    result_environment_authorities: dict[str, dict[str, object]] = {}
+    result_retry_authority: dict[str, tuple[int, tuple[str, ...]]] = {}
     for result, gate in zip(results, expected_gates, strict=False):
         if not isinstance(result, dict):
             raise EvidenceError("proof manifest contains a malformed gate result")
@@ -7352,15 +11586,26 @@ def _validate_completed_manifest(
         status = result.get("status")
         seconds = result.get("seconds")
         detail = result.get("detail")
+        attempt_count = result.get("attemptCount")
+        retry_count = result.get("retryCount")
+        retry_reasons = result.get("retryReasons")
         if not isinstance(gate_id, str) or status not in allowed_statuses:
             raise EvidenceError("proof manifest contains an invalid gate identity/status")
-        if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or seconds < 0:
+        if (
+            not isinstance(seconds, (int, float))
+            or isinstance(seconds, bool)
+            or not math.isfinite(float(seconds))
+            or seconds < 0
+        ):
             raise EvidenceError(f"proof gate {gate_id} has invalid timing")
         if not isinstance(detail, str):
             raise EvidenceError(f"proof gate {gate_id} has invalid detail")
         if quick and gate.tier > 1:
             if (
                 status != NOT_RUN_QUICK
+                or attempt_count != 0
+                or retry_count != 0
+                or retry_reasons != []
                 or result.get("artifacts") not in (None, [])
                 or result.get("environmentAuthority") is not None
             ):
@@ -7368,6 +11613,31 @@ def _validate_completed_manifest(
         elif status == NOT_RUN_QUICK:
             raise EvidenceError(f"proof gate {gate_id} was omitted outside quick-mode policy")
         else:
+            if (
+                isinstance(attempt_count, bool)
+                or not isinstance(attempt_count, int)
+                or attempt_count not in {1, 2}
+                or isinstance(retry_count, bool)
+                or not isinstance(retry_count, int)
+                or retry_count != attempt_count - 1
+                or not isinstance(retry_reasons, list)
+                or len(retry_reasons) != retry_count
+                or any(
+                    reason not in ALLOWED_DIAGNOSTIC_RETRY_REASONS
+                    for reason in retry_reasons
+                )
+            ):
+                raise EvidenceError(f"proof gate {gate_id} has invalid attempt/retry authority")
+            if (status == PASS_AFTER_RETRY) != (retry_count == 1):
+                raise EvidenceError(f"proof gate {gate_id} retry status is contradictory")
+            if retry_count and status in {PASS, SKIP_ENV, NOT_BUILT}:
+                raise EvidenceError(f"proof gate {gate_id} concealed a retry behind {status}")
+            if retry_count and gate.retry_policy != "diagnostic-once":
+                raise EvidenceError(f"proof gate {gate_id} violated its retry policy")
+            result_retry_authority[gate.id] = (
+                retry_count,
+                tuple(str(reason) for reason in retry_reasons),
+            )
             environment_authority = _validate_gate_environment_authority(
                 result.get("environmentAuthority"),
                 gate,
@@ -7377,11 +11647,22 @@ def _validate_completed_manifest(
             result_environment_digests[gate.id] = str(
                 environment_authority["environmentDigest"]
             )
+            result_environment_authorities[gate.id] = environment_authority
+            binding_by_name = {
+                str(item["name"]): item
+                for item in environment_authority["effectiveEnvironment"]
+            }
+            if authority_mode == AUTHORITY_MODE_STAGED_CANDIDATE and (
+                "CORTEX_APP_EXE" in gate.environment_allowlist
+            ):
+                if candidate_executable is None or (
+                    binding_by_name.get("CORTEX_APP_EXE", {}).get("pathSha256")
+                    != _redacted_path_digest(candidate_executable)
+                ):
+                    raise EvidenceError(
+                        f"staged candidate gate {gate.id} did not execute the bound executable"
+                    )
             if gate.id in LIVE_AUTHORITY_GATE_IDS:
-                binding_by_name = {
-                    str(item["name"]): item
-                    for item in environment_authority["effectiveEnvironment"]
-                }
                 roots = stored_run_authority["roots"]
                 if (
                     binding_by_name.get("APPDATA", {}).get("pathSha256")
@@ -7418,8 +11699,11 @@ def _validate_completed_manifest(
         evidence_results,
         stale_takeover=stale_takeover,
         diagnostic_authority_overrides=(authority_mode == AUTHORITY_MODE_DIAGNOSTIC),
+        staged_candidate=(authority_mode == AUTHORITY_MODE_STAGED_CANDIDATE),
     )
-    if manifest.get("exitCode") != reconstructed_code or manifest.get("verdict") != reconstructed_verdict:
+    if not _is_exact_integer(
+        manifest.get("exitCode"), reconstructed_code
+    ) or manifest.get("verdict") != reconstructed_verdict:
         raise EvidenceError("proof verdict/exit code cannot be reconstructed from gate results")
     pending_ids = [result["classId"] for result in evidence_results if result["status"] != "VERIFIED"]
     if manifest.get("requiredEvidencePending") != pending_ids:
@@ -7448,6 +11732,7 @@ def _validate_completed_manifest(
         manifest.get("releaseArtifacts"),
         expected_sha,
         eligible=certification_eligible,
+        run_authority=stored_run_authority,
     )
     if "windowsReleaseAuthority" not in manifest:
         raise EvidenceError("proof manifest omits its Windows release-authority binding state")
@@ -7520,6 +11805,20 @@ def _validate_completed_manifest(
     }
     if not required_artifacts <= set(artifact_by_path):
         raise EvidenceError("proof artifact inventory omits a required run authority")
+    expected_status = _status_md_text(
+        expected_sha,
+        quick,
+        normalized_results,
+        reconstructed_verdict,
+        str(profile),
+        evidence_results,
+    ).encode("utf-8")
+    try:
+        observed_status = (path.parent / "STATUS.md").read_bytes()
+    except OSError as error:
+        raise EvidenceError(f"proof status projection cannot be read: {error}") from error
+    if observed_status != expected_status:
+        raise EvidenceError("proof STATUS.md is not the canonical manifest projection")
     if windows_release_authority is not None and artifact_by_path.get(
         WINDOWS_RELEASE_AUTHORITY_NAME
     ) != manifest.get("windowsReleaseAuthority"):
@@ -7548,16 +11847,81 @@ def _validate_completed_manifest(
         if not isinstance(artifact_path, str) or artifact_by_path.get(artifact_path) != artifact:
             raise EvidenceError("gate artifact is absent from or differs from the global inventory")
 
+    # The supervisor result is a projection of an independently written worker result.  Hashing
+    # both files is insufficient: somebody could rewrite both envelopes, recompute every digest,
+    # and make the supervisor claim a status or retry history the worker never emitted.  Re-open
+    # each worker authority and derive the complete gate projection from those bytes.  Parent-side
+    # timeout/crash failures legitimately have no worker result and remain non-certifying FAILs.
+    for result, gate in zip(results, expected_gates, strict=True):
+        if quick and gate.tier > 1:
+            continue
+        gate_prefix = Path("gates") / gate.id
+        worker_result_relative = str(gate_prefix / "worker-result.json")
+        worker_result_binding = artifact_by_path.get(worker_result_relative)
+        if worker_result_binding is None:
+            if result.get("status") != FAIL:
+                raise EvidenceError(
+                    f"proof gate {gate.id} has no independently written worker result"
+                )
+            continue
+        (
+            worker_status,
+            worker_seconds,
+            worker_detail,
+            worker_artifacts,
+            worker_environment,
+            worker_attempt_authority,
+        ) = _validate_worker_result(
+            path.parent / worker_result_relative,
+            gate,
+            expected_token,
+            authority_mode=authority_mode,
+            run_authority_digest=run_authority_digest,
+            expected_environment_authority=result_environment_authorities[gate.id],
+        )
+        if (
+            worker_status != result.get("status")
+            or worker_seconds != float(result["seconds"])
+            or worker_detail != result.get("detail")
+            or worker_environment != result_environment_authorities[gate.id]
+            or worker_attempt_authority
+            != {
+                "attemptCount": result.get("attemptCount"),
+                "retryCount": result.get("retryCount"),
+                "retryReasons": result.get("retryReasons"),
+            }
+        ):
+            raise EvidenceError(
+                f"proof gate {gate.id} differs from its independently written worker result"
+            )
+        worker_log_relative = str(gate_prefix / "worker.log")
+        worker_log_binding = artifact_by_path.get(worker_log_relative)
+        if worker_log_binding is None:
+            raise EvidenceError(f"proof gate {gate.id} has no durable worker log")
+        expected_result_artifacts = [worker_log_binding]
+        for worker_artifact in worker_artifacts:
+            normalized_path = str(gate_prefix / str(worker_artifact["path"]))
+            normalized = {**worker_artifact, "path": normalized_path}
+            if artifact_by_path.get(normalized_path) != normalized:
+                raise EvidenceError(
+                    f"proof gate {gate.id} worker artifact differs from the global inventory"
+                )
+            expected_result_artifacts.append(normalized)
+        expected_result_artifacts.append(worker_result_binding)
+        if result.get("artifacts") != expected_result_artifacts:
+            raise EvidenceError(
+                f"proof gate {gate.id} artifact projection differs from its worker result"
+            )
+
     event_log = path.parent / "events.jsonl"
-    try:
-        events = [json.loads(line) for line in event_log.read_text(encoding="utf-8").splitlines() if line.strip()]
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise EvidenceError(f"proof journal cannot be reconstructed: {error}") from error
+    events = _strict_json_lines(event_log, "proof journal")
     if not events or any(not isinstance(event, dict) for event in events):
         raise EvidenceError("proof journal is empty or malformed")
     for sequence, event in enumerate(events, start=1):
         if (
-            event.get("schema") != 1
+            isinstance(event.get("schema"), bool)
+            or event.get("schema") != 1
+            or isinstance(event.get("sequence"), bool)
             or event.get("sequence") != sequence
             or event.get("runToken") != expected_token
             or not isinstance(event.get("event"), str)
@@ -7586,13 +11950,20 @@ def _validate_completed_manifest(
         or first.get("gateRegistryHash") != manifest.get("gateRegistryHash")
         or first.get("authorityMode") != authority_mode
         or first.get("runAuthorityDigest") != run_authority_digest
+        or first.get("releasePhase") != stored_run_authority.get("releasePhase")
+        or first.get("stagedReleaseId")
+        != (
+            stored_run_authority["stagedCandidate"]["releaseId"]
+            if authority_mode == AUTHORITY_MODE_STAGED_CANDIDATE
+            else None
+        )
     ):
         raise EvidenceError("proof journal has no matching run_start authority")
     if (
         last.get("event") != "run_end"
         or last.get("fullGitSha") != expected_sha
         or last.get("profile") != profile
-        or last.get("exitCode") != reconstructed_code
+        or not _is_exact_integer(last.get("exitCode"), reconstructed_code)
         or last.get("verdict") != reconstructed_verdict
         or last.get("results") != len(results)
         or last.get("staleTakeover") != stale_takeover
@@ -7600,12 +11971,30 @@ def _validate_completed_manifest(
         or last.get("runAuthorityDigest") != run_authority_digest
         or last.get("diagnosticAuthorityOverrides")
         is not (authority_mode == AUTHORITY_MODE_DIAGNOSTIC)
+        or last.get("releasePhase") != stored_run_authority.get("releasePhase")
+        or last.get("stagedReleaseId")
+        != (
+            stored_run_authority["stagedCandidate"]["releaseId"]
+            if authority_mode == AUTHORITY_MODE_STAGED_CANDIDATE
+            else None
+        )
     ):
         raise EvidenceError("proof journal has no matching terminal run_end")
     if sum(event.get("event") == "run_start" for event in events) != 1 or sum(
         event.get("event") == "run_end" for event in events
     ) != 1:
         raise EvidenceError("proof journal must contain exactly one start and one terminal event")
+    allowed_event_names = {
+        "run_start",
+        "abandonment",
+        "gate_start",
+        "heartbeat",
+        "retry",
+        "gate_end",
+        "run_end",
+    }
+    if any(event.get("event") not in allowed_event_names for event in events):
+        raise EvidenceError("proof journal contains an unknown or failed-publication event")
     abandonment_events = [event for event in events if event.get("event") == "abandonment"]
     if stale_takeover:
         if (
@@ -7616,6 +12005,10 @@ def _validate_completed_manifest(
             raise EvidenceError("proof stale-takeover manifest and journal disagree")
     elif abandonment_events:
         raise EvidenceError("clean proof run contains an unbound abandonment event")
+    if sum(event.get("event") == "retry" for event in events) != sum(
+        count for count, _reasons in result_retry_authority.values()
+    ):
+        raise EvidenceError("proof journal contains an unbound retry event")
     for result, gate in zip(results, expected_gates, strict=True):
         gate_events = [event for event in events if event.get("gate") == gate.id]
         starts = [event for event in gate_events if event.get("event") == "gate_start"]
@@ -7631,6 +12024,26 @@ def _validate_completed_manifest(
             or ends[0].get("environmentDigest") != result_environment_digests.get(gate.id)
         ):
             raise EvidenceError(f"proof journal does not match result for gate {gate.id}")
+        else:
+            retry_events = [
+                event for event in gate_events if event.get("event") == "retry"
+            ]
+            expected_retry_count, expected_retry_reasons = result_retry_authority[gate.id]
+            if (
+                len(retry_events) != expected_retry_count
+                or tuple(event.get("reason") for event in retry_events)
+                != expected_retry_reasons
+                or [event.get("attempt") for event in retry_events]
+                != list(range(2, 2 + expected_retry_count))
+                or any(
+                    event.get("environmentDigest")
+                    != result_environment_digests.get(gate.id)
+                    for event in retry_events
+                )
+            ):
+                raise EvidenceError(
+                    f"proof journal retry authority does not match gate {gate.id}"
+                )
     _validate_product_attestation(path.parent / PRODUCT_ATTESTATION_NAME, path, manifest)
     return manifest
 
@@ -7643,6 +12056,7 @@ def _profile_verdict(
     *,
     stale_takeover: bool = False,
     diagnostic_authority_overrides: bool = False,
+    staged_candidate: bool = False,
 ) -> tuple[int, str]:
     failures = [name for name, status, _, _ in results if status == FAIL]
     incomplete = [
@@ -7664,7 +12078,14 @@ def _profile_verdict(
         for evidence in evidence_results
         if evidence.get("status") != "VERIFIED"
     ]
-    if quick or incomplete or blockers or stale_takeover or diagnostic_authority_overrides:
+    if (
+        quick
+        or incomplete
+        or blockers
+        or stale_takeover
+        or diagnostic_authority_overrides
+        or staged_candidate
+    ):
         reasons = []
         if incomplete:
             reasons.append(f"non-certifying gates: {', '.join(incomplete)}")
@@ -7680,6 +12101,11 @@ def _profile_verdict(
             reasons.append(
                 "caller live-authority overrides were enabled; this run is permanently diagnostic and cannot certify"
             )
+        if staged_candidate:
+            reasons.append(
+                "pre-deployment staged-candidate proof is trustworthy evidence but cannot certify "
+                "until the exact release is active and post-deployment/reboot evidence passes"
+            )
         return 2, "INCOMPLETE — " + " | ".join(reasons)
     final = {
         PROFILE_OWNER: "CORTEX PRODUCT 10/10 — OWNER WORKSTATION",
@@ -7690,16 +12116,58 @@ def _profile_verdict(
     return 0, final[profile]
 
 
+def _retire_legacy_run_lock() -> None:
+    """Fail closed around the pre-lease PID-only lock format.
+
+    A PID without process-creation time and a verifier token cannot distinguish the original
+    holder from PID reuse.  A live PID therefore remains untouchable.  A dead holder can be
+    removed so the verifier self-heals, but the removal itself is lock recovery: this invocation
+    must stop and require one subsequent clean run instead of silently becoming certifying.
+    """
+
+    if not LEGACY_RUN_LOCK.exists():
+        return
+    try:
+        raw = LEGACY_RUN_LOCK.read_text(encoding="utf-8").strip().split()
+        if len(raw) != 1:
+            raise ValueError("legacy lock must contain exactly one PID")
+        legacy_pid = int(raw[0])
+        if legacy_pid <= 0:
+            raise ValueError("legacy lock PID must be positive")
+    except (OSError, UnicodeError, ValueError, IndexError) as error:
+        raise LeaseError(f"unknown legacy verifier lock identity: {error}") from error
+    if _pid_alive(legacy_pid):
+        raise LeaseError(
+            f"legacy verifier pid {legacy_pid} is live but has no creation-time/token identity; "
+            "takeover fails closed"
+        )
+    try:
+        LEGACY_RUN_LOCK.unlink()
+    except OSError as error:
+        raise LeaseError(f"stale legacy verifier lock could not be removed: {error}") from error
+    raise LeaseError(
+        f"removed stale legacy verifier lock for dead pid {legacy_pid}; "
+        "this recovery invocation cannot certify, so run the verifier again"
+    )
+
+
 def aggregate_main(
     quick: bool,
     status_md: str | None,
     profile: str,
     *,
     diagnostic_live_authority_overrides: bool = False,
+    staged_owner_candidate_manifest: Path | None = None,
+    owner_release_phase: str = RELEASE_PHASE_ROUTINE,
 ) -> int:
-    run_authority = _prepare_run_authority(diagnostic_live_authority_overrides)
-    authority_mode, run_authority_digest = _validate_run_authority(run_authority)
     full_sha = _full_git_sha()
+    run_authority = _prepare_run_authority(
+        diagnostic_live_authority_overrides,
+        expected_sha=full_sha,
+        staged_candidate_manifest=staged_owner_candidate_manifest,
+        release_phase=owner_release_phase,
+    )
+    authority_mode, run_authority_digest = _validate_run_authority(run_authority)
     source_tree_digest = _source_tree_digest()
     checkout_state_digest = _checkout_state_digest()
     run_token = uuid.uuid4().hex
@@ -7723,17 +12191,7 @@ def aggregate_main(
     rust_coverage_prerequisite: dict[str, object] | None = None
     journal_finalized = False
     try:
-        if LEGACY_RUN_LOCK.exists():
-            try:
-                legacy_pid = int(LEGACY_RUN_LOCK.read_text(encoding="utf-8").strip().split()[0])
-            except (OSError, UnicodeError, ValueError, IndexError) as error:
-                raise LeaseError(f"unknown legacy verifier lock identity: {error}") from error
-            if _pid_alive(legacy_pid):
-                raise LeaseError(
-                    f"legacy verifier pid {legacy_pid} is live but has no creation-time/token identity; "
-                    "takeover fails closed"
-                )
-            LEGACY_RUN_LOCK.unlink()
+        _retire_legacy_run_lock()
         with acquired_lease(lease) as abandoned_token:
             stale_takeover = abandoned_token is not None
             abandoned_run_token = abandoned_token
@@ -7747,6 +12205,12 @@ def aggregate_main(
                 gateRegistryHash=registry_hash,
                 authorityMode=authority_mode,
                 runAuthorityDigest=run_authority_digest,
+                releasePhase=run_authority["releasePhase"],
+                stagedReleaseId=(
+                    run_authority["stagedCandidate"]["releaseId"]
+                    if authority_mode == AUTHORITY_MODE_STAGED_CANDIDATE
+                    else None
+                ),
             )
             if abandoned_token is not None:
                 journal.append("abandonment", abandonedRunToken=abandoned_token, reason="stale lease takeover")
@@ -7767,12 +12231,22 @@ def aggregate_main(
                             "status": NOT_RUN_QUICK,
                             "seconds": 0.0,
                             "detail": "quick mode",
+                            "attemptCount": 0,
+                            "retryCount": 0,
+                            "retryReasons": [],
                             "environmentAuthority": None,
                         }
                     )
                     continue
                 print(f"\n----- [tier {gate.tier}] {gate.id} :: {gate.charter_ref}", flush=True)
-                status, seconds, detail, artifacts, environment_authority = _run_gate_worker(
+                (
+                    status,
+                    seconds,
+                    detail,
+                    artifacts,
+                    environment_authority,
+                    attempt_authority,
+                ) = _run_gate_worker(
                     gate,
                     run_dir,
                     run_token,
@@ -7789,6 +12263,7 @@ def aggregate_main(
                         "status": status,
                         "seconds": round(seconds, 3),
                         "detail": detail,
+                        **attempt_authority,
                         "artifacts": artifacts,
                         "environmentAuthority": environment_authority,
                     }
@@ -7816,6 +12291,7 @@ def aggregate_main(
                 diagnostic_authority_overrides=(
                     authority_mode == AUTHORITY_MODE_DIAGNOSTIC
                 ),
+                staged_candidate=(authority_mode == AUTHORITY_MODE_STAGED_CANDIDATE),
             )
             # Status is an immutable proof artifact, not a tracked source file. Writing docs/STATUS.md
             # made the certified SHA self-invalidating: committing the generated SHA changed the SHA,
@@ -7847,6 +12323,12 @@ def aggregate_main(
                 authorityMode=authority_mode,
                 runAuthorityDigest=run_authority_digest,
                 diagnosticAuthorityOverrides=(authority_mode == AUTHORITY_MODE_DIAGNOSTIC),
+                releasePhase=run_authority["releasePhase"],
+                stagedReleaseId=(
+                    run_authority["stagedCandidate"]["releaseId"]
+                    if authority_mode == AUTHORITY_MODE_STAGED_CANDIDATE
+                    else None
+                ),
             )
             journal_finalized = True
             manifest_path = run_dir / "manifest.json"
@@ -7907,7 +12389,10 @@ def aggregate_main(
                 manifest_path,
                 full_sha,
                 run_token,
-                require_current_live_authority=(authority_mode == AUTHORITY_MODE_LIVE),
+                require_current_live_authority=(
+                    authority_mode
+                    in {AUTHORITY_MODE_LIVE, AUTHORITY_MODE_STAGED_CANDIDATE}
+                ),
             )
             _assert_source_state(full_sha, source_tree_digest, checkout_state_digest)
             pointer = {
@@ -8038,6 +12523,23 @@ def main():
     ap.add_argument("--quick", action="store_true", help="tiers 0-1 only")
     ap.add_argument("--profile", choices=sorted(PROFILES), default=PROFILE_OWNER)
     ap.add_argument(
+        "--staged-owner-candidate-manifest",
+        type=Path,
+        help=(
+            "exact schema-v2 release-manifest.json emitted by release_private_production.py stage; "
+            "runs the owner profile as non-certifying pre-deployment candidate proof"
+        ),
+    )
+    ap.add_argument(
+        "--owner-release-phase",
+        choices=sorted(OWNER_RELEASE_PHASES),
+        default=RELEASE_PHASE_ROUTINE,
+        help=(
+            "bind an owner deployment phase into runAuthority; pre-deployment additionally requires "
+            "--staged-owner-candidate-manifest"
+        ),
+    )
+    ap.add_argument(
         "--status-md",
         metavar="PATH",
         default=None,
@@ -8110,6 +12612,8 @@ def main():
             or args.authority_mode is not None
             or args.run_authority_digest is not None
             or args.worker_profile is not None
+            or args.staged_owner_candidate_manifest is not None
+            or args.owner_release_phase != RELEASE_PHASE_ROUTINE
         ):
             ap.error("--verifier-fault-campaign cannot be combined with another verifier mode")
         return verifier_fault_campaign_main()
@@ -8126,6 +12630,8 @@ def main():
             or args.authority_mode is not None
             or args.run_authority_digest is not None
             or args.worker_profile is not None
+            or args.staged_owner_candidate_manifest is not None
+            or args.owner_release_phase != RELEASE_PHASE_ROUTINE
         ):
             ap.error("--rust-coverage-prerequisite cannot be combined with another verifier mode")
         return rust_coverage_prerequisite_main()
@@ -8142,6 +12648,34 @@ def main():
         ap.error(
             "--diagnostic-live-authority-overrides is accepted only for a full or quick verifier run"
         )
+    if args.staged_owner_candidate_manifest is not None:
+        if (
+            args.profile != PROFILE_OWNER
+            or args.static
+            or args.quick
+            or args.gate_worker
+            or args.require_certifying_proof
+            or args.proof_manifest is not None
+            or args.windows_release_bundle is not None
+            or args.diagnostic_live_authority_overrides
+            or args.owner_release_phase
+            not in {RELEASE_PHASE_ROUTINE, RELEASE_PHASE_PREDEPLOYMENT}
+        ):
+            ap.error(
+                "--staged-owner-candidate-manifest is accepted only for a full owner-product "
+                "pre-deployment verifier run without diagnostic or Windows-bundle authority"
+            )
+    elif args.owner_release_phase == RELEASE_PHASE_PREDEPLOYMENT:
+        ap.error("pre-deployment phase requires --staged-owner-candidate-manifest")
+    if args.owner_release_phase != RELEASE_PHASE_ROUTINE and (
+        args.profile != PROFILE_OWNER
+        or args.static
+        or args.quick
+        or args.gate_worker
+        or args.require_certifying_proof
+        or args.proof_manifest is not None
+    ):
+        ap.error("--owner-release-phase is accepted only for a full owner-product verifier run")
     if not args.gate_worker and (
         args.authority_mode is not None
         or args.run_authority_digest is not None
@@ -8233,12 +12767,22 @@ def main():
         # not what the lock protects against and must stay runnable alongside a sweep.
         static_main()
         return 0
-    return aggregate_main(
-        quick=args.quick,
-        status_md=args.status_md,
-        profile=args.profile,
-        diagnostic_live_authority_overrides=args.diagnostic_live_authority_overrides,
-    )
+    try:
+        return aggregate_main(
+            quick=args.quick,
+            status_md=args.status_md,
+            profile=args.profile,
+            diagnostic_live_authority_overrides=args.diagnostic_live_authority_overrides,
+            staged_owner_candidate_manifest=args.staged_owner_candidate_manifest,
+            owner_release_phase=(
+                RELEASE_PHASE_PREDEPLOYMENT
+                if args.staged_owner_candidate_manifest is not None
+                else args.owner_release_phase
+            ),
+        )
+    except (EvidenceError, LeaseError, OSError, ValueError) as error:
+        print(f"CORTEX VERIFIER AUTHORITY REJECTED: {error}", flush=True)
+        return 1
 
 
 if __name__ == "__main__":

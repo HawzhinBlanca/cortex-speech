@@ -1,0 +1,96 @@
+{
+  "schema": 1,
+  "bundleId": "cortex-owner-product-proof-inputs-v1",
+  "targetPlatform": "windows-11-x64-owner",
+  "mediaFileCount": 3,
+  "requiredMediaExtensions": [
+    ".flac",
+    ".mov",
+    ".mp4"
+  ],
+  "audiobookMinimumDurationMilliseconds": 1799631,
+  "helperToolchain": {
+    "channel": "1.95.0-x86_64-pc-windows-msvc",
+    "cargoBinarySha256": "dc19c8e6d66802d120bf0696b1924b748bd90f3ca16f21391e54a290ff12b7c5",
+    "rustcBinarySha256": "e3ebbd547ea7b73c034d588ba569602b379f3b05ad1a3b5f8dcfab9d4478d74a",
+    "gitBinarySha256": "cab4c4eea1d869cf9f7be73868dc9a90ad2df1b1b673e5f8c8714a576c25ea96",
+    "gitVersion": "git version 2.54.0.windows.1",
+    "cargoConfigSha256": "2acfaae268cf4a4efd3712fa81f0b39f3fdc7e8382b39edf833d01c0e1044840",
+    "cargoCommitHash": "f2d3ce0bd7f24a49f8f72d9000448f8838c4e850",
+    "rustcCommitHash": "59807616e1fa2540724bfbac14d7976d7e4a3860",
+    "msvcToolsVersion": "14.44.35207",
+    "windowsSdkVersion": "10.0.26100.0",
+    "clBinarySha256": "7a154e5136cc538b42e6944997fc5e3bb49112894e41dd88a70940aaff9aa831",
+    "linkBinarySha256": "359b5861060b8b8899a1ef87385a37b32d8ecb8a81d092866907e7249ab962be",
+    "libBinarySha256": "82938aa4c8fe38f15783696da89068430a1cdc4779908063410e9515f7e9a879",
+    "rcBinarySha256": "43da1503c262c30894c851589bf0155f8365d77e63a5f7bc13982320e3a6b42d",
+    "mtBinarySha256": "1b8a272d586a9ab53ac2ccd457a88bd0210d7d7ac3daea5b34743cc2afe73b26",
+    "msvcTreeSha256": "3c4838bd3e84492e6af3a78ee4b72dd27264306e918cd86d1fe911c301281cfa",
+    "windowsSdkTreeSha256": "7bc683594aaa24a99b00f21ee635d1a22255bce09588867fe7a16193e20f76bb",
+    "rustRuntimeTreeSha256": "2111dcc482c4339166eabe07c01dc4345b2d1ca11e7c1d22c9d8616c9a774cff",
+    "gitRuntimeTreeSha256": "603f1169faa2a704202b8a0110c47a8d2c2ff75357a7e4d3eaf530f25b76b53a"
+  },
+  "files": [
+    {
+      "role": "real-media-mp4",
+      "relativePath": "media/A1-0001_PODCAST-001.mp4",
+      "sourceBasename": "A1-0001_PODCAST-001.mp4",
+      "sha256": "34918275905f206a085ff4444422688b3ce849b32781040c9cb1e07187355a5f",
+      "sizeBytes": 320901
+    },
+    {
+      "role": "real-media-mov",
+      "relativePath": "media/A1-0001_PODCAST-001.mov",
+      "sourceBasename": "A1-0001_PODCAST-001.mov",
+      "sha256": "ab4483a3323624db4d39cae6dcb0cc8262cd066e4739936ea3585486452e2fbe",
+      "sizeBytes": 591784
+    },
+    {
+      "role": "real-media-flac",
+      "relativePath": "media/Lamofull00086400_A01.flac",
+      "sourceBasename": "Lamofull00086400_A01.flac",
+      "sha256": "1358878b4a6d03f368fade40a9f0e5f43f912db075c809a2ab325246d9bbf5e2",
+      "sizeBytes": 31525964
+    },
+    {
+      "role": "long-audiobook-mp3",
+      "relativePath": "audiobook/audiobook-long.mp3",
+      "sourceBasename": "audiobook-long.mp3",
+      "sha256": "c301c6c8dd09bb81e700f8e22cdf38b5d74f9a2a1420b70b3bf5e05cfaf12f36",
+      "sizeBytes": 14397549
+    },
+    {
+      "role": "scale-database-authority",
+      "relativePath": "db-authorities/scale-production-derived-schema60.db",
+      "sourceBasename": "cortex-speech.db",
+      "sha256": "fe312b53386c51b3c725d75b6def86067c049a75ca757a4885a73a46d96c37ea"
+    },
+    {
+      "role": "campaign-database-authority",
+      "relativePath": "db-authorities/current-campaign-exact-schema65.db",
+      "sourceBasename": "cortex-speech.db",
+      "sha256": "ccbbc66cb464db276d05a4d0d3c83e7baaef4732829eebb021f759a4242295e8"
+    }
+  ],
+  "databaseContracts": {
+    "scale": {
+      "authorityRole": "scale-database-authority",
+      "sourceSchemaVersion": 60,
+      "targetSchemaVersion": 69,
+      "segmentCount": 30373,
+      "distinctAudioPathCount": 14715,
+      "campaignAuthority": "absent",
+      "sourceSchemaFingerprintSha256": "80e88a4f9b40ecba46aaee933c98dc7aea54fe8ae58ea3178354409188759cd0",
+      "targetSchemaFingerprintSha256": "53b13a29c593b56078124914df0f043acad5e9bd0d267b7a0f5bcc8af2ce23dd",
+      "derivedRelativePath": "db-derived/scale-current-schema69.db"
+    },
+    "campaignExact": {
+      "authorityRole": "campaign-database-authority",
+      "schemaVersion": 65,
+      "segmentCount": 43774,
+      "distinctAudioPathCount": 27921,
+      "campaignAuthority": "required",
+      "schemaFingerprintSha256": "50b62000b8174323221c206bf747a1507cc5e88459bc16a25064ae09b06ecd66"
+    }
+  }
+}

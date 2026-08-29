@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -43,6 +44,13 @@ def main() -> None:
         if actual != expected:
             raise AssertionError(
                 "generated IPC bindings drifted; run the generator and commit src/lib/generated/ipc.ts"
+            )
+        rendered = actual.decode("utf-8")
+        decisions = re.findall(r"^export type ReviewDecisionV1 = ([^;]+);$", rendered, re.MULTILINE)
+        if decisions != ['"accept" | "edit" | "reject"']:
+            raise AssertionError(
+                "desktop ReviewDecisionV1 must advertise only accept/edit/reject; "
+                "moving on without a decision is renderer navigation, never a commit payload"
             )
     print("generated IPC bindings are current")
 

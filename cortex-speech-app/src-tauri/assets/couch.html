@@ -689,7 +689,9 @@
   // current server refuses it, hold the immutable record for manual replay instead of hammering the
   // endpoint forever or silently discarding the reviewer's transcript and verdict.
   const PLAYBACK_UPGRADE_HOLD_PREFIX = 'cortex.couch.playback-upgrade.';
+  const POOL_UNDO_PREFIX = 'cortex.couch.pool-undo.';
   const OPERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  const POSITIVE_DECIMAL_PATTERN = /^[1-9][0-9]*$/;
   const outboxOperationKey = (operationId) => OUTBOX_OPERATION_PREFIX + operationId;
   const playbackUpgradeHoldKey = (operationId) => PLAYBACK_UPGRADE_HOLD_PREFIX + operationId;
   function newOperationId() {
@@ -707,6 +709,79 @@
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     const hex = [...bytes].map((b) => b.toString(16).padStart(2, '0'));
     return `${hex.slice(0, 4).join('')}-${hex.slice(4, 6).join('')}-${hex.slice(6, 8).join('')}-${hex.slice(8, 10).join('')}-${hex.slice(10).join('')}`;
+  }
+  const poolUndoKey = (reviewer) => POOL_UNDO_PREFIX + encodeURIComponent(reviewer.trim().toLowerCase());
+  function decodePoolUndoTarget(raw, reviewer) {
+    const target = JSON.parse(raw);
+    if (!target || target.version !== 1 || typeof target.reviewer !== 'string'
+        || target.reviewer.trim().toLowerCase() !== reviewer.trim().toLowerCase()
+        || !POSITIVE_DECIMAL_PATTERN.test(target.poolDecisionId || '')
+        || !OPERATION_ID_PATTERN.test(target.decisionOperationId || '')
+        || (target.reversalOperationId !== null
+            && !OPERATION_ID_PATTERN.test(target.reversalOperationId || ''))
+        || target.reversalOperationId === target.decisionOperationId) {
+      throw new Error('invalid durable pool undo target');
+    }
+    return target;
+  }
+  function readPoolUndoTarget() {
+    if (!me) return null;
+    const raw = localStorage.getItem(poolUndoKey(me));
+    return raw === null ? null : decodePoolUndoTarget(raw, me);
+  }
+  function writePoolUndoTarget(target) {
+    const key = poolUndoKey(target.reviewer);
+    const encoded = JSON.stringify(target);
+    localStorage.setItem(key, encoded);
+    const persisted = localStorage.getItem(key);
+    if (persisted === null || JSON.stringify(decodePoolUndoTarget(persisted, target.reviewer)) !== encoded) {
+      throw new Error('pool undo target persistence verification failed');
+    }
+  }
+  function rememberPoolUndoTarget(submission, saved) {
+    const reviewer = (submission.reviewer || me || '').trim();
+    if (!reviewer) throw new Error('reviewer identity is unavailable for the undo receipt');
+    if (saved && saved.poolDecisionId !== undefined && saved.poolDecisionId !== null) {
+      const poolDecisionId = String(saved.poolDecisionId);
+      if (!POSITIVE_DECIMAL_PATTERN.test(poolDecisionId)
+          || !OPERATION_ID_PATTERN.test(submission.operationId || '')) {
+        throw new Error('invalid pool decision receipt');
+      }
+      writePoolUndoTarget({
+        version: 1,
+        reviewer,
+        poolDecisionId,
+        decisionOperationId: submission.operationId,
+        reversalOperationId: null,
+      });
+    } else if (submission.action !== 'skip') {
+      // A later canonical decision owns the bodyless Undo surface. Removing an older pool target can
+      // at worst make a racing tab fail closed: the server independently refuses a bodyless request
+      // whenever the append-only pool action is newer.
+      localStorage.removeItem(poolUndoKey(reviewer));
+    }
+  }
+  function preparePoolUndoTarget() {
+    const target = readPoolUndoTarget();
+    if (!target) return null;
+    if (target.reversalOperationId === null) {
+      target.reversalOperationId = newOperationId();
+      writePoolUndoTarget(target); // durable before the first undo network byte
+    }
+    return {
+      poolDecisionId: target.poolDecisionId,
+      decisionOperationId: target.decisionOperationId,
+      reversalOperationId: target.reversalOperationId,
+    };
+  }
+  function clearPoolUndoTarget(target) {
+    if (!target || !me) return;
+    const current = readPoolUndoTarget();
+    if (current && current.poolDecisionId === target.poolDecisionId
+        && current.decisionOperationId === target.decisionOperationId
+        && current.reversalOperationId === target.reversalOperationId) {
+      localStorage.removeItem(poolUndoKey(me));
+    }
   }
   function showOutboxIdentityFailure() {
     // Persistent and translated: this is work that exists locally but cannot yet be given a safe
@@ -984,9 +1059,10 @@
       // the server says who this link belongs to.
       if (item.reviewer && item.reviewer !== me) continue;
       try {
-        await api('/api/decision', {
+        const saved = await api('/api/decision', {
           method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(item),
         });
+        rememberPoolUndoTarget(item, saved);
       } catch (e) {
         // KEEP, and stop: nothing here is a verdict on the decision itself, so dropping it would
         // destroy work that can still land.
@@ -1469,6 +1545,7 @@
       const saved = await api('/api/decision', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(submission),
       });
+      rememberPoolUndoTarget(submission, saved);
       removeSubmission(submission.operationId);
       // Both judged-audio progress and weighted earnings come back WITH the committed decision.
       applyAccounting(saved);
@@ -1792,7 +1869,12 @@
   $('undo').onclick   = async () => {
     if (busy) return; busy = true;
     try {
-      const undone = await api('/api/undo', { method: 'POST' });
+      const poolUndoTarget = preparePoolUndoTarget();
+      const undone = await api('/api/undo', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(poolUndoTarget || {}),
+      });
+      clearPoolUndoTarget(poolUndoTarget);
       toast(t('undone'));
       await load();
       const pos = queue.findIndex((s) => s.id === undone.id);

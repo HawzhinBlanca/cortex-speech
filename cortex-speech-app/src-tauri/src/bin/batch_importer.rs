@@ -364,10 +364,10 @@ fn inspect_prepared_existing_file(
         ));
     }
 
-    let (sample_rate, pcm) = cortex_speech_app_lib::audio::decode_to_pcm(file).map_err(|error| {
+    let current_identity = AudioFingerprint::identify_canonical_file(file).map_err(|error| {
         format!("cannot decode current prepared WAV {} for identity proof: {error}", file.display())
     })?;
-    let current_content = AudioFingerprint::content_hash(&pcm, sample_rate);
+    let current_content = current_identity.content;
     let mut mismatched = Vec::new();
     for segment_id in &existing_ids {
         let stored_content = db
@@ -862,9 +862,8 @@ mod tests {
             ..Default::default()
         })
         .expect("insert prepared row");
-        let (sample_rate, pcm) = cortex_speech_app_lib::audio::decode_to_pcm(&wav).expect("decode original WAV");
-        db.set_audio_identity(&path_text, &AudioFingerprint::identify(&pcm, sample_rate))
-            .expect("bind original identity");
+        let identity = AudioFingerprint::identify_canonical_file(&wav).expect("decode original WAV canonically");
+        db.set_audio_identity(&path_text, &identity).expect("bind original identity");
         if human_owned {
             db.connection()
                 .execute(

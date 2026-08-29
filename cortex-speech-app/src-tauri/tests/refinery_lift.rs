@@ -215,10 +215,10 @@ fn refinery_lift_injected_error_benchmark() {
     let tmp_db = NamedTempFile::new().expect("tmp db");
     let db = Database::open(tmp_db.path().to_str().expect("utf8 path")).expect("open db");
     db.initialize().expect("init db");
-    let rolled_back = cortex_speech_app_lib::migrations::rollback(&db, 8).expect("rollback disposable benchmark DB");
+    let rolled_back = cortex_speech_app_lib::migrations::rollback(&db, 9).expect("rollback disposable benchmark DB");
     assert_eq!(
         rolled_back,
-        vec![67, 66, 65, 64, 63, 62, 61, 60],
+        vec![68, 67, 66, 65, 64, 63, 62, 61, 60],
         "the algorithm benchmark must run at the exact last machine-verdict-compatible schema"
     );
 

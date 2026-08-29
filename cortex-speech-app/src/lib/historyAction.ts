@@ -9,6 +9,7 @@ const actionKeys = {
   updateSegment: 'history.action.updateSegment',
   deleteSegments: 'history.action.deleteSegments',
   batchTranscribe: 'history.action.batchTranscribe',
+  batchNormalize: 'history.action.batchNormalize',
   speakerAssignment: 'history.action.speakerAssignment',
 } satisfies Record<HistoryActionV1, TranslationKey>;
 

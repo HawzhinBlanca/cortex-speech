@@ -76,6 +76,210 @@ public static class CortexProbeCerts {
 } catch {
     # Already loaded in this session, or the type exists — either way the callback is set.
 }
+
+# The release pointer binds the complete operations tree, not only this watchdog file. Keep the
+# implementation inside the supported .NET runtime so a recovery tick does not depend on Python,
+# Git, module autoload, or shell command parsing. File streams deny concurrent writes while each
+# size/hash pair is measured; reparse points fail closed instead of making authority leave the
+# immutable release directory.
+$helperTypeLoadError = $null
+try {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
+
+public static class CortexOperationsDigest {
+    private static readonly Regex BuildMarker = new Regex(
+        "CORTEX_BUILD_SHA:([0-9a-f]{40}|unknown)(?![0-9a-f])",
+        RegexOptions.CultureInvariant);
+    private sealed class Entry {
+        public string Relative;
+        public string Full;
+        public Entry(string relative, string full) { Relative = relative; Full = full; }
+    }
+
+    private static string Hex(byte[] bytes) {
+        StringBuilder value = new StringBuilder(bytes.Length * 2);
+        foreach (byte item in bytes) value.Append(item.ToString("x2"));
+        return value.ToString();
+    }
+
+    private static byte[] BigEndian(UInt64 value, int width) {
+        byte[] bytes = BitConverter.GetBytes(value);
+        if (BitConverter.IsLittleEndian) Array.Reverse(bytes);
+        if (bytes.Length == width) return bytes;
+        byte[] result = new byte[width];
+        Buffer.BlockCopy(bytes, bytes.Length - width, result, 0, width);
+        return result;
+    }
+
+    private static void Transform(SHA256 digest, byte[] bytes) {
+        digest.TransformBlock(bytes, 0, bytes.Length, bytes, 0);
+    }
+
+    private static void AddTree(string root, DirectoryInfo directory, List<Entry> entries) {
+        if ((directory.Attributes & FileAttributes.ReparsePoint) != 0)
+            throw new IOException("operations bundle contains a directory reparse point: " + directory.FullName);
+        foreach (FileInfo file in directory.GetFiles()) {
+            if ((file.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("operations bundle contains a file reparse point: " + file.FullName);
+            if (String.Equals(file.Extension, ".pyc", StringComparison.OrdinalIgnoreCase)) continue;
+            string relative = file.FullName.Substring(root.Length).TrimStart('\\', '/').Replace('\\', '/');
+            entries.Add(new Entry(relative, file.FullName));
+        }
+        foreach (DirectoryInfo child in directory.GetDirectories()) {
+            if (String.Equals(child.Name, "__pycache__", StringComparison.Ordinal)) continue;
+            AddTree(root, child, entries);
+        }
+    }
+
+    private static void RequireContainedDirectoryChain(string root, FileInfo file) {
+        DirectoryInfo directory = file.Directory;
+        while (directory != null) {
+            if ((directory.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("operations authority crosses a directory reparse point: " + directory.FullName);
+            if (String.Equals(directory.FullName.TrimEnd('\\', '/'), root, StringComparison.OrdinalIgnoreCase)) return;
+            directory = directory.Parent;
+        }
+        throw new IOException("operations authority escapes the immutable release root: " + file.FullName);
+    }
+
+    public static string BakedGitSha(string path) {
+        string actual = null;
+        byte[] carry = new byte[0];
+        byte[] chunk = new byte[1024 * 1024];
+        using (FileStream stream = new FileStream(
+            path, FileMode.Open, FileAccess.Read, FileShare.Read,
+            chunk.Length, FileOptions.SequentialScan)) {
+            int read;
+            while ((read = stream.Read(chunk, 0, chunk.Length)) > 0) {
+                byte[] window = new byte[carry.Length + read];
+                Buffer.BlockCopy(carry, 0, window, 0, carry.Length);
+                Buffer.BlockCopy(chunk, 0, window, carry.Length, read);
+                string text = Encoding.ASCII.GetString(window);
+                int safeStartLimit = Math.Max(0, window.Length - 80);
+                foreach (Match match in BuildMarker.Matches(text)) {
+                    if (match.Index >= safeStartLimit) break;
+                    if (actual != null) throw new IOException("executable contains multiple build SHA markers");
+                    actual = match.Groups[1].Value;
+                }
+                int keep = Math.Min(80, window.Length);
+                carry = new byte[keep];
+                Buffer.BlockCopy(window, window.Length - keep, carry, 0, keep);
+            }
+        }
+        string tail = Encoding.ASCII.GetString(carry);
+        foreach (Match match in BuildMarker.Matches(tail)) {
+            if (actual != null) throw new IOException("executable contains multiple build SHA markers");
+            actual = match.Groups[1].Value;
+        }
+        if (actual == null) throw new IOException("executable has no exact build SHA marker");
+        return actual;
+    }
+
+    public static string Compute(string rootPath) {
+        string root = Path.GetFullPath(rootPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        DirectoryInfo rootInfo = new DirectoryInfo(root);
+        if (!rootInfo.Exists || (rootInfo.Attributes & FileAttributes.ReparsePoint) != 0)
+            throw new IOException("immutable operations root is missing or is a reparse point");
+        DirectoryInfo scripts = new DirectoryInfo(Path.Combine(root, "scripts"));
+        if (!scripts.Exists) throw new DirectoryNotFoundException("operations scripts directory is missing");
+        List<Entry> entries = new List<Entry>();
+        AddTree(root, scripts, entries);
+        string migration = Path.Combine(root, "src-tauri", "src", "migrations", "mod.rs");
+        FileInfo migrationInfo = new FileInfo(migration);
+        if (!migrationInfo.Exists || entries.Count == 0)
+            throw new IOException("operations bundle is missing scripts or the canonical migration ledger");
+        if ((migrationInfo.Attributes & FileAttributes.ReparsePoint) != 0)
+            throw new IOException("canonical migration ledger is a reparse point");
+        RequireContainedDirectoryChain(root, migrationInfo);
+        entries.Add(new Entry("src-tauri/src/migrations/mod.rs", migrationInfo.FullName));
+        entries.Sort(delegate(Entry left, Entry right) {
+            return StringComparer.Ordinal.Compare(left.Relative, right.Relative);
+        });
+
+        using (SHA256 aggregate = SHA256.Create()) {
+            foreach (Entry entry in entries) {
+                byte[] relative = Encoding.UTF8.GetBytes(entry.Relative);
+                byte[] contentHash;
+                long length;
+                using (FileStream stream = new FileStream(
+                    entry.Full, FileMode.Open, FileAccess.Read, FileShare.Read,
+                    1024 * 1024, FileOptions.SequentialScan)) {
+                    length = stream.Length;
+                    using (SHA256 content = SHA256.Create()) contentHash = content.ComputeHash(stream);
+                }
+                Transform(aggregate, BigEndian((UInt64)relative.Length, 4));
+                Transform(aggregate, relative);
+                Transform(aggregate, BigEndian((UInt64)length, 8));
+                Transform(aggregate, Encoding.ASCII.GetBytes(Hex(contentHash)));
+            }
+            aggregate.TransformFinalBlock(new byte[0], 0, 0);
+            return Hex(aggregate.Hash);
+        }
+    }
+}
+
+public static class CortexTcpOwnership {
+    private const int AF_INET = 2;
+    private const int TCP_TABLE_OWNER_PID_LISTENER = 3;
+    private const uint ERROR_INSUFFICIENT_BUFFER = 122;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MibTcpRowOwnerPid {
+        public uint State;
+        public uint LocalAddress;
+        public uint LocalPort;
+        public uint RemoteAddress;
+        public uint RemotePort;
+        public uint OwningPid;
+    }
+
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    private static extern uint GetExtendedTcpTable(
+        IntPtr table, ref int size, bool order, int family, int tableClass, uint reserved);
+
+    public static int[] ListenerPids(int port) {
+        int size = 0;
+        uint result = GetExtendedTcpTable(
+            IntPtr.Zero, ref size, true, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0);
+        if (result != ERROR_INSUFFICIENT_BUFFER)
+            throw new InvalidOperationException("TCP listener table size query failed: " + result);
+        IntPtr buffer = Marshal.AllocHGlobal(size);
+        try {
+            result = GetExtendedTcpTable(
+                buffer, ref size, true, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0);
+            if (result != 0) throw new InvalidOperationException("TCP listener table query failed: " + result);
+            int count = Marshal.ReadInt32(buffer);
+            int rowSize = Marshal.SizeOf(typeof(MibTcpRowOwnerPid));
+            long cursor = buffer.ToInt64() + sizeof(uint);
+            HashSet<int> pids = new HashSet<int>();
+            for (int index = 0; index < count; index++) {
+                MibTcpRowOwnerPid row = (MibTcpRowOwnerPid)Marshal.PtrToStructure(
+                    new IntPtr(cursor + ((long)index * rowSize)), typeof(MibTcpRowOwnerPid));
+                int rowPort = (int)(((row.LocalPort & 0xffU) << 8) | ((row.LocalPort & 0xff00U) >> 8));
+                IPAddress address = new IPAddress((long)row.LocalAddress);
+                if (rowPort == port && (row.LocalAddress == 0 || address.Equals(IPAddress.Loopback)))
+                    pids.Add((int)row.OwningPid);
+            }
+            int[] answer = new int[pids.Count];
+            pids.CopyTo(answer);
+            return answer;
+        } finally {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+}
+'@ -ErrorAction Stop
+} catch {
+    $helperTypeLoadError = $_.Exception.Message
+}
 # The one line a drill reads. Printed for every decision so a test asserts the CHOICE, not a side effect.
 function Report([string]$action) { Write-Output "WATCHDOG-ACTION: $action" }
 
@@ -90,6 +294,18 @@ function Get-Sha256Hex([string]$path) {
     } finally {
         $sha.Dispose()
         $stream.Dispose()
+    }
+}
+
+function Get-Sha256Utf8Lf([string]$path) {
+    $text = [System.IO.File]::ReadAllText($path).Replace("`r`n", "`n")
+    if ($text.Contains("`r")) { throw "unsupported bare carriage return in $path" }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return -join @($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') })
+    } finally {
+        $sha.Dispose()
     }
 }
 
@@ -109,25 +325,48 @@ function Get-VerifiedActiveRelease {
     if (-not (Test-Path -LiteralPath $pointerPath)) { return $null }
     try {
         $value = Get-Content -LiteralPath $pointerPath -Raw | ConvertFrom-Json
-        $expected = @(
+        $legacyExpected = @(
             'schema', 'releaseId', 'expectedDatabaseSchema', 'appGitSha', 'createdAtUtc',
             'directory', 'appExe', 'poolAdminExe', 'appSha256', 'poolAdminSha256',
             'watchdogScript', 'watchdogSha256', 'operationsSha256',
             'dedupManifest', 'dedupManifestSha256'
         )
+        $currentExpected = @($legacyExpected) + @(
+            'schemaContract', 'schemaContractId', 'schemaContractSha256'
+        )
+        if ($value.schema -isnot [int]) { throw 'release pointer schema is not an integer' }
+        if ($value.schema -eq 2) {
+            $expected = $currentExpected
+            if ($value.expectedDatabaseSchema -isnot [int] -or $value.expectedDatabaseSchema -ne 69) {
+                throw 'release pointer does not require private-production database schema 69'
+            }
+        } elseif ($value.schema -eq 1) {
+            # The only legacy boundary still safe for the 65->69 handover is the exact managed v65
+            # pointer. Schema 63/64 releases are not migration authorities for this controller.
+            $expected = $legacyExpected
+            if ($value.expectedDatabaseSchema -isnot [int] -or $value.expectedDatabaseSchema -ne 65) {
+                throw 'legacy release pointer is not the exact schema-65 handover boundary'
+            }
+        } else {
+            throw 'release pointer manifest schema is unsupported'
+        }
         $actual = @($value.PSObject.Properties.Name)
         $missing = @($expected | Where-Object { $_ -notin $actual })
         $extra = @($actual | Where-Object { $_ -notin $expected })
-        if ($missing.Count -or $extra.Count) { throw "release pointer fields do not match schema 1" }
-        if ($value.schema -ne 1 -or $value.expectedDatabaseSchema -ne 65) {
-            throw 'release pointer does not require private-production database schema 65'
-        }
+        if ($missing.Count -or $extra.Count) { throw "release pointer fields do not match manifest schema $($value.schema)" }
         if ([string]$value.appGitSha -notmatch '^[0-9a-f]{40}$') { throw 'release pointer git SHA is invalid' }
-        foreach ($field in @('appSha256', 'poolAdminSha256', 'watchdogSha256', 'operationsSha256', 'dedupManifestSha256')) {
+        $hashFields = @('appSha256', 'poolAdminSha256', 'watchdogSha256', 'operationsSha256', 'dedupManifestSha256')
+        if ($value.schema -eq 2) { $hashFields += 'schemaContractSha256' }
+        foreach ($field in $hashFields) {
             if ([string]$value.$field -notmatch '^[0-9a-f]{64}$') { throw "release pointer $field is invalid" }
         }
+        if ($null -ne $helperTypeLoadError) {
+            throw "release verification helpers could not load: $helperTypeLoadError"
+        }
         $directory = (Resolve-Path -LiteralPath ([string]$value.directory) -ErrorAction Stop).Path.TrimEnd('\')
-        foreach ($field in @('appExe', 'poolAdminExe', 'watchdogScript', 'dedupManifest')) {
+        $pathFields = @('appExe', 'poolAdminExe', 'watchdogScript', 'dedupManifest')
+        if ($value.schema -eq 2) { $pathFields += 'schemaContract' }
+        foreach ($field in $pathFields) {
             $resolved = (Resolve-Path -LiteralPath ([string]$value.$field) -ErrorAction Stop).Path
             if (-not $resolved.StartsWith($directory + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
                 throw "release pointer $field escapes its immutable release directory"
@@ -139,6 +378,56 @@ function Get-VerifiedActiveRelease {
             throw 'release dedup manifest identity does not match the pointer'
         }
         if ($dedup.summary.unconfirmedRiskGroups -ne 0) { throw 'release dedup manifest has unresolved risk' }
+        if ($value.schema -eq 2) {
+            $expectedContract = (Resolve-Path -LiteralPath (Join-Path $directory 'scripts\private_production_schema_contract.v1.json') -ErrorAction Stop).Path
+            if ([string]$value.schemaContract -cne $expectedContract) {
+                throw 'release schema contract is not at its canonical immutable path'
+            }
+            if ([string]$value.schemaContractId -cne 'cortex-private-production-schema-65-to-69-v1') {
+                throw 'release schema contract identity is invalid'
+            }
+            if ((Get-Sha256Hex ([string]$value.schemaContract)) -cne [string]$value.schemaContractSha256) {
+                throw 'release schema contract hash does not match the pointer'
+            }
+            $contract = Get-Content -LiteralPath ([string]$value.schemaContract) -Raw | ConvertFrom-Json
+            $contractExpected = @(
+                'schema', 'contractId', 'targetSchema', 'supportedMigrationSources',
+                'sameSchemaRecovery', 'normalization', 'algorithm', 'migrationSource',
+                'migrationSourceSha256', 'historicalPrefixThroughSchema',
+                'historicalPrefixSha256', 'appendOnlyContract', 'appendOnlyContractSha256'
+            )
+            $contractActual = @($contract.PSObject.Properties.Name)
+            $contractMissing = @($contractExpected | Where-Object { $_ -notin $contractActual })
+            $contractExtra = @($contractActual | Where-Object { $_ -notin $contractExpected })
+            if ($contractMissing.Count -or $contractExtra.Count) { throw 'release schema contract fields are invalid' }
+            $sources = @($contract.supportedMigrationSources)
+            if ($contract.schema -isnot [int] -or $contract.schema -ne 1 `
+                -or [string]$contract.contractId -cne 'cortex-private-production-schema-65-to-69-v1' `
+                -or $contract.targetSchema -isnot [int] -or $contract.targetSchema -ne 69 `
+                -or $sources.Count -ne 1 -or $sources[0] -isnot [int] -or $sources[0] -ne 65 `
+                -or $contract.sameSchemaRecovery -isnot [bool] -or $contract.sameSchemaRecovery -ne $true `
+                -or [string]$contract.normalization -cne 'utf8-lf' `
+                -or [string]$contract.algorithm -cne 'sha256' `
+                -or $contract.historicalPrefixThroughSchema -isnot [int] `
+                -or $contract.historicalPrefixThroughSchema -ne 65) {
+                throw 'release schema contract semantics are invalid'
+            }
+            if ([string]$contract.migrationSource -cne 'src-tauri/src/migrations/mod.rs' `
+                -or [string]$contract.appendOnlyContract -cne 'scripts/append_only_migration_contract.v1.json') {
+                throw 'release schema contract source paths are invalid'
+            }
+            foreach ($field in @('migrationSourceSha256', 'historicalPrefixSha256', 'appendOnlyContractSha256')) {
+                if ([string]$contract.$field -notmatch '^[0-9a-f]{64}$') { throw "release schema contract $field is invalid" }
+            }
+            $migrationSource = (Resolve-Path -LiteralPath (Join-Path $directory 'src-tauri\src\migrations\mod.rs') -ErrorAction Stop).Path
+            $appendOnlyContract = (Resolve-Path -LiteralPath (Join-Path $directory 'scripts\append_only_migration_contract.v1.json') -ErrorAction Stop).Path
+            if ((Get-Sha256Utf8Lf $migrationSource) -cne [string]$contract.migrationSourceSha256) {
+                throw 'release migration source does not match the schema contract'
+            }
+            if ((Get-Sha256Hex $appendOnlyContract) -cne [string]$contract.appendOnlyContractSha256) {
+                throw 'release append-only authority does not match the schema contract'
+            }
+        }
         $checks = @(
             @([string]$value.appExe, [string]$value.appSha256),
             @([string]$value.poolAdminExe, [string]$value.poolAdminSha256),
@@ -147,6 +436,19 @@ function Get-VerifiedActiveRelease {
         foreach ($check in $checks) {
             $actualSha = Get-Sha256Hex $check[0]
             if ($actualSha -ne $check[1]) { throw "release artifact hash mismatch: $($check[0])" }
+        }
+        $operationsActual = [CortexOperationsDigest]::Compute($directory)
+        if ($operationsActual -cne [string]$value.operationsSha256) {
+            throw 'release operations bundle does not match the pointer'
+        }
+        foreach ($binary in @(
+            @([string]$value.appExe, 'application'),
+            @([string]$value.poolAdminExe, 'pool administrator')
+        )) {
+            $bakedSha = [CortexOperationsDigest]::BakedGitSha($binary[0])
+            if ($bakedSha -cne [string]$value.appGitSha) {
+                throw "release $($binary[1]) build SHA does not match the pointer"
+            }
         }
         return $value
     } catch {
@@ -167,7 +469,55 @@ $exe = if ($env:CORTEX_WATCHDOG_EXE) { $env:CORTEX_WATCHDOG_EXE } elseif ($null 
 $poolAdmin = if ($env:CORTEX_WATCHDOG_POOL_ADMIN) { $env:CORTEX_WATCHDOG_POOL_ADMIN } elseif ($null -ne $activeRelease) {
     [string]$activeRelease.poolAdminExe
 } elseif (Test-Path -LiteralPath $packagedPoolAdmin) { $packagedPoolAdmin } else { $legacyPoolAdmin }
+$exeFull = try { (Resolve-Path -LiteralPath $exe -ErrorAction Stop).Path } catch { $exe }
 $session = Join-Path $dataDir 'couch_session.json'
+
+# A hash-valid pointer is still unsafe if its executable and live database disagree about schema.
+# `status` uses pool_admin's source-enforced read-only opener, which validates the complete applied
+# migration history against the exact binary without migrating or taking a reviewer lease. Do this
+# before any probe, kill or launch decision so a v69 binary can never be restart-looped against a v65
+# or future database (and the narrowly-supported legacy v65 pointer proves the inverse boundary too).
+function Test-ActiveReleaseDatabaseSchema([string]$adminPath, [string]$databasePath) {
+    $process = $null
+    try {
+        $start = New-Object System.Diagnostics.ProcessStartInfo
+        $start.FileName = $adminPath
+        $start.Arguments = 'status --db "' + $databasePath + '"'
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $start
+        if (-not $process.Start()) { return @{ Healthy = $false; Reason = 'pool_admin did not start' } }
+        if (-not $process.WaitForExit(60000)) {
+            try { $process.Kill() } catch { }
+            try { [void]$process.WaitForExit(5000) } catch { }
+            return @{ Healthy = $false; Reason = 'pool_admin schema probe exceeded 60 seconds' }
+        }
+        if ($process.ExitCode -ne 0) {
+            return @{ Healthy = $false; Reason = "pool_admin status exited $($process.ExitCode)" }
+        }
+        return @{ Healthy = $true; Reason = 'exact binary accepted complete migration history' }
+    } catch {
+        return @{ Healthy = $false; Reason = "pool_admin schema probe failed: $($_.Exception.Message)" }
+    } finally {
+        if ($null -ne $process) { $process.Dispose() }
+    }
+}
+
+if ($null -ne $activeRelease) {
+    $dbPath = Join-Path $dataDir 'cortex-speech.db'
+    if (-not (Test-Path -LiteralPath $dbPath)) {
+        Report 'blocked (active release database missing)'
+        Write-Log 'active release database is missing - refusing process control'
+        exit 1
+    }
+    $schemaProbe = Test-ActiveReleaseDatabaseSchema $poolAdmin $dbPath
+    if ($schemaProbe.Healthy -ne $true) {
+        Report 'blocked (active release database schema mismatch)'
+        Write-Log "active release database schema refused by exact pool_admin: $($schemaProbe.Reason)"
+        exit 1
+    }
+}
 
 if ($Register) {
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
@@ -262,10 +612,34 @@ $maxConsecutiveKills = 3
 $startupGraceMinutes = if ($env:CORTEX_WATCHDOG_STARTUP_GRACE_MIN) { [double]$env:CORTEX_WATCHDOG_STARTUP_GRACE_MIN } else { 10 }
 
 if ($alive) {
+    # A response proves only that *something* owns the port. Before declaring the supervised app
+    # healthy, bind the IPv4 listener PID back to the exact immutable executable path. Otherwise a
+    # stray dev server, stale helper, or hostile local responder can mask a crashed production app
+    # forever. Re-query each PID after the probe so a process observed before the 60-second probe
+    # window cannot be confused with a later PID reuse.
+    try {
+        if ($null -ne $helperTypeLoadError) { throw "listener ownership helper could not load: $helperTypeLoadError" }
+        $portNumber = 0
+        if (-not [int]::TryParse([string]$port, [ref]$portNumber) -or $portNumber -lt 1 -or $portNumber -gt 65535) {
+            throw "watchdog port is invalid: $port"
+        }
+        $listenerPids = @([CortexTcpOwnership]::ListenerPids($portNumber))
+        $matchingOwners = @($listenerPids | ForEach-Object {
+            $owner = Get-Process -Id $_ -ErrorAction SilentlyContinue
+            if ($null -ne $owner -and $owner.Path -and $owner.Path -eq $exeFull) { $owner }
+        })
+        if (-not $matchingOwners.Count) {
+            throw "responding port $port is not owned by exact app path $exeFull"
+        }
+    } catch {
+        Report 'blocked (responding port is not owned by active release)'
+        Write-Log "liveness responder refused: $($_.Exception.Message)"
+        exit 1
+    }
     if (Test-Path $killCountFile) { Remove-Item $killCountFile -Force -ErrorAction SilentlyContinue }
     Report 'alive'
     if ($DryRun) { exit 0 }
-    # v65 private-production certification. This is a read-only SQLite/filesystem report: it does not
+    # v69 private-production certification. This is a read-only SQLite/filesystem report: it does not
     # fetch a queue, take a lease, mark a clip seen, or touch reviewer history. Run it on the same
     # five-minute clock as liveness while a reviewer session is expected. A failed certification does
     # NOT trigger the destructive restart path (restarting cannot repair missing audio/rights/backups),
@@ -319,7 +693,6 @@ if ($alive) {
 # that name — a second checkout, a debug build, an installed copy under Program Files — while the
 # relaunch below only ever starts THIS one. The watchdog would happily kill a build it is not
 # responsible for and then report success. (A process whose Path cannot be read is not ours to kill.)
-$exeFull = try { (Resolve-Path $exe -ErrorAction Stop).Path } catch { $exe }
 $proc = @(Get-Process -Name cortex-speech-app -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -and $_.Path -eq $exeFull })
 

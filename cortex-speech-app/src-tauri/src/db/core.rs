@@ -91,16 +91,28 @@ pub(super) fn validate_policy4_effect_authority(conn: &Connection) -> AppResult<
     }
 
     let operation_namespace_collisions: i64 = conn.query_row(
-        "SELECT COUNT(*)
-           FROM independent_review_decisions independent
-          WHERE EXISTS (
-                    SELECT 1 FROM review_events canonical
-                     WHERE canonical.operation_id=independent.operation_id
-                )
-             OR EXISTS (
-                    SELECT 1 FROM human_decision_effect_events effect
-                     WHERE effect.operation_id=independent.operation_id
-                )",
+        "WITH canonical_operations(operation_id) AS (
+             SELECT operation_id FROM review_events WHERE operation_id IS NOT NULL
+             UNION SELECT operation_id FROM human_decision_effect_events WHERE operation_id IS NOT NULL
+             UNION SELECT operation_id FROM human_decision_effect_reversals
+             UNION SELECT operation_id FROM review_flag_effect_events
+             UNION SELECT operation_id FROM review_flag_effect_reversals
+         ),
+         independent_operations(operation_id) AS (
+             SELECT operation_id FROM independent_review_decisions
+             UNION ALL
+             SELECT operation_id FROM independent_review_reversals
+         )
+         SELECT
+             (SELECT COUNT(*) FROM independent_operations independent
+               WHERE EXISTS (
+                   SELECT 1 FROM canonical_operations canonical
+                    WHERE canonical.operation_id=independent.operation_id
+               ))
+           + (SELECT COUNT(*) FROM (
+                 SELECT operation_id FROM independent_operations
+                  GROUP BY operation_id HAVING COUNT(*)>1
+             ))",
         [],
         |row| row.get(0),
     )?;
@@ -1162,20 +1174,6 @@ pub(super) fn history_machine_projection_matches(left: &SpeechSegment, right: &S
         && left.speaker_change_score == right.speaker_change_score
 }
 
-/// The exact columns owned by one batch-transcription write. Undo/redo compares and replaces only
-/// this projection, so an unrelated later speaker/split/quality edit neither gets clobbered nor
-/// unnecessarily blocks the inverse.
-pub(super) fn batch_transcription_projection_matches(left: &SpeechSegment, right: &SpeechSegment) -> bool {
-    left.raw_transcript == right.raw_transcript
-        && left.normalized_transcript == right.normalized_transcript
-        && left.confidence == right.confidence
-        && left.confidence_source.as_deref().unwrap_or("unknown")
-            == right.confidence_source.as_deref().unwrap_or("unknown")
-        && left.model_version_id.as_deref().unwrap_or("unknown@pre-registry")
-            == right.model_version_id.as_deref().unwrap_or("unknown@pre-registry")
-        && left.cloud_call == right.cloud_call
-}
-
 /// Fold Sorani codepoint variants (Kaf ك/ک, Yeh ي/ی, Heh, Hamza, ZWNJ, tatweel) in a
 /// full-text search query so it matches the canonical `normalized_transcript` column
 /// regardless of which keyboard variant the user typed — the FTS index stores the
@@ -1251,6 +1249,79 @@ pub(super) fn refuse_blank_asr_persist(segment_id: &str, raw_transcript: &str) -
     if raw_transcript.trim().is_empty() {
         return Err(AppError::Validation(format!(
             "refusing to persist a blank ASR transcript for segment {segment_id}: an empty draft is a failed transcription, not a result"
+        )));
+    }
+    Ok(())
+}
+
+/// Generous stored-hypothesis limits derived from the 2026-08-28 owner snapshot (maximum four
+/// hypotheses, 638 transcript bytes, and 1,711 aggregate transcript bytes per segment). These are
+/// fail-closed corruption/resource boundaries, not product-quality limits; they intentionally leave
+/// several orders of magnitude of headroom and never truncate evidence.
+pub(crate) const MAX_STORED_HYPOTHESES_PER_SEGMENT: usize = 64;
+pub(crate) const MAX_STORED_HYPOTHESIS_TRANSCRIPT_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_STORED_HYPOTHESIS_TRANSCRIPT_BYTES_PER_SEGMENT: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_STORED_HYPOTHESIS_METADATA_FIELD_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_STORED_HYPOTHESIS_METADATA_BYTES_PER_SEGMENT: usize = 512 * 1024;
+
+pub(super) fn validate_stored_hypothesis_payload(segment_id: &str, model_id: &str, transcript: &str) -> AppResult<()> {
+    crate::validation::input::validate_identifier(segment_id).map_err(AppError::Validation)?;
+    crate::validation::input::validate_identifier(model_id).map_err(AppError::Validation)?;
+    if transcript.len() > MAX_STORED_HYPOTHESIS_TRANSCRIPT_BYTES {
+        return Err(AppError::Validation(format!(
+            "E_HYPOTHESIS_LIMIT_EXCEEDED: hypothesis transcript is {} bytes; maximum is {}",
+            transcript.len(),
+            MAX_STORED_HYPOTHESIS_TRANSCRIPT_BYTES
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_stored_hypothesis_upsert_on(
+    conn: &Connection,
+    segment_id: &str,
+    model_id: &str,
+    transcript: &str,
+) -> AppResult<()> {
+    validate_stored_hypothesis_payload(segment_id, model_id, transcript)?;
+    let (other_count, other_transcript_bytes, other_metadata_bytes): (i64, i64, i64) = conn.query_row(
+        "SELECT count(*),
+                COALESCE(sum(length(CAST(transcript AS BLOB))),0),
+                COALESCE(sum(length(CAST(COALESCE(model_id,'') AS BLOB))
+                           +length(CAST(COALESCE(model_version_id,'') AS BLOB))
+                           +length(CAST(COALESCE(created_at,'') AS BLOB))),0)
+           FROM segment_hypotheses
+          WHERE segment_id=?1 AND model_id<>?2",
+        params![segment_id, model_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let projected_count = usize::try_from(other_count)
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| AppError::Validation("E_HYPOTHESIS_LIMIT_EXCEEDED: invalid hypothesis count".into()))?;
+    let projected_transcript_bytes =
+        usize::try_from(other_transcript_bytes).ok().and_then(|bytes| bytes.checked_add(transcript.len())).ok_or_else(
+            || AppError::Validation("E_HYPOTHESIS_LIMIT_EXCEEDED: invalid aggregate hypothesis bytes".into()),
+        )?;
+    // An UPSERT retains an existing model_version_id, while a fresh insert receives the schema
+    // default. Reserve the full allowed metadata-field budget plus a timestamp allowance; this is
+    // conservative even for a legacy same-model row without loading its TEXT into Rust.
+    let new_metadata_bytes = model_id
+        .len()
+        .checked_add(MAX_STORED_HYPOTHESIS_METADATA_FIELD_BYTES)
+        .and_then(|bytes| bytes.checked_add(64))
+        .ok_or_else(|| AppError::Validation("E_HYPOTHESIS_LIMIT_EXCEEDED: invalid hypothesis metadata bytes".into()))?;
+    let projected_metadata_bytes = usize::try_from(other_metadata_bytes)
+        .ok()
+        .and_then(|bytes| bytes.checked_add(new_metadata_bytes))
+        .ok_or_else(|| AppError::Validation("E_HYPOTHESIS_LIMIT_EXCEEDED: invalid aggregate metadata bytes".into()))?;
+    if projected_count > MAX_STORED_HYPOTHESES_PER_SEGMENT
+        || projected_transcript_bytes > MAX_STORED_HYPOTHESIS_TRANSCRIPT_BYTES_PER_SEGMENT
+        || projected_metadata_bytes > MAX_STORED_HYPOTHESIS_METADATA_BYTES_PER_SEGMENT
+    {
+        return Err(AppError::Validation(format!(
+            "E_HYPOTHESIS_LIMIT_EXCEEDED: projected hypothesis authority is {projected_count} rows, \
+             {projected_transcript_bytes} transcript bytes, and {projected_metadata_bytes} metadata bytes"
         )));
     }
     Ok(())

@@ -141,9 +141,9 @@ FORBIDDEN_RUNTIME_PATTERNS = {
     ],
     "src-tauri/src/fingerprint.rs": [
         "fingerprint lock poisoned",
-        "self.known.lock().map",
-        "if let Ok(map) = self.known.lock()",
-        "if let Ok(mut map) = self.known.lock()",
+        "self.state.lock().map",
+        "if let Ok(state) = self.state.lock()",
+        "if let Ok(mut state) = self.state.lock()",
     ],
     "src-tauri/src/cache.rs": [
         "self.store.lock().ok",
@@ -440,8 +440,12 @@ def test_app_state_import_state_recovers_poisoned_lock() -> None:
 
 def test_commands_use_recovered_app_state_import_api() -> None:
     commands = command_surface()
-    if "state.try_start_import()?" not in commands:
-        raise AssertionError("commands.rs must start imports through AppState::try_start_import()")
+    if commands.count("try_start_import_for_run(&agent_run_id)") < 2:
+        raise AssertionError("both ordinary import commands must claim their exact run identity through AppState")
+    if "state.try_start_import_for_recovery_run(&agent_run_id)" not in commands:
+        raise AssertionError("import recovery must claim its exact run identity through the recovery-only AppState gate")
+    if "state.try_start_import()?" in commands:
+        raise AssertionError("commands must not use the anonymous legacy import admission API")
     if "finish_import()" not in commands:
         raise AssertionError("commands.rs must finish imports through AppState::finish_import()")
     if "import_state.lock()" in commands:
@@ -456,10 +460,12 @@ def test_app_state_batch_state_recovers_poisoned_lock() -> None:
         raise AssertionError("AppState must centralize batch state locking behind lock_batch_state()")
     if "Recovering poisoned batch state lock" not in lib:
         raise AssertionError("AppState must warn when recovering a poisoned batch state lock")
-    if "pub fn try_start_batch(&self) -> Result<(), String>" not in lib:
-        raise AssertionError("AppState must expose try_start_batch() for batch command handlers")
-    if "pub fn finish_batch(&self)" not in lib:
-        raise AssertionError("AppState must expose finish_batch() for batch command cleanup")
+    if "pub(crate) fn try_start_batch_for_run(" not in lib:
+        raise AssertionError("AppState must expose exact-run batch admission for command handlers")
+    if ") -> Result<CancellationToken, String>" not in lib:
+        raise AssertionError("exact batch admission must atomically return its cancellation authority")
+    if "pub(crate) fn finish_batch_for_run(" not in lib:
+        raise AssertionError("AppState must expose exact-run batch cleanup")
     direct_lock_count = lib.count("self.batch_state.lock()")
     if direct_lock_count != 1:
         raise AssertionError(f"self.batch_state.lock() must only appear inside lock_batch_state(), found {direct_lock_count}")
@@ -469,10 +475,12 @@ def test_app_state_batch_state_recovers_poisoned_lock() -> None:
 
 def test_commands_use_recovered_app_state_batch_api() -> None:
     commands = command_surface()
-    if "state.try_start_batch()?" not in commands:
-        raise AssertionError("commands.rs must start batches through AppState::try_start_batch()")
-    if "finish_batch()" not in commands:
-        raise AssertionError("commands.rs must finish batches through AppState::finish_batch()")
+    if ".try_start_batch_for_run(" not in commands:
+        raise AssertionError("commands must start batches through exact-run AppState admission")
+    if "finish_batch_for_run(" not in commands:
+        raise AssertionError("commands must finish batches through exact-run AppState cleanup")
+    if "state.try_start_batch()?" in commands:
+        raise AssertionError("commands must not use the anonymous legacy batch admission API")
     if "batch_state.lock()" in commands:
         raise AssertionError("commands.rs must not lock batch_state directly")
     if "use crate::BatchState;" in commands:
@@ -622,8 +630,9 @@ def test_instance_lock_cleanup_reports_failures() -> None:
 def test_commands_do_not_silently_default_critical_db_failures() -> None:
     commands = command_surface()
     required = [
-        'tracing::error!("Batch transcribe DB prefetch failed: {error}")',
-        '.get_segments_by_ids(&segment_ids)\n        .map_err(|e| e.to_string())?',
+        '.map_err(|error| batch_transcribe_admission_error(&error.to_string()))?;',
+        'tracing::error!(%error, "Durable transcription work page could not be read")',
+        'tracing::error!(segment_id = %item.segment_id, %error, "Durable champion commit failed")',
         'let persisted = db.get_hypotheses_for_segment(seg_id).map_err(|e| e.to_string())?;',
         'let mut hyps = hypotheses_for_selected_asr(&settings.asr_model_size, seg, persisted, recorded_is_champion);',
         'let few_shots = crate::jury::get_few_shot_examples(db, seg_id, 5).map_err(|e| e.to_string())?;',
@@ -658,15 +667,13 @@ def test_commands_do_not_silently_default_critical_db_failures() -> None:
 
 def test_commands_batch_transcribe_reports_insert_failures() -> None:
     commands = command_surface()
-    # Batch transcribe writes results through a GUARDED targeted update
-    # (update_batch_transcription_if_unreviewed) rather than a full insert_segment of the prefetched
-    # (now-stale) snapshot, so a concurrent human verify/edit is never clobbered. It must STILL snapshot
-    # the pre-transcription row for undo and report DB-write failures explicitly (never swallow them).
+    # Batch transcription now infers without canonical writes and lets the durable journal own the
+    # exact CAS update, failure evidence, and undo projection in one transaction.
     required = [
-        "match app_state.lock_db().update_batch_transcription_if_unreviewed(",
-        'tracing::error!("Batch transcribe DB update failed for {id}: {error}")',
-        "previous_segments.push(pre_transcription_snapshot);",
-        "transcribed_ids.push(id.clone());",
+        "pipeline.transcribe_bound_draft_only(&bound_source, Some(cancel.as_atomic()))",
+        "authority.commit_champion_draft(item.ordinal, &draft)",
+        'tracing::error!(segment_id = %item.segment_id, %error, "Durable champion commit failed")',
+        'BatchTerminalIntentV1::Failed { code: "BATCH_TRANSCRIPT_WRITE_FAILED".into() }',
     ]
     missing = [pattern for pattern in required if pattern not in commands]
     if missing:
@@ -694,7 +701,6 @@ def test_jury_background_runs_report_failures() -> None:
         'fn log_jury_pipeline_failure(context: &str, error: &str)',
         'tracing::error!("Jury pipeline failed after {context}: {error}");',
         'log_jury_pipeline_failure("single-file import", &error);',
-        'log_jury_pipeline_failure("batch transcription", &error);',
     ]
     missing_commands = [pattern for pattern in required_commands if pattern not in commands]
     if missing_commands:
@@ -718,12 +724,12 @@ def test_pipeline_event_emits_report_failures() -> None:
     required = [
         "fn emit_or_log<T>(app: &tauri::AppHandle, event: &str, payload: T)",
         'tracing::warn!("Failed to emit {event}: {error}");',
-        'emit_or_log(app, "pipeline-started"',
-        'emit_or_log(app, "pipeline-phase"',
-        'emit_or_log(\n                app,\n                "pipeline-progress"',
-        'emit_or_log(app, "pipeline-complete", payload.clone());',
-        'emit_or_log(app, "import-complete", payload);',
-        'emit_or_log(\n                app,\n                "pipeline-error"',
+        '"pipeline-started"',
+        '"pipeline-phase"',
+        '"pipeline-progress"',
+        '"pipeline-complete"',
+        '"import-complete"',
+        '"pipeline-error"',
     ]
     missing = [pattern for pattern in required if pattern not in commands]
     if missing:
@@ -784,14 +790,11 @@ def test_commands_audio_duration_probe_send_failures_are_reported() -> None:
 def test_commands_batch_normalize_reports_prefetch_and_update_failures() -> None:
     commands = command_surface()
     required = [
-        'tracing::warn!("Batch normalize segment not found during prefetch: {id}")',
-        'tracing::error!("Batch normalize DB prefetch failed for {id}: {error}")',
-        'tracing::error!("Batch normalize app state unavailable during prefetch")',
-        "let mut failed = prefetch_failed_ids.len() as u32;",
-        '"file": id, "status": "failed", "operation": "normalize"',
-        'tracing::error!("Batch normalize DB update failed for {id}: {error}")',
-        'tracing::warn!("Batch normalize segment disappeared before update: {id}")',
-        'tracing::error!("Batch normalize app state unavailable before update for {id}")',
+        '.map_err(|error| batch_normalize_start_error(&error.to_string()))?;',
+        'tracing::error!(%error, "Durable normalization work page could not be read")',
+        "lease.commit_normalization(",
+        'tracing::error!(segment_id = %item.segment_id, %error, "Durable normalization item failed")',
+        'BatchTerminalIntentV1::Failed { code: "BATCH_NORMALIZATION_FAILED".into() }',
     ]
     missing = [pattern for pattern in required if pattern not in commands]
     if missing:
@@ -845,7 +848,15 @@ def test_alignment_json_and_quality_are_written_as_one_atomic_statement() -> Non
         )
 
     required_commands = [
-        ".update_segment_alignment_if_unchanged(id, alignment_json.as_deref(), &merged, quality.as_db_str())",
+        # The extracted command first snapshots the DB-owned text/alignment/revision. The writer then
+        # checks both the revision (covering transcript/boundary changes) and the prior JSON in the one
+        # timings+quality statement. These deliberately use separate structural tokens so rustfmt's
+        # multiline call layout cannot make the safety gate stale.
+        ".get_segment_by_id_with_revision(id)",
+        "canonical_alignment_inputs(audio_path, text, alignment_json, stored_segment, segment_id.as_deref())?;",
+        ".update_segment_alignment_if_unchanged(",
+        "expected_revision,",
+        "alignment_json.as_deref(),",
         'map_err(|error| format!("Failed to persist word timings + quality for {id}: {error}"))?;',
         "if !persisted {",
         'return Err(format!("Segment {id} changed while alignment was running; reload it and try again"));',
@@ -857,6 +868,7 @@ def test_alignment_json_and_quality_are_written_as_one_atomic_statement() -> Non
 
     required_pipeline = [
         "match import_writes.update_alignment_if_unchanged(",
+        "expected_revision,",
         "source_alignment.as_deref(),",
         "Ok(false) => {",
         "canonical alignment changed during inference",
@@ -1318,7 +1330,7 @@ def test_finish_import_clears_cancel_token_before_opening_the_gate() -> None:
     lib = (REPO_ROOT / "src-tauri" / "src" / "lib.rs").read_text(encoding="utf-8")
     for fn_name, token_line, gate_line in (
         ("pub fn finish_import(", "lock_import_cancel_token() = None", "ImportState::Idle"),
-        ("pub fn finish_batch(", "lock_batch_cancel_token() = None", "BatchState::Idle"),
+        ("pub(crate) fn finish_batch_for_run(", "lock_batch_cancel_token() = None", "BatchState::Idle"),
     ):
         start = lib.find(fn_name)
         if start == -1:
@@ -1338,13 +1350,10 @@ def test_finish_import_clears_cancel_token_before_opening_the_gate() -> None:
 
 
 def test_batch_normalize_uses_a_targeted_update_not_a_whole_row_upsert() -> None:
-    """batch_normalize must persist normalized_transcript with the targeted single-column
-    update_normalized_transcript, NOT a read-modify-write + whole-row insert_segment upsert of a
-    re-read segment — the latter clobbers a concurrent write to the same segment that lands between
-    the re-read and the upsert (iter-88; the sibling batch commands verify/assign_speaker already use
-    targeted updates). Scoped to the batch_normalize function body."""
+    """batch_normalize must commit through the durable journal's revision-guarded targeted update,
+    never through a read-modify-write whole-row upsert that could clobber concurrent human truth."""
     batch = (REPO_ROOT / "src-tauri" / "src" / "commands" / "batch.rs").read_text(encoding="utf-8")
-    marker = "pub fn batch_normalize("
+    marker = "pub async fn batch_normalize("
     start = batch.find(marker)
     if start == -1:
         raise AssertionError("batch_normalize not found — this gate would pass vacuously")
@@ -1354,8 +1363,8 @@ def test_batch_normalize_uses_a_targeted_update_not_a_whole_row_upsert() -> None
             "batch_normalize uses a whole-row insert_segment upsert — a concurrent write to the segment "
             "can be clobbered; use the targeted db.update_normalized_transcript instead."
         )
-    if "update_normalized_transcript(" not in body:
-        raise AssertionError("batch_normalize must persist via the targeted db.update_normalized_transcript")
+    if "commit_normalization(" not in body:
+        raise AssertionError("batch_normalize must persist through the durable journal's guarded normalization commit")
 
 
 def test_save_session_is_rate_limited() -> None:
@@ -1488,28 +1497,24 @@ def test_pipeline_wsl_retranscribe_rejects_an_empty_result() -> None:
     """The in-pipeline WSL-7B branch of transcribe() receives Ok("") on a TRANSIENT empty result (server
     up but under load — documented in-code, observed 1-of-3 under stress), so
     map_err(tag_7b_unavailable) does NOT catch it.
-    Without an explicit empty guard, the champion commit with an empty draft overwrites a good,
-    unverified stored transcript with "" — silent data loss on both re-transcribe entry points (per-segment
-    IPC + batch_transcribe), unlike the import path which retries/escalates. The branch must reject an empty
-    raw_transcript (return a tagged 7B-unavailable Err) BEFORE the DB write. transcribe() needs the WSL
-    server + audio + DB, so it is not unit-injectable — source-pinned."""
+    Without an explicit empty guard, the draft would reach whichever later atomic publication owner
+    called inference. The branch must reject an empty raw_transcript (return a tagged 7B-unavailable
+    Err) BEFORE returning a publishable draft. The live WSL server is not unit-injectable, so this is
+    source-pinned."""
     pipeline = pipeline_surface()
     anchor = "self.run_wsl_segment_transcript(audio_path, alignment_json, cancel).map_err(tag_7b_unavailable)?;"
     start = pipeline.find(anchor)
     if start == -1:
         raise AssertionError("run_wsl_segment_transcript call not found — this gate would pass vacuously")
-    # Match the METHOD CALL, not a prose mention in the guard's own comment — otherwise the search
-    # lands on the comment and excludes the guard below it.
-    write = pipeline.find(".commit_bound_champion_transcript_if_unreviewed(", start)
-    if write == -1:
-        raise AssertionError("atomic champion commit not found after the WSL call — gate vacuous")
-    between = pipeline[start:write]
+    draft_return = pipeline.find("return Ok(TranscriptionDraft {", start)
+    if draft_return == -1:
+        raise AssertionError("champion draft return not found after the WSL call — gate vacuous")
+    between = pipeline[start:draft_return]
     if "raw_transcript.trim().is_empty()" not in between or "return Err(tag_7b_unavailable(" not in between:
         raise AssertionError(
-            "transcribe()'s WSL-7B branch writes raw_transcript without an empty guard between the "
-            "run_wsl_segment_transcript call and the atomic champion commit — a transient empty 7B "
-            "result (Ok(\"\")) would overwrite a good stored transcript with a blank. Reject an empty "
-            "raw_transcript with a tagged 7B-unavailable Err before the write."
+            "transcribe()'s WSL-7B branch returns raw_transcript without an empty guard between the "
+            "run_wsl_segment_transcript call and the draft return. Reject an empty raw_transcript "
+            "with a tagged 7B-unavailable Err before handing it to a publication owner."
         )
 
 
@@ -1538,15 +1543,19 @@ def test_champion_transcript_and_provenance_commit_atomically() -> None:
     if missing:
         raise AssertionError(f"atomic champion DB commit is missing contracts: {missing}")
 
-    for name, source in (("pipeline.rs", pipeline_surface()), ("commands.rs", command_surface())):
-        if ".commit_bound_champion_transcript_if_unreviewed(" not in source:
-            raise AssertionError(
-                f"{name} does not route champion writes through the source-bound atomic DB helper"
-            )
-        if ".commit_champion_transcript_if_unreviewed(" in source:
-            raise AssertionError(
-                f"{name} routes a production champion write through the unbound test-only helper"
-            )
+    pipeline = pipeline_surface()
+    commands = command_surface()
+    for forbidden in (
+        ".commit_bound_champion_transcript_if_unreviewed(",
+        ".commit_champion_transcript_if_unreviewed(",
+    ):
+        if forbidden in pipeline:
+            raise AssertionError(f"draft-only inference regained a canonical write: {forbidden}")
+    if ".commit_bound_champion_transcript_with_history(" not in commands:
+        raise AssertionError("single champion publication bypasses the atomic source/history DB boundary")
+    if ".commit_champion_transcript_if_unreviewed(" in commands:
+        raise AssertionError("commands routes a production champion write through the unbound test-only helper")
+    for name, source in (("pipeline.rs", pipeline), ("commands.rs", commands)):
         for retired in (".update_asr_transcript_if_unreviewed(", ".replace_hypotheses_with("):
             if retired in source:
                 raise AssertionError(
@@ -1567,8 +1576,9 @@ def test_pipeline_duration_probe_failures_are_not_silent() -> None:
         raise AssertionError(f"pipeline.rs silently defaults duration probe failures to zero:\n{formatted}")
 
     required = [
-        "return self.process_single_file_streaming(path, db, decode_timeout, duration_ms, cancel, on_chunk);",
-        "decode_timeout: Duration,\n        duration_ms: i64,",
+        "return self.process_single_file_streaming(",
+        "StreamingImportContext { duration_ms, cancel, source_provenance:",
+        "let StreamingImportContext { duration_ms, cancel, source_provenance } = context;",
         "let duration_ms = audio::get_duration_ms(path)?;",
         'tracing::warn!("Rediarize duration probe failed for {audio_path}: {error}");',
     ]
@@ -1821,20 +1831,17 @@ def test_global_rate_limiter_recovers_poisoned_lock() -> None:
 
 def test_audio_fingerprint_cache_recovers_poisoned_lock() -> None:
     fingerprint = (REPO_ROOT / "src-tauri/src/fingerprint.rs").read_text(encoding="utf-8")
-    # Matched on the SIGNATURE, not the full generic type. This pinned
-    # `MutexGuard<'_, HashMap<u64, String>>` verbatim and fired when v51 changed the map's VALUE to
-    # `Vec<KnownRecording>` (a spectral bucket may hold several distinct recordings) — a legitimate
-    # design change, with the invariant this gate actually protects fully intact. A guard that fails on
-    # a type it was never about trains people to edit the guard, which is how a real one gets weakened.
-    if "fn lock_known(&self) -> MutexGuard<" not in fingerprint:
-        raise AssertionError("AudioFingerprint must centralize cache locking behind lock_known()")
+    # Match the centralized recovery boundary, not its concrete indexed-state type. The cache now keeps
+    # source, content and reservation indexes under one mutex so admission stays atomic and O(1).
+    if "fn lock_state(&self) -> MutexGuard<" not in fingerprint:
+        raise AssertionError("AudioFingerprint must centralize cache locking behind lock_state()")
     # The real invariant, and STRONGER than the old string match: exactly one place takes the lock.
-    # Counted like the AsrPool sibling above. `fp.known.lock()` in the poison test uses a different
+    # Counted like the AsrPool sibling above. `fp.state.lock()` in the poison test uses a different
     # receiver and is deliberately not counted.
-    direct_lock_count = fingerprint.count("self.known.lock()")
+    direct_lock_count = fingerprint.count("self.state.lock()")
     if direct_lock_count != 1:
         raise AssertionError(
-            f"self.known.lock() must only appear inside AudioFingerprint::lock_known(), found {direct_lock_count}"
+            f"self.state.lock() must only appear inside AudioFingerprint::lock_state(), found {direct_lock_count}"
         )
     if "Recovering poisoned audio fingerprint cache" not in fingerprint:
         raise AssertionError("AudioFingerprint must warn when recovering a poisoned cache")
@@ -2115,9 +2122,9 @@ def test_snapshot_restore_preserves_live_cloud_consent() -> None:
     recovery module owns typed state-file publication, so both surfaces remain source-pinned."""
     surface = command_surface()
     recovery = recovery_surface()
-    start = surface.find("fn restore_db_from_snapshot(")
+    start = surface.find("async fn restore_db_from_snapshot_inner(")
     if start == -1:
-        raise AssertionError("restore_db_from_snapshot not found — this gate would pass vacuously")
+        raise AssertionError("restore_db_from_snapshot_inner not found — this gate would pass vacuously")
     rest = surface[start:]
     end = len(rest)
     for marker in ("\n#[tauri::command]", "\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "):
@@ -2154,7 +2161,9 @@ def test_snapshot_restore_preserves_live_cloud_consent() -> None:
     capture = code_body.find("let live_controls = state.lock_settings().clone();")
     install = code_body.find("install_snapshot_restore_plan(&restore_plan, &data_dir, &live_controls)?")
     runtime = code_body.find("*state.lock_settings() = restored.clone();")
-    completed = code_body.find("mark_named_restore_completed(&data_dir, &name)?;")
+    completed = code_body.find(
+        "mark_named_restore_completed(&data_dir, &name, &restore_plan.expected_db_generation_sha256)?;"
+    )
     clear = code_body.find("clear_review_pilot_restore_pending(&data_dir)?;", completed)
     if -1 in (capture, install, runtime, completed, clear) or not (capture < install < runtime < completed < clear):
         raise AssertionError(
@@ -2232,22 +2241,19 @@ def test_default_transcribe_segment_refuses_blank_draft() -> None:
 
 
 def test_batch_transcribe_refuses_blank_draft() -> None:
-    """batch_transcribe must SKIP a blank draft, not persist it. update_batch_transcription_if_unreviewed
-    (db.rs) writes raw_transcript unconditionally, guarding only human-reviewed rows — so an empty ASR
-    result would overwrite an existing good UNREVIEWED transcript with "" (e.g. a jury_accept 7B draft
-    re-batch-transcribed by the offline CTC engine that returns Ok("") on a quiet clip). Recurring
-    blank-transcript-never-overwrites-good data-loss class. The runtime path needs a full app + pipeline,
-    so it is source-pinned."""
-    src = command_surface()
-    if "update_batch_transcription_if_unreviewed" not in src:
-        raise AssertionError("batch_transcribe persist call not found in commands.rs")
-    guard = "Ok(draft) if draft.final_text.trim().is_empty() && draft.raw_text.trim().is_empty()"
-    if guard not in src:
-        raise AssertionError(
-            "batch_transcribe does not guard a blank draft before update_batch_transcription_if_unreviewed "
-            '— an empty ASR result would overwrite a good unreviewed transcript with "". Add the match-guard '
-            "arm that skips when final_text and raw_text are both empty."
-        )
+    """The side-effect-free batch draft must be validated before the journal can commit it."""
+    commands = command_surface()
+    pipeline = pipeline_surface()
+    if "pipeline.prepare_batch_champion_draft(inferred)" not in commands:
+        raise AssertionError("batch_transcribe does not route inferred text through the closed draft validator")
+    for required in (
+        "draft.raw_text.trim().is_empty()",
+        "crate::quality::is_placeholder_transcript(&draft.raw_text)",
+        "E_BATCH_EMPTY_CHAMPION_DRAFT",
+        "durable_batch_draft_requires_single_owner_and_exact_champion_identity",
+    ):
+        if required not in pipeline:
+            raise AssertionError(f"durable batch draft blank/placeholder guard is missing: {required}")
 
 
 def test_batch_processor_never_deletes_a_segment_with_an_existing_transcript() -> None:

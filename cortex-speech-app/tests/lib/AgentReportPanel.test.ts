@@ -11,95 +11,116 @@ function makeReport(overrides: Partial<AgentImportReport> = {}): AgentImportRepo
     agentRunId: 'run-1',
     source: 'file',
     status: 'completed',
-    audioPaths: ['C:\\audio\\long.wav'],
-    segmentIds: ['seg-1', 'seg-2'],
     summary: {
       totalSegments: 2,
       agenticReadiness: {
         status: 'blocked',
         ready: false,
         sourceReferenceModels: ['gemini-2.5-pro'],
+        sourceReferenceModelCount: 1,
         availableHypothesisModels: ['omniasr-wsl-7b'],
+        availableHypothesisModelCount: 1,
         requiredHypothesisModels: 2,
         checks: [
           {
-            id: 'source_reference',
-            label: 'Whole-file source references',
+            code: 'source_reference',
             status: 'ready',
-            detail: 'Configured source-reference model: gemini-2.5-pro',
           },
           {
-            id: 'hypothesis_coverage',
-            label: 'Multi-model hypothesis coverage',
+            code: 'hypothesis_coverage',
             status: 'blocked',
-            detail: 'Only one usable hypothesis model is ready.',
           },
         ],
+        checkCount: 2,
       },
       sourceReferences: [
         {
-          audioPath: 'C:\\audio\\long.wav',
+          audioFileLabel: 'long.wav',
           modelId: 'gemini-2.5-pro',
-          transcriptPath: 'source_transcripts\\long__gemini.txt',
+          audioContentHash: null,
+          audioSizeBytes: null,
+          transcriptFileLabel: 'long__gemini.txt',
           textChars: 1200,
         },
       ],
+      sourceReferenceCount: 1,
       sourceReferenceRequired: true,
       requiredSourceReferenceModels: ['gemini-2.5-pro'],
+      requiredSourceReferenceModelCount: 1,
       sourceReferenceModels: ['gemini-2.5-pro'],
+      sourceReferenceModelCount: 1,
       sourceReferenceCoverage: [
         {
-          audioPath: 'C:\\audio\\long.wav',
+          audioFileLabel: 'long.wav',
           requiredModels: ['gemini-2.5-pro'],
+          requiredModelCount: 1,
           presentModels: ['gemini-2.5-pro'],
+          presentModelCount: 1,
           missingModels: [],
+          missingModelCount: 0,
           complete: true,
         },
       ],
+      sourceReferenceCoverageCount: 1,
       longFileDossiers: [
         {
-          audioPath: 'C:\\audio\\long.wav',
+          audioFileLabel: 'long.wav',
           chunkCount: 2,
           totalDurationMs: 32000,
           sourceReferences: [
             {
-              audioPath: 'C:\\audio\\long.wav',
+              audioFileLabel: 'long.wav',
               modelId: 'gemini-2.5-pro',
-              transcriptPath: 'source_transcripts\\long__gemini.txt',
+              audioContentHash: null,
+              audioSizeBytes: null,
+              transcriptFileLabel: 'long__gemini.txt',
               textChars: 1200,
             },
           ],
+          sourceReferenceCount: 1,
           sourceReferenceCoverage: {
-            audioPath: 'C:\\audio\\long.wav',
+            audioFileLabel: 'long.wav',
             requiredModels: ['gemini-2.5-pro'],
+            requiredModelCount: 1,
             presentModels: ['gemini-2.5-pro'],
+            presentModelCount: 1,
             missingModels: [],
+            missingModelCount: 0,
             complete: true,
           },
           hypothesisModelCounts: {
             'omniasr-ctc-300m': 2,
             'omniasr-wsl-7b': 1,
           },
+          hypothesisModelKindCount: 2,
           verdictCounts: {
             jury_accept: 1,
             escalated: 1,
           },
+          verdictKindCount: 2,
           trainingReadySegments: 1,
           escalatedSegments: ['seg-2'],
+          escalatedSegmentCount: 1,
           promotionStatus: 'needs_review',
-          promotionBlockers: ['seg-2'],
+          promotionBlockerCodes: ['missing_hypothesis_coverage'],
+          promotionBlockerCount: 1,
         },
       ],
+      longFileDossierCount: 1,
       hypothesisModels: ['omniasr-ctc-300m', 'omniasr-wsl-7b'],
+      hypothesisModelCount: 2,
       hypothesisModelCounts: {
         'omniasr-ctc-300m': 2,
         'omniasr-wsl-7b': 1,
       },
+      hypothesisModelKindCount: 2,
       verdictCounts: {
         jury_accept: 1,
         escalated: 1,
       },
+      verdictKindCount: 2,
       escalatedSegments: ['seg-2'],
+      escalatedSegmentCount: 1,
       hypothesisCoverageBlockers: [
         {
           segmentId: 'seg-2',
@@ -109,34 +130,31 @@ function makeReport(overrides: Partial<AgentImportReport> = {}): AgentImportRepo
             minimumNonEmptyModelCount: 2,
             nonEmptyModelCount: 1,
             passesMinimum: false,
-            nonEmptyModels: ['omniasr-wsl-7b'],
-            ignoredModels: ['asr'],
           },
         },
       ],
+      hypothesisCoverageBlockerCount: 1,
       orchestrationStages: [
         {
           stage: 'source_reference',
           status: 'ready',
-          summary: '1 whole-file source reference transcript recorded.',
+          detailCode: 'ready',
           blockerCount: 0,
-          blockers: [],
         },
         {
           stage: 'multi_model_hypotheses',
           status: 'blocked',
-          summary: '1 segment lacks enough model hypotheses.',
+          detailCode: 'blocked',
           blockerCount: 1,
-          blockers: ['seg-2'],
         },
         {
           stage: 'dataset_promotion',
           status: 'needs_review',
-          summary: '1 segment is training-ready, but review queue items remain.',
+          detailCode: 'needs_review',
           blockerCount: 1,
-          blockers: ['seg-2'],
         },
       ],
+      orchestrationStageCount: 3,
       trainingGradeSummary: {
         totalSegments: 2,
         trainingReadySegments: 1,
@@ -149,9 +167,9 @@ function makeReport(overrides: Partial<AgentImportReport> = {}): AgentImportRepo
         high_confidence_jury_accept: 1,
         jury_accept_needs_review: 1,
       },
+      trainingGradeReasonKindCount: 2,
     },
-    juryReport: { referenceCommitted: 1, humanInbox: 1 },
-    error: null,
+    errorCode: null,
     createdAt: '2026-06-16T12:00:00Z',
     ...overrides,
   };
@@ -165,8 +183,8 @@ function makeStageEvents(): AgentStageEvent[] {
       source: 'file',
       stage: 'source_reference',
       status: 'completed',
-      file: 'long.wav',
-      detail: '2 whole-file source reference transcripts recorded',
+      fileLabel: 'long.wav',
+      detailCode: 'completed',
       current: 1,
       total: 1,
       createdAt: '2026-06-16T12:00:01Z',
@@ -177,8 +195,8 @@ function makeStageEvents(): AgentStageEvent[] {
       source: 'file',
       stage: 'jury_adjudication',
       status: 'blocked',
-      file: 'long.wav',
-      detail: '1 segment lacks enough model hypotheses',
+      fileLabel: 'long.wav',
+      detailCode: 'blocked',
       current: 0,
       total: 2,
       createdAt: '2026-06-16T12:00:02Z',
@@ -200,7 +218,7 @@ describe('AgentReportPanel', () => {
 
     expect(screen.getByTestId('agent-report-panel')).toBeInTheDocument();
     expect(screen.getByText('Latest Agent Run')).toBeInTheDocument();
-    expect(screen.getByText(en['agentReport.status.completed'])).toBeInTheDocument();
+    expect(screen.getAllByText(en['agentReport.status.completed']).length).toBeGreaterThan(0);
     expect(screen.getByText('Training-ready')).toBeInTheDocument();
     expect(screen.getByTestId('agent-report-training-ready')).toHaveTextContent('1 / 50%');
     expect(screen.getAllByText('gemini-2.5-pro')).toHaveLength(4);
@@ -222,7 +240,7 @@ describe('AgentReportPanel', () => {
       'Multi-model hypothesis coverage',
     );
     expect(screen.getByTestId('agent-report-agentic-readiness')).toHaveTextContent(
-      'Only one usable hypothesis model is ready.',
+      en['agentReport.status.blocked'],
     );
     expect(screen.getByTestId('agent-report-model-coverage')).toHaveTextContent('omniasr-ctc-300m');
     expect(screen.getByTestId('agent-report-model-coverage')).toHaveTextContent('2/2');
@@ -240,10 +258,10 @@ describe('AgentReportPanel', () => {
       'Persisted stage log',
     );
     expect(screen.getByTestId('agent-report-persisted-stage-events')).toHaveTextContent(
-      'source_reference',
+      'Source reference',
     );
     expect(screen.getByTestId('agent-report-persisted-stage-events')).toHaveTextContent(
-      'jury_adjudication',
+      'Jury adjudication',
     );
     expect(screen.getByTestId('agent-report-persisted-stage-events')).toHaveTextContent(
       `${en['agentReport.status.blocked']} 0/2`,
@@ -251,7 +269,7 @@ describe('AgentReportPanel', () => {
     expect(screen.getByTestId('agent-report-source-files')).toHaveTextContent('long__gemini.txt');
     expect(screen.getByTestId('agent-report-source-files')).toHaveTextContent('1200 chars');
     expect(screen.getByTestId('agent-report-orchestration-stages')).toHaveTextContent(
-      'source_reference',
+      'Source reference',
     );
     expect(screen.getByTestId('agent-report-orchestration-stages')).toHaveTextContent(
       en['agentReport.status.blocked'],
@@ -272,14 +290,53 @@ describe('AgentReportPanel', () => {
       props: {
         report: makeReport({
           status: 'failed',
-          error: 'Post-import jury adjudication failed after single-file import',
+          errorCode: 'IMPORT_REPORT_FAILED',
         }),
       },
     });
 
     expect(screen.getByText(en['agentReport.status.failed'])).toBeInTheDocument();
-    expect(
-      screen.getByText('Post-import jury adjudication failed after single-file import'),
-    ).toBeInTheDocument();
+    expect(screen.getByText(en['agentReport.runFailedDetail'])).toBeInTheDocument();
+  });
+
+  it('renders authoritative totals instead of bounded preview lengths', () => {
+    const report = makeReport();
+    report.summary.sourceReferenceCount = 10_000;
+    report.summary.sourceReferenceModelCount = 10_000;
+    report.summary.requiredSourceReferenceModelCount = 9_998;
+    report.summary.hypothesisModelCount = 9_999;
+    report.summary.agenticReadiness!.sourceReferenceModelCount = 9_997;
+    report.summary.agenticReadiness!.availableHypothesisModelCount = 9_996;
+    report.summary.escalatedSegmentCount = 9;
+    report.summary.sourceReferenceCoverageCount = 11;
+    report.summary.sourceReferenceCoverage[0].complete = false;
+    report.summary.sourceReferenceCoverage[0].missingModels = ['model-missing'];
+    report.summary.sourceReferenceCoverage[0].missingModelCount = 9_995;
+    report.summary.longFileDossierCount = 12;
+    report.summary.hypothesisCoverageBlockerCount = 13;
+
+    render(AgentReportPanel, { props: { report } });
+
+    expect(screen.getByTestId('agent-report-source-ref-count')).toHaveTextContent('10000');
+    expect(screen.getByTestId('agent-report-source-reference-models')).toHaveTextContent(
+      'gemini-2.5-pro +9999',
+    );
+    expect(screen.getByTestId('agent-report-required-reference-models')).toHaveTextContent(
+      'gemini-2.5-pro +9997',
+    );
+    expect(screen.getByTestId('agent-report-hypothesis-models')).toHaveTextContent('+9997');
+    expect(screen.getByTestId('agent-report-ready-reference-models')).toHaveTextContent('+9996');
+    expect(screen.getByTestId('agent-report-ready-hypothesis-models')).toHaveTextContent('+9995');
+    expect(screen.getByTestId('agent-report-missing-models')).toHaveAttribute(
+      'title',
+      'model-missing +9994',
+    );
+    expect(screen.getByTestId('agent-report-escalated-count')).toHaveTextContent('9');
+    expect(screen.getByTestId('agent-report-escalated-ids')).toHaveTextContent('+3 more');
+    expect(screen.getByTestId('agent-report-source-reference-coverage')).toHaveTextContent(
+      '+7 more',
+    );
+    expect(screen.getByTestId('agent-report-long-file-dossiers')).toHaveTextContent('+9 more');
+    expect(screen.getByTestId('agent-report-coverage-blockers')).toHaveTextContent('+9 more');
   });
 });

@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+#[path = "export_bundle_generation.rs"]
+mod export_bundle_generation;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockingValidationIssues {
@@ -803,96 +806,14 @@ pub fn export_dataset_bundle(
     export_dataset_bundle_inner(db, model_manager, output_dir, settings, production, warning_threshold)
 }
 
-fn require_absent_or_empty_production_target(output_dir: &Path) -> AppResult<()> {
-    match std::fs::symlink_metadata(output_dir) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(AppError::Validation(format!(
-            "Production export target must be an absent or empty directory: {}",
-            output_dir.display()
-        ))),
-        Ok(_) => {
-            if std::fs::read_dir(output_dir)?.next().transpose()?.is_some() {
-                Err(AppError::Validation(format!(
-                    "Production export target must be absent or empty; refusing to reuse or seal existing files in {}",
-                    output_dir.display()
-                )))
-            } else {
-                Ok(())
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn cleanup_generated_bundle_stage(staging_dir: &Path, parent_dir: &Path, staging_prefix: &str) {
-    if !staging_dir.exists() {
-        return;
-    }
-    // Recursive cleanup is allowed only for the exact sibling directory this exporter generated.
-    // Resolve both paths first so a malformed output path can never widen the deletion target.
-    let safe = staging_dir.canonicalize().ok().zip(parent_dir.canonicalize().ok()).is_some_and(
-        |(resolved_stage, resolved_parent)| {
-            resolved_stage.parent() == Some(resolved_parent.as_path())
-                && resolved_stage
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(staging_prefix))
-        },
-    );
-    if !safe {
-        tracing::error!(
-            "Refusing unsafe production-bundle staging cleanup outside the resolved parent: {}",
-            staging_dir.display()
-        );
-        return;
-    }
-    if let Err(error) = std::fs::remove_dir_all(staging_dir) {
-        tracing::warn!("Failed to remove production-bundle staging directory after error: {error}");
-    }
-}
-
 fn export_production_bundle_staged<F>(output_dir: &Path, build: F) -> AppResult<BundleExportResult>
 where
     F: FnOnce(&Path) -> AppResult<BundleExportResult>,
 {
-    // Never let a public export inherit arbitrary artifacts from a prior run. A fresh sibling tree
-    // is the complete unit sealed by SHA256SUMS, then a single same-parent rename publishes it.
-    require_absent_or_empty_production_target(output_dir)?;
-    let parent_dir = output_dir.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent_dir)?;
-    let output_name = output_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| AppError::Validation("Production export target must have a directory name".to_string()))?;
-    let staging_prefix = format!(".{output_name}.cortex-stage-");
-    let staging_dir = parent_dir.join(format!("{staging_prefix}{}", uuid::Uuid::new_v4().simple()));
-    std::fs::create_dir(&staging_dir)?;
-
-    let mut result = match build(&staging_dir) {
-        Ok(result) => result,
-        Err(error) => {
-            cleanup_generated_bundle_stage(&staging_dir, parent_dir, &staging_prefix);
-            return Err(error);
-        }
-    };
-
-    // Recheck immediately before promotion: another process must not be able to place an artifact
-    // in the final target while this run is hashing its sources. Never delete a non-empty target.
-    if let Err(error) = require_absent_or_empty_production_target(output_dir) {
-        cleanup_generated_bundle_stage(&staging_dir, parent_dir, &staging_prefix);
-        return Err(error);
-    }
-    if output_dir.exists() {
-        if let Err(error) = std::fs::remove_dir(output_dir) {
-            cleanup_generated_bundle_stage(&staging_dir, parent_dir, &staging_prefix);
-            return Err(error.into());
-        }
-    }
-    if let Err(error) = std::fs::rename(&staging_dir, output_dir) {
-        cleanup_generated_bundle_stage(&staging_dir, parent_dir, &staging_prefix);
-        return Err(error.into());
-    }
+    // This publisher flushes the complete staged tree, verifies its SHA256SUMS seal, performs one
+    // same-parent no-clobber promotion, persists the parent entry, then reopens and verifies every
+    // final artifact before it can return success.
+    let mut result = export_bundle_generation::publish_new_generation(output_dir, build)?;
 
     result.output_dir = output_dir.to_string_lossy().to_string();
     result.manifest_path = output_dir.join("manifest.json").to_string_lossy().to_string();

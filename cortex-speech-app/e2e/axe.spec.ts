@@ -101,6 +101,7 @@ test.describe('axe-core WCAG 2.2 AA gate (M3.6)', () => {
 
   test('Command palette has zero a11y violations and a named active option', async ({ page }) => {
     await page.goto('/');
+    await expect(page.getByRole('button', { name: 'Command palette' })).toBeVisible();
     await page.keyboard.press('Control+K');
     const dialog = page.getByRole('dialog', { name: 'Command palette' });
     await expect(dialog).toBeVisible();

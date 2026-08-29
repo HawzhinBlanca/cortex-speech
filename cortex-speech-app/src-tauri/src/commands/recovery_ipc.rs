@@ -222,9 +222,10 @@ pub fn acknowledge_quarantine(state: State<'_, AppState>) -> Result<usize, Comma
 #[specta::specta]
 pub async fn db_vacuum(state: State<'_, AppState>) -> Result<(), CommandErrorV1> {
     STRICT_RATE_LIMITER.check("db_vacuum").map_err(|_| recovery_rate_limited_error())?;
-    let db = state.db_arc();
+    let database = state.db_runtime();
     run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mutation = database.begin_mutation()?;
+        let db = database.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| poisoned.into_inner());
         db.vacuum().map_err(|error| error.to_string())
     })
     .await
@@ -291,6 +292,11 @@ async fn restore_db_from_snapshot_inner(name: String, state: State<'_, AppState>
                     completed_selector, name
                 ));
             }
+            if !crate::recovery::completed_named_restore_matches_live(&data_dir, &pending)? {
+                return Err(format!(
+                    "restore '{completed_selector}' has a completion marker but the live SQLite generation does not match it; restart Cortex so fail-closed recovery can replay the exact target or verified original"
+                ));
+            }
             clear_review_pilot_restore_pending(&data_dir)?;
             restore_reservation.commit_named_restore()?;
             tracing::info!("completed pending restore-barrier cleanup for auto-snapshot {name}");
@@ -322,7 +328,7 @@ async fn restore_db_from_snapshot_inner(name: String, state: State<'_, AppState>
     let restored = install_snapshot_restore_plan(&restore_plan, &data_dir, &live_controls)?;
     *state.lock_settings() = restored.clone();
     state.update_pipeline_settings(restored);
-    mark_named_restore_completed(&data_dir, &name)?;
+    mark_named_restore_completed(&data_dir, &name, &restore_plan.expected_db_generation_sha256)?;
     clear_review_pilot_restore_pending(&data_dir)?;
     restore_reservation.commit_named_restore()?;
     drop(restore_reservation);

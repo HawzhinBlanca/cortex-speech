@@ -9,6 +9,8 @@
     saving: boolean;
     saveFailed: boolean;
     recovered: boolean;
+    disabled?: boolean;
+    disabledDescriptionId?: string;
     onUseConflict: () => void;
     onDiscardConflict: () => void;
     onRetryLoad: () => void;
@@ -21,6 +23,8 @@
     saving,
     saveFailed,
     recovered,
+    disabled = false,
+    disabledDescriptionId,
     onUseConflict,
     onDiscardConflict,
     onRetryLoad,
@@ -45,10 +49,22 @@
       </section>
     </div>
     <div class="mt-3 flex flex-wrap gap-2">
-      <button type="button" class="btn btn-primary !text-xs" onclick={onUseConflict}>
+      <button
+        type="button"
+        class="btn btn-primary !text-xs"
+        onclick={onUseConflict}
+        {disabled}
+        aria-describedby={disabled ? disabledDescriptionId : undefined}
+      >
         {$t('review.useLocalDraft')}
       </button>
-      <button type="button" class="btn btn-secondary !text-xs" onclick={onDiscardConflict}>
+      <button
+        type="button"
+        class="btn btn-secondary !text-xs"
+        onclick={onDiscardConflict}
+        {disabled}
+        aria-describedby={disabled ? disabledDescriptionId : undefined}
+      >
         {$t('review.discardLocalDraft')}
       </button>
     </div>
@@ -62,6 +78,8 @@
       type="button"
       class="ring-focus ms-2 rounded-token px-2 py-1 text-xs text-cortex-300 hover:text-default"
       onclick={onRetryLoad}
+      {disabled}
+      aria-describedby={disabled ? disabledDescriptionId : undefined}
     >
       {$t('retry')}
     </button>

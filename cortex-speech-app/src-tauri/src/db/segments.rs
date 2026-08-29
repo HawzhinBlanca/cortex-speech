@@ -613,12 +613,11 @@ impl Database {
         }
     }
 
-    /// Targeted single-column update: sets `normalized_transcript` (the normalized ASR draft) without
-    /// touching the human's answer (annotated_transcript / verdict) or any other field. Returns true
-    /// if the row was found and updated. Used by batch_normalize instead of a read-modify-write +
-    /// whole-row insert_segment upsert, which could clobber a concurrent write between the re-read and
-    /// the write (the anti-clobber discipline the sibling batch updates already follow).
-    pub fn update_normalized_transcript(&self, id: &str, normalized: &str) -> AppResult<bool> {
+    /// Test-only storage fixture for proving a targeted `normalized_transcript` update cannot clobber
+    /// unrelated columns. Production has no legitimate normalized-only transcript publisher: every
+    /// machine draft must cross its source-bound atomic publication boundary with provenance.
+    #[cfg(test)]
+    pub(crate) fn update_normalized_transcript(&self, id: &str, normalized: &str) -> AppResult<bool> {
         let rows = self.conn.execute(
             "UPDATE speech_segments SET normalized_transcript = ?2, updated_at = datetime('now') WHERE id = ?1",
             params![id, normalized],
@@ -846,6 +845,85 @@ impl Database {
         }
     }
 
+    fn validate_import_provenance_source(
+        segments: &[SpeechSegment],
+        provenance: Option<&SourceAudioProvenance>,
+    ) -> AppResult<()> {
+        let Some(provenance) = provenance else {
+            return Ok(());
+        };
+        let source = segments
+            .first()
+            .map(|segment| segment.audio_path.as_str())
+            .ok_or_else(|| AppError::Validation("No import segments to bind to source provenance".into()))?;
+        if provenance.audio_path != source {
+            return Err(AppError::Validation(
+                "Import source provenance does not identify the segment batch's exact audio path".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Publish compatibility import rows and their preprocessing declaration as one source commit.
+    /// A provenance trigger/disk failure therefore cannot leave transcript truth whose processed-audio
+    /// lineage silently vanished.
+    pub(crate) fn insert_segments_with_provenance_batch(
+        &self,
+        segments: &[SpeechSegment],
+        provenance: Option<&SourceAudioProvenance>,
+    ) -> AppResult<()> {
+        Self::validate_import_provenance_source(segments, provenance)?;
+        self.conn.execute("SAVEPOINT import_source_publish", [])?;
+        let result = (|| -> AppResult<()> {
+            self.insert_segments_batch(segments)?;
+            if let Some(provenance) = provenance {
+                self.upsert_source_audio_provenance(provenance)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.release_savepoint("import_source_publish")?;
+                self.track_write()?;
+                Ok(())
+            }
+            Err(error) => {
+                self.cleanup_savepoint_after_error("import_source_publish");
+                Err(error)
+            }
+        }
+    }
+
+    /// Add the optional preprocessing declaration to the existing row+recording-identity atomic
+    /// publisher without duplicating either authority implementation.
+    pub(crate) fn insert_segments_with_audio_identity_and_provenance_batch(
+        &self,
+        segments: &[SpeechSegment],
+        identity: &AudioIdentity,
+        provenance: Option<&SourceAudioProvenance>,
+    ) -> AppResult<()> {
+        Self::validate_import_provenance_source(segments, provenance)?;
+        self.conn.execute("SAVEPOINT import_identity_source_publish", [])?;
+        let result = (|| -> AppResult<()> {
+            self.insert_segments_with_audio_identity_batch(segments, identity)?;
+            if let Some(provenance) = provenance {
+                self.upsert_source_audio_provenance(provenance)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.release_savepoint("import_identity_source_publish")?;
+                self.track_write()?;
+                Ok(())
+            }
+            Err(error) => {
+                self.cleanup_savepoint_after_error("import_identity_source_publish");
+                Err(error)
+            }
+        }
+    }
+
     /// Publish one fully champion-drafted import file as a single durable unit.
     ///
     /// Import inference happens before this boundary. Consequently no placeholder or partially
@@ -938,6 +1016,36 @@ impl Database {
             }
             Err(error) => {
                 self.cleanup_savepoint_after_error("champion_import_publish");
+                Err(error)
+            }
+        }
+    }
+
+    /// Add preprocessing provenance to the all-or-nothing champion row+hypothesis+identity commit.
+    pub(crate) fn insert_champion_segments_with_provenance_batch(
+        &self,
+        segments: &[SpeechSegment],
+        deployment_sha256: &str,
+        identity: Option<&AudioIdentity>,
+        provenance: Option<&SourceAudioProvenance>,
+    ) -> AppResult<()> {
+        Self::validate_import_provenance_source(segments, provenance)?;
+        self.conn.execute("SAVEPOINT champion_import_source_publish", [])?;
+        let result = (|| -> AppResult<()> {
+            self.insert_champion_segments_batch(segments, deployment_sha256, identity)?;
+            if let Some(provenance) = provenance {
+                self.upsert_source_audio_provenance(provenance)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.release_savepoint("champion_import_source_publish")?;
+                self.track_write()?;
+                Ok(())
+            }
+            Err(error) => {
+                self.cleanup_savepoint_after_error("champion_import_source_publish");
                 Err(error)
             }
         }
@@ -1220,6 +1328,7 @@ impl Database {
         confidence_source: Option<&str>,
         cloud_call: bool,
     ) -> AppResult<bool> {
+        let normalizer_version = normalized_transcript.map(|_| crate::normalizer::NORMALIZER_VERSION);
         self.commit_champion_transcript_inner(
             champion,
             expected_deployment_sha256,
@@ -1227,12 +1336,17 @@ impl Database {
             confidence_source,
             cloud_call,
             None,
+            normalizer_version,
+            None,
         )
     }
 
     /// Commit a champion result only while the exact source/revision selected before inference is
     /// still authoritative. Production re-transcription callers must keep the matching decoded-PCM
     /// source lease alive until this method returns.
+    // This closed evidence tuple intentionally stays one call: splitting it across setters would make
+    // transcript and provenance publication non-atomic.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_bound_champion_transcript_if_unreviewed(
         &self,
         champion: &SegmentHypothesis,
@@ -1240,6 +1354,8 @@ impl Database {
         normalized_transcript: Option<&str>,
         confidence_source: Option<&str>,
         cloud_call: bool,
+        decoder_config_sha256: &str,
+        normalizer_version: Option<&str>,
         expected_source: &ChampionTranscriptionSourceSnapshot,
     ) -> AppResult<bool> {
         self.commit_champion_transcript_inner(
@@ -1248,10 +1364,15 @@ impl Database {
             normalized_transcript,
             confidence_source,
             cloud_call,
+            Some(decoder_config_sha256),
+            normalizer_version,
             Some(expected_source),
         )
     }
 
+    // All fields below are one atomic champion publication contract. A builder would only move the
+    // same validation burden while obscuring which values reach the SQL transaction.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn commit_champion_transcript_inner(
         &self,
         champion: &SegmentHypothesis,
@@ -1259,6 +1380,8 @@ impl Database {
         normalized_transcript: Option<&str>,
         confidence_source: Option<&str>,
         cloud_call: bool,
+        decoder_config_sha256: Option<&str>,
+        normalizer_version: Option<&str>,
         expected_source: Option<&ChampionTranscriptionSourceSnapshot>,
     ) -> AppResult<bool> {
         crate::validation::input::validate_identifier(&champion.segment_id).map_err(AppError::Validation)?;
@@ -1273,8 +1396,33 @@ impl Database {
             }
         }
         if let Some(normalized) = normalized_transcript {
-            crate::validation::input::validate_text(normalized, 100_000, "Normalized transcript")
+            crate::validation::input::validate_text(normalized, 100_000, "Derived champion transcript")
                 .map_err(AppError::Validation)?;
+        }
+        if normalized_transcript.is_some() != normalizer_version.is_some() {
+            return Err(AppError::Validation(
+                "Derived champion text and producer version must either both be present or both be absent".into(),
+            ));
+        }
+        if let Some(version) = normalizer_version {
+            crate::validation::input::validate_text(version, 128, "Derived transcript producer version")
+                .map_err(AppError::Validation)?;
+            if version.trim().is_empty() {
+                return Err(AppError::Validation("Derived transcript producer version must not be blank".into()));
+            }
+        }
+        if let Some(config_sha256) = decoder_config_sha256 {
+            if config_sha256.len() != 64
+                || !config_sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(AppError::Validation(
+                    "Decoder configuration identity must be a canonical lowercase SHA-256".into(),
+                ));
+            }
+        } else if expected_source.is_some() {
+            return Err(AppError::Validation(
+                "A bound champion commit requires decoder configuration provenance".into(),
+            ));
         }
 
         let transcript_nfc = to_nfc(&champion.transcript);
@@ -1313,16 +1461,18 @@ impl Database {
                          confidence_source     = COALESCE(?5, 'unknown'),
                          model_version_id      = ?6,
                          cloud_call            = ?7,
+                         decoder_config_hash   = ?8,
+                         normalizer_version    = ?9,
                          updated_at            = datetime('now')
                      WHERE id = ?1
                        AND verified = 0
                        AND (human_decision IS NULL OR human_decision = '')
                        AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))
-                       AND review_revision = ?8
-                       AND audio_path = ?9
-                       AND alignment_json IS ?10
-                       AND duration_ms = ?11
-                       AND audio_content_hash IS ?12",
+                       AND review_revision = ?10
+                       AND audio_path = ?11
+                       AND alignment_json IS ?12
+                       AND duration_ms = ?13
+                       AND audio_content_hash IS ?14",
                     params![
                         champion.segment_id,
                         transcript_nfc,
@@ -1331,6 +1481,8 @@ impl Database {
                         confidence_source,
                         champion.model_id,
                         cloud_call as i32,
+                        decoder_config_sha256,
+                        normalizer_version,
                         source.review_revision,
                         source.segment.audio_path,
                         source.segment.alignment_json,
@@ -1347,6 +1499,8 @@ impl Database {
                          confidence_source     = COALESCE(?5, 'unknown'),
                          model_version_id      = ?6,
                          cloud_call            = ?7,
+                         decoder_config_hash   = ?8,
+                         normalizer_version    = ?9,
                          updated_at            = datetime('now')
                      WHERE id = ?1
                        AND verified = 0
@@ -1360,6 +1514,8 @@ impl Database {
                         confidence_source,
                         champion.model_id,
                         cloud_call as i32,
+                        decoder_config_sha256,
+                        normalizer_version,
                     ],
                 )?
             };

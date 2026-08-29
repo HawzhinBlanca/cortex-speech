@@ -197,7 +197,11 @@ fn build_dpo_dataset_filtered(
         }
 
         let prompt = build_learning_prompt(db, &row)?;
-        pairs.push(DpoPair { prompt, chosen: fix.to_string(), rejected: wrong.to_string() });
+        // Eligibility/dedup intentionally inspect trimmed keys above, but the serialized training
+        // pair preserves the stored evidence byte-for-byte. In particular, `chosen` is the human's
+        // authoritative correction; silently trimming or canonicalizing it would manufacture a
+        // different label while still calling it human-approved.
+        pairs.push(DpoPair { prompt, chosen: row.human_fix, rejected: row.wrong_transcript });
     }
 
     let jsonl = pairs.iter().map(serde_json::to_string).collect::<Result<Vec<_>, _>>()?.join("\n");
@@ -247,22 +251,17 @@ pub(crate) fn holdout_audio_paths(db: &Database) -> AppResult<std::collections::
     Ok(paths)
 }
 
-/// Export the LOOP-2 language-model training corpus: the human-confirmed-correct Sorani text from
-/// reviewed (`human_decision` = accept|edit), non-gold segments — the curated correct text the
-/// flywheel has accumulated. Each line is canonicalized with the char-only normalizer (Kaf/Yeh/Heh
-/// folding, numbers preserved) so the LM's tokens match the ASR surface forms it will rescore, and
-/// any segment whose audio matches a holdout gold clip is excluded by content hash. Run
+/// Export the LOOP-2 language-model training corpus: the exact stored human-confirmed Sorani text
+/// from reviewed (`human_decision` = accept|edit), non-gold segments — the curated correct text the
+/// flywheel has accumulated. Verbatim Law forbids silently canonicalizing the primary label: any
+/// normalized/canonical form must be exported separately and explicitly identified as machine-
+/// derived evidence. Any segment whose audio matches a holdout gold clip is excluded by content
+/// hash. Run
 /// `kenlm lmplz` on these lines externally (the same prepare-here / train-externally pattern as the
 /// fine-tuned 7B).
 pub fn export_lm_corpus(db: &Database) -> AppResult<Vec<String>> {
     let holdout = holdout_content_hashes(db)?;
     let holdout_paths = holdout_audio_paths(db)?;
-    let normalizer = crate::normalizer::SoraniNormalizer::with_config(crate::normalizer::NormalizationConfig {
-        normalize_numbers: false,
-        verbalize_numbers: false,
-        normalize_hamza: true,
-        remove_diacritics: false,
-    });
 
     // Priority mirrors the codebase's canonical "text the human confirmed": the committed
     // verdict_transcript first, then the human's typed annotation, then the VERBATIM raw draft.
@@ -318,10 +317,10 @@ pub fn export_lm_corpus(db: &Database) -> AppResult<Vec<String>> {
             }
         }
 
-        let normalized = normalizer.normalize(&text);
-        if !normalized.trim().is_empty() {
-            corpus.push(normalized);
-        }
+        // Keep the primary LM label exactly as stored by the authoritative decision path. Checks
+        // above may inspect a trimmed view for emptiness/placeholders, but no transformation is
+        // permitted on the emitted value.
+        corpus.push(text);
     }
     Ok(corpus)
 }
@@ -674,6 +673,18 @@ mod tests {
     use crate::db::{SegmentHypothesis, SourceTranscriptRecord, SpeechSegment};
     use rusqlite::params;
 
+    fn assert_rollback_to(db: &Database, target_version: i64) {
+        let head = crate::migrations::max_supported_version();
+        let expected = ((target_version + 1)..=head).rev().collect::<Vec<_>>();
+        assert_eq!(crate::migrations::rollback(db, expected.len()).unwrap(), expected);
+        assert_eq!(crate::migrations::get_current_version(db).unwrap(), target_version);
+    }
+
+    fn assert_upgrade_to_current(db: &Database, source_version: i64) {
+        let expected = ((source_version + 1)..=crate::migrations::max_supported_version()).collect::<Vec<_>>();
+        assert_eq!(crate::migrations::run_migrations(db).unwrap(), expected);
+    }
+
     fn open_mem_db() -> Database {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
@@ -882,7 +893,7 @@ mod tests {
     #[test]
     fn dpo_legacy_example_requires_current_matching_verified_edit() {
         let db = open_mem_db();
-        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        assert_rollback_to(&db, 59);
         db.insert_segment(&SpeechSegment {
             id: "legacy-dpo".into(),
             audio_path: "/legacy-dpo.wav".into(),
@@ -905,7 +916,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        assert_upgrade_to_current(&db, 59);
 
         assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 1);
         db.connection()
@@ -932,7 +943,7 @@ mod tests {
         // differ from annotated/raw. Memory evidence must be judged against what the human actually
         // accepted; comparing the prior draft to itself would invert this Confirm into an Override.
         let db = open_mem_db();
-        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        assert_rollback_to(&db, 59);
         let original = "ئەو ساڵە باش بوو";
         let accepted = "ئەو ساڵە خراپ بوو";
         let memory = crate::corrections::extract_substitution_memories(original, accepted)
@@ -948,7 +959,7 @@ mod tests {
                 params![memory.wrong_token, memory.human_token, memory.slot_key, memory.phonetic_key],
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        assert_upgrade_to_current(&db, 59);
 
         db.insert_segment(&SpeechSegment {
             id: "accepted-hypothesis-segment".into(),
@@ -1032,6 +1043,32 @@ mod tests {
         assert!(corpus.iter().any(|l| l.contains("کوردی")), "reviewed non-gold text included: {corpus:?}");
         assert!(!corpus.iter().any(|l| l.contains("گۆڵد")), "gold segment excluded");
         assert!(!corpus.iter().any(|l| l.contains("ناوەند")), "unreviewed segment excluded");
+    }
+
+    #[test]
+    fn export_lm_corpus_preserves_the_exact_stored_human_label() {
+        // Arabic Kaf/Yeh, ASCII punctuation, repeated/edge whitespace: the old LM exporter silently
+        // folded and trimmed all of these while still presenting the result as the human label.
+        // Selection may inspect whitespace, but the emitted primary label must equal storage bytes.
+        let db = open_mem_db();
+        let exact_human_label = "  كوردى?   دەق  ";
+        db.insert_segment(&SpeechSegment {
+            id: "lm-verbatim-bytes".into(),
+            audio_path: "/missing-lm-verbatim.wav".into(),
+            raw_transcript: "champion raw".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET human_decision = 'edit', verdict_transcript = ?1
+                  WHERE id = 'lm-verbatim-bytes'",
+                [exact_human_label],
+            )
+            .unwrap();
+
+        assert_eq!(export_lm_corpus(&db).unwrap(), vec![exact_human_label.to_string()]);
     }
 
     #[test]
@@ -1304,6 +1341,34 @@ mod tests {
         let result = build_dpo_dataset(&db).expect("build dpo");
         assert_eq!(result.pair_count, 0);
         assert!(result.jsonl.is_empty());
+    }
+
+    #[test]
+    fn dpo_pair_preserves_exact_stored_human_and_machine_evidence() {
+        let db = open_mem_db();
+        db.insert_segment(&SpeechSegment {
+            id: "seg-verbatim-pair".into(),
+            audio_path: "/missing-verbatim-pair.wav".into(),
+            raw_transcript: "champion raw".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let exact_wrong = "  machine proposal  ";
+        let exact_human = "  كوردى?  ";
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "ex-verbatim-pair",
+            "seg-verbatim-pair",
+            exact_wrong,
+            exact_human,
+            None,
+        );
+
+        let result = build_dpo_dataset(&db).unwrap();
+        assert_eq!(result.pair_count, 1);
+        let pair: DpoPair = serde_json::from_str(&result.jsonl).unwrap();
+        assert_eq!(pair.chosen, exact_human, "the primary human label must remain byte-exact");
+        assert_eq!(pair.rejected, exact_wrong, "the paired machine evidence must remain byte-exact");
     }
 
     #[test]

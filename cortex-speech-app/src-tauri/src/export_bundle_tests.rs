@@ -139,6 +139,14 @@ fn assert_no_generated_bundle_stages(parent: &Path, output_name: &str) {
     assert!(leaked.is_empty(), "production export leaked staging directories: {leaked:?}");
 }
 
+fn write_minimal_sealed_production_bundle(root: &Path) -> AppResult<()> {
+    std::fs::create_dir(root.join("nested"))?;
+    std::fs::write(root.join("payload.bin"), b"durable reviewed bytes")?;
+    std::fs::write(root.join("nested").join("details.json"), br#"{"reviewed":true}"#)?;
+    std::fs::write(root.join("manifest.json"), br#"{"files":["payload.bin","nested/details.json"]}"#)?;
+    export::write_sha256sums(root)
+}
+
 fn assert_parquet_has_no_private_reviewer_identity(path: &Path, private_values: &[&str]) {
     use arrow_array::Array;
 
@@ -361,6 +369,173 @@ fn failed_staged_production_build_leaves_no_final_markers_or_staging_tree() {
     assert!(!out.exists(), "a late failure must not publish even a partial final directory");
     assert!(!out.join("manifest.json").exists());
     assert!(!out.join("SHA256SUMS").exists());
+    assert_no_generated_bundle_stages(tmp.path(), "bundle");
+}
+
+#[test]
+fn production_bundle_fault_before_promotion_preserves_old_generation_and_reports_failure() {
+    use export_bundle_generation::{publish_new_generation_with_hook, ProductionBundlePublishPoint};
+
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("bundle");
+    let old = tmp.path().join("older-bundle");
+    std::fs::create_dir(&old).unwrap();
+    write_minimal_sealed_production_bundle(&old).unwrap();
+    let old_payload = std::fs::read(old.join("payload.bin")).unwrap();
+
+    let error = publish_new_generation_with_hook(&out, write_minimal_sealed_production_bundle, |point, _path| {
+        if point == ProductionBundlePublishPoint::StagedAndDurableBeforePromotion {
+            return Err(AppError::Validation("injected pre-promotion failure".to_string()));
+        }
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains("injected pre-promotion failure"));
+    assert!(!out.exists(), "a pre-promotion failure must never expose a final generation");
+    assert_eq!(std::fs::read(old.join("payload.bin")).unwrap(), old_payload);
+    export_bundle_generation::verify_sealed_generation(&old).unwrap();
+    assert_no_generated_bundle_stages(tmp.path(), "bundle");
+}
+
+#[test]
+fn production_bundle_success_replaces_only_an_empty_picker_directory_with_a_verified_generation() {
+    use export_bundle_generation::publish_new_generation;
+
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("bundle");
+    std::fs::create_dir(&out).unwrap();
+    let receipt = publish_new_generation(&out, |staging_dir| {
+        write_minimal_sealed_production_bundle(staging_dir)?;
+        Ok("durable-success")
+    })
+    .unwrap();
+
+    assert_eq!(receipt, "durable-success");
+    export_bundle_generation::verify_sealed_generation(&out).unwrap();
+    assert_eq!(std::fs::read(out.join("payload.bin")).unwrap(), b"durable reviewed bytes");
+    assert_no_generated_bundle_stages(tmp.path(), "bundle");
+}
+
+#[test]
+fn production_bundle_fault_after_rename_before_barrier_never_reports_success() {
+    use export_bundle_generation::{publish_new_generation_with_hook, ProductionBundlePublishPoint};
+
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("bundle");
+    let error = publish_new_generation_with_hook(&out, write_minimal_sealed_production_bundle, |point, _path| {
+        if point == ProductionBundlePublishPoint::RenamedBeforeParentBarrier {
+            return Err(AppError::Validation("injected post-rename failure".to_string()));
+        }
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains("injected post-rename failure"));
+    assert!(out.exists(), "the completed rename must not be destructively rolled back or pruned");
+    export_bundle_generation::verify_sealed_generation(&out).unwrap();
+    assert_no_generated_bundle_stages(tmp.path(), "bundle");
+}
+
+#[test]
+fn production_bundle_fault_after_barrier_before_return_never_reports_success() {
+    use export_bundle_generation::{publish_new_generation_with_hook, ProductionBundlePublishPoint};
+
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("bundle");
+    let error = publish_new_generation_with_hook(&out, write_minimal_sealed_production_bundle, |point, _path| {
+        if point == ProductionBundlePublishPoint::DurableAndVerifiedBeforeReturn {
+            return Err(AppError::Validation("injected pre-return failure".to_string()));
+        }
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains("injected pre-return failure"));
+    assert!(out.exists(), "a durable final generation must not be pruned when result delivery fails");
+    export_bundle_generation::verify_sealed_generation(&out).unwrap();
+    assert_no_generated_bundle_stages(tmp.path(), "bundle");
+}
+
+#[test]
+fn production_bundle_reopens_final_files_and_rejects_post_rename_corruption() {
+    use export_bundle_generation::{publish_new_generation_with_hook, ProductionBundlePublishPoint};
+
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("bundle");
+    let error =
+        publish_new_generation_with_hook(&out, write_minimal_sealed_production_bundle, |point, published_path| {
+            if point == ProductionBundlePublishPoint::RenamedBeforeParentBarrier {
+                std::fs::write(published_path.join("payload.bin"), b"corrupted after rename")?;
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert!(error.to_string().contains("does not match SHA256SUMS"), "{error}");
+    assert!(out.exists(), "an invalid visible generation is retained for diagnosis, never reported as success");
+    assert!(export_bundle_generation::verify_sealed_generation(&out).is_err());
+    assert_no_generated_bundle_stages(tmp.path(), "bundle");
+}
+
+#[test]
+fn production_bundle_racing_destination_is_preserved_and_never_overwritten() {
+    use export_bundle_generation::{publish_new_generation_with_hook, ProductionBundlePublishPoint};
+
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("bundle");
+    let error = publish_new_generation_with_hook(&out, write_minimal_sealed_production_bundle, |point, _path| {
+        if point == ProductionBundlePublishPoint::StagedAndDurableBeforePromotion {
+            std::fs::create_dir(&out)?;
+            std::fs::write(out.join("foreign-owner-marker.txt"), b"must survive")?;
+        }
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains("refusing to overwrite"), "{error}");
+    assert_eq!(std::fs::read(out.join("foreign-owner-marker.txt")).unwrap(), b"must survive");
+    assert!(!out.join("manifest.json").exists());
+    assert_no_generated_bundle_stages(tmp.path(), "bundle");
+}
+
+#[test]
+fn production_bundle_refuses_missing_nested_parent_without_creating_partial_ancestors() {
+    use export_bundle_generation::publish_new_generation_with_hook;
+    use std::cell::Cell;
+
+    let tmp = TempDir::new().unwrap();
+    let missing_parent = tmp.path().join("new-parent").join("nested");
+    let out = missing_parent.join("bundle");
+    let hook_called = Cell::new(false);
+    let error = publish_new_generation_with_hook(&out, write_minimal_sealed_production_bundle, |_point, _path| {
+        hook_called.set(true);
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains("parent must already exist"), "{error}");
+    assert!(!hook_called.get(), "missing ancestors must fail before a staged generation or fault boundary exists");
+    assert!(!tmp.path().join("new-parent").exists(), "the publisher must not create an unsealed ancestor chain");
+}
+
+#[test]
+fn production_bundle_rejects_noncanonical_sha256sums_alias_before_promotion() {
+    use export_bundle_generation::publish_new_generation;
+
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("bundle");
+    let error = publish_new_generation(&out, |staging_dir| {
+        write_minimal_sealed_production_bundle(staging_dir)?;
+        let sums_path = staging_dir.join("SHA256SUMS");
+        let sums = std::fs::read_to_string(&sums_path)?.replace("nested/details.json", "nested//details.json");
+        std::fs::write(sums_path, sums)?;
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains("non-canonical artifact path"), "{error}");
+    assert!(!out.exists());
     assert_no_generated_bundle_stages(tmp.path(), "bundle");
 }
 
@@ -2318,8 +2493,14 @@ fn re_export_into_reused_dir_removes_stale_learning_preferences_orphan() {
 
     // Withdraw the human edit through its exact immutable effect. Raw learning history remains;
     // the effective view retracts it from the next export.
+    let crate::db::DesktopReviewUndoAvailability::Available(crate::db::DesktopReviewUndoAuthority::Decision(authority)) =
+        db.desktop_review_undo_availability().unwrap()
+    else {
+        panic!("export fixture must expose the typed desktop Undo authority");
+    };
+    assert_eq!(authority.effect_event_id, effect_id);
     assert!(matches!(
-        db.undo_human_decision(effect_id, None, "123e4567-e89b-42d3-a456-426614174055").unwrap(),
+        db.undo_latest_desktop_human_decision(&authority, "123e4567-e89b-42d3-a456-426614174055").unwrap(),
         crate::db::HumanDecisionUndoOutcome::Applied { .. }
     ));
 

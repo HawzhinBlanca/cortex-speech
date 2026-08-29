@@ -33,7 +33,7 @@ REAL_MEDIA_TESTS = (
 )
 AUDIOBOOK_TESTS = (
     "audiobook_mp3_decode_and_chunk_plan",
-    "audiobook_mp3_fingerprint_reimport_not_duplicate",
+    "audiobook_mp3_fingerprint_reimport_is_idempotency_conflict",
     "streaming_decoder_matches_the_direct_decoder_on_real_long_audio",
 )
 SCALE_TEST = "export_tests::hf_export_at_real_corpus_scale"

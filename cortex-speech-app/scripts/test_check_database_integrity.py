@@ -63,6 +63,8 @@ class DatabaseIntegrityGateTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.db = self.root / "cortex-speech.db"
+        self.expected_migrations = source_migrations()
+        self.required_schema = max(version for version, _description in self.expected_migrations)
         connection = sqlite3.connect(self.db)
         connection.executescript(
             """
@@ -117,7 +119,7 @@ class DatabaseIntegrityGateTests(unittest.TestCase):
             """
         )
         connection.executescript(HIDDEN_SCHEMA_SQL)
-        connection.executemany("INSERT INTO schema_migrations VALUES(?, ?)", source_migrations())
+        connection.executemany("INSERT INTO schema_migrations VALUES(?, ?)", self.expected_migrations)
         connection.commit()
         connection.close()
 
@@ -141,8 +143,8 @@ class DatabaseIntegrityGateTests(unittest.TestCase):
         self.assertEqual(report["quickCheck"], ["ok"])
         self.assertEqual(report["integrityCheck"], ["ok"])
         self.assertEqual(report["foreignKeyViolations"], 0)
-        self.assertEqual(report["schemaVersion"], 67)
-        self.assertEqual(report["migrationHistoryEntries"], 67)
+        self.assertEqual(report["schemaVersion"], self.required_schema)
+        self.assertEqual(report["migrationHistoryEntries"], len(self.expected_migrations))
         self.assertEqual(report["v58HypothesisArchiveRows"], 0)
         self.assertEqual(report["v58Loop0ArchiveRows"], 0)
         self.assertEqual(report["v58ImmutableTriggers"], 6)
@@ -334,9 +336,10 @@ class DatabaseIntegrityGateTests(unittest.TestCase):
         code, report = self.run_gate()
         self.assertEqual(code, 1, report)
         self.assertEqual(report["schemaVersion"], 59)
-        self.assertEqual(report["requiredSchemaVersion"], 67)
+        self.assertEqual(report["requiredSchemaVersion"], self.required_schema)
+        expected_missing = list(range(60, self.required_schema + 1))
         self.assertTrue(
-            any("missing=[60, 61, 62, 63, 64, 65, 66, 67]" in error for error in report["errors"]),
+            any(f"missing={expected_missing}" in error for error in report["errors"]),
             report,
         )
 
@@ -348,7 +351,11 @@ class DatabaseIntegrityGateTests(unittest.TestCase):
         connection.close()
         code, report = self.run_gate()
         self.assertEqual(code, 1, report)
-        self.assertEqual(report["schemaVersion"], 67, "MAX alone would falsely green this fixture")
+        self.assertEqual(
+            report["schemaVersion"],
+            self.required_schema,
+            "MAX alone would falsely green this fixture",
+        )
         self.assertTrue(any("missing=[23]" in error for error in report["errors"]), report)
         self.assertTrue(any("descriptionMismatch=[31]" in error for error in report["errors"]), report)
 

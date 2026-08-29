@@ -1,5 +1,112 @@
 use super::*;
 
+struct PrivateRestoreSourceBundle {
+    root: PathBuf,
+    database: PathBuf,
+}
+
+/// One source move whose exact decoded-audio authority has been proven before publication.
+///
+/// The lease is intentionally retained until SQLite commits. On the supported Windows workstation
+/// it prevents the candidate file or any parent directory from being replaced between the decoded
+/// PCM hash and the path update that makes those bytes authoritative for every segment.
+struct RelinkAudioPlan {
+    old_path: String,
+    new_path: String,
+    expected_pcm_hash: String,
+    segment_count: usize,
+    _candidate_lease: crate::media::ImportMediaSourceLease,
+}
+
+impl Drop for PrivateRestoreSourceBundle {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.root) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("could not remove private restore-source bundle {}: {error}", self.root.display());
+            }
+        }
+    }
+}
+
+fn sqlite_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut name = database.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn restore_source_file_identity(path: &Path) -> AppResult<Option<(u64, [u8; 32])>> {
+    use std::io::Read as _;
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(AppError::Other(format!("restore source {} must be a regular non-symlink file", path.display())));
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(Some((metadata.len(), hash.finalize().into())))
+}
+
+fn capture_private_restore_source(source: &Path) -> AppResult<PrivateRestoreSourceBundle> {
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| AppError::Other(format!("restore source {} has no file name", source.display())))?;
+    let root = std::env::temp_dir().join(format!("cortex-restore-source-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root)?;
+    let bundle = PrivateRestoreSourceBundle { database: root.join(file_name), root };
+
+    // SHM is a rebuildable index, not authority. A rollback journal, however, may require a write to
+    // recover and cannot be interpreted safely by the read-only source path, so fail closed instead of
+    // guessing whether it is hot. Main + WAL are copied and identity-checked as one stable set.
+    let rollback_journal = sqlite_sidecar_path(source, "-journal");
+    if restore_source_file_identity(&rollback_journal)?.is_some() {
+        return Err(AppError::Other(format!(
+            "restore source {} has a rollback journal; close its writer cleanly and create a stable backup before restoring",
+            source.display()
+        )));
+    }
+    let source_files = [source.to_path_buf(), sqlite_sidecar_path(source, "-wal")];
+    let before = source_files.iter().map(|path| restore_source_file_identity(path)).collect::<AppResult<Vec<_>>>()?;
+    if before[0].is_none() {
+        return Err(AppError::Other(format!("restore source {} does not exist", source.display())));
+    }
+    for (index, source_path) in source_files.iter().enumerate() {
+        let Some((expected_len, expected_hash)) = before[index] else { continue };
+        let destination =
+            if index == 0 { bundle.database.clone() } else { sqlite_sidecar_path(&bundle.database, "-wal") };
+        std::fs::copy(source_path, &destination)?;
+        let copied = restore_source_file_identity(&destination)?.ok_or_else(|| {
+            AppError::Other(format!("private restore source copy {} disappeared", destination.display()))
+        })?;
+        if copied != (expected_len, expected_hash) {
+            return Err(AppError::Other(format!(
+                "private restore source copy {} does not match {}",
+                destination.display(),
+                source_path.display()
+            )));
+        }
+    }
+    let after = source_files.iter().map(|path| restore_source_file_identity(path)).collect::<AppResult<Vec<_>>>()?;
+    if after != before || restore_source_file_identity(&rollback_journal)?.is_some() {
+        return Err(AppError::Other(
+            "restore source SQLite main/WAL generation changed during private capture; retry after its writer stops"
+                .to_string(),
+        ));
+    }
+    Ok(bundle)
+}
+
 impl Database {
     pub fn get_segments(&self, verified: Option<bool>) -> AppResult<Vec<SpeechSegment>> {
         let mut query = format!("SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments");
@@ -351,7 +458,9 @@ impl Database {
                     let t1 = bind(Value::Text(key.created_at.clone()));
                     let t2 = bind(Value::Text(key.created_at.clone()));
                     let id = bind(Value::Text(key.id.clone()));
-                    format!("({created_expr} > COALESCE(datetime(?{t1}), '') OR ({created_expr} = COALESCE(datetime(?{t2}), '') AND id > ?{id}))")
+                    format!(
+                        "({created_expr} > COALESCE(datetime(?{t1}), '') OR ({created_expr} = COALESCE(datetime(?{t2}), '') AND id > ?{id}))"
+                    )
                 }
                 "duration" => {
                     let d1 = bind(Value::Integer(key.duration_ms));
@@ -365,7 +474,9 @@ impl Database {
                     let t1 = bind(Value::Text(key.created_at.clone()));
                     let t2 = bind(Value::Text(key.created_at.clone()));
                     let id = bind(Value::Text(key.id.clone()));
-                    format!("(verified < ?{v1} OR (verified = ?{v2} AND ({created_expr} < COALESCE(datetime(?{t1}), '') OR ({created_expr} = COALESCE(datetime(?{t2}), '') AND id > ?{id}))))")
+                    format!(
+                        "(verified < ?{v1} OR (verified = ?{v2} AND ({created_expr} < COALESCE(datetime(?{t1}), '') OR ({created_expr} = COALESCE(datetime(?{t2}), '') AND id > ?{id}))))"
+                    )
                 }
                 "confidence" => {
                     let c1 = bind(Value::Real(key.confidence));
@@ -389,13 +500,17 @@ impl Database {
                     let t1 = bind(Value::Text(key.created_at.clone()));
                     let t2 = bind(Value::Text(key.created_at.clone()));
                     let id = bind(Value::Text(key.id.clone()));
-                    format!("(escalated < ?{e1} OR (escalated = ?{e2} AND ({poor_expr} > ?{p1} OR ({poor_expr} = ?{p2} AND (COALESCE(agreement_score, 0.5) > ?{a1} OR (COALESCE(agreement_score, 0.5) = ?{a2} AND ({created_expr} < COALESCE(datetime(?{t1}), '') OR ({created_expr} = COALESCE(datetime(?{t2}), '') AND id > ?{id}))))))))")
+                    format!(
+                        "(escalated < ?{e1} OR (escalated = ?{e2} AND ({poor_expr} > ?{p1} OR ({poor_expr} = ?{p2} AND (COALESCE(agreement_score, 0.5) > ?{a1} OR (COALESCE(agreement_score, 0.5) = ?{a2} AND ({created_expr} < COALESCE(datetime(?{t1}), '') OR ({created_expr} = COALESCE(datetime(?{t2}), '') AND id > ?{id}))))))))"
+                    )
                 }
                 _ => {
                     let t1 = bind(Value::Text(key.created_at.clone()));
                     let t2 = bind(Value::Text(key.created_at.clone()));
                     let id = bind(Value::Text(key.id.clone()));
-                    format!("({created_expr} < COALESCE(datetime(?{t1}), '') OR ({created_expr} = COALESCE(datetime(?{t2}), '') AND id > ?{id}))")
+                    format!(
+                        "({created_expr} < COALESCE(datetime(?{t1}), '') OR ({created_expr} = COALESCE(datetime(?{t2}), '') AND id > ?{id}))"
+                    )
                 }
             };
             where_parts.push(keyset);
@@ -753,27 +868,41 @@ impl Database {
     /// in-memory database is safe to publish; this phase never touches the live connection. Named
     /// restore uses the split explicitly so its durable cross-file barrier can be written immediately
     /// before (not before source validation, and not after) the live page swap.
+    ///
+    /// The source copy is deliberately WAL-aware. `immutable=1` is correct only after a caller has
+    /// independently proved that the main file is the whole SQLite authority; a user-selected bare
+    /// backup can still have committed rows in its `-wal`, and ignoring them would validate and
+    /// publish an older, merely healthy generation.
     pub(crate) fn stage_restore_source<P: AsRef<Path>>(src: P) -> AppResult<Self> {
-        let src_conn = Self::open_immutable_connection(src.as_ref())?;
+        Self::stage_restore_source_with_original_evidence(src).map(|(staged, _, _)| staged)
+    }
+
+    /// Stage one WAL-consistent source generation while retaining the policy evidence that existed
+    /// *before* migrations ran. A restore may legitimately migrate an old database to this binary's
+    /// current schema, but that must never make an old policy-bearing snapshot look as though it had
+    /// durable hidden-key authority when it was created.
+    ///
+    /// The returned tuple is `(staged_database, original_schema_version,
+    /// original_max_review_event_id)`. Both evidence values and the final staged database come from
+    /// the same private SQLite snapshot, so no second open can mix generations.
+    pub(crate) fn stage_restore_source_with_original_evidence<P: AsRef<Path>>(src: P) -> AppResult<(Self, i64, i64)> {
+        let private_source = capture_private_restore_source(src.as_ref())?;
+        let staged = Self::open_detached_read_snapshot(private_source.database.to_string_lossy().as_ref())?;
         // Validate the complete, description-bound history before overwriting one live page. A lone
         // high version row is not evidence that its 57 predecessors ran, and restore must not discover
         // that only after the healthy live database has already been replaced.
-        crate::migrations::validate_applied_history(&src_conn)?;
+        let original_schema_version = crate::migrations::validate_applied_history(&staged.conn)?;
+        // review_events was introduced by migration 45. Older, otherwise valid databases have no
+        // table to query; zero is the only possible event authority for them.
+        let original_max_review_event_id = if original_schema_version >= 45 {
+            staged.conn.query_row("SELECT COALESCE(MAX(id), 0) FROM review_events", [], |row| row.get(0))?
+        } else {
+            0
+        };
 
-        // Restore is two-phase. First copy the source into an isolated in-memory database, run the
-        // exact current startup/migration path there, and prove the resulting HEAD database healthy.
-        // Only then copy it over the live connection. Previously an old-but-drifted snapshot could
-        // overwrite the healthy live pages and fail its pending migration afterwards, returning Err
-        // with the library already clobbered.
-        let mut staged = Database::open(":memory:")?;
-        {
-            let backup = backup::Backup::new(&src_conn, &mut staged.conn)?;
-            backup.run_to_completion(Self::BACKUP_PAGES_PER_STEP, Self::BACKUP_STEP_PAUSE, None)?;
-        }
-        // Run integrity on the isolated copy, not the frozen read-only source. SQLite's FTS5
-        // integrity command may use temporary writes and can report "attempt to write a readonly
-        // database" even when the source bytes are healthy; the copied pages are identical and this
-        // remains strictly before any live mutation.
+        // Restore is two-phase. The WAL-consistent private copy above is writable, so FTS5 integrity
+        // checks and migrations cannot mutate the source. Only after that exact generation reaches
+        // HEAD and passes every check may it be copied over the live connection.
         let source_integrity: String = staged.conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         if source_integrity.trim() != "ok" {
             return Err(AppError::Other(format!("snapshot database failed its integrity check: {source_integrity}")));
@@ -802,17 +931,278 @@ impl Database {
                 "staged restore stopped at schema v{staged_version}; this build requires v{expected_version}"
             )));
         }
+        staged.validate_desktop_review_action_journal().map_err(|error| {
+            AppError::Other(format!("staged restore has an invalid desktop review action journal: {error}"))
+        })?;
 
-        Ok(staged)
+        Ok((staged, original_schema_version, original_max_review_event_id))
+    }
+
+    /// Compute a deterministic semantic digest of the complete logical SQLite generation visible to
+    /// this connection. The digest binds ordered schema objects plus every persistent table as a
+    /// multiset of type-preserving row hashes. It is therefore independent of page layout and
+    /// scan/insertion order while still binding NULL/integer/real/text/blob values and hidden row
+    /// identity whenever SQLite exposes one of its canonical aliases. The only value-level
+    /// canonicalization is a closed list of structurally validated wall-clock fields injected by
+    /// immutable historical migrations; those instants are replay time, not source authority.
+    ///
+    /// Callers that start from a file path must first use `open_detached_read_snapshot`; that copies a
+    /// single WAL-consistent snapshot and prevents a main-file-only digest from blessing stale pages.
+    pub(crate) fn restore_generation_sha256(&self) -> AppResult<String> {
+        fn frame(hash: &mut Sha256, bytes: &[u8]) {
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+        }
+
+        fn hash_value(hash: &mut Sha256, value: rusqlite::types::ValueRef<'_>) {
+            match value {
+                rusqlite::types::ValueRef::Null => hash.update([0]),
+                rusqlite::types::ValueRef::Integer(value) => {
+                    hash.update([1]);
+                    hash.update(value.to_be_bytes());
+                }
+                rusqlite::types::ValueRef::Real(value) => {
+                    hash.update([2]);
+                    hash.update(value.to_bits().to_be_bytes());
+                }
+                rusqlite::types::ValueRef::Text(value) => {
+                    hash.update([3]);
+                    frame(hash, value);
+                }
+                rusqlite::types::ValueRef::Blob(value) => {
+                    hash.update([4]);
+                    frame(hash, value);
+                }
+            }
+        }
+
+        fn quote_identifier(identifier: &str) -> String {
+            format!("\"{}\"", identifier.replace('"', "\"\""))
+        }
+
+        fn is_migration_clock_value(table: &str, column: &str) -> bool {
+            matches!(
+                (table, column),
+                ("schema_migrations", "applied_at")
+                    | ("review_compensation_policies", "created_at")
+                    | ("review_effect_state", "created_at")
+                    | ("orphan_segment_hypotheses_archive_v58", "archived_at")
+                    | ("orphan_loop0_shadow_log_archive_v58", "archived_at")
+            )
+        }
+
+        fn hash_migration_clock(
+            hash: &mut Sha256,
+            table: &str,
+            column: &str,
+            value: rusqlite::types::ValueRef<'_>,
+        ) -> AppResult<()> {
+            let rusqlite::types::ValueRef::Text(timestamp) = value else {
+                return Err(AppError::Other(format!(
+                    "restore generation {table}.{column} is not a text migration timestamp"
+                )));
+            };
+            // SQLite's datetime('now') is `YYYY-MM-DD HH:MM:SS`. Permit the ISO separator and a
+            // bounded fractional/timezone suffix for old supported databases, while rejecting an
+            // empty/control-filled value that could conceal corruption behind canonicalization.
+            let structurally_timestamped = (19..=40).contains(&timestamp.len())
+                && timestamp.iter().all(u8::is_ascii)
+                && timestamp.iter().all(|byte| !byte.is_ascii_control())
+                && timestamp.get(0..4).is_some_and(|part| part.iter().all(u8::is_ascii_digit))
+                && timestamp.get(4) == Some(&b'-')
+                && timestamp.get(5..7).is_some_and(|part| part.iter().all(u8::is_ascii_digit))
+                && timestamp.get(7) == Some(&b'-')
+                && timestamp.get(8..10).is_some_and(|part| part.iter().all(u8::is_ascii_digit))
+                && matches!(timestamp.get(10), Some(b' ' | b'T'))
+                && timestamp.get(11..13).is_some_and(|part| part.iter().all(u8::is_ascii_digit))
+                && timestamp.get(13) == Some(&b':')
+                && timestamp.get(14..16).is_some_and(|part| part.iter().all(u8::is_ascii_digit))
+                && timestamp.get(16) == Some(&b':')
+                && timestamp.get(17..19).is_some_and(|part| part.iter().all(u8::is_ascii_digit));
+            if !structurally_timestamped {
+                return Err(AppError::Other(format!(
+                    "restore generation {table}.{column} is not a structurally valid migration timestamp"
+                )));
+            }
+            // These narrowly enumerated values are injected by `datetime('now')` while replaying immutable
+            // historical migrations. Their wall-clock instant is neither source data nor runtime
+            // authority, and hashing it would make the same old snapshot acquire a different target
+            // digest on every recovery attempt. Bind a distinct typed sentinel instead; the table,
+            // column, row identity and every authority-bearing field remain hashed normally.
+            hash.update([0x7f]);
+            Ok(())
+        }
+
+        let mut generation = Sha256::new();
+        frame(&mut generation, b"cortex-sqlite-logical-generation-v1");
+
+        // `rootpage` is intentionally excluded: it is allocation history, not logical authority.
+        // SQL text and all object identities remain exact, including implicit index rows with NULL SQL.
+        let mut schema = self.conn.prepare(
+            "SELECT type, name, tbl_name, sql
+               FROM main.sqlite_schema
+              ORDER BY type COLLATE BINARY, name COLLATE BINARY, tbl_name COLLATE BINARY,
+                       COALESCE(sql, '') COLLATE BINARY",
+        )?;
+        let mut schema_rows = schema.query([])?;
+        while let Some(row) = schema_rows.next()? {
+            generation.update([0x10]);
+            for index in 0..4 {
+                hash_value(&mut generation, row.get_ref(index)?);
+            }
+        }
+        drop(schema_rows);
+        drop(schema);
+
+        let mut table_list = self.conn.prepare(
+            "SELECT name, type, wr, strict
+               FROM pragma_table_list
+              WHERE schema = 'main'
+                AND name <> 'sqlite_schema'
+                AND type IN ('table', 'shadow', 'virtual')
+              ORDER BY name COLLATE BINARY, type COLLATE BINARY",
+        )?;
+        let tables = table_list
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(table_list);
+
+        for (table_name, table_type, without_rowid, strict) in tables {
+            generation.update([0x20]);
+            frame(&mut generation, table_name.as_bytes());
+            frame(&mut generation, table_type.as_bytes());
+            generation.update(without_rowid.to_be_bytes());
+            generation.update(strict.to_be_bytes());
+
+            let mut column_statement = self.conn.prepare(
+                "SELECT name
+                   FROM pragma_table_xinfo(?1)
+                  WHERE hidden = 0
+                  ORDER BY cid",
+            )?;
+            let columns = column_statement
+                .query_map([&table_name], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(column_statement);
+            for column in &columns {
+                frame(&mut generation, column.as_bytes());
+            }
+
+            // A declared column can shadow a rowid alias. Select the first unshadowed canonical alias;
+            // if all three are declared (or this is WITHOUT ROWID), the hidden identity is not exposed.
+            let declared = columns.iter().map(|name| name.to_ascii_lowercase()).collect::<HashSet<_>>();
+            let rowid_alias = (without_rowid == 0)
+                .then(|| ["rowid", "_rowid_", "oid"].into_iter().find(|alias| !declared.contains(*alias)))
+                .flatten();
+            generation.update([u8::from(rowid_alias.is_some())]);
+
+            let mut projections = Vec::with_capacity(columns.len() + usize::from(rowid_alias.is_some()));
+            if let Some(alias) = rowid_alias {
+                projections.push(quote_identifier(alias));
+            }
+            projections.extend(columns.iter().map(|column| quote_identifier(column)));
+            if projections.is_empty() {
+                return Err(AppError::Other(format!(
+                    "persistent table {table_name:?} exposes neither columns nor row identity"
+                )));
+            }
+            let query = format!("SELECT {} FROM {}", projections.join(", "), quote_identifier(&table_name));
+            let mut statement = self.conn.prepare(&query)?;
+            let mut rows = statement.query([])?;
+            let mut row_hashes = Vec::<[u8; 32]>::new();
+            while let Some(row) = rows.next()? {
+                let mut row_hash = Sha256::new();
+                frame(&mut row_hash, b"cortex-sqlite-logical-row-v1");
+                for index in 0..projections.len() {
+                    let column_index = index.checked_sub(usize::from(rowid_alias.is_some()));
+                    if let Some(column_index) = column_index.filter(|index| {
+                        columns.get(*index).is_some_and(|column| is_migration_clock_value(&table_name, column))
+                    }) {
+                        hash_migration_clock(&mut row_hash, &table_name, &columns[column_index], row.get_ref(index)?)?;
+                    } else {
+                        hash_value(&mut row_hash, row.get_ref(index)?);
+                    }
+                }
+                row_hashes.push(row_hash.finalize().into());
+            }
+            row_hashes.sort_unstable();
+            generation.update((row_hashes.len() as u64).to_be_bytes());
+            for row_hash in row_hashes {
+                generation.update(row_hash);
+            }
+        }
+
+        let digest = generation.finalize();
+        let encoded = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        Ok(encoded)
+    }
+
+    pub(crate) fn require_restore_generation_sha256(&self, expected: &str) -> AppResult<()> {
+        let actual = self.restore_generation_sha256()?;
+        if actual != expected {
+            return Err(AppError::Other(format!(
+                "published SQLite generation digest mismatch: expected {expected}, found {actual}"
+            )));
+        }
+        Ok(())
     }
 
     /// Publish a source already proven by [`Self::stage_restore_source`]. SQLite's backup API holds
     /// the destination transaction until completion, so a copy error rolls the destination back
-    /// instead of exposing a partially-restored database.
+    /// instead of exposing a partially-restored database. Publication is forced through SQLite FULL
+    /// durability and a verified TRUNCATE checkpoint; success therefore means no authoritative frame
+    /// remains only in the live WAL.
     pub(crate) fn commit_staged_restore(&mut self, staged: &Database) -> AppResult<()> {
-        let backup = backup::Backup::new(&staged.conn, &mut self.conn)?;
-        backup.run_to_completion(Self::BACKUP_PAGES_PER_STEP, Self::BACKUP_STEP_PAUSE, None)?;
-        Ok(())
+        self.conn.execute_batch("PRAGMA synchronous=FULL;")?;
+        let result = (|| {
+            {
+                let backup = backup::Backup::new(&staged.conn, &mut self.conn)?;
+                backup.run_to_completion(Self::BACKUP_PAGES_PER_STEP, Self::BACKUP_STEP_PAUSE, None)?;
+            }
+            let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+                self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+            let is_memory_database = self.path == ":memory:";
+            let checkpoint_complete = busy == 0
+                && ((log_frames == 0 && checkpointed_frames == 0)
+                    || (is_memory_database && log_frames == -1 && checkpointed_frames == -1));
+            if !checkpoint_complete {
+                return Err(AppError::Other(format!(
+                    "restore publication could not prove an empty authoritative WAL after FULL checkpoint \
+                     (busy={busy}, log={log_frames}, checkpointed={checkpointed_frames})"
+                )));
+            }
+            if !is_memory_database {
+                crate::atomic_file::fsync_parent_dir_strict(Path::new(&self.path)).map_err(|error| {
+                    AppError::Other(format!(
+                        "restore SQLite generation was checkpointed but its directory metadata is not durably synchronized: {error}"
+                    ))
+                })?;
+            }
+            Ok(())
+        })();
+        let reset = self.conn.execute_batch("PRAGMA synchronous=NORMAL;");
+        match result {
+            Ok(()) => {
+                // Publication is already durable. Failing to relax the connection is conservative and
+                // must not manufacture an ambiguous failure response after the generation committed.
+                if let Err(error) = reset {
+                    tracing::error!(
+                        "restore publication committed at FULL durability but synchronous=NORMAL could not be restored: {error}"
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Err(reset_error) = reset {
+                    tracing::warn!("failed to restore SQLite synchronous=NORMAL after restore error: {reset_error}");
+                }
+                Err(error)
+            }
+        }
     }
 
     pub fn restore<P: AsRef<Path>>(&mut self, src: P) -> AppResult<()> {
@@ -850,34 +1240,56 @@ impl Database {
         let mut stmt = self.conn.prepare("SELECT DISTINCT audio_path FROM speech_segments")?;
         let paths: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<_, _>>()?;
         let total_files = paths.len();
-        let mut missing_paths: Vec<String> = paths.into_iter().filter(|p| !Path::new(p).exists()).collect();
+        let mut missing_paths: Vec<String> = paths.into_iter().filter(|p| !Path::new(p).is_file()).collect();
         missing_paths.sort();
         Ok(AudioHealth { total_files, missing_files: missing_paths.len(), missing_paths })
     }
 
-    /// P3.3: relink missing source audio by basename — for each missing `audio_path`, if a file with the
-    /// same file name exists under `search_dir`, repoint every segment on that old path to the found one.
-    /// Basename match (speech_segments store no content hash to verify against); the owner points at the
-    /// folder they moved the audio to. Returns how many distinct paths were relinked + how many remain.
+    /// Relink missing source audio by basename only after proving exact decoded-PCM identity.
     ///
-    /// AMBIGUITY GUARD: if two DISTINCT missing source paths share a basename (e.g. `interview.wav`
-    /// imported from two different folders), a single found `interview.wav` cannot be known to be the
-    /// right one for both — blindly repointing both would serve the WRONG audio for one recording on
-    /// playback/re-transcription. Such colliding paths are left missing (and warned), never guessed.
+    /// The filename locates a candidate; it is never identity. Every segment at the missing path must
+    /// carry the same canonical decoded-PCM BLAKE3, and the sealed candidate must decode to that exact
+    /// hash. All segment, processing-provenance, and whole-file-reference path keys then move in one
+    /// FULL-synchronous transaction. Any identity ambiguity or write failure leaves every key at the
+    /// old path.
     pub fn relink_audio(&self, search_dir: &Path) -> AppResult<RelinkResult> {
+        self.relink_audio_with_hook(search_dir, |_| Ok(()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn relink_audio_with_test_hook(
+        &self,
+        search_dir: &Path,
+        after_table_update: impl FnMut(&'static str) -> AppResult<()>,
+    ) -> AppResult<RelinkResult> {
+        self.relink_audio_with_hook(search_dir, after_table_update)
+    }
+
+    fn relink_audio_with_hook(
+        &self,
+        search_dir: &Path,
+        mut after_table_update: impl FnMut(&'static str) -> AppResult<()>,
+    ) -> AppResult<RelinkResult> {
+        if !search_dir.is_absolute() {
+            return Err(AppError::Validation("Audio relink requires an absolute owner-selected folder".to_string()));
+        }
         let missing = self.audio_health()?.missing_paths;
-        // Count distinct missing paths per basename so we can refuse ambiguous relinks.
-        let mut basename_counts: std::collections::HashMap<std::ffi::OsString, usize> =
-            std::collections::HashMap::new();
+        // Windows filenames are case-insensitive. Count a normalized UTF-8 basename so two stored
+        // spellings cannot both claim the same candidate directory entry.
+        let mut basename_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for old in &missing {
             if let Some(name) = Path::new(old).file_name() {
-                *basename_counts.entry(name.to_os_string()).or_insert(0) += 1;
+                *basename_counts.entry(name.to_string_lossy().to_lowercase()).or_insert(0) += 1;
             }
         }
-        let mut relinked = 0usize;
+
+        // Prove every candidate before opening a transaction. This makes a multi-source relink
+        // all-or-none even when a later candidate has missing, conflicting, or wrong identity.
+        let mut plans = Vec::new();
         for old in &missing {
             let Some(name) = Path::new(old).file_name() else { continue };
-            if basename_counts.get(name).copied().unwrap_or(0) > 1 {
+            let basename_key = name.to_string_lossy().to_lowercase();
+            if basename_counts.get(&basename_key).copied().unwrap_or(0) > 1 {
                 tracing::warn!(
                     "relink: '{}' shares its filename with another missing source — skipped (ambiguous, would risk the wrong audio)",
                     old
@@ -886,7 +1298,9 @@ impl Database {
             }
             let candidate = search_dir.join(name);
             if candidate.is_file() {
-                let new_path = candidate.to_string_lossy().to_string();
+                let new_path = candidate.to_str().ok_or_else(|| {
+                    AppError::Validation("Audio relink candidate path is not valid Unicode".to_string())
+                })?;
                 // Second ambiguity guard: the collision check above only covers basenames shared among
                 // MISSING paths. If the candidate file is already OWNED by another library entry (a
                 // still-present segment whose recording happens to share the name), repointing would
@@ -906,40 +1320,400 @@ impl Database {
                     );
                     continue;
                 }
-                let n = self.conn.execute(
-                    "UPDATE speech_segments SET audio_path = ?2, updated_at = datetime('now') WHERE audio_path = ?1",
-                    params![old, new_path],
+
+                let mut statement = self.conn.prepare(
+                    "SELECT audio_content_hash
+                       FROM speech_segments
+                      WHERE audio_path = ?1
+                      ORDER BY id",
                 )?;
-                // Carry the SOURCE-KEYED tables with the move. Both are joined to segments by
-                // audio_path, so relinking only `speech_segments` orphans them at the old key:
-                //
-                //  * `source_audio_provenance` (v54) then reports the recording as UNCLAIMED, and a
-                //    training pack and dataset card would describe neural-separated, re-concatenated
-                //    audio as an original field recording — precisely the lie that table exists to
-                //    prevent, reintroduced by a file move. Found by adversarial verification
-                //    2026-08-17.
-                //  * `source_transcripts` would silently lose its whole-file reference transcripts,
-                //    forcing a re-fetch that the cache was built to avoid.
-                //
-                // Not fatal: a relink whose provenance carry fails must still relink the audio (the
-                // clips are otherwise unplayable), so the failure warns rather than aborting.
-                for (table, what) in [
-                    ("source_audio_provenance", "processing provenance"),
-                    ("source_transcripts", "reference transcripts"),
-                ] {
-                    if let Err(e) = self.conn.execute(
-                        &format!("UPDATE OR IGNORE {table} SET audio_path = ?2 WHERE audio_path = ?1"),
-                        params![old, new_path],
-                    ) {
-                        tracing::warn!("relink: {what} for '{old}' could not follow the move to '{new_path}': {e}");
+                let stored_hashes = statement
+                    .query_map(params![old], |row| row.get::<_, Option<String>>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                if stored_hashes.is_empty() {
+                    return Err(AppError::Validation(format!(
+                        "Audio relink source '{old}' no longer has any segments"
+                    )));
+                }
+                let mut expected_pcm_hash: Option<&str> = None;
+                for stored_hash in &stored_hashes {
+                    let stored_hash = stored_hash.as_deref().ok_or_else(|| {
+                        AppError::Validation(format!(
+                            "Audio relink source '{old}' has a segment without canonical decoded-PCM identity"
+                        ))
+                    })?;
+                    if !is_canonical_audio_content_hash(stored_hash) {
+                        return Err(AppError::Validation(format!(
+                            "Audio relink source '{old}' has a non-canonical decoded-PCM identity"
+                        )));
                     }
+                    if expected_pcm_hash.is_some_and(|expected| expected != stored_hash) {
+                        return Err(AppError::Validation(format!(
+                            "Audio relink source '{old}' has conflicting decoded-PCM identities"
+                        )));
+                    }
+                    expected_pcm_hash = Some(stored_hash);
                 }
-                if n > 0 {
-                    relinked += 1;
+
+                let expected_pcm_hash = expected_pcm_hash
+                    .ok_or_else(|| AppError::Validation(format!("Audio relink source '{old}' has no PCM identity")))?
+                    .to_string();
+                let candidate_lease = crate::media::seal_import_source(&candidate).map_err(|error| {
+                    AppError::Validation(format!(
+                        "Cannot seal audio relink candidate '{}': {error}",
+                        candidate.display()
+                    ))
+                })?;
+                let candidate_hash = crate::export_bundle::current_canonical_pcm_blake3(candidate_lease.source_path())?;
+                if candidate_hash != expected_pcm_hash {
+                    return Err(AppError::Validation(format!(
+                        "Audio relink candidate '{}' is different audio from the missing source '{old}'",
+                        candidate.display()
+                    )));
                 }
+                plans.push(RelinkAudioPlan {
+                    old_path: old.clone(),
+                    new_path: new_path.to_string(),
+                    expected_pcm_hash,
+                    segment_count: stored_hashes.len(),
+                    _candidate_lease: candidate_lease,
+                });
             }
         }
-        self.track_write()?;
-        Ok(RelinkResult { relinked, still_missing: self.audio_health()?.missing_files })
+
+        if plans.is_empty() {
+            return Ok(RelinkResult { relinked: 0, still_missing: missing.len() });
+        }
+
+        self.with_full_sync(|| {
+            let transaction =
+                rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            for plan in &plans {
+                // BEGIN IMMEDIATE holds the database write reservation while target ownership and the
+                // complete segment set are re-proved. A concurrent insert, identity drift, or new
+                // owner therefore cannot slip between these checks and publication.
+                let target_owners: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM speech_segments WHERE audio_path = ?1",
+                    params![plan.new_path],
+                    |row| row.get(0),
+                )?;
+                if target_owners != 0 {
+                    return Err(AppError::Validation(format!(
+                        "Audio relink target acquired another owner before publication for '{}'",
+                        plan.old_path
+                    )));
+                }
+                let updated_segments = transaction.execute(
+                    "UPDATE speech_segments
+                        SET audio_path = ?2, updated_at = datetime('now')
+                      WHERE audio_path = ?1
+                        AND audio_content_hash = ?3",
+                    params![plan.old_path, plan.new_path, plan.expected_pcm_hash],
+                )?;
+                if updated_segments != plan.segment_count {
+                    return Err(AppError::Validation(format!(
+                        "Audio relink authority changed before publication for '{}'",
+                        plan.old_path
+                    )));
+                }
+                after_table_update("speech_segments")?;
+
+                transaction.execute(
+                    "UPDATE source_audio_provenance SET audio_path = ?2 WHERE audio_path = ?1",
+                    params![plan.old_path, plan.new_path],
+                )?;
+                after_table_update("source_audio_provenance")?;
+
+                transaction.execute(
+                    "UPDATE source_transcripts SET audio_path = ?2 WHERE audio_path = ?1",
+                    params![plan.old_path, plan.new_path],
+                )?;
+                after_table_update("source_transcripts")?;
+            }
+            transaction.commit()?;
+            Ok(RelinkResult { relinked: plans.len(), still_missing: missing.len().saturating_sub(plans.len()) })
+        })
+    }
+}
+
+#[cfg(test)]
+mod restore_generation_tests {
+    use super::*;
+
+    fn append_desktop_decision(database: &Database, segment_id: &str) {
+        database
+            .insert_segment(&SpeechSegment {
+                id: segment_id.into(),
+                audio_path: format!("/{segment_id}.wav"),
+                raw_transcript: format!("served {segment_id}"),
+                duration_ms: 1_000,
+                ..SpeechSegment::default()
+            })
+            .unwrap();
+        database
+            .record_human_decision(segment_id, "accept", Some(&format!("served {segment_id}")), Some(1_000))
+            .unwrap();
+    }
+
+    fn logical_fixture(reverse: bool) -> Database {
+        let database = Database::open(":memory:").unwrap();
+        database.initialize().unwrap();
+        database
+            .connection()
+            .execute_batch(
+                "CREATE TABLE digest_probe (
+                    id INTEGER PRIMARY KEY,
+                    nullable_value,
+                    integer_value INTEGER NOT NULL,
+                    real_value REAL NOT NULL,
+                    text_value TEXT NOT NULL,
+                    blob_value BLOB NOT NULL
+                 );",
+            )
+            .unwrap();
+        let ids = if reverse { [2_i64, 1_i64] } else { [1_i64, 2_i64] };
+        for id in ids {
+            database
+                .connection()
+                .execute(
+                    "INSERT INTO digest_probe
+                         (id, nullable_value, integer_value, real_value, text_value, blob_value)
+                     VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![id, id * -17, id as f64 + 0.25, format!("value-{id}"), vec![0, id as u8, 255]],
+                )
+                .unwrap();
+        }
+        database
+    }
+
+    #[test]
+    fn logical_generation_digest_ignores_page_and_scan_history_but_binds_values_and_schema() {
+        let first = logical_fixture(false);
+        let second = logical_fixture(true);
+        let expected = first.restore_generation_sha256().unwrap();
+        assert_eq!(expected.len(), 64);
+        assert_eq!(second.restore_generation_sha256().unwrap(), expected);
+
+        second.connection().execute("UPDATE digest_probe SET text_value = 'changed' WHERE id = 2", []).unwrap();
+        assert_ne!(second.restore_generation_sha256().unwrap(), expected, "one typed value must change authority");
+        second.connection().execute("UPDATE digest_probe SET text_value = 'value-2' WHERE id = 2", []).unwrap();
+        assert_eq!(second.restore_generation_sha256().unwrap(), expected);
+
+        second.connection().execute("CREATE INDEX digest_probe_text ON digest_probe(text_value)", []).unwrap();
+        assert_ne!(second.restore_generation_sha256().unwrap(), expected, "schema drift must change authority");
+    }
+
+    #[test]
+    fn staged_restore_includes_a_small_committed_wal_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wal-source.db");
+        let source = Database::open(path.to_string_lossy().as_ref()).unwrap();
+        source.initialize().unwrap();
+        source.wal_checkpoint().unwrap();
+        source.connection().execute_batch("PRAGMA wal_autocheckpoint=0;").unwrap();
+        source
+            .insert_segment(&SpeechSegment {
+                id: "wal-authority".into(),
+                audio_path: "wal-authority.wav".into(),
+                raw_transcript: "committed-only-in-wal".into(),
+                duration_ms: 1_000,
+                ..SpeechSegment::default()
+            })
+            .unwrap();
+
+        let wal_path = path.with_file_name(format!("{}-wal", path.file_name().unwrap().to_string_lossy()));
+        assert!(std::fs::metadata(&wal_path).unwrap().len() > 32, "fixture must retain committed WAL frames");
+        let main_before = std::fs::read(&path).unwrap();
+        let wal_before = std::fs::read(&wal_path).unwrap();
+        let expected = source.restore_generation_sha256().unwrap();
+        let staged = Database::stage_restore_source(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), main_before, "staging must not mutate the source main file");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before, "staging must not mutate the source WAL");
+        assert_eq!(staged.restore_generation_sha256().unwrap(), expected);
+        assert_eq!(staged.get_segment_by_id("wal-authority").unwrap().unwrap().raw_transcript, "committed-only-in-wal");
+    }
+
+    #[test]
+    fn staged_restore_retains_original_policy_schema_evidence_before_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("old-policy-source.db");
+        let source = Database::open(path.to_string_lossy().as_ref()).unwrap();
+        source.initialize().unwrap();
+        let current = crate::migrations::max_supported_version();
+        assert!(current >= 59);
+        let reverted = crate::migrations::rollback(&source, usize::try_from(current - 58).unwrap()).unwrap();
+        assert_eq!(reverted.len(), usize::try_from(current - 58).unwrap());
+        assert_eq!(crate::migrations::validate_applied_history(source.connection()).unwrap(), 58);
+
+        let (staged, original_schema, original_max_review_event_id) =
+            Database::stage_restore_source_with_original_evidence(&path).unwrap();
+        assert_eq!(original_schema, 58, "staging migration must not rewrite creation-time policy evidence");
+        assert_eq!(original_max_review_event_id, 0);
+        assert_eq!(
+            crate::migrations::validate_applied_history(staged.connection()).unwrap(),
+            current,
+            "the publishable copy must still migrate fully"
+        );
+    }
+
+    #[test]
+    fn desktop_action_journal_round_trips_through_staging_publication_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("journal-source.db");
+        let source = Database::open(source_path.to_string_lossy().as_ref()).unwrap();
+        source.initialize().unwrap();
+        source.connection().execute_batch("PRAGMA wal_autocheckpoint=0;").unwrap();
+        append_desktop_decision(&source, "journal-round-trip");
+        let expected_availability = source.desktop_review_undo_availability().unwrap();
+
+        let staged = Database::stage_restore_source(&source_path).unwrap();
+        assert_eq!(staged.desktop_review_undo_availability().unwrap(), expected_availability);
+        let expected_generation = staged.restore_generation_sha256().unwrap();
+
+        let live_path = directory.path().join("journal-live.db");
+        let mut live = Database::open(live_path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+        live.commit_staged_restore(&staged).unwrap();
+        live.require_restore_generation_sha256(&expected_generation).unwrap();
+        drop(live);
+
+        let reopened = Database::open(live_path.to_string_lossy().as_ref()).unwrap();
+        reopened.initialize().unwrap();
+        assert_eq!(reopened.desktop_review_undo_availability().unwrap(), expected_availability);
+        reopened.require_restore_generation_sha256(&expected_generation).unwrap();
+    }
+
+    #[test]
+    fn staged_restore_refuses_structurally_healthy_missing_or_invented_desktop_journal_rows() {
+        for corruption in ["missing", "invented"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(format!("journal-{corruption}.db"));
+            let source = Database::open(path.to_string_lossy().as_ref()).unwrap();
+            source.initialize().unwrap();
+            append_desktop_decision(&source, &format!("journal-{corruption}"));
+
+            match corruption {
+                "missing" => {
+                    source
+                        .connection()
+                        .execute_batch(
+                            "DROP TRIGGER desktop_review_action_events_v1_immutable_delete;
+                             DELETE FROM desktop_review_action_events_v1 WHERE action_kind='decision';
+                             CREATE TRIGGER desktop_review_action_events_v1_immutable_delete
+                             BEFORE DELETE ON desktop_review_action_events_v1
+                             BEGIN SELECT RAISE(ABORT,'desktop review action journal is append-only'); END;",
+                        )
+                        .unwrap();
+                }
+                "invented" => {
+                    source
+                        .connection()
+                        .execute_batch(
+                            "DROP TRIGGER desktop_review_action_events_v1_validate_insert;
+                             INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id)
+                             VALUES('flag',9223372036854770000);
+                             CREATE TRIGGER desktop_review_action_events_v1_validate_insert
+                             BEFORE INSERT ON desktop_review_action_events_v1
+                             WHEN (NEW.action_kind<>'legacy_barrier' AND EXISTS (
+                                       SELECT 1 FROM desktop_review_legacy_actions_v1 legacy
+                                        WHERE legacy.source_kind=NEW.action_kind
+                                          AND legacy.effect_event_id=NEW.effect_event_id
+                                   ))
+                                OR (NEW.action_kind='decision' AND NOT EXISTS (
+                                       SELECT 1 FROM human_decision_effect_events effect
+                                        WHERE effect.id=NEW.effect_event_id
+                                          AND effect.source='desktop' AND effect.reviewer IS NULL
+                                   ))
+                                OR (NEW.action_kind='decision_undo' AND NOT EXISTS (
+                                       SELECT 1
+                                         FROM human_decision_effect_reversals reversal
+                                         JOIN human_decision_effect_events effect
+                                           ON effect.id=reversal.effect_event_id
+                                        WHERE reversal.effect_event_id=NEW.effect_event_id
+                                          AND effect.source='desktop' AND effect.reviewer IS NULL
+                                   ))
+                                OR (NEW.action_kind='flag' AND NOT EXISTS (
+                                       SELECT 1 FROM review_flag_effect_events flag
+                                        WHERE flag.id=NEW.effect_event_id
+                                   ))
+                                OR (NEW.action_kind='flag_undo' AND NOT EXISTS (
+                                       SELECT 1 FROM review_flag_effect_reversals reversal
+                                        WHERE reversal.flag_effect_event_id=NEW.effect_event_id
+                                   ))
+                             BEGIN SELECT RAISE(ABORT,'desktop review action journal requires its exact effect'); END;",
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(source.integrity_check().unwrap(), "ok", "{corruption} fixture must remain SQLite-healthy");
+            let error = match Database::stage_restore_source(&path) {
+                Ok(_) => panic!("{corruption} journal corruption unexpectedly passed staged restore"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("desktop review action journal"), "{corruption}: {error}");
+            drop(source);
+            let reopened = Database::open(path.to_string_lossy().as_ref()).unwrap();
+            let startup_error = reopened.initialize().expect_err("normal startup must reject the corrupt journal");
+            assert!(
+                startup_error.to_string().contains("desktop review action journal"),
+                "{corruption} startup: {startup_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn staged_restore_and_startup_refuse_a_legacy_barrier_after_post_boundary_actions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal-late-barrier.db");
+        let source = Database::open(path.to_string_lossy().as_ref()).unwrap();
+        source.initialize().unwrap();
+        assert_eq!(crate::migrations::rollback(&source, 1).unwrap(), vec![69]);
+        append_desktop_decision(&source, "legacy-before-barrier");
+        assert_eq!(crate::migrations::run_migrations(&source).unwrap(), vec![69]);
+        append_desktop_decision(&source, "post-boundary-after-barrier");
+        source
+            .connection()
+            .execute_batch(
+                "DROP TRIGGER desktop_review_action_events_v1_immutable_update;
+                 UPDATE desktop_review_action_events_v1
+                    SET id=(SELECT MAX(id)+1 FROM desktop_review_action_events_v1)
+                  WHERE action_kind='legacy_barrier';
+                 CREATE TRIGGER desktop_review_action_events_v1_immutable_update
+                 BEFORE UPDATE ON desktop_review_action_events_v1
+                 BEGIN SELECT RAISE(ABORT,'desktop review action journal is append-only'); END;",
+            )
+            .unwrap();
+        assert_eq!(source.integrity_check().unwrap(), "ok");
+        let staged_error = match Database::stage_restore_source(&path) {
+            Ok(_) => panic!("a late legacy barrier unexpectedly passed staged restore"),
+            Err(error) => error,
+        };
+        assert!(staged_error.to_string().contains("desktop review action journal"), "{staged_error}");
+
+        drop(source);
+        let reopened = Database::open(path.to_string_lossy().as_ref()).unwrap();
+        let startup_error = reopened.initialize().expect_err("normal startup must refuse the late legacy barrier");
+        assert!(startup_error.to_string().contains("desktop review action journal"), "{startup_error}");
+    }
+
+    #[test]
+    fn restore_publication_is_full_synced_checkpointed_and_exact() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("live.db");
+        let mut live = Database::open(path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+
+        let staged = logical_fixture(true);
+        let expected = staged.restore_generation_sha256().unwrap();
+        live.commit_staged_restore(&staged).unwrap();
+        live.require_restore_generation_sha256(&expected).unwrap();
+        let checkpoint: (i64, i64, i64) = live
+            .connection()
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap();
+        assert_eq!(checkpoint, (0, 0, 0), "no authoritative WAL frame may remain after publication");
+        let synchronous: i64 = live.connection().query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap();
+        assert_eq!(synchronous, 1, "ordinary operation returns to NORMAL only after the FULL barrier");
     }
 }

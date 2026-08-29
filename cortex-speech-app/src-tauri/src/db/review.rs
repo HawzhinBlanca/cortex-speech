@@ -139,6 +139,292 @@ impl Database {
             .optional()?)
     }
 
+    /// Latest active desktop decision that can be offered as restart-safe Undo authority.
+    ///
+    /// A durable reversal is also a process-crash barrier: once one Undo lands, older decisions are
+    /// not offered after restart until a newer desktop decision exists. This prevents a lost Undo
+    /// response followed by a crash from turning the next Backspace into an accidental second Undo.
+    pub(crate) fn desktop_review_undo_availability(&self) -> AppResult<DesktopReviewUndoAvailability> {
+        Self::desktop_review_undo_availability_on(&self.conn)
+    }
+
+    /// Full v69 ledger proof for startup and restore admission. Interactive availability and Undo
+    /// use the trigger-maintained journal tail in O(1); scanning the complete immutable source and
+    /// journal sets belongs at these lifecycle boundaries, not on every renderer refresh.
+    pub(crate) fn validate_desktop_review_action_journal(&self) -> AppResult<()> {
+        Self::validate_desktop_review_action_journal_on(&self.conn)
+    }
+
+    pub(super) fn desktop_review_undo_availability_on(conn: &Connection) -> AppResult<DesktopReviewUndoAvailability> {
+        let latest_action: Option<(String, Option<i64>)> = conn
+            .query_row(
+                "SELECT action_kind,effect_event_id
+                   FROM desktop_review_action_events_v1
+                  ORDER BY id DESC
+                  LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((action_kind, effect_event_id)) = latest_action else {
+            return Ok(DesktopReviewUndoAvailability::NoHistory);
+        };
+        let blocked = match action_kind.as_str() {
+            "legacy_barrier" => Some(DesktopReviewUndoBlockReason::LegacyHistory),
+            "decision_undo" => Some(DesktopReviewUndoBlockReason::LatestDecisionUndone),
+            "flag_undo" => Some(DesktopReviewUndoBlockReason::LatestFlagUndone),
+            "decision" | "flag" => None,
+            _ => {
+                return Err(AppError::Other("desktop review action journal contains an invalid action kind".into()));
+            }
+        };
+        if let Some(reason) = blocked {
+            return Ok(DesktopReviewUndoAvailability::Blocked(reason));
+        }
+        let effect_event_id = effect_event_id
+            .ok_or_else(|| AppError::Other("desktop review action journal is missing its effect identity".into()))?;
+        if action_kind == "flag" {
+            let effect = conn
+                .query_row(
+                    "SELECT effect.id, effect.segment_id, effect.operation_id,
+                            effect.prior_revision, effect.flag_revision, effect.flag_rationale
+                       FROM review_flag_effect_events effect
+                       JOIN speech_segments segment ON segment.id=effect.segment_id
+                       LEFT JOIN review_flag_effect_reversals reversal
+                         ON reversal.flag_effect_event_id=effect.id
+                      WHERE effect.id=?1
+                        AND reversal.flag_effect_event_id IS NULL
+                        AND segment.review_revision >= effect.flag_revision
+                        AND segment.verdict = 'escalated'
+                        AND segment.rationale IS effect.flag_rationale
+                        AND segment.escalated = 1
+                        AND (segment.human_decision IS NULL OR segment.human_decision = '')
+                        AND NOT EXISTS (
+                            SELECT 1
+                              FROM review_flag_effect_events newer
+                             WHERE newer.segment_id=effect.segment_id
+                               AND newer.flag_revision > effect.flag_revision
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1
+                              FROM human_decision_effect_events newer
+                             WHERE newer.segment_id=effect.segment_id
+                               AND newer.decision_revision > effect.flag_revision
+                        )
+                      LIMIT 1",
+                    [effect_event_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            return Ok(match effect {
+                Some((effect_event_id, segment_id, flag_operation_id, prior_revision, flag_revision, rationale)) => {
+                    let flag_kind = match crate::quality::technical_unusable_reason_from_rationale(Some(&rationale)) {
+                        Some(reason) => DesktopReviewFlagKind::TechnicalUnusable(reason.to_string()),
+                        None if rationale.starts_with(crate::quality::TECHNICAL_UNUSABLE_RATIONALE_PREFIX) => {
+                            return Err(AppError::Other(
+                                "desktop review flag contains a malformed reserved technical rationale".into(),
+                            ));
+                        }
+                        None => DesktopReviewFlagKind::Generic,
+                    };
+                    DesktopReviewUndoAvailability::Available(DesktopReviewUndoAuthority::Flag(
+                        DesktopReviewFlagUndoAuthority {
+                            effect_event_id,
+                            flag_payload_hash: desktop_review_flag_payload_hash(
+                                &segment_id,
+                                prior_revision,
+                                &rationale,
+                            ),
+                            segment_id,
+                            flag_operation_id,
+                            prior_revision,
+                            flag_revision,
+                            flag_kind,
+                        },
+                    ))
+                }
+                None => DesktopReviewUndoAvailability::Blocked(DesktopReviewUndoBlockReason::FlagShadowed),
+            });
+        }
+        let authority = conn
+            .query_row(
+                "SELECT effect.id, effect.segment_id, effect.action,
+                        effect.operation_id, effect.operation_payload_hash
+                   FROM human_decision_effect_events effect
+                   JOIN speech_segments segment ON segment.id=effect.segment_id
+                   LEFT JOIN human_decision_effect_reversals reversal
+                     ON reversal.effect_event_id=effect.id
+                  WHERE effect.source = 'desktop'
+                    AND effect.reviewer IS NULL
+                    AND effect.id=?1
+                    AND reversal.effect_event_id IS NULL
+                    AND segment.review_revision >= effect.decision_revision
+                    AND segment.human_decision = effect.action
+                    AND segment.verdict = CASE effect.action
+                        WHEN 'accept' THEN 'human_accept'
+                        WHEN 'edit' THEN 'human_edit'
+                        WHEN 'reject' THEN 'human_reject'
+                    END
+                    AND segment.escalated = 0
+                    AND segment.reviewed_by IS effect.reviewer
+                    AND segment.verified = effect.decision_verified
+                    AND segment.annotated_transcript IS effect.decision_annotated_transcript
+                    AND segment.verdict_transcript IS CASE
+                        WHEN effect.action='reject' THEN effect.prior_verdict_transcript
+                        ELSE effect.decision_transcript
+                    END
+                    AND segment.corrected_at = effect.decision_corrected_at
+                    AND segment.rationale IS effect.decision_rationale
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM human_decision_effect_events newer
+                         WHERE newer.segment_id = effect.segment_id
+                           AND newer.decision_revision > effect.decision_revision
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM review_flag_effect_events flag
+                         WHERE flag.segment_id = effect.segment_id
+                           AND flag.flag_revision > effect.decision_revision
+                    )
+                  LIMIT 1",
+                [effect_event_id],
+                |row| {
+                    Ok(DesktopHumanDecisionUndoAuthority {
+                        effect_event_id: row.get(0)?,
+                        segment_id: row.get(1)?,
+                        action: row.get(2)?,
+                        decision_operation_id: row.get(3)?,
+                        decision_payload_hash: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(match authority {
+            Some(authority) => {
+                DesktopReviewUndoAvailability::Available(DesktopReviewUndoAuthority::Decision(authority))
+            }
+            None => DesktopReviewUndoAvailability::Blocked(DesktopReviewUndoBlockReason::DecisionShadowed),
+        })
+    }
+
+    /// Prove that the v69 total-order journal is neither missing, duplicating nor inventing a
+    /// desktop review action. Pre-v69 rows are enumerated in the sealed legacy baseline; every
+    /// action created after that boundary must have exactly one trigger-authored journal row.
+    pub(super) fn validate_desktop_review_action_journal_on(conn: &Connection) -> AppResult<()> {
+        let invalid: bool = conn.query_row(
+            "WITH source_actions(action_kind,effect_event_id) AS (
+                 SELECT 'decision',id FROM human_decision_effect_events
+                  WHERE source='desktop' AND reviewer IS NULL
+                 UNION ALL
+                 SELECT 'decision_undo',reversal.effect_event_id
+                   FROM human_decision_effect_reversals reversal
+                   JOIN human_decision_effect_events effect ON effect.id=reversal.effect_event_id
+                  WHERE effect.source='desktop' AND effect.reviewer IS NULL
+                 UNION ALL SELECT 'flag',id FROM review_flag_effect_events
+                 UNION ALL SELECT 'flag_undo',flag_effect_event_id FROM review_flag_effect_reversals
+             ),
+             recorded_actions(action_kind,effect_event_id) AS (
+                 SELECT source_kind,effect_event_id FROM desktop_review_legacy_actions_v1
+                 UNION ALL
+                 SELECT action_kind,effect_event_id FROM desktop_review_action_events_v1
+                  WHERE action_kind<>'legacy_barrier'
+             )
+             SELECT
+                 EXISTS(SELECT action_kind,effect_event_id FROM source_actions
+                        EXCEPT SELECT action_kind,effect_event_id FROM recorded_actions)
+                 OR EXISTS(SELECT action_kind,effect_event_id FROM recorded_actions
+                           EXCEPT SELECT action_kind,effect_event_id FROM source_actions)
+                 OR EXISTS(SELECT 1 FROM recorded_actions
+                            GROUP BY action_kind,effect_event_id HAVING COUNT(*)<>1)
+                 OR ((SELECT COUNT(*) FROM desktop_review_action_events_v1
+                       WHERE action_kind='legacy_barrier') <>
+                     CASE WHEN EXISTS(SELECT 1 FROM desktop_review_legacy_actions_v1) THEN 1 ELSE 0 END)
+                 OR EXISTS(
+                     SELECT 1
+                       FROM desktop_review_action_events_v1 action
+                      WHERE action.action_kind<>'legacy_barrier'
+                        AND action.id < (
+                            SELECT barrier.id
+                              FROM desktop_review_action_events_v1 barrier
+                             WHERE barrier.action_kind='legacy_barrier'
+                        )
+                 )
+                 OR EXISTS(
+                     SELECT 1 FROM desktop_review_action_events_v1 inverse
+                      WHERE inverse.action_kind='decision_undo'
+                        AND NOT EXISTS (
+                            SELECT 1 FROM desktop_review_legacy_actions_v1 legacy
+                             WHERE legacy.source_kind='decision'
+                               AND legacy.effect_event_id=inverse.effect_event_id
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM desktop_review_action_events_v1 original
+                             WHERE original.action_kind='decision'
+                               AND original.effect_event_id=inverse.effect_event_id
+                               AND original.id<inverse.id
+                        )
+                 )
+                 OR EXISTS(
+                     SELECT 1 FROM desktop_review_action_events_v1 inverse
+                      WHERE inverse.action_kind='flag_undo'
+                        AND NOT EXISTS (
+                            SELECT 1 FROM desktop_review_legacy_actions_v1 legacy
+                             WHERE legacy.source_kind='flag'
+                               AND legacy.effect_event_id=inverse.effect_event_id
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM desktop_review_action_events_v1 original
+                             WHERE original.action_kind='flag'
+                               AND original.effect_event_id=inverse.effect_event_id
+                               AND original.id<inverse.id
+                        )
+                 )",
+            [],
+            |row| row.get(0),
+        )?;
+        if invalid {
+            Err(AppError::Other(
+                "desktop review action journal does not exactly match immutable decision and flag authority".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn require_latest_desktop_review_action_on(
+        conn: &Connection,
+        expected_kind: &str,
+        expected_effect_event_id: i64,
+    ) -> AppResult<()> {
+        let latest: Option<(String, Option<i64>)> = conn
+            .query_row(
+                "SELECT action_kind,effect_event_id
+                   FROM desktop_review_action_events_v1
+                  ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if latest
+            .as_ref()
+            .is_some_and(|(kind, effect_id)| kind == expected_kind && *effect_id == Some(expected_effect_event_id))
+        {
+            Ok(())
+        } else {
+            Err(AppError::Validation("review Undo target is no longer the globally current desktop action".into()))
+        }
+    }
+
     pub(super) fn desktop_human_decision_replay_on(
         conn: &Connection,
         operation_id: &str,

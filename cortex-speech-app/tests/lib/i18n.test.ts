@@ -6,6 +6,7 @@ import {
   autonomyLabelKey,
   autonomyValues,
   isTranslationKey,
+  setLocale,
   t,
   locale,
   type TranslationKey,
@@ -33,6 +34,16 @@ describe('i18n exact locale contract', () => {
     const translate = get(t);
     // openFile.multiChunk uses a {count} param in both exact-parity dictionaries.
     expect(translate('openFile.multiChunk', { count: '3' })).toContain('3');
+  });
+
+  it('publishes only complete locale dictionaries through the asynchronous switch boundary', async () => {
+    await expect(setLocale('en')).resolves.toBe(true);
+    expect(get(locale)).toBe('en');
+    expect(get(t)('localeToggle')).toBe(en.localeToggle);
+
+    await expect(setLocale('ckb')).resolves.toBe(true);
+    expect(get(locale)).toBe('ckb');
+    expect(get(t)('localeToggle')).toBe(ckb.localeToggle);
   });
 
   it('narrows only keys actually owned by the canonical dictionary', () => {

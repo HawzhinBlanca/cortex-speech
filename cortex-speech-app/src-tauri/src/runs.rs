@@ -289,6 +289,26 @@ pub fn get_agent_import_report(db: &Database, id: &str) -> AppResult<Option<Agen
     }
 }
 
+/// Read the report bound to one import-run identity. `created_at` has one-second resolution and the
+/// report row id is independently random, so "latest LIMIT 1" is not run authority when two imports
+/// settle in the same second. The embedded run id is immutable provenance and is the exact key the
+/// renderer already received on every event.
+pub fn get_agent_import_report_by_run_id(db: &Database, run_id: &str) -> AppResult<Option<AgentImportReport>> {
+    let mut stmt = db.connection().prepare(
+        "SELECT id, source, status, audio_paths_json, segment_ids_json, report_json, created_at
+         FROM agent_import_reports
+         WHERE json_extract(report_json, '$.agentRunId') = ?1
+         ORDER BY datetime(created_at) DESC, id DESC
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![run_id])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(map_agent_import_report(row)?))
+    } else {
+        Ok(None)
+    }
+}
+
 fn normalized_audio_paths(db: &Database, audio_paths: &[String], segment_ids: &[String]) -> AppResult<Vec<String>> {
     let mut paths: BTreeSet<String> = audio_paths.iter().filter(|path| !path.trim().is_empty()).cloned().collect();
     if paths.is_empty() && !segment_ids.is_empty() {
@@ -1107,6 +1127,45 @@ mod tests {
         let listed = list_agent_import_reports(&db, Some(10)).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, report.id);
+    }
+
+    #[test]
+    fn exact_run_lookup_never_confuses_same_second_reports() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let run_a = "00000000-0000-4000-8000-00000000000a";
+        let run_b = "00000000-0000-4000-8000-00000000000b";
+        let record = |run_id: &str, source: &str| {
+            record_agent_import_report_with_options(
+                &db,
+                source,
+                &[],
+                &[],
+                None,
+                None,
+                AgentImportReportOptions {
+                    agent_run_id: Some(run_id.to_string()),
+                    ..AgentImportReportOptions::default()
+                },
+            )
+            .unwrap()
+        };
+        let report_a = record(run_a, "file-a");
+        let report_b = record(run_b, "file-b");
+        db.connection()
+            .execute(
+                "UPDATE agent_import_reports SET created_at='2026-08-28 00:00:00' WHERE id IN (?1, ?2)",
+                params![report_a.id, report_b.id],
+            )
+            .unwrap();
+
+        let exact_a = get_agent_import_report_by_run_id(&db, run_a).unwrap().unwrap();
+        let exact_b = get_agent_import_report_by_run_id(&db, run_b).unwrap().unwrap();
+        assert_eq!(exact_a.agent_run_id.as_deref(), Some(run_a));
+        assert_eq!(exact_a.source, "file-a");
+        assert_eq!(exact_b.agent_run_id.as_deref(), Some(run_b));
+        assert_eq!(exact_b.source, "file-b");
+        assert!(get_agent_import_report_by_run_id(&db, "00000000-0000-4000-8000-00000000000c").unwrap().is_none());
     }
 
     #[test]

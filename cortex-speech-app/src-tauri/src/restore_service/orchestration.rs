@@ -5,10 +5,11 @@ use super::pilot::require_active_pilot_policy_binding;
 use super::playback::validate_restore_target_semantics;
 use crate::database_runtime::{RestoreAdmission, RestoreReservation, RESTORE_ADMISSION};
 use crate::recovery::{
-    begin_named_restore_transaction, clear_review_pilot_restore_pending, explicit_snapshot_pilot_policy,
-    install_snapshot_restore_plan, load_named_restore_pending, mark_named_restore_completed,
-    prepare_named_restore_artifacts, strict_live_settings_for_restore, take_mandatory_pre_restore_snapshot,
-    SnapshotPilotPolicyRestore, SnapshotRestorePlan,
+    begin_named_restore_transaction, bind_named_restore_target_generation, clear_review_pilot_restore_pending,
+    completed_named_restore_matches_live, explicit_snapshot_pilot_policy, install_snapshot_restore_plan,
+    load_named_restore_pending, mark_named_restore_completed, prepare_named_restore_artifacts,
+    reopen_named_restore_completion_for_recovery, strict_live_settings_for_restore,
+    take_mandatory_pre_restore_snapshot, SnapshotPilotPolicyRestore, SnapshotRestorePlan,
 };
 use crate::settings::AppSettings;
 use std::path::Path;
@@ -35,7 +36,12 @@ pub(crate) fn restore_with_mandatory_snapshot(
     validate_restore_target_semantics(&staged)?;
     let pinned = take_mandatory_pre_restore_snapshot(reservation, db, data_dir)?;
     tracing::info!("pre-restore snapshot pinned at {}", pinned.display());
+    let expected = staged.restore_generation_sha256().map_err(|error| {
+        format!("bare restore target generation could not be canonicalized before publication: {error}")
+    })?;
     db.commit_staged_restore(&staged).map_err(|error| error.to_string())?;
+    db.require_restore_generation_sha256(&expected)
+        .map_err(|error| format!("bare restore publication did not produce the exact staged generation: {error}"))?;
     Ok(pinned)
 }
 
@@ -77,8 +83,16 @@ pub(crate) fn prepare_and_restore_named_transaction(
         require_active_pilot_policy_binding(db, floor_policy.as_ref(), &staged, &plan.pilot)?;
     }
     validate_restore_target_semantics(&staged)?;
-    let _pin = begin_named_restore_transaction(reservation, db, data_dir, source_selector)?;
+    let _pin = begin_named_restore_transaction(
+        reservation,
+        db,
+        data_dir,
+        source_selector,
+        &plan.expected_db_generation_sha256,
+    )?;
     db.commit_staged_restore(&staged).map_err(|error| error.to_string())?;
+    db.require_restore_generation_sha256(&plan.expected_db_generation_sha256)
+        .map_err(|error| format!("named restore publication did not produce the exact staged generation: {error}"))?;
     Ok(plan)
 }
 
@@ -92,13 +106,15 @@ fn publish_prepared_snapshot_generation_offline(
     restore_plan: &SnapshotRestorePlan,
     staged: &crate::db::Database,
     live_controls: &AppSettings,
-) -> Result<(), String> {
+) -> Result<String, String> {
     validate_restore_target_semantics(staged)?;
     let db_path = data_dir.join("cortex-speech.db");
     let mut live = crate::db::Database::open_with_retry(db_path.to_string_lossy().as_ref())
         .map_err(|error| format!("could not open live database for recovery: {error}"))?;
     live.commit_staged_restore(staged)
         .map_err(|error| format!("could not publish recovered database generation: {error}"))?;
+    live.require_restore_generation_sha256(&restore_plan.expected_db_generation_sha256)
+        .map_err(|error| format!("recovered live database is not the exact staged generation: {error}"))?;
     let integrity =
         live.integrity_check().map_err(|error| format!("recovered live database could not be verified: {error}"))?;
     if integrity.trim() != "ok" {
@@ -106,7 +122,7 @@ fn publish_prepared_snapshot_generation_offline(
     }
     drop(live);
     install_snapshot_restore_plan(restore_plan, data_dir, live_controls)?;
-    Ok(())
+    Ok(restore_plan.expected_db_generation_sha256.clone())
 }
 
 fn restore_snapshot_generation_offline(
@@ -115,7 +131,8 @@ fn restore_snapshot_generation_offline(
     live_controls: &AppSettings,
     authoritative_floor: &crate::db::Database,
     authoritative_policy: Option<&crate::review_pilot::ReviewPilotPolicy>,
-) -> Result<(), String> {
+    bind_recorded_target: bool,
+) -> Result<String, String> {
     let snapshot_dir = crate::snapshot::resolve_snapshot_dir(data_dir, selector)?;
     let source = snapshot_dir.join("cortex-speech.db");
     let source_metadata = std::fs::symlink_metadata(&source)
@@ -126,8 +143,13 @@ fn restore_snapshot_generation_offline(
     let (restore_plan, staged) = prepare_named_restore_artifacts(&snapshot_dir, &source, || {})?;
     require_restore_authority_superset(authoritative_floor, &staged)?;
     require_active_pilot_policy_binding(authoritative_floor, authoritative_policy, &staged, &restore_plan.pilot)?;
-    publish_prepared_snapshot_generation_offline(data_dir, &restore_plan, &staged, live_controls)?;
-    Ok(())
+    if bind_recorded_target {
+        // This occurs after complete source/config/semantic validation but before the first live page
+        // can change. A replaced snapshot directory under the same selector therefore cannot be
+        // replayed as the originally recorded target.
+        bind_named_restore_target_generation(data_dir, selector, &restore_plan.expected_db_generation_sha256)?;
+    }
+    publish_prepared_snapshot_generation_offline(data_dir, &restore_plan, &staged, live_controls)
 }
 
 /// Complete an interrupted cross-file restore before normal startup performs ANY DB/config write,
@@ -138,29 +160,27 @@ pub(crate) fn recover_interrupted_named_restore_with_admission(
     data_dir: &Path,
     admission: &RestoreAdmission,
 ) -> Result<bool, String> {
-    let Some(pending) = load_named_restore_pending(data_dir)? else {
+    let Some(mut pending) = load_named_restore_pending(data_dir)? else {
         return Ok(false);
     };
     let reservation = admission.claim_recovery()?;
     if let Some(completed_selector) = pending.completed_selector.as_deref() {
-        // The completion marker is written only after every DB/config/settings leg is durable. Verify
-        // the live DB and typed settings without mutating them, then finish the interrupted marker
-        // cleanup. Never roll back a generation already recorded as coherent merely because its
-        // original source was later moved or pruned.
-        let db_path = data_dir.join("cortex-speech.db");
-        // Stage into writable memory: FTS5's integrity path may use temporary writes and therefore
-        // reports a false "attempt to write a readonly database" against an otherwise healthy file.
-        // The shared staging primitive performs immutable-source copy, full integrity, FK and exact
-        // migration-history validation without touching the live artifact.
-        crate::db::Database::stage_restore_source(&db_path)
-            .map_err(|error| format!("completed restore live database could not be verified: {error}"))?;
-        strict_live_settings_for_restore(&data_dir.join("settings.json"))?;
-        clear_review_pilot_restore_pending(data_dir)?;
-        reservation.commit_named_restore()?;
-        tracing::warn!(
-            "finished durable marker cleanup for already-completed restore '{completed_selector}' before startup"
+        // A healthy database is not proof of the recorded generation. Only a WAL-aware, canonical
+        // digest match may take the cleanup-only path. Legacy markers and mismatches are reopened as
+        // incomplete and replay the exact target/original transaction below while the barrier stays.
+        if completed_named_restore_matches_live(data_dir, &pending)? {
+            strict_live_settings_for_restore(&data_dir.join("settings.json"))?;
+            clear_review_pilot_restore_pending(data_dir)?;
+            reservation.commit_named_restore()?;
+            tracing::warn!(
+                "finished exact-generation marker cleanup for already-completed restore '{completed_selector}' before startup"
+            );
+            return Ok(true);
+        }
+        tracing::error!(
+            "completed restore '{completed_selector}' does not match its recorded SQLite generation; replaying the exact target/original transaction"
         );
-        return Ok(true);
+        pending = reopen_named_restore_completion_for_recovery(data_dir, &pending)?;
     }
     let original_pin = crate::snapshot::resolve_snapshot_dir(data_dir, &pending.pre_restore_pin_selector)
         .map_err(|error| format!("interrupted restore has no usable original safety pin: {error}"))?;
@@ -193,9 +213,10 @@ pub(crate) fn recover_interrupted_named_restore_with_admission(
         &live_controls,
         &original_floor,
         original_policy.as_ref(),
+        true,
     );
-    let completed_selector = match target_result {
-        Ok(()) => pending.source_selector.clone(),
+    let (completed_selector, completed_digest) = match target_result {
+        Ok(digest) => (pending.source_selector.clone(), digest),
         Err(target_error) => {
             tracing::error!(
                 "interrupted target restore '{}' could not complete ({target_error}); rolling back verified original '{}'",
@@ -225,13 +246,13 @@ pub(crate) fn recover_interrupted_named_restore_with_admission(
                         pending.source_selector, pending.pre_restore_pin_selector
                     )
                 })?;
-            pending.pre_restore_pin_selector.clone()
+            (pending.pre_restore_pin_selector.clone(), original_plan.expected_db_generation_sha256.clone())
         }
     };
     // Marker deletion is outside the fallback branch: failure here means the selected generation is
     // already coherent, so rolling it back would be an unnecessary second data transition. Stay fatal
     // and retry marker cleanup idempotently on the next launch.
-    mark_named_restore_completed(data_dir, &completed_selector)?;
+    mark_named_restore_completed(data_dir, &completed_selector, &completed_digest)?;
     clear_review_pilot_restore_pending(data_dir)?;
     reservation.commit_named_restore()?;
     tracing::warn!("completed interrupted restore recovery using '{completed_selector}' before normal startup");

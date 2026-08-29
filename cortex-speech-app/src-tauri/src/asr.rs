@@ -305,7 +305,7 @@ impl NativeKurdishAsrEngine {
                      OmniASR-7B champion runs in WSL and is verified by its deploymentSha256 handshake, never \
                      from this directory",
                     model_path.display()
-                ))
+                ));
             }
         };
         for (path, pin) in [(&model_path, model_pin), (&tokens_path, tokens_pin)] {

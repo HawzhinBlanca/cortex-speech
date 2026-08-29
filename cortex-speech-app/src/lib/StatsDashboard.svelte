@@ -4,18 +4,22 @@
   import { onMount } from 'svelte';
   import { chooseDirectory, chooseFile } from './fileDialogs';
   import * as api from './commands';
-  import type { DatasetStats, SpeechSegment } from './types';
+  import type { DatasetStats } from './types';
   import { segments } from './stores/segmentStore';
   import { notifications } from './stores/notificationStore';
-  import {
-    isVerifiedGood,
-    isHumanRejected,
-    isPlaceholderTranscript,
-    effectiveTranscript,
-  } from './segmentQuality';
   import { t } from './i18n';
   import { isTauriRuntime } from './runtime';
+  import { reloadApp } from './reloadBoundary';
   import { formatPublicErrorReference } from './errorText';
+  import StatsAdvancedSection from './StatsAdvancedSection.svelte';
+  import StatsQualitySection from './StatsQualitySection.svelte';
+  import StatsReadinessSection from './StatsReadinessSection.svelte';
+  import {
+    buildLocalStats,
+    buildStatsBlockers,
+    readAccuracyRecord,
+    type InferenceStats,
+  } from './statsDashboardModel';
 
   // External review 2026-08-06, P2.3: "every blocker should have a deterministic next action".
   // `pendingReview` has declared `action: 'review'` since it was written, and the template only ever
@@ -30,11 +34,7 @@
   let relinking = $state(false);
   let quality = $state<import('./commands').DatasetQuality | null>(null);
   let cert = $state<import('./commands').ConformalCertificate | null>(null);
-  let inferenceStats = $state<{
-    vad: { calls: number; failures: number; p50_ms: number; p99_ms: number };
-    asr: { calls: number; failures: number; p50_ms: number; p99_ms: number };
-    model_load_ms: number;
-  } | null>(null);
+  let inferenceStats = $state<InferenceStats | null>(null);
   let loading = $state(true);
   let errorMessage = $state<string | null>(null);
   let fingerprintCount = $state<number | null>(null);
@@ -62,46 +62,7 @@
   );
   const maxBucket = $derived(Math.max(1, ...durationBuckets.map((b) => b.value)));
 
-  // ── P0 #7: decisions, not density ──────────────────────────────────────────────────────────────
-  // Insights leads with one question — can I export a training set? — and, when the answer is no,
-  // what is stopping it. Every blocker below is a REAL count from an existing computation; none is
-  // estimated, and none is invented for the panel.
-  type Blocker = { id: string; count?: number; detail?: string; action?: 'relink' | 'review' };
-
-  const blockers = $derived.by<Blocker[]>(() => {
-    const out: Blocker[] = [];
-    // Ordered by what to do first: broken input, then unreviewed work, then data faults.
-    if (audioHealth && audioHealth.missingFiles > 0) {
-      out.push({ id: 'audioMissing', count: audioHealth.missingFiles, action: 'relink' });
-    }
-    if (stats && stats.pendingCount > 0) {
-      out.push({ id: 'pendingReview', count: stats.pendingCount, action: 'review' });
-    }
-    if (quality && quality.emptyTranscriptCount > 0) {
-      out.push({ id: 'emptyTranscripts', count: quality.emptyTranscriptCount });
-    }
-    if (quality && !quality.qualityGatePassed) {
-      out.push({
-        id: 'qualityGate',
-        count: quality.segmentsAboveWerThreshold + quality.segmentsAboveCerThreshold,
-      });
-    }
-    // Nothing exportable AND the library is non-empty: name the dominant grade reason. Without this
-    // the owner sees "0 ready" on a fully-reviewed library and has no way to learn that the cause is
-    // a missing word aligner rather than anything more reviewing could fix.
-    if (
-      breakdown &&
-      breakdown.summary.totalSegments > 0 &&
-      breakdown.summary.trainingReadySegments === 0
-    ) {
-      const top = Object.entries(breakdown.reasonCounts)
-        .filter(([reason]) => reason !== 'human_verified')
-        .sort((a, b) => b[1] - a[1])[0];
-      out.push({ id: 'nothingTrainingReady', detail: top?.[0], count: top?.[1] });
-    }
-    if (evalRuns !== null && evalRuns.length === 0) out.push({ id: 'noAccuracyRecord' });
-    return out;
-  });
+  const blockers = $derived(buildStatsBlockers(audioHealth, stats, quality, breakdown, evalRuns));
 
   // 'unknown' is a real state, not a fallback to green: it means the readiness inputs did not load.
   const verdict = $derived<'ready' | 'notReady' | 'unknown'>(
@@ -112,102 +73,7 @@
         : 'notReady',
   );
 
-  const nextAction = $derived(blockers[0] ?? null);
-
-  // ONE canonical accuracy record: the most recent gold eval, with the interval it was measured with.
-  // A point estimate with no N, no date and no interval is the "Champion" claim the audit called out.
-  const accuracy = $derived.by(() => {
-    const run = evalRuns && evalRuns.length ? evalRuns[0] : null;
-    if (!run) return null;
-    let cerLow: number | null = null;
-    let cerHigh: number | null = null;
-    let werLow: number | null = null;
-    let werHigh: number | null = null;
-    try {
-      const meta = run.metaJson ? JSON.parse(run.metaJson) : null;
-      if (meta && typeof meta === 'object') {
-        // ABSENT (not null) when there was nothing to resample — so a missing key means "no interval",
-        // and the card shows the point estimate alone rather than inventing a range.
-        cerLow = typeof meta.micro_cer_ci_low === 'number' ? meta.micro_cer_ci_low : null;
-        cerHigh = typeof meta.micro_cer_ci_high === 'number' ? meta.micro_cer_ci_high : null;
-        werLow = typeof meta.micro_wer_ci_low === 'number' ? meta.micro_wer_ci_low : null;
-        werHigh = typeof meta.micro_wer_ci_high === 'number' ? meta.micro_wer_ci_high : null;
-      }
-    } catch {
-      // A run whose meta will not parse still has real point estimates; show those, claim no interval.
-    }
-    return { run, cerLow, cerHigh, werLow, werHigh };
-  });
-
-  function buildLocalStats(items: SpeechSegment[]): DatasetStats {
-    const durationSeconds = items.map((segment) => Math.max(0, segment.durationMs || 0) / 1000);
-    const totalDurationSeconds = durationSeconds.reduce((sum, value) => sum + value, 0);
-    // "Verified" = human-confirmed GOOD. Exclude human-rejected clips ("mark bad"), which carry
-    // verified=true only to leave the review queue — counting them here would inflate the metric.
-    const verifiedCount = items.filter((segment) => isVerifiedGood(segment)).length;
-    // Mirrors compute_stats (stats.rs): the char total describes the SAME population as verifiedCount
-    // and pendingCount above — rejected and placeholder clips excluded — and uses the same effective
-    // transcript. Measured 2026-08-06, the old version overstated the live corpus by 7994 characters
-    // (18.7%) by counting clips marked bad, and read a THIRD field order (normalized first) that
-    // disagreed with both the backend and the effective-transcript rule.
-    const countedForChars = items.filter(
-      (segment) =>
-        !isHumanRejected(segment) && !isPlaceholderTranscript(effectiveTranscript(segment)),
-    );
-    const totalChars = countedForChars.reduce(
-      (sum, segment) => sum + effectiveTranscript(segment).length,
-      0,
-    );
-    const speakerDurations = new Map<
-      string,
-      { segmentCount: number; totalDurationSeconds: number }
-    >();
-
-    for (const segment of items) {
-      const speakerId = segment.speakerId || 'unknown';
-      const current = speakerDurations.get(speakerId) ?? {
-        segmentCount: 0,
-        totalDurationSeconds: 0,
-      };
-      current.segmentCount += 1;
-      current.totalDurationSeconds += Math.max(0, segment.durationMs || 0) / 1000;
-      speakerDurations.set(speakerId, current);
-    }
-
-    return {
-      totalSegments: items.length,
-      totalDurationSeconds,
-      avgDurationSeconds: items.length ? totalDurationSeconds / items.length : 0,
-      verifiedCount,
-      // Pending = awaiting review. A human-rejected clip has ALREADY been reviewed (and discarded), so it
-      // is neither verified nor pending — mirror the backend compute_stats so `items.length - verifiedCount`
-      // does not silently bucket rejected clips into pending.
-      pendingCount: items.filter((segment) => !isVerifiedGood(segment) && !isHumanRejected(segment))
-        .length,
-      verificationRate: items.length ? (verifiedCount / items.length) * 100 : 0,
-      uniqueSpeakers: speakerDurations.size,
-      totalChars,
-      // Divided by the rows the sum covers, not by all items — see compute_stats.
-      avgCharsPerSegment: countedForChars.length ? totalChars / countedForChars.length : 0,
-      durationHistogram: {
-        under5s: durationSeconds.filter((duration) => duration < 5).length,
-        under10s: durationSeconds.filter((duration) => duration >= 5 && duration < 10).length,
-        under15s: durationSeconds.filter((duration) => duration >= 10 && duration < 15).length,
-        under30s: durationSeconds.filter((duration) => duration >= 15 && duration < 30).length,
-        over30s: durationSeconds.filter((duration) => duration >= 30).length,
-      },
-      topSpeakers: Array.from(speakerDurations.entries())
-        .map(([speakerId, value]) => ({ speakerId, ...value }))
-        .sort(
-          (a, b) =>
-            b.segmentCount - a.segmentCount || b.totalDurationSeconds - a.totalDurationSeconds,
-        )
-        .slice(0, 5),
-      // Review timing is backend-only (derived from decision_log); the non-Tauri fallback has none.
-      reviewTiming: { decisionsLogged: 0, medianSeconds: null, samples: 0 },
-      dbSizeBytes: 0, // backend-only (PRAGMA page_count × page_size)
-    };
-  }
+  const accuracy = $derived(readAccuracyRecord(evalRuns));
 
   async function fetchStats() {
     if (!tauriAvailable) {
@@ -406,7 +272,7 @@
     try {
       await api.restoreDbFromSnapshot(name);
       // Full reload: the restored DB invalidates every in-memory store.
-      window.location.reload();
+      reloadApp();
     } catch (e) {
       notifications.error($t('stats.restoreFailed'), { cause: e });
       toolBusy = null;
@@ -433,7 +299,7 @@
     toolBusy = 'restoreFile';
     try {
       await api.dbRestore(src);
-      window.location.reload();
+      reloadApp();
     } catch (e) {
       notifications.error($t('stats.restoreFailed'), { cause: e });
       toolBusy = null;
@@ -480,59 +346,6 @@
     // panel unmounts (navigating away within the 500ms debounce).
     return () => clearTimeout(fetchDebounceTimer);
   });
-
-  // All three are fed values straight off the backend DatasetStats/cert. A null/undefined/NaN field
-  // (e.g. an empty DB, or a field the backend omitted) would make `.toFixed` throw and drop the WHOLE
-  // stats card into its error branch. Return a placeholder for non-finite input instead.
-  function fmt(s: number) {
-    if (!Number.isFinite(s)) return '\u2014';
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const sec = Math.floor(s % 60);
-    if (h > 0) return `${h}h ${m}m`;
-    if (m > 0) return `${m}m ${sec}s`;
-    return `${sec}s`;
-  }
-
-  function pct(v: number) {
-    if (!Number.isFinite(v)) return '\u2014';
-    return `${v.toFixed(1)}%`;
-  }
-
-  // EvalRun.cer/.wer are FRACTIONS (0..1). The pct() above takes an ALREADY-scaled percentage
-  // (verificationRate is 0..100). Two scales behind one name is how a wrong number reaches the
-  // screen, so fractions get their own formatter with its own name.
-  function ratePct(v: number) {
-    if (!Number.isFinite(v)) return '—';
-    return `${(v * 100).toFixed(2)}%`;
-  }
-
-  function blockerText(b: Blocker): string {
-    const n = String(b.count ?? 0);
-    switch (b.id) {
-      case 'audioMissing':
-        return $t('stats.blockerAudioMissing', { n });
-      case 'pendingReview':
-        return $t('stats.blockerPendingReview', { n });
-      case 'emptyTranscripts':
-        return $t('stats.blockerEmptyTranscripts', { n });
-      case 'qualityGate':
-        return $t('stats.blockerQualityGate', { n });
-      case 'nothingTrainingReady':
-        return $t('stats.blockerNothingReady', { n });
-      case 'noAccuracyRecord':
-        return $t('stats.blockerNoAccuracyRecord');
-      default:
-        return b.id;
-    }
-  }
-
-  function fmtMs(v: number) {
-    if (!Number.isFinite(v)) return '\u2014';
-    if (v < 1) return `${(v * 1000).toFixed(0)}\u00b5s`;
-    if (v < 1000) return `${v.toFixed(1)}ms`;
-    return `${(v / 1000).toFixed(2)}s`;
-  }
 </script>
 
 <div class="card p-4 space-y-4">
@@ -547,701 +360,40 @@
       {/each}
     </div>
   {:else if stats}
-    {#if audioHealth && audioHealth.missingFiles > 0}
-      <div
-        class="mb-3 flex items-center justify-between gap-3 rounded-lg border border-amber-600/40 bg-amber-950/30 p-3"
-        data-testid="audio-missing-banner"
-      >
-        <span class="text-sm text-amber-300">
-          {$t('stats.audioMissing').replace('{n}', String(audioHealth.missingFiles))}
-        </span>
-        <button
-          type="button"
-          class="btn btn-primary !text-xs"
-          data-testid="relink-audio-btn"
-          disabled={relinking}
-          onclick={relinkMissingAudio}
-        >
-          {relinking ? $t('stats.relinking') : $t('stats.relink')}
-        </button>
-      </div>
-    {/if}
-    <!-- P0 #7: decisions before density. Insights answers ONE question first — can I export a
-         training set? — then names what blocks it and what to do next. Diagnostics move below the
-         Advanced disclosure. The verdict comes from get_training_grade_breakdown, the same rule the
-         export gates on, so it can never disagree with what an export would actually write. -->
-    <div class="space-y-3" data-testid="readiness-verdict">
-      <div
-        class="rounded-lg border p-3 {verdict === 'ready'
-          ? 'border-emerald-600/40 bg-emerald-950/20'
-          : verdict === 'notReady'
-            ? 'border-amber-600/40 bg-amber-950/20'
-            : 'border-cortex-700/40 bg-cortex-900/30'}"
-      >
-        <div class="flex items-baseline justify-between gap-3">
-          <span
-            class="text-lg font-bold {verdict === 'ready'
-              ? 'text-emerald-300'
-              : verdict === 'notReady'
-                ? 'text-amber-300'
-                : 'text-cortex-400'}"
-            data-testid="readiness-headline"
-          >
-            {verdict === 'ready'
-              ? $t('stats.ready')
-              : verdict === 'notReady'
-                ? $t('stats.notReady')
-                : $t('stats.readinessUnknown')}
-          </span>
-          {#if breakdown}
-            <span class="text-xs text-cortex-400" data-testid="readiness-count">
-              <bdi dir="ltr"
-                >{breakdown.summary.trainingReadySegments}/{breakdown.summary.totalSegments}</bdi
-              >
-            </span>
-          {/if}
-        </div>
-        <p class="mt-1 text-[11px] text-cortex-400 leading-tight">{$t('stats.readyExplain')}</p>
-      </div>
-
-      {#if blockers.length > 0}
-        <div class="space-y-1.5" data-testid="readiness-blockers">
-          <span class="text-xs text-cortex-400 uppercase tracking-wider"
-            >{$t('stats.blockers')}</span
-          >
-          {#each blockers as b (b.id)}
-            <div class="flex items-center justify-between gap-2">
-              <span class="text-xs text-cortex-200">
-                {blockerText(b)}
-                {#if b.detail}
-                  <!-- The dominant grade reason, verbatim from the backend. Untranslated on purpose:
-                       it is the exact token the export and the ledger use, so it stays greppable. -->
-                  <bdi class="text-[10px] font-mono text-cortex-500">{b.detail}</bdi>
-                {/if}
-              </span>
-              {#if b.action === 'relink'}
-                <button
-                  type="button"
-                  class="btn btn-secondary !text-[11px] shrink-0"
-                  data-testid="blocker-relink-btn"
-                  disabled={relinking}
-                  onclick={relinkMissingAudio}
-                >
-                  {relinking ? $t('stats.relinking') : $t('stats.relink')}
-                </button>
-              {:else if b.action === 'review' && onOpenReview}
-                <button
-                  type="button"
-                  class="btn btn-secondary !text-[11px] shrink-0"
-                  data-testid="blocker-review-btn"
-                  onclick={onOpenReview}
-                >
-                  {$t('stats.blockerOpenReview')}
-                </button>
-              {/if}
-            </div>
-          {/each}
-          {#if nextAction}
-            <p class="text-[11px] text-cortex-300 pt-1" data-testid="readiness-next-action">
-              <span class="text-cortex-500">{$t('stats.nextAction')}</span>
-              {blockerText(nextAction)}
-            </p>
-          {/if}
-        </div>
-      {/if}
-
-      <!-- ONE canonical accuracy record. A point estimate with no N, no date and no interval is
-           precisely the unsupported "Champion" claim the audit called out. -->
-      {#if accuracy}
-        <div
-          class="rounded-lg border border-cortex-700/40 bg-cortex-900/30 p-3 space-y-1"
-          data-testid="accuracy-record"
-        >
-          <span class="text-xs text-cortex-400 uppercase tracking-wider">
-            {$t('stats.accuracyTitle')}
-          </span>
-          <div class="flex flex-wrap items-baseline gap-x-4 gap-y-1">
-            <span class="text-sm">
-              <span class="text-cortex-500 text-[11px]">{$t('stats.cerLabel')}</span>
-              <bdi dir="ltr" class="font-bold text-cortex-100">{ratePct(accuracy.run.cer)}</bdi>
-              {#if accuracy.cerLow !== null && accuracy.cerHigh !== null}
-                <bdi dir="ltr" class="text-[10px] text-cortex-500"
-                  >[{ratePct(accuracy.cerLow)}–{ratePct(accuracy.cerHigh)}]</bdi
-                >
-              {/if}
-            </span>
-            <span class="text-sm">
-              <span class="text-cortex-500 text-[11px]">{$t('stats.werLabel')}</span>
-              <bdi dir="ltr" class="font-bold text-cortex-100">{ratePct(accuracy.run.wer)}</bdi>
-              {#if accuracy.werLow !== null && accuracy.werHigh !== null}
-                <bdi dir="ltr" class="text-[10px] text-cortex-500"
-                  >[{ratePct(accuracy.werLow)}–{ratePct(accuracy.werHigh)}]</bdi
-                >
-              {/if}
-            </span>
-          </div>
-          <div class="text-[10px] text-cortex-500 font-mono break-all">
-            <bdi dir="ltr"
-              >{accuracy.run.modelId} · N={accuracy.run.numSegs} · {accuracy.run.runAt} · {accuracy.run.id.slice(
-                0,
-                8,
-              )}</bdi
-            >
-          </div>
-        </div>
-      {:else if evalRuns !== null}
-        <p class="text-[11px] text-amber-400/90" data-testid="accuracy-none">
-          {$t('stats.accuracyNone')}
-        </p>
-      {/if}
-    </div>
-
-    <div class="grid grid-cols-2 gap-3">
-      <div class="bg-cortex-800/30 rounded-lg p-3">
-        <div class="text-2xl font-bold text-cortex-200">{stats.totalSegments}</div>
-        <div class="text-xs text-cortex-400">{$t('stats.totalSegments')}</div>
-      </div>
-      <div class="bg-cortex-800/30 rounded-lg p-3">
-        <div class="text-2xl font-bold text-emerald-400">{fmt(stats.totalDurationSeconds)}</div>
-        <div class="text-xs text-cortex-400">{$t('stats.totalDuration')}</div>
-      </div>
-      <div class="bg-cortex-800/30 rounded-lg p-3">
-        <div class="text-2xl font-bold text-amber-400">{pct(stats.verificationRate)}</div>
-        <div class="text-xs text-cortex-400">
-          {$t('stats.verified')} ({stats.verifiedCount}/{stats.totalSegments})
-        </div>
-      </div>
-      <div class="bg-cortex-800/30 rounded-lg p-3">
-        <div class="text-2xl font-bold text-cortex-300">{stats.uniqueSpeakers}</div>
-        <div class="text-xs text-cortex-400">{$t('stats.uniqueSpeakers')}</div>
-      </div>
-      {#if stats.reviewTiming && stats.reviewTiming.medianSeconds !== null}
-        <div class="bg-cortex-800/30 rounded-lg p-3" data-testid="stat-review-speed">
-          <div class="text-2xl font-bold text-cortex-300">
-            {stats.reviewTiming.medianSeconds.toFixed(1)}s
-          </div>
-          <div class="text-xs text-cortex-400">
-            {$t('stats.reviewSpeed')} ({stats.reviewTiming.samples})
-          </div>
-        </div>
-      {/if}
-      {#if stats.dbSizeBytes > 0}
-        <div class="bg-cortex-800/30 rounded-lg p-3" data-testid="stat-db-size">
-          <div class="text-2xl font-bold text-cortex-300">
-            {(stats.dbSizeBytes / 1048576).toFixed(1)} MB
-          </div>
-          <div class="text-xs text-cortex-400">{$t('stats.dbSize')}</div>
-        </div>
-      {/if}
-      {#if fingerprintCount !== null}
-        <div class="bg-cortex-800/30 rounded-lg p-3" data-testid="stat-fingerprints">
-          <div class="text-2xl font-bold text-cortex-300">{fingerprintCount}</div>
-          <div class="text-xs text-cortex-400">{$t('stats.fingerprints')}</div>
-        </div>
-      {/if}
-    </div>
-
-    {#if quality && quality.totalSegments > 0}
-      <div class="space-y-2">
-        <h3 class="text-xs font-semibold text-cortex-300 uppercase tracking-wider">
-          {$t('stats.qualityTitle')}
-        </h3>
-        <div class="grid grid-cols-2 gap-2">
-          <div class="bg-cortex-800/30 rounded-lg p-2">
-            <div class="text-sm font-bold text-red-300">{quality.emptyTranscriptCount}</div>
-            <div class="text-[10px] text-cortex-400">{$t('stats.emptyTranscripts')}</div>
-          </div>
-          <div class="bg-cortex-800/30 rounded-lg p-2">
-            <div class="text-sm font-bold text-amber-300">{quality.lowConfidenceCount}</div>
-            <div class="text-[10px] text-cortex-400">{$t('stats.lowConfidence')}</div>
-          </div>
-          <div class="bg-cortex-800/30 rounded-lg p-2">
-            <div class="text-sm font-bold text-orange-300">{quality.duplicateTranscriptGroups}</div>
-            <div class="text-[10px] text-cortex-400">
-              {$t('stats.duplicateGroups')} ({quality.duplicateTranscriptSegments}
-              {$t('stats.segShort')})
-            </div>
-          </div>
-          <div class="bg-cortex-800/30 rounded-lg p-2">
-            <div class="text-sm font-bold text-purple-300">{quality.durationOutlierCount}</div>
-            <div class="text-[10px] text-cortex-400">{$t('stats.durationOutliers')}</div>
-          </div>
-        </div>
-        {#if quality.annotatedSegmentCount > 0}
-          <div class="grid grid-cols-2 gap-2">
-            <!-- Round-24 #9: color each metric by ITS OWN real threshold-exceedance count, not the
-                 quality-gate flag. The gate flag is true whenever enforce_quality_gates is off (the
-                 DEFAULT), so it painted bad WER/CER green and used the SAME flag for both cells. Green
-                 here means "no annotated segment exceeds this metric's threshold" — an honest measure. -->
-            <div class="bg-cortex-800/30 rounded-lg p-2">
-              <div
-                class="text-sm font-bold {quality.segmentsAboveWerThreshold === 0
-                  ? 'text-emerald-300'
-                  : 'text-red-300'}"
-              >
-                {quality.meanWer != null ? `${(quality.meanWer * 100).toFixed(1)}%` : '—'}
-              </div>
-              <div class="text-[10px] text-cortex-400">
-                {$t('stats.meanWer')} ({quality.annotatedSegmentCount}
-                {$t('stats.annotated')})
-              </div>
-            </div>
-            <div class="bg-cortex-800/30 rounded-lg p-2">
-              <div
-                class="text-sm font-bold {quality.segmentsAboveCerThreshold === 0
-                  ? 'text-emerald-300'
-                  : 'text-red-300'}"
-              >
-                {quality.meanCer != null ? `${(quality.meanCer * 100).toFixed(1)}%` : '—'}
-              </div>
-              <div class="text-[10px] text-cortex-400">{$t('stats.meanCer')}</div>
-            </div>
-            <div class="bg-cortex-800/30 rounded-lg p-2">
-              <div class="text-sm font-bold text-orange-300">
-                {quality.segmentsAboveWerThreshold}
-              </div>
-              <div class="text-[10px] text-cortex-400">{$t('stats.aboveWer')}</div>
-            </div>
-            <div class="bg-cortex-800/30 rounded-lg p-2">
-              <div class="text-sm font-bold text-orange-300">
-                {quality.segmentsAboveCerThreshold}
-              </div>
-              <div class="text-[10px] text-cortex-400">{$t('stats.aboveCer')}</div>
-            </div>
-          </div>
-          {#if !quality.qualityGatePassed}
-            <p class="text-[10px] text-red-400">{$t('stats.qualityGateFailed')}</p>
-          {/if}
-        {/if}
-        {#if quality.duplicateGroups.length > 0}
-          <div class="text-[10px] text-cortex-500 space-y-1 max-h-20 overflow-y-auto">
-            {#each quality.duplicateGroups.slice(0, 3) as group}
-              <div class="truncate" dir="rtl" lang="ckb">
-                "<bdi>{group.normalizedPreview}</bdi>" —
-                <bdi
-                  >{group.segmentIds.length}
-                  {$t('stats.segShort')}</bdi
-                >
-              </div>
-            {/each}
-          </div>
-        {/if}
-      </div>
-    {/if}
-
-    <!-- P0 #7: everything below is diagnostics — inference internals, model coverage, conformal
-         details and the research tooling. Collapsed by default so the panel leads with the decision.
-         Native <details> rather than a custom accordion: it is keyboard-operable and exposed to
-         screen readers without any JS, which the accessibility gate needs anyway. -->
-    <details class="group border-t border-cortex-800/50 pt-2" data-testid="stats-advanced">
-      <summary
-        class="cursor-pointer list-none text-xs font-semibold uppercase tracking-wider text-cortex-400 hover:text-cortex-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
-      >
-        <span class="inline-block transition-transform group-open:rotate-90">▸</span>
-        {$t('stats.advanced')}
-      </summary>
-      <div class="space-y-4 pt-3">
-        <div class="space-y-1">
-          <span class="text-xs text-cortex-400">{$t('stats.durationDistribution')}</span>
-          <div class="flex gap-1 h-16 items-end">
-            {#each durationBuckets as bar}
-              {#if stats.totalSegments > 0}
-                <div class="flex-1 flex flex-col items-center gap-1">
-                  <div
-                    class="w-full bg-cortex-600 rounded-t transition-all duration-500"
-                    style="height: {(bar.value / maxBucket) * 100}%"
-                    title="{bar.value} ({stats.totalSegments > 0
-                      ? ((bar.value / stats.totalSegments) * 100).toFixed(0)
-                      : 0}%)"
-                  ></div>
-                  <span class="text-[10px] text-cortex-400">{bar.label}</span>
-                </div>
-              {/if}
-            {/each}
-          </div>
-        </div>
-
-        {#if stats.topSpeakers.length > 0}
-          <div class="space-y-1">
-            <span class="text-xs text-cortex-400">{$t('stats.topSpeakers')}</span>
-            <div class="space-y-1 max-h-32 overflow-y-auto">
-              {#each stats.topSpeakers as speaker, i}
-                <div class="flex items-center gap-2 text-xs">
-                  <span class="text-cortex-500 w-4">{i + 1}.</span>
-                  <span class="text-cortex-200 flex-1 truncate">{speaker.speakerId}</span>
-                  <span class="text-cortex-400">{speaker.segmentCount} {$t('stats.segShort')}</span>
-                  <span class="text-cortex-500">{fmt(speaker.totalDurationSeconds)}</span>
-                </div>
-              {/each}
-            </div>
-          </div>
-        {/if}
-
-        {#if cert}
-          <div class="space-y-2 pt-2 border-t border-cortex-800/50" data-testid="conformal-cert">
-            <h3
-              class="text-xs font-semibold text-cortex-300 uppercase tracking-wider flex items-center justify-between"
-            >
-              <span>{$t('stats.conformalTitle')}</span>
-              {#if cert.isCalibrated}
-                <span
-                  class="text-[9px] px-1.5 py-0.5 rounded bg-emerald-950/50 text-emerald-400 border border-emerald-800/40 font-mono"
-                  >{$t('stats.calibrated')}</span
-                >
-              {:else}
-                <span
-                  class="text-[9px] px-1.5 py-0.5 rounded bg-amber-950/50 text-amber-400 border border-amber-800/40 font-mono"
-                  >{$t('stats.heuristic')}</span
-                >
-              {/if}
-            </h3>
-
-            <div class="bg-cortex-900/40 border border-cortex-800/40 rounded-xl p-3 space-y-2">
-              <div class="grid grid-cols-2 gap-2 text-center">
-                <div class="bg-cortex-950/40 p-2 rounded-lg border border-cortex-800/20">
-                  <!-- An UNCALIBRATED certificate has no defensible certified count, so it shows the same
-                   "—" this panel already uses for the threshold and RefineryPanel uses for a metric over
-                   zero segments (undefined, never 0). Measured on the live library 2026-08-03:
-                   `confidence` and `ctc_score` are NULL on all 144 rows, so every segment scores
-                   nonconformity (1-0.5) + 0.1*5 = 1.0 from the two defaults alone. No cut point beats
-                   the target, the fallback threshold becomes that same 1.0, and EVERY non-rejected
-                   segment passes it — 144 - 27 rejects = the 117 that was rendering here in
-                   success-cyan as "Certified Segments". A tautology, not a certification. -->
-                  <div class="text-lg font-bold" class:text-cyan-400={cert.isCalibrated}>
-                    {cert.isCalibrated ? cert.totalCertified : '—'}
-                  </div>
-                  <div class="text-[9px] text-cortex-400">{$t('stats.certifiedSegments')}</div>
-                </div>
-                <div class="bg-cortex-950/40 p-2 rounded-lg border border-cortex-800/20">
-                  <div class="text-lg font-bold text-cortex-200">
-                    {Number.isFinite(cert.threshold) ? cert.threshold.toFixed(3) : '—'}
-                  </div>
-                  <div class="text-[9px] text-cortex-400">
-                    {$t('stats.decisionThreshold')}
-                  </div>
-                </div>
-              </div>
-
-              <div class="text-[10px] text-cortex-400 space-y-1">
-                <div class="flex justify-between">
-                  <span>{$t('stats.targetErrorBound')}</span>
-                  <span class="font-semibold text-cortex-200"
-                    >{(cert.targetError * 100).toFixed(0)}%</span
-                  >
-                </div>
-                <div class="flex justify-between">
-                  <span>{$t('stats.confidenceLevel')}</span>
-                  <span class="font-semibold text-cortex-200"
-                    >{(cert.confidenceLevel * 100).toFixed(0)}%</span
-                  >
-                </div>
-                <div class="flex justify-between">
-                  <span>{$t('stats.expectedErrorBound')}</span>
-                  {#if cert.isCalibrated}
-                    <span class="font-semibold text-emerald-400"
-                      >{(cert.expectedErrorBound * 100).toFixed(1)}%</span
-                    >
-                  {:else}
-                    <!-- Uncalibrated: expectedErrorBound is just the requested target echoed back,
-                     not a measured/achieved bound — never show it in success-green. -->
-                    <span
-                      class="font-semibold text-amber-400/90"
-                      title={$t('stats.uncalibratedTargetTitle')}
-                      >{$t('stats.uncalibratedValue')}</span
-                    >
-                  {/if}
-                </div>
-              </div>
-
-              {#if cert.calibrationNoConfidence > 0 && cert.calibrationRealPosterior + cert.calibrationHeuristic === 0}
-                <!-- The reason nothing certified is that NOTHING HAS A CONFIDENCE, not that too few clips are
-                 verified. Saying "verify at least 10 segments" here sends the owner to do work that cannot
-                 help: measured 2026-08-04, his library has 67 verified clips and 0/144 carry a confidence
-                 or a ctc_score. Legacy hypotheses may legitimately lack posterior confidence; naming the real
-                 cause is the difference between an honest empty state and a wild goose chase. -->
-                <p
-                  class="text-[9px] text-amber-400/90 leading-tight"
-                  data-testid="conformal-no-confidence"
-                >
-                  {$t('stats.conformalNoConfidence')}
-                </p>
-              {:else if !cert.isCalibrated}
-                <p class="text-[9px] text-amber-400/90 leading-tight">
-                  {$t('stats.conformalUncalibrated')}
-                </p>
-              {/if}
-
-              {#if cert.calibrationRealPosterior === 0 && cert.calibrationHeuristic > 0}
-                <!-- Honesty: even a statistically-calibrated cert can be built entirely on the heuristic
-                 confidence fallback (the default offline CTC engine emits no token posteriors). Disclose
-                 the provenance so the number is never over-trusted as a calibrated posterior. -->
-                <p
-                  class="text-[9px] text-amber-400/90 leading-tight"
-                  data-testid="conformal-heuristic-basis"
-                >
-                  {$t('stats.conformalHeuristicBasis')}
-                </p>
-              {/if}
-            </div>
-          </div>
-        {/if}
-
-        {#if inferenceStats}
-          <div class="space-y-2">
-            <h3 class="text-xs font-semibold text-cortex-300 uppercase tracking-wider">
-              {$t('stats.inferenceTitle')}
-            </h3>
-
-            <div class="grid grid-cols-2 gap-2">
-              <div class="bg-cortex-800/30 rounded-lg p-2">
-                <div class="text-[10px] text-cortex-400 mb-1">{$t('inference.vad')}</div>
-                <div class="text-sm font-bold text-cortex-200">
-                  {inferenceStats.vad.calls}
-                  {$t('inference.calls')}
-                </div>
-                <div class="text-[10px] text-cortex-500">
-                  {inferenceStats.vad.failures}
-                  {$t('inference.failures')}
-                  {#if inferenceStats.vad.calls > 0}
-                    &middot; {(
-                      (1 - inferenceStats.vad.failures / inferenceStats.vad.calls) *
-                      100
-                    ).toFixed(1)}% ok
-                  {/if}
-                </div>
-                <div class="text-[10px] text-cortex-500 mt-0.5">
-                  {$t('inference.p50')}
-                  {fmtMs(inferenceStats.vad.p50_ms)} &middot; {$t('inference.p99')}
-                  {fmtMs(inferenceStats.vad.p99_ms)}
-                </div>
-              </div>
-
-              <div class="bg-cortex-800/30 rounded-lg p-2">
-                <div class="text-[10px] text-cortex-400 mb-1">{$t('inference.asr')}</div>
-                <div class="text-sm font-bold text-cortex-200">
-                  {inferenceStats.asr.calls}
-                  {$t('inference.calls')}
-                </div>
-                <div class="text-[10px] text-cortex-500">
-                  {inferenceStats.asr.failures}
-                  {$t('inference.failures')}
-                  {#if inferenceStats.asr.calls > 0}
-                    &middot; {(
-                      (1 - inferenceStats.asr.failures / inferenceStats.asr.calls) *
-                      100
-                    ).toFixed(1)}% ok
-                  {/if}
-                </div>
-                <div class="text-[10px] text-cortex-500 mt-0.5">
-                  {$t('inference.p50')}
-                  {fmtMs(inferenceStats.asr.p50_ms)} &middot; {$t('inference.p99')}
-                  {fmtMs(inferenceStats.asr.p99_ms)}
-                </div>
-              </div>
-            </div>
-
-            {#if inferenceStats.model_load_ms > 0}
-              <div class="text-[10px] text-cortex-500">
-                {$t('inference.modelLoad')}: {fmtMs(inferenceStats.model_load_ms)}
-              </div>
-            {/if}
-          </div>
-        {/if}
-
-        {#if intel && (intel.loop0Shadow.totalObservations > 0 || intel.autoAcceptPrecision.t0Accepts + intel.autoAcceptPrecision.t1Escalations > 0)}
-          <div
-            class="space-y-2 pt-2 border-t border-cortex-800/50"
-            data-testid="intelligence-report"
-          >
-            <h3 class="text-xs font-semibold text-cortex-300 uppercase tracking-wider">
-              {$t('stats.intelTitle')}
-            </h3>
-            <div class="grid grid-cols-2 gap-2">
-              <div class="bg-cortex-800/30 rounded-lg p-2">
-                <!-- Emerald ONLY when the gate has actually been exercised (some would-fire evidence
-                 exists): an evidence-free 0 rendered green visually asserted the C5 "over-triggers
-                 must be 0" go-live gate was passing when there was no evidence at all (true-10
-                 audit 2026-07-09). Neutral until wouldFire > 0. -->
-                <div
-                  class="text-sm font-bold {intel.loop0Shadow.wouldFire === 0
-                    ? 'text-cortex-400'
-                    : intel.loop0Shadow.firedButHumanAcceptedOriginal === 0
-                      ? 'text-emerald-300'
-                      : 'text-red-300'}"
-                  data-testid="loop0-overtriggers"
-                >
-                  {intel.loop0Shadow.wouldFire === 0
-                    ? '—'
-                    : intel.loop0Shadow.firedButHumanAcceptedOriginal}
-                </div>
-                <div class="text-[10px] text-cortex-400">
-                  {$t('stats.loop0OverTriggers')} ({intel.loop0Shadow.wouldFire}/{intel.loop0Shadow
-                    .totalObservations}
-                  {$t('stats.loop0WouldFire')}{intel.loop0Shadow.wouldFire === 0
-                    ? ` · ${$t('stats.noEvidenceYet')}`
-                    : ''})
-                </div>
-              </div>
-              <div class="bg-cortex-800/30 rounded-lg p-2">
-                <div class="text-sm font-bold text-cortex-200" data-testid="c4-precision">
-                  {intel.autoAcceptPrecision.t0HumanConfirmed +
-                    intel.autoAcceptPrecision.t0HumanContradicted >
-                  0
-                    ? `${(
-                        (100 * intel.autoAcceptPrecision.t0HumanConfirmed) /
-                        (intel.autoAcceptPrecision.t0HumanConfirmed +
-                          intel.autoAcceptPrecision.t0HumanContradicted)
-                      ).toFixed(0)}%`
-                    : '—'}
-                </div>
-                <div class="text-[10px] text-cortex-400">
-                  {$t('stats.c4Precision')} ({intel.autoAcceptPrecision.t0HumanConfirmed}/{intel
-                    .autoAcceptPrecision.t0HumanConfirmed +
-                    intel.autoAcceptPrecision.t0HumanContradicted}
-                  · T0 {intel.autoAcceptPrecision.t0Accepts} / T1 {intel.autoAcceptPrecision
-                    .t1Escalations})
-                </div>
-              </div>
-            </div>
-            {#if intel.conformalCalibration}
-              <!-- Honest distance-to-calibration: why the jury escalates everything today, and how far
-               auto-accept is per acoustic bucket at the shipped 5%-CER gate (true-10 audit C3). -->
-              <div class="bg-cortex-800/30 rounded-lg p-2" data-testid="conformal-progress">
-                <div class="text-[10px] text-cortex-400 mb-1">
-                  {$t('stats.conformalProgress', {
-                    n: String(intel.conformalCalibration.minNeededAtZeroCer),
-                  })}
-                </div>
-                <div class="flex flex-wrap gap-x-3 gap-y-0.5">
-                  {#each intel.conformalCalibration.buckets as b (b.bucket)}
-                    <span class="text-[10px] text-cortex-500">
-                      <bdi>{b.bucket}</bdi>: {b.verifiedWithReference}/{b.minNeededAtZeroCer}
-                    </span>
-                  {/each}
-                </div>
-              </div>
-            {/if}
-          </div>
-        {/if}
-
-        {#if tauriAvailable}
-          <div class="space-y-2 pt-2 border-t border-cortex-800/50" data-testid="dataset-tools">
-            <h3 class="text-xs font-semibold text-cortex-300 uppercase tracking-wider">
-              {$t('stats.tools')}
-            </h3>
-            <div class="flex flex-col gap-2">
-              <button
-                type="button"
-                class="btn btn-secondary !text-xs !justify-start"
-                data-testid="import-verified-gold-btn"
-                disabled={toolBusy !== null}
-                onclick={importVerifiedAsGold}
-              >
-                {toolBusy === 'importGold'
-                  ? $t('stats.toolWorking')
-                  : $t('stats.importVerifiedGold')}
-              </button>
-              <button
-                type="button"
-                class="btn btn-secondary !text-xs !justify-start"
-                data-testid="export-gold-eval-btn"
-                disabled={toolBusy !== null}
-                onclick={exportGoldEvalSet}
-              >
-                {toolBusy === 'goldEval' ? $t('stats.toolWorking') : $t('stats.exportGoldEvalSet')}
-              </button>
-              <button
-                type="button"
-                class="btn btn-secondary !text-xs !justify-start"
-                data-testid="export-finetune-pack-btn"
-                disabled={toolBusy !== null}
-                onclick={exportFinetunePack}
-              >
-                {toolBusy === 'finetunePack'
-                  ? $t('stats.toolWorking')
-                  : $t('stats.exportFinetunePack')}
-              </button>
-              <button
-                type="button"
-                class="btn btn-secondary !text-xs !justify-start"
-                data-testid="backup-db-btn"
-                disabled={toolBusy !== null}
-                onclick={backupToFolder}
-              >
-                {toolBusy === 'backup' ? $t('stats.toolWorking') : $t('stats.backupDb')}
-              </button>
-              <button
-                type="button"
-                class="btn btn-secondary !text-xs !justify-start"
-                data-testid="restore-file-btn"
-                disabled={toolBusy !== null}
-                onclick={restoreFromFile}
-              >
-                {toolBusy === 'restoreFile' ? $t('stats.toolWorking') : $t('stats.restoreFile')}
-              </button>
-              <button
-                type="button"
-                class="btn btn-secondary !text-xs !justify-start"
-                data-testid="restore-snapshot-btn"
-                disabled={toolBusy !== null}
-                onclick={toggleSnapshotList}
-              >
-                {toolBusy === 'listSnapshots'
-                  ? $t('stats.toolWorking')
-                  : $t('stats.restoreSnapshot')}
-              </button>
-              <button
-                type="button"
-                class="btn btn-secondary !text-xs !justify-start"
-                data-testid="compact-db-btn"
-                disabled={toolBusy !== null}
-                onclick={compactDatabase}
-              >
-                {toolBusy === 'compact' ? $t('stats.toolWorking') : $t('stats.compactDb')}
-              </button>
-            </div>
-            {#if snapshots}
-              <div class="space-y-1 max-h-40 overflow-y-auto" data-testid="snapshot-list">
-                {#if snapshots.length === 0}
-                  <p class="text-[10px] text-cortex-500">{$t('stats.noSnapshots')}</p>
-                {:else}
-                  {#each snapshots as snap}
-                    <div
-                      class="flex items-center gap-2 text-xs bg-cortex-800/30 rounded-lg px-2 py-1"
-                    >
-                      <span class="text-cortex-300 font-mono flex-1 min-w-0">
-                        <span class="block">{new Date(snap.timestamp * 1000).toLocaleString()}</span
-                        >
-                        <span class="block text-[9px] text-cortex-500 truncate" title={snap.name}>
-                          {snap.name}
-                        </span>
-                      </span>
-                      <span class="text-cortex-400">
-                        {snap.segmentCount === null ? '?' : snap.segmentCount}
-                        {$t('stats.segShort')} · {(snap.dbSizeBytes / 1048576).toFixed(1)} MB
-                      </span>
-                      <button
-                        type="button"
-                        class="btn btn-primary !text-[10px] !px-2 !py-0.5"
-                        disabled={toolBusy !== null}
-                        onclick={() => restoreSnapshot(snap.name, snap.segmentCount)}
-                      >
-                        {toolBusy === 'restore' ? $t('stats.toolWorking') : $t('stats.restore')}
-                      </button>
-                    </div>
-                  {/each}
-                {/if}
-              </div>
-            {/if}
-            {#if buildSha}
-              <div class="text-[10px] text-cortex-600 font-mono" data-testid="build-sha">
-                {$t('stats.buildSha')}: {buildSha.slice(0, 12)}
-              </div>
-            {/if}
-          </div>
-        {/if}
-      </div>
-    </details>
+    <StatsReadinessSection
+      {stats}
+      {audioHealth}
+      {breakdown}
+      {blockers}
+      {verdict}
+      {accuracy}
+      evalRunsLoaded={evalRuns !== null}
+      {fingerprintCount}
+      {relinking}
+      onRelink={relinkMissingAudio}
+      {onOpenReview}
+    />
+    <StatsQualitySection {quality} />
+    <StatsAdvancedSection
+      {stats}
+      {durationBuckets}
+      {maxBucket}
+      {cert}
+      {inferenceStats}
+      {intel}
+      {tauriAvailable}
+      {toolBusy}
+      {snapshots}
+      {buildSha}
+      onImportGold={importVerifiedAsGold}
+      onExportGold={exportGoldEvalSet}
+      onExportFinetune={exportFinetunePack}
+      onBackup={backupToFolder}
+      onRestoreFile={restoreFromFile}
+      onToggleSnapshots={toggleSnapshotList}
+      onRestoreSnapshot={restoreSnapshot}
+      onCompact={compactDatabase}
+    />
   {:else if errorMessage}
     <div class="flex flex-col items-center justify-center py-8 text-red-400 space-y-2">
       <TriangleAlert class="h-10 w-10 opacity-60" strokeWidth={1.5} aria-hidden="true" />

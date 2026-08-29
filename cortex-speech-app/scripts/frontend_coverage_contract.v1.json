@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "thresholds": {
+    "statements": 85,
+    "branches": 80,
+    "functions": 80,
+    "lines": 85
+  },
+  "criticalThresholds": {
+    "statements": 95,
+    "branches": 90,
+    "functions": 90,
+    "lines": 95
+  },
+  "criticalDomains": {
+    "audio-state-machine": ["src/lib/audioMachine.ts"],
+    "review-truth-reducers": ["src/lib/reviewCommitOperation.ts", "src/lib/reviewCommitResult.ts"]
+  },
+  "playwrightProject": "chromium",
+  "viteOrigin": "http://localhost:1420",
+  "minimumFullE2ETests": 100,
+  "minimumInstrumentedE2ETests": 75,
+  "standaloneE2EFiles": ["couch-page.spec.ts"],
+  "minimumE2EConvertedSourceFiles": 10
+}

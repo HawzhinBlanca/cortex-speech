@@ -10,6 +10,8 @@ interrupted handover recoverable after a process crash or reboot.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import ctypes
 import hashlib
 import json
 import os
@@ -28,20 +30,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-EXPECTED_SCHEMA = 65
-COMPATIBLE_PREVIOUS_SCHEMA = 64
 POINTER_FILE = "active-private-production-release.json"
 JOURNAL_FILE = "pending-private-production-release.json"
 MAINTENANCE_FILE = "private-production-maintenance.json"
 RELEASE_MANIFEST_FILE = "release-manifest.json"
 DEDUP_MANIFEST_FILE = "review-pool-dedup-manifest.json"
+SCHEMA_CONTRACT_FILE = "private_production_schema_contract.v1.json"
+SCHEMA_CONTRACT_RELATIVE_PATH = f"scripts/{SCHEMA_CONTRACT_FILE}"
 LEGACY_WATCHDOG_TASK = "CortexWatchdog"
 WATCHDOG_TASK = "CortexPrivateProductionWatchdog"
 RESTORE_TASK = "CortexDailyRestoreDrill"
 RECOVERY_TASK = "CortexReleaseRecovery"
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA64 = re.compile(r"^[0-9a-f]{64}$")
-MANIFEST_FIELDS = {
+BINARY_SHA_MARKER = re.compile(rb"CORTEX_BUILD_SHA:([0-9a-f]{40}|unknown)(?![0-9a-f])")
+LEGACY_V1_MANIFEST_FIELDS = {
     "schema",
     "releaseId",
     "expectedDatabaseSchema",
@@ -58,7 +61,52 @@ MANIFEST_FIELDS = {
     "dedupManifest",
     "dedupManifestSha256",
 }
-LEGACY_V63_MANIFEST_FIELDS = MANIFEST_FIELDS - {"dedupManifest", "dedupManifestSha256"}
+MANIFEST_FIELDS = LEGACY_V1_MANIFEST_FIELDS | {
+    "schemaContract",
+    "schemaContractId",
+    "schemaContractSha256",
+}
+SCHEMA_CONTRACT_FIELDS = {
+    "schema",
+    "contractId",
+    "targetSchema",
+    "supportedMigrationSources",
+    "sameSchemaRecovery",
+    "normalization",
+    "algorithm",
+    "migrationSource",
+    "migrationSourceSha256",
+    "historicalPrefixThroughSchema",
+    "historicalPrefixSha256",
+    "appendOnlyContract",
+    "appendOnlyContractSha256",
+}
+SCHEMA_CONTRACT_ID = "cortex-private-production-schema-65-to-69-v1"
+PRODUCTION_SCHEMA_BOUNDARY = 65
+HISTORICAL_PREFIX_START = "pub static MIGRATIONS: &[Migration] = &["
+FIRST_POST_PRODUCTION_MIGRATION = "    Migration {\n        version: 66,"
+JOURNAL_FIELDS = {
+    "schema",
+    "phase",
+    "startedAtUtc",
+    "sourceSchema",
+    "baselinePoolDecisionId",
+    "candidate",
+    "previousActive",
+    "fallbackApp",
+    "fallbackWatchdog",
+    "snapshotDir",
+    "snapshotManifestSha256",
+    "targetDatabaseSha256",
+}
+JOURNAL_PHASES = {
+    "prepared",
+    "maintenance",
+    "snapshotted",
+    "candidate-certified",
+    "candidate-active",
+    "exposed",
+}
 PROFILE_STATE = (
     "settings.json",
     "champion.json",
@@ -112,9 +160,104 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        durable_replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def durable_replace(source: Path, destination: Path) -> None:
+    """Atomically replace one same-directory file and make the rename metadata durable."""
+
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.MoveFileExW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        kernel32.MoveFileExW.restype = ctypes.c_int
+        movefile_replace_existing = 0x00000001
+        movefile_write_through = 0x00000008
+        if not kernel32.MoveFileExW(
+            str(source),
+            str(destination),
+            movefile_replace_existing | movefile_write_through,
+        ):
+            error = ctypes.get_last_error()
+            raise OSError(error, f"durable replacement failed for {destination}")
+        return
+
+    os.replace(source, destination)
+    descriptor = os.open(destination.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@contextlib.contextmanager
+def exclusive_instance_lock(data_dir: Path):
+    """Hold the same no-sharing authority used by every Windows Cortex writer."""
+
+    lock_path = data_dir / "cortex.lock"
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        generic_read = 0x80000000
+        generic_write = 0x40000000
+        open_always = 4
+        file_attribute_normal = 0x80
+        invalid_handle = ctypes.c_void_p(-1).value
+        handle = kernel32.CreateFileW(
+            str(lock_path),
+            generic_read | generic_write,
+            0,
+            None,
+            open_always,
+            file_attribute_normal,
+            None,
+        )
+        if handle == invalid_handle:
+            error = ctypes.get_last_error()
+            raise ReleaseError(
+                f"database replacement refused because another Cortex writer holds {lock_path} "
+                f"(Windows error {error})"
+            )
+        try:
+            yield
+        finally:
+            if not kernel32.CloseHandle(handle):
+                raise OSError(ctypes.get_last_error(), f"failed to release {lock_path}")
+            try:
+                lock_path.unlink(missing_ok=True)
+            except PermissionError:
+                # A new legitimate owner may have acquired the file after our handle closed.
+                pass
+        return
+
+    import fcntl
+
+    handle = lock_path.open("a+b")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise ReleaseError(f"database replacement refused because another Cortex writer holds {lock_path}") from error
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+        # Keep the stable inode. Unlinking after unlock creates a race where a new owner can lock
+        # this inode just before it is removed and a third process then locks a replacement inode.
 
 
 def is_within(child: Path, parent: Path) -> bool:
@@ -126,12 +269,150 @@ def is_within(child: Path, parent: Path) -> bool:
 
 
 def validate_artifact(path: Path, label: str) -> Path:
-    resolved = path.resolve(strict=True)
-    if not resolved.is_file() or resolved.is_symlink():
+    if path.is_symlink():
+        raise ReleaseError(f"{label} must not be a symlink: {path}")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise ReleaseError(f"{label} is missing or inaccessible: {path}: {error}") from error
+    if not resolved.is_file():
         raise ReleaseError(f"{label} must be a regular non-symlink file: {resolved}")
     if resolved.stat().st_size <= 0:
         raise ReleaseError(f"{label} is empty: {resolved}")
     return resolved
+
+
+def validate_baked_git_sha(path: Path, expected_git_sha: str, label: str) -> str:
+    """Require one exact compile-time Git marker in every shipped Rust executable."""
+
+    resolved = validate_artifact(path, label)
+    if not SHA40.fullmatch(expected_git_sha):
+        raise ReleaseError(f"{label} expected Git SHA is invalid")
+    actual: str | None = None
+    carry = b""
+    try:
+        with resolved.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                window = carry + chunk
+                safe_start_limit = max(0, len(window) - 80)
+                for match in BINARY_SHA_MARKER.finditer(window):
+                    if match.start() >= safe_start_limit:
+                        break
+                    if actual is not None:
+                        raise ReleaseError(f"{label} must contain exactly one CORTEX_BUILD_SHA marker")
+                    actual = match.group(1).decode("ascii")
+                # The longest marker is 57 bytes. Keep enough overlap to discover a marker whose
+                # prefix starts at the end of one block without buffering a multi-hundred-MB exe.
+                carry = window[-80:]
+            for match in BINARY_SHA_MARKER.finditer(carry):
+                if actual is not None:
+                    raise ReleaseError(f"{label} must contain exactly one CORTEX_BUILD_SHA marker")
+                actual = match.group(1).decode("ascii")
+    except OSError as error:
+        raise ReleaseError(f"{label} build identity cannot be read: {error}") from error
+    if actual is None:
+        raise ReleaseError(f"{label} must contain exactly one CORTEX_BUILD_SHA marker")
+    if actual != expected_git_sha:
+        raise ReleaseError(
+            f"{label} was built from Git SHA {actual}, not declared release SHA {expected_git_sha}"
+        )
+    return actual
+
+
+def _normalized_lf_bytes(path: Path, label: str) -> bytes:
+    resolved = validate_artifact(path, label)
+    try:
+        text = resolved.read_bytes().decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ReleaseError(f"{label} is not valid UTF-8") from error
+    normalized = text.replace("\r\n", "\n")
+    if "\r" in normalized:
+        raise ReleaseError(f"{label} contains unsupported bare carriage returns")
+    return normalized.encode("utf-8")
+
+
+def validate_schema_contract(path: Path) -> tuple[Path, dict[str, Any], str]:
+    """Validate the one release/migration authority and every source identity it pins."""
+
+    resolved = validate_artifact(path, "private-production schema contract")
+    value = load_json(resolved)
+    if set(value) != SCHEMA_CONTRACT_FIELDS:
+        raise ReleaseError(
+            "schema contract fields are invalid "
+            f"(missing={sorted(SCHEMA_CONTRACT_FIELDS - set(value))}, "
+            f"extra={sorted(set(value) - SCHEMA_CONTRACT_FIELDS)})"
+        )
+    if type(value["schema"]) is not int or value["schema"] != 1:
+        raise ReleaseError("schema contract schema must be integer 1")
+    if value["contractId"] != SCHEMA_CONTRACT_ID:
+        raise ReleaseError("schema contract identity is not the approved 65-to-69 authority")
+    if type(value["targetSchema"]) is not int or value["targetSchema"] != 69:
+        raise ReleaseError("schema contract target must be exactly 69")
+    sources = value["supportedMigrationSources"]
+    if sources != [PRODUCTION_SCHEMA_BOUNDARY] or any(type(item) is not int for item in sources):
+        raise ReleaseError("schema contract supports exactly one migration source: schema 65")
+    if value["sameSchemaRecovery"] is not True:
+        raise ReleaseError("schema contract must explicitly permit same-schema 69 recovery")
+    if value["normalization"] != "utf8-lf" or value["algorithm"] != "sha256":
+        raise ReleaseError("schema contract hash algorithm/normalization is unsupported")
+    if value["migrationSource"] != "src-tauri/src/migrations/mod.rs":
+        raise ReleaseError("schema contract migration source path is not canonical")
+    if value["appendOnlyContract"] != "scripts/append_only_migration_contract.v1.json":
+        raise ReleaseError("schema contract append-only authority path is not canonical")
+    if value["historicalPrefixThroughSchema"] != PRODUCTION_SCHEMA_BOUNDARY:
+        raise ReleaseError("schema contract historical production boundary is not schema 65")
+    for field in ("migrationSourceSha256", "historicalPrefixSha256", "appendOnlyContractSha256"):
+        if not isinstance(value[field], str) or not SHA64.fullmatch(value[field]):
+            raise ReleaseError(f"schema contract {field} is invalid")
+
+    # The contract always lives at <release-root>/scripts/<name>. Derive all bound paths from that
+    # root, require their canonical relative names, and reject symlink/path substitution.
+    source_root = resolved.parent.parent.resolve(strict=True)
+    migration = validate_artifact(source_root / str(value["migrationSource"]), "canonical migration source")
+    append_only = validate_artifact(
+        source_root / str(value["appendOnlyContract"]), "append-only migration contract"
+    )
+    if not is_within(migration, source_root) or not is_within(append_only, source_root):
+        raise ReleaseError("schema contract source authority escapes its release root")
+    migration_bytes = _normalized_lf_bytes(migration, "canonical migration source")
+    migration_sha = hashlib.sha256(migration_bytes).hexdigest()
+    if migration_sha != value["migrationSourceSha256"]:
+        raise ReleaseError("canonical migration source does not match the schema contract")
+    if sha256_file(append_only) != value["appendOnlyContractSha256"]:
+        raise ReleaseError("append-only migration contract does not match the schema contract")
+
+    migration_text = migration_bytes.decode("utf-8")
+    try:
+        prefix_start = migration_text.index(HISTORICAL_PREFIX_START)
+        prefix_end = migration_text.index(FIRST_POST_PRODUCTION_MIGRATION, prefix_start)
+    except ValueError as error:
+        raise ReleaseError("canonical schema-65 migration boundary is missing") from error
+    prefix_sha = hashlib.sha256(migration_text[prefix_start:prefix_end].encode("utf-8")).hexdigest()
+    if prefix_sha != value["historicalPrefixSha256"]:
+        raise ReleaseError("historical migrations 1-65 do not match the production authority")
+
+    catalog_end = migration_text.find("\n];", prefix_start)
+    if catalog_end < 0:
+        raise ReleaseError("canonical migration catalog terminator is missing")
+    versions = [
+        int(item)
+        for item in re.findall(
+            r"Migration\s*\{\s*version:\s*([0-9]+)\s*,",
+            migration_text[prefix_start:catalog_end],
+        )
+    ]
+    target = int(value["targetSchema"])
+    if versions != list(range(1, target + 1)):
+        raise ReleaseError(f"migration catalog is not the exact contiguous schema 1..={target} authority")
+    return resolved, value, sha256_file(resolved)
+
+
+_BUILTIN_SCHEMA_CONTRACT_PATH = Path(__file__).resolve().with_name(SCHEMA_CONTRACT_FILE)
+_, _BUILTIN_SCHEMA_CONTRACT, _BUILTIN_SCHEMA_CONTRACT_SHA256 = validate_schema_contract(
+    _BUILTIN_SCHEMA_CONTRACT_PATH
+)
+EXPECTED_SCHEMA = int(_BUILTIN_SCHEMA_CONTRACT["targetSchema"])
+SUPPORTED_MIGRATION_SOURCES = frozenset(int(value) for value in _BUILTIN_SCHEMA_CONTRACT["supportedMigrationSources"])
 
 
 def validate_dedup_manifest(path: Path) -> tuple[Path, str]:
@@ -180,26 +461,26 @@ def validate_manifest(
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ReleaseError("release manifest must be one JSON object")
-    legacy_v63 = allow_compatible_previous and set(value) == LEGACY_V63_MANIFEST_FIELDS
-    if set(value) != MANIFEST_FIELDS and not legacy_v63:
+    fields = set(value)
+    current = fields == MANIFEST_FIELDS
+    legacy_v1 = allow_compatible_previous and fields == LEGACY_V1_MANIFEST_FIELDS
+    if not current and not legacy_v1:
         raise ReleaseError(
             f"release manifest fields are invalid (missing={sorted(MANIFEST_FIELDS - set(value))}, "
             f"extra={sorted(set(value) - MANIFEST_FIELDS)})"
         )
-    if type(value["schema"]) is not int or value["schema"] != 1:
-        raise ReleaseError("release manifest schema must be integer 1")
-    required_schemas = (
-        {63}
-        if legacy_v63
-        else ({COMPATIBLE_PREVIOUS_SCHEMA, EXPECTED_SCHEMA} if allow_compatible_previous else {EXPECTED_SCHEMA})
-    )
-    if type(value["expectedDatabaseSchema"]) is not int or value["expectedDatabaseSchema"] not in required_schemas:
-        raise ReleaseError(f"release manifest must require database schema in {sorted(required_schemas)}")
+    expected_manifest_schema = 2 if current else 1
+    if type(value["schema"]) is not int or value["schema"] != expected_manifest_schema:
+        raise ReleaseError(f"release manifest schema must be integer {expected_manifest_schema}")
+    expected_database_schema = EXPECTED_SCHEMA if current else PRODUCTION_SCHEMA_BOUNDARY
+    if type(value["expectedDatabaseSchema"]) is not int or value["expectedDatabaseSchema"] != expected_database_schema:
+        raise ReleaseError(f"release manifest must require database schema {expected_database_schema}")
     if not isinstance(value["appGitSha"], str) or not SHA40.fullmatch(value["appGitSha"]):
         raise ReleaseError("release manifest appGitSha is invalid")
     directory = Path(str(value["directory"])).resolve(strict=True)
     if expected_root is not None and not is_within(directory, expected_root):
         raise ReleaseError("release directory escapes the configured immutable release root")
+    artifacts: dict[str, Path] = {}
     for path_field, hash_field in (
         ("appExe", "appSha256"),
         ("poolAdminExe", "poolAdminSha256"),
@@ -213,18 +494,33 @@ def validate_manifest(
             raise ReleaseError(f"{hash_field} is invalid")
         if sha256_file(artifact) != expected:
             raise ReleaseError(f"{path_field} does not match its release SHA-256")
+        artifacts[path_field] = artifact
+    validate_baked_git_sha(artifacts["appExe"], value["appGitSha"], "release app")
+    validate_baked_git_sha(artifacts["poolAdminExe"], value["appGitSha"], "release pool_admin")
     operations_sha = value["operationsSha256"]
     if not isinstance(operations_sha, str) or not SHA64.fullmatch(operations_sha):
         raise ReleaseError("operationsSha256 is invalid")
     if operations_bundle_sha256(directory) != operations_sha:
         raise ReleaseError("the staged operations bundle does not match its release SHA-256")
-    if not legacy_v63:
-        dedup_path = Path(str(value["dedupManifest"]))
-        if not is_within(dedup_path, directory):
-            raise ReleaseError("dedupManifest escapes the immutable release directory")
-        _, dedup_sha = validate_dedup_manifest(dedup_path)
-        if dedup_sha != value["dedupManifestSha256"]:
-            raise ReleaseError("the staged dedup manifest does not match its release digest")
+    dedup_path = Path(str(value["dedupManifest"]))
+    if not is_within(dedup_path, directory):
+        raise ReleaseError("dedupManifest escapes the immutable release directory")
+    _, dedup_sha = validate_dedup_manifest(dedup_path)
+    if dedup_sha != value["dedupManifestSha256"]:
+        raise ReleaseError("the staged dedup manifest does not match its release digest")
+    if current:
+        expected_contract_path = (directory / SCHEMA_CONTRACT_RELATIVE_PATH).resolve(strict=True)
+        contract_path = Path(str(value["schemaContract"])).resolve(strict=True)
+        if contract_path != expected_contract_path:
+            raise ReleaseError("schemaContract is not the canonical contract inside the immutable release")
+        _, contract, contract_sha = validate_schema_contract(contract_path)
+        if value["schemaContractId"] != contract["contractId"]:
+            raise ReleaseError("release schema contract identity does not match its staged authority")
+        claimed_contract_sha = value["schemaContractSha256"]
+        if not isinstance(claimed_contract_sha, str) or not SHA64.fullmatch(claimed_contract_sha):
+            raise ReleaseError("schemaContractSha256 is invalid")
+        if claimed_contract_sha != contract_sha:
+            raise ReleaseError("staged schema contract does not match its release SHA-256")
     return value
 
 
@@ -259,11 +555,19 @@ def stage_release(
         raise ReleaseError("candidate build must be outside the live immutable release root")
     app_source = validate_artifact(candidate_dir / "cortex-speech-app.exe", "candidate app")
     admin_source = validate_artifact(candidate_dir / "pool_admin.exe", "candidate pool_admin")
+    validate_baked_git_sha(app_source, git_sha, "candidate app")
+    validate_baked_git_sha(admin_source, git_sha, "candidate pool_admin")
     dedup_source, dedup_sha = validate_dedup_manifest(dedup_manifest or source_root / DEDUP_MANIFEST_FILE)
+    _, schema_contract, schema_contract_sha = validate_schema_contract(
+        source_root / SCHEMA_CONTRACT_RELATIVE_PATH
+    )
     app_sha = sha256_file(app_source)
     admin_sha = sha256_file(admin_source)
     operations_sha = operations_bundle_sha256(source_root)
-    release_id = f"{git_sha[:12]}-{app_sha[:12]}-{operations_sha[:12]}-{dedup_sha[:12]}"
+    release_id = (
+        f"{git_sha[:12]}-{app_sha[:12]}-{operations_sha[:12]}-"
+        f"{schema_contract_sha[:12]}-{dedup_sha[:12]}"
+    )
     final = release_root / release_id
     if final.exists():
         manifest = validate_manifest(load_json(final / RELEASE_MANIFEST_FILE), expected_root=release_root)
@@ -280,10 +584,15 @@ def stage_release(
         copy_source_bundle(source_root, stage)
         if operations_bundle_sha256(stage) != operations_sha:
             raise ReleaseError("staged operations bundle changed while it was copied")
+        _, staged_contract, staged_contract_sha = validate_schema_contract(
+            stage / SCHEMA_CONTRACT_RELATIVE_PATH
+        )
+        if staged_contract != schema_contract or staged_contract_sha != schema_contract_sha:
+            raise ReleaseError("staged schema contract changed while it was copied")
         watchdog = stage / "scripts" / "ops" / "cortex-watchdog.ps1"
         validate_artifact(watchdog, "watchdog script")
         manifest = {
-            "schema": 1,
+            "schema": 2,
             "releaseId": release_id,
             "expectedDatabaseSchema": EXPECTED_SCHEMA,
             "appGitSha": git_sha,
@@ -296,6 +605,9 @@ def stage_release(
             "watchdogScript": str(final / "scripts" / "ops" / "cortex-watchdog.ps1"),
             "watchdogSha256": sha256_file(watchdog),
             "operationsSha256": operations_sha,
+            "schemaContract": str(final / SCHEMA_CONTRACT_RELATIVE_PATH),
+            "schemaContractId": schema_contract["contractId"],
+            "schemaContractSha256": schema_contract_sha,
             "dedupManifest": str(final / DEDUP_MANIFEST_FILE),
             "dedupManifestSha256": dedup_sha,
         }
@@ -311,10 +623,13 @@ def database_schema(db_path: Path) -> int:
     try:
         connection = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=30)
         try:
-            row = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
-            if row is None or type(row[0]) is not int:
+            rows = connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
+            versions = [row[0] for row in rows]
+            if not versions or any(type(version) is not int for version in versions):
                 raise ReleaseError("database has no authoritative schema migration history")
-            return int(row[0])
+            if versions != list(range(1, versions[-1] + 1)):
+                raise ReleaseError("database migration history is not one contiguous authority")
+            return int(versions[-1])
         finally:
             connection.close()
     except sqlite3.Error as error:
@@ -364,17 +679,58 @@ def sqlite_backup(source: Path, destination: Path) -> None:
         src.close()
 
 
+def database_content_sha256(db_path: Path) -> str:
+    """Hash one read-only logical snapshot, including WAL-visible committed rows.
+
+    A raw main-file hash can miss committed WAL frames and therefore cannot authorize rollback.
+    ``iterdump`` walks SQLite's transactionally visible schema and rows; length framing makes the
+    comparison unambiguous. The digest is used only within one interrupted handover, never as a
+    cross-version schema fingerprint.
+    """
+
+    digest = hashlib.sha256()
+    try:
+        connection = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=30)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            for statement in connection.iterdump():
+                encoded = statement.encode("utf-8")
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+        finally:
+            connection.close()
+    except (sqlite3.Error, UnicodeError) as error:
+        raise ReleaseError(f"database content authority cannot be hashed: {error}") from error
+    return digest.hexdigest()
+
+
 def preflight_clone(data_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     db_path = data_dir / "cortex-speech.db"
     with tempfile.TemporaryDirectory(prefix="cortex-release-preflight-") as raw:
         clone = Path(raw)
         sqlite_backup(db_path, clone / "cortex-speech.db")
+        source_schema = database_schema(clone / "cortex-speech.db")
+        allowed = SUPPORTED_MIGRATION_SOURCES | {EXPECTED_SCHEMA}
+        if source_schema not in allowed:
+            raise ReleaseError(
+                f"clone preflight accepts only schema {PRODUCTION_SCHEMA_BOUNDARY}->schema {EXPECTED_SCHEMA} "
+                f"or same-schema {EXPECTED_SCHEMA}, not schema {source_schema}"
+            )
         for name in PROFILE_STATE:
             source = data_dir / name
             if source.is_file():
                 shutil.copy2(source, clone / name)
         admin = str(manifest["poolAdminExe"])
-        run_json([admin, "migrate", "--db", str(clone / "cortex-speech.db")], timeout=300)
+        migration = run_json([admin, "migrate", "--db", str(clone / "cortex-speech.db")], timeout=300)
+        if migration.get("appGitSha") != manifest["appGitSha"]:
+            raise ReleaseError("candidate migration came from a different release commit")
+        if migration.get("beforeSchemaVersion") != source_schema:
+            raise ReleaseError("candidate migration did not report the clone's exact source schema")
+        if migration.get("afterSchemaVersion") != EXPECTED_SCHEMA:
+            raise ReleaseError(f"candidate migration did not reach schema {EXPECTED_SCHEMA}")
+        expected_migrated = source_schema != EXPECTED_SCHEMA
+        if migration.get("migrated") is not expected_migrated:
+            raise ReleaseError("candidate migration changed-state report contradicts the schema boundary")
         run_json(
             [admin, "apply-dedup", "--db", str(clone / "cortex-speech.db"), "--manifest", str(manifest["dedupManifest"])],
             timeout=600,
@@ -391,7 +747,12 @@ def preflight_clone(data_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
             raise ReleaseError("candidate clone has missing or changed pool audio")
         if report.get("rights", {}).get("allExact") is not True:
             raise ReleaseError("candidate clone did not establish exact owner rights")
-        return {"rights": rights, "certification": report}
+        return {
+            "sourceSchemaVersion": source_schema,
+            "migration": migration,
+            "rights": rights,
+            "certification": report,
+        }
 
 
 def powershell_file(path: Path, *arguments: str, timeout: int = 300) -> None:
@@ -523,13 +884,13 @@ def prove_canonical_queues(data_dir: Path, manifest: dict[str, Any]) -> dict[str
         probe = run_json(probe_command, timeout=180)
         count = probe.get("availableClips")
         if type(count) is not int or count <= 0:
-            raise ReleaseError(f"canonical v64 queue is empty for reviewer {reviewer}")
+            raise ReleaseError(f"canonical release queue is empty for reviewer {reviewer}")
         if (
             probe.get("passes") is not True
             or probe.get("sampleAudioValidWav") is not True
             or probe.get("submissionIdempotencyAuthority") is not True
         ):
-            raise ReleaseError(f"canonical v64 audio/idempotency probe failed for reviewer {reviewer}")
+            raise ReleaseError(f"canonical release audio/idempotency probe failed for reviewer {reviewer}")
         benchmark_command = [
             str(manifest["poolAdminExe"]),
             "benchmark",
@@ -544,7 +905,7 @@ def prove_canonical_queues(data_dir: Path, manifest: dict[str, Any]) -> dict[str
             benchmark_command.extend(["--dialect", dialect])
         benchmark = run_json(benchmark_command, timeout=180)
         if benchmark.get("passes") is not True:
-            raise ReleaseError(f"canonical v64 queue latency failed for reviewer {reviewer}")
+            raise ReleaseError(f"canonical release queue latency failed for reviewer {reviewer}")
         available[reviewer] = count
     return available
 
@@ -572,6 +933,9 @@ def certify_live(data_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     )
     if report.get("appGitSha") != manifest["appGitSha"]:
         raise ReleaseError("live certification came from a different release commit")
+    manifest_schema = int(manifest["expectedDatabaseSchema"])
+    if report.get("databaseSchemaVersion") != manifest_schema:
+        raise ReleaseError(f"live certification did not prove schema {manifest_schema}")
     if report.get("rights", {}).get("allExact") is not True:
         raise ReleaseError("live pool rights are incomplete or conflicting")
     if report.get("audio", {}).get("allAvailable") is not True:
@@ -579,9 +943,39 @@ def certify_live(data_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     return report
 
 
-def snapshot_before_handover(data_dir: Path, manifest: dict[str, Any]) -> Path:
+def validate_snapshot_manifest_authority(
+    snapshot: Path,
+    *,
+    expected_sha256: str | None = None,
+) -> str:
+    """Verify the complete sealed snapshot inventory and bind its exact manifest bytes."""
+
+    if snapshot.is_symlink():
+        raise ReleaseError(f"rollback snapshot must not be a symlink: {snapshot}")
+    resolved = snapshot.resolve(strict=True)
+    if not resolved.is_dir():
+        raise ReleaseError(f"rollback snapshot is not a directory: {resolved}")
+    manifest_path = validate_artifact(resolved / "SNAPSHOT_MANIFEST.json", "rollback snapshot manifest")
+    digest = sha256_file(manifest_path)
+    if expected_sha256 is not None:
+        if not SHA64.fullmatch(expected_sha256):
+            raise ReleaseError("rollback snapshot manifest authority is invalid")
+        if digest != expected_sha256:
+            raise ReleaseError("rollback snapshot is not the exact snapshot captured for this handover")
+    try:
+        from restore_drill import SnapshotValidationError, validate_snapshot_manifest
+
+        validate_snapshot_manifest(resolved)
+    except (ImportError, OSError, SnapshotValidationError, ValueError) as error:
+        raise ReleaseError(f"rollback snapshot manifest validation failed: {error}") from error
+    return digest
+
+
+def snapshot_before_handover(data_dir: Path, manifest: dict[str, Any]) -> tuple[Path, str]:
     script = Path(str(manifest["directory"])) / "scripts" / "create_recovery_snapshot.py"
-    label = f"preprivate_v{database_schema(data_dir / 'cortex-speech.db')}_to_v{EXPECTED_SCHEMA}"
+    live_database = data_dir / "cortex-speech.db"
+    live_schema = database_schema(live_database)
+    label = f"preprivate_v{live_schema}_to_v{EXPECTED_SCHEMA}"
     result = run([sys.executable, str(script), "--data-dir", str(data_dir), "--label", label], timeout=600)
     local = next((line.split("=", 1)[1].strip() for line in result.stdout.splitlines() if line.startswith("LOCAL_SNAPSHOT=")), None)
     if not local:
@@ -589,46 +983,127 @@ def snapshot_before_handover(data_dir: Path, manifest: dict[str, Any]) -> Path:
     snapshot = Path(local).resolve(strict=True)
     if not (snapshot / "cortex-speech.db").is_file() or not (snapshot / "SNAPSHOT_MANIFEST.json").is_file():
         raise ReleaseError("pre-handover snapshot is incomplete")
-    return snapshot
+    manifest_sha = validate_snapshot_manifest_authority(snapshot)
+    snapshot_database = snapshot / "cortex-speech.db"
+    if database_schema(snapshot_database) != live_schema:
+        raise ReleaseError("pre-handover snapshot database schema differs from the stopped live database")
+    if database_content_sha256(snapshot_database) != database_content_sha256(live_database):
+        raise ReleaseError("pre-handover snapshot is not the exact stopped live database generation")
+    # Bind the same closed inventory again after logical comparison. A concurrent replacement of
+    # either the manifest or its listed database cannot win the validate/compare handoff.
+    validate_snapshot_manifest_authority(snapshot, expected_sha256=manifest_sha)
+    return snapshot, manifest_sha
 
 
-def restore_database(snapshot: Path, data_dir: Path, expected_schema: int) -> Path:
-    source = snapshot / "cortex-speech.db"
+def restore_database(
+    snapshot: Path,
+    data_dir: Path,
+    expected_schema: int,
+    expected_manifest_sha256: str,
+) -> Path:
+    with exclusive_instance_lock(data_dir):
+        return _restore_database_locked(
+            snapshot,
+            data_dir,
+            expected_schema,
+            expected_manifest_sha256,
+        )
+
+
+def _restore_database_locked(
+    snapshot: Path,
+    data_dir: Path,
+    expected_schema: int,
+    expected_manifest_sha256: str,
+) -> Path:
+    validate_snapshot_manifest_authority(snapshot, expected_sha256=expected_manifest_sha256)
+    source = validate_artifact(snapshot / "cortex-speech.db", "rollback snapshot database")
+    source_digest = database_content_sha256(source)
     if database_schema(source) != expected_schema:
         raise ReleaseError("rollback snapshot schema does not match the pre-handover database")
     live = data_dir / "cortex-speech.db"
     temporary = data_dir / f".cortex-speech.rollback.{os.getpid()}.{time.time_ns()}.db"
-    sqlite_backup(source, temporary)
-    if database_schema(temporary) != expected_schema:
-        temporary.unlink(missing_ok=True)
-        raise ReleaseError("staged rollback database failed schema verification")
-    check = sqlite3.connect(temporary)
     try:
-        if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-            raise ReleaseError("staged rollback database failed integrity_check")
-        if check.execute("PRAGMA foreign_key_check").fetchone() is not None:
-            raise ReleaseError("staged rollback database has foreign-key violations")
+        sqlite_backup(source, temporary)
+        if database_schema(temporary) != expected_schema:
+            raise ReleaseError("staged rollback database failed schema verification")
+        if database_content_sha256(temporary) != source_digest:
+            raise ReleaseError("staged rollback database is not the exact logical snapshot authority")
+        check = sqlite3.connect(temporary)
+        try:
+            if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise ReleaseError("staged rollback database failed integrity_check")
+            if check.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise ReleaseError("staged rollback database has foreign-key violations")
+        finally:
+            check.close()
+        # Revalidate after the backup so a changed snapshot can never win a validate/copy race.
+        validate_snapshot_manifest_authority(snapshot, expected_sha256=expected_manifest_sha256)
+
+        quarantine = data_dir / "recovery-quarantine"
+        quarantine.mkdir(exist_ok=True)
+        live_schema = database_schema(live)
+        live_digest = database_content_sha256(live)
+        preserved = quarantine / f"cortex-speech.failed-v{live_schema}.{time.time_ns()}.db"
+        preserved_temporary = quarantine / f".{preserved.name}.{os.getpid()}.tmp"
+        try:
+            sqlite_backup(live, preserved_temporary)
+            if database_content_sha256(preserved_temporary) != live_digest:
+                raise ReleaseError("failed database quarantine copy lost WAL-visible committed state")
+            durable_replace(preserved_temporary, preserved)
+        finally:
+            preserved_temporary.unlink(missing_ok=True)
+
+        # Checkpoint before detaching sidecars. If another writer changes the database anywhere in
+        # this boundary, refuse the replacement and leave the current database authoritative.
+        checkpoint = sqlite3.connect(live, timeout=30)
+        try:
+            mode = str(checkpoint.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            if mode == "wal":
+                busy, _log, _checkpointed = checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if int(busy) != 0:
+                    raise ReleaseError("live database WAL is busy; rollback refuses a concurrent writer")
+        finally:
+            checkpoint.close()
+        if database_content_sha256(live) != live_digest:
+            raise ReleaseError("live database changed while rollback was preparing its replacement")
+
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(live) + suffix)
+            if sidecar.exists():
+                # Keep raw forensic bytes without giving them SQLite's magic companion filename.
+                # A logical backup has its own page salts; attaching the failed database's WAL/SHM
+                # to it could replay foreign frames into the very quarantine copy meant to preserve
+                # evidence, or make that copy appear corrupt on its next open.
+                durable_replace(sidecar, Path(str(preserved) + f".source{suffix}"))
+        durable_replace(temporary, live)
+        return preserved
     finally:
-        check.close()
-    quarantine = data_dir / "recovery-quarantine"
-    quarantine.mkdir(exist_ok=True)
-    preserved = quarantine / f"cortex-speech.failed-v{database_schema(live)}.{int(time.time())}.db"
-    for sidecar in (Path(str(live) + "-wal"), Path(str(live) + "-shm")):
-        sidecar.unlink(missing_ok=True)
-    os.replace(live, preserved)
-    os.replace(temporary, live)
-    return preserved
+        temporary.unlink(missing_ok=True)
 
 
-def rollback_policy(source_schema: int, current_schema: int, baseline_id: int, current_id: int, previous_schema: int | None) -> str:
-    if current_id > baseline_id:
+def rollback_policy(
+    source_schema: int,
+    current_schema: int,
+    baseline_id: int,
+    current_id: int,
+    previous_schema: int | None,
+    *,
+    database_changed: bool = False,
+) -> str:
+    if current_schema > EXPECTED_SCHEMA:
+        return "blocked"
+    if source_schema in SUPPORTED_MIGRATION_SOURCES and current_schema == source_schema:
+        # No database rollback is needed or permitted here. A decision may have completed after the
+        # first baseline read but before maintenance stopped the old app; resume the exact compatible
+        # binary and preserve that forward progress.
+        return "resume-pre-migration"
+    if current_id > baseline_id or database_changed:
         if current_schema == EXPECTED_SCHEMA and previous_schema == EXPECTED_SCHEMA:
             return "binary-only"
         return "preserve-current" if current_schema == EXPECTED_SCHEMA else "blocked"
-    if source_schema < EXPECTED_SCHEMA and current_schema == EXPECTED_SCHEMA:
+    if source_schema in SUPPORTED_MIGRATION_SOURCES and current_schema == EXPECTED_SCHEMA:
         return "restore-pre-migration"
-    if source_schema < EXPECTED_SCHEMA and current_schema == source_schema:
-        return "resume-pre-migration"
     if source_schema == EXPECTED_SCHEMA and previous_schema == EXPECTED_SCHEMA:
         return "binary-only"
     return "blocked"
@@ -657,29 +1132,106 @@ def register_release_tasks(manifest: dict[str, Any]) -> None:
     powershell_file(root / "scripts" / "ops" / "cortex-daily-restore-drill.ps1", "-Register")
 
 
+def validate_release_journal(
+    path: Path,
+    release_root: Path,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
+    journal = load_json(path)
+    if set(journal) != JOURNAL_FIELDS:
+        raise ReleaseError(
+            "release journal fields are invalid "
+            f"(missing={sorted(JOURNAL_FIELDS - set(journal))}, extra={sorted(set(journal) - JOURNAL_FIELDS)})"
+        )
+    if type(journal["schema"]) is not int or journal["schema"] != 2:
+        raise ReleaseError("release journal schema must be integer 2")
+    if journal["phase"] not in JOURNAL_PHASES:
+        raise ReleaseError("release journal phase is invalid")
+    source_schema = journal["sourceSchema"]
+    if type(source_schema) is not int or source_schema not in (SUPPORTED_MIGRATION_SOURCES | {EXPECTED_SCHEMA}):
+        raise ReleaseError(
+            f"release journal source must be schema {PRODUCTION_SCHEMA_BOUNDARY} or {EXPECTED_SCHEMA}"
+        )
+    baseline = journal["baselinePoolDecisionId"]
+    if type(baseline) is not int or baseline < 0:
+        raise ReleaseError("release journal decision baseline is invalid")
+    candidate_value = journal["candidate"]
+    if not isinstance(candidate_value, dict):
+        raise ReleaseError("release journal candidate is invalid")
+    candidate = validate_manifest(candidate_value, expected_root=release_root)
+    previous_value = journal["previousActive"]
+    previous: dict[str, Any] | None = None
+    if previous_value is not None:
+        if not isinstance(previous_value, dict):
+            raise ReleaseError("release journal previousActive is invalid")
+        previous = validate_manifest(previous_value, expected_root=release_root, allow_compatible_previous=True)
+    if source_schema == PRODUCTION_SCHEMA_BOUNDARY:
+        if previous is not None and int(previous["expectedDatabaseSchema"]) != PRODUCTION_SCHEMA_BOUNDARY:
+            raise ReleaseError("schema-65 handover previous release is not a schema-65 legacy boundary")
+    elif previous is None or int(previous["expectedDatabaseSchema"]) != EXPECTED_SCHEMA:
+        raise ReleaseError(f"schema-{EXPECTED_SCHEMA} handover requires a schema-{EXPECTED_SCHEMA} previous release")
+
+    digest = journal["targetDatabaseSha256"]
+    if digest is not None and (not isinstance(digest, str) or not SHA64.fullmatch(digest)):
+        raise ReleaseError("release journal target database digest is invalid")
+    if journal["phase"] in {"candidate-certified", "candidate-active", "exposed"} and digest is None:
+        raise ReleaseError("release journal lost the post-migration database authority")
+    for field in ("fallbackApp", "fallbackWatchdog", "snapshotDir"):
+        if journal[field] is not None and (not isinstance(journal[field], str) or not journal[field]):
+            raise ReleaseError(f"release journal {field} is invalid")
+    snapshot_digest = journal["snapshotManifestSha256"]
+    if snapshot_digest is not None and (
+        not isinstance(snapshot_digest, str) or not SHA64.fullmatch(snapshot_digest)
+    ):
+        raise ReleaseError("release journal snapshot manifest authority is invalid")
+    if (journal["snapshotDir"] is None) != (snapshot_digest is None):
+        raise ReleaseError("release journal snapshot directory and manifest authority must be paired")
+    if source_schema == PRODUCTION_SCHEMA_BOUNDARY and journal["phase"] in {
+        "snapshotted",
+        "candidate-certified",
+        "candidate-active",
+        "exposed",
+    }:
+        if journal["snapshotDir"] is None:
+            raise ReleaseError("schema-65 handover journal lost its bound rollback snapshot")
+    return journal, candidate, previous
+
+
 def recover(data_dir: Path, release_root: Path) -> bool:
     journal_path = data_dir / JOURNAL_FILE
     if not journal_path.is_file():
         unregister_task(RECOVERY_TASK)
         return True
-    journal = load_json(journal_path)
-    candidate = validate_manifest(journal["candidate"], expected_root=release_root)
-    previous = journal.get("previousActive")
-    if previous is not None:
-        if not isinstance(previous, dict):
-            raise ReleaseError("release journal previousActive is invalid")
-        previous = validate_manifest(previous, expected_root=release_root, allow_compatible_previous=True)
+    journal, candidate, previous = validate_release_journal(journal_path, release_root)
     source_schema = int(journal["sourceSchema"])
     baseline = int(journal["baselinePoolDecisionId"])
     db = data_dir / "cortex-speech.db"
     current_schema = database_schema(db)
+    if current_schema > EXPECTED_SCHEMA:
+        raise ReleaseError(
+            f"automatic recovery refuses future database schema {current_schema}; "
+            f"this release supports at most {EXPECTED_SCHEMA}"
+        )
+    if current_schema not in {source_schema, EXPECTED_SCHEMA}:
+        raise ReleaseError(
+            f"interrupted handover reached unsupported schema {current_schema} from source schema {source_schema}"
+        )
     current_id = max_pool_decision_id(db)
+    database_changed = False
+    target_digest = journal["targetDatabaseSha256"]
+    if source_schema in SUPPORTED_MIGRATION_SOURCES and current_schema == EXPECTED_SCHEMA:
+        if target_digest is not None:
+            database_changed = database_content_sha256(db) != target_digest
+        elif journal["phase"] in {"candidate-certified", "candidate-active", "exposed"}:
+            # validate_release_journal normally catches this. Keep the recovery decision locally
+            # fail-closed even if a future journal reader relaxes shape validation.
+            raise ReleaseError("post-migration database authority is missing; rollback safety is unknowable")
     mode = rollback_policy(
         source_schema,
         current_schema,
         baseline,
         current_id,
         int(previous["expectedDatabaseSchema"]) if previous else None,
+        database_changed=database_changed,
     )
     write_maintenance(data_dir, str(candidate["releaseId"]))
     task_change(WATCHDOG_TASK, False, allow_missing=True)
@@ -696,7 +1248,12 @@ def recover(data_dir: Path, release_root: Path) -> bool:
         preserved: Path | None = None
         if mode == "restore-pre-migration":
             snapshot = Path(str(journal.get("snapshotDir", ""))).resolve(strict=True)
-            preserved = restore_database(snapshot, data_dir, source_schema)
+            preserved = restore_database(
+                snapshot,
+                data_dir,
+                source_schema,
+                str(journal["snapshotManifestSha256"]),
+            )
         if previous is not None and int(previous["expectedDatabaseSchema"]) == source_schema:
             atomic_json(data_dir / POINTER_FILE, previous)
             launch_app(Path(str(previous["appExe"])))
@@ -775,18 +1332,14 @@ def deploy(args: argparse.Namespace) -> int:
     if (data_dir / JOURNAL_FILE).exists():
         raise ReleaseError("a prior release handover is unfinished; run the recover command first")
     source_schema = database_schema(db)
-    if source_schema not in {63, COMPATIBLE_PREVIOUS_SCHEMA, EXPECTED_SCHEMA}:
+    if source_schema not in (SUPPORTED_MIGRATION_SOURCES | {EXPECTED_SCHEMA}):
         raise ReleaseError(
-            f"deployment accepts only the proven v63/v{COMPATIBLE_PREVIOUS_SCHEMA}->v{EXPECTED_SCHEMA} "
-            f"or v{EXPECTED_SCHEMA}->v{EXPECTED_SCHEMA} path, not schema v{source_schema}"
+            f"deployment accepts only the proven v{PRODUCTION_SCHEMA_BOUNDARY}->v{EXPECTED_SCHEMA} "
+            f"or same-schema v{EXPECTED_SCHEMA} path, not schema v{source_schema}"
         )
     session_reviewers(data_dir)
     previous = active_pointer(data_dir, release_root)
-    if (
-        source_schema < EXPECTED_SCHEMA
-        and previous is not None
-        and previous.get("expectedDatabaseSchema") != source_schema
-    ):
+    if previous is not None and previous.get("expectedDatabaseSchema") != source_schema:
         raise ReleaseError("the active release pointer is not compatible with the pre-migration database")
     if source_schema == EXPECTED_SCHEMA and previous is None:
         raise ReleaseError(
@@ -795,6 +1348,8 @@ def deploy(args: argparse.Namespace) -> int:
     manifest = stage_release(args.candidate_dir, args.source_root, release_root, args.git_sha, args.dedup_manifest)
     print(f"STAGED_RELEASE={manifest['releaseId']}")
     preflight = preflight_clone(data_dir, manifest)
+    if preflight["sourceSchemaVersion"] != source_schema:
+        raise ReleaseError("clone preflight source schema differs from the live database boundary")
     audio = preflight["certification"]["audio"]
     print(
         "PREFLIGHT_CLONE=PASS "
@@ -813,7 +1368,7 @@ def deploy(args: argparse.Namespace) -> int:
 
     baseline = max_pool_decision_id(db)
     journal: dict[str, Any] = {
-        "schema": 1,
+        "schema": 2,
         "phase": "prepared",
         "startedAtUtc": utc_now(),
         "sourceSchema": source_schema,
@@ -823,6 +1378,8 @@ def deploy(args: argparse.Namespace) -> int:
         "fallbackApp": str(fallback_app) if fallback_app else None,
         "fallbackWatchdog": str(fallback_watchdog) if fallback_watchdog else None,
         "snapshotDir": None,
+        "snapshotManifestSha256": None,
+        "targetDatabaseSha256": None,
     }
     atomic_json(data_dir / JOURNAL_FILE, journal)
     write_maintenance(data_dir, str(manifest["releaseId"]))
@@ -838,15 +1395,27 @@ def deploy(args: argparse.Namespace) -> int:
         stop_app([current_app] if current_app else [])
         baseline = max_pool_decision_id(db)
         journal["baselinePoolDecisionId"] = baseline
-        snapshot = snapshot_before_handover(data_dir, manifest)
+        # Persist the last writer-free baseline before starting snapshot I/O. A crash in this
+        # interval must resume against the exact decision frontier observed after process stop,
+        # never the earlier pre-maintenance observation.
+        atomic_json(data_dir / JOURNAL_FILE, journal)
+        snapshot, snapshot_manifest_sha = snapshot_before_handover(data_dir, manifest)
         journal["snapshotDir"] = str(snapshot)
+        journal["snapshotManifestSha256"] = snapshot_manifest_sha
         journal["phase"] = "snapshotted"
         atomic_json(data_dir / JOURNAL_FILE, journal)
 
         admin = str(manifest["poolAdminExe"])
         migration = run_json([admin, "migrate", "--db", str(db)], timeout=600)
+        if migration.get("appGitSha") != manifest["appGitSha"]:
+            raise ReleaseError("live migration came from a different release commit")
+        if migration.get("beforeSchemaVersion") != source_schema:
+            raise ReleaseError("live migration did not report the exact source schema")
         if migration.get("afterSchemaVersion") != EXPECTED_SCHEMA:
             raise ReleaseError(f"live migration did not reach schema {EXPECTED_SCHEMA}")
+        expected_migrated = source_schema != EXPECTED_SCHEMA
+        if migration.get("migrated") is not expected_migrated:
+            raise ReleaseError("live migration changed-state report contradicts the schema boundary")
         run_json(
             [admin, "apply-dedup", "--db", str(db), "--manifest", str(manifest["dedupManifest"])],
             timeout=600,
@@ -856,6 +1425,11 @@ def deploy(args: argparse.Namespace) -> int:
         queues = prove_canonical_queues(data_dir, manifest)
         if max_pool_decision_id(db) != baseline:
             raise ReleaseError("review decision history changed while the maintenance gate was active")
+        journal["targetDatabaseSha256"] = database_content_sha256(db)
+        journal["phase"] = "candidate-certified"
+        atomic_json(data_dir / JOURNAL_FILE, journal)
+        if database_content_sha256(db) != journal["targetDatabaseSha256"]:
+            raise ReleaseError("database changed after candidate certification and before activation")
         atomic_json(data_dir / POINTER_FILE, manifest)
         journal["phase"] = "candidate-active"
         atomic_json(data_dir / JOURNAL_FILE, journal)
@@ -869,6 +1443,8 @@ def deploy(args: argparse.Namespace) -> int:
         task_change(LEGACY_WATCHDOG_TASK, False, allow_missing=True)
         if max_pool_decision_id(db) != baseline:
             raise ReleaseError("review decision history changed before candidate exposure")
+        if database_content_sha256(db) != journal["targetDatabaseSha256"]:
+            raise ReleaseError("database changed after candidate activation and before exposure")
         (data_dir / MAINTENANCE_FILE).unlink(missing_ok=True)
         journal["phase"] = "exposed"
         atomic_json(data_dir / JOURNAL_FILE, journal)

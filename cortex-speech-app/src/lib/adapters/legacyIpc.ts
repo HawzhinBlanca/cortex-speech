@@ -18,66 +18,16 @@ type CommandResult<Name extends keyof CommandService> = Awaited<
  * a future build step bypasses TypeScript.
  */
 export const LEGACY_IPC_COMMANDS = [
-  'align_segment',
-  'batch_normalize',
-  'batch_transcribe',
-  'build_scorecard',
-  'check_agentic_readiness',
-  'compute_signal_anomaly_scores',
   'couch_review_status',
-  'create_gold_from_file',
   'export_agreement_sample',
-  'export_audio',
-  'export_dataset',
-  'export_finetune_pack',
-  'export_gold_eval_set',
-  'export_huggingface_dataset',
-  'export_transcript',
-  'get_active_learning_queue',
-  'get_audio_health',
-  'get_escalation_queue',
-  'get_escalation_rate_trend',
-  'get_intelligence_report',
-  'get_segment_consensus',
-  'get_waveform',
-  'import_audio_file',
-  'import_directory',
-  'import_verified_segments_as_gold',
-  'list_agent_import_reports',
-  'list_agent_stage_events',
-  'list_eval_runs',
-  'merge_dataset_json',
-  'open_audio_file',
-  'record_review_flag',
-  'rediarize_segments',
-  'relink_audio',
   'reviewer_throughput',
   'revoke_couch_reviewer',
-  'run_gold_eval_asr',
-  'run_jury_pipeline',
-  'run_t2_for_segment',
-  'run_wsl_refinement',
   'spot_check_report',
   'start_couch_review',
   'stop_couch_review',
-  'transcribe_segment',
-  'undo_human_decision',
-  'undo_review_flag',
-  'validate_dataset_cmd',
 ] as const;
 
 type CriticalLegacyIpcContract = {
-  open_audio_file: { args: undefined; result: CommandResult<'openAudioFile'> };
-  import_directory: { args: undefined; result: CommandResult<'importDirectory'> };
-  import_audio_file: { args: { path: string }; result: CommandResult<'importAudioFile'> };
-  export_dataset: {
-    args: { path: string; format: string };
-    result: CommandResult<'exportDataset'>;
-  };
-  export_transcript: {
-    args: { path: string; format: 'txt' | 'srt' | 'vtt' };
-    result: CommandResult<'exportTranscript'>;
-  };
   start_couch_review: {
     args: { reviewers: string[] };
     result: CommandResult<'startCouchReview'>;
@@ -93,57 +43,6 @@ type CriticalLegacyIpcContract = {
   export_agreement_sample: {
     args: undefined;
     result: CommandResult<'exportAgreementSample'>;
-  };
-  get_audio_health: { args: undefined; result: CommandResult<'getAudioHealth'> };
-  relink_audio: { args: { searchDir: string }; result: CommandResult<'relinkAudio'> };
-  validate_dataset_cmd: { args: undefined; result: CommandResult<'validateDataset'> };
-  export_audio: {
-    args: {
-      segmentIds: string[];
-      options: {
-        output_dir: string;
-        format: 'Wav';
-        sample_rate: number;
-        include_metadata: boolean;
-      };
-    };
-    result: CommandResult<'exportAudio'>;
-  };
-  merge_dataset_json: {
-    args: { jsonContent: string };
-    result: CommandResult<'mergeDatasetJson'>;
-  };
-  export_huggingface_dataset: {
-    args: { path: string };
-    result: CommandResult<'exportHuggingfaceDataset'>;
-  };
-  create_gold_from_file: {
-    args: { audioPath: string };
-    result: CommandResult<'createGoldFromFile'>;
-  };
-  import_verified_segments_as_gold: {
-    args: undefined;
-    result: CommandResult<'importVerifiedSegmentsAsGold'>;
-  };
-  export_gold_eval_set: {
-    args: { outDir: string };
-    result: CommandResult<'exportGoldEvalSet'>;
-  };
-  export_finetune_pack: {
-    args: { outDir: string };
-    result: CommandResult<'exportFinetunePack'>;
-  };
-  undo_human_decision: {
-    args: { effectEventId: number; operationId: string };
-    result: CommandResult<'undoHumanDecision'>;
-  };
-  record_review_flag: {
-    args: { segmentId: string; rationale: string; operationId: string };
-    result: CommandResult<'recordReviewFlag'>;
-  };
-  undo_review_flag: {
-    args: { effectEventId: number; operationId: string };
-    result: CommandResult<'undoReviewFlag'>;
   };
 };
 

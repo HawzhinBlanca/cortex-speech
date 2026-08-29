@@ -11918,3 +11918,79 @@ compensation implementation was untouched. No production database, release point
 model, process, port, reviewer truth, or payment state was changed. Honest status: **PROOF GAP CLOSED
 AND OWNER OPT-INS ROUTED — MEDIA/SCALE EXECUTION, COVERAGE, ARCHITECTURE AND RELEASE EVIDENCE STILL
 PENDING — NOT 10/10**.
+
+## 2026-08-29 — ROBUSTNESS LOOP, iteration 1 (restore domain)
+
+- **Doctrine**: `docs/ROBUSTNESS_LOOP.md` (owner mode: one-day continuous, in-session, no cron;
+  codex trees off limits). Scoreboard: `cortex-speech-app/scripts/robustness_scoreboard.py`.
+- **Scoreboard at start**: P0 live GREEN (probe, 6 min old) · P2 hygiene GREEN ·
+  P1 coverage RED — restore 56.85% branches (642 uncovered), ipc 39.84% (616),
+  review 56.36% (240), payment 55.66% (235), playback 57.84% (156).
+- **Target selection**: ipc ranks 2nd by size but was SKIPPED — codex has `commands.rs` and nearly
+  every `commands/*.rs` dirty; tests there would impose merge conflicts. restore taken instead: its
+  top functions (`effects.rs`, `compensation.rs`) are NOT in codex's dirty set.
+- **Work**: `restore_service/effects.rs` — first tests in the module. Three refusal arms of
+  `validate_review_effect_semantics`: forged effect on a skip event, a Couch decision stripped of
+  its human/pay effect, and a deleted schema-v60 frontier row.
+- **Correction inside the iteration**: the frontier test's first version asserted only
+  `if rows > 1`, which could never fire (`singleton_key ... CHECK(singleton_key = 1)`). Rewritten to
+  the reachable zero-row violation, asserted unconditionally.
+- **Result**: `cargo test --lib restore_service` → `3 passed; 0 failed` (exit 0, captured from
+  cargo, not a pipe). Bite proven: with the corruptions neutered the suite fails, exit 101, 2 failed.
+- **Commit**: `629947b0`, pushed to `origin/public/clean-release`.
+- **Next**: re-measure, then `compensation.rs::validate_review_compensation_semantics`
+  (216 uncovered branches, also codex-clean).
+
+## 2026-08-29 — ROBUSTNESS LOOP, iteration 2 (payment arithmetic)
+
+- **Target**: `restore_service/compensation.rs` — the pure guards that decide what a reviewer is
+  OWED. Codex-clean. Chosen over ipc again (codex holds `commands*.rs`).
+- **Work**: 5 tests. `exact_review_entitlement` asserted against LITERAL amounts (1s edit =
+  5_000_000 micro-IQD; 1 audio-hour = 18_000_000_000) so a silent rate change fails, plus refusals
+  for invalid duration/bps, non-exact micro-IQD (never rounded), and past-i64 (never wrapped).
+  The work-id namespace tests are the anti-fraud rule: no re-attribution between reviewers, no
+  length-prefix impersonation, no half-span claiming a full clip, 8 malformed shapes refused.
+- **Bite proof**: sabotaged the PRODUCT (dropped the namespace length prefix; made the exactness
+  check permissive) → 2 tests failed, exit 101. Reverted; final diff `+144/-0`, tests only.
+- **Honest gap**: the i128 overflow arm is unreachable given bps<=10_000 and i64 duration; recorded
+  in the test rather than exercised through a fake path.
+- **Result**: `cargo test --lib restore_service` → `8 passed; 0 failed` (exit 0, captured).
+- **Commit**: `6deb6f84`, pushed to `origin/public/clean-release`.
+- **Also**: doctrine fix — never start a measurement while an iteration is in flight; a run pinned
+  to `a334408f` was invalidated by iteration 1's own commit (35 min lost, guard worked correctly).
+- **Next**: measure from HEAD (end-of-iteration, per doctrine), then pick from the fresh scoreboard.
+
+## 2026-08-29 — ROBUSTNESS LOOP, iteration 3: DEFECT FOUND (restore refuses a real phone undo)
+
+**Not a coverage iteration — a defect report. No product change made; surfaced for the owner.**
+
+While writing refusal tests for `validate_review_effect_semantics`, the BASELINE failed: a
+decide-then-undo sequence built ENTIRELY from production APIs is refused as forged.
+
+Reproduction (in `cortex-scrub`, patch saved at scratchpad/undo-tests.patch):
+1. `record_phone_human_decision_by_at_revision_with_operation(..., "edit", ...)` — op `...019a`
+2. `undo_human_decision(effect_id, Some("Reviewer"), ...)` — op `...019b`
+3. `validate_review_effect_semantics(&db)` →
+   `"database restore refused: phone decision reversal 1 lacks its exact operation-bound compensation inverse"`
+
+Measured state at that point (no forgery, no dropped triggers):
+- `review_events` = [(1, "couch", "edit", Some("…019a"))]      <- carries the DECISION's operation
+- `human_decision_effect_reversals` = [(1, "…019b")]           <- the UNDO's operation
+- `review_compensation_ledger` = [("review-event:1", None), ("undo:…019b", Some(<entry>))]  <- correct inverse
+
+Mechanism: `effects.rs` (~L611-645) binds `?2` to the UNDO's operation id, then requires
+`event.operation_id = ?2` on the DECISION's review event. Those are different operations by
+construction, so the clause can never hold. `reversal.entry_key = 'undo:' || ?2` in the same query
+ALREADY binds the inverse to the undo operation, so the failing clause looks redundant as well as
+wrong — but changing an integrity validator is owner territory, so nothing was altered.
+
+Live reachability CONFIRMED: `couch/decisions.rs:1671` — `api_undo` calls
+`db.undo_human_decision(entry.effect_event_id, Some(reviewer), &entry.operation_id)`. A reviewer
+pressing Undo in Couch Review produces exactly this state.
+
+Impact: fails CLOSED (refuses, never corrupts), but any backup containing an undone phone decision
+cannot be restored — and restore exists to recover reviewer work. The desktop branch is unaffected
+(it takes the `else` path), which is why existing tests, which undo with `actor: None`, never hit it.
+
+Tree left green and clean: the two in-progress tests were reverted (`8 passed; 0 failed`), since a
+test asserting the current behaviour would pin the defect.

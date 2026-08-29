@@ -162,6 +162,12 @@ JOB_STORE_COMMANDS = {
     "export_finetune_pack",
 }
 
+# Mutating commands that must hold explicit restore-generation mutation authority for the complete
+# read/compare/write operation. `db_arc().lock()` only waits out an already-pending restore; it does
+# not make a later restore reservation observe the in-flight mutation. These commands therefore
+# receive the DatabaseRuntime capability and must enter mutation admission before taking its writer.
+MUTATION_RUNTIME_COMMANDS = {"relink_audio", "db_vacuum", "merge_dataset_json"}
+
 
 def source() -> str:
     """The whole command surface: commands.rs + every extracted slice under src/commands/."""
@@ -224,6 +230,15 @@ def test_migrated_exports_do_not_hold_lock_db_across_the_await() -> None:
                 raise AssertionError(f"`{name}` must obtain its tracked JobStore before the blocking task")
             if "state.db_arc()" in body or ".run_tracked(" in body:
                 raise AssertionError(f"`{name}` regained raw database or job-lifecycle authority")
+        elif name in MUTATION_RUNTIME_COMMANDS:
+            if "state.db_runtime()" not in body:
+                raise AssertionError(f"`{name}` must obtain restore-aware mutation authority via state.db_runtime()")
+            if "begin_mutation()" not in body or "lock_after_mutation(" not in body:
+                raise AssertionError(
+                    f"`{name}` must hold mutation admission before taking the serialized writer"
+                )
+            if "state.db_arc()" in body:
+                raise AssertionError(f"`{name}` must not fall back to the weaker raw DB lock path")
         elif "state.db_arc()" not in body:
             raise AssertionError(f"`{name}` must obtain the DB via state.db_arc() for the blocking task")
 

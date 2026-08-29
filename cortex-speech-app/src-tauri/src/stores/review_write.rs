@@ -1,9 +1,12 @@
 //! Serialized human-review effect writes that already expose a stable database-domain contract.
 
-use crate::database_runtime::DatabaseRuntime;
+use crate::database_runtime::{DatabaseRuntime, MutationGuard, RestoreGeneration};
+#[cfg(test)]
+use crate::db::DesktopReviewUndoAuthority;
 use crate::db::{
-    HumanDecisionCommit, HumanDecisionUndoOutcome, HumanFlagCommit, HumanFlagUndoOutcome, PlaybackDecisionProof,
-    PLAYBACK_EVIDENCE_CHANGED,
+    DesktopHumanDecisionUndoAuthority, DesktopPlaybackInterval, DesktopPlaybackReceipt, DesktopPlaybackSession,
+    DesktopReviewFlagUndoAuthority, DesktopReviewUndoAvailability, HumanDecisionCommit, HumanDecisionUndoOutcome,
+    HumanFlagCommit, HumanFlagUndoOutcome, PlaybackDecisionProof, PLAYBACK_EVIDENCE_CHANGED,
 };
 use crate::error::{AppError, AppResult};
 use crate::technical_audio_probe::{
@@ -17,6 +20,16 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ReviewCommitError {
+    #[error("the review segment no longer exists")]
+    SegmentNotFound,
+    #[error("the review revision is stale; current revision is {current_revision}")]
+    StaleRevision { current_revision: i64 },
+    #[error(transparent)]
+    Backend(#[from] AppError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ReviewFlagCommitError {
     #[error("the review segment no longer exists")]
     SegmentNotFound,
     #[error("the review revision is stale; current revision is {current_revision}")]
@@ -177,12 +190,129 @@ impl ReviewWriteStore {
         })
     }
 
+    fn lock_after_mutation(
+        &self,
+        operation: &str,
+        mutation: &MutationGuard<'_>,
+    ) -> std::sync::MutexGuard<'_, crate::db::Database> {
+        self.runtime.lock_after_mutation(mutation).unwrap_or_else(|poisoned| {
+            tracing::warn!(operation, "Recovering poisoned database lock during an admitted review write");
+            poisoned.into_inner()
+        })
+    }
+
+    /// Human-review writes must enter this runtime's restore admission before waiting for the DB
+    /// mutex. Acquiring only the mutex lets restore reserve behind a live writer and erase the write
+    /// immediately after it reports success.
+    fn begin_mutation(&self, operation: &str) -> AppResult<MutationGuard<'_>> {
+        self.runtime.begin_mutation().map_err(|error| {
+            tracing::warn!(operation, %error, "Review write refused by restore admission");
+            AppError::Other(error)
+        })
+    }
+
+    fn begin_mutation_at_generation(
+        &self,
+        generation: RestoreGeneration,
+        operation: &str,
+    ) -> AppResult<MutationGuard<'_>> {
+        self.runtime.begin_mutation_at_restore_generation_serial(generation.serial()).map_err(|error| {
+            tracing::warn!(operation, %error, "Review write crossed a restore generation");
+            AppError::Other(error)
+        })
+    }
+
+    pub(crate) fn capture_restore_generation(&self) -> Result<RestoreGeneration, String> {
+        self.runtime.capture_restore_generation()
+    }
+
+    pub(crate) fn begin_mutation_at_restore_generation_serial(
+        &self,
+        expected_generation: u64,
+    ) -> Result<MutationGuard<'_>, String> {
+        self.runtime.begin_mutation_at_restore_generation_serial(expected_generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn advance_restore_generation_for_test(&self) -> Result<(), String> {
+        self.runtime.advance_restore_generation_for_test()
+    }
+
     /// Resolve the server-owned live media grant behind a playback receipt without leaking a raw
     /// database connection into the command layer. The command may use this id only to borrow the
     /// registry's already-verified source lease; the typed commit repeats the exact receipt/source
     /// checks under the serialized write boundary before changing human truth.
     pub(crate) fn desktop_playback_media_grant_id(&self, playback_receipt_id: &str) -> AppResult<Option<String>> {
         self.lock("desktop_playback_media_grant_id").desktop_playback_media_grant_id(playback_receipt_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_desktop_playback_session_at_generation_v1(
+        &self,
+        segment_id: &str,
+        expected_revision: i64,
+        media_grant_id: &str,
+        client_attempt_id: &str,
+        grant_source_path: &Path,
+        grant_audio_content_hash: &str,
+        reviewer: Option<&str>,
+        restore_generation: RestoreGeneration,
+    ) -> AppResult<DesktopPlaybackSession> {
+        let mutation = self.begin_mutation_at_generation(restore_generation, "begin_desktop_playback_session_v1")?;
+        self.lock_after_mutation("begin_desktop_playback_session_v1", &mutation).begin_desktop_playback_session_v1(
+            segment_id,
+            expected_revision,
+            media_grant_id,
+            client_attempt_id,
+            grant_source_path,
+            grant_audio_content_hash,
+            reviewer,
+        )
+    }
+
+    pub(crate) fn cancel_desktop_playback_session_v1(
+        &self,
+        playback_receipt_id: &str,
+        client_attempt_id: &str,
+    ) -> AppResult<bool> {
+        let mutation = self.begin_mutation("cancel_desktop_playback_session_v1")?;
+        self.lock_after_mutation("cancel_desktop_playback_session_v1", &mutation)
+            .cancel_desktop_playback_session_v1(playback_receipt_id, client_attempt_id)
+    }
+
+    pub(crate) fn replay_finalized_desktop_playback_receipt_v1(
+        &self,
+        playback_receipt_id: &str,
+        media_grant_id: &str,
+        intervals: &[DesktopPlaybackInterval],
+    ) -> AppResult<Option<DesktopPlaybackReceipt>> {
+        self.lock("replay_finalized_desktop_playback_receipt_v1").replay_finalized_desktop_playback_receipt_v1(
+            playback_receipt_id,
+            media_grant_id,
+            intervals,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finalize_desktop_playback_session_at_generation_v1(
+        &self,
+        playback_receipt_id: &str,
+        media_grant_id: &str,
+        grant_source_path: &Path,
+        grant_audio_content_hash: &str,
+        intervals: &[DesktopPlaybackInterval],
+        restore_generation: u64,
+    ) -> AppResult<DesktopPlaybackReceipt> {
+        let mutation =
+            self.runtime.begin_mutation_at_restore_generation_serial(restore_generation).map_err(AppError::Other)?;
+        self.lock_after_mutation("finalize_desktop_playback_session_v1", &mutation)
+            .finalize_desktop_playback_session_v1(
+                playback_receipt_id,
+                media_grant_id,
+                grant_source_path,
+                grant_audio_content_hash,
+                intervals,
+            )
     }
 
     /// Legacy desktop compatibility boundary. Exact operation replay is resolved before current
@@ -196,7 +326,8 @@ impl ReviewWriteStore {
         timestamp_ms: Option<i64>,
         operation_id: &str,
     ) -> AppResult<HumanDecisionCommit> {
-        let database = self.lock("record_human_decision");
+        let mutation = self.begin_mutation("record_human_decision")?;
+        let database = self.lock_after_mutation("record_human_decision", &mutation);
         if let Some(commit) = database.replay_desktop_human_decision(
             segment_id,
             decision,
@@ -241,6 +372,7 @@ impl ReviewWriteStore {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn commit_typed_decision_with_source_lease(
         &self,
         segment_id: &str,
@@ -251,6 +383,31 @@ impl ReviewWriteStore {
         operation_id: &str,
         source_lease: Option<crate::media::VerifiedMediaSourceLease>,
     ) -> Result<HumanDecisionCommit, ReviewCommitError> {
+        let restore_generation = self.runtime.capture_restore_generation().map_err(AppError::Other)?;
+        self.commit_typed_decision_with_source_lease_at_generation(
+            segment_id,
+            base_revision,
+            decision,
+            transcript,
+            playback_receipt_id,
+            operation_id,
+            source_lease,
+            restore_generation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_typed_decision_with_source_lease_at_generation(
+        &self,
+        segment_id: &str,
+        base_revision: i64,
+        decision: &str,
+        transcript: Option<&str>,
+        playback_receipt_id: &str,
+        operation_id: &str,
+        source_lease: Option<crate::media::VerifiedMediaSourceLease>,
+        restore_generation: RestoreGeneration,
+    ) -> Result<HumanDecisionCommit, ReviewCommitError> {
         if let Some(source_lease) = source_lease {
             return self.commit_typed_decision_with_verified_source_lease(
                 segment_id,
@@ -260,6 +417,7 @@ impl ReviewWriteStore {
                 playback_receipt_id,
                 operation_id,
                 source_lease,
+                restore_generation,
             );
         }
 
@@ -271,7 +429,8 @@ impl ReviewWriteStore {
         // long media decode from blocking unrelated durable writes without weakening the final
         // compare-and-swap boundary.
         let (source_path, audio_content_hash) = {
-            let database = self.lock("commit_review_v1_source_recovery");
+            let mutation = self.begin_mutation_at_generation(restore_generation, "commit_review_v1_source_recovery")?;
+            let database = self.lock_after_mutation("commit_review_v1_source_recovery", &mutation);
             if let Some(commit) = database.replay_desktop_review_v1_and_clear_draft(
                 segment_id,
                 base_revision,
@@ -311,6 +470,7 @@ impl ReviewWriteStore {
             playback_receipt_id,
             operation_id,
             source_lease,
+            restore_generation,
         )
     }
 
@@ -324,8 +484,10 @@ impl ReviewWriteStore {
         playback_receipt_id: &str,
         operation_id: &str,
         source_lease: crate::media::VerifiedMediaSourceLease,
+        restore_generation: RestoreGeneration,
     ) -> Result<HumanDecisionCommit, ReviewCommitError> {
-        let database = self.lock("commit_review_v1");
+        let mutation = self.begin_mutation_at_generation(restore_generation, "commit_review_v1")?;
+        let database = self.lock_after_mutation("commit_review_v1", &mutation);
         if let Some(commit) = database.replay_desktop_review_v1_and_clear_draft(
             segment_id,
             base_revision,
@@ -358,22 +520,43 @@ impl ReviewWriteStore {
             .map_err(ReviewCommitError::from)
     }
 
-    pub(crate) fn undo_human_decision(
+    pub(crate) fn desktop_review_undo_availability(&self) -> AppResult<DesktopReviewUndoAvailability> {
+        self.runtime.open_read()?.desktop_review_undo_availability()
+    }
+
+    pub(crate) fn undo_latest_desktop_human_decision(
         &self,
-        effect_event_id: i64,
-        actor: Option<&str>,
+        authority: &DesktopHumanDecisionUndoAuthority,
         operation_id: &str,
     ) -> AppResult<HumanDecisionUndoOutcome> {
-        self.lock("undo_human_decision").undo_human_decision(effect_event_id, actor, operation_id)
+        let mutation = self.begin_mutation("undo_latest_desktop_human_decision")?;
+        self.lock_after_mutation("undo_latest_desktop_human_decision", &mutation)
+            .undo_latest_desktop_human_decision(authority, operation_id)
     }
 
     pub(crate) fn record_flag(
         &self,
         segment_id: &str,
+        base_revision: i64,
         rationale: &str,
         operation_id: &str,
-    ) -> AppResult<HumanFlagCommit> {
-        self.lock("record_review_flag").record_review_flag(segment_id, rationale, operation_id)
+    ) -> Result<HumanFlagCommit, ReviewFlagCommitError> {
+        let mutation = self.begin_mutation("record_review_flag")?;
+        self.lock_after_mutation("record_review_flag", &mutation)
+            .record_review_flag(segment_id, base_revision, rationale, operation_id)
+            .map_err(|error| match error {
+                AppError::Validation(message) if message == "E_REVIEW_FLAG_SEGMENT_NOT_FOUND" => {
+                    ReviewFlagCommitError::SegmentNotFound
+                }
+                AppError::Validation(message) if message.starts_with("E_STALE_REVIEW_FLAG_REVISION:") => {
+                    let current_revision = message
+                        .split_once(':')
+                        .and_then(|(_, revision)| revision.parse::<i64>().ok())
+                        .unwrap_or(base_revision);
+                    ReviewFlagCommitError::StaleRevision { current_revision }
+                }
+                error => ReviewFlagCommitError::Backend(error),
+            })
     }
 
     /// Technical audio failure is intentionally independent from playback proof: playback is the
@@ -409,8 +592,10 @@ impl ReviewWriteStore {
         after_probe: impl FnOnce(),
         after_lease: impl FnOnce(),
     ) -> Result<HumanFlagCommit, TechnicalUnusableCommitError> {
+        let restore_generation = self.runtime.capture_restore_generation().map_err(AppError::Other)?;
         let (audio_path, source_path_sha256, audio_content_hash) = {
-            let database = self.lock("mark_segment_unusable_v1_replay");
+            let mutation = self.begin_mutation_at_generation(restore_generation, "mark_segment_unusable_v1_replay")?;
+            let database = self.lock_after_mutation("mark_segment_unusable_v1_replay", &mutation);
             if let Some(replay) = database
                 .replay_segment_technically_unusable(segment_id, base_revision, reason, operation_id)
                 .map_err(TechnicalUnusableCommitError::Backend)?
@@ -472,7 +657,8 @@ impl ReviewWriteStore {
         })?;
         after_lease();
 
-        let database = self.lock("mark_segment_unusable_v1_commit");
+        let mutation = self.begin_mutation_at_generation(restore_generation, "mark_segment_unusable_v1_commit")?;
+        let database = self.lock_after_mutation("mark_segment_unusable_v1_commit", &mutation);
         let result = match database.mark_segment_technically_unusable_after_verified_failure(
             segment_id,
             base_revision,
@@ -516,8 +702,20 @@ impl ReviewWriteStore {
         result
     }
 
+    pub(crate) fn undo_latest_desktop_review_flag(
+        &self,
+        authority: &DesktopReviewFlagUndoAuthority,
+        operation_id: &str,
+    ) -> AppResult<HumanFlagUndoOutcome> {
+        let mutation = self.begin_mutation("undo_latest_desktop_review_flag")?;
+        self.lock_after_mutation("undo_latest_desktop_review_flag", &mutation)
+            .undo_latest_desktop_review_flag(authority, operation_id)
+    }
+
+    #[cfg(test)]
     pub(crate) fn undo_flag(&self, effect_event_id: i64, operation_id: &str) -> AppResult<HumanFlagUndoOutcome> {
-        self.lock("undo_review_flag").undo_review_flag(effect_event_id, operation_id)
+        let mutation = self.begin_mutation("undo_review_flag")?;
+        self.lock_after_mutation("undo_review_flag", &mutation).undo_review_flag(effect_event_id, operation_id)
     }
 
     pub(crate) fn clear_legacy_decision(&self, segment_id: &str) -> AppResult<()> {
@@ -618,6 +816,12 @@ mod tests {
         Database, HumanDecisionUndoOutcome, HumanFlagUndoOutcome, PlaybackDecisionProof, PlaybackReceipt, SpeechSegment,
     };
 
+    static TECHNICAL_PROBE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_technical_probe_tests() -> std::sync::MutexGuard<'static, ()> {
+        TECHNICAL_PROBE_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn store_with_clip() -> (tempfile::TempDir, ReviewWriteStore, DatabaseRuntime) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("reviews.db");
@@ -642,7 +846,7 @@ mod tests {
                 rusqlite::params!["clip", "a".repeat(64)],
             )
             .unwrap();
-        let runtime = DatabaseRuntime::new(database);
+        let runtime = DatabaseRuntime::isolated_for_test(database);
         (directory, ReviewWriteStore::new(runtime.clone()), runtime)
     }
 
@@ -658,17 +862,726 @@ mod tests {
         writer.finalize().unwrap();
     }
 
+    struct DesktopPlaybackFixture {
+        _directory: tempfile::TempDir,
+        store: ReviewWriteStore,
+        runtime: DatabaseRuntime,
+        source: std::path::PathBuf,
+        content_hash: String,
+        base_revision: i64,
+    }
+
+    impl DesktopPlaybackFixture {
+        fn begin(&self, media_grant_id: &str, client_attempt_id: &str) -> DesktopPlaybackSession {
+            let generation = self.store.capture_restore_generation().unwrap();
+            self.store
+                .begin_desktop_playback_session_at_generation_v1(
+                    "clip",
+                    self.base_revision,
+                    media_grant_id,
+                    client_attempt_id,
+                    &self.source,
+                    &self.content_hash,
+                    None,
+                    generation,
+                )
+                .unwrap()
+        }
+
+        fn set_clock(&self, wall_ms: i64, active_ms: u64) {
+            self.runtime.lock().unwrap().set_playback_test_clock(wall_ms, active_ms);
+        }
+    }
+
+    fn desktop_playback_fixture() -> DesktopPlaybackFixture {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("playback.wav");
+        write_wav(&source, 16_000, 6_400);
+        let content_hash = crate::export_bundle::current_canonical_pcm_blake3(&source).unwrap();
+        let database = Database::open(directory.path().join("playback-restore.db").to_str().unwrap()).unwrap();
+        database.initialize().unwrap();
+        database
+            .insert_segment(&SpeechSegment {
+                id: "clip".into(),
+                audio_path: source.to_string_lossy().into_owned(),
+                raw_transcript: "دەق".into(),
+                duration_ms: 400,
+                alignment_json: Some(
+                    r#"{"source_start_ms":0,"source_end_ms":400,"chunk_index":0,"chunk_count":1}"#.into(),
+                ),
+                ..SpeechSegment::default()
+            })
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+                rusqlite::params!["clip", content_hash],
+            )
+            .unwrap();
+        let base_revision = database.segment_review_revision("clip").unwrap().unwrap();
+        database.set_playback_test_clock(1_000_000, 10_000);
+        let runtime = DatabaseRuntime::isolated_for_test(database);
+        DesktopPlaybackFixture {
+            _directory: directory,
+            store: ReviewWriteStore::new(runtime.clone()),
+            runtime,
+            source,
+            content_hash,
+            base_revision,
+        }
+    }
+
+    fn desktop_playback_counts(runtime: &DatabaseRuntime) -> (i64, i64, i64) {
+        runtime
+            .lock()
+            .unwrap()
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM desktop_playback_sessions_v4),
+                    (SELECT COUNT(*) FROM desktop_playback_intervals_v4),
+                    (SELECT COUNT(*) FROM playback_receipts WHERE policy_version=4)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    fn desktop_playback_session_exists(runtime: &DatabaseRuntime, playback_receipt_id: &str) -> bool {
+        runtime
+            .lock()
+            .unwrap()
+            .connection()
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM desktop_playback_sessions_v4 WHERE playback_receipt_id=?1
+                )",
+                [playback_receipt_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn store_with_listened_clip(
+    ) -> (tempfile::TempDir, ReviewWriteStore, DatabaseRuntime, i64, String, crate::media::VerifiedMediaSourceLease)
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("listened.wav");
+        write_wav(&source, 16_000, 6_400);
+        let content_hash = crate::export_bundle::current_canonical_pcm_blake3(&source).unwrap();
+        let path = directory.path().join("listened-reviews.db");
+        let database = Database::open(path.to_str().unwrap()).unwrap();
+        database.initialize().unwrap();
+        database
+            .insert_segment(&SpeechSegment {
+                id: "clip".into(),
+                audio_path: source.to_string_lossy().into_owned(),
+                raw_transcript: "دەق".into(),
+                duration_ms: 400,
+                alignment_json: Some(
+                    r#"{"source_start_ms":0,"source_end_ms":400,"chunk_index":0,"chunk_count":1}"#.into(),
+                ),
+                ..SpeechSegment::default()
+            })
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE speech_segments SET audio_content_hash = ?2 WHERE id = ?1",
+                rusqlite::params!["clip", content_hash],
+            )
+            .unwrap();
+        let base_revision = database.segment_review_revision("clip").unwrap().unwrap();
+        let media_grant_id = "10000000-0000-4000-8000-000000000001";
+        let client_attempt_id = "10000000-0000-4000-8000-000000000002";
+        database.set_playback_test_clock(1_000_000, 10_000);
+        let session = database
+            .begin_desktop_playback_session_v1(
+                "clip",
+                base_revision,
+                media_grant_id,
+                client_attempt_id,
+                &source,
+                &content_hash,
+                None,
+            )
+            .unwrap();
+        database.set_playback_test_clock(1_000_400, 10_400);
+        database
+            .finalize_desktop_playback_session_v1(
+                &session.playback_receipt_id,
+                media_grant_id,
+                &source,
+                &content_hash,
+                &[DesktopPlaybackInterval { start_ms: 0, end_ms: 360 }],
+            )
+            .unwrap();
+        let source_lease = crate::media::verify_current_source_lease(&source, &content_hash).unwrap();
+        let runtime = DatabaseRuntime::isolated_for_test(database);
+        (
+            directory,
+            ReviewWriteStore::new(runtime.clone()),
+            runtime,
+            base_revision,
+            session.playback_receipt_id,
+            source_lease,
+        )
+    }
+
+    fn wait_for_store_mutation(runtime: &DatabaseRuntime) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !runtime.mutation_active_for_test() {
+            assert!(Instant::now() < deadline, "the real store writer never entered restore mutation admission");
+            std::thread::yield_now();
+        }
+    }
+
+    fn run_while_restore_is_reserved<T: Send + 'static>(
+        runtime: &DatabaseRuntime,
+        operation: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let reservation = runtime.try_reserve_restore_for_test().expect("reserve the isolated runtime restore");
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let value = operation();
+            let _ = result_tx.send(value);
+        });
+        let value = match result_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(value) => value,
+            Err(error) => {
+                // Release admission before joining so a regression that waited on the DB lock fails
+                // cleanly instead of hanging the complete Rust harness forever.
+                drop(reservation);
+                let _ = worker.join();
+                panic!("store write did not fail before a reserved restore: {error}");
+            }
+        };
+        drop(reservation);
+        worker.join().expect("store writer must not panic");
+        value
+    }
+
+    fn effect_counts(runtime: &DatabaseRuntime) -> (i64, i64) {
+        runtime
+            .lock()
+            .unwrap()
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM human_decision_effect_events WHERE segment_id='clip'),
+                    (SELECT COUNT(*) FROM review_flag_effect_events WHERE segment_id='clip')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn restore_first_refuses_desktop_playback_begin_finalize_and_cancel_without_mutation() {
+        let fixture = desktop_playback_fixture();
+        let media_grant_id = "30000000-0000-4000-8000-000000000001";
+        let client_attempt_id = "30000000-0000-4000-8000-000000000002";
+
+        let begin_generation = fixture.store.capture_restore_generation().unwrap();
+        let begin_store = fixture.store.clone();
+        let begin_source = fixture.source.clone();
+        let begin_hash = fixture.content_hash.clone();
+        let begin_result = run_while_restore_is_reserved(&fixture.runtime, move || {
+            begin_store.begin_desktop_playback_session_at_generation_v1(
+                "clip",
+                0,
+                media_grant_id,
+                client_attempt_id,
+                &begin_source,
+                &begin_hash,
+                None,
+                begin_generation,
+            )
+        });
+        assert!(begin_result.is_err(), "restore-first begin must fail closed");
+        assert_eq!(desktop_playback_counts(&fixture.runtime), (0, 0, 0));
+
+        let session = fixture.begin(media_grant_id, client_attempt_id);
+        fixture.set_clock(1_000_400, 10_400);
+        let intervals = vec![DesktopPlaybackInterval { start_ms: 0, end_ms: 360 }];
+        let finalize_generation = fixture.store.capture_restore_generation().unwrap().serial();
+        let finalize_store = fixture.store.clone();
+        let finalize_receipt_id = session.playback_receipt_id.clone();
+        let finalize_source = fixture.source.clone();
+        let finalize_hash = fixture.content_hash.clone();
+        let finalize_result = run_while_restore_is_reserved(&fixture.runtime, move || {
+            finalize_store.finalize_desktop_playback_session_at_generation_v1(
+                &finalize_receipt_id,
+                media_grant_id,
+                &finalize_source,
+                &finalize_hash,
+                &intervals,
+                finalize_generation,
+            )
+        });
+        assert!(finalize_result.is_err(), "restore-first finalization must fail closed");
+        assert_eq!(desktop_playback_counts(&fixture.runtime), (1, 0, 0));
+
+        let cancel_store = fixture.store.clone();
+        let cancel_receipt_id = session.playback_receipt_id.clone();
+        let cancel_result = run_while_restore_is_reserved(&fixture.runtime, move || {
+            cancel_store.cancel_desktop_playback_session_v1(&cancel_receipt_id, client_attempt_id)
+        });
+        assert!(cancel_result.is_err(), "restore-first cancellation must fail closed");
+        assert_eq!(desktop_playback_counts(&fixture.runtime), (1, 0, 0));
+        assert!(fixture
+            .store
+            .cancel_desktop_playback_session_v1(&session.playback_receipt_id, client_attempt_id)
+            .unwrap());
+        assert_eq!(desktop_playback_counts(&fixture.runtime), (0, 0, 0));
+    }
+
+    #[test]
+    fn desktop_playback_mutations_block_restore_until_begin_finalize_and_cancel_commit() {
+        let fixture = desktop_playback_fixture();
+        let media_grant_id = "30000000-0000-4000-8000-000000000003";
+        let client_attempt_id = "30000000-0000-4000-8000-000000000004";
+        let begin_generation = fixture.store.capture_restore_generation().unwrap();
+        let writer_blocker = fixture.runtime.lock().unwrap();
+        let begin_store = fixture.store.clone();
+        let begin_base_revision = fixture.base_revision;
+        let begin_source = fixture.source.clone();
+        let begin_hash = fixture.content_hash.clone();
+        let (begin_tx, begin_rx) = std::sync::mpsc::channel();
+        let begin_worker = std::thread::spawn(move || {
+            let result = begin_store.begin_desktop_playback_session_at_generation_v1(
+                "clip",
+                begin_base_revision,
+                media_grant_id,
+                client_attempt_id,
+                &begin_source,
+                &begin_hash,
+                None,
+                begin_generation,
+            );
+            let _ = begin_tx.send(result);
+        });
+        wait_for_store_mutation(&fixture.runtime);
+        let before_begin: i64 = writer_blocker
+            .connection()
+            .query_row("SELECT COUNT(*) FROM desktop_playback_sessions_v4", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before_begin, 0, "a blocked begin must expose no partial session");
+        assert!(fixture.runtime.try_reserve_restore_for_test().is_err());
+        drop(writer_blocker);
+        let session = begin_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+        begin_worker.join().unwrap();
+        assert_eq!(desktop_playback_counts(&fixture.runtime), (1, 0, 0));
+
+        fixture.set_clock(1_000_400, 10_400);
+        let finalize_generation = fixture.store.capture_restore_generation().unwrap().serial();
+        let writer_blocker = fixture.runtime.lock().unwrap();
+        let finalize_store = fixture.store.clone();
+        let finalize_receipt_id = session.playback_receipt_id.clone();
+        let finalize_source = fixture.source.clone();
+        let finalize_hash = fixture.content_hash.clone();
+        let (finalize_tx, finalize_rx) = std::sync::mpsc::channel();
+        let finalize_worker = std::thread::spawn(move || {
+            let result = finalize_store.finalize_desktop_playback_session_at_generation_v1(
+                &finalize_receipt_id,
+                media_grant_id,
+                &finalize_source,
+                &finalize_hash,
+                &[DesktopPlaybackInterval { start_ms: 0, end_ms: 360 }],
+                finalize_generation,
+            );
+            let _ = finalize_tx.send(result);
+        });
+        wait_for_store_mutation(&fixture.runtime);
+        let before_finalize: (i64, i64) = writer_blocker
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM desktop_playback_intervals_v4),
+                    (SELECT COUNT(*) FROM playback_receipts WHERE policy_version=4)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(before_finalize, (0, 0), "a blocked finalization must expose no partial receipt");
+        assert!(fixture.runtime.try_reserve_restore_for_test().is_err());
+        drop(writer_blocker);
+        finalize_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+        finalize_worker.join().unwrap();
+        assert_eq!(desktop_playback_counts(&fixture.runtime), (1, 1, 1));
+
+        let second_grant_id = "30000000-0000-4000-8000-000000000005";
+        let second_attempt_id = "30000000-0000-4000-8000-000000000006";
+        let second = fixture.begin(second_grant_id, second_attempt_id);
+        let writer_blocker = fixture.runtime.lock().unwrap();
+        let cancel_store = fixture.store.clone();
+        let cancel_receipt_id = second.playback_receipt_id.clone();
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+        let cancel_worker = std::thread::spawn(move || {
+            let result = cancel_store.cancel_desktop_playback_session_v1(&cancel_receipt_id, second_attempt_id);
+            let _ = cancel_tx.send(result);
+        });
+        wait_for_store_mutation(&fixture.runtime);
+        let second_exists: bool = writer_blocker
+            .connection()
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM desktop_playback_sessions_v4 WHERE playback_receipt_id=?1
+                )",
+                [&second.playback_receipt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(second_exists);
+        assert!(fixture.runtime.try_reserve_restore_for_test().is_err());
+        drop(writer_blocker);
+        assert!(cancel_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap());
+        cancel_worker.join().unwrap();
+        assert!(!desktop_playback_session_exists(&fixture.runtime, &second.playback_receipt_id));
+        assert_eq!(desktop_playback_counts(&fixture.runtime), (1, 1, 1));
+    }
+
+    #[test]
+    fn restored_generation_cannot_finalize_or_replay_an_unfinalized_desktop_session() {
+        let fixture = desktop_playback_fixture();
+        let stale_grant_id = "30000000-0000-4000-8000-000000000007";
+        let stale_attempt_id = "30000000-0000-4000-8000-000000000008";
+        let stale = fixture.begin(stale_grant_id, stale_attempt_id);
+        let stale_generation = fixture.store.capture_restore_generation().unwrap().serial();
+
+        let restore = fixture.runtime.try_reserve_restore_for_test().unwrap();
+        restore.arm_named_restore().unwrap();
+        fixture
+            .runtime
+            .with_restore_writer(&restore, |_database| Ok(()))
+            .expect("the test restore must reopen the runtime writer");
+        restore.commit_named_restore().unwrap();
+        drop(restore);
+        fixture.set_clock(1_000_400, 10_400);
+
+        let intervals = [DesktopPlaybackInterval { start_ms: 0, end_ms: 360 }];
+        let stale_error = fixture
+            .store
+            .finalize_desktop_playback_session_at_generation_v1(
+                &stale.playback_receipt_id,
+                stale_grant_id,
+                &fixture.source,
+                &fixture.content_hash,
+                &intervals,
+                stale_generation,
+            )
+            .expect_err("the pre-restore generation must never finalize afterward");
+        assert!(stale_error.to_string().contains("generation changed"), "{stale_error}");
+        assert_eq!(desktop_playback_counts(&fixture.runtime), (1, 0, 0));
+
+        let current_generation = fixture.store.capture_restore_generation().unwrap().serial();
+        let reopened_error = fixture
+            .store
+            .finalize_desktop_playback_session_at_generation_v1(
+                &stale.playback_receipt_id,
+                stale_grant_id,
+                &fixture.source,
+                &fixture.content_hash,
+                &intervals,
+                current_generation,
+            )
+            .expect_err("writer reopen must discard the process-local active-time authority");
+        assert!(reopened_error.to_string().contains("no live active-time authority"), "{reopened_error}");
+        assert_eq!(desktop_playback_counts(&fixture.runtime), (1, 0, 0));
+        assert!(
+            fixture
+                .store
+                .replay_finalized_desktop_playback_receipt_v1(&stale.playback_receipt_id, stale_grant_id, &intervals,)
+                .unwrap()
+                .is_none(),
+            "an unfinalized pre-restore session must never appear as replayable receipt evidence"
+        );
+
+        let current = fixture.begin(stale_grant_id, stale_attempt_id);
+        assert_ne!(
+            current.playback_receipt_id, stale.playback_receipt_id,
+            "an exact post-restore retry must issue fresh authority, never replay the inert pre-restore session"
+        );
+        assert!(!desktop_playback_session_exists(&fixture.runtime, &stale.playback_receipt_id));
+        assert!(desktop_playback_session_exists(&fixture.runtime, &current.playback_receipt_id));
+        assert_eq!(desktop_playback_counts(&fixture.runtime), (1, 0, 0));
+    }
+
+    #[test]
+    fn typed_decision_admission_precedes_writer_lock_and_refuses_restore_without_losing_exact_replay() {
+        let (_directory, store, runtime, base_revision, receipt_id, source_lease) = store_with_listened_clip();
+        let operation_id = "20000000-0000-4000-8000-000000000001";
+        let writer_blocker = runtime.lock().unwrap();
+        let worker_store = store.clone();
+        let worker_receipt = receipt_id.clone();
+        let worker_lease = source_lease.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = worker_store.commit_typed_decision_with_source_lease(
+                "clip",
+                base_revision,
+                "accept",
+                Some("دەق"),
+                &worker_receipt,
+                operation_id,
+                Some(worker_lease),
+            );
+            let _ = result_tx.send(result);
+        });
+
+        wait_for_store_mutation(&runtime);
+        let before: i64 = writer_blocker
+            .connection()
+            .query_row("SELECT COUNT(*) FROM human_decision_effect_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 0, "the blocked writer must not expose partial decision truth");
+        let refusal = runtime
+            .try_reserve_restore_for_test()
+            .err()
+            .expect("restore must refuse an admitted typed decision instead of queuing behind it");
+        assert!(refusal.contains("mutation is already in progress"), "{refusal}");
+        drop(writer_blocker);
+
+        let first = result_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+        worker.join().unwrap();
+        let replay = store
+            .commit_typed_decision_with_source_lease(
+                "clip",
+                base_revision,
+                "accept",
+                Some("دەق"),
+                &receipt_id,
+                operation_id,
+                Some(source_lease),
+            )
+            .unwrap();
+        assert_eq!(replay.effect_event_id, first.effect_event_id);
+        assert_eq!(replay.decided_revision, first.decided_revision);
+        assert_eq!(effect_counts(&runtime), (1, 0), "an exact replay must not duplicate durable truth");
+    }
+
+    #[test]
+    fn reserved_restore_refuses_typed_decision_before_mutation_and_does_not_consume_operation_identity() {
+        let (_directory, store, runtime, base_revision, receipt_id, source_lease) = store_with_listened_clip();
+        let operation_id = "20000000-0000-4000-8000-000000000002";
+        let refused_store = store.clone();
+        let refused_receipt = receipt_id.clone();
+        let refused_lease = source_lease.clone();
+        let error = run_while_restore_is_reserved(&runtime, move || {
+            refused_store.commit_typed_decision_with_source_lease(
+                "clip",
+                base_revision,
+                "accept",
+                Some("دەق"),
+                &refused_receipt,
+                operation_id,
+                Some(refused_lease),
+            )
+        })
+        .expect_err("a restore-first typed decision must fail closed");
+        assert!(error.to_string().contains("restore is in progress"), "{error}");
+        assert_eq!(effect_counts(&runtime), (0, 0));
+
+        let first = store
+            .commit_typed_decision_with_source_lease(
+                "clip",
+                base_revision,
+                "accept",
+                Some("دەق"),
+                &receipt_id,
+                operation_id,
+                Some(source_lease.clone()),
+            )
+            .unwrap();
+        let replay = store
+            .commit_typed_decision_with_source_lease(
+                "clip",
+                base_revision,
+                "accept",
+                Some("دەق"),
+                &receipt_id,
+                operation_id,
+                Some(source_lease),
+            )
+            .unwrap();
+        assert_eq!(replay.effect_event_id, first.effect_event_id);
+        assert_eq!(effect_counts(&runtime), (1, 0));
+    }
+
+    #[test]
+    fn typed_decision_final_boundary_rejects_pre_restore_media_authority() {
+        let (_directory, store, runtime, base_revision, receipt_id, source_lease) = store_with_listened_clip();
+        let pre_restore_generation = store.capture_restore_generation().unwrap();
+        runtime.advance_restore_generation_for_test().unwrap();
+        let error = store
+            .commit_typed_decision_with_verified_source_lease(
+                "clip",
+                base_revision,
+                "accept",
+                Some("دەق"),
+                &receipt_id,
+                "20000000-0000-4000-8000-000000000008",
+                source_lease,
+                pre_restore_generation,
+            )
+            .expect_err("a media lease verified for an older restore generation must not commit afterward");
+        assert!(error.to_string().contains("generation changed"), "{error}");
+        assert_eq!(effect_counts(&runtime), (0, 0));
+    }
+
+    #[test]
+    fn flag_admission_precedes_writer_lock_and_restore_first_refusal_is_zero_mutation() {
+        let (_directory, store, runtime) = store_with_clip();
+        let base_revision = runtime.lock().unwrap().segment_review_revision("clip").unwrap().unwrap();
+        let operation_id = "20000000-0000-4000-8000-000000000003";
+        let writer_blocker = runtime.lock().unwrap();
+        let worker_store = store.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = result_tx.send(worker_store.record_flag("clip", base_revision, "owner flag", operation_id));
+        });
+        wait_for_store_mutation(&runtime);
+        let before: i64 = writer_blocker
+            .connection()
+            .query_row("SELECT COUNT(*) FROM review_flag_effect_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 0);
+        assert!(runtime.try_reserve_restore_for_test().is_err());
+        drop(writer_blocker);
+        let first = result_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+        worker.join().unwrap();
+        assert_eq!(effect_counts(&runtime), (0, 1));
+        assert_eq!(
+            store.record_flag("clip", base_revision, "owner flag", operation_id).unwrap().effect_event_id,
+            first.effect_event_id
+        );
+
+        let (_directory, store, runtime) = store_with_clip();
+        let base_revision = runtime.lock().unwrap().segment_review_revision("clip").unwrap().unwrap();
+        let restore_first_operation = "20000000-0000-4000-8000-000000000004";
+        let refused_store = store.clone();
+        let error = run_while_restore_is_reserved(&runtime, move || {
+            refused_store.record_flag("clip", base_revision, "restore-first flag", restore_first_operation)
+        })
+        .expect_err("a restore-first flag must fail closed");
+        assert!(error.to_string().contains("restore is in progress"), "{error}");
+        assert_eq!(effect_counts(&runtime), (0, 0));
+        let first = store.record_flag("clip", base_revision, "restore-first flag", restore_first_operation).unwrap();
+        let replay = store.record_flag("clip", base_revision, "restore-first flag", restore_first_operation).unwrap();
+        assert_eq!(replay.effect_event_id, first.effect_event_id);
+        assert_eq!(effect_counts(&runtime), (0, 1));
+    }
+
+    #[test]
+    fn technical_unusable_final_admission_precedes_writer_lock_and_restore_first_is_zero_mutation() {
+        let _probe_test = lock_technical_probe_tests();
+        let (directory, store, runtime) = store_with_clip();
+        let source = directory.path().join("clip.wav");
+        write_wav(&source, 16_000, 16_000);
+        let original_len = std::fs::metadata(&source).unwrap().len();
+        std::fs::OpenOptions::new().write(true).open(&source).unwrap().set_len(original_len - 1).unwrap();
+        let base_revision = runtime.lock().unwrap().segment_review_revision("clip").unwrap().unwrap();
+        let operation_id = "20000000-0000-4000-8000-000000000005";
+        let (leased_tx, leased_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_store = store.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = worker_store.mark_technically_unusable_with_hooks(
+                "clip",
+                base_revision,
+                "decodeFailed",
+                operation_id,
+                || {},
+                move || {
+                    leased_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            );
+            let _ = result_tx.send(result);
+        });
+        leased_rx.recv_timeout(Duration::from_secs(3)).expect("technical source lease must complete");
+        let writer_blocker = runtime.lock().unwrap();
+        release_tx.send(()).unwrap();
+        wait_for_store_mutation(&runtime);
+        let before: i64 = writer_blocker
+            .connection()
+            .query_row("SELECT COUNT(*) FROM review_flag_effect_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 0);
+        assert!(runtime.try_reserve_restore_for_test().is_err());
+        drop(writer_blocker);
+        let first = result_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+        worker.join().unwrap();
+        assert_eq!(effect_counts(&runtime), (0, 1));
+        assert_eq!(
+            store
+                .mark_technically_unusable("clip", base_revision, "decodeFailed", operation_id)
+                .unwrap()
+                .effect_event_id,
+            first.effect_event_id
+        );
+
+        let (directory, store, runtime) = store_with_clip();
+        let source = directory.path().join("clip.wav");
+        write_wav(&source, 16_000, 16_000);
+        let original_len = std::fs::metadata(&source).unwrap().len();
+        std::fs::OpenOptions::new().write(true).open(&source).unwrap().set_len(original_len - 1).unwrap();
+        let base_revision = runtime.lock().unwrap().segment_review_revision("clip").unwrap().unwrap();
+        let restore_first_operation = "20000000-0000-4000-8000-000000000006";
+        let refused_store = store.clone();
+        let error = run_while_restore_is_reserved(&runtime, move || {
+            refused_store.mark_technically_unusable("clip", base_revision, "decodeFailed", restore_first_operation)
+        })
+        .expect_err("a restore-first technical flag must fail before probing or mutation");
+        assert!(error.to_string().contains("restore is in progress"), "{error}");
+        assert_eq!(effect_counts(&runtime), (0, 0));
+        let first =
+            store.mark_technically_unusable("clip", base_revision, "decodeFailed", restore_first_operation).unwrap();
+        let replay =
+            store.mark_technically_unusable("clip", base_revision, "decodeFailed", restore_first_operation).unwrap();
+        assert_eq!(replay.effect_event_id, first.effect_event_id);
+        assert_eq!(effect_counts(&runtime), (0, 1));
+    }
+
+    #[test]
+    fn restore_generation_change_during_technical_probe_cannot_land_pre_restore_truth() {
+        let _probe_test = lock_technical_probe_tests();
+        let (directory, store, runtime) = store_with_clip();
+        let source = directory.path().join("clip.wav");
+        write_wav(&source, 16_000, 16_000);
+        let original_len = std::fs::metadata(&source).unwrap().len();
+        std::fs::OpenOptions::new().write(true).open(&source).unwrap().set_len(original_len - 1).unwrap();
+        let base_revision = runtime.lock().unwrap().segment_review_revision("clip").unwrap().unwrap();
+        let generation_runtime = runtime.clone();
+        let error = store
+            .mark_technically_unusable_after_probe(
+                "clip",
+                base_revision,
+                "decodeFailed",
+                "20000000-0000-4000-8000-000000000007",
+                move || generation_runtime.advance_restore_generation_for_test().unwrap(),
+            )
+            .expect_err("pre-restore technical evidence must not authorize a post-restore generation");
+        assert!(error.to_string().contains("generation changed"), "{error}");
+        assert_eq!(effect_counts(&runtime), (0, 0));
+        let row = runtime.lock().unwrap().get_segment_by_id("clip").unwrap().unwrap();
+        assert!(row.verdict.is_none() && row.rationale.is_none() && !row.escalated);
+    }
+
     #[test]
     fn flag_write_replays_exactly_and_undo_is_effect_bound_and_idempotent() {
         let (_directory, store, runtime) = store_with_clip();
+        let base_revision = runtime.lock().unwrap().segment_review_revision("clip").unwrap().unwrap();
         let flag_operation = "11111111-1111-4111-8111-111111111111";
-        let first = store.record_flag("clip", "Needs another listen", flag_operation).unwrap();
-        let replay = store.record_flag("clip", "Needs another listen", flag_operation).unwrap();
+        let first = store.record_flag("clip", base_revision, "Needs another listen", flag_operation).unwrap();
+        let replay = store.record_flag("clip", base_revision, "Needs another listen", flag_operation).unwrap();
         assert_eq!(replay.effect_event_id, first.effect_event_id);
         assert_eq!(replay.flag_revision, first.flag_revision);
 
         let conflict = store
-            .record_flag("clip", "Different request", flag_operation)
+            .record_flag("clip", base_revision, "Different request", flag_operation)
             .expect_err("one operation identity cannot authorize another flag payload");
         assert!(conflict.to_string().contains("different request"), "{conflict}");
 
@@ -679,7 +1592,7 @@ mod tests {
         ));
         assert!(matches!(
             store.undo_flag(first.effect_event_id, undo_operation).unwrap(),
-            HumanFlagUndoOutcome::AlreadyApplied { .. }
+            HumanFlagUndoOutcome::AlreadyApplied
         ));
 
         let database = runtime.lock().unwrap();
@@ -692,6 +1605,67 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM review_flag_effect_reversals", [], |row| row.get(0))
             .unwrap();
         assert_eq!((effects, reversals), (1, 1));
+    }
+
+    #[test]
+    fn active_generic_flag_rejects_a_new_operation_until_exact_undo() {
+        let (_directory, store, runtime) = store_with_clip();
+        let first_operation = "33333333-3333-4333-8333-333333333331";
+        let next_operation = "33333333-3333-4333-8333-333333333332";
+        let undo_operation = "33333333-3333-4333-8333-333333333333";
+
+        let base_revision = runtime.lock().unwrap().segment_review_revision("clip").unwrap().unwrap();
+        let first = store.record_flag("clip", base_revision, "Needs another listen", first_operation).unwrap();
+        let exact_replay = store.record_flag("clip", base_revision, "Needs another listen", first_operation).unwrap();
+        assert_eq!(exact_replay.effect_event_id, first.effect_event_id);
+        assert_eq!(exact_replay.flag_revision, first.flag_revision);
+
+        let before_rejection_revision = runtime.lock().unwrap().segment_review_revision("clip").unwrap().unwrap();
+        let before_rejection_counts = effect_counts(&runtime);
+        let rejection = store
+            .record_flag("clip", first.flag_revision, "Needs another listen", next_operation)
+            .expect_err("a different operation must not stack another flag on the active immutable effect");
+        assert!(rejection.to_string().contains("active immutable effect"), "{rejection}");
+        assert_eq!(
+            runtime.lock().unwrap().segment_review_revision("clip").unwrap().unwrap(),
+            before_rejection_revision,
+            "rejecting the duplicate flag must not advance review truth"
+        );
+        assert_eq!(effect_counts(&runtime), before_rejection_counts, "rejecting the duplicate flag must add no effect");
+
+        let restored_revision = match store.undo_flag(first.effect_event_id, undo_operation).unwrap() {
+            HumanFlagUndoOutcome::Applied { restored_revision, .. } => restored_revision,
+            other => panic!("the exact active flag must be reversible, got {other:?}"),
+        };
+        assert!(matches!(
+            store.undo_flag(first.effect_event_id, undo_operation).unwrap(),
+            HumanFlagUndoOutcome::AlreadyApplied
+        ));
+
+        let second = store.record_flag("clip", restored_revision, "Needs another listen", next_operation).unwrap();
+        assert_eq!(second.prior_revision, restored_revision);
+        assert_eq!(second.flag_revision, restored_revision + 1);
+        let second_replay =
+            store.record_flag("clip", restored_revision, "Needs another listen", next_operation).unwrap();
+        assert_eq!(second_replay.effect_event_id, second.effect_event_id);
+        assert_eq!(second_replay.flag_revision, second.flag_revision);
+
+        let database = runtime.lock().unwrap();
+        let (revision, effects, reversals): (i64, i64, i64) = database
+            .connection()
+            .query_row(
+                "SELECT
+                    review_revision,
+                    (SELECT COUNT(*) FROM review_flag_effect_events WHERE segment_id='clip'),
+                    (SELECT COUNT(*) FROM review_flag_effect_reversals)
+                   FROM speech_segments
+                  WHERE id='clip'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(revision, second.flag_revision);
+        assert_eq!((effects, reversals), (2, 1), "only the initial flag and the post-undo flag may exist");
     }
 
     #[test]
@@ -737,9 +1711,15 @@ mod tests {
         };
 
         let operation_id = "44444444-4444-4444-8444-444444444444";
-        let outcome = store.undo_human_decision(effect_event_id, None, operation_id).unwrap();
+        let DesktopReviewUndoAvailability::Available(DesktopReviewUndoAuthority::Decision(authority)) =
+            store.desktop_review_undo_availability().unwrap()
+        else {
+            panic!("store fixture must expose typed desktop Undo authority");
+        };
+        assert_eq!(authority.effect_event_id, effect_event_id);
+        let outcome = store.undo_latest_desktop_human_decision(&authority, operation_id).unwrap();
         assert!(matches!(outcome, HumanDecisionUndoOutcome::Applied { .. }));
-        let replay = store.undo_human_decision(effect_event_id, None, operation_id).unwrap();
+        let replay = store.undo_latest_desktop_human_decision(&authority, operation_id).unwrap();
         assert!(matches!(replay, HumanDecisionUndoOutcome::AlreadyApplied { .. }));
 
         let database = runtime.lock().unwrap();
@@ -867,6 +1847,7 @@ mod tests {
 
     #[test]
     fn technical_unusable_commit_rejects_same_revision_source_swap_after_probe() {
+        let _probe_test = lock_technical_probe_tests();
         let (directory, store, runtime) = store_with_clip();
         std::fs::write(directory.path().join("clip.wav"), b"not an audio container").unwrap();
         let replacement = directory.path().join("healthy-replacement.wav");
@@ -967,6 +1948,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn technical_unusable_existing_file_lease_blocks_competing_replacement_through_commit() {
+        let _probe_test = lock_technical_probe_tests();
         let (directory, store, runtime) = store_with_clip();
         let source = directory.path().join("clip.wav");
         write_wav(&source, 16_000, 16_000);
@@ -1026,6 +2008,7 @@ mod tests {
 
     #[test]
     fn technical_probe_strictly_limits_distinct_blocking_sources() {
+        let _probe_test = lock_technical_probe_tests();
         let started = Arc::new(std::sync::Barrier::new(3));
         let release = Arc::new(std::sync::Barrier::new(3));
         let mut workers = Vec::new();
@@ -1071,6 +2054,7 @@ mod tests {
 
     #[test]
     fn concurrent_long_healthy_audio_claims_create_zero_effects() {
+        let _probe_test = lock_technical_probe_tests();
         let (directory, store, runtime) = store_with_clip();
         // Sixteen minutes at 8 kHz is deliberately much larger than a review clip. The probe walks
         // packets without accumulating PCM; same-source callers share at most one active flight.

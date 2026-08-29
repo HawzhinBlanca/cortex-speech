@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+import shutil
+import subprocess
+import tomllib
 from pathlib import Path
 
 
@@ -144,6 +149,199 @@ def test_cargo_deny_install_is_pinned() -> None:
     for name in ["ci.yml", "release.yml"]:
         assert_contains(workflow(name), expected, name)
     assert_contains(release_docs(), expected, "docs/RELEASE.md")
+
+
+def test_dependency_advisories_cannot_be_suppressed() -> None:
+    """A documented ignore is still a green result with a known advisory hidden behind it.
+
+    Owner-workstation certification requires the dependency graph to move to a patched release or
+    stay red.  Keeping this as an exact empty list also prevents cargo-deny defaults from changing
+    the meaning of an omitted field under a later tool version.
+    """
+
+    policy = tomllib.loads((REPO_ROOT / "deny.toml").read_text(encoding="utf-8"))
+    advisories = policy.get("advisories")
+    if not isinstance(advisories, dict) or advisories.get("ignore") != []:
+        raise AssertionError("deny.toml must carry an explicit empty advisory ignore list")
+
+
+def test_champion_launcher_escapes_windows_path_separator_regex() -> None:
+    """PowerShell ``-replace`` treats its first operand as a regular expression.
+
+    A single backslash is a syntactically incomplete regex and makes the supported owner launcher
+    abort before it can even read the champion pointer.  Both Windows paths converted for WSL must
+    therefore use the literal-backslash regex ``\\``.  This is deliberately checked as a source
+    invariant because executing the launcher in policy tests would load the 7B model.
+    """
+
+    launcher = (REPO_ROOT / "scripts" / "start_7b_server.ps1").read_text(encoding="utf-8")
+    invalid = r"-replace '\', '/'"
+    valid = r"-replace '\\', '/'"
+    if invalid in launcher:
+        raise AssertionError("start_7b_server.ps1 contains PowerShell's invalid single-backslash regex")
+    if launcher.count(valid) != 1:
+        raise AssertionError("champion launcher must centralize the valid backslash regex in one converter")
+    for conversion in (
+        "ConvertTo-WslPath $winPointer",
+        "ConvertTo-WslPath $serverWin",
+        "ConvertTo-WslPath $clientWin",
+        "ConvertTo-WslPath $guardWin",
+    ):
+        if conversion not in launcher:
+            raise AssertionError(f"champion launcher bypasses its checked path converter: {conversion}")
+
+    for durability_guard in (
+        "Start-Process -FilePath \"wsl.exe\" -WindowStyle Hidden -PassThru",
+        "Invoke-WslBashProgram",
+        "-RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath",
+        "$null = $process.Handle",
+        "$process.WaitForExit([int]($TimeoutSeconds * 1000))",
+        'Stop-Process -InputObject $process -Force',
+        'ConvertTo-BashLiteral "CORTEX_7B_HEALTH_TIMEOUT_SECONDS=5"',
+        '"/usr/bin/env", "-u", "BASH_ENV", "-u", "ENV"',
+        '"/bin/bash", "--noprofile", "--norc", "-c"',
+        "/usr/bin/base64 -d | /bin/bash --noprofile --norc",
+        "[Diagnostics.Stopwatch]::StartNew()",
+        "$serverProcess.HasExited",
+        "$null = $serverProcess.Handle",
+        "cortex_7b_client.py",
+        "--health",
+        "--expected-pointer",
+        "cortex_7b_launch_guard.py",
+        'Set-LaunchState "heartbeat"',
+        'Set-LaunchState "ready"',
+        'Set-LaunchState "stop"',
+        "--heartbeat-timeout 45",
+        'New-Object System.Threading.Mutex($false, "Local\\CortexSpeechChampionLaunch-$port")',
+        "[System.Threading.AbandonedMutexException]",
+        "$launchMutex.ReleaseMutex()",
+        '$launchToken = [Guid]::NewGuid().ToString("N")',
+        "$retainServer = $false",
+        "$retainServer = $true",
+        "finally {",
+        "Stop-Process -InputObject $serverProcess -Force",
+    ):
+        if durability_guard not in launcher:
+            raise AssertionError(f"champion launcher is missing durable pointer-bound startup: {durability_guard}")
+    launcher_code = "\n".join(
+        line for line in launcher.splitlines() if not line.lstrip().startswith("#")
+    )
+    health_invocations = [line for line in launcher_code.splitlines() if "$healthProgram =" in line]
+    if len(health_invocations) != 1 or not all(
+        marker in health_invocations[0]
+        for marker in ("$clientWsl)", "--health", "--expected-pointer", "$pointer)")
+    ):
+        raise AssertionError("launcher must have one health path and bind it to the current pointer")
+    if launcher_code.count("Invoke-WslBashProgram -Program $healthProgram -TimeoutSeconds 15") != 1:
+        raise AssertionError("launcher health must cross WSL through one explicitly bounded invocation")
+    if launcher_code.count('Start-Process -FilePath "wsl.exe"') != 2:
+        raise AssertionError("launcher must have only the bounded WSL helper and exact guarded server process")
+    if re.search(r"(?m)^\s*(?:&\s+)?wsl\.exe\b", launcher_code):
+        raise AssertionError("launcher contains an unbounded direct wsl.exe invocation")
+    if "Get-Date" in launcher_code:
+        raise AssertionError("launcher deadlines must use a monotonic Stopwatch, not adjustable wall time")
+    for private_output in (
+        'Write-Host "  script:    $serverWsl"',
+        'Write-Host "  pointer:   $pointer',
+        'WriteLine("no champion pointer at $winPointer',
+        'WriteLine("server script not found: $serverWin',
+        'WriteLine("client script not found: $clientWin',
+        'WriteLine("launch guard not found: $guardWin',
+        'throw "could not convert Windows path for WSL: $WindowsPath"',
+    ):
+        if private_output in launcher_code:
+            raise AssertionError("launcher status/error output must not retain absolute private paths")
+    if launcher_code.count("$retainServer = $true") != 1:
+        raise AssertionError("launcher must have exactly one ownership-transfer point after readiness")
+    poll_loop = launcher_code.find("$startupTimer = [Diagnostics.Stopwatch]::StartNew()")
+    heartbeat = launcher_code.find('Set-LaunchState "heartbeat"', poll_loop)
+    sleep = launcher_code.find("Start-Sleep -Seconds 10", heartbeat)
+    bound_health = launcher_code.find("if (Test-ServerReady)", sleep)
+    ready_signal = launcher_code.find('Set-LaunchState "ready"', bound_health)
+    ownership_transfer = launcher_code.find("$retainServer = $true", ready_signal)
+    stop_signal = launcher_code.find('Set-LaunchState "stop"', ownership_transfer)
+    forced_stop = launcher_code.find("Stop-Process -InputObject $serverProcess -Force", stop_signal)
+    if min(
+        poll_loop,
+        heartbeat,
+        sleep,
+        bound_health,
+        ready_signal,
+        ownership_transfer,
+        stop_signal,
+        forced_stop,
+    ) < 0 or not (
+        poll_loop
+        < heartbeat
+        < sleep
+        < bound_health
+        < ready_signal
+        < ownership_transfer
+        < stop_signal
+        < forced_stop
+    ):
+        raise AssertionError(
+            "launcher ownership must be heartbeat -> pointer-bound health -> READY transfer, "
+            "with exact guard stop before forced WSL cleanup"
+        )
+    mutex = launcher_code.find("Local\\CortexSpeechChampionLaunch-$port")
+    mutex_wait = launcher_code.find("$launchMutex.WaitOne(0)", mutex)
+    mutex_recheck = launcher_code.find("if (Test-ServerReady)", mutex_wait)
+    child_start = launcher_code.find('Start-Process -FilePath "wsl.exe"', mutex_recheck)
+    if min(mutex, mutex_wait, mutex_recheck, child_start) < 0 or not (
+        mutex < mutex_wait < mutex_recheck < child_start
+    ):
+        raise AssertionError("concurrent launch mutex must recheck exact readiness before child start")
+    if "> ~/cortex_7b_server.log" in launcher_code:
+        raise AssertionError("launcher must not truncate a shared log during concurrent starts")
+    if '"-lc"' in launcher_code:
+        raise AssertionError("launcher must not source an interactive/login Bash profile before startup")
+    if "nohup" in launcher_code:
+        raise AssertionError("champion launcher must not orphan the model behind a short-lived WSL process")
+
+
+def test_champion_launcher_parses_in_an_available_powershell() -> None:
+    """Use the real parser on Windows/release hosts; source checks cannot prove brace correctness."""
+    executable = shutil.which("powershell.exe") or shutil.which("pwsh")
+    if executable is None:
+        return
+    environment = os.environ.copy()
+    environment["CORTEX_LAUNCHER_POLICY_PATH"] = str(REPO_ROOT / "scripts" / "start_7b_server.ps1")
+    parser = (
+        "$tokens=$null;$errors=$null;"
+        "[void][System.Management.Automation.Language.Parser]::ParseFile("
+        "$env:CORTEX_LAUNCHER_POLICY_PATH,[ref]$tokens,[ref]$errors);"
+        "if($errors.Count){$errors|ForEach-Object{[Console]::Error.WriteLine($_.Message)};exit 1}"
+    )
+    result = subprocess.run(
+        [executable, "-NoProfile", "-Command", parser],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(f"champion launcher PowerShell parse failed: {result.stderr or result.stdout}")
+    invalid_environment = environment.copy()
+    invalid_environment["CORTEX_7B_PORT"] = "not-a-port"
+    invalid = subprocess.run(
+        [
+            executable,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            environment["CORTEX_LAUNCHER_POLICY_PATH"],
+        ],
+        env=invalid_environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if invalid.returncode != 2 or "must be an integer from 1 through 65535" not in invalid.stderr:
+        raise AssertionError("champion launcher did not fail closed before WSL on an invalid port")
 
 
 def test_rust_quality_authorities_are_split_mandatory_and_fail_closed() -> None:
@@ -519,6 +717,9 @@ def main() -> None:
     test_workflow_permissions_are_explicit()
     test_workflow_jobs_have_timeouts()
     test_cargo_deny_install_is_pinned()
+    test_dependency_advisories_cannot_be_suppressed()
+    test_champion_launcher_escapes_windows_path_separator_regex()
+    test_champion_launcher_parses_in_an_available_powershell()
     test_rust_quality_authorities_are_split_mandatory_and_fail_closed()
     test_release_docs_and_tag_workflow_share_clean_gate()
     test_playwright_browser_install_precedes_e2e()

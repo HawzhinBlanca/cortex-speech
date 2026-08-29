@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { describe, expect, expectTypeOf, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { invokeCritical, invokeLegacy, type LegacyIpcCommand } from './legacyIpc';
 
 const invokeMock = vi.mocked(invoke);
@@ -13,29 +13,84 @@ describe('handwritten IPC containment', () => {
     ).rejects.toThrow('Refusing unregistered');
     expect(invokeMock).not.toHaveBeenCalled();
   });
-
-  it('preserves exact critical arguments while inferring the registered result type', async () => {
-    invokeMock.mockReset();
-    invokeMock.mockResolvedValueOnce(undefined);
-
-    const result = invokeCritical('export_dataset', {
-      path: 'D:/proof/library.jsonl',
-      format: 'jsonl',
-    });
-    expectTypeOf(result).toEqualTypeOf<Promise<void>>();
-    await expect(result).resolves.toBeUndefined();
-    expect(invokeMock).toHaveBeenCalledWith('export_dataset', {
-      path: 'D:/proof/library.jsonl',
-      format: 'jsonl',
-    });
-  });
 });
 
 // Compile-time proof: generated commands cannot return to the handwritten boundary, critical
 // command arguments cannot be omitted, and arbitrary runtime command strings cannot enter it.
 const compileTimeContractProof = (): void => {
+  // @ts-expect-error owner audio selection is generated and typed
+  void invokeLegacy<unknown>('open_audio_file');
+  // @ts-expect-error both import starts use generated run-identity contracts
+  void invokeCritical('import_directory', { runId: 'run-1' });
+  // @ts-expect-error single-file import is no longer handwritten
+  void invokeLegacy<unknown>('import_audio_file');
+  // @ts-expect-error champion transcription uses the generated result and structured refusal
+  void invokeLegacy<unknown>('transcribe_segment');
+  // @ts-expect-error alignment timestamps are generated DTOs
+  void invokeLegacy<unknown>('align_segment');
+  // @ts-expect-error consensus evidence uses the generated provenance DTO
+  void invokeLegacy<unknown>('get_segment_consensus');
+  // @ts-expect-error waveform loading uses the generated typed command
+  void invokeLegacy<unknown>('get_waveform');
+  // @ts-expect-error dataset export now has a generated structured error boundary
+  void invokeCritical('export_dataset', { path: 'D:/proof/library.jsonl', format: 'jsonl' });
+  // @ts-expect-error transcript export now has a generated structured error boundary
+  void invokeLegacy<unknown>('export_transcript');
+  // @ts-expect-error audio-health results use the generated wire contract
+  void invokeCritical('get_audio_health');
+  // @ts-expect-error relink outcomes and refusals are generated
+  void invokeLegacy<unknown>('relink_audio');
+  // @ts-expect-error dataset validation uses its generated report domain
+  void invokeCritical('validate_dataset_cmd');
+  // @ts-expect-error reviewed-audio export uses generated options, results, and errors
+  void invokeLegacy<unknown>('export_audio');
+  // @ts-expect-error dataset merge has a generated closed result shape
+  void invokeCritical('merge_dataset_json', { jsonContent: '{}' });
+  // @ts-expect-error Hugging Face export uses generated structured errors
+  void invokeLegacy<unknown>('export_huggingface_dataset');
+  // @ts-expect-error gold promotion is generated and path-safe
+  void invokeCritical('create_gold_from_file', { audioPath: 'D:/owner/source.wav' });
+  // @ts-expect-error bulk gold promotion no longer uses handwritten IPC
+  void invokeLegacy<unknown>('import_verified_segments_as_gold');
+  // @ts-expect-error gold eval export uses its generated summary
+  void invokeCritical('export_gold_eval_set', { outDir: 'D:/proof/gold' });
+  // @ts-expect-error fine-tune export uses its complete generated provenance summary
+  void invokeLegacy<unknown>('export_finetune_pack');
+  // @ts-expect-error scorecards use exact generated eval and score DTOs
+  void invokeLegacy<unknown>('build_scorecard');
+  // @ts-expect-error signal anomaly mutation uses a generated structured refusal
+  void invokeLegacy<unknown>('compute_signal_anomaly_scores');
+  // @ts-expect-error active-learning queue arguments and segment results are generated
+  void invokeLegacy<unknown>('get_active_learning_queue');
+  // @ts-expect-error escalation queue results use the generated segment contract
+  void invokeLegacy<unknown>('get_escalation_queue');
+  // @ts-expect-error escalation trend evidence uses its generated DTO
+  void invokeLegacy<unknown>('get_escalation_rate_trend');
+  // @ts-expect-error intelligence evidence uses a closed generated report
+  void invokeLegacy<unknown>('get_intelligence_report');
+  // @ts-expect-error stored eval-run evidence uses the generated public DTO
+  void invokeLegacy<unknown>('list_eval_runs');
+  // @ts-expect-error champion gold evaluation uses generated results and hard-stop errors
+  void invokeLegacy<unknown>('run_gold_eval_asr');
+  // @ts-expect-error the jury report is an exact generated current/retired-mode union
+  void invokeLegacy<unknown>('run_jury_pipeline');
+  // @ts-expect-error T2 uses generated verdict/evidence and scrubbed error contracts
+  void invokeLegacy<unknown>('run_t2_for_segment');
+  // @ts-expect-error WSL refinement admission uses a generated started result
+  void invokeLegacy<unknown>('run_wsl_refinement');
+  // @ts-expect-error rediarization uses generated admission, result, and structured errors
+  void invokeLegacy<unknown>('rediarize_segments');
   // @ts-expect-error generated playback is intentionally absent from the handwritten inventory
   void invokeLegacy<unknown>('begin_desktop_playback_session_v1');
+  // @ts-expect-error generic review flags are revision-bound generated IPC, never handwritten
+  void invokeCritical('record_review_flag', {
+    request: {
+      operationId: 'operation-1',
+      segmentId: 'segment-1',
+      baseRevision: 7,
+      rationale: 'needs another listen',
+    },
+  });
   // @ts-expect-error the complete desktop-history domain is generated, not handwritten
   void invokeCritical('undo');
   // @ts-expect-error generated history queries cannot regress into the legacy inventory
@@ -44,6 +99,12 @@ const compileTimeContractProof = (): void => {
   void invokeLegacy<unknown>('compute_diff');
   // @ts-expect-error generated normalization cannot regress into the legacy inventory
   void invokeLegacy<unknown>('normalize_text');
+  // @ts-expect-error durable batch starts use generated typed admission contracts
+  void invokeLegacy<unknown>('batch_transcribe');
+  // @ts-expect-error durable normalization uses the same generated admission contract
+  void invokeLegacy<unknown>('batch_normalize');
+  // @ts-expect-error terminal batch acknowledgement is generated and exact-id typed
+  void invokeLegacy<unknown>('acknowledge_batch_run');
   // @ts-expect-error health and build identity are generated, not handwritten
   void invokeLegacy<unknown>('app_health');
   // @ts-expect-error inference diagnostics use the generated public DTO

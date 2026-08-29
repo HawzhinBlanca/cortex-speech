@@ -12,9 +12,12 @@ use crate::db::SpeechSegment;
 use crate::history::HistoryManager;
 use crate::ipc_contract::{
     CommandErrorV1, CommitReviewRequestV1, CommittedReviewV1, DeleteSegmentsRequestV1, DeletedSegmentsV1,
-    DesktopPlaybackReceiptV1, DesktopPlaybackSessionV1, MarkSegmentUnusableRequestV1, MarkedSegmentUnusableV1,
-    PlaybackIntervalV1, RenameSpeakerRequestV1, RenamedSpeakerV1, ReviewDecisionV1, ReviewDraftV1,
-    SegmentMetadataChangeV1, SuggestedActionV1, UpdateSegmentMetadataRequestV1, UpdatedSegmentMetadataV1,
+    DesktopHumanDecisionV1, DesktopPlaybackReceiptV1, DesktopPlaybackSessionV1, DesktopReviewFlagKindV1,
+    DesktopReviewUndoAvailabilityV1, DesktopReviewUndoBlockReasonV1, DesktopReviewUndoOutcomeV1,
+    DesktopReviewUndoTargetV1, MarkSegmentUnusableRequestV1, MarkedSegmentUnusableV1, PlaybackIntervalV1,
+    RecordReviewFlagRequestV1, RecordedReviewFlagV1, RenameSpeakerRequestV1, RenamedSpeakerV1, ReviewDecisionV1,
+    ReviewDraftV1, SegmentMetadataChangeV1, SuggestedActionV1, UndoDesktopReviewRequestV1,
+    UpdateSegmentMetadataRequestV1, UpdatedSegmentMetadataV1,
 };
 use crate::stores::{SegmentDeleteError, SegmentMetadataChange, SegmentMetadataUpdateError, SpeakerRenameError};
 use crate::validation::input as validate;
@@ -500,7 +503,23 @@ fn public_precommit_playback_binding_error(_error: &str) -> CommandErrorV1 {
 }
 
 fn public_draft_error(error: &str, action: &str) -> CommandErrorV1 {
-    if error.contains("E_STALE_REVIEW_DRAFT") {
+    if error.contains("E_STALE_REVIEW_DRAFT_WRITE") {
+        CommandErrorV1::new(
+            "DRAFT_WRITE_SUPERSEDED",
+            "A newer draft action replaced this one. Retry the current edit.",
+            true,
+        )
+        .suggested(SuggestedActionV1::Retry)
+    } else if error.to_ascii_lowercase().contains("restore generation changed")
+        || error.to_ascii_lowercase().contains("database restore is in progress")
+    {
+        CommandErrorV1::new(
+            "DRAFT_WRITE_GENERATION_CHANGED",
+            "The workspace was restored while this draft action was pending. Reload the clip and retry.",
+            true,
+        )
+        .suggested(SuggestedActionV1::ReloadClip)
+    } else if error.contains("E_STALE_REVIEW_DRAFT") {
         CommandErrorV1::new(
             "STALE_DRAFT_REVISION",
             "The clip changed while this draft was being saved. Reload it before continuing.",
@@ -524,6 +543,30 @@ fn public_draft_error(error: &str, action: &str) -> CommandErrorV1 {
         };
         CommandErrorV1::new("REVIEW_DRAFT_FAILED", message, false).suggested(SuggestedActionV1::OpenHealth)
     }
+}
+
+/// Reserve the exact next draft mutation before starting a possibly slow native write. A later
+/// reservation fences an older invocation whose renderer response timed out or whose surface was
+/// replaced, while a write already at its commit point completes before this reservation returns.
+#[tauri::command]
+#[specta::specta]
+pub fn reserve_review_draft_write_v1(
+    state: State<'_, AppState>,
+    segment_id: String,
+    operation_id: String,
+) -> Result<(), CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("reserve_review_draft_write_v1").map_err(|_| {
+        CommandErrorV1::new("RATE_LIMITED", "Too many draft actions. Retry in a moment.", true)
+            .suggested(SuggestedActionV1::Retry)
+    })?;
+    validate::validate_identifier(&segment_id)
+        .map_err(|_| CommandErrorV1::new("INVALID_SEGMENT_ID", "The clip identity is invalid.", false))?;
+    validate::validate_identifier(&operation_id)
+        .map_err(|_| CommandErrorV1::new("INVALID_OPERATION_ID", "The draft operation identity is invalid.", false))?;
+    state
+        .review_drafts()
+        .reserve_write(&segment_id, &operation_id)
+        .map_err(|error| public_draft_error(&error.to_string(), "reserved"))
 }
 
 fn review_draft_v1(record: crate::stores::ReviewDraftRecord) -> ReviewDraftV1 {
@@ -565,6 +608,7 @@ pub fn save_review_draft_v1(
     segment_id: String,
     base_revision: i64,
     text: String,
+    operation_id: String,
 ) -> Result<ReviewDraftV1, CommandErrorV1> {
     STRICT_RATE_LIMITER.check("save_review_draft_v1").map_err(|_| {
         CommandErrorV1::new("RATE_LIMITED", "Too many draft saves. Retry in a moment.", true)
@@ -572,6 +616,8 @@ pub fn save_review_draft_v1(
     })?;
     validate::validate_identifier(&segment_id)
         .map_err(|_| CommandErrorV1::new("INVALID_SEGMENT_ID", "The clip identity is invalid.", false))?;
+    validate::validate_identifier(&operation_id)
+        .map_err(|_| CommandErrorV1::new("INVALID_OPERATION_ID", "The draft operation identity is invalid.", false))?;
     if base_revision < 0 {
         return Err(CommandErrorV1::new("INVALID_REVIEW_REVISION", "The clip revision must be non-negative.", false));
     }
@@ -579,7 +625,7 @@ pub fn save_review_draft_v1(
         .map_err(|_| CommandErrorV1::new("INVALID_REVIEW_DRAFT", "The draft is invalid or too long.", false))?;
     state
         .review_drafts()
-        .save(&segment_id, base_revision, &text)
+        .save(&segment_id, base_revision, &text, &operation_id)
         .map(review_draft_v1)
         .map_err(|error| public_draft_error(&error.to_string(), "saved"))
 }
@@ -592,6 +638,7 @@ pub fn delete_review_draft_v1(
     state: State<'_, AppState>,
     segment_id: String,
     base_revision: i64,
+    operation_id: String,
 ) -> Result<bool, CommandErrorV1> {
     STRICT_RATE_LIMITER.check("delete_review_draft_v1").map_err(|_| {
         CommandErrorV1::new("RATE_LIMITED", "Too many draft deletes. Retry in a moment.", true)
@@ -599,24 +646,22 @@ pub fn delete_review_draft_v1(
     })?;
     validate::validate_identifier(&segment_id)
         .map_err(|_| CommandErrorV1::new("INVALID_SEGMENT_ID", "The clip identity is invalid.", false))?;
+    validate::validate_identifier(&operation_id)
+        .map_err(|_| CommandErrorV1::new("INVALID_OPERATION_ID", "The draft operation identity is invalid.", false))?;
     if base_revision < 0 {
         return Err(CommandErrorV1::new("INVALID_REVIEW_REVISION", "The clip revision must be non-negative.", false));
     }
     state
         .review_drafts()
-        .delete_if_revision(&segment_id, base_revision)
+        .delete_if_revision(&segment_id, base_revision, &operation_id)
         .map_err(|error| public_draft_error(&error.to_string(), "deleted"))
 }
 
 fn committed_review_v1(commit: crate::db::HumanDecisionCommit) -> CommittedReviewV1 {
-    let authoritative_transcript = commit
-        .segment
-        .verdict_transcript
-        .as_deref()
-        .filter(|text| !text.trim().is_empty())
-        .or_else(|| commit.segment.annotated_transcript.as_deref().filter(|text| !text.trim().is_empty()))
-        .unwrap_or(&commit.segment.raw_transcript)
-        .to_string();
+    // Return the same product authority every review/export surface uses. In particular, a reject
+    // must not relabel a retained historical machine-jury proposal as the server's authoritative
+    // transcript merely because that proposal still occupies `verdict_transcript`.
+    let authoritative_transcript = crate::quality::effective_transcript(&commit.segment).to_string();
     CommittedReviewV1 {
         segment_id: commit.segment_id,
         committed_revision: commit.decided_revision,
@@ -633,10 +678,22 @@ fn commit_review_v1_on(
     commit_review_v1_on_with_source_lease(store, request, None)
 }
 
+#[cfg(test)]
 fn commit_review_v1_on_with_source_lease(
     store: &crate::stores::ReviewWriteStore,
     request: &CommitReviewRequestV1,
     source_lease: Option<crate::media::VerifiedMediaSourceLease>,
+) -> Result<CommittedReviewV1, CommandErrorV1> {
+    let restore_generation =
+        store.capture_restore_generation().map_err(|error| public_review_error(&error, &request.operation_id))?;
+    commit_review_v1_on_with_source_lease_at_generation(store, request, source_lease, restore_generation)
+}
+
+fn commit_review_v1_on_with_source_lease_at_generation(
+    store: &crate::stores::ReviewWriteStore,
+    request: &CommitReviewRequestV1,
+    source_lease: Option<crate::media::VerifiedMediaSourceLease>,
+    restore_generation: crate::database_runtime::RestoreGeneration,
 ) -> Result<CommittedReviewV1, CommandErrorV1> {
     let invalid =
         |message: &str| CommandErrorV1::new("INVALID_REVIEW_REQUEST", message, false).operation(&request.operation_id);
@@ -665,7 +722,17 @@ fn commit_review_v1_on_with_source_lease(
     })?;
 
     let (decision, transcript) = match request.decision {
-        ReviewDecisionV1::Accept => ("accept", request.transcript.as_deref()),
+        ReviewDecisionV1::Accept => {
+            // Accept must name the exact text the renderer showed. Falling back inside the database
+            // lets a direct/stale client accidentally bless a legacy machine verdict that was never
+            // served under the Verbatim Law.
+            let transcript = request
+                .transcript
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .ok_or_else(|| invalid("An acceptance must identify the non-blank transcript being approved."))?;
+            ("accept", Some(transcript))
+        }
         ReviewDecisionV1::Edit => {
             let transcript = request
                 .transcript
@@ -680,18 +747,10 @@ fn commit_review_v1_on_with_source_lease(
             }
             ("reject", None)
         }
-        ReviewDecisionV1::Skip => {
-            return Err(CommandErrorV1::new(
-                "SKIP_NOT_A_COMMIT",
-                "Skip changes navigation only and cannot create review truth.",
-                false,
-            )
-            .operation(&request.operation_id));
-        }
     };
 
     let commit = store
-        .commit_typed_decision_with_source_lease(
+        .commit_typed_decision_with_source_lease_at_generation(
             &request.segment_id,
             request.base_revision,
             decision,
@@ -699,6 +758,7 @@ fn commit_review_v1_on_with_source_lease(
             playback_receipt_id,
             &request.operation_id,
             source_lease,
+            restore_generation,
         )
         .map_err(|error| match error {
             crate::stores::ReviewCommitError::SegmentNotFound => {
@@ -734,6 +794,8 @@ pub fn commit_review_v1(
             .suggested(SuggestedActionV1::Retry)
     })?;
     let store = state.review_writes();
+    let restore_generation =
+        store.capture_restore_generation().map_err(|error| public_review_error(&error, &request.operation_id))?;
     let media_grant_id = store
         .desktop_playback_media_grant_id(&request.playback_receipt_id)
         .map_err(|error| public_review_error(&error.to_string(), &request.operation_id))?;
@@ -741,7 +803,8 @@ pub fn commit_review_v1(
         let mut registry = state.lock_media_registry();
         registry.playback_binding(&grant_id).ok().map(|binding| binding.source_lease())
     });
-    let commit = commit_review_v1_on_with_source_lease(&store, &request, source_lease)?;
+    let commit =
+        commit_review_v1_on_with_source_lease_at_generation(&store, &request, source_lease, restore_generation)?;
     state.persist_review_cursor(&request.segment_id);
     Ok(commit)
 }
@@ -901,30 +964,409 @@ pub fn undo_human_decision(
     operation_id: String,
 ) -> Result<crate::db::HumanDecisionUndoOutcome, String> {
     STRICT_RATE_LIMITER.check("undo_human_decision")?;
-    state.review_writes().undo_human_decision(effect_event_id, None, &operation_id).map_err(|error| error.to_string())
+    let _ = (state, effect_event_id, operation_id);
+    Err(
+        "TYPED_UNDO_REQUIRED: undo_human_decision is retired; reload review truth and use undo_desktop_review_action_v1"
+            .into(),
+    )
 }
 
+fn public_desktop_undo_target_error(error: &crate::error::AppError) -> CommandErrorV1 {
+    let normalized = error.to_string().to_ascii_lowercase();
+    if error.is_database_busy() || normalized.contains("restore") || normalized.contains("read capacity") {
+        CommandErrorV1::new("DATABASE_BUSY", "The workspace is busy. Retry loading Undo.", true)
+            .suggested(SuggestedActionV1::Retry)
+    } else {
+        CommandErrorV1::new(
+            "UNDO_TARGET_UNAVAILABLE",
+            "The restart-safe Undo target could not be verified. Review data was not changed.",
+            false,
+        )
+        .suggested(SuggestedActionV1::OpenHealth)
+    }
+}
+
+fn public_desktop_undo_error(error: &crate::error::AppError, operation_id: &str) -> CommandErrorV1 {
+    if error.is_database_busy() {
+        CommandErrorV1::new("DATABASE_BUSY", "The workspace is busy. Retry this exact Undo.", true)
+            .operation(operation_id)
+            .suggested(SuggestedActionV1::Retry)
+    } else if matches!(error, crate::error::AppError::Validation(_))
+        && (error.to_string().contains("globally current")
+            || error.to_string().contains("same immutable decision")
+            || error.to_string().contains("same immutable review flag"))
+    {
+        CommandErrorV1::new(
+            "STALE_UNDO_TARGET",
+            "A newer review action or database generation replaced this Undo target. Reload review truth.",
+            false,
+        )
+        .operation(operation_id)
+        .suggested(SuggestedActionV1::ReloadClip)
+    } else if matches!(error, crate::error::AppError::Validation(_)) {
+        CommandErrorV1::new(
+            "INVALID_UNDO_REQUEST",
+            "This Undo identity is invalid or no longer belongs to a reversible desktop review action.",
+            false,
+        )
+        .operation(operation_id)
+        .suggested(SuggestedActionV1::ReloadClip)
+    } else {
+        CommandErrorV1::new(
+            "UNDO_REVIEW_FAILED",
+            "The exact Undo outcome could not be verified. Retry with the retained operation identity or open Health.",
+            true,
+        )
+        .operation(operation_id)
+        .suggested(SuggestedActionV1::OpenHealth)
+    }
+}
+
+fn public_desktop_undo_generation_error(error: &str, operation_id: &str) -> CommandErrorV1 {
+    if error.contains("generation changed") {
+        CommandErrorV1::new(
+            "STALE_UNDO_TARGET",
+            "The database was restored after this Undo target was loaded. Reload review truth.",
+            false,
+        )
+        .operation(operation_id)
+        .suggested(SuggestedActionV1::ReloadClip)
+    } else {
+        CommandErrorV1::new("DATABASE_BUSY", "Database recovery is busy. Retry after it completes.", true)
+            .operation(operation_id)
+            .suggested(SuggestedActionV1::Retry)
+    }
+}
+
+fn get_desktop_review_undo_target_v1_on(
+    store: &crate::stores::ReviewWriteStore,
+) -> Result<DesktopReviewUndoAvailabilityV1, CommandErrorV1> {
+    let before = store
+        .capture_restore_generation()
+        .map_err(|error| public_desktop_undo_target_error(&crate::error::AppError::Other(error)))?;
+    let availability =
+        store.desktop_review_undo_availability().map_err(|error| public_desktop_undo_target_error(&error))?;
+    let after = store
+        .capture_restore_generation()
+        .map_err(|error| public_desktop_undo_target_error(&crate::error::AppError::Other(error)))?;
+    if before != after {
+        return Err(CommandErrorV1::new(
+            "STALE_UNDO_TARGET",
+            "The database changed while Undo history was loading. Retry from current review truth.",
+            true,
+        )
+        .suggested(SuggestedActionV1::Retry));
+    }
+    match availability {
+        crate::db::DesktopReviewUndoAvailability::NoHistory => Ok(DesktopReviewUndoAvailabilityV1::None),
+        crate::db::DesktopReviewUndoAvailability::Blocked(reason) => {
+            let reason = match reason {
+                crate::db::DesktopReviewUndoBlockReason::LegacyHistory => DesktopReviewUndoBlockReasonV1::LegacyHistory,
+                crate::db::DesktopReviewUndoBlockReason::LatestDecisionUndone => {
+                    DesktopReviewUndoBlockReasonV1::LatestDecisionUndone
+                }
+                crate::db::DesktopReviewUndoBlockReason::LatestFlagUndone => {
+                    DesktopReviewUndoBlockReasonV1::LatestFlagUndone
+                }
+                crate::db::DesktopReviewUndoBlockReason::DecisionShadowed => {
+                    DesktopReviewUndoBlockReasonV1::DecisionShadowed
+                }
+                crate::db::DesktopReviewUndoBlockReason::FlagShadowed => DesktopReviewUndoBlockReasonV1::FlagShadowed,
+            };
+            Ok(DesktopReviewUndoAvailabilityV1::Blocked { reason })
+        }
+        crate::db::DesktopReviewUndoAvailability::Available(authority) => {
+            let target = match authority {
+                crate::db::DesktopReviewUndoAuthority::Decision(authority) => {
+                    let decision = match authority.action.as_str() {
+                        "accept" => DesktopHumanDecisionV1::Accept,
+                        "edit" => DesktopHumanDecisionV1::Edit,
+                        "reject" => DesktopHumanDecisionV1::Reject,
+                        _ => {
+                            return Err(CommandErrorV1::new(
+                                "UNDO_TARGET_INVALID",
+                                "The stored Undo target failed integrity validation. Review data was not changed.",
+                                false,
+                            )
+                            .suggested(SuggestedActionV1::OpenHealth));
+                        }
+                    };
+                    DesktopReviewUndoTargetV1::Decision {
+                        effect_event_id: authority.effect_event_id,
+                        segment_id: authority.segment_id,
+                        decision,
+                        source_operation_id: authority.decision_operation_id,
+                        source_payload_hash: authority.decision_payload_hash,
+                        database_generation: before.serial(),
+                    }
+                }
+                crate::db::DesktopReviewUndoAuthority::Flag(authority) => {
+                    let flag_kind = match authority.flag_kind {
+                        crate::db::DesktopReviewFlagKind::Generic => DesktopReviewFlagKindV1::Generic,
+                        crate::db::DesktopReviewFlagKind::TechnicalUnusable(reason) => {
+                            let reason = match reason.as_str() {
+                                "decodeFailed" => crate::ipc_contract::TechnicalUnusableReasonV1::DecodeFailed,
+                                "missingFile" => crate::ipc_contract::TechnicalUnusableReasonV1::MissingFile,
+                                "permissionDenied" => crate::ipc_contract::TechnicalUnusableReasonV1::PermissionDenied,
+                                "corruptContainer" => crate::ipc_contract::TechnicalUnusableReasonV1::CorruptContainer,
+                                _ => {
+                                    return Err(CommandErrorV1::new(
+                                        "UNDO_TARGET_INVALID",
+                                        "The stored technical Undo target failed integrity validation. Review data was not changed.",
+                                        false,
+                                    )
+                                    .suggested(SuggestedActionV1::OpenHealth));
+                                }
+                            };
+                            DesktopReviewFlagKindV1::TechnicalUnusable { reason }
+                        }
+                    };
+                    DesktopReviewUndoTargetV1::Flag {
+                        effect_event_id: authority.effect_event_id,
+                        segment_id: authority.segment_id,
+                        source_operation_id: authority.flag_operation_id,
+                        source_payload_hash: authority.flag_payload_hash,
+                        prior_revision: authority.prior_revision,
+                        flag_revision: authority.flag_revision,
+                        flag_kind,
+                        database_generation: before.serial(),
+                    }
+                }
+            };
+            Ok(DesktopReviewUndoAvailabilityV1::Available { target })
+        }
+    }
+}
+
+fn undo_desktop_review_action_v1_on(
+    store: &crate::stores::ReviewWriteStore,
+    request: &UndoDesktopReviewRequestV1,
+) -> Result<DesktopReviewUndoOutcomeV1, CommandErrorV1> {
+    let database_generation = match &request.target {
+        DesktopReviewUndoTargetV1::Decision { database_generation, .. }
+        | DesktopReviewUndoTargetV1::Flag { database_generation, .. } => *database_generation,
+    };
+    let _mutation = store
+        .begin_mutation_at_restore_generation_serial(database_generation)
+        .map_err(|error| public_desktop_undo_generation_error(&error, &request.operation_id))?;
+    match &request.target {
+        DesktopReviewUndoTargetV1::Decision {
+            effect_event_id,
+            segment_id,
+            decision,
+            source_operation_id,
+            source_payload_hash,
+            ..
+        } => {
+            let action = match decision {
+                DesktopHumanDecisionV1::Accept => "accept",
+                DesktopHumanDecisionV1::Edit => "edit",
+                DesktopHumanDecisionV1::Reject => "reject",
+            };
+            let authority = crate::db::DesktopHumanDecisionUndoAuthority {
+                effect_event_id: *effect_event_id,
+                segment_id: segment_id.clone(),
+                action: action.into(),
+                decision_operation_id: source_operation_id.clone(),
+                decision_payload_hash: source_payload_hash.clone(),
+            };
+            store
+                .undo_latest_desktop_human_decision(&authority, &request.operation_id)
+                .map(|outcome| DesktopReviewUndoOutcomeV1::from_decision_database(*effect_event_id, outcome))
+                .map_err(|error| public_desktop_undo_error(&error, &request.operation_id))
+        }
+        DesktopReviewUndoTargetV1::Flag {
+            effect_event_id,
+            segment_id,
+            source_operation_id,
+            source_payload_hash,
+            prior_revision,
+            flag_revision,
+            flag_kind,
+            ..
+        } => {
+            let flag_kind = match flag_kind {
+                DesktopReviewFlagKindV1::Generic => crate::db::DesktopReviewFlagKind::Generic,
+                DesktopReviewFlagKindV1::TechnicalUnusable { reason } => {
+                    crate::db::DesktopReviewFlagKind::TechnicalUnusable(reason.as_code().into())
+                }
+            };
+            let authority = crate::db::DesktopReviewFlagUndoAuthority {
+                effect_event_id: *effect_event_id,
+                segment_id: segment_id.clone(),
+                flag_operation_id: source_operation_id.clone(),
+                prior_revision: *prior_revision,
+                flag_revision: *flag_revision,
+                flag_payload_hash: source_payload_hash.clone(),
+                flag_kind,
+            };
+            store
+                .undo_latest_desktop_review_flag(&authority, &request.operation_id)
+                .map(|outcome| DesktopReviewUndoOutcomeV1::from_flag_database(*effect_event_id, outcome))
+                .map_err(|error| public_desktop_undo_error(&error, &request.operation_id))
+        }
+    }
+}
+
+/// Discover the globally latest database-proven active desktop decision or flag. The tagged target
+/// is restore-generation-bound and carries only server-derived immutable authority, so Backspace
+/// cannot cross-route colliding decision/flag effect ids after restart.
 #[tauri::command]
+#[specta::specta]
+pub async fn get_desktop_review_undo_target_v1(
+    state: State<'_, AppState>,
+) -> Result<DesktopReviewUndoAvailabilityV1, CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("get_desktop_review_undo_target_v1").map_err(|_| {
+        CommandErrorV1::new("RATE_LIMITED", "Too many Undo-history reads. Retry in a moment.", true)
+            .suggested(SuggestedActionV1::Retry)
+    })?;
+    let store = state.review_writes();
+    tokio::task::spawn_blocking(move || get_desktop_review_undo_target_v1_on(&store)).await.map_err(|_| {
+        CommandErrorV1::new(
+            "UNDO_TARGET_WORKER_FAILED",
+            "The Undo-history worker stopped unexpectedly. Review data was not changed.",
+            true,
+        )
+        .suggested(SuggestedActionV1::Retry)
+    })?
+}
+
+/// Reverse one server-owned desktop decision or flag snapshot with a stable idempotency UUID. The
+/// renderer supplies only the tagged immutable target; it cannot provide or overwrite restored row
+/// truth or private technical-flag rationale.
+#[tauri::command]
+#[specta::specta]
+pub async fn undo_desktop_review_action_v1(
+    state: State<'_, AppState>,
+    request: UndoDesktopReviewRequestV1,
+) -> Result<DesktopReviewUndoOutcomeV1, CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("undo_desktop_review_action_v1").map_err(|_| {
+        CommandErrorV1::new("RATE_LIMITED", "Too many Undo attempts. Retry this exact Undo in a moment.", true)
+            .operation(&request.operation_id)
+            .suggested(SuggestedActionV1::Retry)
+    })?;
+    let store = state.review_writes();
+    let operation_id = request.operation_id.clone();
+    tokio::task::spawn_blocking(move || undo_desktop_review_action_v1_on(&store, &request)).await.map_err(|_| {
+        CommandErrorV1::new(
+            "UNDO_REVIEW_WORKER_FAILED",
+            "The Undo worker stopped unexpectedly. Retry with the retained operation identity.",
+            true,
+        )
+        .operation(&operation_id)
+        .suggested(SuggestedActionV1::Retry)
+    })?
+}
+
+fn recorded_review_flag_v1(commit: crate::db::HumanFlagCommit) -> RecordedReviewFlagV1 {
+    RecordedReviewFlagV1 {
+        effect_event_id: commit.effect_event_id,
+        segment_id: commit.segment_id,
+        prior_revision: commit.prior_revision,
+        flag_revision: commit.flag_revision,
+        segment: commit.segment,
+    }
+}
+
+fn record_review_flag_on(
+    store: &crate::stores::ReviewWriteStore,
+    request: &RecordReviewFlagRequestV1,
+) -> Result<RecordedReviewFlagV1, CommandErrorV1> {
+    let invalid = |message: &str| {
+        CommandErrorV1::new("INVALID_REVIEW_FLAG_REQUEST", message, false).operation(&request.operation_id)
+    };
+    validate::validate_identifier(&request.segment_id).map_err(|_| invalid("The clip identity is invalid."))?;
+    validate::validate_identifier(&request.operation_id).map_err(|_| invalid("The operation identity is invalid."))?;
+    if !uuid::Uuid::parse_str(&request.operation_id)
+        .is_ok_and(|parsed| parsed.hyphenated().to_string() == request.operation_id)
+    {
+        return Err(invalid("The operation identity is invalid."));
+    }
+    if request.base_revision < 0 {
+        return Err(invalid("The clip revision must be non-negative."));
+    }
+    validate::validate_text(&request.rationale, 10_000, "Review flag rationale")
+        .map_err(|_| invalid("The review flag rationale is invalid."))?;
+
+    store
+        .record_flag(&request.segment_id, request.base_revision, &request.rationale, &request.operation_id)
+        .map(recorded_review_flag_v1)
+        .map_err(|error| match error {
+            crate::stores::ReviewFlagCommitError::SegmentNotFound => {
+                CommandErrorV1::new("SEGMENT_NOT_FOUND", "This clip no longer exists.", false)
+                    .operation(&request.operation_id)
+                    .suggested(SuggestedActionV1::ReloadClip)
+            }
+            crate::stores::ReviewFlagCommitError::StaleRevision { current_revision } => {
+                CommandErrorV1::new("STALE_REVISION", "This clip changed; reload it before flagging it.", false)
+                    .operation(&request.operation_id)
+                    .suggested(SuggestedActionV1::ReloadClip)
+                    .detail("expectedRevision", request.base_revision)
+                    .detail("currentRevision", current_revision)
+            }
+            crate::stores::ReviewFlagCommitError::Backend(source) => {
+                let message = source.to_string();
+                if message.contains("operation UUID was already used")
+                    || message.contains("operation UUID is already bound")
+                {
+                    CommandErrorV1::new(
+                        "OPERATION_ID_CONFLICT",
+                        "This action identity is already bound to a different review flag request.",
+                        false,
+                    )
+                    .operation(&request.operation_id)
+                    .suggested(SuggestedActionV1::ReloadClip)
+                } else if message.contains("already has an active immutable effect") {
+                    CommandErrorV1::new(
+                        "REVIEW_FLAG_ALREADY_ACTIVE",
+                        "This clip already has an active review flag. Reload it before taking another action.",
+                        false,
+                    )
+                    .operation(&request.operation_id)
+                    .suggested(SuggestedActionV1::ReloadClip)
+                } else if message.to_ascii_lowercase().contains("database is locked")
+                    || message.to_ascii_lowercase().contains("database is busy")
+                {
+                    CommandErrorV1::new("DATABASE_BUSY", "The workspace is busy. Retry this exact flag.", true)
+                        .operation(&request.operation_id)
+                        .suggested(SuggestedActionV1::Retry)
+                } else if matches!(source, crate::error::AppError::Validation(_)) {
+                    CommandErrorV1::new(
+                        "REVIEW_FLAG_REFUSED",
+                        "The review flag was refused and no clip truth was changed. Reload the clip before retrying.",
+                        false,
+                    )
+                    .operation(&request.operation_id)
+                    .suggested(SuggestedActionV1::ReloadClip)
+                } else {
+                    CommandErrorV1::new(
+                        "COMMIT_OUTCOME_UNKNOWN",
+                        "The review flag outcome could not be confirmed. Restart Cortex to reconcile database truth.",
+                        true,
+                    )
+                    .operation(&request.operation_id)
+                    .suggested(SuggestedActionV1::Retry)
+                }
+            }
+        })
+}
+
+/// Compare-and-swap generic owner review flag. The exact renderer-observed revision is part of the
+/// idempotency payload, so stale UI state cannot flag a newer clip state.
+#[tauri::command]
+#[specta::specta]
 pub fn record_review_flag(
     state: State<'_, AppState>,
-    segment_id: String,
-    rationale: String,
-    operation_id: String,
-) -> Result<crate::db::HumanFlagCommit, String> {
-    RATE_LIMITER.check("record_review_flag")?;
-    validate::validate_identifier(&segment_id)?;
-    validate::validate_text(&rationale, 10_000, "Review flag rationale")?;
-    state.review_writes().record_flag(&segment_id, &rationale, &operation_id).map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-pub fn undo_review_flag(
-    state: State<'_, AppState>,
-    effect_event_id: i64,
-    operation_id: String,
-) -> Result<crate::db::HumanFlagUndoOutcome, String> {
-    STRICT_RATE_LIMITER.check("undo_review_flag")?;
-    state.review_writes().undo_flag(effect_event_id, &operation_id).map_err(|error| error.to_string())
+    request: RecordReviewFlagRequestV1,
+) -> Result<RecordedReviewFlagV1, CommandErrorV1> {
+    RATE_LIMITER.check("record_review_flag").map_err(|_| {
+        CommandErrorV1::new("RATE_LIMITED", "Too many review flag attempts. Retry in a moment.", true)
+            .operation(&request.operation_id)
+            .suggested(SuggestedActionV1::Retry)
+    })?;
+    let committed = record_review_flag_on(&state.review_writes(), &request)?;
+    state.persist_review_cursor(&request.segment_id);
+    Ok(committed)
 }
 
 /// Bound BOTH renderer-supplied identity strings on a playback receipt. `session_id` is stored on the
@@ -967,17 +1409,19 @@ pub fn begin_desktop_playback_session_v1(
         return Err(CommandErrorV1::new("INVALID_REVIEW_REVISION", "The clip revision must be non-negative.", false));
     }
 
+    let store = state.review_writes();
+    let restore_generation = store.capture_restore_generation().map_err(|error| public_playback_error(&error))?;
     // Clone a read-only media lease under the registry lock, then release that lock before taking
     // the serialized DB writer. A grant may spend minutes copying/verifying a large source; waiting
     // for that mutex while holding DB would freeze every unrelated query. The cloned OS handle keeps
-    // the exact cached bytes sealed through the transaction without nested locks.
+    // the exact cached bytes sealed through the transaction without nested locks. The generation
+    // captured above prevents this pre-restore binding from minting authority after a restore.
     let binding = {
         let mut registry = state.lock_media_registry();
         registry.playback_binding(&media_grant_id).map_err(|error| public_playback_error(&error))?
     };
-    let database = state.lock_db();
-    let session = database
-        .begin_desktop_playback_session_v1(
+    let session = store
+        .begin_desktop_playback_session_at_generation_v1(
             &segment_id,
             expected_revision,
             &media_grant_id,
@@ -985,6 +1429,7 @@ pub fn begin_desktop_playback_session_v1(
             &binding.source_path,
             &binding.audio_content_hash,
             None,
+            restore_generation,
         )
         .map_err(|error| public_playback_error(&error.to_string()))?;
     Ok(DesktopPlaybackSessionV1 {
@@ -1015,7 +1460,7 @@ pub fn cancel_desktop_playback_session_v1(
     validate::validate_identifier(&client_attempt_id)
         .map_err(|_| CommandErrorV1::new("INVALID_PLAYBACK_ATTEMPT", "The playback attempt is invalid.", false))?;
     state
-        .lock_db()
+        .review_writes()
         .cancel_desktop_playback_session_v1(&playback_receipt_id, &client_attempt_id)
         .map_err(|error| public_playback_error(&error.to_string()))
 }
@@ -1042,13 +1487,15 @@ pub fn finalize_desktop_playback_session_v1(
         .into_iter()
         .map(|interval| crate::db::DesktopPlaybackInterval { start_ms: interval.start_ms, end_ms: interval.end_ms })
         .collect::<Vec<_>>();
+    let store = state.review_writes();
+    let restore_generation =
+        store.capture_restore_generation().map_err(|error| public_playback_error(&error))?.serial();
 
     // Exact lost-response replay is recovery, not evidence minting. Once the immutable receipt row
     // exists, requiring its short-lived media-cache grant would strand a durable decision after a
     // suspend/TTL expiry. Release the DB lock before touching the registry on the new-receipt path.
     if let Some(receipt) = {
-        let database = state.lock_db();
-        database
+        store
             .replay_finalized_desktop_playback_receipt_v1(&playback_receipt_id, &media_grant_id, &intervals)
             .map_err(|error| public_playback_error(&error.to_string()))?
     } {
@@ -1066,14 +1513,14 @@ pub fn finalize_desktop_playback_session_v1(
         let mut registry = state.lock_media_registry();
         registry.playback_binding(&media_grant_id).map_err(|error| public_precommit_playback_binding_error(&error))?
     };
-    let database = state.lock_db();
-    let receipt = database
-        .finalize_desktop_playback_session_v1(
+    let receipt = store
+        .finalize_desktop_playback_session_at_generation_v1(
             &playback_receipt_id,
             &media_grant_id,
             &binding.source_path,
             &binding.audio_content_hash,
             &intervals,
+            restore_generation,
         )
         .map_err(|error| public_playback_error(&error.to_string()))?;
     Ok(DesktopPlaybackReceiptV1 {
@@ -1120,21 +1567,35 @@ pub fn clear_human_decision(state: State<'_, AppState>, segment_id: String) -> R
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_review_v1_on, mark_segment_unusable_v1_on, persist_whole_segment_update_on,
-        public_precommit_playback_binding_error, public_segment_delete_error, public_segment_metadata_error,
-        public_speaker_rename_error, record_human_decision_on, retired_legacy_decision_error,
-        validate_playback_receipt_identity,
+        commit_review_v1_on, get_desktop_review_undo_target_v1_on, mark_segment_unusable_v1_on,
+        persist_whole_segment_update_on, public_desktop_undo_error, public_precommit_playback_binding_error,
+        public_segment_delete_error, public_segment_metadata_error, public_speaker_rename_error,
+        record_human_decision_on, record_review_flag_on, retired_legacy_decision_error,
+        undo_desktop_review_action_v1_on, validate_playback_receipt_identity,
     };
     use crate::database_runtime::DatabaseRuntime;
     use crate::db::{Database, PlaybackReceipt, SpeechSegment};
     use crate::history::HistoryManager;
     use crate::ipc_contract::{
-        CommitReviewRequestV1, MarkSegmentUnusableRequestV1, ReviewDecisionV1, TechnicalUnusableReasonV1,
+        CommitReviewRequestV1, DesktopHumanDecisionV1, DesktopReviewUndoAvailabilityV1, DesktopReviewUndoBlockReasonV1,
+        DesktopReviewUndoOutcomeV1, DesktopReviewUndoTargetV1, MarkSegmentUnusableRequestV1, RecordReviewFlagRequestV1,
+        ReviewDecisionV1, TechnicalUnusableReasonV1, UndoDesktopReviewRequestV1,
     };
     use crate::stores::{
         require_listened, ReviewWriteStore, SegmentDeleteError, SegmentMetadataUpdateError, SpeakerRenameError,
     };
     use sha2::{Digest, Sha256};
+
+    fn available_undo_target(availability: DesktopReviewUndoAvailabilityV1) -> DesktopReviewUndoTargetV1 {
+        match availability {
+            DesktopReviewUndoAvailabilityV1::Available { target } => target,
+            other => panic!("expected an available restart-safe Undo target, got {other:?}"),
+        }
+    }
+
+    fn exact_undo_request(target: &DesktopReviewUndoTargetV1, operation_id: &str) -> UndoDesktopReviewRequestV1 {
+        UndoDesktopReviewRequestV1 { target: target.clone(), operation_id: operation_id.into() }
+    }
 
     #[test]
     fn finalization_media_binding_refusal_is_a_typed_proven_non_commit() {
@@ -1235,7 +1696,7 @@ mod tests {
 
     fn review_store(database: &Database) -> ReviewWriteStore {
         let writer = Database::open(database.path()).expect("open independent serialized review writer");
-        ReviewWriteStore::new(DatabaseRuntime::new(writer))
+        ReviewWriteStore::new(DatabaseRuntime::isolated_for_test(writer))
     }
 
     fn receipt(db: &Database, id: &str, played: i64) {
@@ -1603,6 +2064,63 @@ mod tests {
     }
 
     #[test]
+    fn typed_accept_without_the_served_transcript_fails_before_any_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_clip(tmp.path(), "typed-accept-missing-text");
+        let base_revision = db.segment_review_revision("typed-accept-missing-text").unwrap().unwrap();
+        let request = CommitReviewRequestV1 {
+            operation_id: "77777777-7777-4777-8777-777777777777".into(),
+            segment_id: "typed-accept-missing-text".into(),
+            base_revision,
+            decision: ReviewDecisionV1::Accept,
+            transcript: None,
+            reason_code: None,
+            playback_receipt_id: "88888888-8888-4888-8888-888888888888".into(),
+        };
+
+        let error = commit_review_v1_on(&review_store(&db), &request)
+            .expect_err("a typed accept may never infer which transcript was approved");
+        assert_eq!(error.code, "INVALID_REVIEW_REQUEST");
+        assert!(error.message.contains("transcript being approved"));
+        let row = db.get_segment_by_id("typed-accept-missing-text").unwrap().unwrap();
+        assert!(row.human_decision.is_none() && row.verdict_transcript.is_none() && !row.verified);
+    }
+
+    #[test]
+    fn typed_reject_response_never_promotes_a_retained_machine_verdict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_clip(tmp.path(), "typed-reject-machine-proposal");
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET verdict='jury_edit',
+                        verdict_transcript='machine proposal',
+                        jury_transcript='machine proposal'
+                  WHERE id='typed-reject-machine-proposal'",
+                [],
+            )
+            .unwrap();
+        let playback_receipt_id = exact_policy4_receipt(&db, "typed-reject-machine-proposal", 9_000);
+        let base_revision = db.segment_review_revision("typed-reject-machine-proposal").unwrap().unwrap();
+        let request = CommitReviewRequestV1 {
+            operation_id: "99999999-9999-4999-8999-999999999999".into(),
+            segment_id: "typed-reject-machine-proposal".into(),
+            base_revision,
+            decision: ReviewDecisionV1::Reject,
+            transcript: None,
+            reason_code: None,
+            playback_receipt_id,
+        };
+
+        let committed = commit_review_v1_on(&review_store(&db), &request).expect("typed reject");
+        assert_eq!(committed.authoritative_transcript, "دەق");
+        assert_ne!(committed.authoritative_transcript, "machine proposal");
+        let row = db.get_segment_by_id("typed-reject-machine-proposal").unwrap().unwrap();
+        assert_eq!(row.human_decision.as_deref(), Some("reject"));
+        assert_eq!(crate::quality::effective_transcript(&row), "دەق");
+    }
+
+    #[test]
     fn startup_rejects_a_tampered_unbound_policy4_interval_digest() {
         let tmp = tempfile::tempdir().unwrap();
         let db = db_with_clip(tmp.path(), "unbound-digest");
@@ -1749,19 +2267,12 @@ mod tests {
             .connection()
             .query_row("SELECT COUNT(*) FROM review_drafts WHERE segment_id='technical-unusable'", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(draft_count, 0, "exact-revision draft clears only with the durable technical mark");
+        assert_eq!(draft_count, 1, "technical classification must retain non-authoritative owner work");
 
         // Repair the source before retrying. Exact operation replay must resolve from the immutable
         // effect before probing current bytes, or a lost success response becomes ambiguous as soon
         // as the owner restores the file.
         write_test_wav(&tmp.path().join("technical-unusable.wav"), 1_600);
-        db.connection()
-            .execute(
-                "INSERT INTO review_drafts (segment_id, base_revision, text, updated_at)
-                 VALUES (?1, ?2, 'autosave raced behind success', datetime('now'))",
-                rusqlite::params!["technical-unusable", base_revision],
-            )
-            .unwrap();
         let replay = mark_segment_unusable_v1_on(&store, &request).expect("lost-response retry");
         assert_eq!(replay, first);
         let stale_draft_count: i64 = db
@@ -1772,23 +2283,36 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(stale_draft_count, 0, "an exact replay clears a raced old-revision autosave");
+        assert_eq!(stale_draft_count, 1, "an exact replay must retain old-revision human work");
 
         db.connection()
             .execute(
                 "INSERT INTO review_drafts (segment_id, base_revision, text, updated_at)
-                 VALUES (?1, ?2, 'newer work must survive', datetime('now'))",
+                 VALUES (?1, ?2, 'newer work must survive', datetime('now'))
+                 ON CONFLICT(segment_id) DO UPDATE SET
+                    base_revision=excluded.base_revision,
+                    text=excluded.text,
+                    updated_at=excluded.updated_at",
                 rusqlite::params!["technical-unusable", first.committed_revision],
             )
             .unwrap();
         assert_eq!(mark_segment_unusable_v1_on(&store, &request).unwrap(), first);
-        let retained_revision: i64 = db
+        let mut retained_revisions_query = db
             .connection()
-            .query_row("SELECT base_revision FROM review_drafts WHERE segment_id='technical-unusable'", [], |row| {
-                row.get(0)
-            })
+            .prepare(
+                "SELECT base_revision FROM review_drafts WHERE segment_id='technical-unusable' ORDER BY base_revision",
+            )
             .unwrap();
-        assert_eq!(retained_revision, first.committed_revision, "old replay must preserve newer-revision work");
+        let retained_revisions = retained_revisions_query
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            retained_revisions,
+            vec![first.committed_revision],
+            "old replay must preserve the single newer-revision owner draft"
+        );
         let flag_count: i64 = db
             .connection()
             .query_row(
@@ -1857,7 +2381,7 @@ mod tests {
     }
 
     #[test]
-    fn technical_unusable_mark_and_draft_clear_are_one_atomic_effect() {
+    fn technical_unusable_mark_never_deletes_a_saved_draft() {
         let tmp = tempfile::tempdir().unwrap();
         let db = db_with_clip(tmp.path(), "technical-unusable-atomic");
         std::fs::write(tmp.path().join("technical-unusable-atomic.wav"), b"not an audio container").unwrap();
@@ -1882,13 +2406,11 @@ mod tests {
             reason: TechnicalUnusableReasonV1::CorruptContainer,
         };
         let store = review_store(&db);
-        let error = mark_segment_unusable_v1_on(&store, &request)
-            .expect_err("draft-clear failure must abort the entire technical mark");
-        assert_eq!(error.code, "MARK_UNUSABLE_FAILED");
+        mark_segment_unusable_v1_on(&store, &request)
+            .expect("technical mark must not attempt to delete non-authoritative draft work");
 
         let row = db.get_segment_by_id("technical-unusable-atomic").unwrap().unwrap();
-        assert!(!crate::quality::is_technically_unusable(&row));
-        assert!(row.verdict.is_none() && row.rationale.is_none() && !row.escalated);
+        assert!(crate::quality::is_technically_unusable(&row));
         let counts: (i64, i64) = db
             .connection()
             .query_row(
@@ -1899,7 +2421,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(counts, (0, 1), "failed mark leaves neither partial effect nor lost draft");
+        assert_eq!(counts, (1, 1), "technical mark is durable while the saved draft remains intact");
     }
 
     #[test]
@@ -1978,17 +2500,23 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = db_with_clip(tmp.path(), "desktop-flag-replay");
         let operation_id = "33333333-3333-4333-8333-333333333333";
-        let first = db.record_review_flag("desktop-flag-replay", "Needs a second listen", operation_id).unwrap();
+        let base_revision = db.segment_review_revision("desktop-flag-replay").unwrap().unwrap();
+        let first =
+            db.record_review_flag("desktop-flag-replay", base_revision, "Needs a second listen", operation_id).unwrap();
         let replay = db
-            .record_review_flag("desktop-flag-replay", "Needs a second listen", operation_id)
+            .record_review_flag("desktop-flag-replay", base_revision, "Needs a second listen", operation_id)
             .expect("an exact retry must return the original flag commit");
         assert_eq!(replay.effect_event_id, first.effect_event_id);
         assert_eq!(replay.flag_revision, first.flag_revision);
 
         let conflict = db
-            .record_review_flag("desktop-flag-replay", "Different request", operation_id)
+            .record_review_flag("desktop-flag-replay", base_revision, "Different request", operation_id)
             .expect_err("one operation UUID cannot authorize a different flag request");
         assert!(conflict.to_string().contains("different request"), "{conflict}");
+        let revision_conflict = db
+            .record_review_flag("desktop-flag-replay", first.flag_revision, "Needs a second listen", operation_id)
+            .expect_err("one operation UUID cannot be replayed with a different base revision");
+        assert!(revision_conflict.to_string().contains("different request"), "{revision_conflict}");
         let effect_count: i64 = db
             .connection()
             .query_row(
@@ -1998,6 +2526,728 @@ mod tests {
             )
             .unwrap();
         assert_eq!(effect_count, 1, "response-loss retry must not create a second flag effect");
+    }
+
+    #[test]
+    fn stale_desktop_flag_is_typed_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_clip(tmp.path(), "desktop-flag-stale");
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET review_revision = 5 WHERE id = ?1",
+                rusqlite::params!["desktop-flag-stale"],
+            )
+            .unwrap();
+        // The renderer still holds r5 while an independent owner-path mutation advances truth to r6.
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET normalized_transcript = 'server truth at r6', review_revision = 6
+                  WHERE id = ?1 AND review_revision = 5",
+                rusqlite::params!["desktop-flag-stale"],
+            )
+            .unwrap();
+        let store = review_store(&db);
+        let operation_id = "34343434-3434-4434-8434-343434343434";
+        let error = record_review_flag_on(
+            &store,
+            &RecordReviewFlagRequestV1 {
+                operation_id: operation_id.into(),
+                segment_id: "desktop-flag-stale".into(),
+                base_revision: 5,
+                rationale: "Needs a second listen".into(),
+            },
+        )
+        .expect_err("an r5 renderer must not flag server truth at r6");
+        assert_eq!(error.code, "STALE_REVISION");
+        assert_eq!(error.operation_id.as_deref(), Some(operation_id));
+        assert_eq!(
+            error.details.get("expectedRevision"),
+            Some(&crate::ipc_contract::CommandErrorDetailV1::Number(5.0))
+        );
+        assert_eq!(error.details.get("currentRevision"), Some(&crate::ipc_contract::CommandErrorDetailV1::Number(6.0)));
+        let unchanged = db.get_segment_by_id("desktop-flag-stale").unwrap().unwrap();
+        assert_eq!(db.segment_review_revision("desktop-flag-stale").unwrap(), Some(6));
+        assert_eq!(unchanged.normalized_transcript.as_deref(), Some("server truth at r6"));
+        assert_eq!(unchanged.verdict, None);
+        assert_eq!(unchanged.rationale, None);
+        assert!(!unchanged.escalated);
+        let effect_count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM review_flag_effect_events WHERE segment_id = ?1",
+                rusqlite::params!["desktop-flag-stale"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(effect_count, 0, "a stale flag must not create partial effect evidence");
+    }
+
+    #[test]
+    fn typed_desktop_undo_survives_restart_rejects_forgery_and_replays_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_clip(tmp.path(), "restart-undo");
+        let database_path = db.path().to_string();
+        let playback_receipt_id = exact_policy4_receipt(&db, "restart-undo", 9_000);
+        let base_revision = db.segment_review_revision("restart-undo").unwrap().unwrap();
+        let request = CommitReviewRequestV1 {
+            operation_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd".into(),
+            segment_id: "restart-undo".into(),
+            base_revision,
+            decision: ReviewDecisionV1::Accept,
+            transcript: Some("دەق".into()),
+            reason_code: None,
+            playback_receipt_id,
+        };
+        let store = review_store(&db);
+        let committed = commit_review_v1_on(&store, &request).expect("typed desktop decision commits");
+        drop(store);
+        drop(db);
+
+        let reopened = Database::open(&database_path).expect("reopen committed workspace");
+        let reopened_store = review_store(&reopened);
+        let target = available_undo_target(
+            get_desktop_review_undo_target_v1_on(&reopened_store).expect("restart-safe target read"),
+        );
+        let target_effect_event_id = match &target {
+            DesktopReviewUndoTargetV1::Decision { effect_event_id, segment_id, decision, .. } => {
+                assert_eq!(segment_id, "restart-undo");
+                assert_eq!(*decision, DesktopHumanDecisionV1::Accept);
+                *effect_event_id
+            }
+            other => panic!("expected a decision Undo target, got {other:?}"),
+        };
+        assert_eq!(target_effect_event_id.to_string(), committed.decision_id.trim_start_matches("effect:"));
+
+        let forged = exact_undo_request(&target, "not-a-uuid");
+        let refused = undo_desktop_review_action_v1_on(&reopened_store, &forged)
+            .expect_err("renderer forgery must not mutate review truth");
+        assert_eq!(refused.code, "INVALID_UNDO_REQUEST");
+        assert!(reopened.get_segment_by_id("restart-undo").unwrap().unwrap().verified);
+
+        let undo_request = exact_undo_request(&target, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
+        let applied =
+            undo_desktop_review_action_v1_on(&reopened_store, &undo_request).expect("exact restart-safe undo applies");
+        let restored_revision = match applied {
+            DesktopReviewUndoOutcomeV1::Applied { effect_event_id, restored_revision, ref segment, .. } => {
+                assert_eq!(effect_event_id, target_effect_event_id);
+                assert_eq!(segment.id, "restart-undo");
+                assert!(!segment.verified);
+                restored_revision
+            }
+            _ => panic!("first exact inverse must report applied"),
+        };
+        assert!(
+            matches!(
+                get_desktop_review_undo_target_v1_on(&reopened_store).unwrap(),
+                DesktopReviewUndoAvailabilityV1::Blocked {
+                    reason: DesktopReviewUndoBlockReasonV1::LatestDecisionUndone
+                }
+            ),
+            "a reversed effect must never reappear as a restart target"
+        );
+        reopened
+            .insert_segment(&SpeechSegment {
+                id: "newer-action-after-lost-response".into(),
+                audio_path: tmp.path().join("newer-action.wav").to_string_lossy().into_owned(),
+                raw_transcript: "دەق".into(),
+                duration_ms: 10_000,
+                ..SpeechSegment::default()
+            })
+            .unwrap();
+        let newer_action_revision =
+            reopened.segment_review_revision("newer-action-after-lost-response").unwrap().unwrap();
+        reopened_store
+            .record_flag(
+                "newer-action-after-lost-response",
+                newer_action_revision,
+                "Later action after the owner did not receive the Undo response",
+                "abababab-abab-4aba-8aba-abababababab",
+            )
+            .unwrap();
+        let replay = undo_desktop_review_action_v1_on(&reopened_store, &undo_request)
+            .expect("lost-response retry resolves idempotently after a later review action");
+        let replay_json = serde_json::to_string(&replay).unwrap();
+        assert!(
+            !replay_json.contains("segment") && !replay_json.contains("restoredRevision"),
+            "an idempotent retry must not mislabel newer mutable truth as the old Undo result: {replay_json}"
+        );
+        match replay {
+            DesktopReviewUndoOutcomeV1::AlreadyApplied { effect_event_id, .. } => {
+                assert_eq!(effect_event_id, target_effect_event_id);
+                assert_eq!(
+                    reopened.segment_review_revision("restart-undo").unwrap(),
+                    Some(restored_revision),
+                    "the test workspace remains at the applied inverse revision"
+                );
+            }
+            _ => panic!("exact inverse replay must report alreadyApplied"),
+        }
+    }
+
+    #[test]
+    fn typed_desktop_undo_refuses_a_target_from_before_restore_generation_without_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_clip(tmp.path(), "stale-generation-undo");
+        let playback_receipt_id = exact_policy4_receipt(&db, "stale-generation-undo", 9_000);
+        let base_revision = db.segment_review_revision("stale-generation-undo").unwrap().unwrap();
+        let store = review_store(&db);
+        commit_review_v1_on(
+            &store,
+            &CommitReviewRequestV1 {
+                operation_id: "10101010-1010-4010-8010-101010101010".into(),
+                segment_id: "stale-generation-undo".into(),
+                base_revision,
+                decision: ReviewDecisionV1::Accept,
+                transcript: Some("دەق".into()),
+                reason_code: None,
+                playback_receipt_id,
+            },
+        )
+        .unwrap();
+        let target = available_undo_target(get_desktop_review_undo_target_v1_on(&store).unwrap());
+        let request = exact_undo_request(&target, "20202020-2020-4020-8020-202020202020");
+        let generation_before = db.restore_generation_sha256().unwrap();
+        let reversal_count_before: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM human_decision_effect_reversals", [], |row| row.get(0))
+            .unwrap();
+        let journal_count_before: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get(0))
+            .unwrap();
+
+        store.advance_restore_generation_for_test().unwrap();
+
+        let error = undo_desktop_review_action_v1_on(&store, &request)
+            .expect_err("a target fetched before a committed restore generation must be stale");
+        assert_eq!(error.code, "STALE_UNDO_TARGET");
+        assert_eq!(db.restore_generation_sha256().unwrap(), generation_before);
+        assert_eq!(
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM human_decision_effect_reversals", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            reversal_count_before
+        );
+        assert_eq!(
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            journal_count_before
+        );
+        assert!(db.get_segment_by_id("stale-generation-undo").unwrap().unwrap().verified);
+    }
+
+    #[test]
+    fn typed_flag_undo_refuses_a_target_from_before_restore_generation_without_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_clip(tmp.path(), "stale-generation-flag-undo");
+        let store = review_store(&db);
+        let base_revision = db.segment_review_revision("stale-generation-flag-undo").unwrap().unwrap();
+        store
+            .record_flag(
+                "stale-generation-flag-undo",
+                base_revision,
+                "Restore generation must dominate replay acknowledgement",
+                "30303030-3030-4030-8030-303030303030",
+            )
+            .unwrap();
+        let target = available_undo_target(get_desktop_review_undo_target_v1_on(&store).unwrap());
+        let request = exact_undo_request(&target, "40404040-4040-4040-8040-404040404040");
+        let revision_before = db.segment_review_revision("stale-generation-flag-undo").unwrap();
+        let reversal_count_before: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM review_flag_effect_reversals", [], |row| row.get(0))
+            .unwrap();
+        let journal_count_before: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get(0))
+            .unwrap();
+
+        store.advance_restore_generation_for_test().unwrap();
+        let error = undo_desktop_review_action_v1_on(&store, &request)
+            .expect_err("a flag target fetched before restore generation changes must be stale");
+        assert_eq!(error.code, "STALE_UNDO_TARGET");
+        assert_eq!(db.segment_review_revision("stale-generation-flag-undo").unwrap(), revision_before);
+        assert!(db.get_segment_by_id("stale-generation-flag-undo").unwrap().unwrap().escalated);
+        assert_eq!(
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM review_flag_effect_reversals", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            reversal_count_before
+        );
+        assert_eq!(
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            journal_count_before
+        );
+    }
+
+    #[test]
+    fn generic_flag_survives_restart_and_exact_undo_leaves_a_crash_barrier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_clip(tmp.path(), "decision-before-flag");
+        let database_path = db.path().to_string();
+        let playback_receipt_id = exact_policy4_receipt(&db, "decision-before-flag", 9_000);
+        let base_revision = db.segment_review_revision("decision-before-flag").unwrap().unwrap();
+        let store = review_store(&db);
+        commit_review_v1_on(
+            &store,
+            &CommitReviewRequestV1 {
+                operation_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
+                segment_id: "decision-before-flag".into(),
+                base_revision,
+                decision: ReviewDecisionV1::Accept,
+                transcript: Some("دەق".into()),
+                reason_code: None,
+                playback_receipt_id,
+            },
+        )
+        .unwrap();
+        db.insert_segment(&SpeechSegment {
+            id: "newer-flag".into(),
+            audio_path: tmp.path().join("newer-flag.wav").to_string_lossy().into_owned(),
+            raw_transcript: "دەق".into(),
+            duration_ms: 10_000,
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+        let newer_flag_revision = db.segment_review_revision("newer-flag").unwrap().unwrap();
+        let flag = store
+            .record_flag(
+                "newer-flag",
+                newer_flag_revision,
+                "Needs a second independent listen",
+                "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            )
+            .unwrap();
+        drop(store);
+        drop(db);
+
+        let reopened = Database::open(&database_path).unwrap();
+        let reopened_store = review_store(&reopened);
+        let target = available_undo_target(get_desktop_review_undo_target_v1_on(&reopened_store).unwrap());
+        match &target {
+            DesktopReviewUndoTargetV1::Flag {
+                effect_event_id,
+                segment_id,
+                prior_revision,
+                flag_revision,
+                flag_kind,
+                ..
+            } => {
+                assert_eq!(*effect_event_id, flag.effect_event_id);
+                assert_eq!(segment_id, "newer-flag");
+                assert_eq!(*prior_revision, newer_flag_revision);
+                assert_eq!(*flag_revision, newer_flag_revision + 1);
+                assert_eq!(*flag_kind, crate::ipc_contract::DesktopReviewFlagKindV1::Generic);
+            }
+            other => panic!("expected generic flag Undo target after restart, got {other:?}"),
+        }
+        let request = exact_undo_request(&target, "99999999-9999-4999-8999-999999999999");
+        assert!(matches!(
+            undo_desktop_review_action_v1_on(&reopened_store, &request).unwrap(),
+            DesktopReviewUndoOutcomeV1::Applied {
+                effect_kind: crate::ipc_contract::DesktopReviewUndoEffectKindV1::Flag,
+                effect_event_id,
+                ..
+            } if effect_event_id == flag.effect_event_id
+        ));
+        assert!(
+            matches!(
+                get_desktop_review_undo_target_v1_on(&reopened_store).unwrap(),
+                DesktopReviewUndoAvailabilityV1::Blocked { reason: DesktopReviewUndoBlockReasonV1::LatestFlagUndone }
+            ),
+            "a flag plus its inverse remains a crash barrier; Undo never falls through to an older decision"
+        );
+
+        reopened
+            .insert_segment(&SpeechSegment {
+                id: "later-action-after-flag-undo".into(),
+                audio_path: tmp.path().join("later-action-after-flag-undo.wav").to_string_lossy().into_owned(),
+                raw_transcript: "دەق".into(),
+                duration_ms: 10_000,
+                ..SpeechSegment::default()
+            })
+            .unwrap();
+        let later_revision = reopened.segment_review_revision("later-action-after-flag-undo").unwrap().unwrap();
+        reopened_store
+            .record_flag(
+                "later-action-after-flag-undo",
+                later_revision,
+                "Later action after a lost flag-Undo response",
+                "abababab-cdcd-4efe-8a8a-abababababab",
+            )
+            .unwrap();
+        let reversals_before: i64 = reopened
+            .connection()
+            .query_row("SELECT COUNT(*) FROM review_flag_effect_reversals", [], |row| row.get(0))
+            .unwrap();
+        let journal_before: i64 = reopened
+            .connection()
+            .query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get(0))
+            .unwrap();
+        assert!(matches!(
+            undo_desktop_review_action_v1_on(&reopened_store, &request).unwrap(),
+            DesktopReviewUndoOutcomeV1::AlreadyApplied {
+                effect_kind: crate::ipc_contract::DesktopReviewUndoEffectKindV1::Flag,
+                effect_event_id,
+            } if effect_event_id == flag.effect_event_id
+        ));
+        let conflicting_replay = exact_undo_request(&target, "88888888-7777-4666-8555-444444444444");
+        assert!(matches!(
+            undo_desktop_review_action_v1_on(&reopened_store, &conflicting_replay).unwrap(),
+            DesktopReviewUndoOutcomeV1::Conflict {
+                effect_kind: crate::ipc_contract::DesktopReviewUndoEffectKindV1::Flag,
+                effect_event_id,
+            } if effect_event_id == flag.effect_event_id
+        ));
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row("SELECT COUNT(*) FROM review_flag_effect_reversals", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            reversals_before,
+            "exact replay and a different inverse UUID must not append another reversal"
+        );
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            journal_before,
+            "replay outcomes must not append another action-journal record"
+        );
+    }
+
+    #[test]
+    fn technical_flag_with_saved_draft_survives_restart_and_exact_undo_preserves_owner_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_clip(tmp.path(), "technical-flag-undo");
+        std::fs::write(tmp.path().join("technical-flag-undo.wav"), b"not an audio container").unwrap();
+        let database_path = db.path().to_string();
+        let base_revision = db.segment_review_revision("technical-flag-undo").unwrap().unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO review_drafts(segment_id,base_revision,text,updated_at)
+                 VALUES(?1,?2,'owner correction must survive',datetime('now'))",
+                rusqlite::params!["technical-flag-undo", base_revision],
+            )
+            .unwrap();
+        let request = MarkSegmentUnusableRequestV1 {
+            operation_id: "12345678-1234-4234-8234-123456789abc".into(),
+            segment_id: "technical-flag-undo".into(),
+            base_revision,
+            reason: TechnicalUnusableReasonV1::CorruptContainer,
+        };
+        let store = review_store(&db);
+        let marked = mark_segment_unusable_v1_on(&store, &request).unwrap();
+        assert_eq!(marked.committed_revision, base_revision + 1);
+        let private_rationale = db
+            .get_segment_by_id("technical-flag-undo")
+            .unwrap()
+            .unwrap()
+            .rationale
+            .expect("technical evidence has a canonical private rationale");
+        drop(store);
+        drop(db);
+
+        let reopened = Database::open(&database_path).unwrap();
+        let reopened_store = review_store(&reopened);
+        let target = available_undo_target(get_desktop_review_undo_target_v1_on(&reopened_store).unwrap());
+        let target_json = serde_json::to_string(&target).unwrap();
+        let effect_event_id = match &target {
+            DesktopReviewUndoTargetV1::Flag {
+                effect_event_id,
+                segment_id,
+                source_operation_id,
+                prior_revision,
+                flag_revision,
+                flag_kind,
+                ..
+            } => {
+                assert_eq!(segment_id, "technical-flag-undo");
+                assert_eq!(source_operation_id, &request.operation_id);
+                assert_eq!(*prior_revision, base_revision);
+                assert_eq!(*flag_revision, base_revision + 1);
+                assert_eq!(
+                    *flag_kind,
+                    crate::ipc_contract::DesktopReviewFlagKindV1::TechnicalUnusable {
+                        reason: TechnicalUnusableReasonV1::CorruptContainer
+                    }
+                );
+                *effect_event_id
+            }
+            other => panic!("expected technical flag Undo target after restart, got {other:?}"),
+        };
+        assert!(
+            !target_json.contains(&private_rationale)
+                && !target_json.contains("path=")
+                && !target_json.contains("audio="),
+            "renderer target must not expose private technical rationale or source hashes: {target_json}"
+        );
+        let retained_before: (i64, String) = reopened
+            .connection()
+            .query_row(
+                "SELECT base_revision,text FROM review_drafts WHERE segment_id=?1",
+                ["technical-flag-undo"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained_before, (base_revision, "owner correction must survive".into()));
+
+        let undo_request = exact_undo_request(&target, "abcdefab-cdef-4abc-8def-abcdefabcdef");
+        let outcome = undo_desktop_review_action_v1_on(&reopened_store, &undo_request).unwrap();
+        assert!(matches!(
+            outcome,
+            DesktopReviewUndoOutcomeV1::Applied {
+                effect_kind: crate::ipc_contract::DesktopReviewUndoEffectKindV1::Flag,
+                effect_event_id: applied_effect,
+                ref segment,
+                ..
+            } if applied_effect == effect_event_id
+                && segment.id == "technical-flag-undo"
+                && segment.verdict.is_none()
+                && segment.rationale.is_none()
+                && !segment.escalated
+        ));
+        let retained_after: (i64, String) = reopened
+            .connection()
+            .query_row(
+                "SELECT base_revision,text FROM review_drafts WHERE segment_id=?1",
+                ["technical-flag-undo"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained_after, retained_before, "flag Undo must not delete or synthesize transcript work");
+        drop(reopened_store);
+        drop(reopened);
+
+        let restarted_again = Database::open(&database_path).unwrap();
+        let restarted_store = review_store(&restarted_again);
+        assert!(matches!(
+            get_desktop_review_undo_target_v1_on(&restarted_store).unwrap(),
+            DesktopReviewUndoAvailabilityV1::Blocked { reason: DesktopReviewUndoBlockReasonV1::LatestFlagUndone }
+        ));
+        let retained_after_restart: (i64, String) = restarted_again
+            .connection()
+            .query_row(
+                "SELECT base_revision,text FROM review_drafts WHERE segment_id=?1",
+                ["technical-flag-undo"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained_after_restart, retained_before);
+    }
+
+    #[test]
+    fn typed_flag_undo_refuses_every_forged_authority_field_without_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_clip(tmp.path(), "forged-flag-undo");
+        let store = review_store(&db);
+        let base_revision = db.segment_review_revision("forged-flag-undo").unwrap().unwrap();
+        store
+            .record_flag(
+                "forged-flag-undo",
+                base_revision,
+                "Exact immutable flag authority",
+                "11111111-2222-4333-8444-555555555555",
+            )
+            .unwrap();
+        let target = available_undo_target(get_desktop_review_undo_target_v1_on(&store).unwrap());
+        let pristine = db.get_segment_by_id("forged-flag-undo").unwrap().unwrap();
+        let pristine_revision = db.segment_review_revision("forged-flag-undo").unwrap().unwrap();
+        let mutations = [
+            ("effectEventId", serde_json::json!(9_999), "INVALID_UNDO_REQUEST"),
+            ("segmentId", serde_json::json!("another-segment"), "STALE_UNDO_TARGET"),
+            ("sourceOperationId", serde_json::json!("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"), "STALE_UNDO_TARGET"),
+            ("sourcePayloadHash", serde_json::json!("f".repeat(64)), "STALE_UNDO_TARGET"),
+            ("priorRevision", serde_json::json!(base_revision + 7), "STALE_UNDO_TARGET"),
+            ("flagRevision", serde_json::json!(base_revision + 8), "STALE_UNDO_TARGET"),
+            ("flagKind", serde_json::json!({"kind":"technicalUnusable","reason":"decodeFailed"}), "STALE_UNDO_TARGET"),
+            ("databaseGeneration", serde_json::json!(9_999), "STALE_UNDO_TARGET"),
+        ];
+        let inverse_operations = [
+            "00000000-0000-4000-8000-000000000101",
+            "00000000-0000-4000-8000-000000000102",
+            "00000000-0000-4000-8000-000000000103",
+            "00000000-0000-4000-8000-000000000104",
+            "00000000-0000-4000-8000-000000000105",
+            "00000000-0000-4000-8000-000000000106",
+            "00000000-0000-4000-8000-000000000107",
+            "00000000-0000-4000-8000-000000000108",
+        ];
+        let journal_before: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get(0))
+            .unwrap();
+
+        for ((field, value, expected_code), operation_id) in mutations.into_iter().zip(inverse_operations) {
+            let mut forged_json = serde_json::to_value(&target).unwrap();
+            forged_json.as_object_mut().unwrap().insert(field.into(), value);
+            let forged: DesktopReviewUndoTargetV1 = serde_json::from_value(forged_json).unwrap();
+            let error = undo_desktop_review_action_v1_on(&store, &exact_undo_request(&forged, operation_id))
+                .expect_err("forged flag authority must fail before mutation");
+            assert_eq!(error.code, expected_code, "wrong public error for forged field {field}");
+            let current = db.get_segment_by_id("forged-flag-undo").unwrap().unwrap();
+            assert_eq!(
+                db.segment_review_revision("forged-flag-undo").unwrap(),
+                Some(pristine_revision),
+                "{field} changed revision"
+            );
+            assert_eq!(current.verdict, pristine.verdict, "{field} changed verdict");
+            assert_eq!(current.rationale, pristine.rationale, "{field} changed rationale");
+            assert_eq!(current.escalated, pristine.escalated, "{field} changed escalation");
+            let reversal_count: i64 = db
+                .connection()
+                .query_row("SELECT COUNT(*) FROM review_flag_effect_reversals", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(reversal_count, 0, "{field} wrote a reversal");
+            assert_eq!(
+                db.connection()
+                    .query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                journal_before,
+                "{field} appended a journal record"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_flag_inverse_cannot_jump_over_a_newer_desktop_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_clip(tmp.path(), "older-flag");
+        db.insert_segment(&SpeechSegment {
+            id: "newer-decision".into(),
+            audio_path: tmp.path().join("newer-decision.wav").to_string_lossy().into_owned(),
+            raw_transcript: "دەق".into(),
+            duration_ms: 10_000,
+            alignment_json: Some(
+                r#"{"source_start_ms":0,"source_end_ms":10000,"chunk_index":0,"chunk_count":1}"#.into(),
+            ),
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+                rusqlite::params!["newer-decision", "b".repeat(64)],
+            )
+            .unwrap();
+        let store = review_store(&db);
+        let older_flag_revision = db.segment_review_revision("older-flag").unwrap().unwrap();
+        let older = store
+            .record_flag(
+                "older-flag",
+                older_flag_revision,
+                "First global review action must not jump a newer decision",
+                "12121212-1212-4212-8212-121212121212",
+            )
+            .unwrap();
+        let stale_target = available_undo_target(get_desktop_review_undo_target_v1_on(&store).unwrap());
+        assert!(matches!(
+            &stale_target,
+            DesktopReviewUndoTargetV1::Flag { effect_event_id, .. } if *effect_event_id == older.effect_event_id
+        ));
+        let playback_receipt_id = exact_policy4_receipt(&db, "newer-decision", 9_000);
+        let base_revision = db.segment_review_revision("newer-decision").unwrap().unwrap();
+        commit_review_v1_on(
+            &store,
+            &CommitReviewRequestV1 {
+                operation_id: "34343434-3434-4434-8434-343434343434".into(),
+                segment_id: "newer-decision".into(),
+                base_revision,
+                decision: ReviewDecisionV1::Accept,
+                transcript: Some("دەق".into()),
+                reason_code: None,
+                playback_receipt_id,
+            },
+        )
+        .unwrap();
+
+        let reversals_before: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM review_flag_effect_reversals", [], |row| row.get(0))
+            .unwrap();
+        let journal_before: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get(0))
+            .unwrap();
+        let refused = undo_desktop_review_action_v1_on(
+            &store,
+            &exact_undo_request(&stale_target, "56565656-5656-4656-8656-565656565656"),
+        )
+        .expect_err("global LIFO authority must reject a stale typed flag inverse");
+        assert_eq!(refused.code, "STALE_UNDO_TARGET");
+        let still_flagged = db.get_segment_by_id("older-flag").unwrap().unwrap();
+        assert!(still_flagged.escalated, "the stale inverse must leave the older flag untouched");
+        assert_eq!(
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM review_flag_effect_reversals", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            reversals_before
+        );
+        assert_eq!(
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            journal_before
+        );
+    }
+
+    #[test]
+    fn generic_internal_undo_cannot_bypass_typed_desktop_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_clip(tmp.path(), "typed-only-desktop-undo");
+        let playback_receipt_id = exact_policy4_receipt(&db, "typed-only-desktop-undo", 9_000);
+        let base_revision = db.segment_review_revision("typed-only-desktop-undo").unwrap().unwrap();
+        let store = review_store(&db);
+        let committed = commit_review_v1_on(
+            &store,
+            &CommitReviewRequestV1 {
+                operation_id: "78787878-7878-4878-8878-787878787878".into(),
+                segment_id: "typed-only-desktop-undo".into(),
+                base_revision,
+                decision: ReviewDecisionV1::Accept,
+                transcript: Some("دەق".into()),
+                reason_code: None,
+                playback_receipt_id,
+            },
+        )
+        .unwrap();
+        let effect_event_id = committed
+            .decision_id
+            .strip_prefix("effect:")
+            .and_then(|value| value.parse::<i64>().ok())
+            .expect("typed commit returns its opaque effect identity");
+        let refused = db
+            .undo_human_decision(effect_event_id, None, "90909090-9090-4090-8090-909090909090")
+            .expect_err("a caller without typed immutable authority must not undo a desktop decision");
+        assert!(refused.to_string().contains("does not own"), "unexpected refusal: {refused}");
+        assert!(db.get_segment_by_id("typed-only-desktop-undo").unwrap().unwrap().verified);
+    }
+
+    #[test]
+    fn typed_desktop_undo_errors_never_expose_private_backend_details() {
+        let stale_flag = public_desktop_undo_error(
+            &crate::error::AppError::Validation(
+                "desktop Undo authority no longer identifies the same immutable review flag".into(),
+            ),
+            "11111111-1111-4111-8111-111111111111",
+        );
+        assert_eq!(stale_flag.code, "STALE_UNDO_TARGET");
+        assert_eq!(stale_flag.suggested_action, Some(crate::ipc_contract::SuggestedActionV1::ReloadClip));
+
+        let error = public_desktop_undo_error(
+            &crate::error::AppError::Other(
+                "SQL failed at C:\\private\\owner.db with secret token and raw statement".into(),
+            ),
+            "11111111-1111-4111-8111-111111111111",
+        );
+        let public = serde_json::to_string(&error).unwrap();
+        assert_eq!(error.code, "UNDO_REVIEW_FAILED");
+        assert!(!public.contains("owner.db") && !public.contains("secret token") && !public.contains("statement"));
     }
 
     /// A clip the library has never seen cannot have been heard, and must not pass by defaulting.

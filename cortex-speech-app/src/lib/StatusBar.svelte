@@ -62,7 +62,7 @@
           {#if $pipelineCurrentFile}
             <span class="text-cortex-500 truncate max-w-xs" title={$pipelineCurrentFile}>
               {$t('pipeline.currentFile', {
-                file: $pipelineCurrentFile.split(/[/\\]/).pop() ?? $pipelineCurrentFile,
+                file: $pipelineCurrentFile.split(/[/\\]/).pop()!,
               })}
             </span>
           {/if}
@@ -83,7 +83,7 @@
           {#if $pipelineCurrentFile}
             <span class="text-cortex-500 truncate max-w-xs" title={$pipelineCurrentFile}>
               {$t('pipeline.currentFile', {
-                file: $pipelineCurrentFile.split(/[/\\]/).pop() ?? $pipelineCurrentFile,
+                file: $pipelineCurrentFile.split(/[/\\]/).pop()!,
               })}
             </span>
           {/if}

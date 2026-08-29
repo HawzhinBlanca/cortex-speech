@@ -382,15 +382,24 @@ pub fn save_session(
         .check("save_session")
         .map_err(|_| public_session_error("RATE_LIMITED", "Session saving is busy. Retry in a moment.", true))?;
     validate_public_session_state(&search_query, &sort_order)?;
-    let db = state.lock_db();
-    let mut session = state.lock_session();
-    session.set_view_state(search_query, sort_order, filter_verified);
-    session.save(&db).map_err(|_| {
-        public_session_error(
-            "SESSION_SAVE_FAILED",
-            "The workspace view could not be saved. Open Health for recovery options.",
-            false,
-        )
+    state.save_session_view_state(search_query, sort_order, filter_verified).map_err(|error| {
+        if matches!(
+            &error,
+            crate::error::AppError::Other(message)
+                if message == crate::database_runtime::RESTORE_IN_PROGRESS_MSG
+        ) {
+            public_session_error(
+                "RESTORE_IN_PROGRESS",
+                "The workspace is being restored. Retry the view save when recovery finishes.",
+                true,
+            )
+        } else {
+            public_session_error(
+                "SESSION_SAVE_FAILED",
+                "The workspace view could not be saved. Open Health for recovery options.",
+                false,
+            )
+        }
     })
 }
 

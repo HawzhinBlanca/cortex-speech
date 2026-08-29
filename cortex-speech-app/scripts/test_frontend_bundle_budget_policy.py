@@ -113,6 +113,7 @@ def test_budget_executable_passes_small_graph_and_rejects_large_static_dependenc
         (dist / "assets" / "entry.js").write_text("import './dependency.js';", encoding="utf-8")
         dependency = dist / "assets" / "dependency.js"
         dependency.write_text("export const ready = true;", encoding="utf-8")
+        (dist / "assets" / "en.js").write_text("export const locale = 'en';", encoding="utf-8")
         manifest = {
             "index.html": {
                 "file": "assets/entry.js",
@@ -120,6 +121,10 @@ def test_budget_executable_passes_small_graph_and_rejects_large_static_dependenc
                 "imports": ["_dependency.js"],
             },
             "_dependency.js": {"file": "assets/dependency.js"},
+            "src/lib/i18n/en.ts": {
+                "file": "assets/en.js",
+                "isDynamicEntry": True,
+            },
         }
         (dist / ".vite" / "manifest.json").write_text(
             json.dumps(manifest), encoding="utf-8"

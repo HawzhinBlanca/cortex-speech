@@ -29,6 +29,7 @@ PIPELINE = SRC / "pipeline.rs"
 COMMANDS = SRC / "commands.rs"
 SETTINGS = SRC / "settings.rs"
 EVENTS = Path(__file__).resolve().parents[1] / "src" / "lib" / "events.ts"
+COORDINATOR = Path(__file__).resolve().parents[1] / "src" / "lib" / "batchOperationCoordinator.ts"
 
 
 def _fn_body(text: str, signature: str) -> str:
@@ -157,29 +158,34 @@ def test_the_finetuned_override_yields_to_the_champion() -> None:
 
 
 def test_batch_transcribe_hard_stops_on_the_first_failure() -> None:
-    """A failure must cancel the run and be reported as halted — never counted and carried past."""
+    """A durable item failure must stop the loop and terminalize as halted, never tally-and-carry."""
     text = command_surface(SRC)
-
-    assert "record_first_failure(&first_failure" in text, (
-        "batch_transcribe no longer records the failure that stopped it"
+    db = (SRC / "db" / "batch_jobs.rs").read_text(encoding="utf-8")
+    for required in (
+        "transcribe_bound_draft_only",
+        "BatchItemCommitOutcomeV1::Failed { code }",
+        "BatchTerminalIntentV1::Failed { code }",
+        "worker.finish(terminal_intent)",
+        "BatchJobLifecycleV1::Failed => BatchRunDisposition::Halted",
+        '"halted"',
+        "batch_halt_error",
+    ):
+        assert required in text, f"durable batch hard-stop contract is missing: {required}"
+    failed_arm = text.find("BatchItemCommitOutcomeV1::Failed { code }")
+    assert failed_arm != -1 and re.search(r"break(?:\s+'[a-z_]+)?;", text[failed_arm:failed_arm + 400]), (
+        "a durable failed item does not immediately stop later champion work"
     )
-    assert "cancel.cancel();" in text, (
-        "batch_transcribe does not cancel on failure — it would keep drafting and finish with a tally, "
-        "leaving a half-champion dataset that looks complete"
-    )
-    assert '"halted"' in text and '"haltedBy"' in text, (
-        "a stopped run must be emitted as halted with its cause, never as an ordinary completion"
-    )
-
-    halt = text.find("if first_failure.lock()")
-    assert halt != -1, "the hard-stop check is gone from the worker loop"
-    assert "break;" in text[halt:halt + 300], "the hard-stop check does not actually stop the loop"
+    for required in (
+        "require_batch_not_hard_stopped_v1",
+        "durable_item_failure_globally_stops_later_champion_and_normalize_effects",
+    ):
+        assert required in db, f"durable global hard-stop proof is missing: {required}"
 
 
 def test_the_ui_surfaces_the_hard_stop_instead_of_swallowing_it() -> None:
     """The frontend half of the hard stop. Only the Rust emit was pinned — which is why this shipped.
 
-    `batch_transcribe`'s terminal emit is `type: "halted"` + `haltedBy`, and it is the ONLY terminal
+    `batch_transcribe`'s terminal emit is `type: "halted"` + a typed `CommandErrorV1`, and it is the ONLY terminal
     event for the run. `events.ts` typed the union as started|progress|completed and branched on
     exactly those three, so "halted" matched nothing: the segment list never refreshed, isProcessing
     stayed true, batchProgress stayed 'running' and pipelinePhase stayed 'transcribing' forever, and
@@ -195,28 +201,46 @@ def test_the_ui_surfaces_the_hard_stop_instead_of_swallowing_it() -> None:
     # 'halted', and a substring scan over the whole block passed while the union had lost the member.
     union = re.search(r"(?m)^\s*type:\s*(.+);$", iface)
     assert union and "'halted'" in union.group(1), "the BatchProgressEvent type union dropped 'halted'"
-    assert "haltedBy" in iface, "BatchProgressEvent no longer carries the halt cause"
-
-    body_start = text.find("async function refreshAfterBatch(")
-    assert body_start != -1, "refreshAfterBatch is gone — this gate would pass vacuously"
-    body = text[body_start : text.index("\n}", body_start)]
-    halted = body.find("payload.type === 'halted'")
-    assert halted != -1, "refreshAfterBatch no longer distinguishes a halted run from a completed one"
-    assert "notifications.error" in body and "payload.haltedBy" in body, (
-        "a halted batch must reach the user as an ERROR naming its cause, not a silent state reset"
+    assert "error?: CommandErrorV1" in iface, (
+        "BatchProgressEvent no longer carries the typed halt cause"
     )
-    for softer in ("notifications.success", "notifications.warning"):
-        assert halted < body.index(softer), (
-            f"{softer} is evaluated before the halted branch — a hard-stopped run would be reported "
-            "as a success or a partial tally, exactly the 'looks finished' failure this policy bans"
-        )
+    assert "haltedBy" not in iface, "raw haltedBy prose was reintroduced into the renderer contract"
 
-    listen_start = text.find("listen<BatchProgressEvent>('batch-progress'")
+    coordinator = COORDINATOR.read_text(encoding="utf-8")
+    notify_start = coordinator.find("function notifyRecoveredOutcome(")
+    notify_end = coordinator.find("function notifyOutcomeUnknown(", notify_start)
+    assert notify_start != -1 and notify_end != -1, "durable batch outcome presenter is missing"
+    presenter = coordinator[notify_start:notify_end]
+    assert "outcome.disposition === 'panicked' || outcome.disposition === 'halted'" in presenter
+    assert "notifications.error" in presenter and "publicBatchHaltDetail" in presenter, (
+        "a durable halted outcome must reach the owner as a localized error"
+    )
+
+    settle_start = coordinator.find("async function settle(")
+    settle_end = coordinator.find("function scheduleStatusMonitor(", settle_start)
+    assert settle_start != -1 and settle_end != -1, "exact durable settlement path is missing"
+    settlement = coordinator[settle_start:settle_end]
+    presented = settlement.find("notifyRecoveredOutcome(")
+    refreshed = settlement.find("boundedBatchRefresh(")
+    acknowledged = settlement.find("acknowledgeBatchRunWithRetry(")
+    assert -1 not in (presented, refreshed, acknowledged) and presented < refreshed < acknowledged, (
+        "the owner must see the durable outcome and refresh truth before the backend may forget it"
+    )
+
+    listen_start = text.find("stageListener<unknown>(generation, staged, 'batch-progress'")
     assert listen_start != -1, "the batch-progress listener is gone — this gate would pass vacuously"
-    listener = text[listen_start : text.index("unlisteners.push(unlistenBatch)", listen_start)]
-    assert "'halted'" in listener and "refreshAfterBatch" in listener, (
-        "the batch-progress listener ignores 'halted' again — the terminal state (isProcessing, "
-        "pipelinePhase, batchProgress, endOperation) would never clear after a hard stop"
+    listener_end = text.find("'batch-worker-settled'", listen_start)
+    assert listener_end != -1, "the post-worker settlement listener is gone"
+    listener = text[listen_start:listener_end]
+    assert "publicBatchProgressEvent(event.payload)" in listener, (
+        "batch progress no longer passes through the closed runtime validator"
+    )
+    assert "'halted'" in listener and "markBatchTerminalEvent" in listener, (
+        "the batch-progress listener ignores or misclassifies halted telemetry"
+    )
+    settled_start = text.find("stageListener<unknown>(generation, staged, 'batch-worker-settled'")
+    assert settled_start != -1 and "onBatchWorkerSettled" in text[settled_start:settled_start + 1800], (
+        "physical worker settlement no longer delegates to durable outcome reconciliation"
     )
 
 

@@ -70,10 +70,7 @@
     const q = query.trim().toLowerCase();
     if (!q) return commands;
     return commands.filter(
-      (c) =>
-        fuzzy(c.label.toLowerCase(), q) ||
-        c.category.toLowerCase().includes(q) ||
-        c.label.toLowerCase().includes(q),
+      (c) => fuzzy(c.label.toLowerCase(), q) || c.category.toLowerCase().includes(q),
     );
   });
 

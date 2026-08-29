@@ -207,15 +207,15 @@ pub async fn import_model_checkpoint(
     }
     let checkpoint_path =
         validate::validate_file_path(&checkpoint_path).map_err(|_| invalid_model_import_error("checkpointPath"))?;
-    let db = state.db_arc();
+    let database = state.db_runtime();
     run_blocking(move || {
         // Own the restore fence in the worker itself. Cancelling the async IPC must not detach the
         // multi-GB hash from the generation it will eventually mutate.
-        let _mutation = begin_mutation().map_err(|_| MODEL_MUTATION_RESTORE_BLOCKED.to_string())?;
+        let mutation = database.begin_mutation().map_err(|_| MODEL_MUTATION_RESTORE_BLOCKED.to_string())?;
         // Hash the (potentially multi-GB) checkpoint off the main thread AND before taking the DB lock
         // — holding the global db mutex across the full-file SHA-256 would starve every UI DB poll.
         let sha = crate::registry::hash_checkpoint(&checkpoint_path).map_err(|e| e.to_string())?;
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
         crate::registry::register_checkpoint(
             &db,
             &id,
@@ -255,11 +255,11 @@ pub async fn import_model_deployment(
     STRICT_RATE_LIMITER.check("import_model_deployment").map_err(|_| model_registry_rate_limited_error())?;
     validate_model_identifier(&source, "source")?;
     validate_deployment_request(&manifest_path, &expected_deployment_sha256, &expected_model_id, &license)?;
-    let db = state.db_arc();
+    let database = state.db_runtime();
     run_blocking(move || {
         // Manifest verification can take ten minutes. It and the final registry write are one
         // generation-bound mutation, and the guard must outlive cancellation of the async caller.
-        let _mutation = begin_mutation().map_err(|_| MODEL_MUTATION_RESTORE_BLOCKED.to_string())?;
+        let mutation = database.begin_mutation().map_err(|_| MODEL_MUTATION_RESTORE_BLOCKED.to_string())?;
         let verified = if manifest_path.starts_with('/') {
             let server = crate::engine_runtime::server_script_path(&app)
                 .ok_or_else(|| "bundled cortex_7b_server.py verifier could not be resolved".to_string())?;
@@ -286,7 +286,7 @@ pub async fn import_model_deployment(
             }
             local.record()
         };
-        let db = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let db = database.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::registry::register_verified_deployment_record(&db, &verified, &source, &license)
             .map(ModelVersionSummaryV1::from)
             .map_err(|error| error.to_string())
@@ -316,7 +316,7 @@ pub async fn bootstrap_legacy_champion(
 ) -> Result<ModelVersionSummaryV1, crate::ipc_contract::CommandErrorV1> {
     STRICT_RATE_LIMITER.check("bootstrap_legacy_champion").map_err(|_| model_registry_rate_limited_error())?;
     validate_deployment_request(&manifest_path, &expected_deployment_sha256, &expected_model_id, &license)?;
-    let db = state.db_arc();
+    let database = state.db_runtime();
     let data_dir = state.lock_data_dir().clone().ok_or_else(|| {
         crate::ipc_contract::CommandErrorV1::new(
             "MODEL_STATE_UNAVAILABLE",
@@ -328,7 +328,7 @@ pub async fn bootstrap_legacy_champion(
     run_blocking(move || {
         // Champion publication spans external verification, a registry transaction, and an atomic
         // pointer update. Never allow a restore to split those across database generations.
-        let _mutation = begin_mutation().map_err(|_| MODEL_MUTATION_RESTORE_BLOCKED.to_string())?;
+        let mutation = database.begin_mutation().map_err(|_| MODEL_MUTATION_RESTORE_BLOCKED.to_string())?;
         let verified = if manifest_path.starts_with('/') {
             let server = crate::engine_runtime::server_script_path(&app)
                 .ok_or_else(|| "bundled cortex_7b_server.py verifier could not be resolved".to_string())?;
@@ -352,7 +352,7 @@ pub async fn bootstrap_legacy_champion(
             }
             local.record()
         };
-        let db = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let db = database.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| poisoned.into_inner());
         let model = crate::registry::bootstrap_verified_legacy_deployment(&db, &verified, &license)
             .map_err(|error| error.to_string())?;
         crate::registry::sync_champion_pointer(&db, &data_dir).map_err(|error| error.to_string())?;
@@ -463,26 +463,26 @@ pub async fn undo(
     app: tauri::AppHandle,
 ) -> Result<crate::ipc_contract::HistoryMutationResultV1, crate::ipc_contract::CommandErrorV1> {
     RATE_LIMITER.check("undo").map_err(|_| history_rate_limited_error())?;
-    let database = state.db_arc();
+    let database = state.db_runtime();
     let history = state.history_arc_for_restore();
     let worker_app = app.clone();
-    let (result, _mutation) = tokio::task::spawn_blocking(move || {
-        let mutation = crate::database_runtime::begin_mutation().map_err(|_| history_restore_in_progress_error())?;
-        let database = database.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let result = tokio::task::spawn_blocking(move || {
+        let mutation = database.begin_mutation().map_err(|_| history_restore_in_progress_error())?;
+        let database_guard = database.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| poisoned.into_inner());
         let history = history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let action = history.undo(&database).map_err(|error| public_history_error("undo", &error.to_string()))?;
+        let action = history.undo(&database_guard).map_err(|error| public_history_error("undo", &error.to_string()))?;
         let status = history_status(&history);
         drop(history);
-        drop(database);
+        drop(database_guard);
         if action.is_some() {
             if let Some(app_state) = worker_app.try_state::<AppState>() {
                 app_state.session_auto_save();
             }
         }
-        Ok::<_, crate::ipc_contract::CommandErrorV1>((
-            crate::ipc_contract::HistoryMutationResultV1 { action: action.map(Into::into), status },
-            mutation,
-        ))
+        Ok::<_, crate::ipc_contract::CommandErrorV1>(crate::ipc_contract::HistoryMutationResultV1 {
+            action: action.map(Into::into),
+            status,
+        })
     })
     .await
     .map_err(|_| {
@@ -503,26 +503,26 @@ pub async fn redo(
     app: tauri::AppHandle,
 ) -> Result<crate::ipc_contract::HistoryMutationResultV1, crate::ipc_contract::CommandErrorV1> {
     RATE_LIMITER.check("redo").map_err(|_| history_rate_limited_error())?;
-    let database = state.db_arc();
+    let database = state.db_runtime();
     let history = state.history_arc_for_restore();
     let worker_app = app.clone();
-    let (result, _mutation) = tokio::task::spawn_blocking(move || {
-        let mutation = crate::database_runtime::begin_mutation().map_err(|_| history_restore_in_progress_error())?;
-        let database = database.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let result = tokio::task::spawn_blocking(move || {
+        let mutation = database.begin_mutation().map_err(|_| history_restore_in_progress_error())?;
+        let database_guard = database.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| poisoned.into_inner());
         let history = history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let action = history.redo(&database).map_err(|error| public_history_error("redo", &error.to_string()))?;
+        let action = history.redo(&database_guard).map_err(|error| public_history_error("redo", &error.to_string()))?;
         let status = history_status(&history);
         drop(history);
-        drop(database);
+        drop(database_guard);
         if action.is_some() {
             if let Some(app_state) = worker_app.try_state::<AppState>() {
                 app_state.session_auto_save();
             }
         }
-        Ok::<_, crate::ipc_contract::CommandErrorV1>((
-            crate::ipc_contract::HistoryMutationResultV1 { action: action.map(Into::into), status },
-            mutation,
-        ))
+        Ok::<_, crate::ipc_contract::CommandErrorV1>(crate::ipc_contract::HistoryMutationResultV1 {
+            action: action.map(Into::into),
+            status,
+        })
     })
     .await
     .map_err(|_| {
@@ -743,6 +743,7 @@ fn join_wsl_log_reader(thread: std::thread::JoinHandle<()>, stream: &str) {
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn run_wsl_refinement(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -750,62 +751,65 @@ pub fn run_wsl_refinement(
     limit_segments: Option<u32>,
     dry_run: bool,
     test_one: bool,
-) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("run_wsl_refinement")?;
-    // P1.3b: don't start the 7B refinement loop (a background DB writer) while a restore is reserved.
-    if restore_pending() {
-        return Err(RESTORE_IN_PROGRESS_MSG.into());
-    }
-
-    // Single-run guard: claim the running flag atomically. If it was already true, a batch is in
-    // flight — refuse rather than starting a second concurrent loop over the same segments.
-    if WSL_REFINE_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return Err("WSL 7B refinement batch transcription is already running.".into());
-    }
-    // P1.3b (publish-then-recheck): the running flag is now PUBLISHED; re-read the reservation. This
-    // closes the atomic check-then-set race with prepare_restore (which sets RESTORE_PENDING then reads
-    // this flag via writers_active): either it already observed our flag (the fence refuses the restore),
-    // or we observe its reservation here and roll back — the two orderings can no longer both slip.
-    if restore_pending() {
-        WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-        return Err(RESTORE_IN_PROGRESS_MSG.into());
-    }
-    // The running flag is now OURS; every early return below MUST clear it or the guard would wedge.
-    // Reset CANCEL at the START of the run (standard cancellation-token pattern) rather than trusting
-    // the previous run's guard to have cleared it. The guard clears CANCEL then RUNNING as two separate
-    // atomic stores, so a `cancel` that read RUNNING==true just before the guard could set CANCEL=true
-    // AFTER the guard cleared it — leaking a stale cancel that would make THIS fresh batch abort
-    // immediately, doing zero work, with no error surfaced. Clearing it here, now that RUNNING is
-    // exclusively ours, drops that leaked value. (The only residual is a cancel landing in the tiny
-    // window between the claim above and this store; that is user-recoverable by clicking cancel again,
-    // whereas the leak was silent and unrecoverable.)
-    WSL_REFINE_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
-
-    // Read everything the worker needs under the locks NOW, then release them so the long per-segment
-    // loop holds no AppState lock. A 7B call can take seconds; holding a lock across the loop would
-    // freeze the UI's get_segments exactly like the jury-starvation bug we already fixed. The
-    // poison-recovering lock_* accessors never panic.
-    let setup = {
-        let settings = state.lock_settings();
-        let external_script = settings.external_asr_script_path();
-        let auto_normalize = settings.auto_normalize;
-        let verbalize_numbers = settings.verbalize_numbers;
-        drop(settings);
-        external_script.map(|script| (script, auto_normalize, verbalize_numbers))
-    };
-    let (external_script, auto_normalize, verbalize_numbers) = match setup {
-        Some(values) => values,
-        None => {
-            WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-            return Err("External ASR provider script is not configured in Settings.".into());
+) -> Result<crate::ipc_contract::WslRefinementStartedV1, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER
+        .check("run_wsl_refinement")
+        .map_err(|_| crate::ipc_contract::owner_analysis_rate_limited("run_wsl_refinement"))?;
+    let result = (|| -> Result<(), String> {
+        // P1.3b: don't start the 7B refinement loop (a background DB writer) while a restore is reserved.
+        if restore_pending() {
+            return Err(RESTORE_IN_PROGRESS_MSG.into());
         }
-    };
-    let db_path = state.lock_pipeline().db_path().to_string();
 
-    // Builder::spawn returns Err on OS thread-creation failure instead of PANICKING like thread::spawn,
-    // so a failed spawn can't leave WSL_REFINE_RUNNING wedged true (the RAII guard lives inside the
-    // closure and would never run on a spawn panic).
-    let spawned = std::thread::Builder::new().name("wsl-7b-batch".into()).spawn(move || {
+        // Single-run guard: claim the running flag atomically. If it was already true, a batch is in
+        // flight — refuse rather than starting a second concurrent loop over the same segments.
+        if WSL_REFINE_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err("WSL 7B refinement batch transcription is already running.".into());
+        }
+        // P1.3b (publish-then-recheck): the running flag is now PUBLISHED; re-read the reservation. This
+        // closes the atomic check-then-set race with prepare_restore (which sets RESTORE_PENDING then reads
+        // this flag via writers_active): either it already observed our flag (the fence refuses the restore),
+        // or we observe its reservation here and roll back — the two orderings can no longer both slip.
+        if restore_pending() {
+            WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+            return Err(RESTORE_IN_PROGRESS_MSG.into());
+        }
+        // The running flag is now OURS; every early return below MUST clear it or the guard would wedge.
+        // Reset CANCEL at the START of the run (standard cancellation-token pattern) rather than trusting
+        // the previous run's guard to have cleared it. The guard clears CANCEL then RUNNING as two separate
+        // atomic stores, so a `cancel` that read RUNNING==true just before the guard could set CANCEL=true
+        // AFTER the guard cleared it — leaking a stale cancel that would make THIS fresh batch abort
+        // immediately, doing zero work, with no error surfaced. Clearing it here, now that RUNNING is
+        // exclusively ours, drops that leaked value. (The only residual is a cancel landing in the tiny
+        // window between the claim above and this store; that is user-recoverable by clicking cancel again,
+        // whereas the leak was silent and unrecoverable.)
+        WSL_REFINE_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // Read everything the worker needs under the locks NOW, then release them so the long per-segment
+        // loop holds no AppState lock. A 7B call can take seconds; holding a lock across the loop would
+        // freeze the UI's get_segments exactly like the jury-starvation bug we already fixed. The
+        // poison-recovering lock_* accessors never panic.
+        let setup = {
+            let settings = state.lock_settings();
+            let external_script = settings.external_asr_script_path();
+            let auto_normalize = settings.auto_normalize;
+            let verbalize_numbers = settings.verbalize_numbers;
+            drop(settings);
+            external_script.map(|script| (script, auto_normalize, verbalize_numbers))
+        };
+        let (external_script, auto_normalize, verbalize_numbers) = match setup {
+            Some(values) => values,
+            None => {
+                WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+                return Err("External ASR provider script is not configured in Settings.".into());
+            }
+        };
+        let db_path = state.lock_pipeline().db_path().to_string();
+
+        // Builder::spawn returns Err on OS thread-creation failure instead of PANICKING like thread::spawn,
+        // so a failed spawn can't leave WSL_REFINE_RUNNING wedged true (the RAII guard lives inside the
+        // closure and would never run on a spawn panic).
+        let spawned = std::thread::Builder::new().name("wsl-7b-batch".into()).spawn(move || {
         // Clears WSL_REFINE_RUNNING + WSL_REFINE_CANCEL on every exit path, including a panic.
         let _running = WslRefineRunningGuard;
         // catch_unwind so a panic in the loop still emits a terminal wsl-status — otherwise the panel
@@ -848,12 +852,21 @@ pub fn run_wsl_refinement(
             serde_json::json!({ "status": status, "transcribed": transcribed, "failed": failed, "exit_code": exit_code }),
         );
     });
-    if let Err(error) = spawned {
-        WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-        return Err(format!("Failed to start the WSL 7B batch worker thread: {error}"));
-    }
+        if let Err(error) = spawned {
+            WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+            return Err(format!("Failed to start the WSL 7B batch worker thread: {error}"));
+        }
 
-    Ok(serde_json::json!({ "status": "started" }))
+        Ok(())
+    })();
+    result
+        .map(|()| crate::ipc_contract::WslRefinementStartedV1 {
+            status: crate::ipc_contract::WslRefinementStartStatusV1::Started,
+        })
+        .map_err(|error| {
+            tracing::warn!("Owner WSL refinement start failed: {error}");
+            crate::ipc_contract::public_wsl_refinement_error(&error)
+        })
 }
 
 struct WslRefinementSummary {
@@ -1046,6 +1059,29 @@ fn run_wsl_refinement_loop(
                 } else {
                     None
                 };
+                let normalizer_version = normalized.as_ref().map(|_| crate::normalizer::NORMALIZER_VERSION);
+                #[derive(serde::Serialize)]
+                #[serde(rename_all = "camelCase")]
+                struct WslRefinementCommitConfigV1<'a> {
+                    schema: u8,
+                    protocol: &'static str,
+                    build_git_sha: &'static str,
+                    model_version_id: &'a str,
+                    deployment_sha256: &'a str,
+                    auto_normalize: bool,
+                    verbalize_numbers: bool,
+                    normalizer_version: Option<&'static str>,
+                }
+                let decoder_config_sha256 = canonical_batch_config_sha256(&WslRefinementCommitConfigV1 {
+                    schema: 1,
+                    protocol: "wsl-refinement-commit-v1",
+                    build_git_sha: crate::GIT_SHA,
+                    model_version_id: &result.model_version_id,
+                    deployment_sha256: &result.deployment_sha256,
+                    auto_normalize,
+                    verbalize_numbers,
+                    normalizer_version,
+                })?;
                 let champion = crate::db::SegmentHypothesis {
                     segment_id: id.to_string(),
                     model_id: result.model_version_id,
@@ -1058,6 +1094,8 @@ fn run_wsl_refinement_loop(
                     normalized.as_deref(),
                     Some("external_provider"),
                     false,
+                    &decoder_config_sha256,
+                    normalizer_version,
                     &source_snapshot,
                 ) {
                     Ok(true) => {
@@ -1139,19 +1177,18 @@ pub fn cancel_wsl_refinement() -> Result<(), crate::ipc_contract::CommandErrorV1
 #[tauri::command]
 pub async fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize, String> {
     RATE_LIMITER.check("compute_acoustic_scores")?;
-    let mutation = begin_mutation()?;
     let settings_gpu = {
         let s = state.lock_settings();
         s.enable_gpu
     };
     let models_dir = state.lock_model_manager().models_dir.clone();
-    let db = state.db_arc();
+    let database = state.db_runtime();
     run_blocking(move || {
-        let _mutation = mutation;
+        let mutation = database.begin_mutation()?;
         // P1.3: `WHERE ctc_score IS NULL` instead of reading the whole library and `continue`-ing past
         // every row that already has one. After the first pass this returns nothing at all.
         let segments = {
-            let db = db.lock().unwrap_or_else(|p| p.into_inner());
+            let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
             db.get_pending_segments(crate::db::PendingWork::CtcScore).map_err(|e| e.to_string())?
         };
 
@@ -1211,7 +1248,7 @@ pub async fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize
                 }
             };
 
-            let guard = db.lock().unwrap_or_else(|p| p.into_inner());
+            let guard = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
             guard.update_ctc_score(&seg.id, score).map_err(|e| e.to_string())?;
             count += 1;
         }
@@ -1222,16 +1259,23 @@ pub async fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize
 }
 
 #[tauri::command]
-pub async fn compute_signal_anomaly_scores(state: State<'_, AppState>) -> Result<usize, String> {
-    RATE_LIMITER.check("compute_signal_anomaly_scores")?;
-    let mutation = begin_mutation()?;
+#[specta::specta]
+pub async fn compute_signal_anomaly_scores(
+    state: State<'_, AppState>,
+) -> Result<usize, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER
+        .check("compute_signal_anomaly_scores")
+        .map_err(|_| crate::ipc_contract::owner_analysis_rate_limited("compute_signal_anomaly_scores"))?;
     let models_dir = state.lock_model_manager().models_dir.clone();
-    let db = state.db_arc();
-    run_blocking(move || {
-        let _mutation = mutation;
+    let database = state.db_runtime();
+    let result = run_blocking(move || {
+        let mutation = database.begin_mutation().map_err(|error| {
+            tracing::warn!("Owner signal-analysis admission failed: {error}");
+            error
+        })?;
         // P1.3: `WHERE signal_anomaly_score IS NULL` — see the CTC sibling above.
         let segments = {
-            let db = db.lock().unwrap_or_else(|p| p.into_inner());
+            let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
             db.get_pending_segments(crate::db::PendingWork::SignalAnomaly).map_err(|e| e.to_string())?
         };
 
@@ -1279,12 +1323,19 @@ pub async fn compute_signal_anomaly_scores(state: State<'_, AppState>) -> Result
                 }
             };
 
-            let guard = db.lock().unwrap_or_else(|p| p.into_inner());
+            let guard = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
             guard.update_signal_anomaly_score(&seg.id, score).map_err(|e| e.to_string())?;
             count += 1;
         }
 
         Ok(count)
     })
-    .await
+    .await;
+    result.map_err(|error| {
+        tracing::warn!("Owner signal-anomaly analysis failed: {error}");
+        crate::ipc_contract::public_owner_analysis_error(
+            crate::ipc_contract::OwnerAnalysisOperationV1::SignalAnomaly,
+            &error,
+        )
+    })
 }

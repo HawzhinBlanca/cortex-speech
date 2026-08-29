@@ -286,9 +286,9 @@ def test_every_review_queue_serving_path_applies_the_focus() -> None:
         # page alone still left the Inbox handing out guests).
         (src / "commands" / "agentic.rs", "crate::voice_focus::resolve(dir.as_deref())"),
         (src / "db.rs", "id IN (SELECT value FROM json_each("),
-        (REPO_ROOT / "src" / "lib" / "ReviewMode.svelte", "focused: true"),
+        (REPO_ROOT / "src" / "lib" / "reviewModeQueue.svelte.ts", "focused: true"),
         # A narrowed queue must SAY it is narrowed, and must never claim the library is finished.
-        (REPO_ROOT / "src" / "lib" / "ReviewMode.svelte", "subsetScoped"),
+        (REPO_ROOT / "src" / "lib" / "reviewModeQueue.svelte.ts", "subsetScoped"),
         (src / "db.rs", "pub focus_narrowed: bool"),
     ]
     for path, needle in anchors:
@@ -306,8 +306,8 @@ def test_every_review_queue_serving_path_applies_the_focus() -> None:
         "ensure_library_focus_unchanged",
     ):
         assert needle in library_page, f"focused desktop page lost its generation-bound focus anchor: {needle!r}"
-    review = (REPO_ROOT / "src" / "lib" / "ReviewMode.svelte").read_text(encoding="utf-8")
-    assert "allReviewed: !subsetScoped" in review, (
+    review = (REPO_ROOT / "src" / "lib" / "reviewModeQueue.svelte.ts").read_text(encoding="utf-8")
+    assert "allReviewed: !subset &&" in review, (
         "the completion banner must exclude EVERY subset, not just a search — a drained focus queue "
         "announcing the whole library as reviewed is a false completion claim"
     )

@@ -31,10 +31,11 @@ from review_pilot_hidden_contract import HIDDEN_SCHEMA_SQL, policy_sha256, parse
 
 TEST_FOCUS_IDS = ("focus-a", "focus-b", "focus-c")
 TEST_FOCUS_CONTRACT = contract_for_ids(TEST_FOCUS_IDS)
+CURRENT_SCHEMA = source_migrations(DEFAULT_MIGRATIONS)[-1][0]
 
 
 def test_required_schema_tracks_the_append_only_rust_catalog() -> None:
-    assert activator.REQUIRED_SCHEMA == source_migrations(DEFAULT_MIGRATIONS)[-1][0]
+    assert activator.REQUIRED_SCHEMA == CURRENT_SCHEMA
 
 
 def _verify_test_focus(data_dir: Path):
@@ -50,7 +51,7 @@ def activate(*args, **kwargs):
         return activator.activate(*args, **kwargs)
 
 
-def seed(root: Path, *, schema: int = 67) -> tuple[Path, dict[str, object]]:
+def seed(root: Path, *, schema: int = CURRENT_SCHEMA) -> tuple[Path, dict[str, object]]:
     db_path = root / "cortex-speech.db"
     conn = sqlite3.connect(db_path)
     conn.executescript(
@@ -384,7 +385,7 @@ def test_schema_56_is_refused_before_any_activation_file_changes() -> None:
         try:
             activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
         except RuntimeError as error:
-            assert "schema 56/67" in str(error)
+            assert f"schema 56/{CURRENT_SCHEMA}" in str(error)
         else:
             raise AssertionError("pre-compensation database was accepted")
         assert not (root / POLICY_FILE).exists()
@@ -465,7 +466,7 @@ def test_maintenance_revocation_precedes_schema_56_to_current_work_and_survives_
         try:
             activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
         except RuntimeError as error:
-            assert "schema 56/67" in str(error)
+            assert f"schema 56/{CURRENT_SCHEMA}" in str(error)
         else:
             raise AssertionError("schema 56 unexpectedly activated")
         assert (root / REVOCATION_FILE).read_bytes() == marker_before

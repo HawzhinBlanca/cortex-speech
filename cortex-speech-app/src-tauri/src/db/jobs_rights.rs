@@ -165,22 +165,54 @@ impl Database {
         Ok(())
     }
 
-    /// Discard an interrupted job (the user chose not to resume). Deletes both tables explicitly so it
-    /// works whether or not the foreign-keys pragma is enabling CASCADE.
-    pub fn discard_import_job(&self, job_id: &str) -> AppResult<()> {
+    /// Discard the exact current interrupted job (the user chose not to resume). Deletes both tables
+    /// explicitly so it works whether or not the foreign-keys pragma is enabling CASCADE.
+    ///
+    /// `NotFound` and `Changed` are honest compare-and-delete outcomes, not success. In particular,
+    /// a stale renderer must never clear its banner after deleting zero rows while a newer recovery
+    /// authority remains live.
+    pub(crate) fn discard_import_job(&self, job_id: &str) -> AppResult<DiscardImportJobOutcome> {
+        crate::validation::input::validate_identifier(job_id).map_err(AppError::Validation)?;
         // SAVEPOINT: the two deletes are one invariant (same pattern as begin_import_job). As two
         // auto-commit statements, a failure between them deleted the job's per-file progress journal
         // while leaving the job row alive and 'running' — the startup resume prompt would then offer a
         // job with an EMPTY completed-files list, and resuming would re-import files whose segments
         // already exist, duplicating them.
         self.conn.execute("SAVEPOINT discard_import_job", [])?;
-        let result: AppResult<()> = (|| {
+        let result: AppResult<DiscardImportJobOutcome> = (|| {
+            let mut running = self.conn.prepare(
+                "SELECT id FROM import_jobs WHERE status = 'running'
+                 ORDER BY datetime(created_at) DESC, id DESC",
+            )?;
+            let running_ids: Vec<String> = running.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
+            drop(running);
+            let Some(current_id) = running_ids.first() else {
+                return Ok(DiscardImportJobOutcome::NotFound);
+            };
+            if running_ids.len() != 1 {
+                return Err(AppError::Other(format!(
+                    "Interrupted import journal invariant failed: expected one running job, found {}",
+                    running_ids.len()
+                )));
+            }
+            if current_id != job_id {
+                return Ok(DiscardImportJobOutcome::Changed);
+            }
             self.conn.execute("DELETE FROM import_job_files WHERE job_id = ?1", params![job_id])?;
-            self.conn.execute("DELETE FROM import_jobs WHERE id = ?1", params![job_id])?;
-            Ok(())
+            let deleted =
+                self.conn.execute("DELETE FROM import_jobs WHERE id = ?1 AND status = 'running'", params![job_id])?;
+            if deleted != 1 {
+                return Err(AppError::Other(format!(
+                    "Interrupted import journal '{job_id}' changed during exact discard"
+                )));
+            }
+            Ok(DiscardImportJobOutcome::Discarded)
         })();
         match result {
-            Ok(()) => self.release_savepoint("discard_import_job"),
+            Ok(outcome) => {
+                self.release_savepoint("discard_import_job")?;
+                Ok(outcome)
+            }
             Err(e) => {
                 self.cleanup_savepoint_after_error("discard_import_job");
                 Err(e)
@@ -484,7 +516,8 @@ impl Database {
         let n = self.conn.execute(
             "UPDATE jobs SET state = 'failed', error_code = COALESCE(error_code, 'INTERRUPTED'),
                  finished_at = datetime('now'), updated_at = datetime('now')
-             WHERE state = 'running' AND kind <> 'model_promotion'",
+             WHERE state = 'running'
+               AND kind NOT IN ('model_promotion','batch_transcribe_v1','batch_normalize_v1')",
             [],
         )?;
         Ok(n)
@@ -537,6 +570,7 @@ impl Database {
         // emit the same Sorani text in different forms (NFD vs NFC) would be scored as disagreeing and
         // a real consensus would be spuriously escalated. Matches the NFC enforced on speech_segments.
         let transcript = to_nfc(&hyp.transcript);
+        validate_stored_hypothesis_upsert_on(&self.conn, &hyp.segment_id, &hyp.model_id, &transcript)?;
         self.conn.execute(
             "INSERT INTO segment_hypotheses (segment_id, model_id, transcript, confidence)
              VALUES (?1, ?2, ?3, ?4)
@@ -555,6 +589,7 @@ impl Database {
     /// segment with no provenance merely because cleanup ran first.
     pub fn replace_hypotheses_with(&self, hyp: &SegmentHypothesis) -> AppResult<()> {
         let transcript = to_nfc(&hyp.transcript);
+        validate_stored_hypothesis_payload(&hyp.segment_id, &hyp.model_id, &transcript)?;
         self.conn.execute("SAVEPOINT replace_hypotheses", [])?;
         let result = (|| -> AppResult<()> {
             self.conn.execute("DELETE FROM segment_hypotheses WHERE segment_id = ?1", params![hyp.segment_id])?;
@@ -649,6 +684,10 @@ impl Database {
     /// convert. `load_audio_identities` casts back the same way.
     pub(super) fn ensure_audio_identity_compatible(&self, audio_path: &str, identity: &AudioIdentity) -> AppResult<()> {
         let alias_key = audio_path.replace('/', "\\").to_lowercase();
+        // Content hash is definitive. The spectral value is only a legacy/candidate bucket and can
+        // legitimately change when the same 44.1/48 kHz PCM is decoded through another buffering
+        // route. Treating that bucket as source authority falsely rejected unchanged recordings; new
+        // writers use one fixed route, while this compatibility boundary remains correct for old rows.
         let conflict: Option<(String, Option<i64>, String)> = self
             .conn
             .query_row(
@@ -656,11 +695,10 @@ impl Database {
                    FROM speech_segments
                   WHERE LOWER(REPLACE(audio_path, '/', CHAR(92))) = ?1
                     AND audio_content_hash IS NOT NULL
-                    AND (audio_content_hash <> ?2
-                         OR (audio_fingerprint IS NOT NULL AND audio_fingerprint <> ?3))
+                    AND audio_content_hash <> ?2
                   ORDER BY rowid
                   LIMIT 1",
-                params![alias_key, identity.content, identity.spectral as i64],
+                params![alias_key, identity.content],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
@@ -1200,8 +1238,10 @@ impl Database {
             .optional()?)
     }
 
-    /// Returns the number of rows actually changed — human-reviewed rows are skipped by the guard,
-    /// so this can be less than `updates.len()`; callers must report THIS, not the attempted count.
+    /// Historical fixture for pre-Verbatim-Law consensus behavior. There are deliberately no
+    /// production callers and `cfg(test)` removes this raw-transcript mutator from the shipped app:
+    /// machine consensus is evidence and may never replace champion/human transcript authority.
+    #[cfg(test)]
     pub fn update_segment_consensus_batch(&self, updates: &[(String, String, String, f64)]) -> AppResult<usize> {
         self.conn.execute("SAVEPOINT consensus_batch", [])?;
         let result: AppResult<usize> = (|| {
@@ -1308,12 +1348,14 @@ impl Database {
         Ok(())
     }
 
-    /// Persist alignment output only if the canonical alignment read before slow inference is still
-    /// current. SQLite `IS` is deliberately used instead of `=` so `None` compares NULL-safely. A
-    /// concurrent boundary/timing edit returns `Ok(false)` and is never overwritten.
+    /// Persist alignment output only if the complete segment revision and canonical alignment read
+    /// before slow inference are still current. SQLite `IS` is deliberately used instead of `=` so
+    /// `None` compares NULL-safely. Any concurrent transcript, review, boundary, timing, or evidence
+    /// mutation returns `Ok(false)` and is never overwritten.
     pub fn update_segment_alignment_if_unchanged(
         &self,
         segment_id: &str,
+        expected_revision: i64,
         expected_alignment: Option<&str>,
         alignment_json: &str,
         quality: &str,
@@ -1321,9 +1363,9 @@ impl Database {
         crate::validation::input::validate_alignment_json(alignment_json).map_err(AppError::Validation)?;
         let changed = self.conn.execute(
             "UPDATE speech_segments
-             SET alignment_json = ?3, alignment_quality = ?4, updated_at = datetime('now')
-             WHERE id = ?1 AND alignment_json IS ?2",
-            params![segment_id, expected_alignment, alignment_json, quality],
+             SET alignment_json = ?4, alignment_quality = ?5, updated_at = datetime('now')
+             WHERE id = ?1 AND review_revision = ?2 AND alignment_json IS ?3",
+            params![segment_id, expected_revision, expected_alignment, alignment_json, quality],
         )?;
         if changed > 0 {
             self.track_write()?;

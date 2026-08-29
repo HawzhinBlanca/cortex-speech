@@ -6,15 +6,12 @@ const PROVEN_UNCOMMITTED_FINALIZATION_CODES = new Set([
   // Public command validation occurs before any database call.
   'INVALID_PLAYBACK_RECEIPT',
   'INVALID_MEDIA_GRANT',
-  // These typed outcomes are emitted by validation branches before the receipt transaction commits.
+  // These typed outcomes are emitted by validation branches whose native contract proves that no
+  // older timed-out invocation can subsequently commit the same receipt.
   'NO_PLAYBACK_EVIDENCE',
   'PLAYBACK_COVERAGE_INSUFFICIENT',
-  'PLAYBACK_TIME_IMPLAUSIBLE',
   'PLAYBACK_REVISION_CHANGED',
   'PLAYBACK_EVIDENCE_CHANGED',
-  'PLAYBACK_SESSION_EXPIRED',
-  // Emitted only after durable-receipt replay returned none and before finalization begins.
-  'PLAYBACK_MEDIA_GRANT_UNAVAILABLE',
 ]);
 
 /**
@@ -122,6 +119,11 @@ export class ReviewPlaybackAttemptLedger {
 
   finalizedReceipt(segmentId: string, baseRevision: number): string | null {
     return this.pending.get(attemptKey(segmentId, baseRevision))?.finalizedReceiptId ?? null;
+  }
+
+  /** Return the immutable payload retained after an ambiguous or lost finalization response. */
+  pendingAttempt(segmentId: string, baseRevision: number): ReviewPlaybackAttempt | null {
+    return this.pending.get(attemptKey(segmentId, baseRevision))?.attempt ?? null;
   }
 
   resolve(segmentId: string, baseRevision: number): void {

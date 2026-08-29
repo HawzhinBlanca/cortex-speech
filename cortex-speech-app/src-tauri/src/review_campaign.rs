@@ -300,7 +300,7 @@ fn parse_progress(raw: &str, policy: &SequentialReviewCampaign) -> Result<Campai
     canonical_uuid(&progress.transition_id, "sequential review transition id")?;
     match progress.phase {
         CampaignPhase::FirstPassActive => {
-            return Err("first-pass progress must be represented by the immutable base policy".to_string())
+            return Err("first-pass progress must be represented by the immutable base policy".to_string());
         }
         CampaignPhase::SecondPassActive => {
             if progress.independent_decision_count != 0
@@ -889,6 +889,14 @@ pub fn record_independent_decision(
                  SELECT 1 FROM review_events WHERE operation_id=?1
                  UNION ALL
                  SELECT 1 FROM human_decision_effect_events WHERE operation_id=?1
+                 UNION ALL
+                 SELECT 1 FROM human_decision_effect_reversals WHERE operation_id=?1
+                 UNION ALL
+                 SELECT 1 FROM review_flag_effect_events WHERE operation_id=?1
+                 UNION ALL
+                 SELECT 1 FROM review_flag_effect_reversals WHERE operation_id=?1
+                 UNION ALL
+                 SELECT 1 FROM independent_review_reversals WHERE operation_id=?1
              )",
             [input.operation_id],
             |row| row.get(0),
@@ -984,6 +992,23 @@ pub fn latest_independent_decision(
         .map_err(|error| format!("latest independent decision cannot be read: {error}"))
 }
 
+/// Derive the stable, domain-separated identity for a bodyless Couch inverse request. The phone's
+/// original decision UUID cannot name both the decision and its reversal under the global v69
+/// operation namespace. Derivation keeps retries deterministic (including a lost response in the
+/// same durable decision context) without minting a second meaning for the forward UUID.
+pub fn independent_reversal_operation_id(decision_operation_id: &str) -> Result<String, String> {
+    canonical_uuid(decision_operation_id, "independent decision operation id")?;
+    let mut digest = Sha256::new();
+    digest.update(b"cortex-independent-review-reversal-v1\0");
+    digest.update(decision_operation_id.as_bytes());
+    let digest = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50; // RFC 9562 name-based/version-5 shape.
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122/9562 variant.
+    Ok(uuid::Uuid::from_bytes(bytes).hyphenated().to_string())
+}
+
 pub fn reverse_independent_decision(
     db: &Database,
     policy: &SequentialReviewCampaign,
@@ -996,8 +1021,9 @@ pub fn reverse_independent_decision(
         return Err("independent reversal is outside the active Alle second pass".to_string());
     }
     canonical_uuid(operation_id, "independent reversal operation id")?;
-    let existing: Option<(String, String)> = db
-        .connection()
+    let tx = rusqlite::Transaction::new_unchecked(db.connection(), rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("independent reversal cannot lock its operation namespace: {error}"))?;
+    let existing: Option<(String, String)> = tx
         .query_row(
             "SELECT operation_id, reviewer FROM independent_review_reversals WHERE decision_id = ?1",
             [decision_id],
@@ -1007,12 +1033,39 @@ pub fn reverse_independent_decision(
         .map_err(|error| format!("independent reversal receipt cannot be read: {error}"))?;
     if let Some((existing_operation, existing_reviewer)) = existing {
         if existing_operation == operation_id && existing_reviewer.eq_ignore_ascii_case(reviewer) {
+            tx.rollback().map_err(|error| format!("independent reversal replay cannot release its lock: {error}"))?;
             return Ok(());
         }
         return Err("independent decision already has another reversal identity".to_string());
     }
-    let changed = db
-        .connection()
+    let operation_collision: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM review_events WHERE operation_id=?1
+                 UNION ALL
+                 SELECT 1 FROM human_decision_effect_events WHERE operation_id=?1
+                 UNION ALL
+                 SELECT 1 FROM human_decision_effect_reversals WHERE operation_id=?1
+                 UNION ALL
+                 SELECT 1 FROM review_flag_effect_events WHERE operation_id=?1
+                 UNION ALL
+                 SELECT 1 FROM review_flag_effect_reversals WHERE operation_id=?1
+                 UNION ALL
+                 SELECT 1 FROM independent_review_decisions WHERE operation_id=?1
+                 UNION ALL
+                 SELECT 1 FROM independent_review_reversals WHERE operation_id=?1
+             )",
+            [operation_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("independent reversal operation namespace cannot be checked: {error}"))?;
+    if operation_collision {
+        return Err(
+            "E_REVIEW_OPERATION_NAMESPACE_COLLISION: independent reversal UUID is already bound to another review action"
+                .to_string(),
+        );
+    }
+    let changed = tx
         .execute(
             "INSERT INTO independent_review_reversals
                 (decision_id, operation_id, reviewer, created_at_ms)
@@ -1025,7 +1078,7 @@ pub fn reverse_independent_decision(
     if changed != 1 {
         return Err("independent decision reversal target is missing or outside this campaign".to_string());
     }
-    Ok(())
+    tx.commit().map_err(|error| format!("independent decision reversal cannot commit: {error}"))
 }
 
 fn progress_json_and_sha256(progress: &CampaignProgress) -> Result<(String, String), String> {
@@ -1716,6 +1769,38 @@ mod tests {
         // not create separate idempotency namespaces: an independent replay must fail before it can
         // bind a different human act to the same externally visible operation identity.
         let first_pass_operation_id = "00000000-0000-4000-8000-000000000001";
+        let direct_generation_before = db.restore_generation_sha256().unwrap();
+        let direct_independent_collision = db
+            .connection()
+            .execute(
+                "INSERT INTO independent_review_decisions
+                    (campaign_id,segment_id,reviewer,action,submitted_transcript,
+                     served_transcript,served_revision,audio_content_hash,source_start_ms,
+                     source_end_ms,duration_ms,requested_action,requested_transcript,
+                     operation_id,operation_payload_hash,app_git_sha,playback_guard_version,
+                     created_at_ms)
+                 VALUES (?1,?2,'Alle','accept',?3,?3,?4,?5,?6,?7,1000,
+                         'accept',?3,?8,?9,?10,'content-hash-raw-counter-v3',1999)",
+                rusqlite::params![
+                    policy.campaign_id,
+                    segment_id,
+                    raw,
+                    served_revision,
+                    content_hash,
+                    source_span.0,
+                    source_span.1,
+                    first_pass_operation_id,
+                    canonical_payload_hash,
+                    crate::GIT_SHA,
+                ],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            direct_independent_collision.contains("belongs to another review action"),
+            "{direct_independent_collision}"
+        );
+        assert_eq!(db.restore_generation_sha256().unwrap(), direct_generation_before);
         let collision = record_independent_decision(
             &db,
             &policy,
@@ -1775,6 +1860,178 @@ mod tests {
             .unwrap();
         assert_eq!(stored_reviewer, "Alle");
 
+        let trigger_collision = db
+            .connection()
+            .execute(
+                "INSERT INTO independent_review_reversals
+                    (decision_id,operation_id,reviewer,created_at_ms)
+                 VALUES (?1,?2,'Alle',3499)",
+                rusqlite::params![decision_id, independent_operation_id],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(trigger_collision.contains("belongs to another review action"), "{trigger_collision}");
+
+        let reversal_collision =
+            reverse_independent_decision(&db, &policy, decision_id, "Alle", independent_operation_id, 3_500)
+                .unwrap_err();
+        assert!(reversal_collision.contains("E_REVIEW_OPERATION_NAMESPACE_COLLISION"), "{reversal_collision}");
+        assert_eq!(
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM independent_review_reversals", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "a cross-action inverse collision must be zero mutation"
+        );
+        let independent_reversal_operation_id = "20000000-0000-4000-8000-000000000100";
+        reverse_independent_decision(&db, &policy, decision_id, "Alle", independent_reversal_operation_id, 3_600)
+            .unwrap();
+
+        let canonical_generation_before = db.restore_generation_sha256().unwrap();
+        let review_event_count_before: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap();
+        let direct_review_event_collision = db
+            .connection()
+            .execute(
+                "INSERT INTO review_events
+                    (segment_id,reviewer,action,compensation_action,source,timestamp_ms,
+                     duration_ms,operation_id,operation_payload_hash,requested_action,
+                     requested_transcript,served_transcript,served_revision,app_git_sha,
+                     playback_guard_version)
+                 VALUES (?1,'Rubar','skip','skip','couch',3700,1000,?2,?3,
+                         'skip','',?4,?5,?6,'content-hash-raw-counter-v3')",
+                rusqlite::params![
+                    segment_id,
+                    independent_operation_id,
+                    crate::db::review_operation_payload_hash(segment_id, "skip", "", "Rubar"),
+                    raw,
+                    served_revision,
+                    crate::GIT_SHA,
+                ],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            direct_review_event_collision.contains("belongs to independent review truth"),
+            "{direct_review_event_collision}"
+        );
+        assert_eq!(db.restore_generation_sha256().unwrap(), canonical_generation_before);
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "independent-namespace-decision-probe".into(),
+            audio_path: "/independent-namespace-decision-probe.wav".into(),
+            raw_transcript: "namespace decision probe".into(),
+            duration_ms: 1_000,
+            ..crate::db::SpeechSegment::default()
+        })
+        .unwrap();
+        let direct_effect_generation_before = db.restore_generation_sha256().unwrap();
+        let direct_effect_collision = db
+            .connection()
+            .execute(
+                "INSERT INTO human_decision_effect_events
+                    (segment_id,reviewer,source,operation_id,operation_payload_hash,action,
+                     served_transcript,decision_transcript,decision_verified,
+                     decision_corrected_at,requested_action,requested_transcript,
+                     requested_timestamp_ms,prior_revision,decision_revision,prior_verified,
+                     prior_escalated)
+                 VALUES ('independent-namespace-decision-probe',NULL,'desktop',?1,?2,
+                         'accept','namespace decision probe','namespace decision probe',1,
+                         '2026-08-28 12:00:00','accept','namespace decision probe',1000,
+                         0,1,0,0)",
+                rusqlite::params![independent_reversal_operation_id, "a".repeat(64)],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(direct_effect_collision.contains("belongs to independent review truth"), "{direct_effect_collision}");
+        assert_eq!(db.restore_generation_sha256().unwrap(), direct_effect_generation_before);
+        assert_eq!(
+            db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get::<_, i64>(0)).unwrap(),
+            review_event_count_before
+        );
+        assert_eq!(
+            db.connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM human_decision_effect_events
+                      WHERE segment_id='independent-namespace-decision-probe'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.segment_review_revision("independent-namespace-decision-probe").unwrap(), Some(0));
+
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "independent-namespace-flag-probe".into(),
+            audio_path: "/independent-namespace-flag-probe.wav".into(),
+            raw_transcript: "namespace probe".into(),
+            duration_ms: 1_000,
+            ..crate::db::SpeechSegment::default()
+        })
+        .unwrap();
+        let generation_before = db.restore_generation_sha256().unwrap();
+        let journal_before: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get(0))
+            .unwrap();
+        let generic_flag_collision = db
+            .record_review_flag_for_test(
+                "independent-namespace-flag-probe",
+                "must remain unchanged",
+                independent_operation_id,
+            )
+            .unwrap_err();
+        assert!(
+            generic_flag_collision.to_string().contains("E_REVIEW_OPERATION_NAMESPACE_COLLISION"),
+            "{generic_flag_collision}"
+        );
+        let source = db.technical_unusable_source_snapshot("independent-namespace-flag-probe").unwrap().unwrap();
+        let technical_flag_collision = db
+            .mark_segment_technically_unusable_after_verified_failure(
+                "independent-namespace-flag-probe",
+                source.review_revision,
+                "permissionDenied",
+                &source.source_path_sha256,
+                source.audio_content_hash.as_deref(),
+                independent_reversal_operation_id,
+            )
+            .unwrap_err();
+        assert!(
+            technical_flag_collision.to_string().contains("E_REVIEW_OPERATION_NAMESPACE_COLLISION"),
+            "{technical_flag_collision}"
+        );
+        let direct_flag_collision = db
+            .connection()
+            .execute(
+                "INSERT INTO review_flag_effect_events
+                    (operation_id,segment_id,prior_revision,flag_revision,
+                     prior_verdict,prior_rationale,flag_rationale,prior_escalated)
+                 VALUES (?1,'independent-namespace-flag-probe',0,1,NULL,NULL,'direct collision',0)",
+                [independent_operation_id],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(direct_flag_collision.contains("belongs to another review action"), "{direct_flag_collision}");
+        assert_eq!(db.restore_generation_sha256().unwrap(), generation_before);
+        assert_eq!(
+            db.connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM review_flag_effect_events
+                      WHERE segment_id='independent-namespace-flag-probe'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "both forward flag writers and the SQL backstop must be zero mutation on collision"
+        );
+        assert_eq!(
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            journal_before
+        );
+
         // Prove the symmetric fence. The canonical skip writer holds the same IMMEDIATE
         // reservation and must refuse a UUID that independent truth claimed first.
         let skip_hash = crate::db::review_operation_payload_hash(segment_id, "skip", "", "Rubar");
@@ -1791,6 +2048,23 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(reverse_collision.contains("E_REVIEW_OPERATION_NAMESPACE_COLLISION"), "{reverse_collision}");
+
+        let reversal_namespace_collision = db
+            .record_review_event_with_operation(
+                segment_id,
+                "Rubar",
+                "skip",
+                "couch",
+                4_100,
+                independent_reversal_operation_id,
+                &skip_hash,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            reversal_namespace_collision.contains("E_REVIEW_OPERATION_NAMESPACE_COLLISION"),
+            "{reversal_namespace_collision}"
+        );
     }
 
     #[test]
@@ -1827,8 +2101,9 @@ mod tests {
         };
         let decision_id = record_independent_decision(&db, &policy, &input).unwrap().unwrap();
         assert!(!independent_segment_pending(&db, &policy, id).unwrap());
-        reverse_independent_decision(&db, &policy, decision_id, "Alle", operation_id, 3_000).unwrap();
-        reverse_independent_decision(&db, &policy, decision_id, "Alle", operation_id, 3_000).unwrap();
+        let reversal_operation_id = "20000000-0000-4000-8000-000000000002";
+        reverse_independent_decision(&db, &policy, decision_id, "Alle", reversal_operation_id, 3_000).unwrap();
+        reverse_independent_decision(&db, &policy, decision_id, "Alle", reversal_operation_id, 3_000).unwrap();
         assert!(independent_segment_pending(&db, &policy, id).unwrap());
         let corpus = db.get_segment_by_id(id).unwrap().unwrap();
         assert_eq!(corpus.reviewed_by.as_deref(), Some("Rubar"));

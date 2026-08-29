@@ -48,6 +48,7 @@ MIN_BRANCH_PERCENT = 80.0
 
 CRITICAL_MIN_LINE_PERCENT = 95.0
 CRITICAL_MIN_REGION_PERCENT = 95.0
+CRITICAL_MIN_FUNCTION_PERCENT = 90.0
 CRITICAL_MIN_BRANCH_PERCENT = 90.0
 
 # These paths are the committed critical-domain boundary. A missing pattern is evidence failure,
@@ -475,6 +476,7 @@ def _critical_coverage_domains(data_set: Mapping[str, Any]) -> tuple[
     thresholds = {
         "lines": CRITICAL_MIN_LINE_PERCENT,
         "regions": CRITICAL_MIN_REGION_PERCENT,
+        "functions": CRITICAL_MIN_FUNCTION_PERCENT,
         "branches": CRITICAL_MIN_BRANCH_PERCENT,
     }
     for domain, patterns in CRITICAL_COVERAGE_DOMAINS.items():

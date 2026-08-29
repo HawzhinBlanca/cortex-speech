@@ -140,7 +140,11 @@ def test_removed_cloud_stt_and_alternative_retranscribe_surfaces_stay_absent() -
     champion_required: dict[Path, tuple[str, ...]] = {
         LIB_RS: ("commands::transcribe_segment",),
         COMMANDS_DIR / "transcribe.rs": ("pub async fn transcribe_segment(",),
-        REPO_ROOT / "src" / "Workstation.svelte": ("api.transcribeSegment(",),
+        REPO_ROOT / "src" / "Workstation.svelte": ("createWorkstationSegmentActions",),
+        REPO_ROOT / "src" / "lib" / "workstationSegmentActions.ts": (
+            "export function createWorkstationSegmentActions(",
+            "api.transcribeSegment(",
+        ),
         REPO_ROOT / "src" / "lib" / "ReviewMode.svelte": ("api.transcribeSegment(",),
     }
     for path, required_tokens in champion_required.items():
@@ -153,7 +157,13 @@ def test_removed_cloud_stt_and_alternative_retranscribe_surfaces_stay_absent() -
                 )
 
     frontend_commands = _strip_comments(read(REPO_ROOT / "src" / "lib" / "commands.ts"))
-    assert_literal_invoke(frontend_commands, "transcribe_segment", "src/lib/commands.ts")
+    assert_contains(
+        frontend_commands,
+        "generatedCommands.transcribeSegment(",
+        "src/lib/commands.ts",
+    )
+    generated_bindings = _strip_comments(read(REPO_ROOT / "src" / "lib" / "generated" / "ipc.ts"))
+    assert_literal_invoke(generated_bindings, "transcribe_segment", "src/lib/generated/ipc.ts")
 
     runtime_forbidden: dict[Path, tuple[str, ...]] = {
         LIB_RS: (

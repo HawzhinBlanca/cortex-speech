@@ -176,13 +176,17 @@ pub(crate) fn parse_roster_text(text: &str) -> Result<HashMap<String, Vec<String
                 // `allowed_for`) are a broken file: which restriction binds would depend on hash
                 // iteration order, and one of them was certainly a typo of the other.
                 if let Some(existing) = roster.keys().find(|k| k.trim().eq_ignore_ascii_case(name.trim())) {
-                    tracing::error!("reviewer_dialects.json: \"{name}\" and \"{existing}\" name the same reviewer — queues serve NOTHING until it is fixed");
+                    tracing::error!(
+                        "reviewer_dialects.json: \"{name}\" and \"{existing}\" name the same reviewer — queues serve NOTHING until it is fixed"
+                    );
                     return Err(format!("\"{name}\" and \"{existing}\" name the same reviewer"));
                 }
                 roster.insert(name, normalized_dialects);
             }
             None => {
-                tracing::error!("reviewer_dialects.json: \"{name}\" is not a list of dialect names — queues serve NOTHING until it is fixed");
+                tracing::error!(
+                    "reviewer_dialects.json: \"{name}\" is not a list of dialect names — queues serve NOTHING until it is fixed"
+                );
                 return Err(format!("entry \"{name}\" is not a list of dialect names (prefix comment keys with _)"));
             }
         }

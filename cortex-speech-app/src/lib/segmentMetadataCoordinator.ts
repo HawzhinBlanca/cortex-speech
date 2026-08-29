@@ -36,16 +36,24 @@ export function createSegmentMetadataCoordinator({
 
   function remember(segmentId: string, metadata: SegmentMetadataBaseline): void {
     const existing = baselines.get(segmentId);
+    let changed = false;
     if (existing) {
-      existing.speakerId = metadata.speakerId;
-      existing.alignmentJson = metadata.alignmentJson;
+      if (
+        existing.speakerId !== metadata.speakerId ||
+        existing.alignmentJson !== metadata.alignmentJson
+      ) {
+        existing.speakerId = metadata.speakerId;
+        existing.alignmentJson = metadata.alignmentJson;
+        changed = true;
+      }
     } else {
       baselines.set(segmentId, {
         speakerId: metadata.speakerId,
         alignmentJson: metadata.alignmentJson,
       });
+      changed = true;
     }
-    onReadinessChanged();
+    if (changed) onReadinessChanged();
   }
 
   function forget(segmentId: string): void {

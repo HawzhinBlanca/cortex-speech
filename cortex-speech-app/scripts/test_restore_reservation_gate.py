@@ -223,7 +223,7 @@ def test_snapshot_and_restore_share_one_mutex_guard_in_both_commands() -> None:
     restore = helper.find("db.commit_staged_restore(&staged)")
     if -1 in (stage, snapshot, restore) or not (stage < snapshot < restore):
         raise AssertionError("bare restore must stage/validate first, then pin the live DB, then atomically publish")
-    named = _fn_body(service, "pub(crate) fn prepare_and_restore_named_transaction(", span=2600)
+    named = _fn_body(service, "pub(crate) fn prepare_and_restore_named_transaction(", span=5200)
     if "prepare_named_restore_artifacts(" not in named or "begin_named_restore_transaction(" not in named:
         raise AssertionError("named restore must bind verified artifacts to its reusable safety-pin transaction")
     if "db.commit_staged_restore(&staged)" not in named:
@@ -250,11 +250,16 @@ def test_snapshot_and_restore_share_one_mutex_guard_in_both_commands() -> None:
     if "successful_restore_reopens_the_writer_before_admission_releases" not in runtime:
         raise AssertionError("restore/reopen generation behavior needs a deterministic runtime regression")
     db = _read("db.rs")
-    stage = _fn_body(db, "pub(crate) fn stage_restore_source", span=3000)
-    if "open_immutable_connection" not in stage:
-        raise AssertionError("restore preflight must not create WAL/SHM sidecars beside a manifest-bound source")
-    if "restore_staging_does_not_create_sidecars_beside_a_frozen_snapshot" not in _read("db_tests.rs"):
-        raise AssertionError("immutable restore-source admission needs a sidecar regression")
+    stage = _fn_body(db, "pub(crate) fn stage_restore_source_with_original_evidence", span=5200)
+    if "capture_private_restore_source" not in stage or "open_detached_read_snapshot" not in stage:
+        raise AssertionError(
+            "restore preflight must privately capture main+WAL authority before opening SQLite, so it neither "
+            "ignores committed WAL rows nor creates sidecars beside a manifest-bound source"
+        )
+    if "open_immutable_connection" in stage:
+        raise AssertionError("restore preflight regressed to immutable main-file-only authority and can ignore WAL truth")
+    if "staged_restore_includes_a_small_committed_wal_generation" not in db:
+        raise AssertionError("WAL-aware restore-source admission needs a committed-small-WAL regression")
 
 
 def test_every_production_database_entrypoint_requires_the_shared_pre_migration_pin() -> None:
@@ -283,11 +288,14 @@ def test_every_production_database_entrypoint_requires_the_shared_pre_migration_
 
 def test_named_snapshot_restore_commits_config_only_after_atomic_required_state_and_settings() -> None:
     commands = _read("commands/recovery_ipc.rs")
+    service = _read("restore_service/orchestration.rs")
     body = _fn_body(commands, "pub async fn restore_db_from_snapshot(", span=14_000)
     history = body.find("state.lock_history().clear();")
     install = body.find("install_snapshot_restore_plan(&restore_plan, &data_dir, &live_controls)?")
     runtime = body.find("*state.lock_settings() = restored.clone();")
-    completed = body.find("mark_named_restore_completed(&data_dir, &name)?;")
+    completed = body.find(
+        "mark_named_restore_completed(&data_dir, &name, &restore_plan.expected_db_generation_sha256)?;"
+    )
     clear = body.find("clear_review_pilot_restore_pending(&data_dir)?;", completed)
     commit = body.find("restore_reservation.commit_named_restore()?;", completed)
     if -1 in (history, install, runtime, completed, clear, commit) or not (
@@ -307,6 +315,18 @@ def test_named_snapshot_restore_commits_config_only_after_atomic_required_state_
     marker = _fn_body(recovery, "pub(crate) fn begin_named_restore_transaction(", span=3800)
     if not (0 <= marker.find("reservation.arm_named_restore()?") < marker.find("write_named_restore_pending")):
         raise AssertionError("named admission must arm fail-closed parking before writing its durable marker")
+    for required in (
+        "target_db_generation_sha256",
+        "completed_db_generation_sha256",
+        "NAMED_RESTORE_PENDING_SCHEMA: u32 = 3",
+        "fsync_parent_dir_strict",
+    ):
+        if required not in recovery:
+            raise AssertionError(f"named restore lost exact-generation/durable marker authority: {required}")
+    if "db.require_restore_generation_sha256(&plan.expected_db_generation_sha256)" not in service:
+        raise AssertionError("named restore must prove the exact staged live SQLite generation before config publication")
+    if "completed_named_restore_matches_live(data_dir, &pending)?" not in service:
+        raise AssertionError("startup cleanup must compare the WAL-aware live generation with the completion digest")
 
     lib = _read("lib.rs")
     recovery = lib.find("recover_interrupted_named_restore_at_startup(&data_dir)")
@@ -324,12 +344,17 @@ def test_long_prework_publishers_hold_full_operation_mutation_guards() -> None:
     ):
         body = _fn_body(commands, signature, span=7500)
         worker = body.find("run_blocking(move ||")
-        mutation = body.find("let _mutation = begin_mutation()")
+        mutation = body.find("database.begin_mutation()")
         mutation_end = body.find(";", mutation)
+        writer = body.find("database.lock_after_mutation(&mutation)", mutation)
         publish = body.find(final_publish)
         propagated = mutation != -1 and mutation_end != -1 and "?" in body[mutation:mutation_end]
-        if -1 in (worker, mutation, mutation_end, publish) or not propagated or not (worker < mutation < publish):
-            raise AssertionError(f"{signature} must own mutation admission inside its detachable worker through publish")
+        if -1 in (worker, mutation, mutation_end, writer, publish) or not propagated or not (
+            worker < mutation < writer < publish
+        ):
+            raise AssertionError(
+                f"{signature} must own exact-runtime mutation admission inside its detachable worker through publish"
+            )
 
     integration = _read("integration_runner.rs")
     body = _fn_body(integration, "pub fn run(", span=3500)
@@ -337,6 +362,128 @@ def test_long_prework_publishers_hold_full_operation_mutation_guards() -> None:
     first_import = body.find("pipeline.import_directory(")
     if mutation == -1 or first_import == -1 or mutation >= first_import:
         raise AssertionError("registered integration/audiobook lifecycle must fence its complete write lifetime")
+    if "lock_after_mutation(&mutation)" not in body:
+        raise AssertionError("integration lifecycle must not re-enter the ordinary admission lock after mutation")
+
+
+def test_owner_runtime_writers_enter_exact_mutation_before_waiting_for_sqlite() -> None:
+    """A writer may never re-enter the ordinary admission lock after announcing a mutation.
+
+    Holding the admission mutex while waiting for SQLite can hide ``mutations_active`` from a
+    competing restore until after the write has committed.  The exact runtime guard plus
+    ``lock_after_mutation`` is the lock-order contract that makes writer-first restore refusal
+    deterministic.
+    """
+
+    def assert_boundary(rel: str, signature: str, span: int = 5000) -> None:
+        body = _fn_body(_read(rel), signature, span=span)
+        admission = body.find(".begin_mutation()")
+        writer = body.find(".lock_after_mutation(", admission)
+        if admission == -1 or writer == -1 or admission >= writer:
+            raise AssertionError(
+                f"{rel}:{signature} must enter its DatabaseRuntime mutation before taking the writer lock"
+            )
+
+    for rel, signature, span in (
+        ("lib.rs", "pub(crate) fn save_session_view_state(", 1800),
+        ("lib.rs", "pub fn session_save(", 1800),
+        ("lib.rs", "pub(crate) fn persist_review_cursor(", 1800),
+        ("lib.rs", "pub fn session_auto_save(", 1800),
+        ("commands.rs", "pub async fn merge_dataset_json(", 2400),
+        ("commands/gold_eval.rs", "pub async fn import_gold_segments(", 2600),
+        ("commands/gold_eval.rs", "pub async fn run_gold_eval(", 1800),
+        ("commands/gold_eval.rs", "pub async fn create_gold_from_file(", 2200),
+        ("commands/gold_eval.rs", "pub async fn import_verified_segments_as_gold(", 2000),
+        ("commands/jury.rs", "pub async fn run_t0_gate(", 2300),
+        ("commands/recovery_ipc.rs", "pub async fn db_vacuum(", 1500),
+        ("commands/segments_read.rs", "pub async fn relink_audio(", 2500),
+        ("commands/system_ops.rs", "pub async fn import_model_checkpoint(", 4800),
+        ("commands/system_ops.rs", "pub async fn import_model_deployment(", 7000),
+        ("commands/system_ops.rs", "pub async fn bootstrap_legacy_champion(", 7000),
+        ("commands/system_ops.rs", "pub async fn undo(", 3600),
+        ("commands/system_ops.rs", "pub async fn redo(", 3600),
+        ("commands/system_ops.rs", "pub async fn compute_acoustic_scores(", 9000),
+        ("commands/system_ops.rs", "pub async fn compute_signal_anomaly_scores(", 9000),
+        ("commands/transcribe.rs", "pub async fn transcribe_segment(", 13_000),
+        ("commands/transcribe.rs", "pub async fn align_segment(", 9000),
+    ):
+        assert_boundary(rel, signature, span)
+
+    ingest = _fn_body(_read("commands/ingest.rs"), "fn emit_agent_stage_event(", span=3400)
+    for required in ("app_state.db_runtime()", "database.begin_mutation()", "database.lock_after_mutation(&mutation)"):
+        if required not in ingest:
+            raise AssertionError(f"agent-stage persistence bypasses exact restore admission: {required}")
+
+    for rel in ("stores/import_write.rs", "stores/jobs.rs"):
+        production = _read(rel).split("#[cfg(test)]", 1)[0]
+        for required in ("self.runtime.begin_mutation()", "self.runtime.lock_after_mutation(mutation)"):
+            if required not in production:
+                raise AssertionError(f"{rel} lost the exact runtime writer boundary: {required}")
+        if "use crate::database_runtime::{begin_mutation" in production:
+            raise AssertionError(f"{rel} regressed to the process-global mutation authority")
+        if "self.runtime.lock()" in production:
+            raise AssertionError(f"{rel} still has an ordinary writer-lock path")
+
+    segment_store = _read("stores/segment_write.rs").split("#[cfg(test)]", 1)[0]
+    if "self.runtime.lock_after_mutation(mutation)" not in segment_store:
+        raise AssertionError("segment writes may not re-enter DatabaseRuntime::lock after mutation admission")
+    if "self.runtime.lock()" in segment_store:
+        raise AssertionError("segment write production code still has an ordinary writer-lock path")
+
+    batch_store = _read("stores/batch.rs").split("#[cfg(test)]", 1)[0]
+    if "lock_after_mutation" not in batch_store or ".lock(" in batch_store:
+        raise AssertionError("durable batch writes must use their held mutation lease for every writer lock")
+
+    draft_store = _read("stores/review_draft.rs").split("#[cfg(test)]", 1)[0]
+    if "with_reserved_review_draft_write" not in draft_store or "lock_after_mutation(mutation)" not in draft_store:
+        raise AssertionError("reserved draft writes must pass their mutation capability into the writer lock")
+    if "self.runtime.lock()" in draft_store:
+        raise AssertionError("reserved draft writes still re-enter the ordinary admission lock")
+
+    for regression in (
+        "import_write_and_restore_admission_are_linearized_before_the_writer_lock",
+        "session_view_save_and_restore_admission_are_linearized_before_the_writer_lock",
+    ):
+        if regression not in _read("stores/import_write.rs") + _read("lib.rs"):
+            raise AssertionError(f"missing deterministic writer-first/restore-first regression: {regression}")
+
+
+def test_desktop_playback_writes_are_generation_bound_and_race_proven() -> None:
+    review_store = _read("stores/review_write.rs")
+
+    boundaries = (
+        (
+            "pub(crate) fn begin_desktop_playback_session_at_generation_v1(",
+            "self.begin_mutation_at_generation(restore_generation",
+            'self.lock_after_mutation("begin_desktop_playback_session_v1", &mutation)',
+        ),
+        (
+            "pub(crate) fn cancel_desktop_playback_session_v1(",
+            'self.begin_mutation("cancel_desktop_playback_session_v1")',
+            'self.lock_after_mutation("cancel_desktop_playback_session_v1", &mutation)',
+        ),
+        (
+            "pub(crate) fn finalize_desktop_playback_session_at_generation_v1(",
+            "self.runtime.begin_mutation_at_restore_generation_serial(restore_generation)",
+            'self.lock_after_mutation("finalize_desktop_playback_session_v1", &mutation)',
+        ),
+    )
+    for signature, admission_token, writer_token in boundaries:
+        body = _fn_body(review_store, signature, span=1800)
+        admission = body.find(admission_token)
+        writer = body.find(writer_token, admission)
+        if admission == -1 or writer == -1 or admission >= writer:
+            raise AssertionError(
+                f"{signature} must bind restore admission before taking the desktop playback writer lock"
+            )
+
+    for regression in (
+        "restore_first_refuses_desktop_playback_begin_finalize_and_cancel_without_mutation",
+        "desktop_playback_mutations_block_restore_until_begin_finalize_and_cancel_commit",
+        "restored_generation_cannot_finalize_or_replay_an_unfinalized_desktop_session",
+    ):
+        if regression not in review_store:
+            raise AssertionError(f"missing deterministic desktop playback/restore regression: {regression}")
 
 
 def test_external_writers_share_the_desktop_instance_lock() -> None:
@@ -382,10 +529,17 @@ def _assert_guarded(src: str, signature_start: str, who: str, token: str = "rest
 def test_every_writer_start_checks_restore_pending() -> None:
     lib = _read("lib.rs")
     _assert_guarded(lib, "pub fn try_start_import(", "try_start_import")
-    _assert_guarded(lib, "pub fn try_start_batch(", "try_start_batch")
+    _assert_guarded(
+        lib,
+        "pub(crate) fn try_start_batch_for_run(",
+        "try_start_batch_for_run",
+    )
 
     commands = _read("commands.rs")
-    _assert_guarded(commands, 'RATE_LIMITER.check("run_wsl_refinement")', "run_wsl_refinement (7B refine)")
+    # Follow the command signature rather than one formatting-specific rate-limiter expression. The
+    # typed IPC conversion split `.check(...)` across lines; the restore proof still has to inspect
+    # the actual function body and find its pre-publication reservation check.
+    _assert_guarded(commands, "pub fn run_wsl_refinement(", "run_wsl_refinement (7B refine)")
 
     jury = _read("commands/jury.rs")
     _assert_guarded(jury, "pub async fn run_dpo_update(", "run_dpo_update", "super::restore_pending()")
@@ -464,6 +618,8 @@ def main() -> None:
     test_every_production_database_entrypoint_requires_the_shared_pre_migration_pin()
     test_named_snapshot_restore_commits_config_only_after_atomic_required_state_and_settings()
     test_long_prework_publishers_hold_full_operation_mutation_guards()
+    test_owner_runtime_writers_enter_exact_mutation_before_waiting_for_sqlite()
+    test_desktop_playback_writes_are_generation_bound_and_race_proven()
     test_external_writers_share_the_desktop_instance_lock()
     test_every_writer_start_checks_restore_pending()
     print("restore-reservation gate source policy passed")

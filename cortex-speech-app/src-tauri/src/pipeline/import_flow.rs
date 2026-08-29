@@ -12,12 +12,8 @@ impl ProcessingPipeline {
         self.import_directory_with_agent_run_id(dir_path, cancel, None, None, None, callback)
     }
 
-    /// `resume_completed`: when resuming a crashed import, the set of file paths already imported in the
-    /// interrupted run — they are skipped (their segments already persisted, per-file). `None` for a
-    /// normal import, so the default path's behavior is unchanged.
-    /// `resume_job_id`: the atomically published successor journal created by the command before the
-    /// worker starts. When present, this worker validates and continues it instead of opening a gap by
-    /// creating another journal generation.
+    /// `resume_completed` names already-persisted files from a crashed run; `None` keeps fresh-import behavior.
+    /// `resume_job_id` names the pre-published successor journal this worker must validate and continue.
     pub fn import_directory_with_agent_run_id(
         &self,
         dir_path: &Path,
@@ -147,6 +143,19 @@ impl ProcessingPipeline {
                 token.check()?;
             }
 
+            // Resume authority can delete a replaceable pre-publication stage, so its canonical-PCM
+            // comparison needs the same immutable-source guarantee as a fresh import. Keep this
+            // outer lease through resume inspection, any retry, publication, and durable journal
+            // completion. The per-file processor deliberately takes its own compatible read lease,
+            // making direct/single-file callers safe as well.
+            let file_source_lease = crate::media::seal_import_source(file).map_err(|error| {
+                AppError::Other(format!(
+                    "Import source {} could not be held immutable through resume/publication: {error}",
+                    file.display()
+                ))
+            })?;
+            let file = file_source_lease.source_path();
+
             let fname = file.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
             let file_path_str = file.to_string_lossy().to_string();
 
@@ -163,7 +172,8 @@ impl ProcessingPipeline {
                 if stored_paths.len() > 1 {
                     return Err(AppError::Validation(format!(
                         "Resume found multiple stored path spellings for {} ({:?}); refusing to choose one or adopt duplicate authority",
-                        file.display(), stored_paths
+                        file.display(),
+                        stored_paths
                     )));
                 }
                 let lookup_path = stored_paths.first().map(String::as_str).unwrap_or(file_path_str.as_str());
@@ -191,15 +201,21 @@ impl ProcessingPipeline {
                 let champion_model_id = resume_champion_model_id.as_deref().ok_or_else(|| {
                     AppError::Other("resume authority was requested without a champion identity".to_string())
                 })?;
-                let (sample_rate, current_pcm) = audio::decode_to_pcm(file).map_err(|error| {
+                let current_duration_ms = audio::get_duration_ms(file).map_err(|error| {
                     AppError::Other(format!(
                         "Resume could not verify the current canonical audio for {file_path_str}; existing rows were left untouched: {error}"
                     ))
                 })?;
-                let current_content_hash = AudioFingerprint::content_hash(&current_pcm, sample_rate);
+                let current_identity = self
+                    .identity_for_existing_source(file, current_duration_ms, cancel.as_ref())
+                    .map_err(|error| {
+                        AppError::Other(format!(
+                            "Resume could not verify the current canonical audio for {file_path_str}; existing rows were left untouched: {error}"
+                        ))
+                    })?;
                 let source_identity_matches = resume_existing_ids.iter().try_fold(true, |matches, segment_id| {
                     db.segment_audio_content_hash(segment_id)
-                        .map(|stored| matches && stored.as_deref() == Some(current_content_hash.as_str()))
+                        .map(|stored| matches && stored.as_deref() == Some(current_identity.content.as_str()))
                 })?;
                 has_authoritative_segments = source_identity_matches
                     && segments
@@ -215,6 +231,10 @@ impl ProcessingPipeline {
                     journaled
                 );
                 import_writes.rollback_segments(&resume_existing_ids)?;
+                // The database is authority. Only after its complete rollback succeeds may the
+                // in-memory dedup index forget this source; otherwise the old pre-publication cache
+                // entry would reject the exact recovery attempt until the whole app restarted.
+                self.fingerprint.forget_source(file);
             }
             if resume_should_skip_file(resume_completed.is_some(), has_authoritative_segments) {
                 import_jobs.mark_import_file_done(&job_id, &file_path_str).map_err(|error| {
@@ -339,6 +359,7 @@ impl ProcessingPipeline {
                     )));
                 }
             }
+            drop(file_source_lease);
         }
 
         if !imported_ids.is_empty() {
@@ -452,12 +473,189 @@ impl ProcessingPipeline {
         self.process_single_file_with_progress(path, db, None, |_, _| {})
     }
 
+    /// Compute the one canonical whole-source identity while retaining bounded memory for long
+    /// recordings. Canonical identity is always the concatenation of fixed 90-second, mono 16 kHz
+    /// decode windows. It must not switch to whole-buffer resampling with review-chunk settings: a
+    /// 44.1/48 kHz source resampled independently at window boundaries is byte-different from the same
+    /// source resampled in one pass, so a setting change would otherwise make unchanged audio look
+    /// replaced and let a cross-path duplicate acquire another identity.
+    fn identity_for_existing_source(
+        &self,
+        path: &Path,
+        duration_ms: i64,
+        cancel: Option<&CancellationToken>,
+    ) -> AppResult<crate::fingerprint::AudioIdentity> {
+        let decode_timeout = Duration::from_secs((duration_ms as f64 / 1000.0 * 2.0).clamp(30.0, 3600.0) as u64);
+        let mut identity = crate::fingerprint::StreamingIdentity::new();
+        let mut samples_seen = false;
+        audio::decode_pcm_windows_streaming(
+            path.to_path_buf(),
+            audio::DECODE_WINDOW_MS,
+            decode_timeout.min(MAX_WINDOW_DECODE_WAIT),
+            |window, _| {
+                if let Some(token) = cancel {
+                    token.check()?;
+                }
+                if !window.pcm.is_empty() {
+                    let (sample_rate, pcm) = audio::ensure_pcm_16khz(window.sample_rate, window.pcm)?;
+                    if !pcm.is_empty() {
+                        samples_seen = true;
+                        identity.push(&pcm, sample_rate);
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        if !samples_seen {
+            return Err(AppError::Validation("Existing source path now decodes to empty audio".into()));
+        }
+        Ok(identity.finish())
+    }
+
+    /// Decode a non-streaming import into bounded memory using the exact same fixed-window resampling
+    /// protocol used by long imports and later source-identity verification. Collecting the already
+    /// canonical windows avoids a second file pass and, crucially, binds ASR PCM and the persisted
+    /// identity to the same bytes. Whole-file decode followed by a separate identity pass would reopen
+    /// a file-mutation race between transcript input and identity publication.
+    fn decode_canonical_pcm_buffered(
+        &self,
+        path: &Path,
+        decode_timeout: Duration,
+        cancel: Option<&CancellationToken>,
+    ) -> AppResult<(u32, Vec<i16>)> {
+        let mut pcm = Vec::new();
+        let mut saw_audio = false;
+        audio::decode_pcm_windows_streaming(
+            path.to_path_buf(),
+            audio::DECODE_WINDOW_MS,
+            decode_timeout.min(MAX_WINDOW_DECODE_WAIT),
+            |window, _| {
+                if let Some(token) = cancel {
+                    token.check()?;
+                }
+                if window.sample_rate != audio::TARGET_SAMPLE_RATE {
+                    return Err(AppError::Validation(format!(
+                        "Canonical import decoder returned unexpected sample rate {}",
+                        window.sample_rate
+                    )));
+                }
+                if window.pcm.is_empty() {
+                    return Ok(());
+                }
+                let next_len = pcm.len().checked_add(window.pcm.len()).ok_or_else(|| {
+                    AppError::Validation("Canonical import PCM length overflowed the platform limit".into())
+                })?;
+                if next_len > MAX_PCM_SAMPLES {
+                    return Err(AppError::Validation(format!(
+                        "Canonical buffered import exceeded the {MAX_PCM_SAMPLES}-sample memory bound; use streaming import"
+                    )));
+                }
+                pcm.try_reserve(window.pcm.len()).map_err(|_| {
+                    AppError::Validation("Canonical import PCM could not reserve bounded memory".into())
+                })?;
+                pcm.extend_from_slice(&window.pcm);
+                saw_audio = true;
+                Ok(())
+            },
+        )?;
+        if !saw_audio {
+            return Err(AppError::Validation("Empty audio buffer".into()));
+        }
+        Ok((audio::TARGET_SAMPLE_RATE, pcm))
+    }
+
+    /// Return the already-published rows only when the current canonical audio and every transcript
+    /// authority match exactly. Any ambiguity hard-stops without deleting or modifying existing data.
+    fn adopt_existing_source_if_authoritative(
+        &self,
+        path: &Path,
+        db: &Database,
+        duration_ms: i64,
+        cancel: Option<&CancellationToken>,
+    ) -> AppResult<Option<Vec<SpeechSegment>>> {
+        let path_text = path.to_string_lossy();
+        let ids = db.segment_ids_for_audio_path(&path_text)?;
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let segments = db.get_segments_by_ids(&ids)?;
+        if segments.len() != ids.len() {
+            return Err(AppError::Other(format!(
+                "Existing source {} returned only {}/{} durable rows; refusing partial adoption",
+                path.display(),
+                segments.len(),
+                ids.len()
+            )));
+        }
+
+        let identity = self.identity_for_existing_source(path, duration_ms, cancel)?;
+        let source_matches = ids.iter().try_fold(true, |matches, segment_id| {
+            db.segment_audio_content_hash(segment_id)
+                .map(|stored| matches && stored.as_deref() == Some(identity.content.as_str()))
+        })?;
+        if !source_matches {
+            return Err(AppError::Validation(format!(
+                "Source {} already has durable rows, but its current audio identity does not match them; existing data was left untouched",
+                path.display()
+            )));
+        }
+
+        let authoritative = match crate::review_pool::current_champion_7b_model_id(db) {
+            Ok(champion_model_id) => {
+                segments.iter().all(|segment| resume_segment_has_authoritative_transcript(segment, &champion_model_id))
+            }
+            Err(error) => {
+                // Human truth remains adoptable even if the model registry is temporarily unavailable.
+                // Passing an impossible empty champion accepts only the helper's human-authority arm.
+                if segments.iter().all(|segment| resume_segment_has_authoritative_transcript(segment, "")) {
+                    true
+                } else {
+                    return Err(AppError::Other(format!(
+                        "Source {} already has machine-authored rows, but current champion authority could not be established; existing data was left untouched: {error}",
+                        path.display()
+                    )));
+                }
+            }
+        };
+        if !authoritative {
+            return Err(AppError::Validation(format!(
+                "Source {} already has rows that do not all prove current human/champion transcript authority; use interrupted-import recovery instead of creating duplicates",
+                path.display()
+            )));
+        }
+
+        tracing::info!(
+            source = %path.display(),
+            segments = segments.len(),
+            "Adopted exact authoritative import after retry; no new segment IDs were created"
+        );
+        Ok(Some(segments))
+    }
+
     fn process_single_file_with_progress(
         &self,
         path: &Path,
         db: &Database,
         cancel: Option<&CancellationToken>,
+        on_chunk: impl FnMut(usize, usize),
+    ) -> AppResult<Vec<SpeechSegment>> {
+        // Freeze the exact source object before duration probing, optional whole-file cloud
+        // reference work, decoding, inference, and publication. The inner method requires a borrow
+        // of the unforgeable lease, so no future direct caller can accidentally shorten this
+        // lifetime and reintroduce a verify/use race.
+        let source_lease = crate::media::seal_import_source(path).map_err(|error| {
+            AppError::Other(format!("Import source could not be held immutable through publication: {error}"))
+        })?;
+        self.process_single_file_under_source_lease(source_lease.source_path(), db, cancel, on_chunk, &source_lease)
+    }
+
+    fn process_single_file_under_source_lease(
+        &self,
+        path: &Path,
+        db: &Database,
+        cancel: Option<&CancellationToken>,
         mut on_chunk: impl FnMut(usize, usize),
+        _source_lease: &crate::media::ImportMediaSourceLease,
     ) -> AppResult<Vec<SpeechSegment>> {
         if let Some(token) = cancel {
             token.check()?;
@@ -467,19 +665,19 @@ impl ProcessingPipeline {
         if duration_ms == 0 {
             return Err(AppError::Validation("Empty audio file".into()));
         }
+        if let Some(existing) = self.adopt_existing_source_if_authoritative(path, db, duration_ms, cancel)? {
+            on_chunk(existing.len(), existing.len().max(1));
+            return Ok(existing);
+        }
         let import_writes = self.import_write_store(db.path())?;
 
-        // Before anything is decoded: if this recording was PROCESSED before it reached the app (the
-        // pre-import cleaner separates voice from music, cuts the non-speech out, and normalises the
-        // level), record that now, keyed by source path. Its clips are about to become
-        // indistinguishable from raw field recordings in every export unless the library says
-        // otherwise. Best-effort and never fatal — a failed stamp must not fail an import whose
-        // audio is fine — but it WARNs, because what is lost is a provenance claim, not audio.
-        if let Some(provenance) = crate::source_provenance::detect(path) {
+        // Capture the cleaner's declaration before decode, but do not publish it independently.
+        // Segment rows, champion evidence, recording identity and this preprocessing claim cross one
+        // database boundary below; a provenance write failure hard-stops with zero rows instead of
+        // silently presenting processed audio as unclaimed/raw-looking training material.
+        let source_provenance = crate::source_provenance::detect(path);
+        if let Some(provenance) = source_provenance.as_ref() {
             tracing::info!("source audio declared as processed before import: {}", provenance.processing);
-            if let Err(e) = import_writes.upsert_source_audio_provenance(&provenance) {
-                tracing::warn!("could not record source audio provenance for {}: {e}", path.display());
-            }
         }
 
         // F2: fail fast BEFORE any decode/VAD/diarization work if the selected primary engine can't
@@ -504,28 +702,20 @@ impl ProcessingPipeline {
         let decode_timeout = Duration::from_secs((duration_ms as f64 / 1000.0 * 2.0).clamp(30.0, 3600.0) as u64);
 
         if chunking::should_stream_decode(duration_ms, self.settings.max_segment_duration_ms) {
-            return self.process_single_file_streaming(path, db, decode_timeout, duration_ms, cancel, on_chunk);
-        }
-
-        let (sample_rate, pcm) = audio::decode_to_pcm_with_timeout(path, decode_timeout)?;
-
-        if pcm.is_empty() {
-            return Err(AppError::Validation("Empty audio buffer".into()));
-        }
-
-        let (sample_rate, pcm) = audio::ensure_pcm_16khz(sample_rate, pcm)?;
-
-        if pcm.len() > MAX_PCM_SAMPLES {
-            tracing::warn!(
-                "Decoded audio exceeds memory cap ({} samples, ~{} min); chunking will bound each segment",
-                pcm.len(),
-                pcm.len() / sample_rate as usize / 60
+            return self.process_single_file_streaming(
+                path,
+                db,
+                decode_timeout,
+                on_chunk,
+                StreamingImportContext { duration_ms, cancel, source_provenance: source_provenance.as_ref() },
             );
         }
 
-        let identity = self
+        let (sample_rate, pcm) = self.decode_canonical_pcm_buffered(path, decode_timeout, cancel)?;
+
+        let (identity, fingerprint_reservation) = self
             .fingerprint
-            .check_and_register(&pcm, sample_rate, Some(path))
+            .reserve_import(&pcm, sample_rate, Some(path))
             .map_err(|e| AppError::Validation(e.into()))?;
         // v50: the value used to be computed here and thrown away as `_fp`, which is why duplicate
         // detection could not survive a restart. Stamped onto the rows AFTER persist_segments below,
@@ -617,20 +807,27 @@ impl ProcessingPipeline {
         let persisted = if let Some(deployment_sha256) = champion_deployment.as_deref() {
             // Canonical publication happens only after every champion/refiner call succeeded. Segment
             // rows, sole champion hypotheses and cross-session audio identity share one savepoint.
-            import_writes.publish_champion_segments(&prepared, deployment_sha256, Some(&identity))?;
+            import_writes.publish_champion_segments(
+                &prepared,
+                deployment_sha256,
+                Some(&identity),
+                source_provenance.as_ref(),
+            )?;
             prepared
         } else if identity.spectral != 0 {
             // Compatibility publication is still one source operation: rows and identity commit
             // together, and a changed recording at the same logical path rolls the whole batch back.
-            import_writes.publish_segments_with_identity(&prepared, &identity)?;
+            import_writes.publish_segments_with_identity(&prepared, &identity, source_provenance.as_ref())?;
             prepared
         } else {
-            self.persist_segments(&import_writes, prepared)?
+            self.persist_segments(&import_writes, prepared, source_provenance.as_ref())?
         };
+        // Rows plus source identity are now durable. Before this point every `?`, cancellation and
+        // champion failure drops the reservation and makes an exact retry available in this session.
+        fingerprint_reservation.commit();
         // Deferred to AFTER the 7B pass so both evaluate the real transcript, not the placeholder, and
         // so alignment does not clobber the slice offsets the pass depends on. See persist_segments.
         self.shadow_log_loop0(db, &import_writes, &persisted);
-        self.enqueue_background_alignments(&persisted, import_writes);
         {
             let primary_by_segment: HashMap<&str, PrimaryHypothesis<'_>> = persisted
                 .iter()
@@ -645,6 +842,10 @@ impl ProcessingPipeline {
                 }
             }
         }
+        // Snapshot alignment authority only after all synchronous hypothesis writes: migration v68
+        // advances the segment revision for hypothesis evidence, so enqueueing earlier would make the
+        // detached worker correctly reject every newly-populated row as stale.
+        self.enqueue_background_alignments(&persisted, import_writes);
         Ok(persisted)
     }
 
@@ -653,10 +854,10 @@ impl ProcessingPipeline {
         path: &Path,
         db: &Database,
         decode_timeout: Duration,
-        duration_ms: i64,
-        cancel: Option<&CancellationToken>,
         mut on_chunk: impl FnMut(usize, usize),
+        context: StreamingImportContext<'_>,
     ) -> AppResult<Vec<SpeechSegment>> {
+        let StreamingImportContext { duration_ms, cancel, source_provenance } = context;
         let estimated_total =
             ((duration_ms as f64 / self.settings.max_segment_duration_ms.max(1) as f64).ceil() as usize).max(1);
         let mut global_chunk = 0usize;
@@ -715,10 +916,9 @@ impl ProcessingPipeline {
                 // twice would change the whole-file digest and break the equality with the
                 // non-streaming path.
                 //
-                // The per-window check stays: it fails fast, before the ASR cost, when this session has
-                // already seen the same audio. The accumulated whole-file identity below is what gets
-                // PERSISTED, so the next session catches it too.
-                self.fingerprint.check_and_register(&p, sr, Some(path)).map_err(|e| AppError::Validation(e.into()))?;
+                // Do not register window identities: only the complete recording is database authority.
+                // Registering here used to leave dozens of phantom entries when a later ASR window
+                // failed, blocking a legitimate retry until restart.
                 recording_identity.push(&p, sr);
                 (sr, p)
             };
@@ -860,18 +1060,16 @@ impl ProcessingPipeline {
             return Err(AppError::Validation("No speech chunks produced".into()));
         }
 
-        // The whole-recording duplicate check, BEFORE anything is persisted. It has to happen here and
-        // not next to the stamp below: the per-window checks inside the loop compare WINDOW hashes,
-        // which by construction never equal the whole-file hash that gets persisted, so a streamed
-        // recording re-imported in a LATER session would sail past every one of them. Registering the
-        // identity without testing it would leave cross-session dedup looking implemented while doing
-        // nothing for exactly the long files this path exists to handle.
-        //
-        // Late is not free — the ASR work for this file is already spent — but the harm being prevented
-        // is duplicate ROWS in the library, and those have not been written yet.
+        // Reserve the ONE whole-recording identity accumulated across every decoded canonical-PCM
+        // window. There are intentionally no per-window duplicate checks: only the completed identity
+        // names the source that canonical publication will bind. Reservation happens before champion
+        // ASR and before any segment/hypothesis row is published, so a duplicate spends decode,
+        // VAD/chunk-planning and optional preprocessing work only; it cannot spend champion inference
+        // or expose a partial/colliding recording.
         let identity = recording_identity.finish();
-        self.fingerprint
-            .check_and_register_identity(&identity, Some(path))
+        let fingerprint_reservation = self
+            .fingerprint
+            .reserve_import_identity(&identity, Some(path))
             .map_err(|e| AppError::Validation(e.into()))?;
 
         let chunk_count = segments.len() as u32;
@@ -902,17 +1100,22 @@ impl ProcessingPipeline {
         let mut prepared = segments;
         let champion_deployment = self.run_primary_wsl_pass_for_import(&mut prepared, cancel)?;
         let persisted = if let Some(deployment_sha256) = champion_deployment.as_deref() {
-            import_writes.publish_champion_segments(&prepared, deployment_sha256, Some(&identity))?;
+            import_writes.publish_champion_segments(
+                &prepared,
+                deployment_sha256,
+                Some(&identity),
+                source_provenance,
+            )?;
             prepared
         } else if identity.spectral != 0 {
-            import_writes.publish_segments_with_identity(&prepared, &identity)?;
+            import_writes.publish_segments_with_identity(&prepared, &identity, source_provenance)?;
             prepared
         } else {
-            self.persist_segments(&import_writes, prepared)?
+            self.persist_segments(&import_writes, prepared, source_provenance)?
         };
+        fingerprint_reservation.commit();
         // Deferred to here so both see the real transcript and alignment doesn't clobber offsets.
         self.shadow_log_loop0(db, &import_writes, &persisted);
-        self.enqueue_background_alignments(&persisted, import_writes);
         {
             let primary_by_segment: HashMap<&str, PrimaryHypothesis<'_>> = persisted
                 .iter()
@@ -927,6 +1130,7 @@ impl ProcessingPipeline {
                 }
             }
         }
+        self.enqueue_background_alignments(&persisted, import_writes);
         Ok(persisted)
     }
 
@@ -1265,13 +1469,14 @@ impl ProcessingPipeline {
         &self,
         import_writes: &crate::stores::ImportWriteStore,
         segments: Vec<SpeechSegment>,
+        source_provenance: Option<&crate::db::SourceAudioProvenance>,
     ) -> AppResult<Vec<SpeechSegment>> {
         if segments.is_empty() {
             return Err(AppError::Validation("No speech chunks produced".into()));
         }
 
         // insert_segments_batch wraps inserts in its own transaction; do not nest SAVEPOINTs.
-        import_writes.publish_segments(&segments)?;
+        import_writes.publish_segments(&segments, source_provenance)?;
 
         // NOTE: neither LOOP-0 shadow logging nor background word-alignment runs here. Champion imports
         // bypass this compatibility publisher and use publish_champion_segments only after in-memory
@@ -1281,7 +1486,8 @@ impl ProcessingPipeline {
     }
 
     /// M2.3 / P1.3: for each freshly persisted segment, record whether LOOP-0 WOULD have fired on its
-    /// finalized transcript (annotated ▸ normalized ▸ raw), WITHOUT mutating anything. Memories are
+    /// finalized Verbatim-Law transcript (human annotation ▸ champion raw), WITHOUT mutating anything.
+    /// Normalized/refined machine strings remain evidence and never drive correction-memory authority. Memories are
     /// loaded once. Best-effort: a load or write failure logs and never fails the import.
     fn shadow_log_loop0(
         &self,
@@ -1326,15 +1532,28 @@ impl ProcessingPipeline {
             return;
         }
         // Group by source file so each recording is decoded ONCE (a VAD-chunked file yields many
-        // segments sharing one audio_path). Carry each segment's source-offset alignment_json + its
-        // finalized text (annotated ▸ raw — the VERBATIM 7B transcript; aligning the LLM-refined
-        // paraphrase would time words the speaker never said).
-        let mut by_path: std::collections::HashMap<String, Vec<(String, Option<String>, String)>> =
-            std::collections::HashMap::new();
-        for s in segments {
-            let text =
-                crate::corrections::loop0_draft_text(s.annotated_transcript.as_deref(), &s.raw_transcript).to_string();
-            by_path.entry(s.audio_path.clone()).or_default().push((s.id.clone(), s.alignment_json.clone(), text));
+        // segments sharing one audio_path). Carry each segment's source-offset alignment_json + the
+        // exact authoritative review projection (human annotation ▸ immutable champion raw).
+        // Word chips and seek timers must describe the text the reviewer actually sees after reload;
+        // normalized/refined text remains evidence and cannot drive review timing authority.
+        let segment_ids: Vec<String> = segments.iter().map(|segment| segment.id.clone()).collect();
+        let stored_sources = match import_writes.alignment_sources(&segment_ids) {
+            Ok(sources) => sources,
+            Err(error) => {
+                tracing::warn!("background alignment skipped: canonical source snapshot failed: {error}");
+                return;
+            }
+        };
+        type AlignmentWorkItem = (String, Option<String>, String, i64);
+        let mut by_path: std::collections::HashMap<String, Vec<AlignmentWorkItem>> = std::collections::HashMap::new();
+        for (s, revision) in stored_sources {
+            let text = crate::quality::effective_transcript(&s).to_string();
+            by_path.entry(s.audio_path.clone()).or_default().push((
+                s.id.clone(),
+                s.alignment_json.clone(),
+                text,
+                revision,
+            ));
         }
         // Resolved HERE because the thread below is `move` and never captures `self`. That is exactly how
         // this path ended up on `aligner::align` — the free fallback-only stub — instead of the real
@@ -1379,7 +1598,7 @@ impl ProcessingPipeline {
                             continue;
                         }
                     };
-                for (seg_id, source_alignment, text) in jobs {
+                for (seg_id, source_alignment, text, expected_revision) in jobs {
                     if text.trim().is_empty() {
                         continue;
                     }
@@ -1402,6 +1621,7 @@ impl ProcessingPipeline {
                             let merged = crate::chunking::merge_word_timestamps(source_alignment.as_deref(), &words);
                             match import_writes.update_alignment_if_unchanged(
                                 &seg_id,
+                                expected_revision,
                                 source_alignment.as_deref(),
                                 &merged,
                                 // The quality the aligner ACTUALLY achieved. This was hardcoded to
@@ -1551,20 +1771,11 @@ impl ProcessingPipeline {
                             None => deployment_identity = Some((model_id.clone(), deployment_sha256)),
                             _ => {}
                         }
+                        let (derived_transcript, derived_producer_version) =
+                            self.derived_review_transcript(&draft.raw_text, &draft.final_text);
                         seg.raw_transcript = draft.raw_text;
-                        seg.normalized_transcript = if self.settings.auto_normalize && !draft.final_text.is_empty() {
-                            let norm_config = crate::normalizer::NormalizationConfig {
-                                normalize_numbers: self.settings.auto_normalize,
-                                verbalize_numbers: self.settings.verbalize_numbers,
-                                normalize_hamza: true,
-                                remove_diacritics: false,
-                            };
-                            Some(SoraniNormalizer::with_config(norm_config).normalize(&draft.final_text))
-                        } else {
-                            None
-                        };
-                        seg.normalizer_version =
-                            seg.normalized_transcript.as_ref().map(|_| NORMALIZER_VERSION.to_string());
+                        seg.normalized_transcript = derived_transcript;
+                        seg.normalizer_version = derived_producer_version;
                         seg.confidence = draft.confidence;
                         seg.confidence_source = draft.confidence_source;
                         seg.model_version_id = Some(model_id);
@@ -1596,14 +1807,7 @@ impl ProcessingPipeline {
         let mut last_problem = String::from("7B produced no result");
         let mut infra = false;
         for attempt in 1..=MAX_ATTEMPTS {
-            match self.transcribe_with_champion_commit(
-                Some(segment_id),
-                audio_path,
-                alignment_json,
-                cancel,
-                false,
-                None,
-            ) {
+            match self.transcribe_import_draft_only(segment_id, audio_path, alignment_json, cancel) {
                 Ok(draft) => {
                     let usable = !draft.raw_text.trim().is_empty() && !draft.raw_text.contains("[Pending");
                     if usable {
@@ -1659,6 +1863,14 @@ impl ProcessingPipeline {
         _agent_run_id: Option<&str>,
         on_event: impl Fn(PipelineEvent),
     ) -> AppResult<Vec<SpeechSegment>> {
+        // Acquire path/file immutability before even the duration estimate. This entry point used to
+        // probe by path and only seal inside `process_single_file_with_progress`, leaving the first
+        // decoder open outside the source authority and allowing a parent-tree replacement between
+        // the estimate and the real import.
+        let source_lease = crate::media::seal_import_source(path).map_err(|error| {
+            AppError::Other(format!("Import source could not be held immutable through publication: {error}"))
+        })?;
+        let path = source_lease.source_path();
         let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
         let duration_ms = audio::get_duration_ms(path)?;
         let estimated_chunks =
@@ -1701,26 +1913,32 @@ impl ProcessingPipeline {
         // Imports always use the configured primary engine. Optional cloud tools may be invoked only
         // through their explicit per-segment actions; a consent toggle can never replace the 7B
         // champion for an entire import or create a mixed-engine dataset after a cloud failure.
-        let result = self.process_single_file_with_progress(path, &db, cancel.as_ref(), |current, total| {
-            chunks_done = current;
-            let total = total.max(estimated_chunks);
-            self.set_import_status(current, total, &fname);
-            on_event(PipelineEvent::Phase { phase: "transcribing".into() });
-            on_event(agent_stage(
-                "audio_chunking",
-                "running",
-                fname.clone(),
-                format!("Preparing chunk {current}/{total}"),
-                current,
-                total,
-            ));
-            on_event(PipelineEvent::Progress {
-                current,
-                total,
-                file: fname.clone(),
-                status: format!("Transcribing chunk {current}/{total}"),
-            });
-        });
+        let result = self.process_single_file_under_source_lease(
+            path,
+            &db,
+            cancel.as_ref(),
+            |current, total| {
+                chunks_done = current;
+                let total = total.max(estimated_chunks);
+                self.set_import_status(current, total, &fname);
+                on_event(PipelineEvent::Phase { phase: "transcribing".into() });
+                on_event(agent_stage(
+                    "audio_chunking",
+                    "running",
+                    fname.clone(),
+                    format!("Preparing chunk {current}/{total}"),
+                    current,
+                    total,
+                ));
+                on_event(PipelineEvent::Progress {
+                    current,
+                    total,
+                    file: fname.clone(),
+                    status: format!("Transcribing chunk {current}/{total}"),
+                });
+            },
+            &source_lease,
+        );
 
         match &result {
             Ok(segments) => {

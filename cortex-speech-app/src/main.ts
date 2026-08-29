@@ -2,7 +2,11 @@ import { mount } from 'svelte';
 import App from './App.svelte';
 import './app.css';
 import { installGlobalErrorTrap } from './lib/globalErrorTrap';
+import { get } from 'svelte/store';
+import { prepareInitialLocale, t } from './lib/i18n';
+import { notifications } from './lib/stores/notificationStore';
 import type { SpeechSegment } from './lib/types';
+import type { AgenticReadinessV1, BatchRunStatusResponseV1 } from './lib/generated/ipc';
 
 type DemoSpeechSegment = SpeechSegment & { confidence: number; snrDb: number };
 
@@ -31,13 +35,7 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     'list_model_versions',
     'models_status',
   ]);
-  const emptyObjectCommands = new Set([
-    'app_health',
-    'check_agentic_readiness',
-    'db_info',
-    'get_settings',
-    'import_status',
-  ]);
+  const emptyObjectCommands = new Set(['app_health', 'db_info', 'get_settings', 'import_status']);
 
   // Sample Sorani dataset so the populated curate UI renders without a backend.
   const SAMPLE: Array<[string, number, string | null, boolean, number]> = [
@@ -111,6 +109,8 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
       decisionId: string;
     }
   >();
+  let demoBatchRun: BatchRunStatusResponseV1 | null = null;
+  const acknowledgedDemoBatches = new Set<string>();
   // Return detached rows just like IPC serialization does. The backing collection remains mutable so
   // review decisions survive subsequent reads during a browser-preview session.
   const sampleSegments = () => demoSegments.map((segment) => ({ ...segment }));
@@ -149,6 +149,56 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     // throwing while the app is already handling another update.
     if (cmd === 'plugin:event|listen') return args?.handler ?? 0;
     if (cmd.startsWith('plugin:')) return null;
+    if (cmd === 'get_active_batch_run') return demoBatchRun;
+    if (cmd === 'get_batch_run_status') {
+      const operationId = String(args?.operationId ?? '');
+      if (demoBatchRun?.operationId === operationId) return demoBatchRun;
+      return { operationId, operation: null, status: 'unknown', total: null, outcome: null };
+    }
+    if (cmd === 'acknowledge_batch_run') {
+      const operationId = String(args?.operationId ?? '');
+      if (acknowledgedDemoBatches.has(operationId)) return true;
+      if (demoBatchRun?.operationId !== operationId || demoBatchRun.status !== 'settled') {
+        return false;
+      }
+      acknowledgedDemoBatches.add(operationId);
+      demoBatchRun = null;
+      return true;
+    }
+    if (cmd === 'batch_transcribe' || cmd === 'batch_normalize') {
+      const ids = Array.isArray(args?.ids)
+        ? args.ids.filter((id): id is string => typeof id === 'string')
+        : [];
+      const operationId = String(args?.operationId ?? '');
+      const operation = cmd === 'batch_transcribe' ? 'transcribe' : 'normalize';
+      if (!operationId || ids.length === 0 || demoBatchRun) {
+        throw {
+          schema: 1,
+          code: 'BATCH_RUN_REJECTED',
+          message: 'The preview batch could not be admitted.',
+          retryable: true,
+          suggestedAction: 'retry',
+          operationId: operationId || null,
+        };
+      }
+      demoBatchRun = {
+        operationId,
+        operation,
+        status: 'settled',
+        total: ids.length,
+        outcome: {
+          disposition: 'completed',
+          total: ids.length,
+          succeeded: ids.length,
+          failed: 0,
+          skipped: 0,
+          abandoned: 0,
+          cancelled: false,
+          errorCode: null,
+        },
+      };
+      return { status: 'started', operationId, operation };
+    }
     if (cmd === 'get_review_page_v1') {
       const scope = args?.scope as { kind?: string; query?: string; focusId?: string } | undefined;
       const query =
@@ -556,7 +606,26 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
         isCalibrated: false,
       };
     }
-    if (cmd === 'restore_session' || cmd === 'take_last_crash') return null;
+    if (cmd === 'restore_session' || cmd === 'take_last_crash' || cmd === 'get_interrupted_import')
+      return null;
+    if (cmd === 'check_agentic_readiness') {
+      return {
+        status: 'ready',
+        ready: true,
+        sourceReferenceModels: [],
+        sourceReferenceModelCount: 0,
+        availableHypothesisModels: ['omniasr-wsl-7b'],
+        availableHypothesisModelCount: 1,
+        requiredHypothesisModels: 1,
+        checks: [
+          { code: 'source_reference', status: 'not_required' },
+          { code: 'primary_asr', status: 'ready' },
+          { code: 'hypothesis_coverage', status: 'not_required' },
+          { code: 'readiness_snapshot', status: 'ready' },
+        ],
+        checkCount: 4,
+      } satisfies AgenticReadinessV1;
+    }
     if (cmd === 'save_session' || cmd === 'update_settings') return null;
     if (cmd === 'get_history_status_v1') return { undoAction: null, redoAction: null };
     if (cmd === 'undo' || cmd === 'redo') {
@@ -631,6 +700,8 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
   console.info('[cortex] dev Tauri mock installed — UI preview mode (no backend)');
 }
 
+const initialLocaleReady = await prepareInitialLocale();
 const app = mount(App, { target: document.getElementById('app')! });
+if (!initialLocaleReady) notifications.error(get(t)('localeLoadFailed'));
 
 export default app;

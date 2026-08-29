@@ -627,63 +627,98 @@ pub async fn get_audio_duration(path: String) -> Result<i64, String> {
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_waveform(
     path: String,
     num_points: usize,
     alignment_json: Option<String>,
     state: State<'_, AppState>,
-) -> Result<Vec<f32>, String> {
-    RATE_LIMITER.check("get_waveform")?;
-    let validated = validate::validate_file_path(&path)?;
+) -> Result<Vec<f32>, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER.check("get_waveform").map_err(|_| crate::ipc_contract::owner_critical_rate_limited("get_waveform"))?;
+    let validated = validate::validate_file_path(&path).map_err(|_| crate::ipc_contract::invalid_audio_path_error())?;
     if let Some(ref aj) = alignment_json {
-        validate::validate_alignment_json(aj)?;
+        validate::validate_alignment_json(aj).map_err(|_| crate::ipc_contract::invalid_alignment_error())?;
     }
     // Clone the pipeline out of the global lock before the (up to 30 s) decode so a waveform
     // render never starves other pipeline-lock users (matches import_audio_file / rediarize /
     // run_gold_eval_asr, which all clone for the same reason), then decode OFF the main thread.
     let pipeline = state.lock_pipeline().clone();
-    run_blocking(move || {
+    let result = run_blocking(move || {
         pipeline.get_waveform(&validated, num_points, alignment_json.as_deref()).map_err(|e| e.to_string())
     })
-    .await
+    .await;
+    result.map_err(|error| {
+        tracing::warn!("Owner waveform command failed: {error}");
+        crate::ipc_contract::public_waveform_error(&error)
+    })
 }
 
 /// P3.3: report which distinct source audio files are missing on disk (moved/renamed/deleted).
 #[tauri::command]
-pub async fn get_audio_health(state: State<'_, AppState>) -> Result<crate::db::AudioHealth, String> {
-    RATE_LIMITER.check("get_audio_health")?;
+#[specta::specta]
+pub async fn get_audio_health(
+    state: State<'_, AppState>,
+) -> Result<crate::db::AudioHealth, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER
+        .check("get_audio_health")
+        .map_err(|_| crate::ipc_contract::owner_critical_rate_limited("get_audio_health"))?;
     let segment_queries = state.segment_queries();
-    run_blocking(move || segment_queries.audio_health().map_err(|e| e.to_string())).await
+    let result = run_blocking(move || segment_queries.audio_health().map_err(|e| e.to_string())).await;
+    result.map_err(|error| {
+        tracing::warn!("Owner audio-health command failed: {error}");
+        crate::ipc_contract::public_owner_data_error(crate::ipc_contract::OwnerDataOperationV1::AudioHealth, &error)
+    })
 }
 
 /// P3.3: relink missing source audio by basename against a folder the owner picks.
 #[tauri::command]
-pub async fn relink_audio(search_dir: String, state: State<'_, AppState>) -> Result<crate::db::RelinkResult, String> {
-    STRICT_RATE_LIMITER.check("relink_audio")?;
+#[specta::specta]
+pub async fn relink_audio(
+    search_dir: String,
+    state: State<'_, AppState>,
+) -> Result<crate::db::RelinkResult, crate::ipc_contract::CommandErrorV1> {
+    STRICT_RATE_LIMITER
+        .check("relink_audio")
+        .map_err(|_| crate::ipc_contract::owner_critical_rate_limited("relink_audio"))?;
     // P1.1: reject a UNC search dir BEFORE db.relink_audio probes `search_dir.join(name).is_file()` — a
     // renderer-supplied `\\attacker\share` would otherwise drive the SMB redirector (NTLM forced-auth
     // leak) on the is_file() stat and then PERSIST the UNC path into the row. Syntactic guard, zero I/O
     // (no canonicalize: the picked dir is searched as-is); also subsumes the prior null-byte check.
-    validate::reject_unc_path(&search_dir)?;
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+    validate::reject_unc_path(&search_dir).map_err(|_| crate::ipc_contract::invalid_relink_path_error())?;
+    let database = state.db_runtime();
+    let result = run_blocking(move || {
+        let mutation = database.begin_mutation().map_err(|error| error.to_string())?;
+        let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
         db.relink_audio(std::path::Path::new(&search_dir)).map_err(|e| e.to_string())
     })
-    .await
+    .await;
+    result.map_err(|error| {
+        tracing::warn!("Owner audio-relink command failed: {error}");
+        crate::ipc_contract::public_owner_data_error(crate::ipc_contract::OwnerDataOperationV1::RelinkAudio, &error)
+    })
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_active_learning_queue(
     state: State<'_, AppState>,
     target_error: f64,
     confidence_level: f64,
     limit: usize,
-) -> Result<Vec<SpeechSegment>, String> {
-    RATE_LIMITER.check("get_active_learning_queue")?;
+) -> Result<Vec<SpeechSegment>, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER
+        .check("get_active_learning_queue")
+        .map_err(|_| crate::ipc_contract::owner_analysis_rate_limited("get_active_learning_queue"))?;
     let segment_queries = state.segment_queries();
-    run_blocking(move || {
+    let result = run_blocking(move || {
         segment_queries.active_learning_queue(target_error, confidence_level, limit).map_err(Into::into)
     })
-    .await
+    .await;
+    result.map_err(|error| {
+        tracing::warn!("Owner active-learning queue command failed: {error}");
+        crate::ipc_contract::public_owner_analysis_error(
+            crate::ipc_contract::OwnerAnalysisOperationV1::ActiveLearningQueue,
+            &error,
+        )
+    })
 }

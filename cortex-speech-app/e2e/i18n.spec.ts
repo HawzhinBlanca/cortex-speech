@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { installTauriMock } from './helpers/tauri-mock';
 import { openHeaderOverflow, openSettingsFromHeader } from './helpers/header';
 

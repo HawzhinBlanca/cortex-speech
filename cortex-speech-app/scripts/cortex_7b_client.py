@@ -25,12 +25,17 @@ import json
 import socket
 import sqlite3
 import argparse
+import shutil
 import subprocess
+import tempfile
 import time
+import stat
+from pathlib import Path
 
 HOST = os.environ.get("CORTEX_7B_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CORTEX_7B_PORT", "8799"))
 MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_POINTER_BYTES = 1024 * 1024
 HEALTH_TIMEOUT_SECONDS = float(os.environ.get("CORTEX_7B_HEALTH_TIMEOUT_SECONDS", "5"))
 TRANSCRIPTION_TIMEOUT_SECONDS = float(os.environ.get("CORTEX_7B_TRANSCRIPTION_TIMEOUT_SECONDS", "280"))
 PROTOCOL = "cortex-omniasr-adapter"
@@ -46,6 +51,68 @@ EX_SERVER = 3    # server replied with an error
 
 class DuplicateKeyError(ValueError):
     pass
+
+
+class SegmentSnapshotError(RuntimeError):
+    """The live SQLite database could not be copied into a trustworthy read snapshot."""
+
+
+def read_segment_from_snapshot(db, segment_id, attempts=3, retry_base_seconds=0.2):
+    """Read immutable clip inputs from a private DB+WAL snapshot without touching the live DB.
+
+    The DB and WAL cannot be copied atomically while the app is writing. A copy/open failure is
+    therefore retried as an infrastructure error, never silently downgraded to a main-file-only
+    read. A missing row is also retried while a WAL existed before or after that snapshot, covering
+    checkpoint races that can yield a valid-looking but incomplete DB/WAL pair.
+    """
+    if attempts < 1:
+        raise ValueError("snapshot attempts must be positive")
+
+    last_error = None
+    for attempt in range(attempts):
+        tmpdir = None
+        try:
+            tmpdir = tempfile.mkdtemp(prefix="cortex7b_")
+            tmp = os.path.join(tmpdir, "snap.db")
+            wal = db + "-wal"
+            wal_was_present = os.path.exists(wal)
+            # Observe WAL state before copying the main file. If the requested committed row is
+            # already authoritative and no WAL exists here, it must be represented in this main DB.
+            shutil.copyfile(db, tmp)
+            if wal_was_present:
+                # Never continue with only the main file after observing a WAL. That can turn a
+                # transient copy/checkpoint race into a false EX_NOSEG for a committed import.
+                shutil.copyfile(wal, tmp + "-wal")
+
+            con = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
+            try:
+                row = con.execute(
+                    "SELECT audio_path, alignment_json FROM speech_segments WHERE id=?", (segment_id,)
+                ).fetchone()
+            finally:
+                con.close()
+
+            last_error = None
+            if row is not None:
+                return row
+            if not wal_was_present and not os.path.exists(wal):
+                return None
+            # The row may have landed in a WAL while the independently copied files crossed a
+            # checkpoint boundary. Retain an infrastructure error across retries: absence is only
+            # provable from a snapshot where no WAL exists before or after the read.
+            last_error = RuntimeError("segment absent from a WAL-backed database snapshot")
+        except Exception as exc:
+            last_error = exc
+        finally:
+            if tmpdir is not None:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
+        if attempt + 1 < attempts:
+            time.sleep(retry_base_seconds * (attempt + 1))
+
+    if last_error is not None:
+        raise SegmentSnapshotError(str(last_error)) from last_error
+    return None
 
 
 def _object_without_duplicate_keys(pairs):
@@ -96,6 +163,93 @@ def _is_sha256(value):
         and value == value.lower()
         and all(char in "0123456789abcdef" for char in value)
     )
+
+
+def load_expected_champion_identity(pointer_path):
+    """Read the registry pointer as a small, unambiguous identity authority.
+
+    Health validation already proves that the listener speaks the Cortex protocol and reports a
+    complete deployment identity.  That is not enough for startup: a stale, otherwise valid
+    champion can still own the port.  Bind the listener to the exact model/deployment selected by
+    the current registry pointer without hashing the multi-gigabyte model on every health probe.
+
+    The serving process independently verifies the manifest and every component before it binds.
+    Here we deliberately read only the pointer's immutable identity fields, using the same size,
+    duplicate-key, schema and key-shape rules needed to make that comparison unambiguous.
+    """
+    path = Path(pointer_path)
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+        # A FIFO passed through the environment must not block startup before fstat can reject it.
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise ValueError("champion pointer is not a regular file")
+            # The limit is enforced on bytes read from the already-open handle. A pre-read stat()
+            # followed by read_bytes() has a replacement race that can turn a small checked file
+            # into an unbounded allocation.
+            raw = handle.read(MAX_POINTER_BYTES + 1)
+    except OSError as exc:
+        raise ValueError("champion pointer is unavailable") from exc
+    if not raw or len(raw) > MAX_POINTER_BYTES:
+        raise ValueError(
+            f"champion pointer must be a non-empty file no larger than {MAX_POINTER_BYTES} bytes"
+        )
+    try:
+        pointer = json.loads(raw.decode("utf-8"), object_pairs_hook=_object_without_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, DuplicateKeyError) as exc:
+        raise ValueError(f"champion pointer is not unambiguous UTF-8 JSON: {exc}") from exc
+    if not isinstance(pointer, dict) or set(pointer) != {"schema", "champions"}:
+        raise ValueError("champion pointer must contain exactly schema and champions")
+    if type(pointer["schema"]) is not int or pointer["schema"] != 2:
+        raise ValueError(f"unsupported champion pointer schema {pointer['schema']!r}")
+    champions = pointer["champions"]
+    if not isinstance(champions, dict):
+        raise ValueError("champion pointer champions must be an object")
+    entry = champions.get(FAMILY)
+    if not isinstance(entry, dict):
+        raise ValueError(f"champion pointer has no {FAMILY} entry")
+    required = {"modelVersionId", "deploymentManifestPath", "deploymentSha256"}
+    allowed = required | {"source", "license"}
+    if not required.issubset(entry) or not set(entry).issubset(allowed):
+        raise ValueError(
+            f"champion pointer {FAMILY} entry must contain exactly the required identity fields"
+        )
+    model_id = entry["modelVersionId"]
+    manifest_path = entry["deploymentManifestPath"]
+    deployment_sha = entry["deploymentSha256"]
+    if (
+        not isinstance(model_id, str)
+        or not model_id.strip()
+        or any(ord(char) < 32 or ord(char) == 127 for char in model_id)
+    ):
+        raise ValueError("champion pointer modelVersionId must be non-empty text")
+    if (
+        not isinstance(manifest_path, str)
+        or not manifest_path.strip()
+        or any(ord(char) < 32 or ord(char) == 127 for char in manifest_path)
+    ):
+        raise ValueError("champion pointer deploymentManifestPath must be non-empty text")
+    if not _is_sha256(deployment_sha):
+        raise ValueError("champion pointer deploymentSha256 is not a canonical SHA-256")
+    return model_id, deployment_sha
+
+
+def validate_health_against_pointer(response, pointer_path):
+    """Reject a valid-but-stale listener that is not the pointer-selected champion."""
+    expected_model_id, expected_deployment_sha = load_expected_champion_identity(pointer_path)
+    if response["modelVersionId"] != expected_model_id:
+        raise ValueError(
+            "listener modelVersionId does not match the current champion pointer "
+            f"({response['modelVersionId']!r} != {expected_model_id!r})"
+        )
+    if response["deploymentSha256"] != expected_deployment_sha:
+        raise ValueError(
+            "listener deploymentSha256 does not match the current champion pointer "
+            f"({response['deploymentSha256']} != {expected_deployment_sha})"
+        )
+    return response
 
 
 def validate_identity_response(response):
@@ -292,12 +446,21 @@ def main():
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--segment-id")
     mode.add_argument("--health", action="store_true", help="query the exact loaded deployment; never reads the DB")
+    ap.add_argument(
+        "--expected-pointer",
+        help="with --health, require the listener to match this exact champion registry pointer",
+    )
     ap.add_argument("--stdout-only", action="store_true")
     a = ap.parse_args()
+
+    if a.expected_pointer and not a.health:
+        ap.error("--expected-pointer requires --health")
 
     if a.health:
         try:
             response = validate_health_response(request_server({"op": "health"}, HEALTH_TIMEOUT_SECONDS))
+            if a.expected_pointer:
+                response = validate_health_against_pointer(response, a.expected_pointer)
         except ClientFailure as exc:
             fail(exc.code, str(exc))
         except ValueError as exc:
@@ -312,44 +475,18 @@ def main():
     # The app holds its DB open in WAL mode while it calls us, and over the WSL /mnt 9p filesystem the
     # normal SQLite locks raise "disk I/O error", while an immutable read of the main file MISSES
     # freshly-imported segments that still live in -wal. Robust fix: snapshot-copy the DB + its -wal
-    # (+ -shm) to a private temp file and read that — no lock on the live DB, and SQLite applies the WAL
+    # to a private temp file and read that — no lock on the live DB, and SQLite applies the WAL
     # so we see fresh segments. (audio_path + alignment never change once a segment exists.)
-    import shutil
-    import tempfile
-    row = None
-    read_err = None
     # The app writes the WAL while we copy, so a single-shot copy can be torn (page copied mid-write)
     # and the open fails — which previously escalated a transient blip into an EX_DB infra-failure.
     # Retry the whole snapshot: a torn copy is momentary. Deliberately do NOT copy -shm — the shared-
     # memory index is only valid for the live connections that created it; a copied one makes SQLite
     # refuse the database outright ("unable to open database file", reproduced on this machine), while
     # a fresh read of db + -wal rebuilds it automatically.
-    for attempt in range(3):
-        tmpdir = tempfile.mkdtemp(prefix="cortex7b_")
-        try:
-            tmp = os.path.join(tmpdir, "snap.db")
-            shutil.copyfile(db, tmp)
-            wal = db + "-wal"
-            if os.path.exists(wal):
-                try:
-                    shutil.copyfile(wal, tmp + "-wal")
-                except Exception:
-                    pass
-            con = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
-            row = con.execute(
-                "SELECT audio_path, alignment_json FROM speech_segments WHERE id=?", (a.segment_id,)
-            ).fetchone()
-            con.close()
-            read_err = None
-            break
-        except Exception as e:
-            read_err = e
-            time.sleep(0.2 * (attempt + 1))
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-    if read_err is not None:
-        fail(EX_DB, f"7B client: could not read the app DB at {db}: {read_err}")
+    try:
+        row = read_segment_from_snapshot(db, a.segment_id)
+    except SegmentSnapshotError:
+        fail(EX_DB, "7B client: could not create a consistent app DB snapshot after three attempts")
     if row is None:
         fail(EX_NOSEG, f"7B client: segment {a.segment_id} not found in the app DB")
 

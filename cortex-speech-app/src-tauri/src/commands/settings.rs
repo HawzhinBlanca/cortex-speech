@@ -14,7 +14,7 @@ use crate::ipc_contract::{
     ApiKeyProviderV1, CloudConsentKindV1, CommandErrorV1, RendererSettingsV1, SetCloudConsentRequestV1, SettingValueV1,
     SettingsPatchResultV1, SettingsPatchV1, SettingsSnapshotV1, SuggestedActionV1,
 };
-use crate::settings::AppSettings;
+use crate::settings::{AppSettings, SETTINGS_WRITE_BLOCKED_CODE, SETTINGS_WRITE_BLOCKED_MESSAGE};
 use crate::AppState;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -85,6 +85,17 @@ fn public_api_key_error(code: &str, message: &str, retryable: bool) -> CommandEr
     } else {
         error.suggested(SuggestedActionV1::OpenHealth)
     }
+}
+
+fn require_settings_write_authority(settings: &AppSettings) -> Result<(), CommandErrorV1> {
+    settings.require_writable().map_err(|_| {
+        public_settings_error(SETTINGS_WRITE_BLOCKED_CODE, SETTINGS_WRITE_BLOCKED_MESSAGE, false)
+            .suggested(SuggestedActionV1::OpenHealth)
+    })
+}
+
+fn require_legacy_settings_write_authority(settings: &AppSettings) -> Result<(), String> {
+    settings.require_writable().map_err(|_| format!("{SETTINGS_WRITE_BLOCKED_CODE}: {SETTINGS_WRITE_BLOCKED_MESSAGE}"))
 }
 
 fn validate_public_api_key(key: &str) -> Result<(), CommandErrorV1> {
@@ -306,6 +317,7 @@ fn persist_settings_change(
     next: &AppSettings,
     withdraw_consent_before_save: bool,
 ) -> Result<(), CommandErrorV1> {
+    require_settings_write_authority(next)?;
     let settings_path = state.lock_data_dir().clone().map(|dir| dir.join("settings.json"));
     if withdraw_consent_before_save {
         // A privacy withdrawal is a stop instruction. It reaches the running pipeline even if a
@@ -346,6 +358,8 @@ pub fn update_settings(mut settings: AppSettings, state: State<'_, AppState>) ->
     // legacy whole-object transaction with new clients so an older renderer cannot reorder the
     // pipeline publication after a newer revision-guarded write.
     let _settings_write = state.lock_settings_write();
+    let current = state.lock_settings().clone();
+    require_legacy_settings_write_authority(&current)?;
     // Server-side trust boundary: reject a malicious endpoint/oversized payload before it
     // can take effect and redirect LLM requests (+ the API key) to an attacker's server. Validate
     // BEFORE canonicalization so a tampered webview cannot submit an unapproved cloud model and
@@ -361,11 +375,8 @@ pub fn update_settings(mut settings: AppSettings, state: State<'_, AppState>) ->
     // failure (full/read-only/locked disk) leaves the in-memory settings, the running pipeline, AND
     // disk all consistent at the OLD value — never a three-way divergence where get_settings() reports
     // an unsaved change (including cloud-consent toggles) that the pipeline and the next launch ignore.
-    let settings_path = {
-        let current = state.lock_settings();
-        settings.merge_session_secret_from(&current);
-        state.lock_data_dir().clone().map(|d| d.join("settings.json"))
-    };
+    settings.merge_session_secret_from(&current);
+    let settings_path = state.lock_data_dir().clone().map(|d| d.join("settings.json"));
     // WITHDRAWALS TAKE EFFECT BEFORE THE SAVE (external review 2026-08-06). Persist-first below is
     // right for a preference and for GRANTING consent, but a revocation must not be contingent on
     // free disk space: with a full or read-only disk the save fails, this function returns Err, and
@@ -432,6 +443,7 @@ pub fn patch_settings_v1(
     })?;
     let _settings_write = state.lock_settings_write();
     let current = state.lock_settings().clone();
+    require_settings_write_authority(&current)?;
     match evaluate_patch(&current, &patch)? {
         EvaluatedSettingsChange::AlreadyApplied(settings) => settings_result(&settings, true),
         EvaluatedSettingsChange::Apply(next) => {
@@ -464,6 +476,7 @@ pub fn set_cloud_consent_v1(
     })?;
     let _settings_write = state.lock_settings_write();
     let current = state.lock_settings().clone();
+    require_settings_write_authority(&current)?;
     match evaluate_consent(&current, &request)? {
         EvaluatedSettingsChange::AlreadyApplied(settings) => settings_result(&settings, true),
         EvaluatedSettingsChange::Apply(next) => {
@@ -698,6 +711,57 @@ mod tests {
         assert!(json.get("model_dir").is_none());
         assert!(json.get("output_dir").is_none());
         assert!(json.to_string().find("never-cross-ipc").is_none());
+    }
+
+    #[test]
+    fn unreadable_settings_fallback_has_stable_typed_and_legacy_write_refusals() {
+        let blocked = AppSettings { settings_write_blocked: true, ..AppSettings::default() };
+
+        let typed = require_settings_write_authority(&blocked).expect_err("typed mutations must fail closed");
+        assert_eq!(typed.code, SETTINGS_WRITE_BLOCKED_CODE);
+        assert_eq!(typed.message, SETTINGS_WRITE_BLOCKED_MESSAGE);
+        assert!(!typed.retryable, "a same-process retry must not clear recovery authority");
+        assert_eq!(typed.suggested_action, Some(SuggestedActionV1::OpenHealth));
+        assert!(typed.details.is_empty(), "public refusal must not expose paths or raw filesystem errors");
+
+        let legacy = require_legacy_settings_write_authority(&blocked).expect_err("legacy mutation must fail closed");
+        assert_eq!(legacy, format!("{SETTINGS_WRITE_BLOCKED_CODE}: {SETTINGS_WRITE_BLOCKED_MESSAGE}"));
+    }
+
+    #[test]
+    fn every_settings_mutation_checks_authority_before_evaluation_or_side_effects() {
+        let src = include_str!("settings.rs");
+        let prod = src.split("mod tests").next().unwrap_or(src);
+
+        let legacy_start = prod.find("pub fn update_settings").expect("legacy settings command");
+        let legacy_end = prod.find("pub fn get_settings_v1").expect("typed settings getter");
+        let legacy = &prod[legacy_start..legacy_end];
+        let legacy_guard =
+            legacy.find("require_legacy_settings_write_authority(&current)").expect("legacy write-authority guard");
+        let legacy_revoke = legacy.find("state.revoke_pipeline_consent_now").expect("legacy revocation side effect");
+        let legacy_save = legacy.find("settings.save(&path)").expect("legacy persistence");
+        assert!(
+            legacy_guard < legacy_revoke && legacy_guard < legacy_save,
+            "legacy fallback mutation must refuse before privacy/persistence side effects"
+        );
+
+        let patch_start = prod.find("pub fn patch_settings_v1").expect("typed patch command");
+        let patch_end = prod.find("pub fn set_cloud_consent_v1").expect("typed consent command");
+        let patch = &prod[patch_start..patch_end];
+        assert!(
+            patch.find("require_settings_write_authority(&current)").expect("typed patch authority guard")
+                < patch.find("evaluate_patch(&current").expect("typed patch evaluation"),
+            "typed patch must refuse before evaluating a fallback as authoritative settings"
+        );
+
+        let consent_start = patch_end;
+        let consent_end = prod.find("pub fn get_configured_providers").expect("next command after typed consent");
+        let consent = &prod[consent_start..consent_end];
+        assert!(
+            consent.find("require_settings_write_authority(&current)").expect("typed consent authority guard")
+                < consent.find("evaluate_consent(&current").expect("typed consent evaluation"),
+            "typed consent must refuse before evaluating or revoking from fallback settings"
+        );
     }
 
     #[test]

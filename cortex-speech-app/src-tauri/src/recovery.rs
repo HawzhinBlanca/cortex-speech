@@ -22,11 +22,16 @@ pub(crate) enum SnapshotPilotPolicyRestore {
 pub(crate) struct SnapshotRestorePlan {
     pub(crate) pilot: SnapshotPilotPolicyRestore,
     pub(crate) optional: Vec<(crate::snapshot::OptionalSnapshotState, crate::snapshot::OptionalSnapshotRestore)>,
+    /// Canonical logical digest of the fully migrated, validated SQLite generation paired with this
+    /// configuration plan. Config publication and the durable completion marker may advance only
+    /// after the live WAL-aware database proves this exact value.
+    pub(crate) expected_db_generation_sha256: String,
 }
 
 pub(crate) fn inspect_snapshot_pilot_policy(
     snapshot_dir: &Path,
-    snapshot_db: &Path,
+    original_schema_version: i64,
+    original_max_review_event_id: i64,
     manifest_verified: bool,
 ) -> Result<SnapshotPilotPolicyRestore, String> {
     let policy_path = snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_FILE);
@@ -60,23 +65,15 @@ pub(crate) fn inspect_snapshot_pilot_policy(
             // missing focus would turn a bounded campaign into a different paid workload.
             crate::review_pilot::validate_controlled_focus(snapshot_dir)
                 .map_err(|error| format!("snapshot controlled-pilot focus is invalid: {error}"))?;
-            let source = crate::db::Database::open_immutable_connection(snapshot_db)
-                .map_err(|error| format!("snapshot pilot policy could not bind to its database: {error}"))?;
-            let snapshot_schema: i64 = source
-                .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |row| row.get(0))
-                .map_err(|error| format!("snapshot pilot schema could not be verified: {error}"))?;
-            if snapshot_schema < crate::review_pilot::REVIEW_PILOT_HIDDEN_KEYS_SCHEMA_VERSION {
+            if original_schema_version < crate::review_pilot::REVIEW_PILOT_HIDDEN_KEYS_SCHEMA_VERSION {
                 return Err(format!(
-                    "policy-bearing snapshot schema {snapshot_schema} predates durable hidden-key authority v{}; restoring it could forget already-served paid QC keys",
+                    "policy-bearing snapshot schema {original_schema_version} predates durable hidden-key authority v{}; restoring it could forget already-served paid QC keys",
                     crate::review_pilot::REVIEW_PILOT_HIDDEN_KEYS_SCHEMA_VERSION
                 ));
             }
-            let max_event_id: i64 = source
-                .query_row("SELECT COALESCE(MAX(id), 0) FROM review_events", [], |row| row.get(0))
-                .map_err(|error| format!("snapshot pilot baseline could not be verified: {error}"))?;
-            if policy.after_review_event_id > max_event_id {
+            if policy.after_review_event_id > original_max_review_event_id {
                 return Err(format!(
-                    "snapshot pilot baseline {} is ahead of its database review-event maximum {max_event_id}",
+                    "snapshot pilot baseline {} is ahead of its database review-event maximum {original_max_review_event_id}",
                     policy.after_review_event_id
                 ));
             }
@@ -131,10 +128,17 @@ pub(crate) fn explicit_snapshot_pilot_policy(
 
 pub(crate) fn inspect_snapshot_restore_plan(
     snapshot_dir: &Path,
-    snapshot_db: &Path,
+    snapshot_db: &crate::db::Database,
+    original_schema_version: i64,
+    original_max_review_event_id: i64,
     manifest_verified: bool,
 ) -> Result<SnapshotRestorePlan, String> {
-    let pilot = inspect_snapshot_pilot_policy(snapshot_dir, snapshot_db, manifest_verified)?;
+    let pilot = inspect_snapshot_pilot_policy(
+        snapshot_dir,
+        original_schema_version,
+        original_max_review_event_id,
+        manifest_verified,
+    )?;
     let optional = crate::snapshot::OPTIONAL_SNAPSHOT_STATE
         .iter()
         .copied()
@@ -143,7 +147,10 @@ pub(crate) fn inspect_snapshot_restore_plan(
                 .map(|action| (state, action))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(SnapshotRestorePlan { pilot, optional })
+    let expected_db_generation_sha256 = snapshot_db
+        .restore_generation_sha256()
+        .map_err(|error| format!("snapshot database generation could not be canonicalized for restore: {error}"))?;
+    Ok(SnapshotRestorePlan { pilot, optional, expected_db_generation_sha256 })
 }
 
 pub(crate) fn prepare_named_restore_artifacts<F>(
@@ -171,9 +178,20 @@ where
 
     // These are the only parse/stage paths. Neither config planning nor SQLite migration opens the
     // mutable promoted source again, so a later path replacement cannot mix generations.
-    let plan = inspect_snapshot_restore_plan(image.root(), &image.database_path(), image.manifest_verified())?;
+    let (staged, original_schema_version, original_max_review_event_id) =
+        crate::db::Database::stage_restore_source_with_original_evidence(image.database_path())
+            .map_err(|error| error.to_string())?;
     image.verify_owned_digest()?;
-    let staged = crate::db::Database::stage_restore_source(image.database_path()).map_err(|error| error.to_string())?;
+    // Bind config planning to the already-owned, WAL-aware, fully migrated SQLite generation. No
+    // immutable main-file probe is allowed here: if a source ever carries WAL authority, staging is
+    // the only path that may interpret it.
+    let plan = inspect_snapshot_restore_plan(
+        image.root(),
+        &staged,
+        original_schema_version,
+        original_max_review_event_id,
+        image.manifest_verified(),
+    )?;
     image.verify_owned_digest()?;
     Ok((plan, staged))
 }
@@ -215,7 +233,9 @@ pub(crate) fn begin_named_restore_transaction(
     db: &crate::db::Database,
     data_dir: &Path,
     source_selector: &str,
+    target_db_generation_sha256: &str,
 ) -> Result<std::path::PathBuf, String> {
+    validate_generation_sha256(target_db_generation_sha256)?;
     if let Some(pending) = load_named_restore_pending(data_dir)? {
         if let Some(completed) = pending.completed_selector.as_deref() {
             return Err(format!(
@@ -227,6 +247,23 @@ pub(crate) fn begin_named_restore_transaction(
                 "an interrupted restore of '{}' is pending; retry that exact snapshot before selecting '{}'",
                 pending.source_selector, source_selector
             ));
+        }
+        if let Some(recorded) = pending.target_db_generation_sha256.as_deref() {
+            if recorded != target_db_generation_sha256 {
+                return Err(format!(
+                    "the pending restore target generation changed: recorded {recorded}, staged {target_db_generation_sha256}; refusing to replay a different database under the same selector"
+                ));
+            }
+        } else {
+            // Upgrade an interrupted schema-1/2 marker before another page publication. The old
+            // marker remains a valid fail-closed barrier, but it cannot authorize a second swap until
+            // the exact staged target generation is durably bound.
+            let upgraded = NamedRestorePending {
+                schema: NAMED_RESTORE_PENDING_SCHEMA,
+                target_db_generation_sha256: Some(target_db_generation_sha256.to_string()),
+                ..pending.clone()
+            };
+            replace_named_restore_pending(data_dir, &upgraded)?;
         }
         let pin = crate::snapshot::resolve_snapshot_dir(data_dir, &pending.pre_restore_pin_selector)?;
         if !crate::snapshot::verify_snapshot_manifest_for_restore(&pin)? {
@@ -242,7 +279,9 @@ pub(crate) fn begin_named_restore_transaction(
         schema: NAMED_RESTORE_PENDING_SCHEMA,
         source_selector: source_selector.to_string(),
         pre_restore_pin_selector: pin_selector(data_dir, &pin)?,
+        target_db_generation_sha256: Some(target_db_generation_sha256.to_string()),
         completed_selector: None,
+        completed_db_generation_sha256: None,
     };
     // This is the commit boundary: source/config preflight and the safety pin already succeeded;
     // the durable fail-closed marker lands immediately before the live SQLite page transaction.
@@ -262,14 +301,30 @@ pub(crate) struct NamedRestorePending {
     pub(crate) schema: u32,
     pub(crate) source_selector: String,
     pub(crate) pre_restore_pin_selector: String,
+    /// Schema 3 binds the exact fully migrated target before any live page is published. Legacy
+    /// schema-1/2 markers omit this and are upgraded or replayed fail-closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) target_db_generation_sha256: Option<String>,
     /// Written only after DB + every required config/settings file has committed. If marker cleanup
     /// then fails or the process crashes, startup clears the barrier without replaying or rolling
     /// back an already-coherent generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) completed_selector: Option<String>,
+    /// Exact canonical live SQLite generation proven after FULL publication and before completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) completed_db_generation_sha256: Option<String>,
 }
 
-pub(crate) const NAMED_RESTORE_PENDING_SCHEMA: u32 = 2;
+pub(crate) const NAMED_RESTORE_PENDING_SCHEMA: u32 = 3;
+
+fn validate_generation_sha256(digest: &str) -> Result<(), String> {
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+        return Err(
+            "restore database generation SHA-256 must be exactly 64 lowercase hexadecimal characters".to_string()
+        );
+    }
+    Ok(())
+}
 
 pub(crate) fn atomic_write_restore_state(path: &Path, bytes: &[u8]) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
@@ -290,6 +345,8 @@ pub(crate) fn atomic_write_restore_state(path: &Path, bytes: &[u8]) -> Result<()
         let _ = std::fs::remove_file(&temp);
         return Err(format!("could not atomically install {}: {error}", path.display()));
     }
+    crate::atomic_file::fsync_parent_dir_strict(path)
+        .map_err(|error| format!("could not durably publish restore state {}: {error}", path.display()))?;
     Ok(())
 }
 
@@ -306,6 +363,63 @@ pub(crate) fn remove_live_restore_state(destination: &Path) -> Result<(), String
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("could not remove {}: {error}", destination.display())),
     }
+    crate::atomic_file::fsync_parent_dir_strict(destination)
+        .map_err(|error| format!("could not durably persist absence of {}: {error}", destination.display()))?;
+    Ok(())
+}
+
+fn validate_named_restore_pending(state: &NamedRestorePending) -> Result<(), String> {
+    if !matches!(state.schema, 1 | 2 | NAMED_RESTORE_PENDING_SCHEMA) {
+        return Err(format!("unsupported restore transaction schema {}", state.schema));
+    }
+    for (label, selector) in
+        [("source", state.source_selector.as_str()), ("pre-restore pin", state.pre_restore_pin_selector.as_str())]
+    {
+        if selector.is_empty()
+            || selector.trim() != selector
+            || selector.len() > 255
+            || selector.chars().any(char::is_control)
+        {
+            return Err(format!("restore transaction {label} selector is invalid"));
+        }
+    }
+    if state.schema == 1 && state.completed_selector.is_some() {
+        return Err("legacy restore transaction cannot claim a completed generation".to_string());
+    }
+    if state.schema < NAMED_RESTORE_PENDING_SCHEMA
+        && (state.target_db_generation_sha256.is_some() || state.completed_db_generation_sha256.is_some())
+    {
+        return Err(format!("legacy restore transaction schema {} cannot carry generation digests", state.schema));
+    }
+    if let Some(completed) = state.completed_selector.as_deref() {
+        if completed != state.source_selector && completed != state.pre_restore_pin_selector {
+            return Err("restore transaction completion selector is not its target or original pin".to_string());
+        }
+    }
+    if state.schema == NAMED_RESTORE_PENDING_SCHEMA {
+        let target = state.target_db_generation_sha256.as_deref().ok_or_else(|| {
+            "restore transaction schema 3 is missing its target database generation SHA-256".to_string()
+        })?;
+        validate_generation_sha256(target)?;
+        match (state.completed_selector.as_deref(), state.completed_db_generation_sha256.as_deref()) {
+            (None, None) => {}
+            (Some(selector), Some(completed)) => {
+                validate_generation_sha256(completed)?;
+                if selector == state.source_selector && completed != target {
+                    return Err(
+                        "restore transaction claims target completion with a different database generation SHA-256"
+                            .to_string(),
+                    );
+                }
+            }
+            (Some(_), None) => {
+                return Err("restore transaction completion is missing its database generation SHA-256".to_string());
+            }
+            (None, Some(_)) => {
+                return Err("restore transaction has a completion digest without a completion selector".to_string());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -321,17 +435,7 @@ pub(crate) fn load_named_restore_pending(data_dir: &Path) -> Result<Option<Named
     let state: NamedRestorePending = serde_json::from_slice(&bytes).map_err(|error| {
         format!("restore transaction {} is invalid and paid review remains blocked: {error}", pending.display())
     })?;
-    if !matches!(state.schema, 1 | NAMED_RESTORE_PENDING_SCHEMA) {
-        return Err(format!("unsupported restore transaction schema {}", state.schema));
-    }
-    if state.schema == 1 && state.completed_selector.is_some() {
-        return Err("legacy restore transaction cannot claim a completed generation".to_string());
-    }
-    if let Some(completed) = state.completed_selector.as_deref() {
-        if completed != state.source_selector && completed != state.pre_restore_pin_selector {
-            return Err("restore transaction completion selector is not its target or original pin".to_string());
-        }
-    }
+    validate_named_restore_pending(&state)?;
     Ok(Some(state))
 }
 
@@ -350,6 +454,7 @@ pub(crate) fn named_restore_barrier_may_exist(data_dir: &Path) -> bool {
 }
 
 pub(crate) fn write_named_restore_pending(data_dir: &Path, state: &NamedRestorePending) -> Result<(), String> {
+    validate_named_restore_pending(state)?;
     if let Some(existing) = load_named_restore_pending(data_dir)? {
         return (existing == *state).then_some(()).ok_or_else(|| {
             format!(
@@ -364,23 +469,108 @@ pub(crate) fn write_named_restore_pending(data_dir: &Path, state: &NamedRestoreP
     atomic_write_restore_state(&data_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), &bytes)
 }
 
-pub(crate) fn mark_named_restore_completed(data_dir: &Path, completed_selector: &str) -> Result<(), String> {
+fn replace_named_restore_pending(data_dir: &Path, state: &NamedRestorePending) -> Result<(), String> {
+    validate_named_restore_pending(state)?;
+    let mut bytes = serde_json::to_vec_pretty(state)
+        .map_err(|error| format!("could not serialize restore transaction replacement: {error}"))?;
+    bytes.push(b'\n');
+    atomic_write_restore_state(&data_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), &bytes)
+}
+
+pub(crate) fn bind_named_restore_target_generation(
+    data_dir: &Path,
+    source_selector: &str,
+    target_db_generation_sha256: &str,
+) -> Result<(), String> {
+    validate_generation_sha256(target_db_generation_sha256)?;
+    let mut pending = load_named_restore_pending(data_dir)?
+        .ok_or_else(|| "restore target generation cannot be bound because its durable marker is missing".to_string())?;
+    if pending.source_selector != source_selector {
+        return Err(format!(
+            "restore target generation belongs to selector '{}', not '{}'",
+            pending.source_selector, source_selector
+        ));
+    }
+    if pending.completed_selector.is_some() {
+        return Err("a completed restore marker cannot be rebound to a target generation".to_string());
+    }
+    if let Some(existing) = pending.target_db_generation_sha256.as_deref() {
+        return (existing == target_db_generation_sha256).then_some(()).ok_or_else(|| {
+            format!(
+                "the pending restore target generation changed: recorded {existing}, staged {target_db_generation_sha256}"
+            )
+        });
+    }
+    pending.schema = NAMED_RESTORE_PENDING_SCHEMA;
+    pending.target_db_generation_sha256 = Some(target_db_generation_sha256.to_string());
+    replace_named_restore_pending(data_dir, &pending)
+}
+
+pub(crate) fn mark_named_restore_completed(
+    data_dir: &Path,
+    completed_selector: &str,
+    completed_db_generation_sha256: &str,
+) -> Result<(), String> {
+    validate_generation_sha256(completed_db_generation_sha256)?;
     let mut pending = load_named_restore_pending(data_dir)?
         .ok_or_else(|| "restore completion cannot be recorded because its durable marker is missing".to_string())?;
     if completed_selector != pending.source_selector && completed_selector != pending.pre_restore_pin_selector {
         return Err("restore completion selector is not the recorded target or original pin".to_string());
     }
     if let Some(existing) = pending.completed_selector.as_deref() {
-        return (existing == completed_selector)
-            .then_some(())
-            .ok_or_else(|| format!("restore was already completed with a different generation '{existing}'"));
+        return (existing == completed_selector
+            && pending.completed_db_generation_sha256.as_deref() == Some(completed_db_generation_sha256))
+        .then_some(())
+        .ok_or_else(|| {
+            format!("restore was already completed with a different selector or database generation '{existing}'")
+        });
     }
     pending.schema = NAMED_RESTORE_PENDING_SCHEMA;
+    if pending.target_db_generation_sha256.is_none() {
+        pending.target_db_generation_sha256 = Some(completed_db_generation_sha256.to_string());
+    }
+    if completed_selector == pending.source_selector
+        && pending.target_db_generation_sha256.as_deref() != Some(completed_db_generation_sha256)
+    {
+        return Err("target restore completion digest does not match the transaction's recorded target".to_string());
+    }
     pending.completed_selector = Some(completed_selector.to_string());
+    pending.completed_db_generation_sha256 = Some(completed_db_generation_sha256.to_string());
     let mut bytes = serde_json::to_vec_pretty(&pending)
         .map_err(|error| format!("could not serialize completed restore transaction: {error}"))?;
     bytes.push(b'\n');
     atomic_write_restore_state(&data_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), &bytes)
+}
+
+/// Reopen a completed marker only while startup holds recovery admission and has already proved that
+/// the live SQLite generation does not match its completion digest. A crash after this rewrite leaves
+/// an ordinary incomplete barrier, so the next launch replays the same target/original path again.
+pub(crate) fn reopen_named_restore_completion_for_recovery(
+    data_dir: &Path,
+    pending: &NamedRestorePending,
+) -> Result<NamedRestorePending, String> {
+    let mut reopened = pending.clone();
+    reopened.completed_selector = None;
+    reopened.completed_db_generation_sha256 = None;
+    replace_named_restore_pending(data_dir, &reopened)?;
+    Ok(reopened)
+}
+
+pub(crate) fn completed_named_restore_matches_live(
+    data_dir: &Path,
+    pending: &NamedRestorePending,
+) -> Result<bool, String> {
+    let Some(expected) = pending.completed_db_generation_sha256.as_deref() else {
+        return Ok(false);
+    };
+    validate_generation_sha256(expected)?;
+    let db_path = data_dir.join("cortex-speech.db");
+    let live = crate::db::Database::stage_restore_source(&db_path)
+        .map_err(|error| format!("completed restore live database could not be verified: {error}"))?;
+    Ok(live
+        .restore_generation_sha256()
+        .map_err(|error| format!("completed restore live database generation could not be digested: {error}"))?
+        == expected)
 }
 
 pub(crate) fn clear_review_pilot_restore_pending(data_dir: &Path) -> Result<(), String> {
@@ -396,6 +586,9 @@ pub(crate) fn clear_review_pilot_restore_pending(data_dir: &Path) -> Result<(), 
             "restore completed, but paid review remains fail-closed because {} could not be removed: {error}",
             pending.display()
         )
+    })?;
+    crate::atomic_file::fsync_parent_dir_strict(&pending).map_err(|error| {
+        format!("restore barrier was removed but its directory could not be durably synchronized: {error}")
     })?;
     Ok(())
 }
@@ -543,6 +736,11 @@ pub(crate) fn install_snapshot_restore_plan(
     restored.save(&live_settings_path).map_err(|error| {
         format!(
             "snapshot database was restored, but live-control-preserving settings could not be installed; paid review remains blocked: {error}"
+        )
+    })?;
+    crate::atomic_file::fsync_parent_dir_strict(&live_settings_path).map_err(|error| {
+        format!(
+            "snapshot settings were installed, but their directory metadata is not durably synchronized; paid review remains blocked: {error}"
         )
     })?;
     Ok(restored)
@@ -712,21 +910,58 @@ mod tests {
             schema: NAMED_RESTORE_PENDING_SCHEMA,
             source_selector: "rotating/snapshot-1".to_string(),
             pre_restore_pin_selector: "pinned/prerestore-1".to_string(),
+            target_db_generation_sha256: Some("1".repeat(64)),
             completed_selector: None,
+            completed_db_generation_sha256: None,
         };
         write_named_restore_pending(directory.path(), &state).unwrap();
         assert_eq!(load_named_restore_pending(directory.path()).unwrap(), Some(state.clone()));
         assert!(named_restore_barrier_may_exist(directory.path()));
 
-        let error = mark_named_restore_completed(directory.path(), "rotating/snapshot-2").unwrap_err();
+        let error = mark_named_restore_completed(directory.path(), "rotating/snapshot-2", &"2".repeat(64)).unwrap_err();
         assert!(error.contains("not the recorded target"));
-        mark_named_restore_completed(directory.path(), &state.source_selector).unwrap();
+        mark_named_restore_completed(directory.path(), &state.source_selector, &"1".repeat(64)).unwrap();
         let completed = load_named_restore_pending(directory.path()).unwrap().unwrap();
         assert_eq!(completed.completed_selector.as_deref(), Some(state.source_selector.as_str()));
+        assert_eq!(completed.completed_db_generation_sha256.as_deref(), Some("1".repeat(64).as_str()));
 
         clear_review_pilot_restore_pending(directory.path()).unwrap();
         assert_eq!(load_named_restore_pending(directory.path()).unwrap(), None);
         assert!(!named_restore_barrier_may_exist(directory.path()));
+    }
+
+    #[test]
+    fn schema_three_restore_marker_rejects_missing_or_mismatched_generation_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE);
+        std::fs::write(
+            &marker,
+            br#"{
+              "schema": 3,
+              "sourceSelector": "snapshot_1",
+              "preRestorePinSelector": "pinned/original_1"
+            }"#,
+        )
+        .unwrap();
+        let missing = load_named_restore_pending(directory.path()).unwrap_err();
+        assert!(missing.contains("missing its target database generation"), "{missing}");
+
+        std::fs::write(
+            &marker,
+            format!(
+                "{{\n  \"schema\": 3,\n  \"sourceSelector\": \"snapshot_1\",\n  \
+                 \"preRestorePinSelector\": \"pinned/original_1\",\n  \
+                 \"targetDbGenerationSha256\": \"{}\",\n  \
+                 \"completedSelector\": \"snapshot_1\",\n  \
+                 \"completedDbGenerationSha256\": \"{}\"\n}}\n",
+                "1".repeat(64),
+                "2".repeat(64)
+            ),
+        )
+        .unwrap();
+        let mismatch = load_named_restore_pending(directory.path()).unwrap_err();
+        assert!(mismatch.contains("different database generation"), "{mismatch}");
+        assert!(named_restore_barrier_may_exist(directory.path()), "invalid authority must remain fail-closed");
     }
 
     #[test]
@@ -762,6 +997,7 @@ mod tests {
                 settings_state,
                 crate::snapshot::OptionalSnapshotRestore::Install(serde_json::to_vec_pretty(&historical).unwrap()),
             )],
+            expected_db_generation_sha256: "0".repeat(64),
         };
 
         let restored = install_snapshot_restore_plan(&plan, directory.path(), &live).unwrap();

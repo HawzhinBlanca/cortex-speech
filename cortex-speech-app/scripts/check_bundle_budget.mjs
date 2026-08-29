@@ -37,6 +37,7 @@ const cssGzipBytes = sumGzip(cssFiles);
 
 const JAVASCRIPT_LIMIT_BYTES = 125_000;
 const CSS_LIMIT_BYTES = 15_000;
+const SECONDARY_LOCALE_KEY = 'src/lib/i18n/en.ts';
 const kb = (bytes) => (bytes / 1000).toFixed(2);
 
 console.log(
@@ -51,6 +52,17 @@ for (const file of [...cssFiles].sort()) {
 }
 
 const failures = [];
+const secondaryLocale = manifest[SECONDARY_LOCALE_KEY];
+if (!secondaryLocale) {
+  failures.push('secondary English locale chunk is missing from the build manifest');
+} else {
+  if (!secondaryLocale.isDynamicEntry || initialKeys.has(SECONDARY_LOCALE_KEY)) {
+    failures.push('secondary English locale must remain outside the default Sorani startup graph');
+  }
+  console.log(
+    `Secondary English locale: ${kb(gzipBytes(secondaryLocale.file))} KB gzip (on demand)`,
+  );
+}
 if (javascriptGzipBytes > JAVASCRIPT_LIMIT_BYTES) {
   failures.push(
     `initial JavaScript exceeds its limit by ${kb(javascriptGzipBytes - JAVASCRIPT_LIMIT_BYTES)} KB`,

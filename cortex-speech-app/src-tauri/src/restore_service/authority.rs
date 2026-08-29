@@ -1,6 +1,6 @@
 //! Monotonic review, payment, and consent authority for restore admission.
 
-const DURABLE_REVIEW_RESTORE_TABLES: [&str; 33] = [
+const DURABLE_REVIEW_RESTORE_TABLES: [&str; 34] = [
     "review_pilot_hidden_keys",
     "review_events",
     "spot_checks",
@@ -34,6 +34,7 @@ const DURABLE_REVIEW_RESTORE_TABLES: [&str; 33] = [
     "review_pool_voice_certificates",
     "review_pool_dedup_manifests",
     "review_pool_duplicate_exclusions",
+    "desktop_review_action_events_v1",
 ];
 
 const EFFECT_BOUND_AGENT_EXAMPLES_RESTORE_PROJECTION: &str =
@@ -43,8 +44,52 @@ const LEGACY_AGENT_EXAMPLES_RESTORE_PROJECTION: &str = "SELECT * FROM legacy_age
 const LEGACY_CORRECTIONS_RESTORE_PROJECTION: &str = "SELECT * FROM legacy_corrections_v60";
 const LEGACY_REVIEWED_SEGMENTS_RESTORE_PROJECTION: &str = "SELECT * FROM legacy_reviewed_segments_v60";
 const LEGACY_MACHINE_VERDICTS_RESTORE_PROJECTION: &str = "SELECT * FROM legacy_machine_verdict_segments_v60";
+const LEGACY_DESKTOP_ACTIONS_RESTORE_PROJECTION: &str = "SELECT * FROM desktop_review_legacy_actions_v1";
+const DESKTOP_ACTION_JOURNAL_ORDERED_RESTORE_PROJECTION: &str =
+    "SELECT * FROM desktop_review_action_events_v1 ORDER BY id";
 
-const REVIEWED_SEGMENT_RESTORE_PROJECTION: &str = "SELECT segment.id,
+// A forward Undo/redecision legitimately changes the mutable human projection, so it cannot be an
+// exact-row restore floor. The reviewed clip and every source/export identity already present at the
+// floor are nevertheless monotonic authority: a newer target may fill a previously-null identity,
+// but it may not delete the clip or change an established hash/span/duration. Encoding one row per
+// present attribute gives `require_encoded_row_superset` exactly those semantics.
+const REVIEWED_SEGMENT_EXPORT_IDENTITY_RESTORE_PROJECTION: &str = "WITH reviewed AS (
+        SELECT segment.id, segment.audio_content_hash, segment.audio_fingerprint,
+               segment.alignment_json, segment.duration_ms
+          FROM speech_segments segment
+         WHERE segment.human_decision IS NOT NULL
+            OR segment.reviewed_by IS NOT NULL
+            OR (
+               segment.verified = 1
+               AND (segment.annotated_transcript IS NOT NULL OR segment.verdict_transcript IS NOT NULL)
+            )
+            OR EXISTS (
+               SELECT 1 FROM review_events event
+                WHERE event.segment_id = segment.id
+                  AND event.source <> 'couch_spot_check'
+                  AND event.action IN ('accept', 'edit', 'reject')
+            )
+            OR EXISTS (
+               SELECT 1 FROM review_compensation_ledger ledger
+                WHERE ledger.segment_id = segment.id
+                  AND ledger.compensation_action = 'undo'
+            )
+    )
+    SELECT id, 'segment' AS identity_kind, 'present' AS identity_value FROM reviewed
+    UNION ALL
+    SELECT id, 'audio_content_hash', audio_content_hash FROM reviewed
+     WHERE audio_content_hash IS NOT NULL
+    UNION ALL
+    SELECT id, 'audio_fingerprint', printf('%lld',audio_fingerprint) FROM reviewed
+     WHERE audio_fingerprint IS NOT NULL
+    UNION ALL
+    SELECT id, 'alignment_json', alignment_json FROM reviewed
+     WHERE alignment_json IS NOT NULL
+    UNION ALL
+    SELECT id, 'duration_ms', printf('%lld',duration_ms) FROM reviewed
+    ORDER BY id, identity_kind";
+
+const REVIEWED_SEGMENT_ACTIVITY_PROJECTION: &str = "SELECT segment.id,
             segment.audio_content_hash,
             segment.audio_fingerprint,
             segment.alignment_json,
@@ -196,9 +241,38 @@ pub(super) fn require_encoded_row_equality(
     Ok(())
 }
 
-/// Require `target` to contain every exact durable row in `floor`. Values as well as identities are
-/// compared with SQLite storage-class fidelity; a row with the same primary key but changed text,
-/// amount, policy, timestamp, or REAL bits is therefore a regression, not a match.
+fn require_desktop_action_journal_prefix(
+    floor: &crate::db::Database,
+    target: &crate::db::Database,
+) -> Result<(), String> {
+    let label = "desktop review action journal";
+    let (floor_columns, floor_rows) =
+        exact_query_rows(floor, label, DESKTOP_ACTION_JOURNAL_ORDERED_RESTORE_PROJECTION)?;
+    let (target_columns, target_rows) =
+        exact_query_rows(target, label, DESKTOP_ACTION_JOURNAL_ORDERED_RESTORE_PROJECTION)?;
+    if target_columns != floor_columns {
+        return Err(format!(
+            "database restore refused: target {label} columns do not match the authoritative review-history floor"
+        ));
+    }
+    if target_rows.len() < floor_rows.len() || target_rows[..floor_rows.len()] != floor_rows {
+        return Err(
+            "database restore refused: target desktop review action journal does not extend the exact authoritative prefix"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Require `target` to contain every exact append-only durable row in `floor`. Values as well as
+/// identities are compared with SQLite storage-class fidelity; a row with the same primary key but
+/// changed text, amount, policy, timestamp, or REAL bits is therefore a regression, not a match.
+///
+/// The mutable human fields in `speech_segments` are deliberately not compared as an exact row: a
+/// legitimate forward Undo/redecision replaces that projection while extending the immutable
+/// effect/reversal/action journals. The clip's established export/pay identities remain monotonic
+/// below, while every publication path separately calls `validate_restore_target_semantics` to
+/// reconstruct and verify the terminal human projection from immutable authority.
 pub(crate) fn require_durable_review_history_superset(
     floor: &crate::db::Database,
     target: &crate::db::Database,
@@ -208,6 +282,7 @@ pub(crate) fn require_durable_review_history_superset(
         let (target_columns, target_rows) = exact_table_rows(target, table)?;
         require_encoded_row_superset(table, floor_columns, floor_rows, target_columns, target_rows)?;
     }
+    require_desktop_action_journal_prefix(floor, target)?;
     let (floor_columns, floor_rows) =
         exact_query_rows(floor, "effect-bound agent examples", EFFECT_BOUND_AGENT_EXAMPLES_RESTORE_PROJECTION)?;
     let (target_columns, target_rows) =
@@ -229,22 +304,18 @@ pub(crate) fn require_durable_review_history_superset(
         ("legacy correction snapshot", LEGACY_CORRECTIONS_RESTORE_PROJECTION),
         ("legacy reviewed-segment snapshot", LEGACY_REVIEWED_SEGMENTS_RESTORE_PROJECTION),
         ("legacy machine-verdict snapshot", LEGACY_MACHINE_VERDICTS_RESTORE_PROJECTION),
+        ("legacy desktop-action baseline", LEGACY_DESKTOP_ACTIONS_RESTORE_PROJECTION),
     ] {
         let (floor_columns, floor_rows) = exact_query_rows(floor, label, projection)?;
         let (target_columns, target_rows) = exact_query_rows(target, label, projection)?;
         require_encoded_row_equality(label, floor_columns, floor_rows, target_columns, target_rows)?;
     }
+    let label = "reviewed speech-segment export projection";
     let (floor_columns, floor_rows) =
-        exact_query_rows(floor, "reviewed speech-segment export projection", REVIEWED_SEGMENT_RESTORE_PROJECTION)?;
+        exact_query_rows(floor, label, REVIEWED_SEGMENT_EXPORT_IDENTITY_RESTORE_PROJECTION)?;
     let (target_columns, target_rows) =
-        exact_query_rows(target, "reviewed speech-segment export projection", REVIEWED_SEGMENT_RESTORE_PROJECTION)?;
-    require_encoded_row_superset(
-        "reviewed speech-segment export projection",
-        floor_columns,
-        floor_rows,
-        target_columns,
-        target_rows,
-    )?;
+        exact_query_rows(target, label, REVIEWED_SEGMENT_EXPORT_IDENTITY_RESTORE_PROJECTION)?;
+    require_encoded_row_superset(label, floor_columns, floor_rows, target_columns, target_rows)?;
     Ok(())
 }
 
@@ -386,6 +457,8 @@ pub(crate) fn has_durable_review_activity(db: &crate::db::Database) -> Result<bo
         "review_pool_voice_certificates",
         "review_pool_dedup_manifests",
         "review_pool_duplicate_exclusions",
+        "desktop_review_legacy_actions_v1",
+        "desktop_review_action_events_v1",
     ] {
         let exists: bool = db
             .connection()
@@ -424,7 +497,7 @@ pub(crate) fn has_durable_review_activity(db: &crate::db::Database) -> Result<bo
     let reviewed_truth_exists: bool = db
         .connection()
         .query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM ({REVIEWED_SEGMENT_RESTORE_PROJECTION}) LIMIT 1)"),
+            &format!("SELECT EXISTS(SELECT 1 FROM ({REVIEWED_SEGMENT_ACTIVITY_PROJECTION}) LIMIT 1)"),
             [],
             |row| row.get(0),
         )

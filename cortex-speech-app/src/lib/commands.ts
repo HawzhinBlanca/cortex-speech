@@ -1,38 +1,65 @@
-import { invokeCritical, invokeLegacy } from './adapters/legacyIpc';
+import { invokeCritical } from './adapters/legacyIpc';
 import { commands as generatedCommands } from './generated/ipc';
 import { formatUnknownError } from './errorText';
+import { withReviewOperationTimeout } from './reviewOperationTimeout';
 import type {
   ActiveVoiceFocusV1,
+  AgenticReadinessV1,
+  AgentImportReportV1,
+  AgentOrchestrationStageV1,
+  AgentStageEventV1,
   AssignedSpeakersV1,
   AssignSpeakersRequestV1,
   AppHealthV1,
+  AudioExportOptionsV1,
+  AudioExportResultV1,
+  AudioHealth as GeneratedAudioHealth,
   BackupVerificationV1,
+  BatchRunStatusResponseV1,
+  BatchStartedV1,
   CommandErrorV1,
+  ConsensusWordV1,
+  DirectoryImportStartedV1,
   DeletedSegmentsV1,
   CommitReviewRequestV1,
   CommittedReviewV1,
   DesktopPlaybackReceiptV1,
   DesktopPlaybackSessionV1,
+  DesktopReviewUndoAvailabilityV1,
+  DesktopReviewUndoOutcomeV1,
+  DesktopReviewUndoTargetV1,
   HistoryMutationResultV1,
   HistoryStatusV1,
   EngineStatusV1,
+  EvalRunResultV1,
   MarkedSegmentUnusableV1,
   MarkSegmentUnusableRequestV1,
   InferenceStatsV1,
+  IntelligenceReportV1,
   ImportJobV1,
+  FileImportStartedV1,
+  FinetunePackResult as GeneratedFinetunePackResult,
+  GoldEvalExport as GeneratedGoldEvalExport,
   ImportResumeV1,
+  ImportRunStatusResponseV1,
   JobV1,
+  JuryPipelineReportV1,
   MediaGrant,
+  MergeDatasetResultV1,
   ModelDownloadSummaryV1,
   ModelStatusEntryV1,
   ModelVersionSummaryV1,
   PlaybackIntervalV1,
   QuarantineNoticeV1,
+  RecordReviewFlagRequestV1,
+  RecordedReviewFlagV1,
+  RelinkResult as GeneratedRelinkResult,
   RenamedSpeakerV1,
   RenameSpeakerRequestV1,
   ReviewDraftV1,
   ReviewPageV1,
   ReviewScope,
+  SegmentConsensusV1,
   SegmentMetadataChangeV1,
   SettingsPatchResultV1,
   SettingsPatchV1,
@@ -42,13 +69,29 @@ import type {
   TextDiff,
   TracingSpanV1,
   TracingStatsV1,
+  T2ResultV1,
+  T2VerdictV1,
+  TranscribedSegmentV1,
   UpdatedSegmentMetadataV1,
+  UndoDesktopReviewRequestV1,
+  ValidationIssue as GeneratedValidationIssue,
+  ValidationReport as GeneratedValidationReport,
+  WslRefinementStartedV1,
+  ScorecardResponse as GeneratedScorecardResponse,
+  IssueCategory as GeneratedIssueCategory,
+  IssueSeverity as GeneratedIssueSeverity,
+  WordTimestampV1,
 } from './generated/ipc';
+export type { DesktopReviewFlagKindV1 } from './generated/ipc';
 export type {
   ActiveVoiceFocusV1,
   AppHealthV1 as AppHealth,
   DesktopPlaybackReceiptV1,
   DesktopPlaybackSessionV1,
+  DesktopReviewUndoAvailabilityV1,
+  DesktopReviewUndoBlockReasonV1,
+  DesktopReviewUndoOutcomeV1,
+  DesktopReviewUndoTargetV1,
   HistoryActionV1,
   HistoryMutationResultV1,
   HistoryStatusV1,
@@ -56,6 +99,8 @@ export type {
   MarkSegmentUnusableRequestV1,
   InferenceStatsV1 as InferenceStats,
   PlaybackIntervalV1,
+  RecordReviewFlagRequestV1,
+  RecordedReviewFlagV1,
   ReviewDraftV1,
   ReviewPageV1,
   SpeakerInventoryItemV1,
@@ -63,7 +108,15 @@ export type {
   TracingSpanV1 as TracingSpan,
   TracingStatsV1 as TracingStats,
 } from './generated/ipc';
-import type { SpeechSegment, SegmentsPage, WordTimestamp, DatasetStats } from './types';
+import type {
+  DatasetStats,
+  EscalationTrendPoint,
+  EvalRun,
+  EvalRunResult,
+  LabelQualityLift,
+  SpeechSegment,
+  SegmentsPage,
+} from './types';
 import type { AppSettings } from './stores/settingsStore';
 import {
   mapBackendToFrontend,
@@ -71,12 +124,21 @@ import {
   type BackendSettings,
 } from './settingsAdapter';
 
-export async function openAudioFile(): Promise<string | null> {
-  return invokeCritical('open_audio_file');
+type GeneratedCommandResult<T> =
+  { status: 'ok'; data: T } | { status: 'error'; error: CommandErrorV1 };
+
+async function unwrapGenerated<T>(result: Promise<GeneratedCommandResult<T>>): Promise<T> {
+  const settled = await result;
+  if (settled.status === 'error') throw settled.error;
+  return settled.data;
 }
 
-export async function importDirectory(): Promise<{ status: string }> {
-  return invokeCritical('import_directory');
+export async function openAudioFile(): Promise<string | null> {
+  return unwrapGenerated(generatedCommands.openAudioFile());
+}
+
+export async function importDirectory(runId: string): Promise<DirectoryImportStartedV1> {
+  return unwrapGenerated(generatedCommands.importDirectory(runId));
 }
 
 /** Renderer-safe progress for a directory import interrupted by a crash. */
@@ -88,8 +150,37 @@ export async function getInterruptedImport(): Promise<ImportJob | null> {
   return result.data;
 }
 
-export async function resumeInterruptedImport(jobId: string): Promise<ImportResumeV1> {
-  const result = await generatedCommands.resumeInterruptedImport(jobId);
+export async function getImportRunStatus(runId: string): Promise<ImportRunStatusResponseV1> {
+  const result = await generatedCommands.getImportRunStatus(runId);
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+export async function getBatchRunStatus(operationId: string): Promise<BatchRunStatusResponseV1> {
+  const result = await generatedCommands.getBatchRunStatus(operationId);
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+/** The one durable batch currently eligible for renderer adoption, if any. */
+export async function getActiveBatchRun(): Promise<BatchRunStatusResponseV1 | null> {
+  const result = await generatedCommands.getActiveBatchRun();
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+/** Idempotently acknowledge that the renderer handled this exact terminal batch outcome. */
+export async function acknowledgeBatchRun(operationId: string): Promise<boolean> {
+  const result = await generatedCommands.acknowledgeBatchRun(operationId);
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+export async function resumeInterruptedImport(
+  jobId: string,
+  runId: string,
+): Promise<ImportResumeV1> {
+  const result = await generatedCommands.resumeInterruptedImport(jobId, runId);
   if (result.status === 'error') throw result.error;
   return result.data;
 }
@@ -99,8 +190,8 @@ export async function discardInterruptedImport(jobId: string): Promise<void> {
   if (result.status === 'error') throw result.error;
 }
 
-export async function importAudioFile(path: string): Promise<{ status: string; source?: string }> {
-  return invokeCritical('import_audio_file', { path });
+export async function importAudioFile(path: string, runId: string): Promise<FileImportStartedV1> {
+  return unwrapGenerated(generatedCommands.importAudioFile(path, runId));
 }
 
 export async function cancelOperation(): Promise<void> {
@@ -119,6 +210,7 @@ export const ASR_7B_UNAVAILABLE_TAG = 'E_ASR_7B_UNAVAILABLE';
 
 /** True when a transcription error is the "7B champion unavailable/failed" signal above. */
 export function is7bUnavailableError(e: unknown): boolean {
+  if ((e as { code?: unknown } | null)?.code === ASR_7B_UNAVAILABLE_TAG) return true;
   const msg = typeof e === 'string' ? e : ((e as { message?: unknown } | null)?.message ?? '');
   return (
     formatUnknownError(msg, '').includes(ASR_7B_UNAVAILABLE_TAG) ||
@@ -130,30 +222,16 @@ export async function transcribeSegment(
   audioPath: string,
   alignmentJson?: string | null,
   segmentId?: string | null,
-): Promise<{
-  text: string;
-  rawTranscript: string;
-  confidence?: number | null;
-  confidenceSource?: string | null;
-  modelVersionId?: string | null;
-  cloudCall?: boolean;
-}> {
-  return invokeLegacy<{
-    text: string;
-    rawTranscript: string;
-    confidence?: number | null;
-    confidenceSource?: string | null;
-    modelVersionId?: string | null;
-    cloudCall?: boolean;
-  }>('transcribe_segment', {
-    segmentId: segmentId ?? null,
-    audioPath,
-    alignmentJson: alignmentJson ?? null,
-  });
+): Promise<TranscribedSegmentV1> {
+  return unwrapGenerated(
+    generatedCommands.transcribeSegment(segmentId ?? null, audioPath, alignmentJson ?? null),
+  );
 }
 
-export async function batchTranscribe(ids: string[]): Promise<{ status: string }> {
-  return invokeLegacy<{ status: string }>('batch_transcribe', { ids });
+export async function batchTranscribe(ids: string[], operationId: string): Promise<BatchStartedV1> {
+  const result = await generatedCommands.batchTranscribe(ids, operationId);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function normalizeText(text: string): Promise<string> {
@@ -167,32 +245,14 @@ export async function alignSegment(
   text: string,
   alignmentJson?: string | null,
   segmentId?: string | null,
-): Promise<WordTimestamp[]> {
-  return invokeLegacy<WordTimestamp[]>('align_segment', {
-    audioPath,
-    text,
-    alignmentJson: alignmentJson ?? null,
-    segmentId: segmentId ?? null,
-  });
+): Promise<WordTimestampV1[]> {
+  return unwrapGenerated(
+    generatedCommands.alignSegment(audioPath, text, alignmentJson ?? null, segmentId ?? null),
+  );
 }
 
-export interface ConsensusWord {
-  text: string;
-  agreement: number;
-  modelsAgreeing: number;
-  totalModels: number;
-  alternatives: string[];
-}
-
-export interface SegmentConsensus {
-  draft: string;
-  words: ConsensusWord[];
-  modelCount: number;
-  minAgreement: number;
-  meanAgreement: number;
-  /** Distinct engine ids that produced this segment's hypotheses, recorded (never inferred). */
-  models: string[];
-}
+export type ConsensusWord = ConsensusWordV1;
+export type SegmentConsensus = SegmentConsensusV1;
 
 /** Render read-only historical provenance. These labels are not selectable engines; unknown ids show
  * verbatim (never invented) so the review badge always names exactly what produced the stored draft. */
@@ -210,7 +270,7 @@ export function engineLabel(modelId: string): string {
 
 /** Offline best-of-N consensus draft for a segment (ability-weighted vote over its ASR hypotheses). */
 export async function getSegmentConsensus(segmentId: string): Promise<SegmentConsensus> {
-  return invokeLegacy<SegmentConsensus>('get_segment_consensus', { segmentId });
+  return unwrapGenerated(generatedCommands.getSegmentConsensus(segmentId));
 }
 
 export interface GetSegmentsPageOptions {
@@ -263,10 +323,13 @@ function isSegmentsPagePayload(value: unknown): value is SegmentsPage {
 }
 
 export async function getSegment(segmentId: string): Promise<SpeechSegment> {
-  const result = await generatedCommands.getSegment(segmentId);
+  const result = await withReviewOperationTimeout(
+    generatedCommands.getSegment(segmentId),
+    'E_SEGMENT_LOAD_TIMEOUT',
+  );
   if (result.status === 'error') throw result.error;
   const data = result.data;
-  if (!isSpeechSegmentPayload(data)) {
+  if (!isSpeechSegmentPayload(data) || data.id !== segmentId) {
     throw new Error('get_segment returned an invalid payload');
   }
   return data;
@@ -300,14 +363,26 @@ export async function getSegmentsPage(options: GetSegmentsPageOptions = {}): Pro
 
 export function isCommandErrorV1(error: unknown, code?: string): error is CommandErrorV1 {
   if (!error || typeof error !== 'object') return false;
-  const candidate = error as Partial<CommandErrorV1>;
-  return (
-    candidate.schema === 1 &&
-    typeof candidate.code === 'string' &&
-    typeof candidate.message === 'string' &&
-    typeof candidate.retryable === 'boolean' &&
-    (code === undefined || candidate.code === code)
-  );
+  try {
+    // IPC failures are untrusted values. Read every required field exactly once so a Proxy,
+    // throwing accessor, or stateful getter cannot escape a review catch path or produce a
+    // time-of-check/time-of-use classification mismatch. Unknown values are conservatively not a
+    // typed refusal; callers then retain the operation identity and reconcile durable truth.
+    const candidate = error as Partial<CommandErrorV1>;
+    const schema = candidate.schema;
+    const candidateCode = candidate.code;
+    const message = candidate.message;
+    const retryable = candidate.retryable;
+    return (
+      schema === 1 &&
+      typeof candidateCode === 'string' &&
+      typeof message === 'string' &&
+      typeof retryable === 'boolean' &&
+      (code === undefined || candidateCode === code)
+    );
+  } catch {
+    return false;
+  }
 }
 
 export function reviewErrorMessage(_error: unknown, fallback: string): string {
@@ -351,7 +426,10 @@ export async function getVoiceFocusReviewPageV1(
  */
 export async function commitReviewV1(request: CommitReviewRequestV1): Promise<CommittedReviewV1> {
   const invokeExact = async (): Promise<CommittedReviewV1> => {
-    const result = await generatedCommands.commitReviewV1(request);
+    const result = await withReviewOperationTimeout(
+      generatedCommands.commitReviewV1(request),
+      'E_REVIEW_COMMIT_TIMEOUT',
+    );
     if (result.status === 'error') throw result.error;
     return result.data;
   };
@@ -361,6 +439,20 @@ export async function commitReviewV1(request: CommitReviewRequestV1): Promise<Co
     if (error instanceof Error) return invokeExact();
     throw error;
   }
+}
+
+/** Read the database-owned exact desktop review action eligible for restart-safe Undo. */
+export async function getDesktopReviewUndoAvailabilityV1(): Promise<DesktopReviewUndoAvailabilityV1> {
+  return unwrapGenerated(generatedCommands.getDesktopReviewUndoTargetV1());
+}
+
+/** Submit the complete immutable target plus one stable renderer-owned idempotency identity. */
+export async function undoDesktopReviewActionV1(
+  target: DesktopReviewUndoTargetV1,
+  operationId: string,
+): Promise<DesktopReviewUndoOutcomeV1> {
+  const request: UndoDesktopReviewRequestV1 = { target, operationId };
+  return unwrapGenerated(generatedCommands.undoDesktopReviewActionV1(request));
 }
 
 /**
@@ -373,7 +465,10 @@ export async function markSegmentUnusableV1(
   request: MarkSegmentUnusableRequestV1,
 ): Promise<MarkedSegmentUnusableV1> {
   const invokeExact = async (): Promise<MarkedSegmentUnusableV1> => {
-    const result = await generatedCommands.markSegmentUnusableV1(request);
+    const result = await withReviewOperationTimeout(
+      generatedCommands.markSegmentUnusableV1(request),
+      'E_MARK_UNUSABLE_TIMEOUT',
+    );
     if (result.status === 'error') throw result.error;
     return result.data;
   };
@@ -387,7 +482,10 @@ export async function markSegmentUnusableV1(
 
 /** Load one crash-safe draft. Drafts are non-authoritative and never enter corpus truth. */
 export async function getReviewDraftV1(segmentId: string): Promise<ReviewDraftV1 | null> {
-  const result = await generatedCommands.getReviewDraftV1(segmentId);
+  const result = await withReviewOperationTimeout(
+    generatedCommands.getReviewDraftV1(segmentId),
+    'E_REVIEW_DRAFT_LOAD_TIMEOUT',
+  );
   if (result.status === 'error') throw result.error;
   return result.data;
 }
@@ -398,7 +496,16 @@ export async function saveReviewDraftV1(
   baseRevision: number,
   text: string,
 ): Promise<ReviewDraftV1> {
-  const result = await generatedCommands.saveReviewDraftV1(segmentId, baseRevision, text);
+  const operationId = crypto.randomUUID();
+  const reservation = await withReviewOperationTimeout(
+    generatedCommands.reserveReviewDraftWriteV1(segmentId, operationId),
+    'E_REVIEW_DRAFT_RESERVE_TIMEOUT',
+  );
+  if (reservation.status === 'error') throw reservation.error;
+  const result = await withReviewOperationTimeout(
+    generatedCommands.saveReviewDraftV1(segmentId, baseRevision, text, operationId),
+    'E_REVIEW_DRAFT_SAVE_TIMEOUT',
+  );
   if (result.status === 'error') throw result.error;
   return result.data;
 }
@@ -408,7 +515,16 @@ export async function deleteReviewDraftV1(
   segmentId: string,
   baseRevision: number,
 ): Promise<boolean> {
-  const result = await generatedCommands.deleteReviewDraftV1(segmentId, baseRevision);
+  const operationId = crypto.randomUUID();
+  const reservation = await withReviewOperationTimeout(
+    generatedCommands.reserveReviewDraftWriteV1(segmentId, operationId),
+    'E_REVIEW_DRAFT_RESERVE_TIMEOUT',
+  );
+  if (reservation.status === 'error') throw reservation.error;
+  const result = await withReviewOperationTimeout(
+    generatedCommands.deleteReviewDraftV1(segmentId, baseRevision, operationId),
+    'E_REVIEW_DRAFT_DELETE_TIMEOUT',
+  );
   if (result.status === 'error') throw result.error;
   return result.data;
 }
@@ -498,12 +614,12 @@ export async function deleteSegmentsV1(ids: string[]): Promise<DeletedSegmentsV1
 }
 
 export async function exportDataset(path: string, format: string): Promise<void> {
-  return invokeCritical('export_dataset', { path, format });
+  await unwrapGenerated(generatedCommands.exportDataset(path, format));
 }
 
 /** Plain human transcript / subtitle export (format: 'txt' | 'srt' | 'vtt'). */
 export async function exportTranscript(path: string, format: 'txt' | 'srt' | 'vtt'): Promise<void> {
-  return invokeCritical('export_transcript', { path, format });
+  await unwrapGenerated(generatedCommands.exportTranscript(path, format));
 }
 
 export type EngineStatus = EngineStatusV1;
@@ -531,124 +647,31 @@ export async function startChampionEngine(): Promise<void> {
   if (result.status === 'error') throw result.error;
 }
 
-export interface AgentSourceReferenceSummary {
-  audioPath: string;
-  modelId: string;
-  audioContentHash?: string | null;
-  audioSizeBytes?: number | null;
-  transcriptPath: string;
-  textChars: number;
-}
-
-export interface AgentSourceReferenceCoverage {
-  audioPath: string;
-  requiredModels: string[];
-  presentModels: string[];
-  missingModels: string[];
-  complete: boolean;
-}
-
-export interface AgentLongFileDossier {
-  audioPath: string;
-  chunkCount: number;
-  totalDurationMs: number;
-  sourceReferences: AgentSourceReferenceSummary[];
-  sourceReferenceCoverage: AgentSourceReferenceCoverage;
-  hypothesisModelCounts: Record<string, number>;
-  verdictCounts: Record<string, number>;
-  trainingReadySegments: number;
-  escalatedSegments: string[];
-  promotionStatus: string;
-  promotionBlockers: string[];
-}
-
-export interface HypothesisCoverageReport {
-  minimumNonEmptyModelCount: number;
-  nonEmptyModelCount: number;
-  passesMinimum: boolean;
-  nonEmptyModels: string[];
-  ignoredModels: string[];
-}
-
-export interface AgentHypothesisCoverageBlocker {
-  segmentId: string;
-  grade: string;
-  trainingReady: boolean;
-  coverage: HypothesisCoverageReport;
-}
-
-export interface AgentOrchestrationStage {
-  stage: string;
-  status: string;
-  summary: string;
-  blockerCount: number;
-  blockers: string[];
-}
-
-export interface AgentImportSummary {
-  totalSegments: number;
-  agenticReadiness?: AgenticReadiness | null;
-  sourceReferences: AgentSourceReferenceSummary[];
-  sourceReferenceRequired: boolean;
-  requiredSourceReferenceModels: string[];
-  sourceReferenceModels: string[];
-  sourceReferenceCoverage: AgentSourceReferenceCoverage[];
-  longFileDossiers: AgentLongFileDossier[];
-  hypothesisModels: string[];
-  hypothesisModelCounts: Record<string, number>;
-  verdictCounts: Record<string, number>;
-  escalatedSegments: string[];
-  trainingGradeSummary: {
-    totalSegments: number;
-    trainingReadySegments: number;
-    goldSegments: number;
-    silverSegments: number;
-    reviewSegments: number;
-    rejectedSegments: number;
-  };
-  trainingGradeReasonCounts: Record<string, number>;
-  hypothesisCoverageBlockers: AgentHypothesisCoverageBlocker[];
-  orchestrationStages: AgentOrchestrationStage[];
-}
-
-export interface AgentImportReport {
-  id: string;
-  agentRunId: string | null;
-  source: string;
-  status: string;
-  audioPaths: string[];
-  segmentIds: string[];
-  summary: AgentImportSummary;
-  juryReport: Record<string, unknown> | null;
-  error: string | null;
-  createdAt: string;
-}
-
-export interface AgentStageEvent {
-  id: number;
-  runId: string;
-  source: string;
-  stage: string;
-  status: string;
-  file: string;
-  detail: string;
-  current: number;
-  total: number;
-  createdAt: string;
-}
+export type AgentImportReport = AgentImportReportV1;
+export type AgentStageEvent = AgentStageEventV1;
+export type AgentOrchestrationStage = AgentOrchestrationStageV1;
 
 export async function listAgentImportReports(limit = 25): Promise<AgentImportReport[]> {
-  return invokeLegacy<AgentImportReport[]>('list_agent_import_reports', { limit });
+  const result = await generatedCommands.listAgentImportReports(limit);
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+export async function getAgentImportReportByRunId(
+  runId: string,
+): Promise<AgentImportReport | null> {
+  const result = await generatedCommands.getAgentImportReportByRunId(runId);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function listAgentStageEvents(
   runId?: string | null,
   limit = 50,
 ): Promise<AgentStageEvent[]> {
-  return invokeLegacy<AgentStageEvent[]>('list_agent_stage_events', {
-    runId: runId ?? null,
-    limit,
-  });
+  const result = await generatedCommands.listAgentStageEvents(runId ?? null, limit);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function registerMediaAsset(audioPath: string): Promise<MediaGrant> {
@@ -949,11 +972,7 @@ export async function getWaveform(
   numPoints: number,
   alignmentJson?: string | null,
 ): Promise<number[]> {
-  return invokeLegacy<number[]>('get_waveform', {
-    path,
-    numPoints,
-    alignmentJson: alignmentJson ?? null,
-  });
+  return unwrapGenerated(generatedCommands.getWaveform(path, numPoints, alignmentJson ?? null));
 }
 
 export async function getDatasetStats(): Promise<DatasetStats> {
@@ -963,57 +982,25 @@ export async function getDatasetStats(): Promise<DatasetStats> {
 }
 
 /** P3.3: which distinct source audio files are missing on disk. */
-export interface AudioHealth {
-  totalFiles: number;
-  missingFiles: number;
-  missingPaths: string[];
-}
+export type AudioHealth = GeneratedAudioHealth;
 
 /** P3.3: outcome of a basename-based relink. */
-export interface RelinkResult {
-  relinked: number;
-  stillMissing: number;
-}
+export type RelinkResult = GeneratedRelinkResult;
 
 export async function getAudioHealth(): Promise<AudioHealth> {
-  return invokeCritical('get_audio_health');
+  return unwrapGenerated(generatedCommands.getAudioHealth());
 }
 
 /** P3.3: relink missing source audio by basename against a folder the owner picks. */
 export async function relinkAudio(searchDir: string): Promise<RelinkResult> {
-  return invokeCritical('relink_audio', { searchDir });
+  return unwrapGenerated(generatedCommands.relinkAudio(searchDir));
 }
 
 /** Intelligence read-side: LOOP-0 shadow precision (C5 go-live evidence) + auto-accept precision (C4). */
-export interface IntelligenceReport {
-  loop0Shadow: {
-    totalObservations: number;
-    wouldFire: number;
-    /** OVER-TRIGGER count — must be 0 before LOOP-0 firing may ever be enabled (C5). */
-    firedButHumanAcceptedOriginal: number;
-    firedAndHumanEdited: number;
-    firedAndHumanRejected: number;
-  };
-  autoAcceptPrecision: {
-    t0Accepts: number;
-    t1Escalations: number;
-    t0HumanConfirmed: number;
-    t0HumanContradicted: number;
-  };
-  /** Honest distance-to-calibration for the T0 auto-accept gate: per-SNR-bucket verified counts vs
-   * the minimum needed at ZERO CER (a hard lower bound — real data needs more). Explains why the
-   * jury escalates everything at low data volumes instead of leaving it a mystery (C3). Optional so
-   * an older backend (pre-v34 exe) doesn't break the dashboard. */
-  conformalCalibration?: {
-    targetErrorCer: number;
-    perBucketDelta: number;
-    minNeededAtZeroCer: number;
-    buckets: Array<{ bucket: string; verifiedWithReference: number; minNeededAtZeroCer: number }>;
-  };
-}
+export type IntelligenceReport = IntelligenceReportV1;
 
 export async function getIntelligenceReport(): Promise<IntelligenceReport> {
-  return invokeLegacy<IntelligenceReport>('get_intelligence_report');
+  return unwrapGenerated(generatedCommands.getIntelligenceReport());
 }
 
 /** B2: a past corruption quarantine, if any, plus how many restore snapshots exist. */
@@ -1344,32 +1331,22 @@ export const ValidationCategory = {
   InvalidSpeaker: 'InvalidSpeaker',
   CorruptAudio: 'CorruptAudio',
   AnnotationIncomplete: 'AnnotationIncomplete',
+  HighWer: 'HighWer',
+  HighCer: 'HighCer',
+  QualityGateFailed: 'QualityGateFailed',
+  ClippingDetected: 'ClippingDetected',
+  LowRmsVolume: 'LowRmsVolume',
+  AlignmentHeuristic: 'AlignmentHeuristic',
   Other: 'Other',
 } as const;
 
-export type ValidationSeverityValue = (typeof ValidationSeverity)[keyof typeof ValidationSeverity];
-export type ValidationCategoryValue = (typeof ValidationCategory)[keyof typeof ValidationCategory];
-
-export interface ValidationIssue {
-  severity: ValidationSeverityValue;
-  category: ValidationCategoryValue;
-  segmentId: string | null;
-  field: string;
-  message: string;
-  details: string | null;
-}
-
-export interface ValidationReport {
-  totalSegments: number;
-  totalAudioFiles: number;
-  passed: number;
-  warnings: ValidationIssue[];
-  errors: ValidationIssue[];
-  summary: string;
-}
+export type ValidationSeverityValue = GeneratedIssueSeverity;
+export type ValidationCategoryValue = GeneratedIssueCategory;
+export type ValidationIssue = GeneratedValidationIssue;
+export type ValidationReport = GeneratedValidationReport;
 
 export async function validateDataset(): Promise<ValidationReport> {
-  return invokeCritical('validate_dataset_cmd');
+  return unwrapGenerated(generatedCommands.validateDatasetCmd());
 }
 
 export const AudioExportFormat = {
@@ -1377,24 +1354,15 @@ export const AudioExportFormat = {
 } as const;
 
 export type AudioExportFormatValue = (typeof AudioExportFormat)[keyof typeof AudioExportFormat];
+type OwnerAudioExportOptions = Omit<AudioExportOptionsV1, 'format'> & {
+  format: AudioExportFormatValue;
+};
 
 export async function exportAudio(
   segmentIds: string[],
-  options: {
-    output_dir: string;
-    format: AudioExportFormatValue;
-    sample_rate: number;
-    include_metadata: boolean;
-  },
-): Promise<{
-  total: number;
-  succeeded: number;
-  failed: number;
-  output_dir: string;
-  files: string[];
-  errors: string[];
-}> {
-  return invokeCritical('export_audio', { segmentIds, options });
+  options: OwnerAudioExportOptions,
+): Promise<AudioExportResultV1> {
+  return unwrapGenerated(generatedCommands.exportAudio(segmentIds, options));
 }
 
 export async function assignSpeakersV1(
@@ -1405,12 +1373,14 @@ export async function assignSpeakersV1(
   return result.data;
 }
 
-export async function batchNormalize(ids: string[]): Promise<{ status: string }> {
-  return invokeLegacy<{ status: string }>('batch_normalize', { ids });
+export async function batchNormalize(ids: string[], operationId: string): Promise<BatchStartedV1> {
+  const result = await generatedCommands.batchNormalize(ids, operationId);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function rediarizeSegments(ids: string[]): Promise<number> {
-  return invokeLegacy<number>('rediarize_segments', { ids });
+  return unwrapGenerated(generatedCommands.rediarizeSegments(ids));
 }
 
 export async function renameSpeakerV1(request: RenameSpeakerRequestV1): Promise<RenamedSpeakerV1> {
@@ -1419,14 +1389,12 @@ export async function renameSpeakerV1(request: RenameSpeakerRequestV1): Promise<
   return result.data;
 }
 
-export async function mergeDatasetJson(
-  jsonContent: string,
-): Promise<{ created: number; updated: number }> {
-  return invokeCritical('merge_dataset_json', { jsonContent });
+export async function mergeDatasetJson(jsonContent: string): Promise<MergeDatasetResultV1> {
+  return unwrapGenerated(generatedCommands.mergeDatasetJson(jsonContent));
 }
 
 export async function exportHuggingfaceDataset(outputDir: string): Promise<void> {
-  return invokeCritical('export_huggingface_dataset', { path: outputDir });
+  await unwrapGenerated(generatedCommands.exportHuggingfaceDataset(outputDir));
 }
 
 export async function undo(): Promise<HistoryMutationResultV1> {
@@ -1517,24 +1485,12 @@ export async function takeLastCrash(): Promise<string | null> {
   return result.data;
 }
 
-export interface AgenticReadinessCheck {
-  id: string;
-  label: string;
-  status: 'ready' | 'degraded' | 'blocked';
-  detail: string;
-}
-
-export interface AgenticReadiness {
-  status: 'ready' | 'degraded' | 'blocked';
-  ready: boolean;
-  sourceReferenceModels: string[];
-  availableHypothesisModels: string[];
-  requiredHypothesisModels: number;
-  checks: AgenticReadinessCheck[];
-}
+export type AgenticReadiness = AgenticReadinessV1;
 
 export async function checkAgenticReadiness(): Promise<AgenticReadiness> {
-  return invokeLegacy<AgenticReadiness>('check_agentic_readiness');
+  const result = await generatedCommands.checkAgenticReadiness();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export interface WslRefinementOptions {
@@ -1544,13 +1500,17 @@ export interface WslRefinementOptions {
   test_one: boolean;
 }
 
-export async function runWslRefinement(options: WslRefinementOptions): Promise<{ status: string }> {
-  return invokeLegacy<{ status: string }>('run_wsl_refinement', {
-    limitFiles: options.limit_files ?? null,
-    limitSegments: options.limit_segments ?? null,
-    dryRun: options.dry_run,
-    testOne: options.test_one,
-  });
+export async function runWslRefinement(
+  options: WslRefinementOptions,
+): Promise<WslRefinementStartedV1> {
+  return unwrapGenerated(
+    generatedCommands.runWslRefinement(
+      options.limit_files ?? null,
+      options.limit_segments ?? null,
+      options.dry_run,
+      options.test_one,
+    ),
+  );
 }
 
 export async function cancelWslRefinement(): Promise<void> {
@@ -1587,7 +1547,7 @@ export async function getDatasetCertificate(
 }
 
 export async function computeSignalAnomalyScores(): Promise<number> {
-  return invokeLegacy<number>('compute_signal_anomaly_scores');
+  return unwrapGenerated(generatedCommands.computeSignalAnomalyScores());
 }
 
 export async function getActiveLearningQueue(
@@ -1595,61 +1555,49 @@ export async function getActiveLearningQueue(
   confidenceLevel: number,
   limit: number,
 ): Promise<SpeechSegment[]> {
-  return invokeLegacy<SpeechSegment[]>('get_active_learning_queue', {
-    targetError,
-    confidenceLevel,
-    limit,
-  });
+  return unwrapGenerated(
+    generatedCommands.getActiveLearningQueue(targetError, confidenceLevel, limit),
+  );
 }
 
 // ── Phase 1 — Gold-Set Eval Harness ────────────────────────────────────────
 
-import type { EvalRun, EvalRunResult, EscalationTrendPoint, LabelQualityLift } from './types';
+function toEvalRunResultV1(result: EvalRunResult): EvalRunResultV1 {
+  return {
+    run: { ...result.run, metaJson: result.run.metaJson ?? null },
+    segments: result.segments,
+  };
+}
 
 /** Run the real pinned champion over the gold set; the renderer cannot supply a model label. */
 export async function runGoldEvalAsr(): Promise<EvalRunResult> {
-  return invokeLegacy<EvalRunResult>('run_gold_eval_asr');
+  return unwrapGenerated(generatedCommands.runGoldEvalAsr());
 }
 
 /** Create gold-eval segments from a verified file. Returns the number created. */
 export async function createGoldFromFile(audioPath: string): Promise<number> {
-  return invokeCritical('create_gold_from_file', { audioPath });
+  return unwrapGenerated(generatedCommands.createGoldFromFile(audioPath));
 }
 
 /** M2.7 / P1.6: summary of an export_gold_eval_set run. */
-export interface GoldEvalExport {
-  manifestPath: string;
-  totalGold: number;
-  exported: number;
-  skipped: number;
-}
+export type GoldEvalExport = GeneratedGoldEvalExport;
 
 /** M2.7 / P1.6: bulk-promote every reviewed source file into the gold set; returns rows created. */
 export async function importVerifiedSegmentsAsGold(): Promise<number> {
-  return invokeCritical('import_verified_segments_as_gold');
+  return unwrapGenerated(generatedCommands.importVerifiedSegmentsAsGold());
 }
 
 /** M2.7 / P1.6: export the gold set (manifest.jsonl + 16 kHz WAV clips) under outDir. */
 export async function exportGoldEvalSet(outDir: string): Promise<GoldEvalExport> {
-  return invokeCritical('export_gold_eval_set', { outDir });
+  return unwrapGenerated(generatedCommands.exportGoldEvalSet(outDir));
 }
 
 /** M5.1 / P5.1: summary of an export_finetune_pack run. */
-export interface FinetunePackResult {
-  manifestPath: string;
-  /** P5.5: pins the exact rows this pack contains — the corpus-ledger key. */
-  manifestSha256: string;
-  totalVerified: number;
-  excludedUnexportable: number;
-  /** Rows the training-grade rubric refused (mark-bad, severe audio, placeholder) — the B1 guard. */
-  excludedNotTrainingReady: number;
-  emitted: number;
-  skipped: number;
-}
+export type FinetunePackResult = GeneratedFinetunePackResult;
 
 /** M5.1 / P5.1: export a fine-tune training pack from verified segments (holdout-excluded) under outDir. */
 export async function exportFinetunePack(outDir: string): Promise<FinetunePackResult> {
-  return invokeCritical('export_finetune_pack', { outDir });
+  return unwrapGenerated(generatedCommands.exportFinetunePack(outDir));
 }
 
 /** P0.2: the git SHA the running binary was built from (baked at build time). Used for build-info display. */
@@ -1660,21 +1608,23 @@ export async function appGitSha(): Promise<string> {
 }
 
 /** A reproducible scorecard built from already-computed gold-eval results. */
-export interface ScorecardResponse {
-  scorecard: unknown;
-  markdown: string;
-}
+export type ScorecardResponse = GeneratedScorecardResponse;
 
 /** Build a scorecard (system vs optional baseline) from gold-eval results. */
 export async function buildScorecard(
   system: EvalRunResult,
   baseline?: EvalRunResult | null,
 ): Promise<ScorecardResponse> {
-  return invokeLegacy<ScorecardResponse>('build_scorecard', { system, baseline: baseline ?? null });
+  return unwrapGenerated(
+    generatedCommands.buildScorecard(
+      toEvalRunResultV1(system),
+      baseline === null || baseline === undefined ? null : toEvalRunResultV1(baseline),
+    ),
+  );
 }
 
 export async function listEvalRuns(): Promise<EvalRun[]> {
-  return invokeLegacy<EvalRun[]>('list_eval_runs');
+  return unwrapGenerated(generatedCommands.listEvalRuns());
 }
 
 export async function getLabelQualityLift(): Promise<LabelQualityLift> {
@@ -1686,7 +1636,7 @@ export async function getLabelQualityLift(): Promise<LabelQualityLift> {
 // ── Phase 2 — T0 Gate + Jury ───────────────────────────────────────────────
 
 export async function getEscalationQueue(limit: number): Promise<SpeechSegment[]> {
-  return invokeLegacy<SpeechSegment[]>('get_escalation_queue', { limit });
+  return unwrapGenerated(generatedCommands.getEscalationQueue(limit));
 }
 
 /** Cumulative canonical MEDIA time the authorized renderer reported traversing for one clip revision.
@@ -1708,10 +1658,13 @@ export async function recordPlaybackReceipt(args: {
     startMs: Math.max(0, Math.round(interval.startMs)),
     endMs: Math.max(0, Math.round(interval.endMs)),
   }));
-  const result = await generatedCommands.finalizeDesktopPlaybackSessionV1(
-    args.playbackReceiptId,
-    args.mediaGrantId,
-    intervals,
+  const result = await withReviewOperationTimeout(
+    generatedCommands.finalizeDesktopPlaybackSessionV1(
+      args.playbackReceiptId,
+      args.mediaGrantId,
+      intervals,
+    ),
+    'E_PLAYBACK_FINALIZATION_TIMEOUT',
   );
   if (result.status === 'error') throw result.error;
   return result.data;
@@ -1725,11 +1678,6 @@ export interface HumanDecisionCommit {
   decidedRevision: number;
   segment: SpeechSegment;
 }
-
-export type HumanDecisionUndoOutcome =
-  | { status: 'applied'; restoredRevision: number; segment: SpeechSegment }
-  | { status: 'alreadyApplied'; restoredRevision: number; segment: SpeechSegment }
-  | { status: 'conflict'; segment: SpeechSegment };
 
 export async function recordHumanDecision(
   _segmentId: string,
@@ -1747,85 +1695,40 @@ export async function recordHumanDecision(
   } satisfies CommandErrorV1;
 }
 
-/** Exact server-owned inverse of one committed human decision. */
-export async function undoHumanDecision(
-  effectEventId: number,
-  operationId: string,
-): Promise<HumanDecisionUndoOutcome> {
-  return invokeCritical('undo_human_decision', { effectEventId, operationId });
-}
-
-export interface HumanFlagCommit {
-  effectEventId: number;
-  segmentId: string;
-  priorRevision: number;
-  flagRevision: number;
-  segment: SpeechSegment;
-}
-
-export type HumanFlagUndoOutcome =
-  | { status: 'applied'; restoredRevision: number; segment: SpeechSegment }
-  | { status: 'alreadyApplied'; segment: SpeechSegment }
-  | { status: 'conflict'; segment: SpeechSegment };
-
 /** Atomically flag one undecided row and retain a database-owned exact inverse. */
 export async function recordReviewFlag(
-  segmentId: string,
-  rationale: string,
-): Promise<HumanFlagCommit> {
-  const operationId = crypto.randomUUID();
-  const args = { segmentId, rationale, operationId };
+  request: RecordReviewFlagRequestV1,
+): Promise<RecordedReviewFlagV1> {
+  const invokeExact = () =>
+    withReviewOperationTimeout(
+      unwrapGenerated(generatedCommands.recordReviewFlag(request)),
+      'E_REVIEW_FLAG_TIMEOUT',
+    );
   try {
-    return await invokeCritical('record_review_flag', args);
-  } catch {
-    return invokeCritical('record_review_flag', args);
+    return await invokeExact();
+  } catch (error) {
+    if (error instanceof Error) return invokeExact();
+    throw error;
   }
 }
 
-/** Exact server-owned inverse of one committed review flag. */
-export async function undoReviewFlag(
-  effectEventId: number,
-  operationId: string,
-): Promise<HumanFlagUndoOutcome> {
-  return invokeCritical('undo_review_flag', { effectEventId, operationId });
-}
-
 export async function getEscalationRateTrend(): Promise<EscalationTrendPoint[]> {
-  return invokeLegacy<EscalationTrendPoint[]>('get_escalation_rate_trend');
+  return unwrapGenerated(generatedCommands.getEscalationRateTrend());
 }
 
 // ── Jury Pipeline (Items 1 & 2) ───────────────────────────────────────────────
 
-export interface JuryPipelineReport {
-  totalInput: number;
-  t0AutoAccepted: number;
-  t0Escalated: number;
-  t1Committed: number;
-  t2Committed: number;
-  humanInbox: number;
-}
+export type JuryPipelineReport = JuryPipelineReportV1;
 
 /** Run the full T0→T1→T2 cascade on a batch of segment IDs. */
 export async function runJuryPipeline(segmentIds: string[]): Promise<JuryPipelineReport> {
-  return invokeLegacy<JuryPipelineReport>('run_jury_pipeline', { segmentIds });
+  return unwrapGenerated(generatedCommands.runJuryPipeline(segmentIds));
 }
 
-export interface T2Verdict {
-  transcript: string;
-  reason: string;
-  confidence: number;
-  evidence: unknown[];
-  selfConsistencyAgreement: boolean;
-  votes: number;
-}
-
-export interface T2Result {
-  verdict: T2Verdict | null;
-  mustEscalate: boolean;
-  error: string | null;
-}
+export type T2Verdict = T2VerdictV1;
+export type T2Result = T2ResultV1;
 
 /** Run Gemini audio T2 judge directly on a single segment. */
 export async function runT2ForSegment(segmentId: string, apiKey: string): Promise<T2Result> {
-  return invokeLegacy<T2Result>('run_t2_for_segment', { segmentId, apiKey });
+  return unwrapGenerated(generatedCommands.runT2ForSegment(segmentId, apiKey));
 }

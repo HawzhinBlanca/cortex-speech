@@ -134,8 +134,10 @@ def test_migrated_commands_validate_then_delegate_without_raw_database_authority
         "db.apply_speaker_assignment_history(changes, true)?",
         "db.apply_deleted_segments_history(segments, false)?",
         "db.apply_deleted_segments_history(segments, true)?",
-        "db.apply_batch_transcription_history(previous_segments, current_segments, false)?",
-        "db.apply_batch_transcription_history(previous_segments, current_segments, true)?",
+        "**previous = db.apply_history_machine_projection_atomic(current, previous)?;",
+        "**current = db.apply_history_machine_projection_atomic(previous, current)?;",
+        "let next = db.apply_batch_job_history_v1(token)?;",
+        "*token = next;",
         "MAX_HISTORY_BYTES",
         "retained_bytes > self.max_bytes",
     ):
@@ -159,9 +161,11 @@ def test_migrated_commands_validate_then_delegate_without_raw_database_authority
     history_database = read("db/history.rs")
     for required in (
         "SAVEPOINT history_machine_snapshot",
-        "SAVEPOINT history_batch_transcription",
+        "SAVEPOINT history_machine_projection",
         "SAVEPOINT history_deleted_segments",
-        "batch_transcription_projection_matches(&actual, expected)",
+        "current.review_revision != expected.review_revision",
+        "current.hypotheses != expected.hypotheses",
+        "applied.review_revision <= current.review_revision",
         "Cannot redo stale deletion",
         'self.conn.execute("UPDATE speech_segments SET id = id WHERE 0", [])?',
     ):

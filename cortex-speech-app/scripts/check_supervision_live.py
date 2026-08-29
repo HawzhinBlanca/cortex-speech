@@ -21,8 +21,8 @@ The pure decision logic is `evaluate_supervision` and is unit-tested by `test_su
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 import shutil
 import ssl
@@ -31,6 +31,13 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+from release_private_production import (
+    ReleaseError,
+    defaults as release_defaults,
+    load_json,
+    validate_manifest,
+)
 
 LEGACY_WATCHDOG_TASK = "CortexWatchdog"
 PRIVATE_WATCHDOG_TASK = "CortexPrivateProductionWatchdog"
@@ -216,7 +223,9 @@ def _private_watchdog_problem(data_dir: Path) -> str | None:
     if not pointer.is_file():
         return None
     try:
-        value = json.loads(pointer.read_text(encoding="utf-8"))
+        value = load_json(pointer)
+        _default_data, release_root = release_defaults()
+        value = validate_manifest(value, expected_root=release_root, allow_compatible_previous=True)
         expected_path = Path(str(value["watchdogScript"])).resolve(strict=True)
         expected_hash = str(value["watchdogSha256"])
         if len(expected_hash) != 64 or any(ch not in "0123456789abcdef" for ch in expected_hash):
@@ -227,7 +236,7 @@ def _private_watchdog_problem(data_dir: Path) -> str | None:
         arguments = _watchdog_action_arguments()
         if arguments is None or str(expected_path).lower() not in arguments.lower():
             raise ValueError("scheduled action does not invoke the active release's versioned watchdog")
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except (OSError, KeyError, TypeError, ValueError, ReleaseError) as error:
         return f"{PRIVATE_WATCHDOG_TASK} is not bound to the active immutable release: {error}"
     return None
 
