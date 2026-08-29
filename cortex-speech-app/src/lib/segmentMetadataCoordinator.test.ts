@@ -3,6 +3,20 @@ import { createSegmentMetadataCoordinator } from './segmentMetadataCoordinator';
 import type { SegmentMetadataBaseline, SegmentMetadataFields } from './commands';
 
 describe('segment metadata coordinator', () => {
+  it('does not publish a readiness change for an identical hydrated baseline', () => {
+    const onReadinessChanged = vi.fn();
+    const coordinator = createSegmentMetadataCoordinator({
+      save: vi.fn(),
+      applyServerTruth: vi.fn(),
+      onReadinessChanged,
+    });
+
+    coordinator.remember('segment-a', { speakerId: 'speaker-a', alignmentJson: '{"words":[]}' });
+    coordinator.remember('segment-a', { speakerId: 'speaker-a', alignmentJson: '{"words":[]}' });
+
+    expect(onReadinessChanged).toHaveBeenCalledOnce();
+  });
+
   it('serializes local edits and rebases the second request on the first server ACK', async () => {
     let releaseFirst!: () => void;
     const calls: Array<{ expectedSpeaker: string | null; value: unknown }> = [];
