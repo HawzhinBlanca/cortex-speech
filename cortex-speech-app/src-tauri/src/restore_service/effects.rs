@@ -619,8 +619,19 @@ pub(crate) fn validate_review_effect_semantics(db: &crate::db::Database) -> Resu
                             AND original.reverses_entry_id IS NULL
                            JOIN review_compensation_ledger reversal
                              ON reversal.reverses_entry_id = original.entry_id
+                          -- ?2 is the UNDO's operation id, taken from
+                          -- human_decision_effect_reversals.operation_id. It is bound here to the
+                          -- INVERSE ledger entry (`entry_key = 'undo:' || ?2`), which is where it
+                          -- belongs. It must NOT be compared against event.operation_id: that
+                          -- column holds the DECISION's operation, a different value by
+                          -- construction, so `event.operation_id = ?2` could never be true and this
+                          -- query refused every genuine phone undo -- state that couch's own
+                          -- api_undo produces. The binding stays complete without it: event.id
+                          -- pins the event, original.review_event_id pins that event's one
+                          -- un-reversed pay entry, reversal.reverses_entry_id pins the inverse to
+                          -- that exact entry, and the field equalities below prove the inverse is
+                          -- an exact negation.
                           WHERE event.id = ?1
-                            AND event.operation_id = ?2
                             AND reversal.id > ?3
                             AND reversal.entry_key = 'undo:' || ?2
                             AND reversal.policy_version = original.policy_version
@@ -698,9 +709,14 @@ pub(crate) fn validate_review_effect_semantics(db: &crate::db::Database) -> Resu
                    JOIN human_decision_effect_reversals effect_reversal
                      ON effect_reversal.effect_event_id = effect.id
                    JOIN review_events event ON event.id = effect.review_event_id
+                  -- The same impossible comparison as the effect-side query above, in its second
+                  -- home: effect_reversal.operation_id is the UNDO's operation, event.operation_id
+                  -- is the DECISION's, so `event.operation_id = effect_reversal.operation_id` never
+                  -- held and every genuine phone undo was refused here too. The entry_key join
+                  -- already binds the inverse to its undo operation; the review_events join is kept
+                  -- because it still requires the effect's event to exist.
                   WHERE reversal.id = ?1
-                    AND reversal.entry_key = 'undo:' || effect_reversal.operation_id
-                    AND event.operation_id = effect_reversal.operation_id",
+                    AND reversal.entry_key = 'undo:' || effect_reversal.operation_id",
                 [reversal_id],
                 |row| row.get(0),
             )
@@ -1795,4 +1811,427 @@ pub(crate) fn validate_review_effect_semantics(db: &crate::db::Database) -> Resu
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_review_effect_semantics;
+    use crate::db::Database;
+
+    // This module's own fixtures rather than the ones in commands.rs: those live in another file's
+    // test module (unimportable), and that file is under active refactor elsewhere, so growing it
+    // would only manufacture merge conflicts. Everything here is deliberately minimal — one paid
+    // clip, one real decision — because each test's job is to corrupt exactly ONE thing.
+
+    fn canonical_operation(index: u64) -> String {
+        format!("00000000-0000-4000-8000-{index:012x}")
+    }
+
+    /// A segment carrying the canonical pay evidence: content hash, fingerprint, source span.
+    fn paid_segment(db: &Database, id: &str) {
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: id.to_string(),
+            audio_path: format!("{id}.wav"),
+            raw_transcript: "machine draft".to_string(),
+            duration_ms: 1_000,
+            confidence: Some(0.99),
+            ..crate::db::SpeechSegment::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_content_hash = ?2,
+                        audio_fingerprint = ?3,
+                        alignment_json = '{\"source_start_ms\":0,\"source_end_ms\":1000}',
+                        duration_ms = 1000
+                  WHERE id = ?1",
+                rusqlite::params![id, "a".repeat(64), 424_242_i64],
+            )
+            .unwrap();
+    }
+
+    fn seeded_db(id: &str) -> Database {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        paid_segment(&db, id);
+        db
+    }
+
+    /// Record a real Couch review event through the production API.
+    fn couch_event(db: &Database, id: &str, action: &str, index: u64) {
+        db.record_review_event_with_operation(
+            id,
+            "Reviewer",
+            action,
+            "couch",
+            i64::try_from(index).unwrap(),
+            &canonical_operation(index),
+            &crate::db::review_operation_payload_hash(id, action, "", "Reviewer"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_clean_restore_target_passes_and_the_frontier_row_is_singular() {
+        // The baseline: without this, every refusal below could be passing for the wrong reason.
+        let db = seeded_db("clean-clip");
+        validate_review_effect_semantics(&db).expect("a freshly initialized database is a valid restore target");
+
+        couch_event(&db, "clean-clip", "skip", 401);
+        validate_review_effect_semantics(&db).expect("a skip creates no effect and stays valid");
+
+        // review_effect_state is the schema-v60 frontier and must be exactly one row. The FIRST
+        // version of this test tried to insert a second row and asserted only `if rows > 1` — but
+        // the column is `singleton_key INTEGER PRIMARY KEY CHECK(singleton_key = 1)`, so a second
+        // row is impossible and the assertion never ran. A conditional assertion that cannot fire
+        // is not a test. The reachable violation is ZERO rows: a restored file whose frontier was
+        // dropped has no cutoff at all, and every pre-v60 row would read as effective.
+        db.connection().execute("DROP TRIGGER review_effect_state_immutable_delete", []).unwrap();
+        assert_eq!(db.connection().execute("DELETE FROM review_effect_state", []).unwrap(), 1);
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("one canonical schema-v60 frontier row"), "{error}");
+    }
+
+    #[test]
+    fn a_forged_effect_on_a_non_decision_event_is_refused() {
+        // A skip is not a decision: it pays nothing and must leave no human-decision effect. Forging
+        // one would invent paid, reviewed truth for a clip nobody judged — so the trigger is dropped
+        // first (a restored file may already contain rows written with triggers disabled, which is
+        // exactly the case this whole validation pass exists for).
+        let db = seeded_db("forged-clip");
+        couch_event(&db, "forged-clip", "skip", 402);
+        validate_review_effect_semantics(&db).unwrap();
+
+        let event_id: i64 =
+            db.connection().query_row("SELECT MAX(id) FROM review_events", [], |row| row.get(0)).unwrap();
+        let prior_revision = db.segment_review_revision("forged-clip").unwrap().unwrap();
+        db.connection().execute("DROP TRIGGER human_decision_effect_events_validate_review_event_insert", []).unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO human_decision_effect_events
+                    (review_event_id, segment_id, reviewer, source, action,
+                     served_transcript, decision_transcript, decision_annotated_transcript,
+                     decision_verified, decision_corrected_at,
+                     prior_revision, decision_revision, prior_verified, prior_escalated)
+                 VALUES (?1, 'forged-clip', 'Reviewer', 'couch', 'edit',
+                         'served transcript', 'forged edit', 'forged edit', 1,
+                         '2026-08-29 00:00:00', ?2, ?2 + 1, 0, 0)",
+                rusqlite::params![event_id, prior_revision],
+            )
+            .unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("must not create a human-decision effect"), "{error}");
+    }
+
+    #[test]
+    fn a_decision_event_stripped_of_its_pay_effect_is_refused() {
+        // The mirror of the forgery above, and the one that costs a reviewer money: a real Couch
+        // decision whose human/pay effect is missing from the restored file. The work happened; the
+        // evidence that it should be paid did not survive. Publishing that silently is the failure.
+        let db = seeded_db("stripped-clip");
+        let revision = db.segment_review_revision("stripped-clip").unwrap().unwrap();
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "stripped-clip",
+            "accept",
+            Some("machine draft"),
+            "Reviewer",
+            revision,
+            &canonical_operation(403),
+            &crate::db::review_operation_payload_hash("stripped-clip", "accept", "machine draft", "Reviewer"),
+        )
+        .unwrap()
+        .unwrap();
+        validate_review_effect_semantics(&db).expect("a genuine phone decision is a valid restore target");
+
+        db.connection().execute("DROP TRIGGER IF EXISTS human_decision_effect_events_immutable_delete", []).ok();
+        let removed = db.connection().execute("DELETE FROM human_decision_effect_events", []).unwrap();
+        assert_eq!(removed, 1, "the fixture must have created exactly one pay effect to remove");
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(
+            error.contains("does not have exactly one matching human/pay effect"),
+            "a decision without its pay effect must be refused: {error}"
+        );
+    }
+
+    /// A real phone decision, returning its effect id. The effect rows are trigger-protected, so
+    /// every corruption below drops the guard first — a restored file can already contain rows
+    /// written with triggers disabled, which is the situation this whole pass exists for.
+    fn decided(db: &Database, id: &str, index: u64) -> i64 {
+        let revision = db.segment_review_revision(id).unwrap().unwrap();
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            id,
+            "edit",
+            Some("corrected text"),
+            "Reviewer",
+            revision,
+            &canonical_operation(index),
+            &crate::db::review_operation_payload_hash(id, "edit", "corrected text", "Reviewer"),
+        )
+        .unwrap()
+        .unwrap();
+        db.connection().query_row("SELECT MAX(id) FROM human_decision_effect_events", [], |row| row.get(0)).unwrap()
+    }
+
+    /// Put the connection into the state a RESTORED FILE can genuinely arrive in: triggers dropped,
+    /// CHECK constraints ignored, foreign keys off. This is not a way around the schema — it is the
+    /// threat model. Every corruption below is refused by a CHECK or FK on a normally-configured
+    /// connection (measured: `decision_revision = prior_revision + 1`, the accept/edit transcript
+    /// CHECK, and the review_event_id FK all bite first), so those constraints ARE the first line of
+    /// defence and are worth knowing about. The validator is the second line, and it is the only one
+    /// that still applies to bytes written elsewhere with the guards disabled — which is exactly why
+    /// `validate_review_effect_semantics` exists and why these arms must be tested.
+    fn unlock_effects(db: &Database) {
+        for trigger in [
+            "human_decision_effect_events_immutable_update",
+            "human_decision_effect_events_validate_review_event_insert",
+        ] {
+            db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).ok();
+        }
+        db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+    }
+
+    #[test]
+    fn an_effect_that_breaks_its_revision_or_identity_boundary_is_refused() {
+        // decision_revision must be exactly prior_revision + 1. Anything else means the effect
+        // claims a place in the revision chain it did not earn, which is how a forged decision
+        // slips ahead of, or on top of, a real one.
+        // Each corruption is pinned to the message it ACTUALLY produces, not to the one it seems
+        // like it should. A revision-shifted effect is caught earlier, by the event/effect pay
+        // match: once the revision moves, the effect no longer answers for its event. That refusal
+        // is correct and is the one worth pinning; asserting the later message would have meant
+        // loosening the test until it passed.
+        let corruptions: [(&str, &str, &str); 4] = [
+            (
+                "revision skips ahead",
+                "UPDATE human_decision_effect_events SET decision_revision = prior_revision + 2",
+                "does not have exactly one matching human/pay effect",
+            ),
+            (
+                "revision regresses",
+                "UPDATE human_decision_effect_events SET decision_revision = prior_revision",
+                "does not have exactly one matching human/pay effect",
+            ),
+            (
+                // Also caught by the pay match rather than the identity check: the effect's action
+                // must answer its event's action, so retyping it as an unpaid `skip` breaks the
+                // pairing before the identity clause is ever reached.
+                "non-decision action",
+                "UPDATE human_decision_effect_events SET action = 'skip'",
+                "does not have exactly one matching human/pay effect",
+            ),
+            (
+                "blank decision timestamp",
+                "UPDATE human_decision_effect_events SET decision_corrected_at = '  '",
+                "violates its immutable identity/revision boundary",
+            ),
+        ];
+        for (label, sabotage, expected) in corruptions {
+            let db = seeded_db("identity-clip");
+            decided(&db, "identity-clip", 420);
+            validate_review_effect_semantics(&db).expect("the genuine decision must validate first");
+            unlock_effects(&db);
+            db.connection().execute(sabotage, []).unwrap();
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
+        }
+    }
+
+    #[test]
+    fn an_effect_whose_post_decision_text_is_not_canonical_is_refused() {
+        // The decision transcript IS the reviewer's paid output. A blank one, or one that
+        // disagrees with the annotated transcript the dataset actually serves, means the row no
+        // longer records what the human decided — and `annotated_transcript` is human-only by law.
+        let corruptions: [(&str, &str); 3] = [
+            (
+                "blank decision text",
+                "UPDATE human_decision_effect_events SET decision_transcript = '   ', decision_annotated_transcript = '   '",
+            ),
+            (
+                "decision text disagrees with what is served",
+                "UPDATE human_decision_effect_events SET decision_annotated_transcript = 'something else'",
+            ),
+            (
+                "untrimmed decision text is not NFC-canonical",
+                "UPDATE human_decision_effect_events SET decision_transcript = '  corrected text  ', decision_annotated_transcript = '  corrected text  '",
+            ),
+        ];
+        for (label, sabotage) in corruptions {
+            let db = seeded_db("text-clip");
+            decided(&db, "text-clip", 421);
+            validate_review_effect_semantics(&db).unwrap();
+            unlock_effects(&db);
+            db.connection().execute(sabotage, []).unwrap();
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(error.contains("no exact canonical post-decision transcript"), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_phone_effect_pointing_at_a_missing_event_is_refused() {
+        // A phone effect names the review event that authorized it. Repointing it at an event that
+        // does not exist severs the decision from its provenance while leaving it in the dataset:
+        // paid, reviewed-looking truth with nothing behind it.
+        let db = seeded_db("orphan-clip");
+        decided(&db, "orphan-clip", 422);
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_effects(&db);
+        db.connection().execute("UPDATE human_decision_effect_events SET review_event_id = 999999", []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(
+            error.contains("names no post-v60 review event")
+                || error.contains("does not have exactly one matching human/pay effect"),
+            "severing an effect from its event must be refused, either as an orphan effect or as an \
+             event left without its pay effect: {error}"
+        );
+    }
+
+    #[test]
+    fn a_review_event_without_canonical_provenance_is_refused() {
+        // The event carries the build and playback-guard provenance that makes a Couch decision
+        // auditable. A restored file whose events lost it cannot prove which build produced them.
+        let corruptions: [(&str, &str); 3] = [
+            ("unknown playback guard", "UPDATE review_events SET playback_guard_version = 'legacy-v0'"),
+            ("truncated build sha", "UPDATE review_events SET app_git_sha = 'abc123'"),
+            ("forged operation id", "UPDATE review_events SET operation_id = 'not-a-uuid'"),
+        ];
+        // Every case must reach a verdict, and the test must PROVE it reached one. The first draft
+        // used `continue` when the corrupting write was refused, which would have let all three
+        // cases skip and the test pass having asserted nothing -- the same vacuous shape as the
+        // frontier test above. Now each case records which layer refused, and the tally is asserted.
+        let mut refused_by_schema = 0;
+        let mut refused_by_validator = 0;
+        for (label, sabotage) in corruptions {
+            let db = seeded_db("provenance-clip");
+            decided(&db, "provenance-clip", 423);
+            validate_review_effect_semantics(&db).unwrap();
+            // The REAL trigger names — the first draft guessed
+            // ("review_events_immutable_update", "review_events_no_update"), neither of which
+            // exists, so every corruption bounced off the untouched guards and the test proved
+            // nothing. The tally assertion below is what surfaced that.
+            for trigger in [
+                "review_events_v60_post_cutoff_immutable_update",
+                "review_events_v60_provenance_immutable_update",
+                "review_event_operation_immutable_update",
+            ] {
+                db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).ok();
+            }
+            if db.connection().execute(sabotage, []).is_err() {
+                refused_by_schema += 1; // an immutability trigger held: also a pass, but a different one
+                continue;
+            }
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("lacks canonical Couch/build/playback provenance")
+                    || error.contains("does not have exactly one matching human/pay effect"),
+                "{label}: {error}"
+            );
+            refused_by_validator += 1;
+        }
+        assert_eq!(
+            refused_by_schema + refused_by_validator,
+            3,
+            "every provenance corruption must reach a verdict from some layer"
+        );
+        assert!(
+            refused_by_validator > 0,
+            "at least one corruption must survive the schema and be caught by the VALIDATOR, or this \
+             test proves only that triggers exist ({refused_by_schema} refused by schema)"
+        );
+    }
+
+    /// A paid phone decision that was then undone through the production APIs, exactly as
+    /// `couch::api_undo` does it. Returns the effect id the reversal hangs off.
+    fn decided_then_undone(db: &Database, id: &str, decide_index: u64, undo_index: u64) -> i64 {
+        let effect_id = decided(db, id, decide_index);
+        // The actor must OWN the effect -- an anonymous caller cannot reverse a reviewer's paid
+        // decision -- which is why couch passes Some(reviewer) at couch/decisions.rs.
+        assert!(matches!(
+            db.undo_human_decision(effect_id, Some("Reviewer"), &canonical_operation(undo_index)).unwrap(),
+            crate::db::HumanDecisionUndoOutcome::Applied { .. }
+        ));
+        effect_id
+    }
+
+    #[test]
+    fn a_genuine_phone_undo_is_a_valid_restore_target() {
+        // REGRESSION. This state -- decide on the phone, then Undo -- was refused outright with
+        // "lacks its exact operation-bound compensation inverse", because the query compared the
+        // UNDO's operation id against the review event's, which carries the DECISION's. Those
+        // differ by construction, so any backup containing an undone phone decision could not be
+        // restored. Built here entirely from production APIs: no forgery, no dropped triggers.
+        let db = seeded_db("genuine-undo");
+        decided_then_undone(&db, "genuine-undo", 430, 431);
+
+        // The evidence the validator must accept, asserted so this test documents the shape.
+        let (events, reversals): (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM review_events),
+                        (SELECT COUNT(*) FROM human_decision_effect_reversals)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((events, reversals), (1, 1));
+        let inverses: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM review_compensation_ledger WHERE reverses_entry_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inverses, 1, "the undo must have produced exactly one compensation inverse");
+
+        validate_review_effect_semantics(&db).expect("a phone decision undone through the production API must restore");
+    }
+
+    #[test]
+    fn a_forged_or_missing_pay_inverse_is_still_refused_after_the_fix() {
+        // The other half of the regression: removing the impossible clause must not have opened the
+        // door. Each corruption below breaks the inverse in a way that would let an undo stand
+        // while the money it claws back does not move, or moves by the wrong amount.
+        let corruptions: [(&str, &str); 4] = [
+            ("inverse deleted entirely", "DELETE FROM review_compensation_ledger WHERE reverses_entry_id IS NOT NULL"),
+            (
+                "inverse keyed to a different undo operation",
+                "UPDATE review_compensation_ledger SET entry_key = 'undo:00000000-0000-4000-8000-0000000009ff'
+                  WHERE reverses_entry_id IS NOT NULL",
+            ),
+            (
+                "inverse does not negate the amount",
+                "UPDATE review_compensation_ledger SET delta_micro_iqd = delta_micro_iqd + 1
+                  WHERE reverses_entry_id IS NOT NULL",
+            ),
+            (
+                "inverse pays out instead of clawing back",
+                "UPDATE review_compensation_ledger SET entitlement_micro_iqd = 5000000
+                  WHERE reverses_entry_id IS NOT NULL",
+            ),
+        ];
+        for (label, sabotage) in corruptions {
+            let db = seeded_db("forged-inverse");
+            decided_then_undone(&db, "forged-inverse", 432, 433);
+            validate_review_effect_semantics(&db).expect("the genuine undo must validate first");
+
+            for trigger in [
+                "review_compensation_ledger_immutable_update",
+                "review_compensation_ledger_immutable_delete",
+                "review_compensation_ledger_append_only_update",
+                "review_compensation_ledger_append_only_delete",
+            ] {
+                db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).ok();
+            }
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+            let changed = db.connection().execute(sabotage, []).unwrap_or(0);
+            assert!(changed > 0, "{label}: the corruption must actually apply, or this case proves nothing");
+
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("lacks its exact operation-bound compensation inverse"),
+                "{label}: a broken pay inverse must still be refused: {error}"
+            );
+        }
+    }
 }
