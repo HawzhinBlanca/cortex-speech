@@ -5,7 +5,7 @@
 
 use crate::database_runtime::DatabaseRuntime;
 use crate::db::PlaybackReceiptObservation;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlaybackObservation {
@@ -30,7 +30,8 @@ impl PlaybackWriteStore {
     }
 
     pub(crate) fn record_observation(&self, observation: PlaybackObservation) -> AppResult<()> {
-        let database = self.runtime.lock().unwrap_or_else(|poisoned| {
+        let mutation = self.runtime.begin_mutation().map_err(AppError::Other)?;
+        let database = self.runtime.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| {
             tracing::warn!("Recovering poisoned database lock while recording playback evidence");
             poisoned.into_inner()
         });

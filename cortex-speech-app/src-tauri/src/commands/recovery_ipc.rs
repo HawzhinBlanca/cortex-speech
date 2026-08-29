@@ -222,9 +222,10 @@ pub fn acknowledge_quarantine(state: State<'_, AppState>) -> Result<usize, Comma
 #[specta::specta]
 pub async fn db_vacuum(state: State<'_, AppState>) -> Result<(), CommandErrorV1> {
     STRICT_RATE_LIMITER.check("db_vacuum").map_err(|_| recovery_rate_limited_error())?;
-    let db = state.db_arc();
+    let database = state.db_runtime();
     run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mutation = database.begin_mutation()?;
+        let db = database.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| poisoned.into_inner());
         db.vacuum().map_err(|error| error.to_string())
     })
     .await

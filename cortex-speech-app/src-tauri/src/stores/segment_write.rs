@@ -144,8 +144,12 @@ impl SegmentWriteStore {
         Self { runtime, history }
     }
 
-    fn lock_database(&self, operation: &str) -> MutexGuard<'_, crate::db::Database> {
-        self.runtime.lock().unwrap_or_else(|poisoned| {
+    fn lock_database_after_mutation(
+        &self,
+        operation: &str,
+        mutation: &MutationGuard<'_>,
+    ) -> MutexGuard<'_, crate::db::Database> {
+        self.runtime.lock_after_mutation(mutation).unwrap_or_else(|poisoned| {
             tracing::warn!(operation, "Recovering poisoned database lock during a segment write");
             poisoned.into_inner()
         })
@@ -207,7 +211,7 @@ impl SegmentWriteStore {
             }
         }
 
-        let database = self.lock_database("update_segment_metadata_v1");
+        let database = self.lock_database_after_mutation("update_segment_metadata_v1", &admission);
         let Some(mut segment) = database.get_segment_by_id(segment_id)? else {
             return Err(SegmentMetadataUpdateError::Missing);
         };
@@ -248,7 +252,7 @@ impl SegmentWriteStore {
 
     pub(crate) fn delete_batch(&self, ids: &[String]) -> Result<(usize, SegmentMutation), SegmentDeleteError> {
         let admission = begin_mutation().map_err(AppError::Other).map_err(SegmentDeleteError::from)?;
-        let database = self.lock_database("delete_segments_batch");
+        let database = self.lock_database_after_mutation("delete_segments_batch", &admission);
         let segments = database.get_segments_by_ids(ids).map_err(SegmentDeleteError::from)?;
         database.delete_segments_batch(ids).map_err(SegmentDeleteError::from)?;
         drop(database);
@@ -276,7 +280,7 @@ impl SegmentWriteStore {
         }
         validate::validate_speaker_label(new_id).map_err(|_| SpeakerRenameError::Invalid)?;
 
-        let database = self.lock_database("rename_speaker_v1");
+        let database = self.lock_database_after_mutation("rename_speaker_v1", &admission);
         let history_changes = database
             .rename_speaker_with_inventory(old_id, new_id, expected_source_count, expected_target_count)
             .map_err(SpeakerRenameError::from)?;
@@ -322,7 +326,7 @@ impl SegmentWriteStore {
             validate::validate_speaker_label(speaker_id).map_err(|_| SpeakerAssignmentError::Invalid)?;
         }
 
-        let database = self.lock_database("assign_speaker_batch_v1");
+        let database = self.lock_database_after_mutation("assign_speaker_batch_v1", &admission);
         let changes =
             database.assign_speaker_batch_atomic(ids, target_speaker_id).map_err(SpeakerAssignmentError::from)?;
         let changed_count = changes.len();
