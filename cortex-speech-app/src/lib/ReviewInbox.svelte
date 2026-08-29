@@ -22,7 +22,11 @@
   import ReviewInboxActionBar from './ReviewInboxActionBar.svelte';
   import ReviewInboxQueueRail from './ReviewInboxQueueRail.svelte';
   import ReviewInboxHeader from './ReviewInboxHeader.svelte';
-  import { ReviewCommitOperationLedger, type ReviewCommitIntent } from './reviewCommitOperation';
+  import {
+    ReviewCommitOperationLedger,
+    reviewCommitFailureDisposition,
+    type ReviewCommitIntent,
+  } from './reviewCommitOperation';
   import {
     ReviewPlaybackAttemptLedger,
     hasSufficientReviewPlayback,
@@ -84,6 +88,16 @@
   let history: InboxHistoryEntry[] = [];
   const commitOperations = new ReviewCommitOperationLedger();
   const playbackAttempts = new ReviewPlaybackAttemptLedger();
+
+  function reconcileCommitFailure(intent: ReviewCommitIntent | null, error: unknown): void {
+    if (!intent) return;
+    const disposition = reviewCommitFailureDisposition(error);
+    if (disposition === 'retain-exact-retry') return;
+    commitOperations.resolve(intent);
+    if (disposition === 'restart-playback') {
+      playbackAttempts.resolve(intent.segmentId, intent.baseRevision);
+    }
+  }
   // Round-23 #12: the autonomy dial reflects and WRITES the real backend `jury_autonomy_level` setting
   // (read by the T0 gate's apply_autonomy), not a dead local variable.
   let autonomyLevel: AutonomyLevel = 'propose';
@@ -837,7 +851,7 @@
     const baseRevision = requireBaseRevision(cur);
     if (baseRevision === null) return;
     isSubmitting = true;
-    let commitIntent: ReviewCommitIntent;
+    let commitIntent: ReviewCommitIntent | null = null;
     try {
       const playbackReceiptId = await finalizePlaybackReceipt(cur, baseRevision);
       if (!playbackReceiptId) return;
@@ -874,6 +888,7 @@
       statusMsg = $t('inbox.status.accepted');
       if (visibleId === cur.id) void advance();
     } catch (e) {
+      reconcileCommitFailure(commitIntent, e);
       statusMsg = decisionFailure('inbox.status.acceptFailed', e);
       if (api.isCommandErrorV1(e, 'STALE_REVISION')) void loadQueue();
     } finally {
@@ -914,7 +929,7 @@
     if (baseRevision === null) return;
     const text = editText.trim();
     isSubmitting = true;
-    let commitIntent: ReviewCommitIntent;
+    let commitIntent: ReviewCommitIntent | null = null;
     try {
       // Navigation, native close and submission share this same durable barrier. If the draft write
       // fails, playback and authoritative commit do not begin and the clip/editor remain unchanged.
@@ -962,6 +977,7 @@
       statusMsg = $t('inbox.status.edited');
       if (visibleId === cur.id) void advance();
     } catch (e) {
+      reconcileCommitFailure(commitIntent, e);
       statusMsg = decisionFailure('inbox.status.editFailed', e);
       if (api.isCommandErrorV1(e, 'STALE_REVISION')) void loadQueue();
     } finally {
@@ -978,7 +994,7 @@
     const baseRevision = requireBaseRevision(cur);
     if (baseRevision === null) return;
     isSubmitting = true;
-    let commitIntent: ReviewCommitIntent;
+    let commitIntent: ReviewCommitIntent | null = null;
     try {
       const playbackReceiptId = await finalizePlaybackReceipt(cur, baseRevision);
       if (!playbackReceiptId) return;
@@ -1012,6 +1028,7 @@
       statusMsg = $t('inbox.status.rejected');
       if (visibleId === cur.id) void advance();
     } catch (e) {
+      reconcileCommitFailure(commitIntent, e);
       statusMsg = decisionFailure('inbox.status.rejectFailed', e);
       if (api.isCommandErrorV1(e, 'STALE_REVISION')) void loadQueue();
     } finally {

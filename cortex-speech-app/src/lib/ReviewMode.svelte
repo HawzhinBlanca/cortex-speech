@@ -36,7 +36,11 @@
     ReviewDraftWriteCoordinator,
     type RevisionBoundReviewDraftIntent,
   } from './reviewDraftWriteCoordinator';
-  import { ReviewCommitOperationLedger, type ReviewCommitIntent } from './reviewCommitOperation';
+  import {
+    ReviewCommitOperationLedger,
+    reviewCommitFailureDisposition,
+    type ReviewCommitIntent,
+  } from './reviewCommitOperation';
   import {
     ReviewPlaybackAttemptLedger,
     hasSufficientReviewPlayback,
@@ -80,6 +84,16 @@
   let reviewGeneration = 0;
   const commitOperations = new ReviewCommitOperationLedger();
   const playbackAttempts = new ReviewPlaybackAttemptLedger();
+
+  function reconcileCommitFailure(intent: ReviewCommitIntent | null, error: unknown): void {
+    if (!intent) return;
+    const disposition = reviewCommitFailureDisposition(error);
+    if (disposition === 'retain-exact-retry') return;
+    commitOperations.resolve(intent);
+    if (disposition === 'restart-playback') {
+      playbackAttempts.resolve(intent.segmentId, intent.baseRevision);
+    }
+  }
 
   function committedEffectId(
     segmentId: string,
@@ -629,7 +643,7 @@
     // No blocking confirm (true-10 audit): 'x' is undoable via Backspace now, so a native
     // window.confirm per press only broke the keyboard flow.
     saving = true;
-    let commitIntent: ReviewCommitIntent;
+    let commitIntent: ReviewCommitIntent | null = null;
     try {
       await flushActiveReviewDraft();
       if (
@@ -699,6 +713,7 @@
         if (visibleIndex >= 0) index = visibleIndex;
       }
     } catch (e) {
+      reconcileCommitFailure(commitIntent, e);
       if (api.isCommandErrorV1(e, 'NO_PLAYBACK_EVIDENCE'))
         notifications.error($t('review.mustListen'));
       else {
@@ -1301,7 +1316,7 @@
       void loadReviewPage(true);
       return;
     }
-    let commitIntent: ReviewCommitIntent;
+    let commitIntent: ReviewCommitIntent | null = null;
     try {
       // The typed decision is not a substitute for crash-safe draft durability. Persist the exact
       // visible editor first so a transport loss or process death cannot erase the correction while
@@ -1395,6 +1410,7 @@
       }
       advance();
     } catch (e) {
+      reconcileCommitFailure(commitIntent, e);
       if (api.isCommandErrorV1(e, 'NO_PLAYBACK_EVIDENCE'))
         notifications.error($t('review.mustListen'));
       else {
