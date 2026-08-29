@@ -89,22 +89,23 @@ pub(crate) fn validate_segments_with_settings(
         }
     }
 
-    // 2. Check empty transcripts. Round-25 #2: flag only when the EFFECTIVE transcript is empty
+    // 2. Check empty transcripts. Flag only when the authoritative Verbatim-Law transcript is empty
     // (mirroring quality.rs::effective_transcript) — a clip whose raw ASR produced nothing but which a
-    // curator then hand-annotated (or the jury committed a verdict for) is valid and training-ready.
+    // curator then hand-annotated or explicitly decided is valid. A machine jury proposal alone is
+    // evidence, not content authority, and must not hide the empty transcript.
     // Flagging it spuriously raised an EmptyTranscript warning that blocks a production bundle export
     // under the default warning_threshold=0.
     for seg in segments {
-        let has_content = !seg.raw_transcript.trim().is_empty()
-            || seg.annotated_transcript.as_deref().is_some_and(|a| !a.trim().is_empty())
-            || seg.verdict_transcript.as_deref().is_some_and(|v| !v.trim().is_empty());
+        let has_content = !crate::quality::effective_transcript(seg).trim().is_empty();
         if !has_content {
             issues.push(ValidationIssue {
                 severity: IssueSeverity::Warning,
                 category: IssueCategory::EmptyTranscript,
                 segment_id: Some(seg.id.clone()),
                 field: "raw_transcript".to_string(),
-                message: "Segment has no transcript (raw, annotation, and verdict are all empty)".to_string(),
+                message:
+                    "Segment has no authoritative transcript (human verdict, annotation, and champion raw are empty)"
+                        .to_string(),
                 details: Some(format!("Path: {}", seg.audio_path)),
             });
         }
@@ -416,6 +417,26 @@ mod tests {
         assert!(
             !report.warnings.iter().any(|i| i.category == IssueCategory::EmptyTranscript),
             "a hand-annotated segment with empty raw ASR must not be flagged empty"
+        );
+    }
+
+    #[test]
+    fn machine_verdict_alone_cannot_hide_an_empty_authoritative_transcript() {
+        let mut machine_only = make_seg("machine-only", "/fake/path.wav", "");
+        machine_only.verdict = Some("jury_accept".to_string());
+        machine_only.verdict_transcript = Some("machine jury proposal".to_string());
+
+        let report = validate_segments_with_settings(&[machine_only.clone()], &AppSettings::default()).unwrap();
+        assert!(
+            report.warnings.iter().any(|issue| issue.category == IssueCategory::EmptyTranscript),
+            "machine evidence must not mint transcript authority"
+        );
+
+        machine_only.human_decision = Some("accept".to_string());
+        let report = validate_segments_with_settings(&[machine_only], &AppSettings::default()).unwrap();
+        assert!(
+            !report.warnings.iter().any(|issue| issue.category == IssueCategory::EmptyTranscript),
+            "an explicit human decision may promote its frozen verdict transcript"
         );
     }
 
