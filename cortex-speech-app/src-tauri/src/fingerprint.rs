@@ -232,6 +232,28 @@ impl AudioFingerprint {
         AudioIdentity { spectral: Self::fingerprint(pcm, sample_rate), content: Self::content_hash(pcm, sample_rate) }
     }
 
+    /// Decode one source through the persisted-identity protocol: fixed 90-second windows, mono
+    /// 16 kHz PCM, concatenated in source order. Persisted writers and later verifiers must not use
+    /// whole-buffer resampling because resampler boundary state changes the canonical byte stream.
+    pub fn identify_canonical_file(path: &Path) -> crate::error::AppResult<AudioIdentity> {
+        let mut identity = StreamingIdentity::new();
+        let mut saw_audio = false;
+        crate::audio::decode_pcm_windows(path, crate::audio::DECODE_WINDOW_MS, |window| {
+            if !window.pcm.is_empty() {
+                saw_audio = true;
+                identity.push(&window.pcm, window.sample_rate);
+            }
+            Ok(())
+        })?;
+        if !saw_audio {
+            return Err(crate::error::AppError::Validation(format!(
+                "Source audio decoded to no canonical samples: {}",
+                path.display()
+            )));
+        }
+        Ok(identity.finish())
+    }
+
     fn source_key(source: Option<&Path>) -> String {
         source
             .map(|p| {
@@ -406,6 +428,50 @@ mod tests {
 
     fn stored(spectral: u64, content: Option<&str>, path: &str) -> StoredAudioIdentity {
         StoredAudioIdentity { spectral, content: content.map(str::to_string), audio_path: path.to_string() }
+    }
+
+    #[test]
+    fn canonical_file_identity_matches_the_explicit_fixed_window_protocol() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("canonical-identity.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for index in 0..88_200i32 {
+            writer.write_sample(((index % 1_001) - 500) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let mut expected = StreamingIdentity::new();
+        crate::audio::decode_pcm_windows(&path, crate::audio::DECODE_WINDOW_MS, |window| {
+            expected.push(&window.pcm, window.sample_rate);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(AudioFingerprint::identify_canonical_file(&path).unwrap(), expected.finish());
+    }
+
+    #[test]
+    fn persisted_identity_tools_use_the_canonical_file_protocol() {
+        for (name, source) in [
+            ("backfill_fingerprints", include_str!("bin/backfill_fingerprints.rs")),
+            ("batch_importer", include_str!("bin/batch_importer.rs")),
+        ] {
+            let production = source.split("\n#[cfg(test)]\nmod tests").next().unwrap_or(source);
+            assert!(
+                production.contains("AudioFingerprint::identify_canonical_file"),
+                "{name} must call the fixed-window canonical identity protocol"
+            );
+            assert!(!production.contains("decode_to_pcm("), "{name} must not persist a whole-buffer identity");
+            assert!(
+                !production.contains("AudioFingerprint::identify("),
+                "{name} must not bypass canonical file decoding at a persisted writer"
+            );
+        }
     }
 
     /// THE P1.1 REGRESSION TEST. A tier-1 collision between DISTINCT recordings must keep both.

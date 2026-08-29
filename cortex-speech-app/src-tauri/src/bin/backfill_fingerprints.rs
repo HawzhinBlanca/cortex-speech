@@ -19,7 +19,6 @@
 //!   cargo run --release --bin backfill_fingerprints
 //!   cargo run --release --bin backfill_fingerprints -- --apply
 
-use cortex_speech_app_lib::audio;
 use cortex_speech_app_lib::db::Database;
 use cortex_speech_app_lib::fingerprint::AudioFingerprint;
 use std::collections::BTreeMap;
@@ -109,15 +108,14 @@ fn main() -> Result<(), String> {
             missing += 1;
             continue;
         }
-        let (sample_rate, pcm) = match audio::decode_to_pcm(path) {
-            Ok(v) => v,
+        let identity = match AudioFingerprint::identify_canonical_file(std::path::Path::new(path)) {
+            Ok(identity) => identity,
             Err(e) => {
                 undecodable += 1;
                 eprintln!("  decode failed: {path} ({e})");
                 continue;
             }
         };
-        let identity = AudioFingerprint::identify(&pcm, sample_rate);
         if identity.spectral == 0 {
             // Digital silence or a sub-16ms clip. `register` refuses to store this bucket because every
             // later silent window would land in it; so does this.
