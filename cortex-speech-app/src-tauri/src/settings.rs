@@ -1,4 +1,4 @@
-use crate::atomic_file::{remove_file_on_error, replace_file};
+use crate::atomic_file::{fsync_parent_dir_strict, remove_file_on_error, replace_file};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -163,7 +163,19 @@ pub struct AppSettings {
     /// hardcoded-prior path (no persistence, no warm-start).
     #[serde(default)]
     pub irt_ability_learning_enabled: bool,
+
+    /// Process-local fail-closed authority. This is set only when startup had to return defaults but
+    /// could not prove that the owner's existing settings bytes were recoverable/readable/preserved.
+    /// It is deliberately absent from JSON and IPC: neither a stale file nor an untrusted legacy
+    /// payload may clear the block. Restart after repairing access reloads authoritative disk state.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub settings_write_blocked: bool,
 }
+
+pub const SETTINGS_WRITE_BLOCKED_CODE: &str = "SETTINGS_WRITE_BLOCKED";
+pub const SETTINGS_WRITE_BLOCKED_MESSAGE: &str =
+    "Settings are read-only because the existing settings file could not be recovered safely. Restart after repairing file access or use workspace recovery.";
 
 fn default_hf_train_ratio() -> f64 {
     0.8
@@ -379,6 +391,7 @@ impl Default for AppSettings {
             use_finetuned_asr: false,
             ger_refinement_enabled: false,
             irt_ability_learning_enabled: false,
+            settings_write_blocked: false,
         }
     }
 }
@@ -511,11 +524,24 @@ impl AppSettings {
         // the file is present (the common case).
         match crate::atomic_file::recover_interrupted_replace(path) {
             Ok(true) => {
-                tracing::warn!("Recovered settings from an interrupted save at {}", path.display())
+                // Recovery is a rename, so the bytes are not durably authoritative until the
+                // containing directory accepts the metadata barrier. A failed barrier is not a
+                // reason to discard the recovered bytes; it is a reason to make this process's
+                // fallback/settings snapshot read-only until a clean restart can prove authority.
+                if let Err(e) = fsync_parent_dir_strict(path) {
+                    return Self::write_blocked_defaults(
+                        path,
+                        &format!("interrupted-save recovery metadata could not be persisted safely: {e}"),
+                    );
+                }
+                tracing::warn!("Recovered settings from an interrupted save at {}", path.display());
             }
             Ok(false) => {}
             Err(e) => {
-                tracing::warn!("Could not check for an interrupted settings save at {}: {e}", path.display())
+                return Self::write_blocked_defaults(
+                    path,
+                    &format!("interrupted-save recovery authority was unreadable: {e}"),
+                );
             }
         }
         match std::fs::read_to_string(path) {
@@ -554,17 +580,31 @@ impl AppSettings {
                         // it BEFORE returning defaults so the next update_settings save cannot overwrite —
                         // and permanently destroy — the still-recoverable original.
                         tracing::warn!("Failed to parse settings file at {}: {}; using defaults", path.display(), e);
-                        Self::preserve_unparseable_settings(path);
-                        Self::default()
+                        match Self::preserve_unparseable_settings(path) {
+                            Ok(backup) => {
+                                tracing::warn!("Preserved unparseable settings as {}", backup.display());
+                                Self::default()
+                            }
+                            Err(preserve_error) => Self::write_blocked_defaults(
+                                path,
+                                &format!("unparseable bytes could not be preserved safely: {preserve_error}"),
+                            ),
+                        }
                     }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(e) => {
-                tracing::warn!("Failed to read settings file at {}: {}; using defaults", path.display(), e);
-                Self::default()
-            }
+            Err(e) => Self::write_blocked_defaults(path, &format!("settings bytes were unreadable: {e}")),
         }
+    }
+
+    fn write_blocked_defaults(path: &std::path::Path, reason: &str) -> Self {
+        tracing::error!(
+            path = %path.display(),
+            reason,
+            "Using safe runtime defaults with settings persistence blocked; existing bytes will not be overwritten"
+        );
+        Self { settings_write_blocked: true, ..Self::default() }
     }
 
     /// Strict, non-mutating recovery parser. Snapshot preflight must never call `load`: its normal
@@ -649,17 +689,26 @@ impl AppSettings {
         }
     }
 
-    /// Rename an unparseable settings file to `settings.json.corrupt-<epoch>` so a subsequent save of
-    /// the defaults can never clobber the owner's recoverable original. Best-effort.
-    fn preserve_unparseable_settings(path: &std::path::Path) {
+    /// Rename an unparseable settings file to a unique sibling and strictly persist that directory
+    /// entry before defaults become writable. Failure is load-bearing: the returned defaults carry a
+    /// process-local write block so no later save can overwrite the still-authoritative original.
+    fn preserve_unparseable_settings(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let mut backup = path.as_os_str().to_owned();
-        backup.push(format!(".corrupt-{ts}"));
+        backup.push(format!(".corrupt-{ts}-{}", uuid::Uuid::new_v4().simple()));
         let backup = std::path::PathBuf::from(backup);
-        match std::fs::rename(path, &backup) {
-            Ok(()) => tracing::warn!("Preserved unparseable settings as {}", backup.display()),
-            Err(e) => tracing::warn!("Could not preserve unparseable settings at {}: {e}", path.display()),
+        std::fs::rename(path, &backup)?;
+        fsync_parent_dir_strict(path)?;
+        Ok(backup)
+    }
+
+    pub fn require_writable(&self) -> Result<(), crate::error::AppError> {
+        if self.settings_write_blocked {
+            return Err(crate::error::AppError::Validation(format!(
+                "{SETTINGS_WRITE_BLOCKED_CODE}: {SETTINGS_WRITE_BLOCKED_MESSAGE}"
+            )));
         }
+        Ok(())
     }
 
     /// Validate frontend-supplied settings SERVER-SIDE before they take effect — the Rust
@@ -776,6 +825,9 @@ impl AppSettings {
     }
 
     pub fn save(&self, path: &std::path::Path) -> Result<(), crate::error::AppError> {
+        // Check before creating a parent or temporary file. A fallback snapshot whose original
+        // authority was unreadable must be observational only for this process lifetime.
+        self.require_writable()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -889,6 +941,17 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    #[cfg(target_os = "windows")]
+    fn open_with_windows_share_mode(path: &Path, share_mode: u32) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(share_mode)
+            .open(path)
+            .expect("open real Windows sharing-denial fixture")
+    }
+
     /// The external script string is EXECUTED, so it is a trust boundary — and the owner's real
     /// configured client must keep working, which is the half a validation most easily breaks.
     #[test]
@@ -961,15 +1024,117 @@ mod tests {
         // owner's still-recoverable original.
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("settings.json");
-        std::fs::write(&path, "{ not valid json ").unwrap();
-        let _ = AppSettings::load(&path); // returns defaults
+        let original = b"{ not valid json ";
+        std::fs::write(&path, original).unwrap();
+        let loaded = AppSettings::load(&path); // returns defaults only after a durable quarantine
+        assert!(!loaded.settings_write_blocked, "a durably preserved original makes defaults writable");
         assert!(!path.exists(), "the unparseable file is moved aside, not left in place");
-        let preserved = std::fs::read_dir(dir.path())
+        let preserved: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
-            .count();
-        assert_eq!(preserved, 1, "the unparseable settings file is preserved as .corrupt-<ts>");
+            .collect();
+        assert_eq!(preserved.len(), 1, "the unparseable settings file is preserved exactly once");
+        assert_eq!(std::fs::read(preserved[0].path()).unwrap(), original, "quarantine must preserve exact bytes");
+    }
+
+    #[test]
+    fn settings_write_block_is_process_local_and_never_serialized() {
+        let blocked = AppSettings::write_blocked_defaults(Path::new("settings.json"), "injected preservation failure");
+        assert!(blocked.settings_write_blocked);
+        let refusal = blocked.require_writable().expect_err("unsafe fallback must be read-only").to_string();
+        assert!(refusal.contains(SETTINGS_WRITE_BLOCKED_CODE));
+
+        let json = serde_json::to_string(&blocked).expect("serialize blocked fallback");
+        assert!(!json.contains("settings_write_blocked"), "write authority must never cross JSON or IPC");
+        assert!(
+            !json.contains(SETTINGS_WRITE_BLOCKED_CODE),
+            "internal recovery state must not leak into settings bytes"
+        );
+        let round_trip: AppSettings = serde_json::from_str(&json).expect("deserialize public settings shape");
+        assert!(
+            !round_trip.settings_write_blocked,
+            "a file or legacy IPC payload cannot persist, assert, or clear process-local write authority"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_read_sharing_denial_returns_blocked_defaults_and_preserves_original_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        let authoritative = AppSettings { autoplay_segments: true, ..AppSettings::default() };
+        let original = serde_json::to_vec_pretty(&authoritative).unwrap();
+        std::fs::write(&path, &original).unwrap();
+
+        // A genuine share-mode denial: while this handle is open no second reader can acquire the
+        // file. load() must not turn an unreadable authority into ordinary writable defaults.
+        let denial = open_with_windows_share_mode(&path, 0);
+        let mut fallback = AppSettings::load(&path);
+        assert!(fallback.settings_write_blocked);
+        assert!(!fallback.autoplay_segments, "runtime remains on privacy-safe defaults");
+        drop(denial);
+
+        fallback.autoplay_segments = false;
+        let refusal = fallback.save(&path).expect_err("blocked fallback must never overwrite authority").to_string();
+        assert!(refusal.contains(SETTINGS_WRITE_BLOCKED_CODE));
+        assert_eq!(std::fs::read(&path).unwrap(), original, "the exact authoritative bytes must survive");
+        assert!(!path.with_extension("json.tmp").exists(), "refusal happens before a temp file is created");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_preservation_sharing_denial_blocks_all_later_saves_without_losing_original() {
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = b"{ invalid but still owner-recoverable json";
+        std::fs::write(&path, original).unwrap();
+
+        // Permit load() to open/read the file, but deliberately omit FILE_SHARE_DELETE. Windows
+        // therefore rejects the quarantine rename with a real sharing violation.
+        let deny_rename = open_with_windows_share_mode(&path, FILE_SHARE_READ | FILE_SHARE_WRITE);
+        let fallback = AppSettings::load(&path);
+        assert!(fallback.settings_write_blocked, "failed preservation must make fallback read-only");
+        drop(deny_rename);
+
+        let refusal =
+            fallback.save(&path).expect_err("block survives after the transient lock is released").to_string();
+        assert!(refusal.contains(SETTINGS_WRITE_BLOCKED_CODE));
+        assert_eq!(std::fs::read(&path).unwrap(), original, "the original invalid bytes must remain exact");
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".corrupt-")),
+            "a failed rename must not claim a quarantine exists"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_interrupted_recovery_sharing_denial_keeps_backup_and_blocks_new_settings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        let backup = dir.path().join("settings.json.replace-bak-locked");
+        let authoritative = AppSettings { jury_cloud_opt_in: true, ..AppSettings::default() };
+        let original = serde_json::to_vec_pretty(&authoritative).unwrap();
+        std::fs::write(&backup, &original).unwrap();
+
+        // Model the exact Windows crash-recovery state: canonical name absent, authoritative backup
+        // present, but another process temporarily holds it without rename/delete sharing.
+        let deny_recovery_rename = open_with_windows_share_mode(&backup, 0);
+        let fallback = AppSettings::load(&path);
+        assert!(fallback.settings_write_blocked, "unsafe interrupted-replace recovery must fail closed");
+        assert!(!fallback.jury_cloud_opt_in, "an unproven backup must never be published as live settings");
+        drop(deny_recovery_rename);
+
+        let refusal = fallback.save(&path).expect_err("blocked fallback cannot create a competing canonical file");
+        assert!(refusal.to_string().contains(SETTINGS_WRITE_BLOCKED_CODE));
+        assert!(!path.exists(), "a failed recovery must not invent a new canonical settings file");
+        assert_eq!(std::fs::read(&backup).unwrap(), original, "the exact interrupted-save backup must survive");
     }
 
     #[test]
@@ -1005,6 +1170,7 @@ mod tests {
         let loaded = AppSettings::load(&path);
 
         assert!(loaded.jury_cloud_opt_in, "consent opt-in must be recovered, not reverted to default OFF");
+        assert!(!loaded.settings_write_blocked, "a recovered file is writable only after its strict metadata barrier");
         assert!(path.exists(), "the backup must have been promoted to the canonical path");
     }
 

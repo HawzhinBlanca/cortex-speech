@@ -104,6 +104,53 @@ pub(crate) fn fsync_parent_dir(final_path: &Path) {
     }
 }
 
+/// Strictly persist a directory's entries.
+///
+/// This is deliberately separate from [`fsync_parent_dir`]: existing atomic-file callers use that
+/// older helper after a replacement has already committed and intentionally treat a directory-sync
+/// failure as best-effort cleanup. Recovery/snapshot commit protocols, by contrast, must not report a
+/// generation durable until the filesystem accepts the metadata barrier, so they use this fallible
+/// variant and propagate every error.
+#[cfg(target_os = "windows")]
+pub(crate) fn fsync_directory_strict(directory: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    let metadata = fs::symlink_metadata(directory)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("directory durability barrier requires a real directory: {}", directory.display()),
+        ));
+    }
+
+    // FlushFileBuffers requires a write-capable handle on Windows. Opening the directory read-only
+    // (the common Unix pattern and the former best-effort implementation above) yields
+    // ERROR_ACCESS_DENIED on NTFS even with FILE_FLAG_BACKUP_SEMANTICS.
+    fs::OpenOptions::new().write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(directory)?.sync_all()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn fsync_directory_strict(directory: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(directory)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("directory durability barrier requires a real directory: {}", directory.display()),
+        ));
+    }
+    fs::File::open(directory)?.sync_all()
+}
+
+/// Strictly persist the containing directory entry for `final_path`.
+///
+/// A bare relative file lives in the current directory, so `.` is the correct metadata authority
+/// rather than silently skipping the barrier.
+pub(crate) fn fsync_parent_dir_strict(final_path: &Path) -> io::Result<()> {
+    let parent = final_path.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    fsync_directory_strict(parent)
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn replacement_backup_path(final_path: &Path) -> PathBuf {
     let file_name = final_path.file_name().and_then(|name| name.to_str()).unwrap_or("target");
@@ -276,6 +323,25 @@ mod tests {
 
         assert_eq!(fs::read(&final_path).expect("read final"), payload);
         assert!(!tmp_path.exists());
+    }
+
+    #[test]
+    fn strict_directory_barriers_propagate_and_accept_real_directories() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let child = tmp_dir.path().join("durable-entry");
+        fs::write(&child, b"durable").expect("write child");
+        fs::OpenOptions::new().write(true).open(&child).unwrap().sync_all().unwrap();
+
+        fsync_directory_strict(tmp_dir.path()).expect("strict directory FlushFileBuffers/fsync");
+        fsync_parent_dir_strict(&child).expect("strict parent directory barrier");
+
+        let ordinary_file = tmp_dir.path().join("not-a-directory");
+        fs::write(&ordinary_file, b"file").unwrap();
+        assert_eq!(
+            fsync_directory_strict(&ordinary_file).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput,
+            "strict directory barriers must never silently accept a file"
+        );
     }
 
     #[test]
