@@ -1979,6 +1979,27 @@ mod tests {
 
     const TEST_CHAMPION: &str = "omniasr-7b-test-champion";
 
+    fn rollback_fixture_to(db: &Database, target_version: i64) {
+        let expected = crate::migrations::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > target_version)
+            .rev()
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>();
+        assert_eq!(crate::migrations::rollback(db, expected.len()).unwrap(), expected);
+        assert_eq!(crate::migrations::get_current_version(db).unwrap(), target_version);
+    }
+
+    fn upgrade_fixture_from(db: &Database, source_version: i64) {
+        let expected = crate::migrations::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > source_version)
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>();
+        assert_eq!(crate::migrations::run_migrations(db).unwrap(), expected);
+        assert_eq!(crate::migrations::get_current_version(db).unwrap(), crate::migrations::max_supported_version());
+    }
+
     fn seed_champion(db: &Database) {
         crate::registry::register_candidate(
             db,
@@ -2028,9 +2049,9 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         seed_champion(&db);
-        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        rollback_fixture_to(&db, 59);
         db.insert_segment_full(&reviewed_segment("clip", &audio, "Rubar", first_text)).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        upgrade_fixture_from(&db, 59);
         db.connection()
             .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='clip'", ["a".repeat(64)])
             .unwrap();
@@ -2048,7 +2069,7 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         seed_champion(&db);
-        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        rollback_fixture_to(&db, 59);
         for id in ["a", "b"] {
             let audio = dir.path().join(format!("{id}.wav"));
             std::fs::write(&audio, b"wav").unwrap();
@@ -2059,7 +2080,7 @@ mod tests {
             };
             db.insert_segment_full(&row).unwrap();
         }
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        upgrade_fixture_from(&db, 59);
         db.connection()
             .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='a'", ["a".repeat(64)])
             .unwrap();
@@ -2384,10 +2405,10 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         seed_champion(&db);
-        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        rollback_fixture_to(&db, 59);
         db.insert_segment_full(&segment("first", &first_audio, Some("Rubar"))).unwrap();
         db.insert_segment_full(&segment("second", &second_audio, None)).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        upgrade_fixture_from(&db, 59);
         db.connection()
             .execute(
                 "UPDATE speech_segments

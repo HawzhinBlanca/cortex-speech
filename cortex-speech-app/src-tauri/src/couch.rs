@@ -523,6 +523,27 @@ mod tests {
             tempfile::tempdir().expect("thread-local Couch fixture audio directory");
     }
 
+    fn rollback_fixture_to(db: &Database, target_version: i64) {
+        let expected = crate::migrations::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > target_version)
+            .rev()
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>();
+        assert_eq!(crate::migrations::rollback(db, expected.len()).unwrap(), expected);
+        assert_eq!(crate::migrations::get_current_version(db).unwrap(), target_version);
+    }
+
+    fn upgrade_fixture_from(db: &Database, source_version: i64) {
+        let expected = crate::migrations::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > source_version)
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>();
+        assert_eq!(crate::migrations::run_migrations(db).unwrap(), expected);
+        assert_eq!(crate::migrations::get_current_version(db).unwrap(), crate::migrations::max_supported_version());
+    }
+
     fn test_db(dir: &std::path::Path) -> (Database, String) {
         let path = dir.join("couch-test.db").to_string_lossy().to_string();
         let db = Database::open(&path).unwrap();
@@ -3127,12 +3148,12 @@ mod tests {
         // nothing written to the corpus. The clip stayed pending and was swallowed again every batch.
         let tmp = tempfile::tempdir().unwrap();
         let (db, _) = test_db(tmp.path());
-        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        rollback_fixture_to(&db, 59);
         let mut gold = seg("g1", "دەقی خاو");
         gold.annotated_transcript = Some("دەقی ڕاست".into());
         gold.verified = true;
         db.insert_segment(&gold).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        upgrade_fixture_from(&db, 59);
         let state = state();
 
         // It was handed to Sara as a check while it was still verified.
@@ -4094,11 +4115,7 @@ mod tests {
     /// A GOLD clip with a known human answer whose RAW draft is wrong — the shape a spot check needs.
     /// `is_gold` matters: without it a peer's fresh correction would qualify as an answer key.
     fn gold_seg(db: &Database, id: &str, wrong_draft: &str, human_answer: &str) {
-        assert_eq!(
-            crate::migrations::rollback(db, 8).unwrap(),
-            vec![67, 66, 65, 64, 63, 62, 61, 60],
-            "gold test authority must be created before the v60 legacy snapshot"
-        );
+        rollback_fixture_to(db, 59);
         let mut s = seg(id, wrong_draft);
         s.verified = true;
         s.is_gold = true;
@@ -4106,7 +4123,7 @@ mod tests {
         s.verdict = Some("human_edit".into());
         s.verdict_transcript = Some(human_answer.into());
         db.insert_segment_full(&s).unwrap();
-        assert_eq!(crate::migrations::run_migrations(db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        upgrade_fixture_from(db, 59);
     }
 
     #[test]
@@ -6415,7 +6432,7 @@ mod tests {
         // insert_segment_full so the row returns to its pre-decision snapshot losslessly.
         let tmp = tempfile::tempdir().unwrap();
         let (db, _p) = test_db(tmp.path());
-        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        rollback_fixture_to(&db, 59);
 
         // Persist the jury columns with insert_segment_full (insert_segment would drop them).
         let mut s = seg("esc1", "دەق یەک");
@@ -6424,7 +6441,7 @@ mod tests {
         s.verified = false;
         s.is_gold = false;
         db.insert_segment_full(&s).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        upgrade_fixture_from(&db, 59);
 
         let state = state();
         let body = serde_json::json!({"heardMs": 600_000,  "id": "esc1", "action": "accept", "text": "دەق یەک" });
