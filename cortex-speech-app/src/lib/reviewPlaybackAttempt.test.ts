@@ -37,6 +37,33 @@ describe('review playback attempt authority', () => {
     expect(Object.isFrozen(retry.intervals)).toBe(true);
   });
 
+  it('exposes only the exact immutable pending attempt until that authority is resolved', () => {
+    const ledger = new ReviewPlaybackAttemptLedger();
+    const mutableIntervals = [{ startMs: 0, endMs: 875 }];
+    const frozen = ledger.snapshot({
+      segmentId: 'seg-pending',
+      baseRevision: 19,
+      playbackReceiptId: 'receipt-pending',
+      mediaGrantId: 'grant-pending',
+      intervals: mutableIntervals,
+    });
+
+    mutableIntervals[0].endMs = 999;
+    expect(ledger.pendingAttempt('seg-pending', 19)).toBe(frozen);
+    expect(ledger.pendingAttempt('seg-pending', 19)).toEqual({
+      segmentId: 'seg-pending',
+      baseRevision: 19,
+      playbackReceiptId: 'receipt-pending',
+      mediaGrantId: 'grant-pending',
+      intervals: [{ startMs: 0, endMs: 875 }],
+    });
+    expect(ledger.pendingAttempt('seg-pending', 20)).toBeNull();
+    expect(ledger.pendingAttempt('another-segment', 19)).toBeNull();
+
+    ledger.resolve('seg-pending', 19);
+    expect(ledger.pendingAttempt('seg-pending', 19)).toBeNull();
+  });
+
   it('issues a fresh snapshot only after the prior authority is resolved', () => {
     const ledger = new ReviewPlaybackAttemptLedger();
     const base = {
@@ -82,19 +109,21 @@ describe('review playback attempt authority', () => {
 
   it('retires only typed server-attested non-commits and keeps every ambiguous outcome frozen', () => {
     for (const code of [
+      'INVALID_PLAYBACK_RECEIPT',
       'INVALID_MEDIA_GRANT',
+      'NO_PLAYBACK_EVIDENCE',
       'PLAYBACK_COVERAGE_INSUFFICIENT',
-      'PLAYBACK_TIME_IMPLAUSIBLE',
       'PLAYBACK_REVISION_CHANGED',
       'PLAYBACK_EVIDENCE_CHANGED',
-      'PLAYBACK_SESSION_EXPIRED',
-      'PLAYBACK_MEDIA_GRANT_UNAVAILABLE',
     ]) {
       expect(isProvenUncommittedPlaybackFinalization({ schema: 1, code })).toBe(true);
     }
     for (const error of [
       new Error('transport lost'),
       { schema: 1, code: 'DATABASE_BUSY' },
+      { schema: 1, code: 'PLAYBACK_TIME_IMPLAUSIBLE' },
+      { schema: 1, code: 'PLAYBACK_MEDIA_GRANT_UNAVAILABLE' },
+      { schema: 1, code: 'PLAYBACK_SESSION_EXPIRED' },
       { schema: 1, code: 'PLAYBACK_PROOF_FAILED' },
       { schema: 1, code: 'PLAYBACK_AUTHORITY_MISMATCH' },
       { schema: 1, code: 'COMMIT_OUTCOME_UNKNOWN' },
@@ -179,5 +208,28 @@ describe('review playback attempt authority', () => {
         intervals: [{ startMs: 0, endMs: 850 }],
       }),
     ).toMatchObject({ playbackReceiptId: 'receipt-256' });
+  });
+
+  it('does not exhaust capacity after one thousand proven-uncommitted attempts are retired', () => {
+    const ledger = new ReviewPlaybackAttemptLedger();
+    for (let index = 0; index < 1_000; index += 1) {
+      ledger.snapshot({
+        segmentId: `refused-${index}`,
+        baseRevision: index,
+        playbackReceiptId: `receipt-${index}`,
+        mediaGrantId: `grant-${index}`,
+        intervals: [{ startMs: 0, endMs: 850 }],
+      });
+      ledger.resolve(`refused-${index}`, index);
+    }
+    expect(
+      ledger.snapshot({
+        segmentId: 'after-refusals',
+        baseRevision: 1_001,
+        playbackReceiptId: 'fresh-receipt',
+        mediaGrantId: 'fresh-grant',
+        intervals: [{ startMs: 0, endMs: 850 }],
+      }),
+    ).toMatchObject({ playbackReceiptId: 'fresh-receipt' });
   });
 });
