@@ -12045,3 +12045,30 @@ on `origin/public/clean-release`.
 Honest status before the iteration-5 remeasurement: the product chunk is green and pushed, but no
 new coverage delta is claimed until the exact pinned all-target run finishes. Production and
 scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 6: immutable legacy decision baseline
+
+Iteration 5's exact clean-SHA measurement at ledger commit `bf298d6fe1b07e1bc9312b52dde66eb0d0964b3e`
+passed 1,818 library tests with 0 failures and 8 ignores, reliability 23/23, soak 1/1, Tauri
+integration 1/1, shell smoke 1/1, user-data 2/2, and all Criterion targets. Overall branch coverage
+moved 59.43% to 59.46%; restore moved 60.03% to 60.36%, reducing uncovered restore branches from
+602 to 597. P1 remains red, P2 green, and P0 unknown because the production heartbeat is absent.
+
+The next dense uncovered cluster was the first post-v60 decision's binding to its immutable reviewed
+schema-59 origin. The regression builds that authority through the real rollback/migrate path,
+validates the exact migrated terminal state, records a phone decision through the production writer,
+then applies eight one-field prior-state corruptions: verified flag, annotated transcript, verdict,
+verdict transcript, escalation, human decision, correction timestamp, and reviewer. Every corruption
+is proven to apply, must produce the exact legacy-baseline refusal, and is reset before the full chain
+is revalidated.
+
+The first draft also changed `prior_rationale`; its focused run failed because that field is correctly
+rejected earlier by the effect identity boundary. That case was removed rather than misreported as
+legacy-baseline coverage. The corrected focused proof passed 1/1, and the complete restore-effects
+suite passed 20/20. Installed stable rustfmt passed its exact check; installed stable Clippy passed all
+targets/features with `-D warnings`. Product commit `a3d59363` was pushed and independently matched on
+`origin/public/clean-release`.
+
+Honest status before the iteration-6 remeasurement: the corrected product chunk is green and pushed,
+but no new coverage delta is claimed until the exact pinned all-target run finishes. Production and
+scheduled tasks were untouched.
