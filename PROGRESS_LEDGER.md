@@ -12324,3 +12324,20 @@ rustfmt passed; installed stable Clippy passed all targets/features with `-D war
 Honest status before the iteration-15 remeasurement: the product chunk is green, but no new coverage
 delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
 and P2 remains green. Production and scheduled tasks were untouched.
+
+The first exact iteration-15 measurement at pushed ledger commit
+`b34c0b71b3bc3aeb1e6b7ce7ba31545e0a6127eb` completed 1,828 library tests with 0 failures and 8
+ignores plus the same green E2E, reliability, soak, Tauri, shell, user-data, and Criterion matrix.
+The artifact (`aa7ffbfe9eef41b699b7b4752192d2e4`, SHA-256
+`6e90c1146ff3f654acde6d284da946be0e7b880a596aefa3f975abeaf3de9c58`) proved only nine of the ten
+targeted correction branches turned green: overall branches reached 60.28%, restore reached 67.46%
+(499 → 490 uncovered), and the active effects target moved 100 → 91. The noncanonical correction
+audio hash was correctly intercepted by the earlier retained-segment hash-equality guard, so the
+initial fixture did not prove the later canonical-hash condition.
+
+Follow-up product commit `5830cbf8361c63754ae85dc7942fcfdc367a0bda` repairs that proof without
+weakening either guard: it corrupts the retained segment and correction hash together under the
+restored-file threat model, preserving their equality so canonicality owns the refusal. The repaired
+focused proof passed 1/1, restore effects passed 29/29, and strict stable Clippy/rustfmt passed. The
+first artifact is retained as evidence of the caught miss; no final iteration-15 delta is claimed
+until a new exact pinned all-target run measures the follow-up commit.
