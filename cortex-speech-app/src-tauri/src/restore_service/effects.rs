@@ -2612,6 +2612,41 @@ mod tests {
     }
 
     #[test]
+    fn every_uncovered_flag_identity_field_is_refused_at_its_own_boundary() {
+        let corruptions = [
+            ("nonpositive effect id", "UPDATE review_flag_effect_events SET id = 0"),
+            ("noncanonical operation id", "UPDATE review_flag_effect_events SET operation_id = 'NOT-A-CANONICAL-UUID'"),
+            ("blank segment id", "UPDATE review_flag_effect_events SET segment_id = '   '"),
+            ("nonconsecutive flag revision", "UPDATE review_flag_effect_events SET flag_revision = prior_revision + 2"),
+            ("blank flag rationale", "UPDATE review_flag_effect_events SET flag_rationale = '   '"),
+            (
+                "noncanonical flag rationale",
+                "UPDATE review_flag_effect_events SET flag_rationale = '  genuine concern  '",
+            ),
+            ("invalid prior escalation", "UPDATE review_flag_effect_events SET prior_escalated = 2"),
+        ];
+
+        for (label, sabotage) in corruptions {
+            let db = seeded_db("flag-identity-fields");
+            db.record_review_flag("flag-identity-fields", "genuine concern", &canonical_operation(469)).unwrap();
+            validate_review_effect_semantics(&db).expect("the genuine review-flag effect must validate first");
+
+            db.connection().execute("DROP TRIGGER review_flag_effect_events_immutable_update", []).unwrap();
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+            assert_eq!(
+                db.connection().execute(sabotage, []).unwrap(),
+                1,
+                "{label}: the corruption must apply, or the refusal proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("violates its immutable revision/operation identity"),
+                "{label}: expected the exact flag-identity refusal, got: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn an_effect_whose_post_decision_text_is_not_canonical_is_refused() {
         // The decision transcript IS the reviewer's paid output. A blank one, or one that
         // disagrees with the annotated transcript the dataset actually serves, means the row no
