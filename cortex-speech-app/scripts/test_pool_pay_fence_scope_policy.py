@@ -80,8 +80,39 @@ def test_decision_fence_is_scoped_to_the_unpaid_second_pass() -> None:
     print("[OK] the pay fence is scoped to the unpaid second-pass branch and answers 503")
 
 
+def test_blinded_second_pass_campaign_is_also_fenced() -> None:
+    """The campaign's blinded second pass had the SAME defect with NO fence at all: it demands full
+    playback evidence, then records only `independent_review_decisions` — `review_campaign.rs` never
+    writes `review_compensation_ledger` — so activating a second pass would take evidenced work for
+    free with every request answering 200 (2026-08-30 audit). Pin the fence inside the
+    `is_blinded_second_pass` branch, production-only (cfg(test) keeps the lifecycle tests on the real
+    recording path)."""
+    text = _read("decisions.rs")
+    # The ROUTING branch specifically — `is_blinded_second_pass` also appears in the recorder's own
+    # revalidation and in the undo route, and the first raw find() landed there instead.
+    branch = text.find("early_campaign.as_ref().filter(|policy| policy.is_blinded_second_pass())")
+    if branch < 0:
+        raise AssertionError("the blinded second-pass routing branch is gone from couch/decisions.rs")
+    tail = text[branch:branch + 1500]
+    if FENCE not in tail:
+        raise AssertionError(
+            "the blinded second-pass branch lost its pay fence — record_independent_decision never "
+            "writes review_compensation_ledger, so serving it takes playback-evidenced work for free"
+        )
+    if not re.search(r"err_reply\(\s*503", tail):
+        raise AssertionError("the second-pass pay refusal must answer 503, the retryable operational code")
+    campaign = (SRC.parent / "review_campaign.rs").read_text(encoding="utf-8")
+    if "review_compensation_ledger" in campaign and "never writes" not in campaign:
+        raise AssertionError(
+            "review_campaign.rs now touches review_compensation_ledger — if a second-pass pay contract "
+            "landed, this fence pin and the fence itself must be retired TOGETHER, deliberately"
+        )
+    print("[OK] the blinded second-pass branch carries the pay fence and answers 503")
+
+
 if __name__ == "__main__":
     test_startup_does_not_refuse_on_a_pool_row()
     test_decision_fence_is_scoped_to_the_unpaid_second_pass()
+    test_blinded_second_pass_campaign_is_also_fenced()
     print("PASS: pool pay-fence scope policy")
     sys.exit(0)

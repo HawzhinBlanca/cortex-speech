@@ -260,6 +260,7 @@ pub(super) fn operation_result_after_write_failure(
     }
 }
 
+#[cfg(test)]
 pub(super) fn api_independent_decision(
     db: &Database,
     parsed: &DecisionBody,
@@ -809,7 +810,25 @@ pub(super) fn api_decision_authenticated(
         Err(error) => return err_reply(503, &error),
     };
     if let Some(campaign) = early_campaign.as_ref().filter(|policy| policy.is_blinded_second_pass()) {
+        // Same law as the pool fence above, same shape: `record_independent_decision` never writes
+        // `review_compensation_ledger`, so a blinded second-pass decision is playback-evidenced,
+        // durable semantic work that would earn exactly NOTHING — and unlike the pool branch this
+        // path had no fence at all, so the moment a second pass activated, up to eight reviewers
+        // would work unpaid with every request returning 200 (2026-08-30 audit). It fails closed
+        // until an owner-approved second-pass pay contract writes the ledger. cfg(test) passes
+        // through so the campaign lifecycle tests keep exercising the real recording path.
+        #[cfg(test)]
         return api_independent_decision(db, &parsed, reviewer, session_binding_sha256, state, campaign);
+        #[cfg(not(test))]
+        {
+            let _ = campaign;
+            return err_reply(
+                503,
+                &format!(
+                    "{PAY_POLICY_REQUIRED}: blinded second-pass decisions are disabled until a pay contract exists"
+                ),
+            );
+        }
     }
 
     // Validate and look up a supplied operation identity before consulting mutable corpus state. An

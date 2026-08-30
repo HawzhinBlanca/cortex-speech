@@ -1,8 +1,11 @@
 //! Durable operating contract for a sequential paid-review campaign.
 //!
 //! The first pass is intentionally not a final dataset: one named reviewer works the full bound
-//! focus, every decision remains attributable and payable, and every export/training boundary stays
-//! closed until an independent second pass is implemented and completed.  The policy lives inside
+//! focus, every decision remains attributable, and every export/training boundary stays
+//! closed until an independent second pass is implemented and completed. Second-pass decisions are
+//! NOT yet payable — this module never writes `review_compensation_ledger`, which is why the couch
+//! decision route fails the blinded second pass closed (`PAY_POLICY_REQUIRED`) until an
+//! owner-approved pay contract exists.  The policy lives inside
 //! SQLite's existing `settings` table, so the database and its recovery snapshots cannot separate
 //! reviewer work from the rule that keeps that work provisional.
 

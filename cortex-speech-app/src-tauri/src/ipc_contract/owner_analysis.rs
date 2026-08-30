@@ -750,8 +750,10 @@ mod tests {
 
     #[test]
     fn champion_unavailable_remains_an_exact_public_hard_stop() {
-        let private =
-            format!("{}: worker failed at Z:\\private-vault\\models\\champion", crate::pipeline::ASR_7B_UNAVAILABLE_TAG);
+        let private = format!(
+            "{}: worker failed at Z:\\private-vault\\models\\champion",
+            crate::pipeline::ASR_7B_UNAVAILABLE_TAG
+        );
         let error = public_gold_eval_error(&private);
         assert_eq!(error.code, crate::pipeline::ASR_7B_UNAVAILABLE_TAG);
         assert!(error.message.contains(crate::pipeline::ASR_7B_UNAVAILABLE_TAG));
