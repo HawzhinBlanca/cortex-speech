@@ -2015,6 +2015,64 @@ mod tests {
     }
 
     #[test]
+    fn every_uncovered_post_v60_memory_baseline_field_is_refused() {
+        let corruptions = [
+            ("noncanonical memory id", "UPDATE correction_memory SET id = 'not-a-uuid' WHERE id = ?1"),
+            ("blank wrong token", "UPDATE correction_memory SET wrong_token = '   ' WHERE id = ?1"),
+            ("blank human token", "UPDATE correction_memory SET human_token = '   ' WHERE id = ?1"),
+            ("blank slot key", "UPDATE correction_memory SET slot_key = '   ' WHERE id = ?1"),
+            (
+                "equivalent wrong and human tokens",
+                "UPDATE correction_memory SET human_token = wrong_token WHERE id = ?1",
+            ),
+            ("nonfinite confidence", "UPDATE correction_memory SET confidence = 9e999 WHERE id = ?1"),
+            ("nonbaseline confidence", "UPDATE correction_memory SET confidence = 0.6 WHERE id = ?1"),
+            ("nonzero confirmation baseline", "UPDATE correction_memory SET confirm_count = 1 WHERE id = ?1"),
+            ("nonzero override baseline", "UPDATE correction_memory SET override_count = 1 WHERE id = ?1"),
+            (
+                "premature fired-at baseline",
+                "UPDATE correction_memory SET last_fired_at = '2026-08-30 00:00:00' WHERE id = ?1",
+            ),
+            ("missing capture", "DELETE FROM correction_memory_contributions WHERE memory_id = ?1"),
+            (
+                "capture without its origin effect",
+                "UPDATE correction_memory_contributions SET effect_event_id = effect_event_id + 100000 WHERE memory_id = ?1",
+            ),
+        ];
+
+        for (label, sabotage) in corruptions {
+            let db = seeded_db("post-v60-memory-baseline");
+            decided(&db, "post-v60-memory-baseline", 470);
+            let memory_id: String = db
+                .connection()
+                .query_row("SELECT id FROM correction_memory WHERE legacy_seed = 0 ORDER BY id LIMIT 1", [], |row| {
+                    row.get(0)
+                })
+                .expect("a genuine edit must create at least one post-v60 correction memory");
+            validate_review_effect_semantics(&db).expect("the genuine post-v60 memory must validate first");
+
+            for trigger in [
+                "correction_memory_v60_baseline_immutable_update",
+                "correction_memory_contributions_immutable_update",
+                "correction_memory_contributions_immutable_delete",
+            ] {
+                db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).unwrap();
+            }
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+            assert_eq!(
+                db.connection().execute(sabotage, [&memory_id]).unwrap(),
+                1,
+                "{label}: the corruption must apply, or the refusal proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("lacks its zero-baseline capture identity"),
+                "{label}: expected the exact post-v60 baseline refusal, got: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn correction_memory_contributions_refuse_every_invalid_action_or_evidence_shape() {
         // These rows drive the live corrector and therefore may not be detached from an existing
         // memory/effect, invent impossible deltas, capture on a non-edit, or claim an outcome
