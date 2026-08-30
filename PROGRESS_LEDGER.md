@@ -12341,3 +12341,37 @@ restored-file threat model, preserving their equality so canonicality owns the r
 focused proof passed 1/1, restore effects passed 29/29, and strict stable Clippy/rustfmt passed. The
 first artifact is retained as evidence of the caught miss; no final iteration-15 delta is claimed
 until a new exact pinned all-target run measures the follow-up commit.
+
+## 2026-08-31 — Reliability iteration 16: exhaustive typed-desktop operation fields
+
+The repaired exact iteration-15 measurement at pushed ledger commit
+`dc08e85f98461c2c98288ca01a3c7b431b3a8ad8` completed 1,828 library tests with 0 failures and 8
+ignores, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell smoke 1/1,
+user-data 2/2, and all Criterion targets. The certifying wrapper exited red solely because the
+locked coverage thresholds remain unmet. The final artifact (`5a5c6aa8c94f4dee89375f9a4e40a281`,
+SHA-256 `1fcaeabcfe55f052c49e4dfd7ec56071e0b6f5053d9a3881ed4da56e893a5243`) proved all ten intended
+correction conditions green. Overall branches reached 60.30%; restore reached 67.53%, reducing
+uncovered restore branches from 499 to 489, and the active effects target moved 100 to 90. The same
+run measured IPC at 42.61% (438/1,028) while the first iteration-15 run measured 42.80% (440/1,028)
+without an IPC code change; that two-branch difference is retained as coverage-run variance rather
+than misreported as a product regression. P1 remains red, P2 green, and P0 unknown because the
+production heartbeat is absent.
+
+The next reachable LLVM cluster contained five unproved inner conditions in the typed-desktop
+operation boundary. The new table-driven regression begins with the exact v1 desktop-effect shape,
+including its production digest formula and playback authority, proves the clean row validates, then
+independently supplies a noncanonical operation UUID, noncanonical payload hash, nonpositive request
+timestamp, unnormalized requested text, or empty requested text. Existing tests already own tuple
+presence and payload equality; the new cases use present but invalid values so each inner semantic
+guard owns its refusal. Larger-looking phone-link and retained-current-state clusters were excluded
+because earlier exact guards already prove the same equalities, making their later failure arms
+unreachable without weakening validation.
+
+The focused proof passed 1/1 across all five mutations and the complete restore-effects suite passed
+30/30. Installed stable rustfmt passed; installed stable Clippy passed all targets/features with
+`-D warnings`. Product commit `adf1dfb35841c3f61d1c19f90173cec382c9e88c` is ready for the
+ledger commit and exact push.
+
+Honest status before the iteration-16 remeasurement: the product chunk is green, but no coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
