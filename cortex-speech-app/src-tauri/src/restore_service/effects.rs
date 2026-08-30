@@ -2560,6 +2560,58 @@ mod tests {
     }
 
     #[test]
+    fn every_remaining_effect_identity_field_is_refused_at_its_own_boundary() {
+        let corruptions = [
+            ("nonpositive effect id", "UPDATE human_decision_effect_events SET id = 0"),
+            ("blank segment id", "UPDATE human_decision_effect_events SET segment_id = '   '"),
+            (
+                "nonconsecutive decision revision",
+                "UPDATE human_decision_effect_events SET decision_revision = prior_revision + 2",
+            ),
+            ("nondecision action", "UPDATE human_decision_effect_events SET action = 'skip'"),
+            ("invalid decision verified", "UPDATE human_decision_effect_events SET decision_verified = 2"),
+            ("invalid prior verified", "UPDATE human_decision_effect_events SET prior_verified = 2"),
+            ("invalid prior escalation", "UPDATE human_decision_effect_events SET prior_escalated = 2"),
+            (
+                "decision rationale drifts from prior",
+                "UPDATE human_decision_effect_events SET decision_rationale = 'forged rationale'",
+            ),
+            ("empty served transcript", "UPDATE human_decision_effect_events SET served_transcript = ''"),
+            (
+                "noncanonical served transcript",
+                "UPDATE human_decision_effect_events SET served_transcript = '  machine draft  '",
+            ),
+        ];
+
+        for (label, sabotage) in corruptions {
+            let db = seeded_db("desktop-identity-fields");
+            let authority = "11111111-2222-4333-8444-555555555555";
+            let prior_revision = db.segment_review_revision("desktop-identity-fields").unwrap().unwrap();
+            let genuine = crate::db::desktop_review_v1_payload_hash(
+                "desktop-identity-fields",
+                prior_revision,
+                "edit",
+                Some("desktop corrected"),
+                authority,
+            );
+            insert_typed_desktop_effect(&db, "desktop-identity-fields", authority, &genuine);
+            validate_review_effect_semantics(&db).expect("the genuine typed desktop effect must validate first");
+
+            unlock_effects(&db);
+            assert_eq!(
+                db.connection().execute(sabotage, []).unwrap(),
+                1,
+                "{label}: the corruption must apply, or the refusal proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("violates its immutable identity/revision boundary"),
+                "{label}: expected the exact effect-identity refusal, got: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn an_effect_whose_post_decision_text_is_not_canonical_is_refused() {
         // The decision transcript IS the reviewer's paid output. A blank one, or one that
         // disagrees with the annotated transcript the dataset actually serves, means the row no
