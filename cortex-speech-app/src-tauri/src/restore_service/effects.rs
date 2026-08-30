@@ -2988,6 +2988,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn every_uncovered_effect_bound_agent_example_field_is_refused() {
+        let corruptions = [
+            ("noncanonical example id", "UPDATE agent_examples SET id = 'not-a-canonical-uuid' WHERE effect_event_id IS NOT NULL"),
+            (
+                "example crosses its segment boundary",
+                "UPDATE agent_examples SET segment_id = 'another-segment' WHERE effect_event_id IS NOT NULL",
+            ),
+            (
+                "example is attached to a non-edit effect",
+                "UPDATE review_events SET action = 'accept' WHERE id = (SELECT review_event_id FROM human_decision_effect_events LIMIT 1);
+                 UPDATE review_compensation_ledger SET effective_decision = 'accept' WHERE review_event_id IS NOT NULL;
+                 UPDATE human_decision_effect_events SET action = 'accept'",
+            ),
+            ("nonhuman example source", "UPDATE agent_examples SET source = 'model' WHERE effect_event_id IS NOT NULL"),
+            (
+                "example is not human verified",
+                "UPDATE agent_examples SET verified_by_human = 0 WHERE effect_event_id IS NOT NULL",
+            ),
+            ("blank wrong transcript", "UPDATE agent_examples SET wrong_transcript = '' WHERE effect_event_id IS NOT NULL"),
+            ("blank human fix", "UPDATE agent_examples SET human_fix = '' WHERE effect_event_id IS NOT NULL"),
+            (
+                "learning-equivalent wrong and fix",
+                "UPDATE agent_examples SET wrong_transcript = human_fix WHERE effect_event_id IS NOT NULL",
+            ),
+            (
+                "wrong side is not rederived from retained speech",
+                "UPDATE agent_examples SET wrong_transcript = 'different machine draft' WHERE effect_event_id IS NOT NULL",
+            ),
+            (
+                "example disagrees with its correction row",
+                "UPDATE corrections SET raw_hypothesis = 'different correction draft' WHERE effect_event_id IS NOT NULL",
+            ),
+        ];
+
+        for (label, sabotage) in corruptions {
+            let db = seeded_db("agent-example-fields");
+            decided(&db, "agent-example-fields", 425);
+            let row_counts: (i64, i64) = db
+                .connection()
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM agent_examples WHERE effect_event_id IS NOT NULL),
+                         (SELECT COUNT(*) FROM corrections WHERE effect_event_id IS NOT NULL)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(row_counts, (1, 1), "{label}: the genuine edit must write both learning rows");
+            validate_review_effect_semantics(&db).expect("the genuine edit learning rows must validate first");
+
+            for trigger in [
+                "agent_examples_v60_effect_immutable_update",
+                "corrections_v60_effect_immutable_update",
+                "human_decision_effect_events_immutable_update",
+                "review_compensation_ledger_immutable_update",
+                "review_events_v60_post_cutoff_immutable_update",
+                "review_events_v60_provenance_immutable_update",
+                "review_event_operation_immutable_update",
+            ] {
+                db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).unwrap();
+            }
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+            db.connection().execute_batch(sabotage).unwrap();
+
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("is not one genuine human edit"),
+                "{label}: expected the exact effect-bound example refusal, got: {error}"
+            );
+        }
+    }
+
     /// A paid phone decision that was then undone through the production APIs, exactly as
     /// `couch::api_undo` does it. Returns the effect id the reversal hangs off.
     fn decided_then_undone(db: &Database, id: &str, decide_index: u64, undo_index: u64) -> i64 {
