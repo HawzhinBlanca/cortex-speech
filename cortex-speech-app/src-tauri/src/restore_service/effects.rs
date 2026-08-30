@@ -2015,6 +2015,103 @@ mod tests {
     }
 
     #[test]
+    fn correction_memory_contributions_refuse_every_invalid_action_or_evidence_shape() {
+        // These rows drive the live corrector and therefore may not be detached from an existing
+        // memory/effect, invent impossible deltas, capture on a non-edit, or claim an outcome
+        // without its firing timestamp. Each case starts from one genuine accepted phone decision
+        // plus one legitimate migrated memory, then inserts exactly one restored-file corruption.
+        let cases = [
+            ("missing effect", true, false, 0, 1, 0, Some("2026-08-30 00:00:00"), "names a missing effect"),
+            (
+                "missing memory",
+                false,
+                true,
+                0,
+                1,
+                0,
+                Some("2026-08-30 00:00:00"),
+                "violates its action/evidence identity",
+            ),
+            ("out-of-range capture", false, false, 2, 0, 0, None, "violates its action/evidence identity"),
+            ("zero contribution", false, false, 0, 0, 0, None, "violates its action/evidence identity"),
+            (
+                "simultaneous confirm and override",
+                false,
+                false,
+                0,
+                1,
+                1,
+                Some("2026-08-30 00:00:00"),
+                "violates its action/evidence identity",
+            ),
+            ("capture on accept", false, false, 1, 0, 0, None, "violates its action/evidence identity"),
+            ("confirm without fired-at", false, false, 0, 1, 0, None, "violates its action/evidence identity"),
+            ("blank fired-at", false, false, 0, 0, 1, Some("   "), "violates its action/evidence identity"),
+        ];
+
+        for (label, missing_effect, missing_memory, capture, confirm, override_delta, fired_at, expected) in cases {
+            let db = seeded_db("contribution-boundary");
+            let revision = db.segment_review_revision("contribution-boundary").unwrap().unwrap();
+            db.record_phone_human_decision_by_at_revision_with_operation(
+                "contribution-boundary",
+                "accept",
+                Some("machine draft"),
+                "Reviewer",
+                revision,
+                &canonical_operation(460),
+                &crate::db::review_operation_payload_hash(
+                    "contribution-boundary",
+                    "accept",
+                    "machine draft",
+                    "Reviewer",
+                ),
+            )
+            .unwrap()
+            .unwrap();
+            let effect_id: i64 = db
+                .connection()
+                .query_row("SELECT MAX(id) FROM human_decision_effect_events", [], |row| row.get(0))
+                .unwrap();
+
+            db.connection().execute("DROP TRIGGER correction_memory_v60_seed_validate_insert", []).unwrap();
+            db.connection()
+                .execute(
+                    "INSERT INTO correction_memory
+                        (id, wrong_token, human_token, slot_key, phonetic_key, legacy_seed)
+                     VALUES ('00000000-0000-4000-8000-000000000902',
+                             'known-wrong', 'known-fix', 'known|slot', 'known', 1)",
+                    [],
+                )
+                .unwrap();
+            validate_review_effect_semantics(&db).expect("the genuine decision and legacy memory must validate first");
+
+            db.connection().execute("DROP TRIGGER correction_memory_contributions_effect_validate_insert", []).unwrap();
+            db.connection().execute_batch("PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;").unwrap();
+            let inserted_effect = if missing_effect { effect_id + 100_000 } else { effect_id };
+            let inserted_memory = if missing_memory {
+                "00000000-0000-4000-8000-000000009999"
+            } else {
+                "00000000-0000-4000-8000-000000000902"
+            };
+            assert_eq!(
+                db.connection()
+                    .execute(
+                        "INSERT INTO correction_memory_contributions
+                            (effect_event_id, memory_id, capture_delta, confirm_delta, override_delta, fired_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![inserted_effect, inserted_memory, capture, confirm, override_delta, fired_at],
+                    )
+                    .unwrap(),
+                1,
+                "{label}: the corruption must apply, or the refusal proves nothing"
+            );
+
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
+        }
+    }
+
+    #[test]
     fn a_forged_effect_on_a_non_decision_event_is_refused() {
         // A skip is not a decision: it pays nothing and must leave no human-decision effect. Forging
         // one would invent paid, reviewed truth for a clip nobody judged — so the trigger is dropped
