@@ -12247,5 +12247,6 @@ authority → audio `Range: bytes=0-1` → **206** → full body 200 (190,124 by
 forwarder green, rollback watch clean. Suites: Rust 1995/0/8, policy 141/141.
 
 Note: the diagnostic claimed one extra session for the reviewer (indistinguishable from them
-reopening their link; expires on the 24 h TTL). The earlier "awapc01" DNS failure during diagnosis
-was a truncated-screenshot typo — the funnel is and was `hawapc01.tail721a13.ts.net`.
+reopening their link; expires on the 24 h TTL). The earlier DNS failure during diagnosis was a
+truncated-screenshot typo in the funnel hostname (the screenshot's URL bar had cut its first
+character); the funnel itself was healthy throughout.

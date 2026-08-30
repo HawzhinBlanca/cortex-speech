@@ -1225,10 +1225,19 @@ def _fn_fuzz_smoke():
 
 
 PROFILE_OWNER = "owner-product"
+# The machine's ACTUAL production duty: owner-product plus the seven reviewer-serving gates
+# (links, queues, spot-check pool, compensation readiness, review-mode certification, playback
+# enforcement, supervision). Added 2026-08-31 because the default profile deliberately scoped to
+# "one desktop user" while up to eight paid phone reviewers are what this workstation serves — a
+# green owner-product sweep said nothing about them (audit finding, adversarially confirmed).
+# Deliberately additive: owner campaigns and deployment proof phases stay pinned to owner-product
+# (their validators hard-require it); this profile CONSUMES the same owner evidence classes and
+# adds live serving proof on top. It carries none of the Windows signing/VM/pilot classes.
+PROFILE_REVIEW = "owner-review-product"
 PROFILE_WINDOWS = "windows-product"
 PROFILE_MODEL = "model-evidence"
 PROFILE_FULL = "full-charter"
-PROFILES = frozenset({PROFILE_OWNER, PROFILE_WINDOWS, PROFILE_MODEL, PROFILE_FULL})
+PROFILES = frozenset({PROFILE_OWNER, PROFILE_REVIEW, PROFILE_WINDOWS, PROFILE_MODEL, PROFILE_FULL})
 
 PENDING_EXTERNAL = "PENDING_EXTERNAL"
 EVIDENCE_VERIFIED = "VERIFIED"
@@ -1337,7 +1346,7 @@ class EvidenceClassSpec:
     description: str
 
 
-_OWNER_EVIDENCE = frozenset({PROFILE_OWNER, PROFILE_WINDOWS, PROFILE_FULL})
+_OWNER_EVIDENCE = frozenset({PROFILE_OWNER, PROFILE_REVIEW, PROFILE_WINDOWS, PROFILE_FULL})
 _WINDOWS_EVIDENCE = frozenset({PROFILE_WINDOWS, PROFILE_FULL})
 _MODEL_EVIDENCE = frozenset({PROFILE_MODEL, PROFILE_FULL})
 
@@ -1449,6 +1458,7 @@ EVIDENCE_CLASSES: tuple[EvidenceClassSpec, ...] = (
 # classes whose hashes must be carried by ProductAttestationV1.
 PROFILE_REQUIRED_RELEASE_ARTIFACT_ROLES: dict[str, tuple[str, ...]] = {
     PROFILE_OWNER: ("application-executable",),
+    PROFILE_REVIEW: ("application-executable",),
     PROFILE_WINDOWS: (
         "application-executable",
         "windows-msi",
@@ -1677,27 +1687,39 @@ def _profiles_for_gate(name: str, tier: int) -> frozenset[str]:
         profiles.add(PROFILE_WINDOWS)
         if name not in OWNER_PRODUCT_EXCLUDED_GATE_IDS:
             profiles.add(PROFILE_OWNER)
+        # The review profile is owner-product's 48 PLUS the seven reviewer-serving gates. Only
+        # branch-protection stays out: it proves GitHub server state, not this workstation's duty.
+        if name != "branch-protection":
+            profiles.add(PROFILE_REVIEW)
     return frozenset(profiles)
 
 
 def _timeout_for_gate(name: str, kind: str) -> int:
     """Explicit provisional budgets; certification remains blocked until three baselines calibrate them."""
 
-    if kind == "fn":
-        return 120
-    return {
+    # KNOWN COLLISION, deliberately left visible (2026-08-31): `fuzz-smoke` is an fn gate, so the
+    # short-circuit below gives it 120 s — while its body runs `cargo fuzz list` (180 s internal),
+    # a cold ASAN `cargo fuzz build` (3_600 s internal) and 30 s per target. Its old 1_200 s table
+    # entry was DEAD CODE behind this short-circuit, and honoring it pushes the full-charter budget
+    # 1_020 s over the charter's six-hour ceiling. Re-budgeting the whole registry is a calibration
+    # decision, not a midnight edit: the gate stays at its historical effective 120 s, will red
+    # honestly on any cold fuzz build, and the three-baseline calibration chain is the instrument
+    # that must resize it (together with an owner call on the 6 h cap).
+    explicit = {
         "python-policies": 1_500,
         "test-rust": 1_800,
         "clippy": 900,
         "test-e2e+a11y": 900,
         "real-app-e2e": 900,
-        "fuzz-smoke": 1_200,
         "pipeline-ipc-e2e": 900,
         "durability-drill": 1_200,
         "export-kill-drill": 900,
         "owner-real-media-rust": 1_800,
         "owner-scale-export-rust": 900,
-    }.get(name, 240)
+    }
+    if kind == "fn":
+        return 120
+    return explicit.get(name, 240)
 
 
 GATE_BASE_ENVIRONMENT = (
@@ -10907,7 +10929,7 @@ def _validate_release_artifacts(
     missing = sorted(set(PROFILE_REQUIRED_RELEASE_ARTIFACT_ROLES[profile]) - set(roles))
     if eligible and missing:
         raise EvidenceError(f"certifying proof omits release-artifact roles: {', '.join(missing)}")
-    if eligible and profile in {PROFILE_OWNER, PROFILE_WINDOWS, PROFILE_FULL}:
+    if eligible and profile in {PROFILE_OWNER, PROFILE_REVIEW, PROFILE_WINDOWS, PROFILE_FULL}:
         executable = next(
             (artifact for artifact in value if artifact.get("role") == "application-executable"),
             None,
@@ -11125,7 +11147,7 @@ def _revalidate_latest_release_executable(
     Authenticode/Sigstore validators; this local recheck deliberately makes no claim about them.
     """
 
-    if profile not in {PROFILE_OWNER, PROFILE_WINDOWS, PROFILE_FULL}:
+    if profile not in {PROFILE_OWNER, PROFILE_REVIEW, PROFILE_WINDOWS, PROFILE_FULL}:
         return
     recorded = next(
         (artifact for artifact in value if artifact.get("role") == "application-executable"),
@@ -12123,6 +12145,7 @@ def _profile_verdict(
         return 2, "INCOMPLETE — " + " | ".join(reasons)
     final = {
         PROFILE_OWNER: "CORTEX PRODUCT 10/10 — OWNER WORKSTATION",
+        PROFILE_REVIEW: "CORTEX PRODUCT 10/10 — OWNER WORKSTATION + PAID REVIEW SERVING",
         PROFILE_WINDOWS: "CORTEX PRODUCT 10/10 — WINDOWS 11",
         PROFILE_MODEL: "CORTEX MODEL EVIDENCE — VERIFIED",
         PROFILE_FULL: "CORTEX 10/10: ALL GATES GREEN",
