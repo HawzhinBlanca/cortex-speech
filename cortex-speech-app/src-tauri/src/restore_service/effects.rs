@@ -2360,6 +2360,62 @@ mod tests {
     }
 
     #[test]
+    fn active_decisions_and_flags_require_their_exact_terminal_snapshots() {
+        let decision_db = seeded_db("decision-active-terminal");
+        decided(&decision_db, "decision-active-terminal", 467);
+        validate_review_effect_semantics(&decision_db).expect("a genuine active decision must validate first");
+        let decision_corruptions = [
+            (
+                "verdict",
+                "UPDATE speech_segments SET verdict = 'human_accept' WHERE id = 'decision-active-terminal'",
+                "UPDATE speech_segments SET verdict = 'human_edit' WHERE id = 'decision-active-terminal'",
+            ),
+            (
+                "escalation",
+                "UPDATE speech_segments SET escalated = 1 WHERE id = 'decision-active-terminal'",
+                "UPDATE speech_segments SET escalated = 0 WHERE id = 'decision-active-terminal'",
+            ),
+        ];
+        for (label, sabotage, restore) in decision_corruptions {
+            assert_eq!(decision_db.connection().execute(sabotage, []).unwrap(), 1, "{label}: corruption must apply");
+            let error = validate_review_effect_semantics(&decision_db).unwrap_err();
+            assert!(
+                error.contains("disagrees with its latest active human-decision effect"),
+                "{label}: expected the exact active-decision refusal, got: {error}"
+            );
+            assert_eq!(decision_db.connection().execute(restore, []).unwrap(), 1, "{label}: reset must apply");
+            validate_review_effect_semantics(&decision_db)
+                .expect("each decision reset must restore the exact terminal state");
+        }
+
+        let flag_db = seeded_db("flag-active-terminal");
+        flag_db.record_review_flag("flag-active-terminal", "genuine concern", &canonical_operation(468)).unwrap();
+        validate_review_effect_semantics(&flag_db).expect("a genuine active flag must validate first");
+        let flag_corruptions = [
+            (
+                "verdict",
+                "UPDATE speech_segments SET verdict = 'human_edit' WHERE id = 'flag-active-terminal'",
+                "UPDATE speech_segments SET verdict = 'escalated' WHERE id = 'flag-active-terminal'",
+            ),
+            (
+                "escalation",
+                "UPDATE speech_segments SET escalated = 0 WHERE id = 'flag-active-terminal'",
+                "UPDATE speech_segments SET escalated = 1 WHERE id = 'flag-active-terminal'",
+            ),
+        ];
+        for (label, sabotage, restore) in flag_corruptions {
+            assert_eq!(flag_db.connection().execute(sabotage, []).unwrap(), 1, "{label}: corruption must apply");
+            let error = validate_review_effect_semantics(&flag_db).unwrap_err();
+            assert!(
+                error.contains("disagrees with its latest active review-flag effect"),
+                "{label}: expected the exact active-flag refusal, got: {error}"
+            );
+            assert_eq!(flag_db.connection().execute(restore, []).unwrap(), 1, "{label}: reset must apply");
+            validate_review_effect_semantics(&flag_db).expect("each flag reset must restore the exact terminal state");
+        }
+    }
+
+    #[test]
     fn a_forged_effect_on_a_non_decision_event_is_refused() {
         // A skip is not a decision: it pays nothing and must leave no human-decision effect. Forging
         // one would invent paid, reviewed truth for a clip nobody judged — so the trigger is dropped
