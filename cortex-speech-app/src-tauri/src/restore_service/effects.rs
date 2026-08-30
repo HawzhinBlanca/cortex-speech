@@ -2910,6 +2910,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn every_uncovered_review_event_provenance_field_is_refused() {
+        let corruptions = [
+            ("unknown source", "UPDATE review_events SET source = 'forged-source'"),
+            ("unknown action", "UPDATE review_events SET action = 'forged-action'"),
+            ("unknown requested action", "UPDATE review_events SET requested_action = 'forged-request'"),
+            ("noncanonical payload hash", "UPDATE review_events SET operation_payload_hash = 'not-a-hash'"),
+            (
+                "mismatched canonical payload hash",
+                "UPDATE review_events SET operation_payload_hash = '0000000000000000000000000000000000000000000000000000000000000000'",
+            ),
+            ("noncanonical served text", "UPDATE review_events SET served_transcript = '  machine draft  '"),
+            ("negative served revision", "UPDATE review_events SET served_revision = -1"),
+            ("invalid request classification", "UPDATE review_events SET action = 'skip'"),
+            (
+                "nonhex build sha",
+                "UPDATE review_events SET app_git_sha = 'gggggggggggggggggggggggggggggggggggggggg'",
+            ),
+        ];
+
+        for (label, sabotage) in corruptions {
+            let db = seeded_db("event-provenance-fields");
+            decided(&db, "event-provenance-fields", 471);
+            validate_review_effect_semantics(&db).expect("the genuine review event must validate first");
+            for trigger in [
+                "review_events_v60_post_cutoff_immutable_update",
+                "review_events_v60_provenance_immutable_update",
+                "review_event_operation_immutable_update",
+            ] {
+                db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).unwrap();
+            }
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+            assert_eq!(
+                db.connection().execute(sabotage, []).unwrap(),
+                1,
+                "{label}: the corruption must apply, or the refusal proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("lacks canonical Couch/build/playback provenance"),
+                "{label}: expected the exact event-provenance refusal, got: {error}"
+            );
+        }
+
+        let db = seeded_db("event-provenance-request-text");
+        decided(&db, "event-provenance-request-text", 472);
+        validate_review_effect_semantics(&db).expect("the genuine request text must validate first");
+        for trigger in [
+            "review_events_v60_post_cutoff_immutable_update",
+            "review_events_v60_provenance_immutable_update",
+            "review_event_operation_immutable_update",
+        ] {
+            db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).unwrap();
+        }
+        let noncanonical_request = "  corrected text  ";
+        let matching_hash = crate::db::review_operation_payload_hash(
+            "event-provenance-request-text",
+            "edit",
+            noncanonical_request,
+            "Reviewer",
+        );
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "UPDATE review_events SET requested_transcript = ?1, operation_payload_hash = ?2",
+                    rusqlite::params![noncanonical_request, matching_hash],
+                )
+                .unwrap(),
+            1,
+            "the noncanonical request and its matching hash must both apply"
+        );
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(
+            error.contains("lacks canonical Couch/build/playback provenance"),
+            "expected the request-text canonicality refusal, got: {error}"
+        );
+    }
+
     /// A paid phone decision that was then undone through the production APIs, exactly as
     /// `couch::api_undo` does it. Returns the effect id the reversal hangs off.
     fn decided_then_undone(db: &Database, id: &str, decide_index: u64, undo_index: u64) -> i64 {
