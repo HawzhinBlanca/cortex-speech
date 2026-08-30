@@ -12155,3 +12155,37 @@ real-environment forwarder run back to exit 0; full policy suite 141/141, exit f
 Honest status: **the machinery fixes are code-verified and test-covered but have not yet run a
 REAL handover; the next deploy from this branch is their first live exercise. The release-dir
 copies of the old scripts still carry the old behavior until then.**
+
+---
+
+## 2026-08-30 — SHIPPED: the reconciled build serves, on schema 69
+
+Readiness step 4. Release `3fbe9a8c2164-848765e79112-61b9f69c47a2-876715ee80e9-363def17e69f`
+(commit `3fbe9a8c`, branch codex/10-10-reconcile-20260830) performed the FIRST live v65→v69
+migration handover at 22:00 and was verified at the serving path, not the pipeline's word:
+
+- Build: `npm run build` green with the bundle budget PASSING (the 8/29 "128 KB red" is stale);
+  `cargo build --release --bins` 11 m 22 s; both binaries verified to bake `3fbe9a8c…` by
+  `grep -a` with a positive control.
+- Stage: clone-preflight PASSED — the 65→69 migration ran on a clone of the live DB and certified
+  (schema 69, 16,990/16,990 pool clips' audio present, rights exact) before anything live moved.
+- Deploy: PRIVATE_PRODUCTION_RELEASE=READY, schema=69, all six reviewer queues proven,
+  reviewReady=True. The step-3 machinery ran it: handover lock held end to end, recovery arm
+  registered before the maintenance marker, arm unregistered on success (verified absent).
+- Serving-path proof (post-READY, independent): active pointer AND the running process both name
+  the new release; live DB at schema 69 with 32,322 segments / 1,293 review_events intact; the
+  review-health probe at 22:03 — all 6 links AUTHENTICATE through the funnel, exact queues
+  (Alle 14,041 / Hawzhin 16,973 / Pavel 16,990 / Roza 14,041 / Rubar 16,599 / Sabat 14,031),
+  link continuity unchanged, vault unchanged; alarm forwarder exit 0; and a 3-minute rollback
+  watch across multiple watchdog cycles — the pointer did not flip (the 77-second silent-revert
+  class was checked for, not assumed away).
+
+Reviewers now get: the restore-validator fixes (backups with undos/desktop reviews restorable),
+the pool-scope + two-different-reviewers consensus export boundary, decision-first queue ordering,
+the full roster-recasing fix, atomic desktop undo, the single-coin pay display, 24-hour sliding
+cookies (the reviewed harder posture — phone cookie sessions older than 24 h will re-auth via
+their original pairing links, which continuity proves all still work), claim hardening, placeholder
+authority, startup recovery surfacing, and the deploy/alarm machinery of steps 2–3.
+
+Honest status: **serving and verified. The old release dirs (5444151a, c1dae8b8) remain on disk
+as rollback fallbacks. Deployed at night with no reviewer mid-session (last decision 13 h prior).**
