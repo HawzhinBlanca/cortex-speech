@@ -12124,3 +12124,32 @@ Product commit `4db34bf942604755633976aba211ae65da3444b9` is ready for the ledge
 Honest status before the iteration-8 remeasurement: the product chunk is green, but no new coverage
 delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
 and P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 9: exhaustive effect identity fields
+
+Iteration 8's exact measurement at ledger commit `fb62fbd48531f76d5caff36c46d829074df4d2dd`
+completed 1,821 library tests with 0 failures and 8 ignores, E2E 10/10, reliability 23/23, soak 1/1,
+Tauri integration 1/1, shell smoke 1/1, user-data 2/2, and all Criterion targets. The first concurrent
+nightly attempt exhausted the Windows pagefile and produced cascading metadata diagnostics; a fresh
+run with `CARGO_BUILD_JOBS=1` preserved the exact source, targets, features, branch instrumentation,
+and thresholds and completed successfully. The certifying wrapper still exited red solely because the
+locked coverage thresholds remain unmet. Overall branch coverage stayed 59.75%; restore moved 62.75%
+to 62.88%, reducing uncovered restore branches from 561 to 559. The active effects function fell from
+162 to 160 uncovered branches. P1 remains red, P2 green, and P0 unknown because the production
+heartbeat is absent.
+
+The new LLVM artifact exposed ten untested fields in the immutable effect identity/revision boundary.
+One table-driven regression starts every case from a genuine typed desktop effect, proves that clean
+state validates, then independently corrupts the effect id, segment id, decision revision, action,
+decision-verified flag, prior-verified flag, prior-escalation flag, rationale continuity, served-text
+presence, or served-text canonical form. Every mutation is proven to apply and must produce the exact
+identity/revision refusal. The typed desktop shape deliberately avoids the earlier Couch event/pay-link
+guard that correctly owns comparable phone-effect failures.
+
+The focused proof passed 1/1 and the complete restore-effects suite passed 23/23. Installed stable
+rustfmt passed its exact check; installed stable Clippy passed all targets/features with `-D warnings`.
+Product commit `f0417be9b70ad00c28cb5193cf65865da03a1582` is ready for the ledger commit and exact push.
+
+Honest status before the iteration-9 remeasurement: the product chunk is green, but no new coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
