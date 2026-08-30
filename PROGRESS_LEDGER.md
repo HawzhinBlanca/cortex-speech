@@ -11959,3 +11959,26 @@ Measured: 1,812/1,812 library tests, 0 failed, 8 ignored. The gate carries an an
 proves a real reviewer name hashes into the forbidden set while a neutral fixture name does not, so
 a future edit cannot leave it asserting nothing. No live database write, no deploy, no reviewer
 restart.
+
+## 2026-08-30 — Reliability iterations 1–2: restore refusal coverage
+
+The pinned robustness scoreboard ranked
+`restore_service::effects::validate_review_effect_semantics` first. Work stayed on
+`public/clean-release` in the isolated `cortex-scrub` worktree; no live database, reviewer service,
+scheduled task, release pointer, model, GPU setting, or production artifact was touched.
+
+- Iteration 1 proved that every noncanonical schema-v60 frontier field and both frontiers claiming
+  nonexistent event/ledger history are refused for the intended reason. Commits `f9566433` and
+  `75ebb3df` were pushed. Exact pinned coverage passed 1,814 library tests with 0 failures and moved
+  restore branches from 58.59% to 58.99% (622 to 616 uncovered); overall branches moved from 59.24%
+  to 59.30%.
+- Iteration 2 took the next uncovered desktop-operation boundary. One table-driven test proves that
+  an unlinked desktop effect is refused if it is relabelled as Couch work, acquires a reviewer, or
+  loses its operation id, payload hash, requested action, or timestamp. Focused result:
+  `test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 1807 filtered out`. Strict
+  all-target/all-feature Clippy with `-D warnings` and rustfmt both exited 0. Commit
+  `e32b5a3a3aa66b4fbe50f15cac9f3a5c539846cb` was pushed and independently matched on
+  `origin/public/clean-release`.
+
+Honest status before the iteration-2 remeasurement: P0 remains unknown because no current health
+heartbeat exists; P1 remains red and materially below its locked bars; P2 remains green.
