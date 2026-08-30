@@ -1814,6 +1814,39 @@ mod tests {
     }
 
     #[test]
+    fn manifest_names_reject_every_reachable_unsafe_shape_and_keep_valid_boundaries() {
+        let unsafe_names = [
+            "",
+            ".",
+            "..",
+            r"\rooted",
+            "nested/file",
+            "line\nbreak",
+            "bad<name",
+            "trailing-space ",
+            "trailing-dot.",
+            "nul.txt",
+            "com1.log",
+            "lpt9",
+        ];
+        for name in unsafe_names {
+            assert_eq!(
+                safe_manifest_name(name),
+                Err(format!("snapshot manifest contains unsafe file path '{name}'")),
+                "unsafe manifest name must fail closed: {name:?}",
+            );
+        }
+        assert!(
+            safe_manifest_name(&MANIFEST_FILE.to_ascii_lowercase()).is_err(),
+            "the manifest cannot declare itself, regardless of case",
+        );
+
+        for name in ["cortex-speech.db", "champion.json", "com0.log", "lpt0", "company.txt", "manifest-copy.json"] {
+            assert_eq!(safe_manifest_name(name), Ok(()), "valid boundary name was rejected: {name:?}");
+        }
+    }
+
+    #[test]
     fn active_pilot_snapshot_requires_exact_current_schema_and_completed_event_grants() {
         let db = seeded_db();
         let policy = pilot_policy();
