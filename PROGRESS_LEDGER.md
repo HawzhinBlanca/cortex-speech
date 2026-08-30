@@ -12072,3 +12072,30 @@ targets/features with `-D warnings`. Product commit `a3d59363` was pushed and in
 Honest status before the iteration-6 remeasurement: the corrected product chunk is green and pushed,
 but no new coverage delta is claimed until the exact pinned all-target run finishes. Production and
 scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 7: exact reversal terminal snapshots
+
+Iteration 6's exact clean-SHA measurement at ledger commit `390fc14e082570090ca6e40dd6355a4db9ae7563`
+passed 1,819 library tests with 0 failures and 8 ignores, reliability 23/23, soak 1/1, Tauri
+integration 1/1, shell smoke 1/1, user-data 2/2, and all Criterion targets. Overall branch coverage
+moved 59.46% to 59.69%; restore moved 60.36% to 62.35%, reducing uncovered restore branches from
+597 to 567. The measured secondary effects target fell from 198 to 168 uncovered branches. P1
+remains red, P2 green, and P0 unknown because the production heartbeat is absent.
+
+The next uniquely owned terminal guards were the latest decision-reversal and flag-reversal
+snapshots. The corrected regression drives a real phone decision plus undo and a real review flag
+plus undo through production writers, proves both clean inverse states validate, then changes verdict
+and escalation independently for each. All four corruptions are proven to apply, must produce their
+exact decision/flag reversal refusal, and are reset before revalidating the clean inverse.
+
+Two earlier drafts failed honestly and were narrowed instead of weakened: lowering revision is
+rejected earlier by the latest-effect revision floor, while stable human fields are rejected earlier
+by the exact effect-chain projection. Those cases cannot truthfully claim terminal-guard coverage and
+are absent from the final test. The corrected focused proof passed 1/1 and the complete restore-effects
+suite passed 21/21. Installed stable rustfmt passed; installed stable Clippy passed all targets/features
+with `-D warnings`. Product commit `ee61fc0b` was pushed and independently matched on
+`origin/public/clean-release`.
+
+Honest status before the iteration-7 remeasurement: the corrected product chunk is green and pushed,
+but no new coverage delta is claimed until the exact pinned all-target run finishes. Production and
+scheduled tasks were untouched.
