@@ -12295,3 +12295,32 @@ rustfmt passed; installed stable Clippy passed all targets/features with `-D war
 Honest status before the iteration-14 remeasurement: the product chunk is green, but no new coverage
 delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
 and P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 15: exhaustive effect-bound correction provenance
+
+Iteration 14's exact serialized measurement at ledger commit
+`9a3003f842497836dd222a27c3053b4c59b11e1c` completed 1,827 library tests with 0 failures and 8
+ignores, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell smoke 1/1,
+user-data 2/2, and all Criterion targets. The certifying wrapper exited red solely because the
+locked coverage thresholds remain unmet. Overall branch coverage moved 60.13% to 60.22%; restore
+moved 66.20% to 66.87%, reducing uncovered restore branches from 509 to 499. The active effects
+function fell from 110 to 100 uncovered branches. P1 remains red, P2 green, and P0 unknown because
+the production heartbeat is absent.
+
+The next reachable LLVM cluster contained ten unproved effect-bound correction provenance
+conditions. The new table-driven regression starts every case from a genuine edit written through
+the production phone-decision API, proves the writer created exactly one bound agent example and
+correction, and proves that clean state validates. It then independently corrupts correction UUID,
+edit-only authority, reviewer identity, audio hash, wrong/fix presence, wrong/fix distinction,
+decision-text equality, retained-speech derivation, or one-correction-per-effect ownership. Cases
+that alter correction text remove the earlier agent-example row under the restored-file threat model
+so the correction guard, rather than the earlier example/correction equality guard, owns the refusal.
+The edit-only case preserves event/effect/ledger linkage by updating the three action fields together.
+
+The focused proof passed 1/1 and the complete restore-effects suite passed 29/29. Installed stable
+rustfmt passed; installed stable Clippy passed all targets/features with `-D warnings`. Product commit
+`6875964c61027086c6214e881bc1ab3be54e00d8` is ready for the ledger commit and exact push.
+
+Honest status before the iteration-15 remeasurement: the product chunk is green, but no new coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
