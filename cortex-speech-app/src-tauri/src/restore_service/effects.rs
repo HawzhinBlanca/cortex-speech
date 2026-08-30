@@ -3061,6 +3061,113 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_uncovered_effect_bound_correction_field_is_refused() {
+        let corruptions = [
+            (
+                "noncanonical correction id",
+                "UPDATE corrections SET id = 'not-a-canonical-uuid' WHERE effect_event_id IS NOT NULL",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "correction is attached to a non-edit effect",
+                "DELETE FROM agent_examples WHERE effect_event_id IS NOT NULL;
+                 UPDATE review_events SET action = 'accept' WHERE id = (SELECT review_event_id FROM human_decision_effect_events LIMIT 1);
+                 UPDATE review_compensation_ledger SET effective_decision = 'accept' WHERE review_event_id IS NOT NULL;
+                 UPDATE human_decision_effect_events SET action = 'accept'",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "reviewer crosses the effect boundary",
+                "UPDATE corrections SET reviewer_id = 'Other Reviewer' WHERE effect_event_id IS NOT NULL",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "noncanonical audio hash",
+                "UPDATE corrections SET audio_content_hash = 'not-an-audio-hash' WHERE effect_event_id IS NOT NULL",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "blank wrong transcript",
+                "DELETE FROM agent_examples WHERE effect_event_id IS NOT NULL;
+                 UPDATE corrections SET raw_hypothesis = '' WHERE effect_event_id IS NOT NULL",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "blank human fix",
+                "DELETE FROM agent_examples WHERE effect_event_id IS NOT NULL;
+                 UPDATE corrections SET human_fix = '' WHERE effect_event_id IS NOT NULL",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "learning-equivalent wrong and fix",
+                "DELETE FROM agent_examples WHERE effect_event_id IS NOT NULL;
+                 UPDATE corrections SET raw_hypothesis = human_fix WHERE effect_event_id IS NOT NULL",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "fix disagrees with the decision effect",
+                "DELETE FROM agent_examples WHERE effect_event_id IS NOT NULL;
+                 UPDATE human_decision_effect_events
+                    SET decision_transcript = 'different corrected text',
+                        decision_annotated_transcript = 'different corrected text'",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "wrong side is not rederived from retained speech",
+                "DELETE FROM agent_examples WHERE effect_event_id IS NOT NULL;
+                 UPDATE corrections SET raw_hypothesis = 'different machine draft' WHERE effect_event_id IS NOT NULL",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "one effect owns duplicate corrections",
+                "DROP INDEX idx_corrections_one_per_effect_event;
+                 INSERT INTO corrections
+                     (id, segment_id, audio_content_hash, raw_hypothesis, human_fix,
+                      jury_verdict, model_version_id, reviewer_id, effect_event_id)
+                 SELECT '00000000-0000-4000-8000-000000000426', segment_id,
+                        audio_content_hash, raw_hypothesis, human_fix, jury_verdict,
+                        model_version_id, reviewer_id, effect_event_id
+                   FROM corrections WHERE effect_event_id IS NOT NULL",
+                "owns more than one correction",
+            ),
+        ];
+
+        for (label, sabotage, expected) in corruptions {
+            let db = seeded_db("correction-fields");
+            decided(&db, "correction-fields", 426);
+            let row_counts: (i64, i64) = db
+                .connection()
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM agent_examples WHERE effect_event_id IS NOT NULL),
+                         (SELECT COUNT(*) FROM corrections WHERE effect_event_id IS NOT NULL)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(row_counts, (1, 1), "{label}: the genuine edit must write both learning rows");
+            validate_review_effect_semantics(&db).expect("the genuine correction must validate first");
+
+            for trigger in [
+                "agent_examples_v60_effect_immutable_delete",
+                "corrections_v60_effect_immutable_update",
+                "human_decision_effect_events_immutable_update",
+                "review_compensation_ledger_immutable_update",
+                "review_events_v60_post_cutoff_immutable_update",
+                "review_events_v60_provenance_immutable_update",
+                "review_event_operation_immutable_update",
+            ] {
+                db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).unwrap();
+            }
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+            db.connection().execute_batch(sabotage).unwrap();
+
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(error.contains(expected), "{label}: expected correction refusal '{expected}', got: {error}");
+        }
+    }
+
     /// A paid phone decision that was then undone through the production APIs, exactly as
     /// `couch::api_undo` does it. Returns the effect id the reversal hangs off.
     fn decided_then_undone(db: &Database, id: &str, decide_index: u64, undo_index: u64) -> i64 {
