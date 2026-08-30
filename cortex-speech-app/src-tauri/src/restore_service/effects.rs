@@ -2300,6 +2300,66 @@ mod tests {
     }
 
     #[test]
+    fn reversed_decisions_and_flags_require_their_exact_terminal_snapshots() {
+        let decision_db = seeded_db("decision-reversal-terminal");
+        decided_then_undone(&decision_db, "decision-reversal-terminal", 463, 464);
+        validate_review_effect_semantics(&decision_db).expect("a genuine decision undo must validate first");
+        let decision_corruptions = [
+            (
+                "verdict",
+                "UPDATE speech_segments SET verdict = 'human_edit' WHERE id = 'decision-reversal-terminal'",
+                "UPDATE speech_segments SET verdict = NULL WHERE id = 'decision-reversal-terminal'",
+            ),
+            (
+                "escalation",
+                "UPDATE speech_segments SET escalated = 1 WHERE id = 'decision-reversal-terminal'",
+                "UPDATE speech_segments SET escalated = 0 WHERE id = 'decision-reversal-terminal'",
+            ),
+        ];
+        for (label, sabotage, restore) in decision_corruptions {
+            assert_eq!(decision_db.connection().execute(sabotage, []).unwrap(), 1, "{label}: corruption must apply");
+            let error = validate_review_effect_semantics(&decision_db).unwrap_err();
+            assert!(
+                error.contains("does not reflect human-decision reversal"),
+                "{label}: expected the exact decision-reversal refusal, got: {error}"
+            );
+            assert_eq!(decision_db.connection().execute(restore, []).unwrap(), 1, "{label}: reset must apply");
+            validate_review_effect_semantics(&decision_db).expect("each decision reset must restore the exact inverse");
+        }
+
+        let flag_db = seeded_db("flag-reversal-terminal");
+        let flag =
+            flag_db.record_review_flag("flag-reversal-terminal", "genuine concern", &canonical_operation(465)).unwrap();
+        assert!(matches!(
+            flag_db.undo_review_flag(flag.effect_event_id, &canonical_operation(466)).unwrap(),
+            crate::db::HumanFlagUndoOutcome::Applied { .. }
+        ));
+        validate_review_effect_semantics(&flag_db).expect("a genuine flag undo must validate first");
+        let flag_corruptions = [
+            (
+                "verdict",
+                "UPDATE speech_segments SET verdict = 'escalated' WHERE id = 'flag-reversal-terminal'",
+                "UPDATE speech_segments SET verdict = NULL WHERE id = 'flag-reversal-terminal'",
+            ),
+            (
+                "escalation",
+                "UPDATE speech_segments SET escalated = 1 WHERE id = 'flag-reversal-terminal'",
+                "UPDATE speech_segments SET escalated = 0 WHERE id = 'flag-reversal-terminal'",
+            ),
+        ];
+        for (label, sabotage, restore) in flag_corruptions {
+            assert_eq!(flag_db.connection().execute(sabotage, []).unwrap(), 1, "{label}: corruption must apply");
+            let error = validate_review_effect_semantics(&flag_db).unwrap_err();
+            assert!(
+                error.contains("does not reflect review-flag reversal"),
+                "{label}: expected the exact flag-reversal refusal, got: {error}"
+            );
+            assert_eq!(flag_db.connection().execute(restore, []).unwrap(), 1, "{label}: reset must apply");
+            validate_review_effect_semantics(&flag_db).expect("each flag reset must restore the exact inverse");
+        }
+    }
+
+    #[test]
     fn a_forged_effect_on_a_non_decision_event_is_refused() {
         // A skip is not a decision: it pays nothing and must leave no human-decision effect. Forging
         // one would invent paid, reviewed truth for a clip nobody judged — so the trigger is dropped
