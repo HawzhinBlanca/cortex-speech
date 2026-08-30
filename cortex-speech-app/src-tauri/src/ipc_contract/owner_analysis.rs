@@ -657,7 +657,7 @@ mod tests {
     fn assert_scrubbed(error: &CommandErrorV1) {
         let wire = serde_json::to_string(error).expect("serialize public error");
         for private in [
-            "C:\\Users\\Owner\\secret.wav",
+            "Z:\\private-vault\\secret.wav",
             "SELECT * FROM speech_segments",
             "token=owner-secret",
             "https://private-provider.invalid",
@@ -669,7 +669,7 @@ mod tests {
 
     #[test]
     fn analysis_jury_and_refinement_errors_are_bounded_and_scrubbed() {
-        let private = "C:\\Users\\Owner\\secret.wav SELECT * FROM speech_segments token=owner-secret https://private-provider.invalid";
+        let private = "Z:\\private-vault\\secret.wav SELECT * FROM speech_segments token=owner-secret https://private-provider.invalid";
         let errors = [
             public_owner_analysis_error(OwnerAnalysisOperationV1::SignalAnomaly, private),
             public_owner_analysis_error(OwnerAnalysisOperationV1::ActiveLearningQueue, private),
@@ -751,7 +751,7 @@ mod tests {
     #[test]
     fn champion_unavailable_remains_an_exact_public_hard_stop() {
         let private =
-            format!("{}: worker failed at C:\\Users\\Owner\\models\\champion", crate::pipeline::ASR_7B_UNAVAILABLE_TAG);
+            format!("{}: worker failed at Z:\\private-vault\\models\\champion", crate::pipeline::ASR_7B_UNAVAILABLE_TAG);
         let error = public_gold_eval_error(&private);
         assert_eq!(error.code, crate::pipeline::ASR_7B_UNAVAILABLE_TAG);
         assert!(error.message.contains(crate::pipeline::ASR_7B_UNAVAILABLE_TAG));
@@ -818,7 +818,7 @@ mod tests {
         assert!(!disabled.retryable);
 
         let private =
-            public_rediarization_error("database open failed at C:\\Users\\Owner\\private.db SELECT token=secret");
+            public_rediarization_error("database open failed at Z:\\private-vault\\private.db SELECT token=secret");
         assert_eq!(private.code, "REDIARIZATION_FAILED");
         assert_scrubbed(&private);
     }

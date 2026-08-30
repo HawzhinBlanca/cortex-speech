@@ -614,7 +614,7 @@ mod tests {
 
     fn assert_scrubbed(error: &CommandErrorV1) {
         let wire = serde_json::to_string(error).expect("serialize public error");
-        for private in ["C:\\Users\\Owner\\secret.wav", "SELECT * FROM speech_segments", "token=owner-secret"] {
+        for private in ["Z:\\private-vault\\secret.wav", "SELECT * FROM speech_segments", "token=owner-secret"] {
             assert!(!wire.contains(private), "private diagnostic escaped public wire: {wire}");
         }
         assert!(error.message.chars().count() <= 180, "public message must stay bounded");
@@ -623,7 +623,7 @@ mod tests {
     #[test]
     fn champion_unavailable_keeps_exact_public_sentinel_and_scrubs_private_detail() {
         let error = public_transcription_error(&format!(
-            "{}: C:\\Users\\Owner\\secret.wav token=owner-secret",
+            "{}: Z:\\private-vault\\secret.wav token=owner-secret",
             crate::pipeline::ASR_7B_UNAVAILABLE_TAG
         ));
         assert_eq!(error.code, crate::pipeline::ASR_7B_UNAVAILABLE_TAG);
@@ -634,7 +634,7 @@ mod tests {
 
     #[test]
     fn every_owner_critical_fallback_is_bounded_and_scrubbed() {
-        let private = "C:\\Users\\Owner\\secret.wav SELECT * FROM speech_segments token=owner-secret";
+        let private = "Z:\\private-vault\\secret.wav SELECT * FROM speech_segments token=owner-secret";
         let errors = [
             public_file_picker_error(private),
             public_directory_picker_error(private),
@@ -687,7 +687,11 @@ mod tests {
             failed: 1,
             output_dir: "D:/owner-export".into(),
             files: vec!["segment-1.wav".into()],
-            errors: vec!["segment-2: C:\\Users\\Owner\\secret.wav token=owner-secret".into()],
+            // A private-looking path plus a secret, WITHOUT a real Windows profile prefix: the
+            // repo hygiene gate (test_windows_repo_hygiene.py) refuses profile-directory literals
+            // in tracked sources, and this proof only needs SOME sensitive content to vanish —
+            // the wire type must redact whatever the error carried, not this string in particular.
+            errors: vec!["segment-2: Z:\\private-vault\\secret.wav token=owner-secret".into()],
         });
         let audio_wire = serde_json::to_value(audio).unwrap();
         assert_eq!(audio_wire["output_dir"], "D:/owner-export");
