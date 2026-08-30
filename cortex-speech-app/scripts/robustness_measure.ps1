@@ -5,19 +5,23 @@
 # claim progress it did not make. So measurement and identity are written together, here, or not
 # at all.
 #
-# Runs in the ISOLATED worktree (default cortex-scrub) with the pinned toolchain and the exact
+# Runs in this repo by default, or in an ISOLATED worktree via -Worktree, with the pinned toolchain and the exact
 # flags verify_10 uses, so the number this produces is comparable to the CI gate's number.
 #
 #   powershell -ExecutionPolicy Bypass -File scripts/robustness_measure.ps1 [-Worktree <path>]
 
 param(
-    [string]$Worktree = 'C:\Users\Wareen\Desktop\cortex-scrub'
+    # Defaults to THIS repo. Pass -Worktree to measure an isolated clone instead; the dirty-tree
+    # refusal below makes measuring the working repo safe. Deliberately not a hardcoded profile path:
+    # this tree is published de-identified, so an absolute user-profile literal leaks the owner's
+    # account and breaks on every other machine.
+    [string]$Worktree = (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 )
 
 $ErrorActionPreference = 'Stop'
 $app = Join-Path $Worktree 'cortex-speech-app'
 $srcTauri = Join-Path $app 'src-tauri'
-$outDir = Join-Path 'C:\Users\Wareen\Desktop\cortex-speech\cortex-speech-app\logs' 'robustness'
+$outDir = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'logs') 'robustness'
 $out = Join-Path $outDir 'coverage-latest.json'
 $meta = Join-Path $outDir 'coverage-latest.meta.json'
 

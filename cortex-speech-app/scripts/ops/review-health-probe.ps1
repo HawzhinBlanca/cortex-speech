@@ -16,7 +16,7 @@
 # Recovery clears the desktop flag on the next green run and says so in the log.
 
 $ErrorActionPreference = 'Continue'
-$repoApp   = 'C:\Users\Wareen\Desktop\cortex-speech\cortex-speech-app'
+$repoApp   = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 # The repo's own locked interpreter, by ABSOLUTE path. Bare `python` resolved to another agent's
 # venv in one shell and to nothing in the scheduled-task context — the first scheduled fire died
 # before its first log line over exactly this. The .policy-python venv is what the policy suite
