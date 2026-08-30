@@ -3465,6 +3465,54 @@ mod tests {
     }
 
     #[test]
+    fn every_uncovered_desktop_operation_field_is_refused() {
+        // Start from the exact typed-v1 writer shape, prove it restores, then damage one member of
+        // the operation tuple at a time. These are deliberately values rather than NULLs: the
+        // existing boundary test owns tuple presence, while this one proves the inner semantic
+        // guards are independently reachable under the restored-file threat model.
+        for (label, sabotage) in [
+            (
+                "noncanonical operation id",
+                "UPDATE human_decision_effect_events SET operation_id = 'not-a-canonical-uuid'",
+            ),
+            (
+                "noncanonical payload hash",
+                "UPDATE human_decision_effect_events SET operation_payload_hash = 'not-a-canonical-hash'",
+            ),
+            ("nonpositive request timestamp", "UPDATE human_decision_effect_events SET requested_timestamp_ms = 0"),
+            (
+                "unnormalized requested transcript",
+                "UPDATE human_decision_effect_events SET requested_transcript = ' desktop corrected '",
+            ),
+            ("empty requested transcript", "UPDATE human_decision_effect_events SET requested_transcript = ''"),
+        ] {
+            let db = seeded_db("desktop-operation-fields");
+            let authority = "11111111-2222-4333-8444-555555555555";
+            let prior_revision = db.segment_review_revision("desktop-operation-fields").unwrap().unwrap();
+            let genuine = crate::db::desktop_review_v1_payload_hash(
+                "desktop-operation-fields",
+                prior_revision,
+                "edit",
+                Some("desktop corrected"),
+                authority,
+            );
+            insert_typed_desktop_effect(&db, "desktop-operation-fields", authority, &genuine);
+            validate_review_effect_semantics(&db).expect("the genuine typed desktop effect must validate first");
+
+            assert_eq!(
+                db.connection().execute(sabotage, []).unwrap(),
+                1,
+                "{label}: the corruption must apply, or this case proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("outside the exact anonymous desktop operation boundary"),
+                "{label}: expected the exact desktop-operation refusal, got: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn a_forged_typed_desktop_review_is_still_refused() {
         // The other half: teaching the validator the v1 contract must not let anything through.
         // Each case is a row claiming contract 1 whose digest does not answer for its own contents.
