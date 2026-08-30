@@ -12099,3 +12099,28 @@ with `-D warnings`. Product commit `ee61fc0b` was pushed and independently match
 Honest status before the iteration-7 remeasurement: the corrected product chunk is green and pushed,
 but no new coverage delta is claimed until the exact pinned all-target run finishes. Production and
 scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 8: exact active terminal snapshots
+
+Iteration 7's exact clean-SHA measurement at ledger commit `615e7222f1bddfc88084b1f8ab998b98a30e2b45`
+passed 1,820 library tests with 0 failures and 8 ignores, E2E 10/10, reliability 23/23, soak 1/1,
+Tauri integration 1/1, shell smoke 1/1, user-data 2/2, and all Criterion targets. Overall branch
+coverage moved 59.69% to 59.75%; restore moved 62.35% to 62.75%, reducing uncovered restore branches
+from 567 to 561. The measured secondary effects target fell from 168 to 162 uncovered branches. P1
+remains red, P2 green, and P0 unknown because the production heartbeat is absent.
+
+The next uniquely owned terminal guards were the active decision and active flag snapshots. One
+regression drives a genuine active phone decision and a genuine active review flag through production
+writers, proves both clean states validate, then changes verdict and escalation independently for each.
+All four corruptions are proven to apply, must produce their exact active-decision or active-flag
+terminal refusal, and are reset before revalidating the clean state. Stable human fields, rationale,
+and revision were deliberately excluded because earlier effect-chain, rationale, and revision-floor
+guards own those failures.
+
+The focused proof passed 1/1 and the complete restore-effects suite passed 22/22. Installed stable
+rustfmt passed its exact check; installed stable Clippy passed all targets/features with `-D warnings`.
+Product commit `4db34bf942604755633976aba211ae65da3444b9` is ready for the ledger commit and exact push.
+
+Honest status before the iteration-8 remeasurement: the product chunk is green, but no new coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
