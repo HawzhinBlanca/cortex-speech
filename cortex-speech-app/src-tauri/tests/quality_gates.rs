@@ -43,7 +43,19 @@ fn setup_db_with_audio() -> (Database, TempDir, PathBuf) {
     // These fixtures intentionally exercise the historical annotated-row quality metric, not the
     // schema-v60 human-decision write boundary. Author them only on the exact legacy schema where
     // whole-row review fields were legal; production schemas remain fail-closed.
-    assert_eq!(cortex_speech_app_lib::migrations::rollback(&db, 9).unwrap(), vec![68, 67, 66, 65, 64, 63, 62, 61, 60]);
+    //
+    // Derived from the live catalog, never a second hand-written number: the target is BELOW
+    // schema v60, and the exact rollback list follows whatever the head currently is. The old
+    // literal [68..60] went stale the day v69 landed — every --all-targets run (and therefore the
+    // branch-instrumented coverage phase) red while --lib stayed green (caught 2026-08-31 by the
+    // first real coverage prerequisite).
+    let expected: Vec<i64> = cortex_speech_app_lib::migrations::MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version > 59)
+        .rev()
+        .map(|migration| migration.version)
+        .collect();
+    assert_eq!(cortex_speech_app_lib::migrations::rollback(&db, expected.len()).unwrap(), expected);
     (db, tmp, audio_dir)
 }
 
