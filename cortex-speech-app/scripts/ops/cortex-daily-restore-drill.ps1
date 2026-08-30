@@ -61,13 +61,26 @@ if ($DryRun) {
     exit 0
 }
 
-$python = if (Get-Command py.exe -ErrorAction SilentlyContinue) { 'py.exe' } elseif (
+# The repo's locked interpreter FIRST, by absolute path: bare py/python from PATH resolved to
+# another agent's venv on this box before (the probe died over exactly this). PATH remains only a
+# fallback so the drill still runs on a machine without the venv.
+$pinned = Join-Path $repoApp '.policy-python\Scripts\python.exe'
+$python = if (Test-Path -LiteralPath $pinned) { $pinned } elseif (
+    Get-Command py.exe -ErrorAction SilentlyContinue
+) { 'py.exe' } elseif (
     Get-Command python.exe -ErrorAction SilentlyContinue
-) { 'python.exe' } else { throw 'Neither py.exe nor python.exe is available for restore_drill.py' }
+) { 'python.exe' } else { throw 'No python interpreter is available for restore_drill.py' }
 $started = [DateTimeOffset]::UtcNow
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+# Scoped to 'Continue' for the native call: under 5.1 with 'Stop', any stderr LINE from python
+# (a DeprecationWarning is enough) becomes a terminating NativeCommandError -- the script died
+# HERE and the report below never wrote, leaving a stale pass=true JSON as the record. The real
+# verdict is the exit code, captured immediately after.
+$previousPreference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 $output = @(& $python $restoreScript $latest.Path 2>&1)
 $exitCode = $LASTEXITCODE
+$ErrorActionPreference = $previousPreference
 $stopwatch.Stop()
 $rtoSeconds = [Math]::Round($stopwatch.Elapsed.TotalSeconds, 3)
 $pass = $exitCode -eq 0 -and $rtoSeconds -le 300

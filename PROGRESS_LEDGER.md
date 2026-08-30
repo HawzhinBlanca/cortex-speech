@@ -12082,3 +12082,39 @@ ledger-staleness one is settled by this entry, and the remaining 11 (frontend/st
 model-claim attestation, review-pilot certification) pre-date the reconciliation — proven by
 running all 11 against pristine `a1d552d3` in a clean worktree, all exit 1 there — and are being
 addressed next on this branch.**
+
+---
+
+## 2026-08-30 — The alarms are armed: detections now leave the room
+
+Readiness step 2, after the 14.4-hour silent outage (power loss 2026-08-29 19:11 → logon
+2026-08-30 09:33, zero notifications while every detector worked).
+
+**`scripts/ops/cortex-alarm-forwarder.ps1`** — one terminus for every detector's verdict, running
+as scheduled task **CortexAlarmForwarder** (S4U, every 5 min, registered elevated and REAL-fired:
+Last Result 0). S4U is the point: it keeps checking at the lock screen, exactly when every
+Interactive-logon cortex task slept through the outage. It reads outputs only, never heals
+(one healer per resource): probe alert file + probe liveness, watchdog liveness + give-up,
+pool-certification gates (reviewReady/rightsComplete/disk — campaign progress deliberately never
+alarms), restore-drill verdict + staleness, LOCAL and OFFSITE snapshot age (the off-drive net's
+death was invisible by design before), C:/offsite headroom, champion port. Dedup: 6-hour re-alert,
+[RESOLVED] notes on recovery, size-capped log. Notifies: log always; CRITICAL → Desktop
+CORTEX-ALARMS.txt + msg.exe; owner-configured `<data>\alert-webhook.url` (plain-text POST, https
+only) and `<data>\healthcheck.url` dead-man GET (skipped while critical, so a degraded host trips
+the external service too). No external destination is hardcoded — nothing leaves the machine until
+the owner creates those files.
+
+Proven, not assumed: live run exit 0 with one honest WARN (champion 7B down since the reboot);
+fault-injected probe alert → exit 1 + CRITICAL + Desktop file; cleared → [RESOLVED] + cleanup;
+gate `test_alarm_forwarder_policy.py` (6 tests) fail-before verified by mutating a detector id
+(red, exact pin named) and restoring byte-identical (green).
+
+Also repaired the drill wrapper's report-killing fragility (repo copy; release dir untouched):
+under PS 5.1 + `$ErrorActionPreference='Stop'`, one python stderr LINE became a terminating
+NativeCommandError at the invocation — the report never wrote and a stale pass=true stood as the
+record; the call is now preference-scoped and prefers `.policy-python` over PATH. Real drill
+through the repaired wrapper: PASS, RTO 2.829 s.
+
+Honest status: **armed on-machine and testable end to end; the two off-machine legs wait on the
+owner placing his own URLs in `alert-webhook.url` / `healthcheck.url`, and unattended RECOVERY
+(vs detection) still waits on the boot-posture decision.**
