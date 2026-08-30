@@ -3312,7 +3312,21 @@ OWNER_GATED = [
 ]
 
 
-LOG_DIR = Path(tempfile.gettempdir()) / "cortex-verify10"
+# Durable by design (2026-08-31): every proof manifest, calibration baseline, fault-campaign
+# authority and owner-evidence authority used to hang off %TEMP%\cortex-verify10 — one Disk
+# Cleanup / Storage Sense pass on the C: drive that has historically filled to 0 would have erased
+# the entire certification history, and the three-consecutive-clean-runs calibration chain was
+# practically unsustainable on a volatile root. The root now lives beside the immutable release
+# store under %LOCALAPPDATA%\CortexSpeech, overridable with CORTEX_VERIFY10_ROOT; the temp
+# fallback remains only for platforms without LOCALAPPDATA (Linux/macOS CI smoke).
+LOG_DIR = Path(
+    os.environ.get("CORTEX_VERIFY10_ROOT")
+    or (
+        str(Path(os.environ["LOCALAPPDATA"]) / "CortexSpeech" / "verify10")
+        if os.environ.get("LOCALAPPDATA")
+        else str(Path(tempfile.gettempdir()) / "cortex-verify10")
+    )
+)
 PROOF_ROOT = LOG_DIR / "proof-runs"
 LATEST_PROOF = LOG_DIR / "latest-proof.json"
 RUN_LOCK = LOG_DIR / "verify10.lease.json"
@@ -4952,7 +4966,7 @@ def _owner_campaign_candidates(
         if not manifest_path.is_file():
             events_path = directory / OWNER_EVIDENCE_SOURCE_EVENTS
             if events_path.is_file():
-                first = _first_strict_json_line(events_path, f"{class_id} incomplete campaign")
+                first = _strict_first_json_line(events_path, f"{class_id} incomplete campaign")
                 if (
                     first.get("fullGitSha") == expected_sha
                     and first.get("gateRegistryHash") == expected_registry_hash
