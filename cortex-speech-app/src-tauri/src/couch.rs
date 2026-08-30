@@ -1693,6 +1693,8 @@ mod tests {
         });
         let (code, _, body, ..) = api_decision(&db, decision.to_string().as_bytes(), "Alle", &state);
         assert_eq!(code, 200, "pool decision failed: {}", String::from_utf8_lossy(&body));
+        let pool_receipt: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let pool_decision_id = pool_receipt["poolDecisionId"].as_i64().unwrap();
         let canonical = db.get_segment_by_id("pool-reviewed").unwrap().unwrap();
         assert_eq!(canonical.reviewed_by.as_deref(), Some("Rubar"));
         assert_eq!(canonical.annotated_transcript.as_deref(), Some("Rubar first truth"));
@@ -1744,7 +1746,12 @@ mod tests {
         assert_eq!(code, 409, "a different reviewer must not inherit the pool receipt");
         assert_eq!(pool_decision_count(), 1);
 
-        let (code, _, body, ..) = api_undo(&db, "Alle", &state);
+        let undo_request = serde_json::json!({
+            "poolDecisionId": pool_decision_id.to_string(),
+            "decisionOperationId": pool_operation_id,
+            "reversalOperationId": "30000000-0000-4000-8000-000000000003",
+        });
+        let (code, _, body, ..) = api_undo_with_body(&db, undo_request.to_string().as_bytes(), "Alle", &state);
         assert_eq!(code, 200, "pool undo failed: {}", String::from_utf8_lossy(&body));
         assert!(crate::review_pool::pending_segment_ids(&db, &pool, "Alle", None)
             .unwrap()
@@ -1752,6 +1759,19 @@ mod tests {
         let canonical = db.get_segment_by_id("pool-reviewed").unwrap().unwrap();
         assert_eq!(canonical.reviewed_by.as_deref(), Some("Rubar"));
         assert_eq!(canonical.annotated_transcript.as_deref(), Some("Rubar first truth"));
+        let retry_state = Mutex::new(CouchState { pool_policy: Some(pool), ..CouchState::default() });
+        let (code, _, retry_body, ..) =
+            api_undo_with_body(&db, undo_request.to_string().as_bytes(), "alle", &retry_state);
+        assert_eq!(code, 200, "lost-response restart retry must replay the exact pool reversal");
+        let retry: serde_json::Value = serde_json::from_slice(&retry_body).unwrap();
+        assert_eq!(retry["poolDecisionId"], pool_decision_id);
+        assert_eq!(
+            db.connection()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM review_pool_reversals", [], |row| row.get(0))
+                .unwrap(),
+            1,
+            "an exact retry must not append a second reversal"
+        );
     }
 
     #[test]
@@ -1962,6 +1982,22 @@ mod tests {
 
         let (code, _, body, ..) = api_undo(&db, "Alle", &state);
         assert_eq!(code, 200, "second-pass undo failed: {}", String::from_utf8_lossy(&body));
+        let reversal_operation: String = db
+            .connection()
+            .query_row(
+                "SELECT operation_id FROM independent_review_reversals WHERE decision_id=(
+                     SELECT id FROM independent_review_decisions WHERE operation_id=?1
+                 )",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(reversal_operation, operation_id, "the forward UUID cannot also name its inverse");
+        assert_eq!(
+            reversal_operation,
+            crate::review_campaign::independent_reversal_operation_id(operation_id).unwrap(),
+            "bodyless inverse retries need one deterministic, domain-separated operation identity"
+        );
         assert!(crate::review_campaign::independent_segment_pending(&db, &campaign, id).unwrap());
         let corpus = db.get_segment_by_id(id).unwrap().unwrap();
         assert_eq!(corpus.annotated_transcript.as_deref(), Some("Rubar corrected truth"));
@@ -4071,6 +4107,28 @@ mod tests {
         assert!(page.contains("return migrateLegacyOutboxLocked(false);"));
         assert!(page.contains("if (!mayAssignIds) return false;"));
         assert!(page.contains("legacyFingerprint(current) !== legacyFingerprint(identified)"));
+    }
+
+    #[test]
+    fn pool_undo_persists_an_exact_reversal_request_before_posting() {
+        let page = include_str!("../assets/couch.html");
+        let prepare = page
+            .split_once("function preparePoolUndoTarget()")
+            .and_then(|(_, tail)| tail.split_once("function clearPoolUndoTarget(target)"))
+            .map(|(body, _)| body)
+            .expect("pool undo preparation");
+        assert!(prepare.contains("target.reversalOperationId = newOperationId();"));
+        assert!(prepare.contains("writePoolUndoTarget(target); // durable before the first undo network byte"));
+        let undo = page.split_once("$('undo').onclick").map(|(_, tail)| tail).expect("undo handler");
+        let persist = undo.find("preparePoolUndoTarget()").expect("durable addressed target");
+        let post = undo.find("await api('/api/undo'").expect("undo POST");
+        assert!(persist < post, "the reversal operation identity must be durable before the POST");
+        assert!(undo.contains("body: JSON.stringify(poolUndoTarget || {})"));
+        assert!(page.contains("rememberPoolUndoTarget(item, saved);"), "outbox replay must recover the target receipt");
+        assert!(
+            page.contains("rememberPoolUndoTarget(submission, saved);"),
+            "the online decision path must persist the same receipt"
+        );
     }
 
     #[test]

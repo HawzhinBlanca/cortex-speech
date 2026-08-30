@@ -28,34 +28,33 @@ describe('App layout integrity', () => {
 
   it('does not render the duplicate stats side panel in Insights', () => {
     const app = workstationSource();
-    expect(app).toContain("{#if $filteredSegments.length > 0 && viewMode !== 'insights'}");
+    expect(app).toContain("{#if $filteredSegments.length > 0 && view.viewMode !== 'insights'}");
   });
 
   it('keeps export and library actions reachable after the last review advances past the queue', () => {
-    const review = readFileSync(resolve(root, 'src/lib/ReviewMode.svelte'), 'utf8');
-    const terminalStart = review.indexOf('{:else if !current}');
-    const terminal = review.slice(terminalStart, review.indexOf('{:else}', terminalStart));
+    const terminal = readFileSync(resolve(root, 'src/lib/ReviewModeTerminal.svelte'), 'utf8');
     expect(terminal).toContain('data-testid="review-terminal-export"');
     expect(terminal).toContain('data-testid="review-terminal-done"');
   });
 
   it('routes every review transition through the panel-preserving entry and exit helpers', () => {
     const app = workstationSource();
-    expect(app).toContain("else if (id === 'review') enterReviewMode();");
-    expect(app).toContain("else if (viewMode === 'review') leaveReviewMode");
+    const view = readFileSync(resolve(root, 'src/lib/workstationViewController.svelte.ts'), 'utf8');
+    const center = readFileSync(resolve(root, 'src/lib/WorkstationCenter.svelte'), 'utf8');
+    expect(view).toContain("else if (id === 'review') enterReviewModeForIntent(intent);");
+    expect(view).toContain("void leaveReviewModeForIntent(id as 'curate' | 'insights', intent);");
     expect(app).toContain("const loadStatsDashboard = () => import('./lib/StatsDashboard.svelte')");
-    expect(app).toContain('load={loadStatsDashboard}');
-    expect(app).toContain('componentProps={{ onOpenReview: enterReviewMode }}');
+    expect(app).toContain('{loadStatsDashboard}');
+    expect(center).toContain('load={loadStatsDashboard}');
+    expect(center).toContain('componentProps={{ onOpenReview: onEnterReview }}');
     expect(app).toContain("const loadReviewMode = () => import('./lib/ReviewMode.svelte')");
     // Passing leaveReviewMode directly would feed the DOM MouseEvent into its `nextView` parameter,
     // assigning an event object to viewMode instead of returning to the library.
-    expect(app).toContain(
-      'componentProps={{ onExport: handleExport, onDone: () => void leaveReviewMode() }}',
-    );
-    expect(app).toContain(
+    expect(center).toContain('componentProps={{ onExport, onDone: () => void onLeaveReview() }}');
+    expect(view).toContain(
       'snapshot?.sidebarWide === sidebarWide ? snapshot.sidebarOpen : sidebarWide',
     );
-    expect(app).toContain('snapshot?.statsWide === statsWide ? snapshot.statsOpen : statsWide');
+    expect(view).toContain('snapshot?.statsWide === statsWide ? snapshot.statsOpen : statsWide');
   });
 
   it('does not pass a DOM event into the optional settings-tab parameter', () => {
@@ -65,20 +64,22 @@ describe('App layout integrity', () => {
   });
 
   it('does not unmount a review editor until its visible recovery draft is durable', () => {
-    const app = workstationSource();
-    const start = app.indexOf("async function leaveReviewMode(nextView: 'curate' | 'insights'");
-    const end = app.indexOf('\n  function selectWorkspace(', start);
+    const view = readFileSync(resolve(root, 'src/lib/workstationViewController.svelte.ts'), 'utf8');
+    const start = view.indexOf('async function leaveReviewModeForIntent(');
+    const end = view.indexOf('\n  function leaveReviewMode(', start);
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
-    const exit = app.slice(start, end);
+    const exit = view.slice(start, end);
 
     const flush = exit.indexOf('await flushReviewDrafts();');
     const unmount = exit.indexOf('viewMode = nextView;');
     expect(flush).toBeGreaterThanOrEqual(0);
     expect(unmount).toBeGreaterThan(flush);
     expect(exit).toContain('catch (error)');
-    expect(exit).toContain("notifications.error($t('review.closeDraftFailed')");
-    expect(exit).toContain("if (exitSeq !== reviewExitSeq || viewMode !== 'review') return;");
+    expect(exit).toContain("notifications.error(translate('review.closeDraftFailed')");
+    expect(exit).toContain('intent !== surfaceIntentSequence ||');
+    expect(exit).toContain("viewMode !== 'review' ||");
+    expect(exit).toContain('sharedDurableReviewUndo.blocksSurfaceTransition()');
   });
 
   it('keeps the browser preview review queue filtered and stateful like the real IPC backend', () => {

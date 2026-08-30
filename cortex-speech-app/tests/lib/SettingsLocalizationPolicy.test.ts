@@ -113,7 +113,7 @@ describe('settings and playback localization policy', () => {
   });
 
   it('keeps the Inbox local-only notice behind translation keys', () => {
-    const owner = readFileSync(resolve(root, 'src/lib/ReviewInbox.svelte'), 'utf8');
+    const owner = readFileSync(resolve(root, 'src/lib/ReviewInboxWorkspace.svelte'), 'utf8');
     const header = readFileSync(resolve(root, 'src/lib/ReviewInboxHeader.svelte'), 'utf8');
     expect(owner).toContain("import ReviewInboxHeader from './ReviewInboxHeader.svelte'");
     expect(owner).toContain('<ReviewInboxHeader');

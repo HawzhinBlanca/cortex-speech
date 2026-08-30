@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "type": "OwnerMutationCampaignContractV1",
+  "thresholds": {
+    "backendCriticalDomainPercent": 90,
+    "frontendReducerDomainPercent": 80
+  },
+  "backend": {
+    "tool": "cargo-mutants",
+    "version": "27.1.0",
+    "manifest": "src-tauri/Cargo.toml",
+    "sourceBoundary": "rust_quality_gate.CRITICAL_COVERAGE_DOMAINS",
+    "includeEveryDiscoveredMutant": true,
+    "includeSharedSourceInEveryMatchingDomain": true,
+    "cargoArguments": ["--lib", "--all-features"],
+    "testArguments": [],
+    "jobs": 2,
+    "minimumTestTimeoutSeconds": 120,
+    "timeoutMultiplier": 4.0,
+    "buildTimeoutMultiplier": 4.0,
+    "allowedExitCodes": [0, 2, 3],
+    "allowedRawSummaries": [
+      "CaughtMutant",
+      "MissedMutant",
+      "Timeout",
+      "Unviable"
+    ]
+  },
+  "frontend": {
+    "tool": "stryker-js",
+    "coreVersion": "10.0.0",
+    "vitestRunnerVersion": "10.0.0",
+    "vitestVersion": "4.1.10",
+    "config": "stryker.owner-critical.config.json",
+    "vitestConfig": "vitest.mutation.config.ts",
+    "includeEveryDiscoveredMutant": true,
+    "allowedExitCodes": [0],
+    "allowedRawStatuses": [
+      "Killed",
+      "Survived",
+      "Timeout",
+      "CompileError",
+      "RuntimeError",
+      "NoCoverage"
+    ],
+    "domains": {
+      "audio-state-machine": {
+        "sources": ["src/lib/audioMachine.ts"],
+        "tests": ["tests/lib/audioMachine.test.ts"]
+      },
+      "review-truth-reducers": {
+        "sources": [
+          "src/lib/reviewCommitOperation.ts",
+          "src/lib/reviewCommitResult.ts"
+        ],
+        "tests": [
+          "src/lib/reviewCommitOperation.test.ts",
+          "src/lib/reviewCommitResult.test.ts"
+        ]
+      }
+    }
+  }
+}

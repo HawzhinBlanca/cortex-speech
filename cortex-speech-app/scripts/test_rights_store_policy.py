@@ -26,8 +26,10 @@ def test_store_owns_serialized_writes_and_bounded_reads_without_ui_dependencies(
     for required in (
         "struct RightsStore",
         "runtime: DatabaseRuntime",
-        'self.lock("set_recording_rights")',
-        'self.lock("revoke_recording_consent")',
+        "self.runtime.begin_mutation().map_err(AppError::Other)?",
+        "lock_after_mutation(&mutation)",
+        ".set_recording_rights(audio_path, rights)",
+        ".revoke_recording(audio_path)",
         "self.runtime.open_read()?.list_recording_rights()",
     ):
         if required not in store:

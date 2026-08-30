@@ -103,10 +103,20 @@ def atomic_write_bytes(path: Path, content: bytes) -> None:
 
 
 def atomic_write_json(path: Path, value: object) -> None:
-    atomic_write_bytes(
-        path,
-        (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"),
-    )
+    try:
+        encoded = (
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise EvidenceError(f"evidence JSON is not canonical or finite for {path}: {error}") from error
+    atomic_write_bytes(path, encoded)
 
 
 def _remove_publication_name_durably(path: Path) -> None:
@@ -166,9 +176,23 @@ def publish_validated_json(
 
 
 def read_json_object(path: Path) -> dict[str, object]:
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate key {key!r}")
+            value[key] = item
+        return value
+
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON number {token!r}")
+            ),
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         raise LeaseError(f"cannot read verifier lease {path}: {error}") from error
     if not isinstance(value, dict):
         raise LeaseError(f"verifier lease {path} is not a JSON object")
@@ -637,11 +661,25 @@ class EvidenceJournal:
             try:
                 lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
                 if lines:
-                    last = json.loads(lines[-1])
+                    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+                        value: dict[str, object] = {}
+                        for key, item in pairs:
+                            if key in value:
+                                raise ValueError(f"duplicate key {key!r}")
+                            value[key] = item
+                        return value
+
+                    last = json.loads(
+                        lines[-1],
+                        object_pairs_hook=reject_duplicate_keys,
+                        parse_constant=lambda token: (_ for _ in ()).throw(
+                            ValueError(f"non-finite JSON number {token!r}")
+                        ),
+                    )
                     if not isinstance(last, dict) or last.get("runToken") != run_token:
                         raise ValueError("journal tail is bound to another run")
                     sequence = last.get("sequence")
-                    if not isinstance(sequence, int) or sequence < 1:
+                    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
                         raise ValueError("journal tail has no valid sequence")
                     self.sequence = sequence
             except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
@@ -658,12 +696,18 @@ class EvidenceJournal:
             **fields,
         }
         try:
+            encoded = json.dumps(
+                record,
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+            )
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+                handle.write(encoded + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-        except OSError as error:
+        except (OSError, TypeError, ValueError) as error:
             raise EvidenceError(f"cannot append verifier evidence event {event}: {error}") from error
         return record
 

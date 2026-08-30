@@ -31,32 +31,18 @@ const components = productionSources.filter((path) => path.endsWith('.svelte'));
 
 const controllerComponents = new Set([
   'Workstation.svelte',
-  'lib/AgentReportPanel.svelte',
-  'lib/AudioPlayer.svelte',
   'lib/ModelDownload.svelte',
   'lib/ModelRegistry.svelte',
-  'lib/RefineryPanel.svelte',
   'lib/ReviewInbox.svelte',
   'lib/ReviewMode.svelte',
   'lib/SettingsPanel.svelte',
   'lib/StatsDashboard.svelte',
-  'lib/ValidationPanel.svelte',
   'lib/WslConsolePanel.svelte',
 ]);
 
 // Existing debt is explicit and monotonic: these are ceilings, not exemptions from the target.
 // A file may shrink below its target and disappear from this list without changing the gate.
-const knownOversizeCeilings = new Map<string, number>([
-  ['Workstation.svelte', 2_490],
-  ['lib/ReviewInbox.svelte', 2_130],
-  ['lib/ReviewMode.svelte', 2_200],
-  ['lib/SettingsPanel.svelte', 1_309],
-  ['lib/StatsDashboard.svelte', 1_263],
-  ['lib/AudioPlayer.svelte', 902],
-  ['lib/ValidationPanel.svelte', 562],
-  ['lib/AgentReportPanel.svelte', 532],
-  ['lib/Waveform.svelte', 397],
-]);
+const knownOversizeCeilings = new Map<string, number>();
 
 describe('frontend architecture contract', () => {
   it('keeps the composition root within its locked 350-line ceiling', () => {
@@ -145,11 +131,15 @@ describe('frontend architecture contract', () => {
 
   it('keeps the heavy statistics workspace out of the initial JavaScript graph', () => {
     const workstation = readFileSync(join(sourceRoot, 'Workstation.svelte'), 'utf8');
+    const consumers = ['lib/WorkstationCenter.svelte', 'lib/WorkstationStatsPanel.svelte']
+      .map((path) => readFileSync(join(sourceRoot, path), 'utf8'))
+      .join('\n');
     expect(workstation).not.toContain("import StatsDashboard from './lib/StatsDashboard.svelte'");
     expect(workstation).toContain(
       "const loadStatsDashboard = () => import('./lib/StatsDashboard.svelte')",
     );
-    expect(workstation.match(/load=\{loadStatsDashboard\}/g)).toHaveLength(2);
+    expect(workstation.match(/\{loadStatsDashboard\}/g)).toHaveLength(2);
+    expect(consumers.match(/load=\{loadStatsDashboard\}/g)).toHaveLength(2);
   });
 
   it('separates generated contracts from literal, allow-listed handwritten IPC', () => {

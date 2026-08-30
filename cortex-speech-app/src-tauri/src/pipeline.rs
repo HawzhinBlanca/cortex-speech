@@ -4,29 +4,42 @@ use crate::audio;
 use crate::cache::TranscriptCache;
 use crate::cancel::CancellationToken;
 use crate::chunking::{self, MAX_PCM_SAMPLES};
-use crate::db::{
-    ChampionTranscriptionSourceSnapshot, Database, SegmentHypothesis, SourceTranscriptRecord, SpeechSegment,
-};
+use crate::db::{ChampionTranscriptionSourceSnapshot, Database, SegmentHypothesis, SpeechSegment};
 use crate::error::{AppError, AppResult};
 use crate::fingerprint::AudioFingerprint;
 use crate::models::ModelManager;
-use crate::normalizer::SoraniNormalizer;
+use crate::normalizer::{SoraniNormalizer, NORMALIZER_VERSION};
 use crate::settings::AppSettings;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 mod import_flow;
+mod source_reference;
 mod transcription;
 use uuid::Uuid;
 
 const SUBPROCESS_ERROR_PREVIEW_CHARS: usize = 4096;
 const SOURCE_AUDIO_HASH_BUFFER_BYTES: usize = 128 * 1024;
-const NORMALIZER_VERSION: &str = "sorani-normalizer-v1";
+
+#[derive(Clone, Copy)]
+struct StreamingImportContext<'a> {
+    duration_ms: i64,
+    cancel: Option<&'a CancellationToken>,
+    source_provenance: Option<&'a crate::db::SourceAudioProvenance>,
+}
+
+/// Producer identity stored in the legacy-named `normalizer_version` column when the configured
+/// refinement/loop stages change the champion's immutable raw hypothesis without also
+/// running the Sorani normalizer. This keeps the derived machine-evidence projection attributable
+/// instead of disguising it as raw ASR or as `sorani-normalizer-v1` output; Verbatim Law never lets
+/// this evidence become the authoritative review/export/training transcript.
+pub(crate) const MACHINE_REVIEW_FINAL_VERSION: &str = "cortex-machine-review-final-v1";
 /// Longest we will wait for ONE 90 s decode window in the streaming import.
 ///
 /// The old whole-file budget (`duration × 2`, up to an hour) cannot be reused as-is: decode and ASR
@@ -55,12 +68,6 @@ pub struct TranscriptionDraft {
     /// publication uses it to bind every drafted row to the still-current registry identity.
     pub(crate) deployment_sha256: Option<String>,
     pub cloud_call: bool,
-    /// TRUE when `transcribe` itself already committed this draft to the segment row (the WSL-7B
-    /// champion branch commits transcript + sole hypothesis + provenance atomically). Callers must
-    /// then NOT write again: the 2026-08-20 external review found batch_transcribe re-writing the
-    /// same result, so a failed second write reported "failed" for a row the first commit had
-    /// already changed — two owners for one commit. One inference, one commit, one owner.
-    pub committed_by_pipeline: bool,
 }
 
 /// An imported segment bound to both its one-statement database snapshot and an immutable decoded-
@@ -72,15 +79,21 @@ pub(crate) struct BoundTranscriptionSource {
     _source_lease: crate::media::VerifiedMediaSourceLease,
 }
 
-/// Batch-scoped single-flight cache for verified source leases. Segments cut from the same recording
-/// share one decoded-PCM verification and one immutable OS handle, while different recordings may
-/// still verify concurrently. The cache belongs to the batch and therefore outlives every worker.
+/// Work-page-scoped single-flight cache for verified source leases. Segments cut from the same
+/// recording share one decoded-PCM verification and one immutable OS handle, while dropping the
+/// fixed-size page releases handles before the next page is loaded.
 pub(crate) type TranscriptionSourceLeaseCache =
     Mutex<HashMap<(String, String), Arc<OnceLock<Result<crate::media::VerifiedMediaSourceLease, String>>>>>;
 
 impl BoundTranscriptionSource {
     pub(crate) fn segment(&self) -> &SpeechSegment {
         &self.snapshot.segment
+    }
+
+    /// Exact database/source authority captured before inference. The immutable media lease remains
+    /// owned by `self` while this reference is used at the commit boundary.
+    pub(crate) fn snapshot(&self) -> &ChampionTranscriptionSourceSnapshot {
+        &self.snapshot
     }
 }
 
@@ -1415,6 +1428,151 @@ impl ProcessingPipeline {
         self.wsl_7b_server_preflight()
     }
 
+    /// Batch publication is a production-truth operation, so it is stricter than the generic
+    /// primary-engine probe: the configured primary must be the registered OmniASR-7B champion.
+    /// Diagnostic/local engines may still be exercised by their dedicated tools, but they cannot
+    /// silently populate a durable production batch.
+    pub(crate) fn preflight_batch_champion(&self) -> AppResult<()> {
+        if self.settings.asr_model_size != crate::settings::AsrModelSize::WSL7B {
+            return Err(AppError::Validation(format!(
+                "{ASR_7B_UNAVAILABLE_TAG}: durable batch transcription requires the pinned OmniASR-7B champion; refusing the configured diagnostic engine"
+            )));
+        }
+        if self.wsl7b_primary_unresolved() {
+            return Err(Self::primary_engine_unavailable_error());
+        }
+        self.wsl_7b_server_preflight()
+    }
+
+    /// Map immutable champion raw + configured pipeline final text into the one derived review slot.
+    /// Every publication path uses this helper so refinement/LOOP0 cannot survive in one workflow
+    /// and silently disappear after reload in another.
+    pub(crate) fn derived_review_transcript(
+        &self,
+        raw_text: &str,
+        final_text: &str,
+    ) -> (Option<String>, Option<String>) {
+        if self.settings.auto_normalize {
+            let config = crate::normalizer::NormalizationConfig {
+                normalize_numbers: self.settings.auto_normalize,
+                verbalize_numbers: self.settings.verbalize_numbers,
+                normalize_hamza: true,
+                remove_diacritics: false,
+            };
+            return (
+                Some(SoraniNormalizer::with_config(config).normalize(final_text)),
+                Some(NORMALIZER_VERSION.to_string()),
+            );
+        }
+
+        let raw_nfc = crate::db::to_nfc(raw_text);
+        let final_nfc = crate::db::to_nfc(final_text);
+        if final_nfc != raw_nfc {
+            (Some(final_nfc), Some(MACHINE_REVIEW_FINAL_VERSION.to_string()))
+        } else {
+            (None, None)
+        }
+    }
+
+    /// Convert one side-effect-free inference result into the closed payload accepted by the
+    /// durable batch journal. Missing model/deployment identity and placeholders are evidence
+    /// failures rather than values the publication owner may guess.
+    /// Raw remains the champion hypothesis; a different configured final is retained as attributable
+    /// derived machine evidence even when the normalizer itself is disabled.
+    pub(crate) fn prepare_batch_champion_draft(
+        &self,
+        draft: TranscriptionDraft,
+    ) -> AppResult<crate::db::BatchChampionDraftV1> {
+        if draft.raw_text.trim().is_empty() || crate::quality::is_placeholder_transcript(&draft.raw_text) {
+            return Err(AppError::Validation(
+                "E_BATCH_EMPTY_CHAMPION_DRAFT: the champion returned no publishable transcript".into(),
+            ));
+        }
+        if draft.final_text.trim().is_empty() || crate::quality::is_placeholder_transcript(&draft.final_text) {
+            return Err(AppError::Validation(
+                "E_BATCH_EMPTY_REFINED_DRAFT: the final champion transcript is not publishable".into(),
+            ));
+        }
+        let model_version_id = draft.model_version_id.ok_or_else(|| {
+            AppError::Validation("E_BATCH_MODEL_IDENTITY_MISSING: champion model identity is absent".into())
+        })?;
+        let deployment_sha256 = draft.deployment_sha256.ok_or_else(|| {
+            AppError::Validation("E_BATCH_MODEL_IDENTITY_MISSING: champion deployment identity is absent".into())
+        })?;
+        let (normalized_transcript, normalizer_version) =
+            self.derived_review_transcript(&draft.raw_text, &draft.final_text);
+        Ok(crate::db::BatchChampionDraftV1 {
+            raw_transcript: draft.raw_text,
+            normalized_transcript,
+            confidence: draft.confidence,
+            confidence_source: draft.confidence_source,
+            model_version_id,
+            deployment_sha256,
+            cloud_call: draft.cloud_call,
+            normalizer_version,
+        })
+    }
+
+    /// Prepare the closed evidence tuple for one owner-initiated, source-bound retranscription.
+    ///
+    /// `raw_transcript` is always the immutable champion hypothesis. If the configured pipeline's
+    /// `final_text` differs after optional refinement/loop stages and auto-normalization is disabled,
+    /// retain it in the derived transcript slot with an explicit producer marker. It remains labeled
+    /// machine evidence; authoritative review/export/training continues to use human verdict, human
+    /// annotation, then champion raw. Identical raw/final text deliberately leaves the evidence slot
+    /// absent.
+    pub(crate) fn prepare_bound_champion_draft(
+        &self,
+        draft: TranscriptionDraft,
+    ) -> AppResult<crate::db::BatchChampionDraftV1> {
+        self.prepare_batch_champion_draft(draft)
+    }
+
+    /// Content identity for every result-affecting option held by this exact pipeline clone. The
+    /// session API secret is removed before serialization; its configured/not-configured state and
+    /// all provider/model/refinement/normalization choices remain bound. Only the digest is stored.
+    /// `protocol` deliberately distinguishes a one-clip commit from the schema-68 batch contract
+    /// while keeping the historical batch digest byte-for-byte stable.
+    fn transcription_config_sha256(&self, protocol: &'static str) -> AppResult<String> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct BatchTranscriptionConfigV1 {
+            schema: u8,
+            protocol: &'static str,
+            build_git_sha: &'static str,
+            normalizer_version: &'static str,
+            settings: AppSettings,
+        }
+
+        let payload = BatchTranscriptionConfigV1 {
+            schema: 1,
+            protocol,
+            build_git_sha: crate::GIT_SHA,
+            normalizer_version: NORMALIZER_VERSION,
+            settings: self.settings.for_client_response(),
+        };
+        let bytes = serde_json::to_vec(&payload)?;
+        let digest = Sha256::digest(bytes);
+        let mut encoded = String::with_capacity(64);
+        for byte in digest {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "{byte:02x}").map_err(|error| AppError::Other(error.to_string()))?;
+        }
+        Ok(encoded)
+    }
+
+    /// Provenance for a single bound champion commit. A new transcript must never inherit the
+    /// decoder/config hash from the draft it replaced.
+    pub(crate) fn champion_transcription_config_sha256(&self) -> AppResult<String> {
+        self.transcription_config_sha256("bound-champion-transcribe-v1")
+    }
+
+    /// Immutable schema-68 batch configuration identity. Keep this protocol string stable because
+    /// it is part of every durable request hash and retry check.
+    pub(crate) fn batch_transcription_config_sha256(&self) -> AppResult<String> {
+        self.transcription_config_sha256("durable-batch-transcribe-v1")
+    }
+
     fn wsl_7b_server_preflight(&self) -> AppResult<()> {
         if !self.should_use_wsl_primary_asr() {
             return Ok(());
@@ -1548,223 +1706,6 @@ impl ProcessingPipeline {
 
     fn open_db(&self) -> AppResult<Database> {
         Database::open(&self.db_path)
-    }
-
-    fn source_transcript_dir(&self) -> Option<PathBuf> {
-        Path::new(&self.db_path).parent().map(|dir| dir.join("source_transcripts"))
-    }
-
-    fn source_reference_enabled(&self) -> bool {
-        // Both the persisted choice and the revocable live consent must agree. Keep status reporting
-        // on the exact same predicate as the upload gate so the UI never claims an external reference
-        // is running when this import is champion-only.
-        self.settings.jury_cloud_opt_in && self.consent.jury_cloud()
-    }
-
-    /// The Gemini key for the whole-file reference transcript, read from the ENCRYPTED store.
-    ///
-    /// NOT `settings.llm_api_key`, which is where this used to look. `AppSettings::load` deliberately
-    /// CLEARS that field and rewrites settings.json, so a plaintext key never survives on disk (P0.3).
-    /// The consequence was that the field is empty on every run after the one where it was typed, so
-    /// `ensure_source_reference_transcripts` failed with "Gemini API key is required" no matter what the
-    /// owner did — and `llm_api_key_configured` stayed true, so the UI reported a key that was gone.
-    /// Measured 2026-08-10: an import of three files failed 3/3 on exactly that error while
-    /// secrets.env held a working OpenRouter key and an EMPTY GEMINI_API_KEY.
-    ///
-    /// `secrets.env` via ApiKeys is where the jury and OpenRouter paths already look, so this makes the reference transcript agree with the rest of the
-    /// crate instead of being the one caller reading a field that is guaranteed empty.
-    ///
-    /// The in-memory settings field is still honoured as a fallback: within the single session where
-    /// the owner has just typed a key, it holds the value before any reload scrubs it, and refusing it
-    /// there would be a surprising "I just entered it" failure.
-    fn jury_cloud_api_key(&self) -> AppResult<Option<String>> {
-        let from_store = match Path::new(&self.db_path).parent() {
-            Some(data_dir) => {
-                crate::api_keys::ApiKeys::load(data_dir)
-                    .map_err(|error| AppError::Other(format!("Could not load the encrypted API-key store: {error}")))?
-                    .gemini
-            }
-            None => None,
-        };
-        Ok(from_store.or_else(|| {
-            let typed = self.settings.llm_api_key.trim();
-            (!typed.is_empty()).then(|| typed.to_string())
-        }))
-    }
-
-    fn reusable_source_reference_record(
-        &self,
-        import_writes: &crate::stores::ImportWriteStore,
-        existing: &SourceTranscriptRecord,
-        current_identity: Option<&SourceAudioIdentity>,
-    ) -> AppResult<Option<SourceTranscriptRecord>> {
-        let Some(current_identity) = current_identity else {
-            tracing::warn!(
-                "Ignoring cached whole-file reference transcript for {} with {} because the current audio file identity could not be verified",
-                existing.audio_path,
-                existing.model_id
-            );
-            return Ok(None);
-        };
-        let identity_matches = existing.audio_content_hash.as_deref() == Some(current_identity.content_hash.as_str())
-            && existing.audio_size_bytes == Some(current_identity.size_bytes);
-        if !identity_matches {
-            tracing::warn!(
-                "Ignoring cached whole-file reference transcript for {} with {} because the stored audio identity does not match the current file",
-                existing.audio_path,
-                existing.model_id
-            );
-            return Ok(None);
-        }
-
-        if !crate::agentic::is_usable_source_reference_transcript(&existing.transcript_text) {
-            tracing::warn!(
-                "Ignoring cached whole-file reference transcript for {} with {} because the stored DB text is empty or unusable",
-                existing.audio_path,
-                existing.model_id
-            );
-            return Ok(None);
-        }
-
-        let transcript_path = Path::new(&existing.transcript_path);
-        let saved_text = match std::fs::read_to_string(transcript_path) {
-            Ok(text) => text,
-            Err(error) => {
-                tracing::warn!(
-                    "Ignoring cached whole-file reference transcript for {} with {} because '{}' could not be read: {}",
-                    existing.audio_path,
-                    existing.model_id,
-                    existing.transcript_path,
-                    error
-                );
-                return Ok(None);
-            }
-        };
-        if !crate::agentic::is_usable_source_reference_transcript(&saved_text) {
-            tracing::warn!(
-                "Ignoring cached whole-file reference transcript for {} with {} because '{}' is empty or unusable",
-                existing.audio_path,
-                existing.model_id,
-                existing.transcript_path
-            );
-            return Ok(None);
-        }
-
-        let saved_text = saved_text.trim().to_string();
-        if saved_text == existing.transcript_text.trim() {
-            return Ok(Some(existing.clone()));
-        }
-
-        let synced = SourceTranscriptRecord {
-            transcript_text: saved_text,
-            created_at: existing.created_at.clone(),
-            ..existing.clone()
-        };
-        import_writes.upsert_source_transcript(&synced)?;
-        tracing::info!(
-            "Synced cached whole-file reference transcript for {} with {} from edited text file '{}'",
-            existing.audio_path,
-            existing.model_id,
-            existing.transcript_path
-        );
-        Ok(Some(synced))
-    }
-
-    fn ensure_source_reference_transcripts(
-        &self,
-        path: &Path,
-        db: &Database,
-    ) -> AppResult<Vec<SourceTranscriptRecord>> {
-        // Snapshot AND live consent: a withdrawal after this import began must stop the upload.
-        if !self.source_reference_enabled() {
-            return Ok(Vec::new());
-        }
-        let import_writes = self.import_write_store(db.path())?;
-        let Some(api_key) = self.jury_cloud_api_key()? else {
-            return Err(AppError::Other(
-                "Gemini API key is required for whole-file reference transcript when jury cloud opt-in \
-                 is enabled. Save it from Settings (it goes to secrets.env, DPAPI-encrypted); note that \
-                 settings.json is NOT a place a key can live - AppSettings::load scrubs it by design."
-                    .to_string(),
-            ));
-        };
-
-        let audio_path = path.to_string_lossy().to_string();
-        let output_dir = self
-            .source_transcript_dir()
-            .ok_or_else(|| AppError::Other("Cannot resolve app data directory for source transcripts".into()))?;
-        let current_identity = match source_audio_identity(path) {
-            Ok(identity) => Some(identity),
-            Err(error) => {
-                tracing::warn!(
-                    "Cannot verify current audio identity for whole-file source transcript cache at {}: {}",
-                    path.display(),
-                    error
-                );
-                None
-            }
-        };
-        let mut records = Vec::new();
-        let mut errors = Vec::new();
-
-        for model in self.settings.source_reference_models() {
-            if let Some(existing) = db.get_source_transcript(&audio_path, &model)? {
-                if let Some(existing) =
-                    self.reusable_source_reference_record(&import_writes, &existing, current_identity.as_ref())?
-                {
-                    tracing::info!(
-                        "Reusing whole-file reference transcript for {} from {}",
-                        path.display(),
-                        existing.transcript_path
-                    );
-                    records.push(existing);
-                    continue;
-                }
-            }
-
-            match crate::agentic::generate_whole_file_reference_transcript(path, &model, &api_key, &output_dir) {
-                Ok(artifact) => {
-                    let identity =
-                        current_identity.as_ref().cloned().or_else(|| source_audio_identity(path).ok()).ok_or_else(
-                            || {
-                                AppError::Other(format!(
-                                "Cannot verify audio identity after generating whole-file reference transcript for {}",
-                                path.display()
-                            ))
-                            },
-                        )?;
-                    let record = SourceTranscriptRecord {
-                        audio_path: artifact.audio_path,
-                        model_id: artifact.model_id,
-                        audio_content_hash: Some(identity.content_hash),
-                        audio_size_bytes: Some(identity.size_bytes),
-                        transcript_path: artifact.transcript_path,
-                        transcript_text: artifact.transcript_text,
-                        created_at: None,
-                    };
-                    import_writes.upsert_source_transcript(&record)?;
-                    records.push(record);
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "Whole-file reference transcript failed for {} with {}: {}",
-                        path.display(),
-                        model,
-                        error
-                    );
-                    errors.push(format!("{model}: {error}"));
-                }
-            }
-        }
-
-        if !errors.is_empty() {
-            let scope = if records.is_empty() { "All" } else { "Some" };
-            return Err(AppError::Other(format!(
-                "{scope} whole-file reference transcript models failed before chunking; refusing to continue with incomplete source-reference evidence: {}",
-                errors.join("; ")
-            )));
-        }
-        Ok(records)
     }
 
     pub fn align(

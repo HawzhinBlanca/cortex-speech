@@ -2,7 +2,48 @@
 
 use super::*;
 
-use crate::ipc_contract::{CommandErrorV1, SuggestedActionV1};
+use crate::ipc_contract::{
+    public_agent_stage_progress, BatchOperationV1, BatchStartStatusV1, BatchStartedV1, CommandErrorV1,
+    SuggestedActionV1,
+};
+
+const PICKER_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const PICKER_CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerWaitError {
+    Cancelled,
+    Closed,
+    TimedOut,
+}
+
+async fn await_picker_response<T, Cancel, Deadline>(
+    mut response: tokio::sync::oneshot::Receiver<T>,
+    cancel: Cancel,
+    deadline: Deadline,
+) -> Result<T, PickerWaitError>
+where
+    Cancel: std::future::Future<Output = ()>,
+    Deadline: std::future::Future<Output = ()>,
+{
+    tokio::pin!(cancel);
+    tokio::pin!(deadline);
+    tokio::select! {
+        biased;
+        _ = &mut cancel => Err(PickerWaitError::Cancelled),
+        value = &mut response => value.map_err(|_| PickerWaitError::Closed),
+        _ = &mut deadline => Err(PickerWaitError::TimedOut),
+    }
+}
+
+async fn wait_for_import_cancel(cancel: crate::CancellationToken) {
+    loop {
+        if cancel.is_cancelled() {
+            return;
+        }
+        tokio::time::sleep(PICKER_CANCEL_POLL_INTERVAL).await;
+    }
+}
 
 /// Renderer-safe view of one durable interrupted-import journal. The source directory and every
 /// completed absolute path remain backend-only; the owner needs identity and progress to resume or
@@ -39,6 +80,102 @@ pub struct ImportResumeV1 {
     pub status: ImportResumeStatusV1,
     pub resuming: bool,
     pub import_job_id: String,
+    pub run_id: String,
+}
+
+/// Exact in-process admission truth used only to reconcile an import command whose response may
+/// have been lost after the backend accepted it. It intentionally makes no claim about durable
+/// transcript success; terminal import events and refreshed database reads remain authoritative for
+/// that result.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, specta::Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportRunStatusV1 {
+    Running,
+    Settled,
+    Rejected,
+    Unknown,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportRunStatusResponseV1 {
+    pub run_id: String,
+    pub status: ImportRunStatusV1,
+}
+
+impl From<crate::ImportRunAdmission> for ImportRunStatusV1 {
+    fn from(value: crate::ImportRunAdmission) -> Self {
+        match value {
+            crate::ImportRunAdmission::Running => Self::Running,
+            crate::ImportRunAdmission::Settled => Self::Settled,
+            crate::ImportRunAdmission::Rejected => Self::Rejected,
+            crate::ImportRunAdmission::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// Releases a claimed import run as `rejected` on every pre-worker early return. This makes the
+/// status query authoritative even when validation, recovery inspection, dialog handling, or OS
+/// thread creation fails after the caller has committed to a run identity.
+struct ClaimedImportStart<'a> {
+    state: &'a AppState,
+    run_id: &'a str,
+    armed: bool,
+}
+
+impl<'a> ClaimedImportStart<'a> {
+    fn new(state: &'a AppState, run_id: &'a str) -> Self {
+        Self { state, run_id, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ClaimedImportStart<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state.abort_import_start(self.run_id);
+        }
+    }
+}
+
+/// RAII ownership for the native file-picker cancellation slot. Async command cancellation,
+/// timeout, callback-channel closure and normal selection all release the exact token they armed.
+struct ClaimedFilePicker<'a> {
+    state: &'a AppState,
+    token: crate::CancellationToken,
+}
+
+impl Drop for ClaimedFilePicker<'_> {
+    fn drop(&mut self) {
+        self.state.finish_file_picker(&self.token);
+    }
+}
+
+fn canonical_import_run_id(run_id: &str) -> Result<String, ()> {
+    let canonical = uuid::Uuid::parse_str(run_id).map(|id| id.to_string()).map_err(|_| ())?;
+    (canonical == run_id).then_some(canonical).ok_or(())
+}
+
+pub(super) fn canonical_batch_operation_id(operation_id: &str) -> Result<String, ()> {
+    let canonical = uuid::Uuid::parse_str(operation_id).map(|id| id.to_string()).map_err(|_| ())?;
+    (canonical == operation_id).then_some(canonical).ok_or(())
+}
+
+pub(super) fn validate_batch_segment_ids(ids: &[String]) -> Result<(), String> {
+    if ids.is_empty() || ids.len() > 100_000 {
+        return Err("INVALID_BATCH_SELECTION: select between one and 100,000 segments".into());
+    }
+    let mut unique = std::collections::HashSet::with_capacity(ids.len());
+    for id in ids {
+        validate::validate_identifier(id)?;
+        if !unique.insert(id.as_str()) {
+            return Err("INVALID_BATCH_SELECTION: duplicate segment identity".into());
+        }
+    }
+    Ok(())
 }
 
 fn import_rate_limited_error() -> CommandErrorV1 {
@@ -77,12 +214,24 @@ fn invalid_import_job_id_error() -> CommandErrorV1 {
     CommandErrorV1::new("INVALID_IMPORT_JOB_ID", "The interrupted import identity is invalid.", false)
 }
 
+fn invalid_import_run_id_error() -> CommandErrorV1 {
+    CommandErrorV1::new("INVALID_IMPORT_RUN_ID", "The import run identity is invalid.", false)
+}
+
+pub(super) fn invalid_batch_operation_id_error() -> CommandErrorV1 {
+    CommandErrorV1::new("INVALID_BATCH_OPERATION_ID", "The batch operation identity is invalid.", false)
+}
+
 fn changed_import_job_error() -> CommandErrorV1 {
     CommandErrorV1::new(
         "IMPORT_JOB_CHANGED",
         "The interrupted import changed since it was shown. Its current durable state has been reloaded.",
         false,
     )
+}
+
+fn no_interrupted_import_error() -> CommandErrorV1 {
+    CommandErrorV1::new("NO_INTERRUPTED_IMPORT", "There is no interrupted import to recover.", false)
 }
 
 fn public_import_start_error(private_detail: &str) -> CommandErrorV1 {
@@ -114,8 +263,25 @@ fn public_import_start_error(private_detail: &str) -> CommandErrorV1 {
 }
 
 #[tauri::command]
-pub async fn open_audio_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
-    RATE_LIMITER.check("open_audio_file")?;
+#[specta::specta]
+pub fn get_import_run_status(
+    run_id: String,
+    state: State<'_, AppState>,
+) -> Result<ImportRunStatusResponseV1, CommandErrorV1> {
+    RATE_LIMITER.check("get_import_run_status").map_err(|_| import_rate_limited_error())?;
+    let run_id = canonical_import_run_id(&run_id).map_err(|_| invalid_import_run_id_error())?;
+    Ok(ImportRunStatusResponseV1 { status: state.import_run_admission(&run_id).into(), run_id })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn open_audio_file(app: tauri::AppHandle) -> Result<Option<String>, CommandErrorV1> {
+    RATE_LIMITER
+        .check("open_audio_file")
+        .map_err(|_| crate::ipc_contract::owner_critical_rate_limited("open_audio_file"))?;
+    let state = app.state::<AppState>();
+    let token = state.try_start_file_picker().map_err(|error| crate::ipc_contract::public_file_picker_error(&error))?;
+    let _picker_claim = ClaimedFilePicker { state: &state, token: token.clone() };
     use tauri_plugin_dialog::DialogExt;
     // MUST be async + non-blocking: this command runs on the main thread, and blocking_pick_file
     // there freezes the ENTIRE app UI for as long as the picker is open (confirmed: a second
@@ -128,7 +294,17 @@ pub async fn open_audio_file(app: tauri::AppHandle) -> Result<Option<String>, St
         .pick_file(move |picked| {
             let _ = tx.send(picked);
         });
-    let picked = rx.await.map_err(|_| "file dialog closed unexpectedly".to_string())?;
+    let picked = await_picker_response(rx, wait_for_import_cancel(token), tokio::time::sleep(PICKER_RESPONSE_TIMEOUT))
+        .await
+        .map_err(|error| {
+            tracing::warn!(?error, "Native file picker did not return normally");
+            let code = match error {
+                PickerWaitError::TimedOut => "E_FILE_PICKER_TIMEOUT",
+                PickerWaitError::Closed => "E_FILE_PICKER_CLOSED",
+                PickerWaitError::Cancelled => "E_FILE_PICKER_CANCELLED",
+            };
+            crate::ipc_contract::public_file_picker_error(code)
+        })?;
     Ok(picked.and_then(|p| p.as_path().map(|p| p.to_string_lossy().to_string())))
 }
 
@@ -139,6 +315,55 @@ where
     if let Err(error) = app.emit(event, payload) {
         tracing::warn!("Failed to emit {event}: {error}");
     }
+}
+
+const IMPORT_PROCESSING_FAILED: &str = "IMPORT_PROCESSING_FAILED";
+const IMPORT_ENRICHMENT_FAILED: &str = "IMPORT_ENRICHMENT_FAILED";
+
+/// Reduce an owner-visible source identity to a bounded basename before it crosses into the
+/// webview. Splitting both separator styles is intentional: journals can retain Windows paths even
+/// when a fixture is inspected under another host. Control characters are never useful UI.
+fn public_import_item_label(private_file: &str) -> String {
+    crate::ipc_contract::public_file_label(private_file, "")
+}
+
+fn public_event_run_id(run_id: Option<&str>) -> String {
+    run_id.and_then(|value| uuid::Uuid::parse_str(value).ok()).map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn public_pipeline_error_payload(run_id: Option<&str>, private_file: &str, code: &'static str) -> serde_json::Value {
+    serde_json::json!({
+        "runId": public_event_run_id(run_id),
+        "file": public_import_item_label(private_file),
+        "code": code,
+    })
+}
+
+/// Log private diagnostics only in the native log, then emit the closed public event shape. Raw
+/// database/decoder errors and absolute paths must never hitchhike around the typed command layer
+/// through an asynchronous event.
+fn emit_public_pipeline_error(
+    app: &tauri::AppHandle,
+    run_id: Option<&str>,
+    private_file: &str,
+    private_error: &str,
+    code: &'static str,
+) {
+    tracing::warn!(file = private_file, error = private_error, error_code = code, "Pipeline operation failed");
+    emit_or_log(app, "pipeline-error", public_pipeline_error_payload(run_id, private_file, code));
+}
+
+fn emit_import_enrichment_complete(app: &tauri::AppHandle, run_id: &str, segment_ids: &[String]) {
+    emit_or_log(
+        app,
+        "import-enrichment-complete",
+        serde_json::json!({
+            "runId": public_event_run_id(Some(run_id)),
+            "source": "file",
+            "segmentCount": segment_ids.len(),
+            "segmentIds": segment_ids,
+        }),
+    );
 }
 
 pub(super) fn send_audio_duration_probe_result(
@@ -160,46 +385,78 @@ struct AgentStageEmission<'a> {
 }
 
 fn emit_agent_stage_event(app: &tauri::AppHandle, run_id: Option<&str>, source: &str, event: AgentStageEmission<'_>) {
+    // Raw detail remains available to native diagnostics and (when correlated) the durable audit
+    // record. It is deliberately not part of the renderer event below.
+    tracing::debug!(
+        run_id = run_id.unwrap_or(""),
+        source,
+        stage = event.stage,
+        status = event.status,
+        file = event.file,
+        detail = event.detail,
+        current = event.current,
+        total = event.total,
+        "Agent import stage changed"
+    );
     if let Some(run_id) = run_id {
         if let Some(app_state) = app.try_state::<AppState>() {
-            let db = app_state.lock_db();
-            if let Err(error) = crate::runs::record_agent_stage_event(
-                &db,
-                run_id,
-                source,
-                event.stage,
-                event.status,
-                event.file,
-                event.detail,
-                event.current,
-                event.total,
-            ) {
-                tracing::warn!("Failed to persist agent stage event {run_id}/{}: {error}", event.stage);
-            }
+            let database = app_state.db_runtime();
+            match database.begin_mutation() {
+                Ok(mutation) => {
+                    let db = database.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| {
+                        tracing::warn!("Recovering poisoned database lock during agent-stage persistence");
+                        poisoned.into_inner()
+                    });
+                    if let Err(error) = crate::runs::record_agent_stage_event(
+                        &db,
+                        run_id,
+                        source,
+                        event.stage,
+                        event.status,
+                        event.file,
+                        event.detail,
+                        event.current,
+                        event.total,
+                    ) {
+                        tracing::warn!("Failed to persist agent stage event {run_id}/{}: {error}", event.stage);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(run_id, stage = event.stage, %error, "Agent stage event refused during restore");
+                }
+            };
         }
     }
 
     emit_or_log(
         app,
         "pipeline-agent-stage",
-        serde_json::json!({
-            "stage": event.stage,
-            "status": event.status,
-            "file": event.file,
-            "detail": event.detail,
-            "current": event.current,
-            "total": event.total,
-        }),
+        public_agent_stage_progress(
+            run_id.unwrap_or_default(),
+            event.stage,
+            event.status,
+            event.file,
+            event.current,
+            event.total,
+        ),
     );
 }
 
 fn emit_pipeline_event(app: &tauri::AppHandle, event: &PipelineEvent, run_id: Option<&str>, source: &str) {
     match event {
         PipelineEvent::Started { total } => {
-            emit_or_log(app, "pipeline-started", serde_json::json!({ "total": total }));
+            emit_or_log(
+                app,
+                "pipeline-started",
+                serde_json::json!({ "runId": public_event_run_id(run_id), "total": total }),
+            );
         }
         PipelineEvent::Phase { phase } => {
-            emit_or_log(app, "pipeline-phase", serde_json::json!({ "phase": phase }));
+            emit_or_log(
+                app,
+                "pipeline-phase",
+                serde_json::json!({ "runId": public_event_run_id(run_id), "phase": phase }),
+            );
         }
         PipelineEvent::AgentStage { stage, status, file, detail, current, total } => {
             emit_agent_stage_event(
@@ -213,9 +470,13 @@ fn emit_pipeline_event(app: &tauri::AppHandle, event: &PipelineEvent, run_id: Op
             emit_or_log(
                 app,
                 "pipeline-progress",
-                serde_json::json!({
-                    "current": current, "total": total, "file": file, "status": status
-                }),
+                crate::ipc_contract::public_pipeline_progress(
+                    &public_event_run_id(run_id),
+                    *current,
+                    *total,
+                    file,
+                    status,
+                ),
             );
         }
         PipelineEvent::Completed { total, succeeded, failed } => {
@@ -224,20 +485,13 @@ fn emit_pipeline_event(app: &tauri::AppHandle, event: &PipelineEvent, run_id: Op
             // mislabel the event the UI routes on.
             let payload = serde_json::json!({
                 "total": total, "succeeded": succeeded, "failed": failed,
-                "source": source,
+                "source": source, "runId": public_event_run_id(run_id),
             });
             emit_or_log(app, "pipeline-complete", payload.clone());
             emit_or_log(app, "import-complete", payload);
         }
         PipelineEvent::Error { file, error } => {
-            tracing::warn!("Import error for {file}: {error}");
-            emit_or_log(
-                app,
-                "pipeline-error",
-                serde_json::json!({
-                    "file": file, "error": error
-                }),
-            );
+            emit_public_pipeline_error(app, run_id, file, error, IMPORT_PROCESSING_FAILED);
         }
     }
 }
@@ -247,50 +501,86 @@ fn log_jury_pipeline_failure(context: &str, error: &str) {
 }
 
 #[tauri::command]
-pub async fn import_directory(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("import_directory")?;
-    {
-        // Scope State before the dialog await. An unavailable dedup index must return its stable code
-        // immediately rather than opening a picker for work the backend is forbidden to admit.
-        let state = app.state::<AppState>();
-        state.require_audio_import_ready().map_err(|error| error.to_string())?;
+#[specta::specta]
+pub async fn import_directory(
+    app: tauri::AppHandle,
+    run_id: String,
+) -> Result<crate::ipc_contract::DirectoryImportStartedV1, CommandErrorV1> {
+    let agent_run_id = canonical_import_run_id(&run_id).map_err(|_| invalid_import_run_id_error())?;
+    let state = app.state::<AppState>();
+    if RATE_LIMITER.check("import_directory").is_err() {
+        state.remember_import_rejection(&agent_run_id);
+        return Err(crate::ipc_contract::owner_critical_rate_limited("import_directory"));
     }
+    // Claim the exact run BEFORE the native dialog. If the invoke response/channel is interrupted
+    // while the owner is choosing a folder, get_import_run_status reports `running`, never an
+    // ambiguous `unknown` that could make the renderer clear a still-pending command.
+    state
+        .try_start_import_for_run(&agent_run_id)
+        .map_err(|error| crate::ipc_contract::public_import_start_error(&error))?;
+    let mut claimed_start = ClaimedImportStart::new(&state, &agent_run_id);
+    // Arm cancellation before opening the native picker. The renderer already exposes its global
+    // Cancel control for this exact running ID, so a lost picker callback must remain stoppable.
+    let cancel = state.start_cancel_token();
     use tauri_plugin_dialog::DialogExt;
     // async + non-blocking folder picker — blocking_pick_folder on this main-thread command froze
-    // the whole UI while the picker was open (same footgun as open_audio_file). State is fetched
-    // AFTER the await so no State borrow is held across it.
+    // the whole UI while the picker was open (same footgun as open_audio_file).
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog().file().pick_folder(move |picked| {
         let _ = tx.send(picked);
     });
-    let dir = rx.await.map_err(|_| "folder dialog closed unexpectedly".to_string())?;
+    let dir =
+        await_picker_response(rx, wait_for_import_cancel(cancel.clone()), tokio::time::sleep(PICKER_RESPONSE_TIMEOUT))
+            .await
+            .map_err(|error| {
+                tracing::warn!(run_id = %agent_run_id, ?error, "Native directory picker did not return normally");
+                let code = match error {
+                    PickerWaitError::Cancelled => "E_DIRECTORY_PICKER_CANCELLED",
+                    PickerWaitError::TimedOut => "E_DIRECTORY_PICKER_TIMEOUT",
+                    PickerWaitError::Closed => "E_DIRECTORY_PICKER_CLOSED",
+                };
+                crate::ipc_contract::public_directory_picker_error(code)
+            })?;
     let dir_path = match dir.and_then(|p| p.as_path().map(|p| p.to_path_buf())) {
         Some(p) => p,
-        None => return Err("No directory selected".into()),
+        None => return Err(crate::ipc_contract::public_directory_picker_error("E_DIRECTORY_PICKER_CANCELLED")),
     };
-    validate::validate_file_path(&dir_path.to_string_lossy())?;
-
-    let state = app.state::<AppState>();
-    state.try_start_import()?;
-
-    let cancel = Some(state.start_cancel_token());
+    if cancel.is_cancelled() {
+        return Err(crate::ipc_contract::public_directory_picker_error("E_DIRECTORY_PICKER_CANCELLED"));
+    }
+    validate::validate_file_path(&dir_path.to_string_lossy())
+        .map_err(|_| crate::ipc_contract::invalid_import_source_path_error())?;
+    if cancel.is_cancelled() {
+        return Err(crate::ipc_contract::public_directory_picker_error("E_DIRECTORY_PICKER_CANCELLED"));
+    }
+    let cancel = Some(cancel);
 
     let pipeline = state.lock_pipeline().clone();
 
-    let agent_run_id = uuid::Uuid::new_v4().to_string();
     let app_clone = app.clone();
-    std::thread::spawn(move || {
+    let worker_agent_run_id = agent_run_id.clone();
+    let worker = std::thread::Builder::new().name("cortex-import-directory".into()).spawn(move || {
+        let agent_run_id = worker_agent_run_id;
         struct ImportGuard {
             app: tauri::AppHandle,
+            run_id: String,
         }
         impl Drop for ImportGuard {
             fn drop(&mut self) {
                 if let Some(app_state) = self.app.try_state::<AppState>() {
                     app_state.finish_import();
+                    // Published only AFTER ImportState becomes Idle. The earlier import-complete
+                    // event can reach the renderer before this drop runs; this settlement edge lets
+                    // ambiguous/lost-response recovery reconcile without ever exposing a live job.
+                    emit_or_log(
+                        &self.app,
+                        "import-worker-settled",
+                        serde_json::json!({ "runId": self.run_id, "source": "directory" }),
+                    );
                 }
             }
         }
-        let _guard = ImportGuard { app: app_clone.clone() };
+        let _guard = ImportGuard { app: app_clone.clone(), run_id: agent_run_id.clone() };
 
         // Panic-guard the directory worker (same rationale as the single-file path): an unwound
         // panic must not leave the import UI stuck "processing".
@@ -308,24 +598,33 @@ pub async fn import_directory(app: tauri::AppHandle) -> Result<serde_json::Value
 
         if let Err(e) = result {
             let error = e.to_string();
-            tracing::warn!("Import directory failed: {error}");
-            emit_or_log(
+            emit_public_pipeline_error(
                 &app_clone,
-                "pipeline-error",
-                serde_json::json!({
-                    "file": dir_path.to_string_lossy(),
-                    "error": error,
-                }),
+                Some(&agent_run_id),
+                &dir_path.to_string_lossy(),
+                &error,
+                IMPORT_PROCESSING_FAILED,
             );
             let payload = serde_json::json!({
+                "runId": public_event_run_id(Some(&agent_run_id)),
                 "total": 0, "succeeded": 0, "failed": 1, "cancelled": false, "source": "directory"
             });
             emit_or_log(&app_clone, "import-complete", payload.clone());
             emit_or_log(&app_clone, "pipeline-complete", payload);
         }
     });
+    match worker {
+        Ok(_) => claimed_start.disarm(),
+        Err(error) => {
+            tracing::warn!("Could not start directory import worker: {error}");
+            return Err(crate::ipc_contract::import_worker_start_error());
+        }
+    }
 
-    Ok(serde_json::json!({ "status": "started" }))
+    Ok(crate::ipc_contract::DirectoryImportStartedV1 {
+        status: crate::ipc_contract::ImportStartStatusV1::Started,
+        run_id,
+    })
 }
 
 /// P3.2: the crashed directory import to resume, if any. Query at STARTUP — when no import is active,
@@ -334,6 +633,13 @@ pub async fn import_directory(app: tauri::AppHandle) -> Result<serde_json::Value
 #[specta::specta]
 pub fn get_interrupted_import(state: State<'_, AppState>) -> Result<Option<ImportJobV1>, CommandErrorV1> {
     RATE_LIMITER.check("get_interrupted_import").map_err(|_| import_rate_limited_error())?;
+    // A 'running' journal belongs to the live worker whenever the in-process gate is armed. Holding
+    // this admission across the read also prevents a fresh import from entering between the state
+    // check and the snapshot query. A caller may still receive a stale DTO if an import starts after
+    // this function returns; exact discard/resume comparisons make that harmless.
+    let Some(_admission) = state.try_import_recovery_admission() else {
+        return Ok(None);
+    };
     state
         .job_store()
         .find_interrupted_import()
@@ -347,10 +653,21 @@ pub fn get_interrupted_import(state: State<'_, AppState>) -> Result<Option<Impor
 pub fn discard_interrupted_import(job_id: String, state: State<'_, AppState>) -> Result<(), CommandErrorV1> {
     STRICT_RATE_LIMITER.check("discard_interrupted_import").map_err(|_| import_rate_limited_error())?;
     validate::validate_identifier(&job_id).map_err(|_| invalid_import_job_id_error())?;
-    state
+    // Keep the same mutex that starts an import locked through the compare-and-delete. This is the
+    // safety boundary for lost resume responses: the live successor can neither be advertised nor
+    // deleted while its worker owns ImportState::Running.
+    let Some(_admission) = state.try_import_recovery_admission() else {
+        return Err(public_import_start_error("Import already in progress"));
+    };
+    match state
         .job_store()
         .discard_interrupted_import(&job_id)
-        .map_err(|error| import_journal_write_error(&error.to_string()))
+        .map_err(|error| import_journal_write_error(&error.to_string()))?
+    {
+        crate::db::DiscardImportJobOutcome::Discarded => Ok(()),
+        crate::db::DiscardImportJobOutcome::NotFound => Err(no_interrupted_import_error()),
+        crate::db::DiscardImportJobOutcome::Changed => Err(changed_import_job_error()),
+    }
 }
 
 /// P3.2: resume the interrupted directory import — re-run its folder, skipping files already imported
@@ -360,16 +677,25 @@ pub fn discard_interrupted_import(job_id: String, state: State<'_, AppState>) ->
 #[specta::specta]
 pub fn resume_interrupted_import(
     job_id: String,
+    run_id: String,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ImportResumeV1, CommandErrorV1> {
-    RATE_LIMITER.check("resume_interrupted_import").map_err(|_| import_rate_limited_error())?;
-    validate::validate_identifier(&job_id).map_err(|_| invalid_import_job_id_error())?;
-    state.require_audio_import_ready().map_err(|_| import_not_ready_error())?;
+    let agent_run_id = canonical_import_run_id(&run_id).map_err(|_| invalid_import_run_id_error())?;
+    if RATE_LIMITER.check("resume_interrupted_import").is_err() {
+        state.remember_import_rejection(&agent_run_id);
+        return Err(import_rate_limited_error());
+    }
+    if validate::validate_identifier(&job_id).is_err() {
+        state.remember_import_rejection(&agent_run_id);
+        return Err(invalid_import_job_id_error());
+    }
+    state.try_start_import_for_recovery_run(&agent_run_id).map_err(|error| public_import_start_error(&error))?;
+    let mut claimed_start = ClaimedImportStart::new(&state, &agent_run_id);
     let job =
         state.job_store().find_interrupted_import().map_err(|error| import_journal_read_error(&error.to_string()))?;
     let Some(job) = job else {
-        return Err(CommandErrorV1::new("NO_INTERRUPTED_IMPORT", "There is no interrupted import to resume.", false));
+        return Err(no_interrupted_import_error());
     };
     if job.id != job_id {
         return Err(changed_import_job_error());
@@ -384,7 +710,6 @@ pub fn resume_interrupted_import(
     }
     let completed: std::collections::HashSet<String> = job.completed_paths.iter().cloned().collect();
 
-    state.try_start_import().map_err(|error| public_import_start_error(&error))?;
     // Atomically hand the old journal to a successor BEFORE the worker is spawned. The transaction
     // copies every completed path and retires the old row in one commit, so a kill here leaves exactly
     // one resumable journal. On a handoff error, release the in-process single-flight claim while the
@@ -392,28 +717,34 @@ pub fn resume_interrupted_import(
     let resume_job_id = match state.job_store().handoff_import_for_resume(&job.id) {
         Ok(job_id) => job_id,
         Err(error) => {
-            state.finish_import();
             tracing::warn!("Could not claim interrupted import journal for resume: {error}");
             return Err(import_journal_write_error(&error.to_string()));
         }
     };
     let cancel = Some(state.start_cancel_token());
     let pipeline = state.lock_pipeline().clone();
-    let agent_run_id = uuid::Uuid::new_v4().to_string();
     let app_clone = app.clone();
     let worker_resume_job_id = resume_job_id.clone();
+    let worker_agent_run_id = agent_run_id.clone();
     let worker = std::thread::Builder::new().name("cortex-import-resume".into()).spawn(move || {
+        let agent_run_id = worker_agent_run_id;
         struct ImportGuard {
             app: tauri::AppHandle,
+            run_id: String,
         }
         impl Drop for ImportGuard {
             fn drop(&mut self) {
                 if let Some(app_state) = self.app.try_state::<AppState>() {
                     app_state.finish_import();
+                    emit_or_log(
+                        &self.app,
+                        "import-worker-settled",
+                        serde_json::json!({ "runId": self.run_id, "source": "directory" }),
+                    );
                 }
             }
         }
-        let _guard = ImportGuard { app: app_clone.clone() };
+        let _guard = ImportGuard { app: app_clone.clone(), run_id: agent_run_id.clone() };
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             pipeline.import_directory_with_agent_run_id(
                 &dir_path,
@@ -432,37 +763,50 @@ pub fn resume_interrupted_import(
         };
         if let Err(e) = result {
             let error = e.to_string();
-            tracing::warn!("Resume import failed: {error}");
-            emit_or_log(
+            emit_public_pipeline_error(
                 &app_clone,
-                "pipeline-error",
-                serde_json::json!({ "file": dir_path.to_string_lossy(), "error": error }),
+                Some(&agent_run_id),
+                &dir_path.to_string_lossy(),
+                &error,
+                IMPORT_PROCESSING_FAILED,
             );
-            let payload = serde_json::json!({ "total": 0, "succeeded": 0, "failed": 1, "cancelled": false, "source": "directory" });
+            let payload = serde_json::json!({
+                "runId": public_event_run_id(Some(&agent_run_id)),
+                "total": 0, "succeeded": 0, "failed": 1, "cancelled": false, "source": "directory"
+            });
             emit_or_log(&app_clone, "import-complete", payload.clone());
             emit_or_log(&app_clone, "pipeline-complete", payload);
         }
     });
-    if let Err(error) = worker {
-        state.finish_import();
-        tracing::warn!("Could not start interrupted import worker for journal {resume_job_id}: {error}");
-        return Err(public_import_start_error(&error.to_string()));
+    match worker {
+        Ok(_) => claimed_start.disarm(),
+        Err(error) => {
+            tracing::warn!("Could not start interrupted import worker for journal {resume_job_id}: {error}");
+            return Err(public_import_start_error(&error.to_string()));
+        }
     }
-    Ok(ImportResumeV1 { status: ImportResumeStatusV1::Started, resuming: true, import_job_id: resume_job_id })
+    Ok(ImportResumeV1 { status: ImportResumeStatusV1::Started, resuming: true, import_job_id: resume_job_id, run_id })
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn import_audio_file(
     path: String,
+    run_id: String,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("import_audio_file")?;
-    state.require_audio_import_ready().map_err(|error| error.to_string())?;
-    let validated = validate::validate_file_path(&path)?;
+) -> Result<crate::ipc_contract::FileImportStartedV1, CommandErrorV1> {
+    let agent_run_id = canonical_import_run_id(&run_id).map_err(|_| invalid_import_run_id_error())?;
+    if RATE_LIMITER.check("import_audio_file").is_err() {
+        state.remember_import_rejection(&agent_run_id);
+        return Err(crate::ipc_contract::owner_critical_rate_limited("import_audio_file"));
+    }
+    state
+        .try_start_import_for_run(&agent_run_id)
+        .map_err(|error| crate::ipc_contract::public_import_start_error(&error))?;
+    let mut claimed_start = ClaimedImportStart::new(&state, &agent_run_id);
+    let validated = validate::validate_file_path(&path).map_err(|_| crate::ipc_contract::invalid_audio_path_error())?;
     let file_path = Path::new(&validated).to_path_buf();
-
-    state.try_start_import()?;
 
     // NOTE: do NOT pre-emit pipeline-started/-phase here. The worker emits them via
     // PipelineEvent::Started/Phase (import_single_file_with_events), exactly like the directory path.
@@ -472,20 +816,27 @@ pub fn import_audio_file(
 
     let pipeline = state.lock_pipeline().clone();
 
-    let agent_run_id = uuid::Uuid::new_v4().to_string();
     let app_clone = app.clone();
-    std::thread::spawn(move || {
+    let worker_agent_run_id = agent_run_id.clone();
+    let worker = std::thread::Builder::new().name("cortex-import-file".into()).spawn(move || {
+        let agent_run_id = worker_agent_run_id;
         struct ImportGuard {
             app: tauri::AppHandle,
+            run_id: String,
         }
         impl Drop for ImportGuard {
             fn drop(&mut self) {
                 if let Some(app_state) = self.app.try_state::<AppState>() {
                     app_state.finish_import();
+                    emit_or_log(
+                        &self.app,
+                        "import-worker-settled",
+                        serde_json::json!({ "runId": self.run_id, "source": "file" }),
+                    );
                 }
             }
         }
-        let _guard = ImportGuard { app: app_clone.clone() };
+        let _guard = ImportGuard { app: app_clone.clone(), run_id: agent_run_id.clone() };
 
         // Guard the decode/VAD/ASR worker against panics (e.g. a pathological tensor inside
         // onnxruntime/sherpa-onnx). Without this, an unwound panic skips every terminal event
@@ -515,15 +866,17 @@ pub fn import_audio_file(
             Ok(r) => r,
             Err(_) => {
                 let fname = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
-                emit_or_log(
+                emit_public_pipeline_error(
                     &app_clone,
-                    "pipeline-error",
-                    serde_json::json!({
-                        "file": fname,
-                        "error": "Import failed unexpectedly (internal error); see logs.",
-                    }),
+                    Some(&agent_run_id),
+                    fname,
+                    "Import worker panicked; see native logs",
+                    IMPORT_PROCESSING_FAILED,
                 );
-                let payload = serde_json::json!({ "total": 1, "succeeded": 0, "failed": 1, "source": "file" });
+                let payload = serde_json::json!({
+                    "runId": public_event_run_id(Some(&agent_run_id)),
+                    "total": 1, "succeeded": 0, "failed": 1, "source": "file"
+                });
                 emit_or_log(&app_clone, "import-complete", payload.clone());
                 emit_or_log(&app_clone, "pipeline-complete", payload);
                 return;
@@ -552,6 +905,7 @@ pub fn import_audio_file(
                 // the global DB lock across ASR, starving the UI's get_segments so the list never
                 // rendered during import.) Adjudication enriches the segments and emits a refresh.
                 let ready_payload = serde_json::json!({
+                    "runId": public_event_run_id(Some(&agent_run_id)),
                     "total": 1, "succeeded": 1, "failed": 0,
                     "segmentCount": seg_count, "segmentIds": segment_ids.clone(), "source": "file",
                 });
@@ -579,25 +933,25 @@ pub fn import_audio_file(
                         let _mutation = match begin_mutation() {
                             Ok(guard) => guard,
                             Err(error) => {
-                                emit_or_log(
+                                emit_public_pipeline_error(
                                     &app_clone,
-                                    "pipeline-error",
-                                    serde_json::json!({ "file": &post_import_file, "error": error }),
+                                    Some(&agent_run_id),
+                                    &post_import_file,
+                                    &error,
+                                    IMPORT_ENRICHMENT_FAILED,
                                 );
-                                let done_payload = serde_json::json!({
-                                    "total": 1,
-                                    "succeeded": 1,
-                                    "failed": 0,
-                                    "segmentCount": seg_count,
-                                    "segmentIds": segment_ids.clone(),
-                                    "source": "file",
-                                });
-                                emit_or_log(&app_clone, "import-complete", done_payload.clone());
-                                emit_or_log(&app_clone, "pipeline-complete", done_payload);
+                                emit_import_enrichment_complete(&app_clone, &agent_run_id, &segment_ids);
                                 return;
                             }
                         };
-                        emit_or_log(&app_clone, "pipeline-phase", serde_json::json!({ "phase": "adjudicating" }));
+                        emit_or_log(
+                            &app_clone,
+                            "pipeline-phase",
+                            serde_json::json!({
+                                "runId": public_event_run_id(Some(&agent_run_id)),
+                                "phase": "adjudicating"
+                            }),
+                        );
                         let adjudication_detail = format!("Adjudicating {} imported segment(s)", segment_ids.len());
                         emit_agent_stage_event(
                             &app_clone,
@@ -650,16 +1004,7 @@ pub fn import_audio_file(
                                 // Still emit the terminal refresh — adjudication is best-effort and the
                                 // import itself already succeeded, so the UI must not hang waiting for a
                                 // completion event that would otherwise never fire on this early return.
-                                let done_payload = serde_json::json!({
-                                    "total": 1,
-                                    "succeeded": 1,
-                                    "failed": 0,
-                                    "segmentCount": seg_count,
-                                    "segmentIds": segment_ids,
-                                    "source": "file",
-                                });
-                                emit_or_log(&app_clone, "import-complete", done_payload.clone());
-                                emit_or_log(&app_clone, "pipeline-complete", done_payload);
+                                emit_import_enrichment_complete(&app_clone, &agent_run_id, &segment_ids);
                                 return;
                             };
                             // R3: this background adjudication thread writes verdicts + the import report on
@@ -783,23 +1128,18 @@ pub fn import_audio_file(
                             // (the jury_adjudication stage event already carries the detail) — NOT an
                             // import failure.
                             log_jury_pipeline_failure("single-file import", &error);
-                            emit_or_log(
+                            emit_public_pipeline_error(
                                 &app_clone,
-                                "pipeline-error",
-                                serde_json::json!({ "file": &post_import_file, "error": error }),
+                                Some(&agent_run_id),
+                                &post_import_file,
+                                &error,
+                                IMPORT_ENRICHMENT_FAILED,
                             );
                         }
-                        // Refresh the UI so any references/verdicts produced by adjudication appear.
-                        let done_payload = serde_json::json!({
-                            "total": 1,
-                            "succeeded": 1,
-                            "failed": 0,
-                            "segmentCount": seg_count,
-                            "segmentIds": segment_ids,
-                            "source": "file",
-                        });
-                        emit_or_log(&app_clone, "import-complete", done_payload.clone());
-                        emit_or_log(&app_clone, "pipeline-complete", done_payload);
+                        // Refresh report/evidence only. Import truth already completed at the
+                        // segments-ready edge above; replaying `import-complete` here could end a
+                        // newer import and select the wrong clip.
+                        emit_import_enrichment_complete(&app_clone, &agent_run_id, &segment_ids);
                     }));
                     if outcome.is_err() {
                         // Adjudication unwound (e.g. a panic deep in ASR/onnxruntime). Settle the stage
@@ -818,26 +1158,21 @@ pub fn import_audio_file(
                                 total: panic_seg_count,
                             },
                         );
-                        let done_payload = serde_json::json!({
-                            "total": 1, "succeeded": 1, "failed": 0,
-                            "segmentCount": panic_seg_count, "source": "file",
-                        });
-                        emit_or_log(&panic_app, "import-complete", done_payload.clone());
-                        emit_or_log(&panic_app, "pipeline-complete", done_payload);
+                        emit_import_enrichment_complete(&panic_app, &panic_run_id, &[]);
                     }
                 });
             }
             Err(e) => {
                 let fname = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
-                emit_or_log(
+                emit_public_pipeline_error(
                     &app_clone,
-                    "pipeline-error",
-                    serde_json::json!({
-                        "file": fname,
-                        "error": e.to_string(),
-                    }),
+                    Some(&agent_run_id),
+                    fname,
+                    &e.to_string(),
+                    IMPORT_PROCESSING_FAILED,
                 );
                 let payload = serde_json::json!({
+                    "runId": public_event_run_id(Some(&agent_run_id)),
                     "total": 1,
                     "succeeded": 0,
                     "failed": 1,
@@ -848,8 +1183,19 @@ pub fn import_audio_file(
             }
         }
     });
+    match worker {
+        Ok(_) => claimed_start.disarm(),
+        Err(error) => {
+            tracing::warn!("Could not start file import worker: {error}");
+            return Err(crate::ipc_contract::import_worker_start_error());
+        }
+    }
 
-    Ok(serde_json::json!({ "status": "started", "source": "file" }))
+    Ok(crate::ipc_contract::FileImportStartedV1 {
+        status: crate::ipc_contract::ImportStartStatusV1::Started,
+        source: crate::ipc_contract::ImportSourceV1::File,
+        run_id,
+    })
 }
 
 /// P0.2 — expose the git SHA baked into the running exe at build time so the frontend/e2e harness
@@ -892,384 +1238,505 @@ pub(crate) struct ClipSpan {
     pub end_ms: i64,
 }
 
-/// Record the FIRST failure only, so the reported cause is the one that actually stopped the run.
-/// The terminal cause of a batch run, or `None` — the ONLY shape that may be reported as `completed`.
-///
-/// A per-clip failure comes first because it is the harder stop (clips were left undrafted). A
-/// post-batch jury failure keeps its own wording: every clip WAS drafted, so borrowing the per-clip
-/// "remaining clips were not transcribed" phrasing would be its own small lie.
-pub(super) fn batch_terminal_halt_cause(clip_failure: Option<String>, jury_failure: Option<String>) -> Option<String> {
-    clip_failure.or_else(|| jury_failure.map(|error| format!("post-batch jury adjudication failed: {error}")))
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(super) enum BatchHaltCode {
+    ChampionUnavailable,
+    ChampionIdentityMismatch,
+    TranscriptionSourceChanged,
+    AudioDecodeFailed,
+    BatchRefinementFailed,
+    BatchTranscriptionFailed,
 }
 
-fn record_first_failure(slot: &std::sync::Mutex<Option<String>>, message: String) {
-    if let Ok(mut guard) = slot.lock() {
-        if guard.is_none() {
-            *guard = Some(message);
+fn batch_halt_code_for_error(error: &crate::error::AppError) -> BatchHaltCode {
+    use crate::error::{AppError, AudioError};
+    match error {
+        AppError::Audio(
+            AudioError::UnsupportedCodec(_)
+            | AudioError::Decode(_)
+            | AudioError::Resample(_)
+            | AudioError::NoTracks(_)
+            | AudioError::EmptyBuffer,
+        ) => BatchHaltCode::AudioDecodeFailed,
+        AppError::Validation(message) if message.starts_with("E_TRANSCRIPTION_SOURCE_CHANGED:") => {
+            BatchHaltCode::TranscriptionSourceChanged
         }
+        AppError::Validation(message)
+            if message.starts_with(crate::pipeline::ASR_7B_UNAVAILABLE_TAG)
+                && (message.contains("does not match registry champion")
+                    || message.contains("transcription reply identity")) =>
+        {
+            BatchHaltCode::ChampionIdentityMismatch
+        }
+        AppError::Validation(message) if message.starts_with(crate::pipeline::ASR_7B_UNAVAILABLE_TAG) => {
+            BatchHaltCode::ChampionUnavailable
+        }
+        AppError::Other(message) if message.starts_with("LLM refinement failed") => {
+            BatchHaltCode::BatchRefinementFailed
+        }
+        // These are primary recognizer/model failures. Calling them a refinement failure would send
+        // the owner toward the wrong recovery path and misstate which stage produced no transcript.
+        AppError::Asr(_) | AppError::Onnx(_) | AppError::ModelNotFound { .. } => {
+            BatchHaltCode::BatchTranscriptionFailed
+        }
+        _ => BatchHaltCode::BatchTranscriptionFailed,
     }
 }
 
-/// Worker count for a batch transcription, from `CORTEX_BATCH_CONCURRENCY`.
-///
-/// Anything absent, unparseable, zero, negative or absurd falls back to 1 — the strictly serial
-/// behaviour this command had before concurrency existed. A bad value must never silently become a
-/// 32-way fan-out at an ASR server, so the fallback is the SAFE end, not the fast one.
-pub(super) fn parse_batch_concurrency(raw: Option<&str>) -> usize {
-    raw.and_then(|value| value.trim().parse::<usize>().ok()).filter(|n| (1..=32).contains(n)).unwrap_or(1)
+fn batch_halt_error(code: BatchHaltCode) -> crate::ipc_contract::CommandErrorV1 {
+    use crate::ipc_contract::SuggestedActionV1;
+    let (wire_code, message, retryable, suggested_action) = match code {
+        BatchHaltCode::ChampionUnavailable => {
+            ("CHAMPION_UNAVAILABLE", "The champion engine is unavailable.", true, Some(SuggestedActionV1::OpenHealth))
+        }
+        BatchHaltCode::ChampionIdentityMismatch => (
+            "CHAMPION_IDENTITY_MISMATCH",
+            "The loaded engine is not the registered champion.",
+            false,
+            Some(SuggestedActionV1::OpenModels),
+        ),
+        BatchHaltCode::TranscriptionSourceChanged => (
+            "TRANSCRIPTION_SOURCE_CHANGED",
+            "The transcription source changed.",
+            false,
+            Some(SuggestedActionV1::ReloadClip),
+        ),
+        BatchHaltCode::AudioDecodeFailed => {
+            ("AUDIO_DECODE_FAILED", "The audio could not be decoded.", false, Some(SuggestedActionV1::ReloadClip))
+        }
+        BatchHaltCode::BatchRefinementFailed => {
+            ("BATCH_REFINEMENT_FAILED", "Transcript refinement failed.", true, Some(SuggestedActionV1::Retry))
+        }
+        BatchHaltCode::BatchTranscriptionFailed => {
+            ("BATCH_TRANSCRIPTION_FAILED", "Batch transcription failed.", true, Some(SuggestedActionV1::Retry))
+        }
+    };
+    let error = crate::ipc_contract::CommandErrorV1::new(wire_code, message, retryable);
+    match suggested_action {
+        Some(action) => error.suggested(action),
+        None => error,
+    }
 }
 
+fn batch_transcribe_admission_error(private_detail: &str) -> CommandErrorV1 {
+    if private_detail.contains("BATCH_ADMISSION_CANCELLED") {
+        return batch_start_commit_error(crate::BatchStartCommitError::Cancelled);
+    }
+    if private_detail.contains(crate::database_runtime::RESTORE_IN_PROGRESS_MSG) {
+        return CommandErrorV1::new(
+            "RESTORE_IN_PROGRESS",
+            "A database restore is in progress. Wait for it to finish, then retry.",
+            true,
+        )
+        .suggested(SuggestedActionV1::Retry);
+    }
+    if private_detail.contains("restore generation changed") {
+        return CommandErrorV1::new(
+            "RESTORE_GENERATION_CHANGED",
+            "The database changed during batch preparation. Retry from the current workspace.",
+            true,
+        )
+        .suggested(SuggestedActionV1::Retry);
+    }
+    if private_detail.contains("already in progress") || private_detail.contains("one_live_batch") {
+        return CommandErrorV1::new("BATCH_ALREADY_RUNNING", "Another batch operation is already running.", true)
+            .suggested(SuggestedActionV1::Retry);
+    }
+    if private_detail.contains("does not exist") {
+        return CommandErrorV1::new(
+            "BATCH_SEGMENT_MISSING",
+            "A selected segment no longer exists. Reload the library before retrying.",
+            false,
+        )
+        .suggested(SuggestedActionV1::ReloadClip);
+    }
+    CommandErrorV1::new(
+        "BATCH_ADMISSION_FAILED",
+        "The transcription batch could not be admitted durably. Open Health before retrying.",
+        false,
+    )
+    .suggested(SuggestedActionV1::OpenHealth)
+}
+
+fn durable_transcription_failure_code(error: &crate::error::AppError) -> String {
+    batch_halt_error(batch_halt_code_for_error(error)).code
+}
+
+fn batch_transcription_source_cache_cardinality(cache: &crate::pipeline::TranscriptionSourceLeaseCache) -> usize {
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned bounded batch transcription source cache");
+            poisoned.into_inner()
+        })
+        .len()
+}
+
+fn batch_transcription_source_cache_is_within_page_bound(
+    cache: &crate::pipeline::TranscriptionSourceLeaseCache,
+) -> bool {
+    batch_transcription_source_cache_cardinality(cache) <= crate::db::BATCH_PENDING_PAGE_SIZE_V1
+}
+
+/// Start one exact-champion batch whose immutable request, before images, item outcomes, canonical
+/// writes and undo authority all share the schema-68 journal. Inference is deliberately sequential
+/// for the owner workstation: correctness, deterministic hard-stop behavior and bounded pressure
+/// outrank speculative provider fan-out.
 #[tauri::command]
-pub fn batch_transcribe(
+#[specta::specta]
+pub async fn batch_transcribe(
     ids: Vec<String>,
-    state: State<'_, AppState>,
+    operation_id: String,
     app: tauri::AppHandle,
-) -> Result<serde_json::Value, String> {
-    STRICT_RATE_LIMITER.check("batch_transcribe")?;
-    for id in &ids {
-        validate::validate_identifier(id)?;
+) -> Result<BatchStartedV1, CommandErrorV1> {
+    tokio::task::spawn_blocking(move || batch_transcribe_blocking(ids, operation_id, app)).await.map_err(|error| {
+        tracing::error!(%error, "Transcription admission worker stopped unexpectedly");
+        CommandErrorV1::new(
+            "BATCH_START_WORKER_FAILED",
+            "The transcription batch could not be started. Retry; if it continues, open Health.",
+            true,
+        )
+        .suggested(SuggestedActionV1::OpenHealth)
+    })?
+}
+
+fn batch_transcribe_blocking(
+    ids: Vec<String>,
+    operation_id: String,
+    app: tauri::AppHandle,
+) -> Result<BatchStartedV1, CommandErrorV1> {
+    let state = app.state::<AppState>();
+    let operation = crate::BatchOperation::Transcribe;
+    let operation_id = canonical_batch_operation_id(&operation_id).map_err(|_| invalid_batch_operation_id_error())?;
+    if STRICT_RATE_LIMITER.check("batch_transcribe").is_err() {
+        state.remember_batch_rejection(&operation_id, operation);
+        return Err(CommandErrorV1::new("RATE_LIMITED", "Too many batch requests. Wait a moment, then retry.", true)
+            .suggested(SuggestedActionV1::Retry));
     }
+    if let Err(error) = validate_batch_segment_ids(&ids) {
+        state.remember_batch_rejection(&operation_id, operation);
+        tracing::warn!(%error, "Rejected invalid transcription batch selection");
+        return Err(CommandErrorV1::new(
+            "INVALID_BATCH_SELECTION",
+            "Select between one and 100,000 unique segments before transcribing.",
+            false,
+        ));
+    }
+
     let total = ids.len();
-
-    // PREFLIGHT before claiming the job (owner rule 2026-08-11). Measured 2026-08-11: a 487-clip run
-    // was accepted, then HARD-STOPPED on the very first clip because the champion server was not
-    // running — the right outcome, but the caller had already been told "started". Failing here
-    // returns the reason immediately and leaves the queue untouched, rather than after a write cycle.
-    {
-        let pipeline = state.lock_pipeline().clone();
-        pipeline.preflight_primary_engine().map_err(|e| e.to_string())?;
+    let cancel = state
+        .try_start_batch_for_run(&operation_id, operation, total)
+        .map_err(|error| batch_transcribe_admission_error(&error))?;
+    let mut claimed_start = crate::ClaimedBatchStart::new(&state, &operation_id, operation);
+    let restore_generation = crate::database_runtime::capture_restore_generation()
+        .map_err(|error| batch_transcribe_admission_error(&error))?;
+    if cancel.is_cancelled() {
+        return Err(batch_start_commit_error(crate::BatchStartCommitError::Cancelled));
     }
 
-    state.try_start_batch()?;
-
-    let cancel = state.ensure_cancel_token()?;
-
+    // The command may say "started" only after the exact registered champion and result-affecting
+    // configuration have both been proved. A smaller diagnostic engine is never a batch fallback.
     let pipeline = state.lock_pipeline().clone();
+    let preflight = pipeline.preflight_batch_champion();
+    if cancel.is_cancelled() {
+        return Err(batch_start_commit_error(crate::BatchStartCommitError::Cancelled));
+    }
+    if let Err(error) = preflight {
+        tracing::warn!(%error, "Rejected transcription batch before champion admission");
+        return Err(batch_halt_error(batch_halt_code_for_error(&error)));
+    }
+    let config_sha256 = pipeline.batch_transcription_config_sha256().map_err(|error| {
+        tracing::error!(%error, "Transcription configuration could not be hashed");
+        batch_transcribe_admission_error(&error.to_string())
+    })?;
 
-    let app_clone = app.clone();
-    std::thread::spawn(move || {
-        struct BatchGuard {
-            app: tauri::AppHandle,
-        }
-        impl Drop for BatchGuard {
-            fn drop(&mut self) {
-                if let Some(app_state) = self.app.try_state::<AppState>() {
-                    app_state.finish_batch();
+    let executor = new_batch_executor_identity();
+    // Allocate every captured owner before durable admission. Once the journal exists, the unified
+    // guard below is the sole authority that may reopen the process-local batch gate.
+    let worker_app = app.clone();
+    let worker_operation_id = operation_id.clone();
+    let admission_commit =
+        state.commit_batch_start(&operation_id, operation, &cancel).map_err(batch_start_commit_error)?;
+    drop(admission_commit);
+    let (lease, admitted) = state
+        .batch_store()
+        .admit(crate::stores::BatchAdmissionV1 {
+            operation_id: &operation_id,
+            kind: crate::db::BatchJobKindV1::Transcribe,
+            segment_ids: &ids,
+            config_sha256: &config_sha256,
+            executor,
+            cancel: cancel.as_atomic(),
+            restore_generation,
+        })
+        .map_err(|error| batch_transcribe_admission_error(&error.to_string()))?;
+    let mut worker = DurableBatchWorkerGuard::new(worker_app.clone(), worker_operation_id.clone(), operation, lease);
+    if !state.mark_batch_durable_admitted(&operation_id, operation) {
+        tracing::error!(%operation_id, "Transcription durable-admission phase lost exact start authority");
+        claimed_start.disarm();
+        worker
+            .finish(crate::db::BatchTerminalIntentV1::Failed { code: "BATCH_START_AUTHORITY_LOST".into() })
+            .map_err(|error| batch_transcribe_admission_error(&error.to_string()))?;
+        drop(worker);
+        return Err(batch_start_commit_error(crate::BatchStartCommitError::AuthorityLost));
+    }
+    // From here the unified guard owns both journal and process-gate settlement.
+    claimed_start.disarm();
+    if usize::try_from(admitted.total).ok() != Some(total) {
+        tracing::error!(expected = total, admitted = admitted.total, "Durable batch admission count mismatch");
+        worker
+            .finish(crate::db::BatchTerminalIntentV1::Failed { code: "BATCH_EVIDENCE_INVALID".into() })
+            .map_err(|error| batch_transcribe_admission_error(&error.to_string()))?;
+        drop(worker);
+        return Err(CommandErrorV1::new(
+            "BATCH_EVIDENCE_INVALID",
+            "The admitted batch evidence is inconsistent. Open Health before retrying.",
+            false,
+        )
+        .suggested(SuggestedActionV1::OpenHealth));
+    }
+    let start_commit = match state.commit_batch_start(&operation_id, operation, &cancel) {
+        Ok(commit) => commit,
+        Err(error) => {
+            let intent = match error {
+                crate::BatchStartCommitError::Cancelled => {
+                    crate::db::BatchTerminalIntentV1::Cancelled { code: "BATCH_CANCELLED".into() }
                 }
-            }
+                crate::BatchStartCommitError::AuthorityLost => {
+                    crate::db::BatchTerminalIntentV1::Failed { code: "BATCH_START_AUTHORITY_LOST".into() }
+                }
+            };
+            worker.finish(intent).map_err(|settle_error| {
+                tracing::error!(%operation_id, %settle_error, "Admitted transcription could not settle before worker spawn");
+                batch_transcribe_admission_error(&settle_error.to_string())
+            })?;
+            drop(worker);
+            return Err(batch_start_commit_error(error));
         }
-        let _guard = BatchGuard { app: app_clone.clone() };
+    };
 
+    // Drop the final cancel-slot guard before `spawn`: an OS refusal drops the captured worker guard
+    // synchronously, and its exact settlement must be able to clear the cancellation slot.
+    drop(start_commit);
+    let app_clone = worker_app;
+    let spawn = std::thread::Builder::new().name("cortex-batch-transcribe".into()).spawn(move || {
+        worker.mark_worker_entered();
         emit_or_log(
             &app_clone,
             "batch-progress",
             serde_json::json!({
-                "type": "started", "total": total, "operation": "transcribe"
+                "type": "started", "total": total, "operation": "transcribe",
+                "operationId": worker_operation_id.as_str()
             }),
         );
 
-        // CONCURRENCY (2026-08-11). This loop was strictly serial, which is invisible for a local ONNX
-        // batch and disastrous for the 7B+cloud path: measured 22.2 s in the WSL 7B and 52.1 s in
-        // Gemini refinement per clip — ~74 s of almost pure WAITING — putting 487 clips at ~8 hours
-        // with BOTH GPUs at 10-18%. Neither stage is throughput-bound.
-        //
-        // A bounded pool is enough; no explicit two-stage pipeline is needed. The 7B server is two
-        // pre-forked replicas (one per GPU) each serving ONE request at a time, so its accept queue
-        // self-throttles ASR to 2 however many workers ask, while the remaining workers overlap in the
-        // network-bound refinement. Throughput then lands at 2 clips per ~22 s instead of 1 per ~74 s.
-        //
-        // Default 1 — byte-identical behaviour to before for every local batch, opt in via
-        // CORTEX_BATCH_CONCURRENCY for the 7B+cloud path. Writes are NOT parallelised: every
-        // update_batch_transcription_if_unreviewed still runs under the single app_state.lock_db()
-        // mutex, and the pipeline's own connections are WAL with busy_timeout=10s.
-        let concurrency = parse_batch_concurrency(std::env::var("CORTEX_BATCH_CONCURRENCY").ok().as_deref());
-        if concurrency > 1 {
-            tracing::info!("Batch transcribe running {concurrency} clips concurrently");
-        }
+        let mut terminal_intent = crate::db::BatchTerminalIntentV1::Succeeded;
+        let mut page_cursor = None;
 
-        let next_index = std::sync::atomic::AtomicUsize::new(0);
-        let done_count = std::sync::atomic::AtomicUsize::new(0);
-        let succeeded_n = std::sync::atomic::AtomicU32::new(0);
-        let failed_n = std::sync::atomic::AtomicU32::new(0);
-        let skipped_n = std::sync::atomic::AtomicU32::new(0);
-        let cancelled_flag = std::sync::atomic::AtomicBool::new(false);
-        let previous_segments_shared: std::sync::Mutex<Vec<crate::db::SpeechSegment>> =
-            std::sync::Mutex::new(Vec::new());
-        let transcribed_ids_shared: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-        // The FIRST failure, kept verbatim: it is the one that explains the stop, and later workers
-        // finishing their in-flight clip must not overwrite it with a downstream symptom.
-        let first_failure: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-        // Segments commonly share one long source recording. Verify/decode each unique source once,
-        // keep its immutable handle alive through the whole batch, and single-flight concurrent
-        // workers that reach the same recording together.
-        let source_lease_cache: crate::pipeline::TranscriptionSourceLeaseCache = Default::default();
-
-        // Pre-fetch all target segments in a SINGLE DB lock (one WHERE IN query)
-        // instead of re-locking on every loop iteration. For a 500-segment batch
-        // this drops mutex acquisitions from 500 → 1 for the read phase.
-        let seg_map: std::collections::HashMap<String, crate::db::SpeechSegment> = {
-            if let Some(app_state) = app_clone.try_state::<AppState>() {
-                let db = app_state.lock_db();
-                match db.get_segments_by_ids(&ids) {
-                    Ok(segments) => segments.into_iter().map(|s| (s.id.clone(), s)).collect(),
-                    Err(error) => {
-                        tracing::error!("Batch transcribe DB prefetch failed: {error}");
-                        std::collections::HashMap::new()
-                    }
-                }
-            } else {
-                std::collections::HashMap::new()
-            }
-        };
-        // Normalizer Arc cloned once, reused across iterations.
-        let normalizer_arc = app_clone.try_state::<AppState>().map(|s| Arc::clone(&s.normalizer));
-        // Shared across workers: each claims its own segment, so no two ever transcribe the same id.
-        let seg_map = std::sync::Mutex::new(seg_map);
-
-        let run_worker = || loop {
-            let i = next_index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if i >= ids.len() {
-                break;
-            }
-            let id = &ids[i];
-            // Real backpressure (the old call discarded its result): under genuine memory pressure
-            // (<1 GiB available) warn loudly and pause briefly so the OS can reclaim, instead of
-            // marching a heavy ASR loop into an OOM kill mid-batch.
-            if i % 10 == 0 && health::check_memory_pressure() {
-                tracing::warn!(
-                    "memory pressure during batch transcribe ({} MiB available) — pausing 2s at segment {}/{}",
-                    health::available_memory_mb(),
-                    i,
-                    ids.len()
-                );
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            }
-
+        'pages: loop {
             if cancel.is_cancelled() {
-                cancelled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                terminal_intent = crate::db::BatchTerminalIntentV1::Cancelled { code: "BATCH_CANCELLED".into() };
                 break;
             }
-
-            let Some(app_state) = app_clone.try_state::<AppState>() else {
-                break;
+            let page = match worker.lease().and_then(|authority| authority.pending_page(page_cursor)) {
+                Ok(items) => items,
+                Err(error) => {
+                    tracing::error!(%error, "Durable transcription work page could not be read");
+                    terminal_intent =
+                        crate::db::BatchTerminalIntentV1::Failed { code: "BATCH_EVIDENCE_INVALID".into() };
+                    break;
+                }
             };
-            // Use the pre-fetched normalizer (avoids re-cloning Arc on every iteration).
-            let normalizer = normalizer_arc.as_ref().unwrap_or_else(|| &app_state.normalizer);
-
-            let seg = seg_map.lock().ok().and_then(|mut map| map.remove(id.as_str()));
-
-            if let Some(seg) = seg {
-                // Capture full snapshot BEFORE transcription for complete undo.
-                let mut pre_transcription_snapshot = seg.clone();
-                // The batch's cancel token rides into the 7B call (2026-08-20 external review: it
-                // passed None, so Cancel could not reach an in-flight or gate-queued champion call).
-                let bound_source = pipeline.bind_existing_transcription_source_cached(
-                    id,
-                    Some(&seg.audio_path),
-                    seg.alignment_json.as_deref(),
-                    &source_lease_cache,
-                );
-                let transcription = match bound_source {
-                    Ok(source) => {
-                        pre_transcription_snapshot = source.segment().clone();
-                        pipeline.transcribe_bound(&source, Some(cancel.as_atomic()))
-                    }
-                    Err(error) => Err(error),
-                };
-                match transcription {
-                    Ok(draft) if draft.final_text.trim().is_empty() && draft.raw_text.trim().is_empty() => {
-                        // A blank draft is NOT a transcript. update_batch_transcription_if_unreviewed would
-                        // overwrite an existing good (unreviewed) transcript with "" — e.g. a jury_accept 7B
-                        // draft re-batch-transcribed by the weaker offline CTC engine that returns Ok("") on
-                        // a quiet clip. Skip; keep the current text. (Recurring
-                        // blank-transcript-never-overwrites-good data-loss class; matches transcribe_segment.)
-                        tracing::info!(
-                            "Batch transcribe skipped {id}: empty transcript (silent clip) — existing transcript kept"
-                        );
-                        skipped_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    }
-                    Ok(draft) if draft.committed_by_pipeline => {
-                        // ONE commit owner (2026-08-20 external review): the champion branch of
-                        // `transcribe` already committed transcript + sole hypothesis + provenance
-                        // atomically (and refused if the row gained a human decision). Writing the
-                        // same result again here created a second owner whose failure reported
-                        // "failed" for a row the first commit had already changed. Account for the
-                        // work; write nothing.
-                        if let Ok(mut previous_segments) = previous_segments_shared.lock() {
-                            previous_segments.push(pre_transcription_snapshot);
-                        }
-                        if let Ok(mut transcribed_ids) = transcribed_ids_shared.lock() {
-                            transcribed_ids.push(id.clone());
-                        }
-                        succeeded_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    }
-                    Ok(draft) => {
-                        let normalized = normalizer.normalize(&draft.final_text);
-                        // Guarded targeted write (NOT a full insert_segment of the stale snapshot): a
-                        // human may have verified/edited this row since the batch prefetched it. This
-                        // writes only the ASR fields — never `annotated_transcript` (human-only, by
-                        // law; the old seed-when-empty machine write is the 348-row 2026-08-12
-                        // incident) — never touches `verified`, and skips human-owned rows, so a
-                        // concurrent curator decision can never be silently lost.
-                        match app_state.lock_db().update_batch_transcription_if_unreviewed(
-                            id,
-                            &draft.raw_text,
-                            Some(normalized.as_str()),
-                            draft.confidence,
-                            draft.confidence_source.as_deref(),
-                            draft.model_version_id.as_deref(),
-                            draft.cloud_call,
-                        ) {
-                            Ok(true) => {
-                                // Guards named for what they hold, so the undo snapshot and the
-                                // jury's id list still read exactly as the runtime-panic policy
-                                // pins them — the collections moved behind a mutex, the obligation
-                                // to record both did not.
-                                if let Ok(mut previous_segments) = previous_segments_shared.lock() {
-                                    previous_segments.push(pre_transcription_snapshot);
-                                }
-                                if let Ok(mut transcribed_ids) = transcribed_ids_shared.lock() {
-                                    transcribed_ids.push(id.clone());
-                                }
-                                succeeded_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            }
-                            Ok(false) => {
-                                // Row became human-verified/reviewed after the batch began — skip
-                                // rather than overwrite the curator's confirmed label.
-                                tracing::info!("Batch transcribe skipped {id}: human-reviewed since batch start");
-                                skipped_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            }
-                            Err(error) => {
-                                tracing::error!("Batch transcribe DB update failed for {id}: {error}");
-                                failed_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Batch transcribe failed for {id}: {e}");
-                        failed_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        record_first_failure(&first_failure, format!("segment {id}: {e}"));
-                    }
-                }
-            } else {
-                failed_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                record_first_failure(&first_failure, format!("segment {id}: not found in the database"));
-            }
-
-            // HARD STOP (owner rule, 2026-08-11 — AGENT_CHARTER "Stop on the first failure").
-            //
-            // This loop used to count a failure and carry on. Measured 2026-08-10: 25 clips whose
-            // source container the champion could not decode failed one by one, the batch ran to
-            // "completion", and the review queue ended up 462 clips at champion quality and 25 at a
-            // weaker engine — with no error surfaced anywhere. A partly-drafted dataset that LOOKS
-            // finished is worse than a run that stopped: the mixed provenance is invisible and
-            // silently poisons every measurement taken from it afterwards.
-            //
-            // So the first failure cancels the batch. Everything already written stays written and is
-            // reported; the run is reported as FAILED, never as done.
-            if first_failure.lock().map(|f| f.is_some()).unwrap_or(false) {
-                cancel.cancel();
+            if page.is_empty() {
                 break;
             }
-
-            // Completion COUNT, not the claim index: with workers in flight the highest claimed index
-            // runs ahead of what is actually finished, and a progress bar must never report work that
-            // has not happened.
-            let current = done_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            emit_or_log(
-                &app_clone,
-                "batch-progress",
-                serde_json::json!({
-                    "type": "progress", "current": current, "total": total,
-                    "file": id, "status": "transcribing", "operation": "transcribe"
-                }),
-            );
-        };
-
-        if concurrency == 1 {
-            run_worker();
-        } else {
-            std::thread::scope(|scope| {
-                for _ in 0..concurrency {
-                    scope.spawn(run_worker);
+            // One cache per fixed database page preserves same-recording reuse without retaining
+            // an OS source handle for every distinct recording in a 100,000-item operation.
+            let source_lease_cache: crate::pipeline::TranscriptionSourceLeaseCache = Default::default();
+            for item in page {
+                if cancel.is_cancelled() {
+                    terminal_intent = crate::db::BatchTerminalIntentV1::Cancelled { code: "BATCH_CANCELLED".into() };
+                    break 'pages;
                 }
-            });
-        }
+                if item.ordinal % 10 == 0 && health::check_memory_pressure() {
+                    tracing::warn!(
+                        available_mib = health::available_memory_mb(),
+                        ordinal = item.ordinal,
+                        "Memory pressure during durable transcription; pausing before the next inference"
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
 
-        let succeeded = succeeded_n.load(std::sync::atomic::Ordering::SeqCst);
-        let failed = failed_n.load(std::sync::atomic::Ordering::SeqCst);
-        let skipped = skipped_n.load(std::sync::atomic::Ordering::SeqCst);
-        let cancelled = cancelled_flag.load(std::sync::atomic::Ordering::SeqCst);
-        let previous_segments = previous_segments_shared.into_inner().unwrap_or_default();
-        let transcribed_ids = transcribed_ids_shared.into_inner().unwrap_or_default();
-
-        if !previous_segments.is_empty() {
-            if let Some(app_state) = app_clone.try_state::<AppState>() {
-                let endpoint_ids = previous_segments.iter().map(|segment| segment.id.clone()).collect::<Vec<_>>();
-                match app_state.lock_db().get_segments_by_ids(&endpoint_ids) {
-                    Ok(current_segments) if current_segments.len() == previous_segments.len() => {
-                        app_state.lock_history().push(Command::BatchTranscribe { previous_segments, current_segments });
+                let bound_source = match pipeline.bind_existing_transcription_source_cached(
+                    &item.segment_id,
+                    Some(&item.before.segment.audio_path),
+                    item.before.segment.alignment_json.as_deref(),
+                    &source_lease_cache,
+                ) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        tracing::error!(segment_id = %item.segment_id, %error, "Transcription source binding failed");
+                        terminal_intent = crate::db::BatchTerminalIntentV1::Failed {
+                            code: durable_transcription_failure_code(&error),
+                        };
+                        break 'pages;
                     }
-                    Ok(current_segments) => tracing::error!(
-                        "Batch history refused: {} durable ASR writes produced only {} current endpoints",
-                        previous_segments.len(),
-                        current_segments.len()
-                    ),
-                    Err(error) => tracing::error!(
-                        "Batch history refused because its current endpoint snapshot could not be read: {error}"
-                    ),
+                };
+                if !batch_transcription_source_cache_is_within_page_bound(&source_lease_cache) {
+                    tracing::error!(
+                        operation_id = %worker_operation_id,
+                        "Batch transcription source cache exceeded its fixed durable page bound"
+                    );
+                    terminal_intent =
+                        crate::db::BatchTerminalIntentV1::Failed { code: "BATCH_EVIDENCE_INVALID".into() };
+                    break 'pages;
                 }
+                let inferred = match pipeline.transcribe_bound_draft_only(&bound_source, Some(cancel.as_atomic())) {
+                    Ok(draft) => draft,
+                    Err(error) => {
+                        if cancel.is_cancelled() {
+                            terminal_intent =
+                                crate::db::BatchTerminalIntentV1::Cancelled { code: "BATCH_CANCELLED".into() };
+                        } else {
+                            tracing::error!(segment_id = %item.segment_id, %error, "Champion batch inference failed");
+                            terminal_intent = crate::db::BatchTerminalIntentV1::Failed {
+                                code: durable_transcription_failure_code(&error),
+                            };
+                        }
+                        break 'pages;
+                    }
+                };
+                if cancel.is_cancelled() {
+                    terminal_intent = crate::db::BatchTerminalIntentV1::Cancelled { code: "BATCH_CANCELLED".into() };
+                    break 'pages;
+                }
+                let draft = match pipeline.prepare_batch_champion_draft(inferred) {
+                    Ok(draft) => draft,
+                    Err(error) => {
+                        tracing::error!(segment_id = %item.segment_id, %error, "Champion draft evidence was refused");
+                        terminal_intent = crate::db::BatchTerminalIntentV1::Failed {
+                            code: durable_transcription_failure_code(&error),
+                        };
+                        break 'pages;
+                    }
+                };
+
+                match worker.lease().and_then(|authority| authority.commit_champion_draft(item.ordinal, &draft)) {
+                    Ok(
+                        crate::db::BatchItemCommitOutcomeV1::Applied { .. }
+                        | crate::db::BatchItemCommitOutcomeV1::AlreadyApplied { .. }
+                        | crate::db::BatchItemCommitOutcomeV1::Skipped { .. },
+                    ) => {}
+                    Ok(crate::db::BatchItemCommitOutcomeV1::Failed { code }) => {
+                        terminal_intent = crate::db::BatchTerminalIntentV1::Failed { code };
+                        break 'pages;
+                    }
+                    Ok(crate::db::BatchItemCommitOutcomeV1::AlreadyTerminal { state, code }) => {
+                        if matches!(state, crate::db::BatchItemStateV1::Failed | crate::db::BatchItemStateV1::Abandoned)
+                        {
+                            terminal_intent = crate::db::BatchTerminalIntentV1::Failed {
+                                code: code.unwrap_or_else(|| "BATCH_TRANSCRIPT_WRITE_FAILED".into()),
+                            };
+                            break 'pages;
+                        }
+                        if state == crate::db::BatchItemStateV1::Pending {
+                            terminal_intent =
+                                crate::db::BatchTerminalIntentV1::Failed { code: "BATCH_EVIDENCE_INVALID".into() };
+                            break 'pages;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(segment_id = %item.segment_id, %error, "Durable champion commit failed");
+                        terminal_intent =
+                            crate::db::BatchTerminalIntentV1::Failed { code: "BATCH_TRANSCRIPT_WRITE_FAILED".into() };
+                        break 'pages;
+                    }
+                }
+                page_cursor = Some(item.ordinal);
+                emit_or_log(
+                    &app_clone,
+                    "batch-progress",
+                    serde_json::json!({
+                        "type": "progress", "current": item.ordinal + 1, "total": total,
+                        "status": "transcribing", "operation": "transcribe",
+                        "operationId": worker_operation_id.as_str()
+                    }),
+                );
             }
         }
 
-        // A post-batch jury failure is NOT a clean run. The drafts landed, but the adjudication that
-        // decides what the review queue and the escalation path see did not — and this was log-only
-        // while the terminal event below still said `completed`. That is the same flattering-finish
-        // shape the hard stop above exists to kill: nobody reads the log, everybody reads the event.
-        let mut jury_failure: Option<String> = None;
-        if !transcribed_ids.is_empty() {
-            if let Some(app_state) = app_clone.try_state::<AppState>() {
-                let settings = app_state.lock_settings().clone();
-                // Dedicated connection (not the shared lock_db guard) so the post-batch jury's
-                // possible T2 cloud calls don't hold the global db Mutex and starve the UI's
-                // get_segments while it runs. with_jury_db retries the dedicated open and only falls
-                // back to the shared handle on a hard failure (so a transient lock doesn't skip the
-                // jury entirely).
-                let jury_data_dir = app_state.lock_data_dir().clone();
-                if let Err(error) = with_jury_db(&app_state, |db| {
-                    run_jury_pipeline_core_via(db, &settings, transcribed_ids, jury_data_dir.as_deref())
-                }) {
-                    log_jury_pipeline_failure("batch transcription", &error);
-                    jury_failure = Some(error);
-                }
+        let terminal = match worker.finish(terminal_intent) {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::error!(%error, "Transcription batch could not publish terminal evidence");
+                return;
+            }
+        };
+        let outcome = match durable_batch_outcome(&terminal) {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => {
+                tracing::error!("Transcription terminalization returned a non-terminal status");
+                return;
+            }
+            Err(error) => {
+                tracing::error!(%error, "Transcription terminal evidence is outside the public contract");
+                return;
+            }
+        };
+        if let Some(app_state) = app_clone.try_state::<AppState>() {
+            if !app_state.record_batch_outcome(
+                worker_operation_id.as_str(),
+                crate::BatchOperation::Transcribe,
+                outcome.clone(),
+            ) {
+                tracing::error!("Durable transcription outcome was not accepted by the liveness tracker");
             }
         }
-
-        // A run that stopped on a failure is reported as HALTED, with the first cause named. It must
-        // never arrive at the UI as an ordinary "completed" — that is precisely how a half-drafted
-        // dataset gets mistaken for a finished one.
-        let clip_failure = first_failure.into_inner().ok().flatten();
-        if let Some(reason) = &clip_failure {
-            tracing::error!(
-                "Batch transcribe HARD-STOPPED after {succeeded} succeeded, {skipped} skipped: {reason}. \
-                 Remaining clips were NOT transcribed; the dataset is incomplete, not finished."
-            );
-        }
-        let halted_by = batch_terminal_halt_cause(clip_failure, jury_failure);
+        let event_type =
+            if matches!(outcome.disposition, crate::BatchRunDisposition::Halted | crate::BatchRunDisposition::Panicked)
+            {
+                "halted"
+            } else {
+                "completed"
+            };
         emit_or_log(
             &app_clone,
             "batch-progress",
             serde_json::json!({
-                "type": if halted_by.is_some() { "halted" } else { "completed" },
-                "total": total,
-                "succeeded": succeeded, "failed": failed, "skipped": skipped,
-                "cancelled": cancelled, "operation": "transcribe",
-                "haltedBy": halted_by,
+                "type": event_type,
+                "total": outcome.total,
+                "succeeded": outcome.succeeded,
+                "failed": outcome.failed,
+                "skipped": outcome.skipped,
+                "abandoned": outcome.abandoned,
+                "cancelled": outcome.cancelled,
+                "operation": "transcribe",
+                "operationId": worker_operation_id.as_str(),
+                "error": outcome.error_code.as_ref().map(|code| serde_json::json!({
+                    "schema": 1, "code": code,
+                    "message": "The transcription batch stopped safely.", "retryable": true
+                })),
             }),
         );
     });
 
-    Ok(serde_json::json!({ "status": "started" }))
+    match spawn {
+        Ok(_) => Ok(BatchStartedV1 {
+            status: BatchStartStatusV1::Started,
+            operation_id: operation_id.clone(),
+            operation: BatchOperationV1::Transcribe,
+        }),
+        Err(error) => {
+            tracing::error!(%error, "OS refused the durable transcription worker");
+            Err(CommandErrorV1::new(
+                "BATCH_WORKER_START_FAILED",
+                "The transcription worker could not start. No pending segment was changed.",
+                true,
+            )
+            .suggested(SuggestedActionV1::Retry))
+        }
+    }
 }
 
 fn validate_normalization_text(text: &str) -> Result<(), crate::ipc_contract::CommandErrorV1> {
@@ -1280,6 +1747,59 @@ fn validate_normalization_text(text: &str) -> Result<(), crate::ipc_contract::Co
             false,
         )
     })
+}
+
+#[cfg(test)]
+mod picker_wait_tests {
+    use super::*;
+
+    #[test]
+    fn pre_sent_response_beats_a_simultaneously_ready_deadline() {
+        tauri::async_runtime::block_on(async {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tx.send("selected").expect("send picker response");
+            let result = await_picker_response(rx, std::future::pending(), std::future::ready(())).await;
+            assert_eq!(result, Ok("selected"));
+        });
+    }
+
+    #[test]
+    fn live_unsent_picker_times_out_without_wall_clock_wait() {
+        tauri::async_runtime::block_on(async {
+            let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let result = await_picker_response(rx, std::future::pending(), std::future::ready(())).await;
+            assert_eq!(result, Err(PickerWaitError::TimedOut));
+        });
+    }
+
+    #[test]
+    fn dropped_picker_sender_is_reported_closed() {
+        tauri::async_runtime::block_on(async {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            drop(tx);
+            let result = await_picker_response(rx, std::future::pending(), std::future::pending()).await;
+            assert_eq!(result, Err(PickerWaitError::Closed));
+        });
+    }
+
+    #[test]
+    fn explicit_cancel_interrupts_a_live_picker() {
+        tauri::async_runtime::block_on(async {
+            let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let result = await_picker_response(rx, std::future::ready(()), std::future::pending()).await;
+            assert_eq!(result, Err(PickerWaitError::Cancelled));
+        });
+    }
+
+    #[test]
+    fn explicit_cancel_has_precedence_over_response_and_deadline() {
+        tauri::async_runtime::block_on(async {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tx.send("selected").expect("send picker response");
+            let result = await_picker_response(rx, std::future::ready(()), std::future::ready(())).await;
+            assert_eq!(result, Err(PickerWaitError::Cancelled));
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1363,11 +1883,95 @@ mod typed_import_journal_ipc_tests {
             status: ImportResumeStatusV1::Started,
             resuming: true,
             import_job_id: "import-job-2".to_string(),
+            run_id: "00000000-0000-4000-8000-000000000001".to_string(),
         })
         .expect("serialize import resume DTO");
         assert_eq!(wire["status"], "started");
         assert_eq!(wire["resuming"], true);
         assert_eq!(wire["importJobId"], "import-job-2");
+        assert_eq!(wire["runId"], "00000000-0000-4000-8000-000000000001");
+    }
+
+    #[test]
+    fn import_run_status_wire_shape_is_closed_and_exact() {
+        let run_id = "00000000-0000-4000-8000-000000000001";
+        for (status, expected) in [
+            (ImportRunStatusV1::Running, "running"),
+            (ImportRunStatusV1::Settled, "settled"),
+            (ImportRunStatusV1::Rejected, "rejected"),
+            (ImportRunStatusV1::Unknown, "unknown"),
+        ] {
+            let wire = serde_json::to_value(ImportRunStatusResponseV1 { run_id: run_id.to_string(), status })
+                .expect("serialize import status DTO");
+            assert_eq!(wire["runId"], run_id);
+            assert_eq!(wire["status"], expected);
+        }
+    }
+
+    #[test]
+    fn batch_operation_identity_requires_exact_canonical_uuid_text() {
+        let canonical = "00000000-0000-4000-8000-000000000001";
+        assert_eq!(canonical_batch_operation_id(canonical), Ok(canonical.to_string()));
+        assert!(canonical_batch_operation_id("{00000000-0000-4000-8000-000000000001}").is_err());
+        assert!(canonical_batch_operation_id("00000000-0000-4000-8000-00000000000A").is_err());
+        assert!(canonical_batch_operation_id("batch-1").is_err());
+    }
+
+    #[test]
+    fn batch_selection_rejects_empty_duplicate_invalid_and_unbounded_inputs() {
+        assert!(validate_batch_segment_ids(&[]).is_err());
+        assert!(validate_batch_segment_ids(&["segment-1".into(), "segment-1".into()]).is_err());
+        assert!(validate_batch_segment_ids(&["../segment-1".into()]).is_err());
+        assert!(validate_batch_segment_ids(&vec!["segment-1".into(); 100_001]).is_err());
+        assert!(validate_batch_segment_ids(&["segment-1".into(), "segment-2".into()]).is_ok());
+    }
+
+    #[test]
+    fn transcription_source_cache_enforces_the_durable_page_handle_bound() {
+        let cache: crate::pipeline::TranscriptionSourceLeaseCache = Default::default();
+        {
+            let mut entries = cache.lock().unwrap();
+            for ordinal in 0..crate::db::BATCH_PENDING_PAGE_SIZE_V1 {
+                entries.insert(
+                    (format!("C:/audio/{ordinal}.wav"), format!("pcm-{ordinal}")),
+                    std::sync::Arc::new(std::sync::OnceLock::new()),
+                );
+            }
+        }
+        assert_eq!(batch_transcription_source_cache_cardinality(&cache), crate::db::BATCH_PENDING_PAGE_SIZE_V1);
+        assert!(batch_transcription_source_cache_is_within_page_bound(&cache));
+
+        cache.lock().unwrap().insert(
+            ("C:/audio/overflow.wav".into(), "pcm-overflow".into()),
+            std::sync::Arc::new(std::sync::OnceLock::new()),
+        );
+        assert!(!batch_transcription_source_cache_is_within_page_bound(&cache));
+    }
+
+    #[test]
+    fn pipeline_error_event_scrubs_paths_and_private_errors() {
+        let payload = public_pipeline_error_payload(
+            Some("00000000-0000-4000-8000-000000000001"),
+            r"D:\private\Wareen\source.wav",
+            IMPORT_PROCESSING_FAILED,
+        );
+        let wire = payload.to_string();
+        assert_eq!(payload["file"], "source.wav");
+        assert_eq!(payload["code"], IMPORT_PROCESSING_FAILED);
+        assert_eq!(payload["runId"], "00000000-0000-4000-8000-000000000001");
+        assert!(payload.get("error").is_none());
+        assert!(!wire.contains("Wareen"));
+        assert!(!wire.contains("D:"));
+    }
+
+    #[test]
+    fn batch_halt_classification_distinguishes_refinement_from_primary_transcription() {
+        let refinement =
+            crate::error::AppError::Other("LLM refinement failed for segment s1: provider unavailable".into());
+        let primary = crate::error::AppError::Other("primary transcription worker failed".into());
+
+        assert_eq!(batch_halt_code_for_error(&refinement), BatchHaltCode::BatchRefinementFailed);
+        assert_eq!(batch_halt_code_for_error(&primary), BatchHaltCode::BatchTranscriptionFailed);
     }
 }
 

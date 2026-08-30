@@ -1,5 +1,6 @@
 """Architecture policy for the durable job/interrupted-import store slice."""
 
+import re
 from pathlib import Path
 
 from _pipeline_policy_util import pipeline_surface
@@ -29,14 +30,15 @@ def test_store_owns_bounded_reads_and_serialized_discard_without_ui_dependencies
     for required in (
         "struct JobStore",
         "runtime: DatabaseRuntime",
-        "begin_mutation().map_err(AppError::Other)?",
+        "self.runtime.begin_mutation().map_err(AppError::Other)",
+        "self.runtime.lock_after_mutation(mutation)",
         "self.runtime.open_read()?.find_interrupted_import_job()",
-        'self.lock("discard_interrupted_import").discard_import_job(job_id)',
-        'self.lock("begin_import").begin_import_job(directory, total_files)',
-        'self.lock("handoff_import_for_resume").handoff_import_job_for_resume(prior_job_id)',
-        'self.lock("continue_import").continue_import_job(job_id, directory, total_files)',
-        'self.lock("mark_import_file_done").mark_import_file_done(job_id, path)',
-        'self.lock("complete_import").complete_import_job(job_id)',
+        'self.lock_after_mutation("discard_interrupted_import", &mutation).discard_import_job(job_id)',
+        'self.lock_after_mutation("begin_import", &mutation).begin_import_job(directory, total_files)',
+        'self.lock_after_mutation("handoff_import_for_resume", &mutation).handoff_import_job_for_resume(prior_job_id)',
+        'self.lock_after_mutation("continue_import", &mutation).continue_import_job(job_id, directory, total_files)',
+        'self.lock_after_mutation("mark_import_file_done", &mutation).mark_import_file_done(job_id, path)',
+        'self.lock_after_mutation("complete_import", &mutation).complete_import_job(job_id)',
         "self.runtime.open_read()?.list_recent_jobs(limit)",
         'self.run_tracked(job_id, "export_dataset", "EXPORT_FAILED"',
         'self.run_tracked(job_id, "export_huggingface_dataset", "HF_EXPORT_FAILED"',
@@ -81,13 +83,15 @@ def test_commands_delegate_without_raw_database_authority() -> None:
     for forbidden in ("discard_interrupted_import(&job.id)", "discard_import_job(&job.id)"):
         if forbidden in resume:
             raise AssertionError("resume erased the sole recovery journal before successor publication")
-    claim = resume.find("state.try_start_import()")
+    claim = resume.find("state.try_start_import_for_recovery_run(&agent_run_id)")
     handoff = resume.find(".handoff_import_for_resume(&job.id)")
     spawn = resume.find("std::thread::Builder::new()")
     if min(claim, handoff, spawn) < 0 or not claim < handoff < spawn:
         raise AssertionError("resume must claim single-flight, atomically publish the successor journal, then spawn")
-    if "state.finish_import();" not in resume or "Durable import journal" not in resume:
-        raise AssertionError("resume worker-spawn failure must release memory state while retaining durable authority")
+    if "let mut claimed_start = ClaimedImportStart::new(&state, &agent_run_id);" not in resume:
+        raise AssertionError("resume must RAII-release its in-memory claim on every pre-spawn refusal")
+    if "Err(error) =>" not in resume or "public_import_start_error(&error.to_string())" not in resume:
+        raise AssertionError("resume worker-spawn failure must fail publicly while retaining durable authority")
 
     exports = read("commands/export.rs")
     export_signatures = {
@@ -106,7 +110,8 @@ def test_commands_delegate_without_raw_database_authority() -> None:
         for forbidden in ("state.lock_db()", "state.db_arc()", ".run_tracked(", "crate::db::Database"):
             if forbidden in body:
                 raise AssertionError(f"{name} regained raw database or job-lifecycle authority: {forbidden}")
-        if 'STRICT_RATE_LIMITER.check("' + name + '")' not in body or "validate::validate_output_path" not in body:
+        rate_check = rf'STRICT_RATE_LIMITER\s*\.\s*check\("{re.escape(name)}"\)'
+        if re.search(rate_check, body) is None or "validate::validate_output_path" not in body:
             raise AssertionError(f"{name} lost rate or output-path validation")
 
 

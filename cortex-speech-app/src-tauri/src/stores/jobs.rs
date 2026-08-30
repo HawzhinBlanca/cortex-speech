@@ -1,7 +1,7 @@
 //! Durable job, interrupted-import and tracked-export access.
 
 use crate::database_runtime::{DatabaseRuntime, MutationGuard};
-use crate::db::ImportJob;
+use crate::db::{DiscardImportJobOutcome, ImportJob};
 use crate::error::{AppError, AppResult};
 use crate::eval::{FinetunePackResult, GoldEvalExport};
 use crate::export_audio::{AudioExportOptions, AudioExportResult};
@@ -40,7 +40,7 @@ impl JobStore {
         self.runtime.open_read()?.find_interrupted_import_job()
     }
 
-    pub(crate) fn discard_interrupted_import(&self, job_id: &str) -> AppResult<()> {
+    pub(crate) fn discard_interrupted_import(&self, job_id: &str) -> AppResult<DiscardImportJobOutcome> {
         let mutation = self.begin_mutation()?;
         self.lock_after_mutation("discard_interrupted_import", &mutation).discard_import_job(job_id)
     }
@@ -186,8 +186,50 @@ mod tests {
         assert_eq!(interrupted.dir, "C:/audio");
         assert_eq!(interrupted.completed_paths, vec!["C:/audio/a.wav"]);
 
-        store.discard_interrupted_import(&interrupted.id).unwrap();
+        assert_eq!(store.discard_interrupted_import(&interrupted.id).unwrap(), DiscardImportJobOutcome::Discarded);
         assert!(store.find_interrupted_import().unwrap().is_none());
+    }
+
+    #[test]
+    fn interrupted_import_discard_is_an_exact_compare_and_delete() {
+        let (_directory, store) = store_with_jobs();
+        let current = store.find_interrupted_import().unwrap().unwrap();
+
+        assert_eq!(store.discard_interrupted_import("stale-import-job").unwrap(), DiscardImportJobOutcome::Changed);
+        assert_eq!(store.find_interrupted_import().unwrap().unwrap().id, current.id);
+        assert_eq!(store.discard_interrupted_import(&current.id).unwrap(), DiscardImportJobOutcome::Discarded);
+        assert_eq!(store.discard_interrupted_import(&current.id).unwrap(), DiscardImportJobOutcome::NotFound);
+    }
+
+    #[test]
+    fn interrupted_import_discard_refuses_ambiguous_running_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ambiguous-journal.db");
+        let database = Database::open(path.to_str().unwrap()).unwrap();
+        database.initialize().unwrap();
+        let first = database.begin_import_job("C:/first", 1).unwrap();
+        database
+            .connection()
+            .execute(
+                "INSERT INTO import_jobs (id, dir, total_files, status) VALUES ('second-running', 'C:/second', 1, 'running')",
+                [],
+            )
+            .unwrap();
+        let store = JobStore::new(DatabaseRuntime::new(database));
+
+        let error =
+            store.discard_interrupted_import("second-running").expect_err("multiple running journals must fail closed");
+        assert!(error.to_string().contains("expected one running job"));
+        let database = store.runtime.lock().unwrap();
+        let running: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM import_jobs WHERE status = 'running'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(running, 2, "an ambiguous refusal must preserve every recovery record");
+        assert!(database
+            .connection()
+            .query_row("SELECT EXISTS(SELECT 1 FROM import_jobs WHERE id = ?1)", [first], |row| row.get::<_, bool>(0))
+            .unwrap());
     }
 
     #[test]

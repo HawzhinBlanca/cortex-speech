@@ -12,7 +12,6 @@
 use crate::aligner;
 use crate::audio;
 use crate::health;
-use crate::history::Command;
 use crate::models;
 use crate::pipeline::PipelineEvent;
 use crate::quality;
@@ -39,8 +38,9 @@ use crate::settings::{AppSettings, AsrModelSize};
 use crate::throttle::{RATE_LIMITER, STRICT_RATE_LIMITER};
 use crate::validation::input as validate;
 use crate::AppState;
+use crate::{BatchRunDisposition, BatchRunOutcome};
+use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 use tauri::Emitter;
 use tauri::Manager;
@@ -54,6 +54,10 @@ mod model_download;
 pub use model_download::*;
 mod batch;
 pub use batch::*;
+mod batch_status;
+pub use batch_status::*;
+mod durable_batch;
+pub(super) use durable_batch::{durable_batch_outcome, publishable_durable_batch_status, DurableBatchWorkerGuard};
 mod dataset_analytics;
 pub use dataset_analytics::*;
 mod gold_eval;
@@ -74,9 +78,21 @@ mod settings;
 pub use settings::*;
 mod ingest;
 pub use ingest::*;
-#[cfg(test)]
-use ingest::{batch_terminal_halt_cause, parse_batch_concurrency};
 use ingest::{emit_or_log, send_audio_duration_probe_result};
+#[cfg(test)]
+pub(super) fn get_batch_run_status_blocking_for_test(
+    operation_id: String,
+    state: &AppState,
+) -> Result<crate::ipc_contract::BatchRunStatusResponseV1, crate::ipc_contract::CommandErrorV1> {
+    batch_status::get_batch_run_status_blocking(operation_id, state)
+}
+#[cfg(test)]
+pub(super) fn acknowledge_batch_run_blocking_for_test(
+    operation_id: String,
+    state: &AppState,
+) -> Result<bool, crate::ipc_contract::CommandErrorV1> {
+    batch_status::acknowledge_batch_run_blocking(operation_id, state)
+}
 mod recovery_ipc;
 pub use recovery_ipc::*;
 mod system_ops;
@@ -87,6 +103,53 @@ pub use system_ops::*;
 use system_ops::{
     drain_log_lines, segment_awaits_wsl7b, select_wsl_refinement_targets, wsl_log_preview, WSL_LOG_LINE_PREVIEW_CHARS,
 };
+
+fn lowercase_sha256(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+/// Hash one closed, field-ordered result configuration without retaining secrets or private paths
+/// in the durable job header. Callers must pass a struct (not an unordered JSON map).
+pub(super) fn canonical_batch_config_sha256(value: &impl serde::Serialize) -> Result<String, String> {
+    serde_json::to_vec(value)
+        .map(|bytes| lowercase_sha256(&bytes))
+        .map_err(|error| format!("BATCH_CONFIG_SERIALIZATION_FAILED: {error}"))
+}
+
+/// Create the one process-attempt identity stored in the immutable batch payload and checked by
+/// every effect write. The build script makes an unknown/non-canonical source SHA a compile error.
+pub(super) fn new_batch_executor_identity() -> crate::db::BatchExecutorIdentityV1 {
+    let token = uuid::Uuid::new_v4();
+    crate::db::BatchExecutorIdentityV1 {
+        git_sha: crate::GIT_SHA.to_string(),
+        token_sha256: lowercase_sha256(token.as_bytes()),
+        attempt_generation: 1,
+    }
+}
+
+pub(super) fn batch_start_commit_error(error: crate::BatchStartCommitError) -> crate::ipc_contract::CommandErrorV1 {
+    match error {
+        crate::BatchStartCommitError::Cancelled => crate::ipc_contract::CommandErrorV1::new(
+            "BATCH_START_CANCELLED",
+            "The batch was cancelled before it started. Retry when ready.",
+            true,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry),
+        crate::BatchStartCommitError::AuthorityLost => crate::ipc_contract::CommandErrorV1::new(
+            "BATCH_START_AUTHORITY_LOST",
+            "The batch start authority changed unexpectedly. Open Health before retrying.",
+            false,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::OpenHealth),
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -394,24 +457,6 @@ pub(crate) fn build_agentic_readiness_snapshot(
     }
 }
 
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SegmentConsensus {
-    /// Best-of-N draft transcript (ability-weighted vote across the segment's ASR hypotheses).
-    pub draft: String,
-    /// Per-word breakdown with the agreement signal + what the other models said.
-    pub words: Vec<crate::quality::irt::ConsensusWord>,
-    pub model_count: usize,
-    /// Lowest per-word agreement (0..1) — a quick "how contested is this clip" signal.
-    pub min_agreement: f64,
-    pub mean_agreement: f64,
-    /// Distinct engine ids that produced this segment's hypotheses (e.g. "omniasr-wsl-7b",
-    /// "finetuned-mms-ckb", "omniasr-ctc-300m", "scribe-v1"), in first-seen order. Drawn from the
-    /// recorded hypotheses — NEVER inferred — so the review UI can honestly name which model(s)
-    /// produced the draft. Empty when the segment has no recorded hypotheses (pre-provenance imports).
-    pub models: Vec<String>,
-}
-
 /// Restrict review evidence to the ASR mode the owner selected. In champion mode, hypotheses left by
 /// older builds (300M/1B/MMS/Scribe) are historical artifacts, not voters. If a pre-provenance 7B row
 /// has no hypothesis record, synthesize the one honest vote from the segment's persisted champion
@@ -494,17 +539,29 @@ fn hypotheses_for_selected_asr(
 /// (no cloud) so review can start from a transcript better than any single model and highlight exactly
 /// where the models disagreed. Empty when the segment has no hypotheses to vote over.
 #[tauri::command]
-pub fn get_segment_consensus(state: State<'_, AppState>, segment_id: String) -> Result<SegmentConsensus, String> {
-    RATE_LIMITER.check("get_segment_consensus")?;
-    validate::validate_identifier(&segment_id)?;
+#[specta::specta]
+pub fn get_segment_consensus(
+    state: State<'_, AppState>,
+    segment_id: String,
+) -> Result<crate::ipc_contract::SegmentConsensusV1, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER
+        .check("get_segment_consensus")
+        .map_err(|_| crate::ipc_contract::owner_critical_rate_limited("get_segment_consensus"))?;
+    validate::validate_identifier(&segment_id).map_err(|_| crate::ipc_contract::invalid_segment_id_error())?;
     let selected = state.lock_settings().asr_model_size.clone();
     let (segment, hyps, recorded_is_champion) = {
         let db = state.lock_db();
         let segment = db
             .get_segment_by_id(&segment_id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("Segment '{segment_id}' no longer exists"))?;
-        let hypotheses = db.get_hypotheses_for_segment(&segment_id).map_err(|e| e.to_string())?;
+            .map_err(|error| {
+                tracing::warn!("Consensus segment read failed: {error}");
+                crate::ipc_contract::public_consensus_error(&error.to_string())
+            })?
+            .ok_or_else(|| crate::ipc_contract::public_consensus_error("Segment no longer exists"))?;
+        let hypotheses = db.get_hypotheses_for_segment(&segment_id).map_err(|error| {
+            tracing::warn!("Consensus hypothesis read failed: {error}");
+            crate::ipc_contract::public_consensus_error(&error.to_string())
+        })?;
         // Answered while the lock is held; the filter itself stays pure and DB-free.
         let is_champion = segment_recorded_model_is_champion(&db, &segment);
         (segment, hypotheses, is_champion)
@@ -529,26 +586,42 @@ pub fn get_segment_consensus(state: State<'_, AppState>, segment_id: String) -> 
         let mean = words.iter().map(|w| w.agreement).sum::<f64>() / words.len() as f64;
         (min, mean)
     };
-    Ok(SegmentConsensus { draft, words, model_count, min_agreement, mean_agreement, models })
+    Ok(crate::ipc_contract::SegmentConsensusV1 {
+        draft,
+        words: words.into_iter().map(crate::ipc_contract::ConsensusWordV1::from).collect(),
+        model_count,
+        min_agreement,
+        mean_agreement,
+        models,
+    })
 }
 
 #[tauri::command]
-pub async fn merge_dataset_json(json_content: String, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    STRICT_RATE_LIMITER.check("merge_dataset_json")?;
+#[specta::specta]
+pub async fn merge_dataset_json(
+    json_content: String,
+    state: State<'_, AppState>,
+) -> Result<crate::ipc_contract::MergeDatasetResultV1, crate::ipc_contract::CommandErrorV1> {
+    STRICT_RATE_LIMITER
+        .check("merge_dataset_json")
+        .map_err(|_| crate::ipc_contract::owner_critical_rate_limited("merge_dataset_json"))?;
     // Sanity-bound the pasted payload (generous enough for a real multi-segment dataset) so a
     // pathological blob can't drive an unbounded parse — matching the size guard every other
     // JSON-accepting command applies.
-    validate::validate_text(&json_content, 50_000_000, "Dataset JSON")?;
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+    validate::validate_text(&json_content, 50_000_000, "Dataset JSON")
+        .map_err(|_| crate::ipc_contract::invalid_dataset_payload_error())?;
+    let database = state.db_runtime();
+    let result = run_blocking(move || {
+        let mutation = database.begin_mutation().map_err(|error| error.to_string())?;
+        let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
         let (created, updated) = db.merge_dataset_json(&json_content).map_err(|e| e.to_string())?;
-        Ok(serde_json::json!({
-            "created": created,
-            "updated": updated
-        }))
+        Ok(crate::ipc_contract::MergeDatasetResultV1 { created, updated })
     })
-    .await
+    .await;
+    result.map_err(|error| {
+        tracing::warn!("Owner dataset-merge command failed: {error}");
+        crate::ipc_contract::public_owner_data_error(crate::ipc_contract::OwnerDataOperationV1::MergeDataset, &error)
+    })
 }
 
 /// Recent durable jobs (newest first) for a UI activity surface — a long op bracketed via
@@ -667,10 +740,10 @@ mod typed_job_ipc_tests {
 
 /// Response for `build_scorecard`: the structured scorecard plus a ready-to-paste
 /// Markdown rendering (for a README / HuggingFace model card).
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ScorecardResponse {
-    pub scorecard: crate::scorecard::Scorecard,
+    pub scorecard: crate::ipc_contract::ScorecardV1,
     pub markdown: String,
 }
 
@@ -678,21 +751,37 @@ pub struct ScorecardResponse {
 /// micro WER/CER with bootstrap confidence intervals, plus an optional MAPSSWE
 /// significance comparison against a baseline run. Pure and deterministic.
 #[tauri::command]
+#[specta::specta]
 pub fn build_scorecard(
-    system: crate::eval::EvalRunResult,
-    baseline: Option<crate::eval::EvalRunResult>,
-) -> Result<ScorecardResponse, String> {
-    RATE_LIMITER.check("build_scorecard")?;
+    system: crate::ipc_contract::EvalRunResultV1,
+    baseline: Option<crate::ipc_contract::EvalRunResultV1>,
+) -> Result<ScorecardResponse, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER
+        .check("build_scorecard")
+        .map_err(|_| crate::ipc_contract::owner_analysis_rate_limited("build_scorecard"))?;
+    let system: crate::eval::EvalRunResult = system.into();
+    let baseline = baseline.map(crate::eval::EvalRunResult::from);
     let scorecard = crate::scorecard::build_scorecard(&system, baseline.as_ref(), Default::default());
     let markdown = crate::scorecard::render_markdown(&scorecard);
-    Ok(ScorecardResponse { scorecard, markdown })
+    Ok(ScorecardResponse { scorecard: scorecard.into(), markdown })
 }
 
 #[tauri::command]
-pub fn list_eval_runs(state: State<'_, AppState>) -> Result<Vec<crate::eval::EvalRun>, String> {
-    RATE_LIMITER.check("list_eval_runs")?;
+#[specta::specta]
+pub fn list_eval_runs(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::ipc_contract::EvalRunV1>, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER
+        .check("list_eval_runs")
+        .map_err(|_| crate::ipc_contract::owner_analysis_rate_limited("list_eval_runs"))?;
     let db = state.lock_db();
-    crate::eval::list_eval_runs(&db).map_err(|e| e.to_string())
+    crate::eval::list_eval_runs(&db).map(|runs| runs.into_iter().map(Into::into).collect()).map_err(|error| {
+        tracing::warn!("Owner evaluation-history read failed: {error}");
+        crate::ipc_contract::public_owner_analysis_error(
+            crate::ipc_contract::OwnerAnalysisOperationV1::EvalHistory,
+            &error.to_string(),
+        )
+    })
 }
 
 #[tauri::command]
@@ -808,11 +897,10 @@ pub(crate) fn bg_db_writers_active() -> bool {
 /// Undo a review-inbox `flag()`: clear the escalation the flag set. Distinct from clear_human_decision
 /// (which reopens a decided row by SETTING escalated=1); this is the inverse of flag.
 #[tauri::command]
-pub fn clear_escalation(state: State<'_, AppState>, segment_id: String) -> Result<(), String> {
+pub fn clear_escalation(_state: State<'_, AppState>, segment_id: String) -> Result<(), String> {
     RATE_LIMITER.check("clear_escalation")?;
     validate::validate_identifier(&segment_id)?;
-    let db = state.lock_db();
-    db.clear_escalation(&segment_id).map_err(|e| e.to_string())
+    Err("EXACT_FLAG_UNDO_REQUIRED: identity-free escalation clearing is retired; use the immutable flag effect and an operation UUID".into())
 }
 
 #[tauri::command]
@@ -1230,25 +1318,10 @@ fn has_final_machine_verdict(seg: &crate::db::SpeechSegment) -> bool {
     seg.verdict.as_deref().map(|verdict| !verdict.trim().is_empty()).unwrap_or(false) && !seg.escalated
 }
 
-/// Run `f` with a database handle that does NOT keep the global `AppState` db Mutex locked for the
-/// duration of the call. `run_jury_pipeline_core` interleaves DB reads/writes with (potentially many)
-/// cloud T2 network round-trips in a per-segment loop; passing the shared, locked handle would hold
-/// the global Mutex across every `listen_and_judge`, freezing every other DB-touching command
-/// app-wide for the whole adjudication.
-///
-/// To avoid that, this opens a SECOND, dedicated connection to the same database file and runs `f`
-/// against it — SQLite WAL + `busy_timeout` let the two connections coexist, and all writes land in
-/// the same file, so verdicts persist exactly as before. It falls back to the shared, locked handle
-/// for an in-memory database (tests can't share `:memory:` across connections, and that path has cloud
-/// off so there is no network call to block on) or in the rare event the dedicated open fails.
-fn with_jury_db<R>(app_state: &AppState, f: impl FnOnce(&crate::db::Database) -> R) -> R {
-    jury_db_source(app_state).with(f)
-}
-
-/// Owned, `Send + 'static` form of the jury-DB access above, so an async command can move it into
+/// Owned, `Send + 'static` jury database access, so an async command can move it into
 /// `run_blocking` (a `&AppState` borrow can't cross the await). Carries the db PATH (the dedicated
 /// connection is opened lazily inside `with`, on whichever thread runs it) plus the shared handle for
-/// the fallback. Same semantics as `with_jury_db` — it IS `with_jury_db`'s implementation.
+/// the in-memory/open-failure fallback.
 struct JuryDbSource {
     db_path: String,
     shared: crate::AppDatabaseHandle,
@@ -1777,25 +1850,6 @@ pub fn base64_encode(data: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_post_batch_jury_failure_is_never_reported_as_a_completed_batch() {
-        // The failure was log-only while the terminal `batch-progress` event still said
-        // type:"completed" — the adjudication that decides what the review queue sees had failed and
-        // nothing above the log said so.
-        let jury = batch_terminal_halt_cause(None, Some("jury db unavailable".into()))
-            .expect("a jury failure must produce a halt cause, not a clean completion");
-        assert!(jury.contains("jury"), "{jury}");
-
-        // A per-clip hard stop still wins and keeps its own cause.
-        assert_eq!(
-            batch_terminal_halt_cause(Some("segment x: decode failed".into()), Some("jury db unavailable".into())),
-            Some("segment x: decode failed".to_string())
-        );
-
-        // And a genuinely clean run is still allowed to report completion.
-        assert_eq!(batch_terminal_halt_cause(None, None), None);
-    }
-
     fn test_segment(id: &str, audio_path: &str, raw_transcript: &str) -> crate::db::SpeechSegment {
         crate::db::SpeechSegment {
             id: id.to_string(),
@@ -1822,8 +1876,25 @@ mod tests {
     fn legacy_machine_db() -> crate::db::Database {
         let db = crate::db::Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        rollback_to_legacy_machine_schema(&db);
         db
+    }
+
+    const LEGACY_MACHINE_SCHEMA_VERSION: i64 = 59;
+
+    fn rollback_to_legacy_machine_schema(db: &crate::db::Database) {
+        let head = crate::migrations::max_supported_version();
+        assert!(head >= LEGACY_MACHINE_SCHEMA_VERSION);
+        let expected = ((LEGACY_MACHINE_SCHEMA_VERSION + 1)..=head).rev().collect::<Vec<_>>();
+        assert_eq!(crate::migrations::rollback(db, expected.len()).unwrap(), expected);
+        assert_eq!(crate::migrations::get_current_version(db).unwrap(), LEGACY_MACHINE_SCHEMA_VERSION);
+    }
+
+    fn migrate_legacy_machine_schema_to_head(db: &crate::db::Database) {
+        let head = crate::migrations::max_supported_version();
+        let expected = ((LEGACY_MACHINE_SCHEMA_VERSION + 1)..=head).collect::<Vec<_>>();
+        assert_eq!(crate::migrations::run_migrations(db).unwrap(), expected);
+        assert_eq!(crate::migrations::get_current_version(db).unwrap(), head);
     }
 
     fn copied_database(source: &crate::db::Database) -> crate::db::Database {
@@ -2242,7 +2313,7 @@ mod tests {
         // review_effect_state with a different timestamp and test the wrong authority first.
         let correction_floor = crate::db::Database::open(":memory:").unwrap();
         correction_floor.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&correction_floor, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        rollback_to_legacy_machine_schema(&correction_floor);
         correction_floor
             .connection()
             .execute(
@@ -2254,7 +2325,7 @@ mod tests {
                 ["a".repeat(64)],
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&correction_floor).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        migrate_legacy_machine_schema_to_head(&correction_floor);
         let correction_target = copied_database(&correction_floor);
         correction_target
             .connection()
@@ -2362,7 +2433,7 @@ mod tests {
 
         insert_canonical_pay_segment(&floor, "durable-flag-undo");
         let flag = floor
-            .record_review_flag("durable-flag-undo", "durable flag", "00000000-0000-4000-8000-000000000801")
+            .record_review_flag_for_test("durable-flag-undo", "durable flag", "00000000-0000-4000-8000-000000000801")
             .unwrap();
         assert!(matches!(
             floor.undo_review_flag(flag.effect_event_id, &canonical_operation(203)).unwrap(),
@@ -2926,13 +2997,21 @@ mod tests {
         db.finalize_human_review("effect-desktop-edit", "edit", Some("desktop truth"), None, None).unwrap();
 
         insert_canonical_pay_segment(&db, "effect-active-flag");
-        db.record_review_flag("effect-active-flag", "needs another listen", "00000000-0000-4000-8000-000000000802")
-            .unwrap();
+        db.record_review_flag_for_test(
+            "effect-active-flag",
+            "needs another listen",
+            "00000000-0000-4000-8000-000000000802",
+        )
+        .unwrap();
         db.set_speaker_change_score("effect-active-edit", 0.41).unwrap();
         db.set_speaker_change_score("effect-active-flag", 0.42).unwrap();
         insert_canonical_pay_segment(&db, "effect-undone-flag");
         let undone_flag = db
-            .record_review_flag("effect-undone-flag", "temporary concern", "00000000-0000-4000-8000-000000000803")
+            .record_review_flag_for_test(
+                "effect-undone-flag",
+                "temporary concern",
+                "00000000-0000-4000-8000-000000000803",
+            )
             .unwrap();
         db.set_speaker_change_score("effect-undone-flag", 0.43).unwrap();
         assert!(matches!(
@@ -3101,7 +3180,7 @@ mod tests {
         active.initialize().unwrap();
         insert_canonical_pay_segment(&active, "flag-active-forgery");
         active
-            .record_review_flag("flag-active-forgery", "listen again", "00000000-0000-4000-8000-000000000804")
+            .record_review_flag_for_test("flag-active-forgery", "listen again", "00000000-0000-4000-8000-000000000804")
             .unwrap();
         validate_restore_target_semantics(&active).unwrap();
 
@@ -3133,7 +3212,7 @@ mod tests {
         undone.initialize().unwrap();
         insert_canonical_pay_segment(&undone, "flag-undo-forgery");
         let flag = undone
-            .record_review_flag("flag-undo-forgery", "temporary flag", "00000000-0000-4000-8000-000000000805")
+            .record_review_flag_for_test("flag-undo-forgery", "temporary flag", "00000000-0000-4000-8000-000000000805")
             .unwrap();
         let undo_operation = canonical_operation(110);
         assert!(matches!(
@@ -3172,14 +3251,18 @@ mod tests {
 
         let legacy = crate::db::Database::open(":memory:").unwrap();
         legacy.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&legacy, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        rollback_to_legacy_machine_schema(&legacy);
         let mut legacy_segment = test_segment("flag-legacy-authority", "flag-legacy.wav", "machine draft");
         legacy_segment.verified = true;
         legacy_segment.annotated_transcript = Some("immutable legacy truth".into());
         legacy.insert_segment_full(&legacy_segment).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        migrate_legacy_machine_schema_to_head(&legacy);
         legacy
-            .record_review_flag("flag-legacy-authority", "legacy concern", "00000000-0000-4000-8000-000000000807")
+            .record_review_flag_for_test(
+                "flag-legacy-authority",
+                "legacy concern",
+                "00000000-0000-4000-8000-000000000807",
+            )
             .unwrap();
         validate_restore_target_semantics(&legacy)
             .expect("an exact immutable pre-v60 reviewed baseline remains a valid first flag origin");
@@ -3189,7 +3272,7 @@ mod tests {
     fn mixed_flag_decision_chains_preserve_exact_rationale_through_undo_and_restore() {
         let flag_then_decision = crate::db::Database::open(":memory:").unwrap();
         flag_then_decision.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&flag_then_decision, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        rollback_to_legacy_machine_schema(&flag_then_decision);
         insert_canonical_pay_segment(&flag_then_decision, "rationale-flag-decision");
         flag_then_decision
             .write_segment_verdict(
@@ -3202,12 +3285,13 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(
-            crate::migrations::run_migrations(&flag_then_decision).unwrap(),
-            vec![60, 61, 62, 63, 64, 65, 66, 67]
-        );
+        migrate_legacy_machine_schema_to_head(&flag_then_decision);
         flag_then_decision
-            .record_review_flag("rationale-flag-decision", "flag rationale", "00000000-0000-4000-8000-000000000808")
+            .record_review_flag_for_test(
+                "rationale-flag-decision",
+                "flag rationale",
+                "00000000-0000-4000-8000-000000000808",
+            )
             .unwrap();
         flag_then_decision.finalize_human_review("rationale-flag-decision", "accept", None, Some(1), None).unwrap();
         validate_restore_target_semantics(&flag_then_decision)
@@ -3241,7 +3325,18 @@ mod tests {
             .unwrap();
         assert!(matches!(
             flag_then_decision
-                .undo_human_decision(decision_effect, None, "00000000-0000-4000-8000-000000000809")
+                .undo_latest_desktop_human_decision(
+                    &match flag_then_decision.desktop_review_undo_availability().unwrap() {
+                        crate::db::DesktopReviewUndoAvailability::Available(
+                            crate::db::DesktopReviewUndoAuthority::Decision(authority),
+                        ) => {
+                            assert_eq!(authority.effect_event_id, decision_effect);
+                            authority
+                        }
+                        other => panic!("expected decision Undo authority, got {other:?}"),
+                    },
+                    "00000000-0000-4000-8000-000000000809",
+                )
                 .unwrap(),
             crate::db::HumanDecisionUndoOutcome::Applied { .. }
         ));
@@ -3254,7 +3349,7 @@ mod tests {
 
         let decision_then_flag = crate::db::Database::open(":memory:").unwrap();
         decision_then_flag.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&decision_then_flag, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        rollback_to_legacy_machine_schema(&decision_then_flag);
         insert_canonical_pay_segment(&decision_then_flag, "rationale-decision-flag");
         decision_then_flag
             .write_segment_verdict(
@@ -3267,10 +3362,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(
-            crate::migrations::run_migrations(&decision_then_flag).unwrap(),
-            vec![60, 61, 62, 63, 64, 65, 66, 67]
-        );
+        migrate_legacy_machine_schema_to_head(&decision_then_flag);
         decision_then_flag.finalize_human_review("rationale-decision-flag", "accept", None, Some(2), None).unwrap();
         let effect_id: i64 = decision_then_flag
             .connection()
@@ -3282,11 +3374,24 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            decision_then_flag.undo_human_decision(effect_id, None, "00000000-0000-4000-8000-000000000810").unwrap(),
+            decision_then_flag
+                .undo_latest_desktop_human_decision(
+                    &match decision_then_flag.desktop_review_undo_availability().unwrap() {
+                        crate::db::DesktopReviewUndoAvailability::Available(
+                            crate::db::DesktopReviewUndoAuthority::Decision(authority),
+                        ) => {
+                            assert_eq!(authority.effect_event_id, effect_id);
+                            authority
+                        }
+                        other => panic!("expected decision Undo authority, got {other:?}"),
+                    },
+                    "00000000-0000-4000-8000-000000000810",
+                )
+                .unwrap(),
             crate::db::HumanDecisionUndoOutcome::Applied { .. }
         ));
         decision_then_flag
-            .record_review_flag(
+            .record_review_flag_for_test(
                 "rationale-decision-flag",
                 "later flag rationale",
                 "00000000-0000-4000-8000-000000000811",
@@ -4052,9 +4157,8 @@ mod tests {
         let source = crate::db::Database::open(source_path.to_string_lossy().as_ref()).unwrap();
         source.delete_segment("old-live").unwrap();
         source.insert_segment(&test_segment("restored", "restored.wav", "from snapshot")).unwrap();
-        // A manifest-bound snapshot is a frozen, self-contained DB file. Immutable restore staging
-        // intentionally ignores live WAL sidecars, so finish this fixture like snapshot promotion
-        // does instead of asking raw-file verification to read an open writer's uncheckpointed WAL.
+        // Finish this fixture like snapshot promotion does. Restore staging is WAL-aware, but the
+        // raw file bytes below model a frozen manifest-bound backup rather than an active writer.
         source.wal_checkpoint().unwrap();
         drop(source);
 
@@ -4396,10 +4500,12 @@ mod tests {
         drop(live);
 
         let pending = NamedRestorePending {
-            schema: NAMED_RESTORE_PENDING_SCHEMA,
+            schema: 2,
             source_selector: snapshot_selector(&target, false),
             pre_restore_pin_selector: snapshot_selector(&original_pin, true),
+            target_db_generation_sha256: None,
             completed_selector: None,
+            completed_db_generation_sha256: None,
         };
         write_named_restore_pending(data_dir, &pending).unwrap();
         let admission = RestoreAdmission::new();
@@ -4452,10 +4558,12 @@ mod tests {
         drop(live);
 
         let pending = NamedRestorePending {
-            schema: NAMED_RESTORE_PENDING_SCHEMA,
+            schema: 2,
             source_selector: snapshot_selector(&target, false),
             pre_restore_pin_selector: snapshot_selector(&original_pin, true),
+            target_db_generation_sha256: None,
             completed_selector: None,
+            completed_db_generation_sha256: None,
         };
         write_named_restore_pending(data_dir, &pending).unwrap();
         let admission = RestoreAdmission::new();
@@ -4486,10 +4594,12 @@ mod tests {
         drop(live);
 
         let pending = NamedRestorePending {
-            schema: NAMED_RESTORE_PENDING_SCHEMA,
+            schema: 2,
             source_selector: snapshot_selector(&target, false),
             pre_restore_pin_selector: snapshot_selector(&original_pin, true),
+            target_db_generation_sha256: None,
             completed_selector: None,
+            completed_db_generation_sha256: None,
         };
         write_named_restore_pending(data_dir, &pending).unwrap();
         let admission = RestoreAdmission::new();
@@ -4519,10 +4629,12 @@ mod tests {
         std::fs::write(target.join("settings.json"), b"tampered after manifest").unwrap();
 
         let pending = NamedRestorePending {
-            schema: NAMED_RESTORE_PENDING_SCHEMA,
+            schema: 2,
             source_selector: snapshot_selector(&target, false),
             pre_restore_pin_selector: snapshot_selector(&original_pin, true),
+            target_db_generation_sha256: None,
             completed_selector: None,
+            completed_db_generation_sha256: None,
         };
         write_named_restore_pending(data_dir, &pending).unwrap();
         let admission = RestoreAdmission::new();
@@ -4536,7 +4648,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_restore_marker_cleanup_never_replays_or_rolls_back_missing_sources() {
+    fn exact_completed_restore_generation_cleans_up_after_a_lost_response_without_replay() {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path();
         AppSettings::default().save(&data_dir.join("settings.json")).unwrap();
@@ -4544,12 +4656,15 @@ mod tests {
         let live = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
         live.initialize().unwrap();
         live.insert_segment(&test_segment("committed", "committed.wav", "already coherent")).unwrap();
+        let committed_digest = live.restore_generation_sha256().unwrap();
         drop(live);
         let pending = NamedRestorePending {
             schema: NAMED_RESTORE_PENDING_SCHEMA,
             source_selector: "snapshot_0000009999".to_string(),
             pre_restore_pin_selector: "pinned/missing_0000009998".to_string(),
+            target_db_generation_sha256: Some(committed_digest.clone()),
             completed_selector: Some("snapshot_0000009999".to_string()),
+            completed_db_generation_sha256: Some(committed_digest),
         };
         write_named_restore_pending(data_dir, &pending).unwrap();
         let admission = RestoreAdmission::new();
@@ -4559,6 +4674,49 @@ mod tests {
         assert!(load_named_restore_pending(data_dir).unwrap().is_none());
         let recovered = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
         assert!(recovered.get_segment_by_id("committed").unwrap().is_some());
+    }
+
+    #[test]
+    fn completed_marker_digest_mismatch_replays_the_exact_recorded_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        AppSettings::default().save(&data_dir.join("settings.json")).unwrap();
+        let db_path = data_dir.join("cortex-speech.db");
+        let live = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+        live.insert_segment(&test_segment("original", "original.wav", "original authority")).unwrap();
+        let original_pin = crate::snapshot::take_pinned_snapshot_at(&live, data_dir, "digest-floor", 3, 8_000).unwrap();
+        live.insert_segment(&test_segment("target", "target.wav", "recorded target authority")).unwrap();
+        let target = crate::snapshot::take_snapshot_at(&live, data_dir, 5, 9_000).unwrap().unwrap();
+        let target_selector = snapshot_selector(&target, false);
+        let target_staged = crate::db::Database::stage_restore_source(target.join("cortex-speech.db")).unwrap();
+        let target_digest = target_staged.restore_generation_sha256().unwrap();
+        drop(target_staged);
+
+        // Model a healthy but wrong generation under a durable completion marker. The old health-only
+        // cleanup accepted this state and erased the barrier. Exact-generation recovery must replay.
+        live.delete_segment("target").unwrap();
+        live.insert_segment(&test_segment("wrong", "wrong.wav", "healthy but wrong")).unwrap();
+        drop(live);
+        let pending = NamedRestorePending {
+            schema: NAMED_RESTORE_PENDING_SCHEMA,
+            source_selector: target_selector.clone(),
+            pre_restore_pin_selector: snapshot_selector(&original_pin, true),
+            target_db_generation_sha256: Some(target_digest.clone()),
+            completed_selector: Some(target_selector),
+            completed_db_generation_sha256: Some(target_digest.clone()),
+        };
+        write_named_restore_pending(data_dir, &pending).unwrap();
+
+        let admission = RestoreAdmission::new();
+        assert!(recover_interrupted_named_restore_with_admission(data_dir, &admission).unwrap());
+        assert!(!admission.is_pending());
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+        let recovered = crate::db::Database::open_detached_read_snapshot(db_path.to_string_lossy().as_ref()).unwrap();
+        assert!(recovered.get_segment_by_id("original").unwrap().is_some());
+        assert!(recovered.get_segment_by_id("target").unwrap().is_some());
+        assert!(recovered.get_segment_by_id("wrong").unwrap().is_none());
+        assert_eq!(recovered.restore_generation_sha256().unwrap(), target_digest);
     }
 
     #[test]
@@ -4697,6 +4855,8 @@ mod tests {
         source.initialize().unwrap();
         source.wal_checkpoint().unwrap();
         drop(source);
+        let (_snapshot_authority, snapshot_schema, snapshot_max_review_event_id) =
+            crate::db::Database::stage_restore_source_with_original_evidence(&snapshot_db).unwrap();
 
         let policy = br#"{
           "schema_version": 1,
@@ -4708,7 +4868,9 @@ mod tests {
           ]
         }"#;
         std::fs::write(snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_FILE), policy).unwrap();
-        let legacy_policy = inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, false).unwrap_err();
+        let legacy_policy =
+            inspect_snapshot_pilot_policy(&snapshot_dir, snapshot_schema, snapshot_max_review_event_id, false)
+                .unwrap_err();
         assert!(
             legacy_policy.contains("requires a verified manifest"),
             "a manifestless policy-bearing tree can never authorize a named restore: {legacy_policy}"
@@ -4719,10 +4881,18 @@ mod tests {
             br#"{"segment_ids":["snapshot-wrong"]}"#,
         )
         .unwrap();
-        let wrong_focus = inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, true).unwrap_err();
+        let wrong_focus =
+            inspect_snapshot_pilot_policy(&snapshot_dir, snapshot_schema, snapshot_max_review_event_id, true)
+                .unwrap_err();
         assert!(wrong_focus.contains("digest mismatch"), "{wrong_focus}");
         crate::review_pilot::install_test_focus(&snapshot_dir, ["snapshot-focus"]);
-        let install = inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, true).unwrap();
+        let migrated_legacy = inspect_snapshot_pilot_policy(&snapshot_dir, 58, 0, true).unwrap_err();
+        assert!(
+            migrated_legacy.contains("predates durable hidden-key authority"),
+            "a fully staged migration must not upgrade the snapshot's original policy authority: {migrated_legacy}"
+        );
+        let install =
+            inspect_snapshot_pilot_policy(&snapshot_dir, snapshot_schema, snapshot_max_review_event_id, true).unwrap();
         assert!(matches!(install, SnapshotPilotPolicyRestore::Install(_)));
         crate::review_pilot::install_test_focus(&live_dir, ["snapshot-focus"]);
 
@@ -4732,7 +4902,9 @@ mod tests {
             crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_BYTES,
         )
         .unwrap();
-        assert!(inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, false).is_err());
+        assert!(
+            inspect_snapshot_pilot_policy(&snapshot_dir, snapshot_schema, snapshot_max_review_event_id, false).is_err()
+        );
         std::fs::remove_file(snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE)).unwrap();
 
         std::fs::write(live_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), b"pending").unwrap();
@@ -4755,7 +4927,8 @@ mod tests {
             crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_BYTES,
         )
         .unwrap();
-        let absent = inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, false).unwrap();
+        let absent =
+            inspect_snapshot_pilot_policy(&snapshot_dir, snapshot_schema, snapshot_max_review_event_id, false).unwrap();
         assert_eq!(absent, SnapshotPilotPolicyRestore::ExplicitlyAbsent);
         std::fs::write(live_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), b"pending").unwrap();
         let stale_policy_backup =
@@ -4774,11 +4947,11 @@ mod tests {
         // Legacy snapshots remain recoverable but can never delete or replace a current live policy.
         std::fs::remove_file(snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE)).unwrap();
         assert!(
-            inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, true).is_err(),
+            inspect_snapshot_pilot_policy(&snapshot_dir, snapshot_schema, snapshot_max_review_event_id, true).is_err(),
             "manifest-bearing snapshots can never infer unrestricted state from missing files"
         );
         assert_eq!(
-            inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, false).unwrap(),
+            inspect_snapshot_pilot_policy(&snapshot_dir, snapshot_schema, snapshot_max_review_event_id, false).unwrap(),
             SnapshotPilotPolicyRestore::PreserveLegacy
         );
     }
@@ -5636,28 +5809,5 @@ mod tests {
         assert_eq!(report["humanInbox"].as_u64(), Some(1));
         assert_eq!(fresh.verdict.as_deref(), Some("escalated"));
         assert!(fresh.rationale.as_deref().unwrap_or("").contains("T2 disabled"));
-    }
-
-    /// A bad CORTEX_BATCH_CONCURRENCY must fall back to SERIAL, never to a wide fan-out.
-    ///
-    /// This knob decides how many clips are pushed at the ASR server at once. The failure that
-    /// matters is not "too slow" — it is a typo silently turning into 32 concurrent requests at a
-    /// two-replica server, or a 0 that spawns no workers and hangs the batch forever. Every
-    /// unusable value therefore resolves to 1, which is exactly the behaviour this command had
-    /// before concurrency existed.
-    #[test]
-    fn batch_concurrency_falls_back_to_serial_for_every_unusable_value() {
-        assert_eq!(parse_batch_concurrency(None), 1, "absent -> serial");
-        assert_eq!(parse_batch_concurrency(Some("")), 1, "empty -> serial");
-        assert_eq!(parse_batch_concurrency(Some("0")), 1, "zero would spawn no workers and hang");
-        assert_eq!(parse_batch_concurrency(Some("-4")), 1, "negative -> serial");
-        assert_eq!(parse_batch_concurrency(Some("eight")), 1, "unparseable -> serial");
-        assert_eq!(parse_batch_concurrency(Some("33")), 1, "above the cap -> serial, never uncapped");
-        assert_eq!(parse_batch_concurrency(Some("999999")), 1, "absurd -> serial");
-
-        assert_eq!(parse_batch_concurrency(Some("1")), 1);
-        assert_eq!(parse_batch_concurrency(Some("8")), 8, "a sane value is honoured");
-        assert_eq!(parse_batch_concurrency(Some(" 8 ")), 8, "surrounding whitespace is tolerated");
-        assert_eq!(parse_batch_concurrency(Some("32")), 32, "the cap itself is allowed");
     }
 }

@@ -220,6 +220,17 @@ test.describe('Couch Review phone page', () => {
         // A dropped request is a TypeError from fetch — no status — which is exactly how the page
         // tells "never arrived" (retry) from "the server refused" (do not retry).
         if (net.fail) throw new TypeError('Failed to fetch');
+        if (url.includes('/api/queue')) {
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              reviewer: 'Sara',
+              items: [],
+              heldByOthers: 0,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
         return new Response('{"ok":true}', {
           status: 200,
           headers: { 'content-type': 'application/json' },

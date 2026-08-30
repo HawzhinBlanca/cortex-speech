@@ -5,9 +5,50 @@ use crate::error::{AppError, AppResult};
 use crate::validation::input as validate;
 use flacenc::error::Verify;
 use serde::{Deserialize, Serialize};
-use std::io::{BufWriter, Write};
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Serialize staging/recovery/swap so concurrent renderer requests cannot sweep each other's trees.
+static AUDIO_EXPORT_PUBLICATION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+const AUDIO_EXPORT_STAGING_TAG: &str = ".cortex-reviewed-audio-stage-";
+const AUDIO_EXPORT_BACKUP_TAG: &str = ".cortex-reviewed-audio-backup-";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioExportFault {
+    None,
+    /// Exercise the ENOSPC cleanup path after a clip reaches private staging.
+    #[cfg(test)]
+    DiskFullAfterClips,
+}
+
+struct AudioExportStage {
+    path: PathBuf,
+    parent: PathBuf,
+    prefix: String,
+    armed: bool,
+}
+
+impl AudioExportStage {
+    fn new(path: PathBuf, parent: PathBuf, prefix: String) -> Self {
+        Self { path, parent, prefix, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AudioExportStage {
+    fn drop(&mut self) {
+        if self.armed {
+            cleanup_generated_audio_export_dir(&self.path, &self.parent, &self.prefix);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioExportOptions {
@@ -91,12 +132,344 @@ fn human_export_label(seg: &SpeechSegment) -> Option<(&str, &str)> {
     Some((transcript, decision))
 }
 
+fn audio_export_sibling_prefix(output_dir: &Path, tag: &str) -> AppResult<String> {
+    let output_name =
+        output_dir.file_name().and_then(|name| name.to_str()).filter(|name| !name.is_empty()).ok_or_else(|| {
+            AppError::Validation("Reviewed-audio export target must have a directory name".to_string())
+        })?;
+    Ok(format!(".{output_name}{tag}"))
+}
+
+fn generated_audio_export_dirs(parent: &Path, prefix: &str) -> AppResult<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(|name| name.starts_with(prefix)) {
+            continue;
+        }
+        // Never follow a caller-created symlink/reparse point during recursive cleanup.
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() && !file_type.is_symlink() {
+            paths.push(entry.path());
+        }
+    }
+    Ok(paths)
+}
+
+/// Remove only an exact same-parent generated directory; never follow a caller-created link.
+fn cleanup_generated_audio_export_dir(path: &Path, parent: &Path, prefix: &str) {
+    if !path.exists() {
+        return;
+    }
+    let lexical_safe = path.parent() == Some(parent)
+        && path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with(prefix));
+    let resolved_safe = path
+        .canonicalize()
+        .ok()
+        .zip(parent.canonicalize().ok())
+        .is_some_and(|(resolved, resolved_parent)| resolved.parent() == Some(resolved_parent.as_path()));
+    let is_real_dir = std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if !(lexical_safe && resolved_safe && is_real_dir) {
+        tracing::error!(
+            "Refusing unsafe reviewed-audio export cleanup outside the resolved parent: {}",
+            path.display()
+        );
+        return;
+    }
+    if let Err(error) = std::fs::remove_dir_all(path) {
+        tracing::warn!("Failed to remove reviewed-audio export private directory {}: {error}", path.display());
+    }
+}
+
+fn sha256_file(path: &Path) -> AppResult<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let mut output = String::with_capacity(64);
+    for byte in digest.finalize() {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    Ok(output)
+}
+
+fn safe_manifest_filename(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.contains(['/', '\\'])
+        && Path::new(value).file_name().and_then(|name| name.to_str()) == Some(value)
+}
+
+/// Require byte integrity plus an exact `{SHA256SUMS + manifest entries}` audio↔metadata inventory.
+fn verify_complete_audio_export_dir(output_dir: &Path, expected_files: Option<&[String]>) -> AppResult<()> {
+    let manifest_path = output_dir.join("SHA256SUMS");
+    let metadata_path = output_dir.join("metadata.jsonl");
+    if !manifest_path.is_file() || !metadata_path.is_file() {
+        return Err(AppError::Validation(
+            "directory is not a complete reviewed-audio export (metadata.jsonl or SHA256SUMS is missing)".to_string(),
+        ));
+    }
+    let manifest_size = std::fs::metadata(&manifest_path)?.len();
+    if manifest_size > 16 * 1024 * 1024 {
+        return Err(AppError::Validation(
+            "reviewed-audio SHA256SUMS exceeds the 16 MiB verification limit".to_string(),
+        ));
+    }
+
+    let mut declared = HashMap::<String, String>::new();
+    for line in BufReader::new(std::fs::File::open(&manifest_path)?).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (hash, filename) = line
+            .split_once("  ")
+            .ok_or_else(|| AppError::Validation("reviewed-audio SHA256SUMS contains a malformed entry".to_string()))?;
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) || !safe_manifest_filename(filename) {
+            return Err(AppError::Validation(
+                "reviewed-audio SHA256SUMS contains an unsafe filename or invalid digest".to_string(),
+            ));
+        }
+        if filename == "SHA256SUMS" || declared.insert(filename.to_string(), hash.to_ascii_lowercase()).is_some() {
+            return Err(AppError::Validation(
+                "reviewed-audio SHA256SUMS contains a self-reference or duplicate filename".to_string(),
+            ));
+        }
+    }
+    if !declared.contains_key("metadata.jsonl") {
+        return Err(AppError::Validation(
+            "reviewed-audio SHA256SUMS does not bind the authoritative metadata.jsonl".to_string(),
+        ));
+    }
+
+    let mut actual = HashSet::<String>::new();
+    for entry in std::fs::read_dir(output_dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let filename = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| AppError::Validation("reviewed-audio export contains a non-Unicode filename".to_string()))?;
+        if !file_type.is_file() || file_type.is_symlink() || !safe_manifest_filename(&filename) {
+            return Err(AppError::Validation(
+                "reviewed-audio export contains a directory, link, or unsafe artifact".to_string(),
+            ));
+        }
+        actual.insert(filename);
+    }
+    let mut declared_with_manifest: HashSet<String> = declared.keys().cloned().collect();
+    declared_with_manifest.insert("SHA256SUMS".to_string());
+    if actual != declared_with_manifest {
+        return Err(AppError::Validation(
+            "reviewed-audio export inventory disagrees with SHA256SUMS (missing or orphan artifact)".to_string(),
+        ));
+    }
+    if let Some(expected) = expected_files {
+        let expected: HashSet<String> = expected.iter().cloned().collect();
+        if expected != actual {
+            return Err(AppError::Validation(
+                "reviewed-audio staged inventory disagrees with the command result".to_string(),
+            ));
+        }
+    }
+
+    for (filename, expected_hash) in &declared {
+        let actual_hash = sha256_file(&output_dir.join(filename))?;
+        if &actual_hash != expected_hash {
+            return Err(AppError::Validation(format!(
+                "reviewed-audio staged artifact failed SHA-256 verification: {filename}"
+            )));
+        }
+    }
+
+    let audio_files: HashSet<String> =
+        declared.keys().filter(|name| name.ends_with(".wav") || name.ends_with(".flac")).cloned().collect();
+    if audio_files.is_empty() {
+        return Err(AppError::Validation("reviewed-audio export contains no audio clips".to_string()));
+    }
+    let mut labelled_audio = HashSet::<String>::new();
+    for line in BufReader::new(std::fs::File::open(&metadata_path)?).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: serde_json::Value = serde_json::from_str(&line)?;
+        let filename = record.get("file_name").and_then(serde_json::Value::as_str).ok_or_else(|| {
+            AppError::Validation("reviewed-audio metadata.jsonl row is missing file_name".to_string())
+        })?;
+        if !safe_manifest_filename(filename) || !labelled_audio.insert(filename.to_string()) {
+            return Err(AppError::Validation(
+                "reviewed-audio metadata.jsonl contains an unsafe or duplicate file_name".to_string(),
+            ));
+        }
+    }
+    if labelled_audio != audio_files {
+        return Err(AppError::Validation(
+            "reviewed-audio metadata.jsonl does not label exactly the published audio clips".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_replaceable_audio_export_target(output_dir: &Path) -> AppResult<()> {
+    let metadata = match std::fs::symlink_metadata(output_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(AppError::Validation(
+            "Reviewed-audio export target must be a real directory, not a file or link".to_string(),
+        ));
+    }
+    if std::fs::read_dir(output_dir)?.next().is_none() {
+        return Ok(());
+    }
+    verify_complete_audio_export_dir(output_dir, None).map_err(|error| {
+        AppError::Validation(format!(
+            "Reviewed-audio export target is non-empty and is not an exact complete prior Cortex export; preserving it unchanged. Choose an empty folder. ({error})"
+        ))
+    })
+}
+
+/// Recover either side of the two-rename swap, then sweep non-authoritative private staging.
+fn recover_interrupted_audio_export(output_dir: &Path) -> AppResult<()> {
+    let parent = output_dir.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let staging_prefix = audio_export_sibling_prefix(output_dir, AUDIO_EXPORT_STAGING_TAG)?;
+    let backup_prefix = audio_export_sibling_prefix(output_dir, AUDIO_EXPORT_BACKUP_TAG)?;
+    let mut backups = generated_audio_export_dirs(parent, &backup_prefix)?;
+    backups.sort_by_key(|path| {
+        std::fs::metadata(path).and_then(|metadata| metadata.modified()).unwrap_or(std::time::UNIX_EPOCH)
+    });
+
+    if !output_dir.exists() {
+        if let Some(backup) = backups.pop() {
+            std::fs::rename(&backup, output_dir).map_err(|error| {
+                AppError::Other(format!(
+                    "Could not recover the previous reviewed-audio export after an interrupted publication: {error}"
+                ))
+            })?;
+            crate::atomic_file::fsync_parent_dir(output_dir);
+        }
+    }
+
+    if output_dir.exists() && !backups.is_empty() {
+        // Never discard the recoverable previous generation unless the visible destination is known
+        // complete (or is the empty directory that preceded a first publication).
+        require_replaceable_audio_export_target(output_dir)?;
+        for backup in backups {
+            cleanup_generated_audio_export_dir(&backup, parent, &backup_prefix);
+        }
+    }
+    for staging in generated_audio_export_dirs(parent, &staging_prefix)? {
+        cleanup_generated_audio_export_dir(&staging, parent, &staging_prefix);
+    }
+    Ok(())
+}
+
+fn publish_staged_audio_export(staging_dir: &Path, output_dir: &Path, expected_files: &[String]) -> AppResult<()> {
+    verify_complete_audio_export_dir(staging_dir, Some(expected_files))?;
+    require_replaceable_audio_export_target(output_dir)?;
+
+    let parent = output_dir.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let backup_prefix = audio_export_sibling_prefix(output_dir, AUDIO_EXPORT_BACKUP_TAG)?;
+    let backup_dir = parent.join(format!("{backup_prefix}{}", uuid::Uuid::new_v4().simple()));
+    let had_destination = output_dir.exists();
+    if had_destination {
+        std::fs::rename(output_dir, &backup_dir).map_err(|error| {
+            AppError::Other(format!(
+                "Could not preserve the previous reviewed-audio export before publication: {error}"
+            ))
+        })?;
+        crate::atomic_file::fsync_parent_dir(output_dir);
+    }
+
+    if let Err(promote_error) = std::fs::rename(staging_dir, output_dir) {
+        if had_destination {
+            if let Err(restore_error) = std::fs::rename(&backup_dir, output_dir) {
+                tracing::error!(
+                    preserved_backup = %backup_dir.display(),
+                    %restore_error,
+                    %promote_error,
+                    "Reviewed-audio publication and automatic restoration both failed"
+                );
+                return Err(AppError::Other(format!(
+                    "Reviewed-audio publication failed ({promote_error}) and automatic restoration failed ({restore_error}); the preserved prior export remains in a private recovery directory"
+                )));
+            }
+            crate::atomic_file::fsync_parent_dir(output_dir);
+        }
+        return Err(AppError::Other(format!(
+            "Could not atomically publish the reviewed-audio export; the previous destination was preserved: {promote_error}"
+        )));
+    }
+    crate::atomic_file::fsync_parent_dir(output_dir);
+
+    // A second verification after rename catches an unexpected filesystem filter/driver mutation.
+    // Roll back to the previous generation before reporting failure whenever one existed.
+    if let Err(verify_error) = verify_complete_audio_export_dir(output_dir, Some(expected_files)) {
+        if had_destination {
+            // A failed *new* generation must never share the backup namespace: if restoring the real
+            // backup is itself interrupted, the next recovery must choose old truth, not this invalid tree.
+            let failed_prefix = audio_export_sibling_prefix(output_dir, AUDIO_EXPORT_STAGING_TAG)?;
+            let failed_new = parent.join(format!("{failed_prefix}failed-new-{}", uuid::Uuid::new_v4().simple()));
+            if std::fs::rename(output_dir, &failed_new).is_ok() && std::fs::rename(&backup_dir, output_dir).is_ok() {
+                cleanup_generated_audio_export_dir(&failed_new, parent, &failed_prefix);
+                crate::atomic_file::fsync_parent_dir(output_dir);
+            }
+        } else {
+            cleanup_generated_audio_export_dir(
+                output_dir,
+                parent,
+                output_dir.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+            );
+        }
+        return Err(AppError::Other(format!(
+            "Reviewed-audio publication failed post-promotion verification; the incomplete generation was not accepted: {verify_error}"
+        )));
+    }
+
+    if had_destination {
+        // The new generation is complete and durable. Backup deletion is non-load-bearing cleanup;
+        // a transient scanner lock must not turn a successful publication into a dishonest failure.
+        cleanup_generated_audio_export_dir(&backup_dir, parent, &backup_prefix);
+    }
+    Ok(())
+}
+
 /// Export audio segments from a dataset.
 /// For each segment, copies or extracts the relevant audio portion to the output directory.
 pub fn export_audio_segments(
     db: &Database,
     segment_ids: &[String],
     options: &AudioExportOptions,
+) -> AppResult<AudioExportResult> {
+    export_audio_segments_inner(db, segment_ids, options, AudioExportFault::None)
+}
+
+fn export_audio_segments_inner(
+    db: &Database,
+    segment_ids: &[String],
+    options: &AudioExportOptions,
+    fault: AudioExportFault,
 ) -> AppResult<AudioExportResult> {
     crate::review_campaign::require_export_unblocked(db, "reviewed audio export")?;
     // Round-24/25 #11: the working buffer is decoded+downmixed to 16 kHz (audio::decode_to_pcm), so a
@@ -113,10 +486,20 @@ pub fn export_audio_segments(
     let validated = validate::validate_output_path(&options.output_dir).map_err(AppError::Validation)?;
     let options = AudioExportOptions { output_dir: validated, ..options.clone() };
     let output_dir = Path::new(&options.output_dir);
-    if !output_dir.exists() {
-        std::fs::create_dir_all(output_dir)
-            .map_err(|e| AppError::Other(format!("Failed to create output dir: {e}")))?;
-    }
+    let parent_dir = output_dir.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent_dir)
+        .map_err(|e| AppError::Other(format!("Failed to create reviewed-audio export parent: {e}")))?;
+    let _publication = AUDIO_EXPORT_PUBLICATION_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    recover_interrupted_audio_export(output_dir)?;
+    require_replaceable_audio_export_target(output_dir)?;
+
+    let staging_prefix = audio_export_sibling_prefix(output_dir, AUDIO_EXPORT_STAGING_TAG)?;
+    let staging_dir = parent_dir.join(format!("{staging_prefix}{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir(&staging_dir)
+        .map_err(|e| AppError::Other(format!("Failed to create private reviewed-audio staging directory: {e}")))?;
+    let mut staging = AudioExportStage::new(staging_dir.clone(), parent_dir.to_path_buf(), staging_prefix);
+    let staged_options =
+        AudioExportOptions { output_dir: staging_dir.to_string_lossy().to_string(), ..options.clone() };
 
     // Fail-closed: never export held-out, withdrawn, rejected, or placeholder audio, exactly like
     // export_dataset / HF / bundle. Then require a REAL human accept/edit. `verified` alone is not a
@@ -154,7 +537,7 @@ pub fn export_audio_segments(
             skipped_policy += 1;
             continue;
         }
-        match export_single_segment(db, id, &options) {
+        match export_single_segment(db, id, &staged_options) {
             Ok(exported_file) => {
                 succeeded += 1;
                 files.push(exported_file.filename.clone());
@@ -173,30 +556,51 @@ pub fn export_audio_segments(
         );
     }
 
+    if exported.is_empty() {
+        // A zero-clip run is a true no-op. In particular, missing media or a policy-only selection
+        // must never replace a prior complete bundle with an empty directory.
+        return Ok(AudioExportResult {
+            total: segment_ids.len(),
+            succeeded,
+            failed,
+            output_dir: options.output_dir.clone(),
+            files,
+            errors,
+        });
+    }
+
+    #[cfg(test)]
+    if fault == AudioExportFault::DiskFullAfterClips {
+        return Err(AppError::Io(std::io::Error::other("simulated disk full after staged reviewed-audio clips")));
+    }
+    #[cfg(not(test))]
+    let _ = fault;
+
     // The JSONL sidecar is the authoritative audio↔exact-label pairing and is never optional. CSV
     // escaping must prefix formula-like cells for spreadsheet safety, so CSV cannot honestly be the
     // byte-exact transcript record for every possible human label.
     if !exported.is_empty() {
-        write_metadata_jsonl(output_dir, &exported, &options)?;
+        write_metadata_jsonl(&staging_dir, &exported, &staged_options)?;
         files.push("metadata.jsonl".to_string());
     }
 
     if options.include_metadata && !exported.is_empty() {
-        write_metadata_csv(output_dir, &exported, &options)?;
+        write_metadata_csv(&staging_dir, &exported, &staged_options)?;
         files.push("metadata.csv".to_string());
     }
 
-    // Integrity manifest over every written clip (+ metadata), matching every sibling multi-file export
-    // (export_dataset / HF / bundle / gold-eval / finetune): a consumer runs `sha256sum -c SHA256SUMS`
-    // to detect a corrupted, truncated, or partially-copied WAV in a shared dataset. Written LAST so it
-    // covers all artifacts. Skipped when nothing was exported (all failed/held-out) — no files to cover.
+    // Write the integrity manifest last so it covers every staged clip and sidecar.
     if !files.is_empty() {
-        // Scope the manifest to THIS export's files (not a whole-dir scan): the output dir is
-        // caller-chosen and unstaged, so a re-export of a smaller selection can leave orphan clips from a
-        // prior run that metadata.csv omits — a whole-dir SHA256SUMS would vouch for them (round-25 hunt).
-        crate::export::write_sha256sums_for(output_dir, &files)?;
+        // The staging tree is fresh, and this explicit list is also the public command result. The
+        // verifier below requires the list, manifest and actual directory inventory to match exactly.
+        crate::export::write_sha256sums_for(&staging_dir, &files)?;
         files.push("SHA256SUMS".to_string());
     }
+
+    verify_complete_audio_export_dir(&staging_dir, Some(&files))?;
+    crate::atomic_file::fsync_parent_dir(&staging_dir.join(".directory-sync"));
+    publish_staged_audio_export(&staging_dir, output_dir, &files)?;
+    staging.disarm();
 
     Ok(AudioExportResult {
         total: segment_ids.len(),
@@ -624,6 +1028,17 @@ mod tests {
         (spec.sample_rate, reader.duration())
     }
 
+    fn directory_bytes(path: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let name = entry.file_name().to_string_lossy().to_string();
+                (name, fs::read(entry.path()).unwrap())
+            })
+            .collect()
+    }
+
     /// A withdrawn recording's VOICE must never be written to disk. Until 2026-08-06 this exporter
     /// made no rights call at all: it wrote the WAV/FLAC plus every transcript column into
     /// metadata.csv for a recording whose consent had been revoked. Voice is biometric data under
@@ -753,43 +1168,41 @@ mod tests {
     }
 
     #[test]
-    fn sha256sums_covers_only_this_export_not_orphan_clips() {
-        // Round-25 hunt: export_audio writes into a caller-chosen dir it does NOT stage/clean, so a
-        // re-export of a smaller selection leaves ORPHAN clips from a prior run. A whole-dir SHA256SUMS
-        // would vouch for a stale clip that metadata.csv (this export only) omits — an integrity manifest
-        // asserting a file the dataset itself does not list. The manifest must cover exactly this export.
+    fn reexport_of_smaller_selection_atomically_removes_prior_generation_orphans() {
+        // A complete prior bundle is replaced wholesale by the fresh staged generation. The omitted
+        // clip can therefore be neither left as an orphan nor accidentally vouched for by SHA256SUMS.
         let tmp = TempDir::new().unwrap();
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        let wav = tmp.path().join("clip.wav");
-        make_wav_file(&wav);
-        insert_test_segment(&db, "seg-1", &wav);
+        let wav1 = tmp.path().join("clip1.wav");
+        let wav2 = tmp.path().join("clip2.wav");
+        make_wav_file(&wav1);
+        make_wav_file(&wav2);
+        insert_test_segment(&db, "seg-1", &wav1);
+        insert_test_segment(&db, "seg-2", &wav2);
 
         let out = tmp.path().join("audio_out");
         fs::create_dir_all(&out).unwrap();
-        // A stale artifact from a PRIOR export already sits in the target dir.
-        let orphan = out.join("orphan_from_previous_run.wav");
-        fs::write(&orphan, b"stale clip bytes not part of this export").unwrap();
-
         let options = AudioExportOptions {
             output_dir: out.to_string_lossy().to_string(),
             format: AudioExportFormat::Wav,
             sample_rate: 16000,
             include_metadata: true,
         };
+        let first = export_audio_segments(&db, &["seg-1".to_string(), "seg-2".to_string()], &options).unwrap();
+        let prior_only = first.files.iter().find(|name| name.contains("seg-2") && name.ends_with(".wav")).unwrap();
+        assert!(out.join(prior_only).is_file());
+
         let result = export_audio_segments(&db, &["seg-1".to_string()], &options).unwrap();
         assert_eq!(result.succeeded, 1);
 
         let sums = fs::read_to_string(out.join("SHA256SUMS")).unwrap();
-        assert!(
-            !sums.contains("orphan_from_previous_run.wav"),
-            "SHA256SUMS must NOT vouch for an orphan clip the dataset's metadata omits:\n{sums}"
-        );
+        assert!(!sums.contains(prior_only), "replacement manifest must omit the prior-only clip:\n{sums}");
         assert!(sums.contains("metadata.csv"), "manifest covers this export's metadata.csv");
         let exported_wav = result.files.iter().find(|f| f.ends_with(".wav")).expect("an exported wav");
         assert!(sums.contains(exported_wav.as_str()), "manifest covers the exported clip {exported_wav}");
-        // The fix scopes the manifest; it does not delete the user's other files.
-        assert!(orphan.is_file(), "orphan is left on disk (not vouched, not deleted)");
+        assert!(!out.join(prior_only).exists(), "whole-generation replacement must remove prior-only clips");
+        verify_complete_audio_export_dir(&out, Some(&result.files)).unwrap();
     }
 
     #[test]
@@ -1317,7 +1730,7 @@ mod tests {
     }
 
     #[test]
-    fn test_export_replaces_existing_file_and_cleans_temp() {
+    fn reexport_swaps_one_complete_generation_and_cleans_private_siblings() {
         let tmp = TempDir::new().unwrap();
         let wav_path = tmp.path().join("test.wav");
         make_wav_file(&wav_path);
@@ -1328,10 +1741,7 @@ mod tests {
 
         let out_dir = tmp.path().join("out");
         fs::create_dir_all(&out_dir).unwrap();
-        let output_path = out_dir.join("test_exp1.wav");
-        fs::write(&output_path, b"stale partial export").unwrap();
-
-        let result = export_audio_segments(
+        let first = export_audio_segments(
             &db,
             &["exp1".to_string()],
             &AudioExportOptions {
@@ -1342,18 +1752,126 @@ mod tests {
             },
         )
         .unwrap();
+        let old_wav = first.files.iter().find(|name| name.ends_with(".wav")).unwrap().clone();
+        assert!(out_dir.join(&old_wav).is_file());
+
+        let result = export_audio_segments(
+            &db,
+            &["exp1".to_string()],
+            &AudioExportOptions {
+                output_dir: out_dir.to_string_lossy().to_string(),
+                format: AudioExportFormat::Flac,
+                sample_rate: 16000,
+                include_metadata: true,
+            },
+        )
+        .unwrap();
 
         assert_eq!(result.succeeded, 1);
-        assert_eq!(result.files, vec!["test_exp1.wav", "metadata.jsonl", "metadata.csv", "SHA256SUMS"]);
-        assert_ne!(fs::read(&output_path).unwrap(), b"stale partial export");
-        let (sample_rate, sample_count) = output_wav_info(&output_path);
-        assert_eq!(sample_rate, 16000);
-        assert_eq!(sample_count, 16000);
-        let temp_left = fs::read_dir(&out_dir)
+        assert_eq!(result.files, vec!["test_exp1.flac", "metadata.jsonl", "metadata.csv", "SHA256SUMS"]);
+        assert!(!out_dir.join(old_wav).exists(), "the old generation must not leak into the replacement");
+        assert!(out_dir.join("test_exp1.flac").is_file());
+        verify_complete_audio_export_dir(&out_dir, Some(&result.files)).unwrap();
+        let private_left = fs::read_dir(tmp.path())
             .unwrap()
             .flatten()
-            .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-"));
-        assert!(!temp_left, "temporary export file should be promoted or removed");
+            .any(|entry| entry.file_name().to_string_lossy().contains(".cortex-reviewed-audio-"));
+        assert!(!private_left, "staging/backup siblings should be promoted or removed");
+    }
+
+    #[test]
+    fn disk_full_after_staged_clips_preserves_previous_generation_byte_for_byte() {
+        let tmp = TempDir::new().unwrap();
+        let wav_path = tmp.path().join("test.wav");
+        make_wav_file(&wav_path);
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        insert_test_segment(&db, "exp1", &wav_path);
+        let out_dir = tmp.path().join("out");
+        let options = AudioExportOptions {
+            output_dir: out_dir.to_string_lossy().to_string(),
+            format: AudioExportFormat::Wav,
+            sample_rate: 16000,
+            include_metadata: true,
+        };
+        export_audio_segments(&db, &["exp1".to_string()], &options).unwrap();
+        let before = directory_bytes(&out_dir);
+
+        let error =
+            export_audio_segments_inner(&db, &["exp1".to_string()], &options, AudioExportFault::DiskFullAfterClips)
+                .expect_err("simulated ENOSPC must abort before directory publication");
+        assert!(error.to_string().contains("simulated disk full"));
+        assert_eq!(directory_bytes(&out_dir), before, "the prior bundle must remain byte-identical");
+        assert!(
+            !fs::read_dir(tmp.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains(".cortex-reviewed-audio-")),
+            "failed staging must be cleaned without touching the published directory"
+        );
+    }
+
+    #[test]
+    fn next_run_recovery_restores_previous_generation_after_kill_between_directory_renames() {
+        let tmp = TempDir::new().unwrap();
+        let wav_path = tmp.path().join("test.wav");
+        make_wav_file(&wav_path);
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        insert_test_segment(&db, "exp1", &wav_path);
+        let out_dir = tmp.path().join("out");
+        let options = AudioExportOptions {
+            output_dir: out_dir.to_string_lossy().to_string(),
+            format: AudioExportFormat::Wav,
+            sample_rate: 16000,
+            include_metadata: true,
+        };
+        export_audio_segments(&db, &["exp1".to_string()], &options).unwrap();
+        let before = directory_bytes(&out_dir);
+
+        // Exact hard-kill disk shape: old destination was moved aside, private new generation exists,
+        // but the process died before the staging->destination rename.
+        let backup_prefix = audio_export_sibling_prefix(&out_dir, AUDIO_EXPORT_BACKUP_TAG).unwrap();
+        let staging_prefix = audio_export_sibling_prefix(&out_dir, AUDIO_EXPORT_STAGING_TAG).unwrap();
+        let backup = tmp.path().join(format!("{backup_prefix}kill-fixture"));
+        let staging = tmp.path().join(format!("{staging_prefix}kill-fixture"));
+        fs::rename(&out_dir, &backup).unwrap();
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("partial.wav"), b"truncated new generation").unwrap();
+
+        recover_interrupted_audio_export(&out_dir).unwrap();
+        assert_eq!(directory_bytes(&out_dir), before, "the previous complete generation must be restored exactly");
+        assert!(!backup.exists(), "restoration promotes the backup back to its canonical destination");
+        assert!(!staging.exists(), "non-authoritative crash-left staging is swept after restoration");
+        verify_complete_audio_export_dir(&out_dir, None).unwrap();
+    }
+
+    #[test]
+    fn nonempty_unowned_destination_fails_closed_and_preserves_every_byte() {
+        let tmp = TempDir::new().unwrap();
+        let wav_path = tmp.path().join("test.wav");
+        make_wav_file(&wav_path);
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        insert_test_segment(&db, "exp1", &wav_path);
+        let out_dir = tmp.path().join("out");
+        fs::create_dir(&out_dir).unwrap();
+        fs::write(out_dir.join("owner-notes.txt"), b"do not delete").unwrap();
+        let before = directory_bytes(&out_dir);
+
+        let error = export_audio_segments(
+            &db,
+            &["exp1".to_string()],
+            &AudioExportOptions {
+                output_dir: out_dir.to_string_lossy().to_string(),
+                format: AudioExportFormat::Wav,
+                sample_rate: 16000,
+                include_metadata: true,
+            },
+        )
+        .expect_err("arbitrary non-empty directories are never replaceable export generations");
+        assert!(error.to_string().contains("preserving it unchanged"));
+        assert_eq!(directory_bytes(&out_dir), before);
     }
 
     #[test]

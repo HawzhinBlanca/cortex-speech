@@ -25,6 +25,8 @@ resources = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+embed-resource = "=3.0.9"
+cc = "=1.2.62"
 
 [dependencies]
 # Tauri ecosystem
@@ -57,7 +59,7 @@ unicode-normalization = "0.1.23"
 
 # Async runtime
 # "time" for the champion-supervision tick (engine_runtime's tokio::time::sleep) — no net coupling.
-tokio = { version = "1", features = ["sync", "time"] }
+tokio = { version = "1", features = ["sync", "time", "macros"] }
 
 # DPAPI blob transport encoding for api_keys (0.22 already in the tree transitively — dedupes).
 base64 = "0.22"

@@ -881,6 +881,18 @@ mod tests {
     use super::*;
     use crate::db::SegmentHypothesis;
 
+    fn assert_rollback_to(db: &Database, target_version: i64) {
+        let head = crate::migrations::max_supported_version();
+        let expected = ((target_version + 1)..=head).rev().collect::<Vec<_>>();
+        assert_eq!(crate::migrations::rollback(db, expected.len()).unwrap(), expected);
+        assert_eq!(crate::migrations::get_current_version(db).unwrap(), target_version);
+    }
+
+    fn assert_upgrade_to_current(db: &Database, source_version: i64) {
+        let expected = ((source_version + 1)..=crate::migrations::max_supported_version()).collect::<Vec<_>>();
+        assert_eq!(crate::migrations::run_migrations(db).unwrap(), expected);
+    }
+
     fn make_hyp(seg_id: &str, model: &str, text: &str) -> SegmentHypothesis {
         SegmentHypothesis {
             segment_id: seg_id.into(),
@@ -926,7 +938,7 @@ mod tests {
     fn legacy_machine_db() -> Database {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        assert_rollback_to(&db, 59);
         db
     }
 
@@ -1209,7 +1221,7 @@ mod tests {
     fn few_shot_legacy_example_requires_current_verified_edit_with_matching_text() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        assert_rollback_to(&db, 59);
         db.insert_segment(&make_seg("legacy-example", "wrong draft")).unwrap();
         db.insert_segment(&make_seg("legacy-query", "human fix")).unwrap();
         db.connection()
@@ -1227,7 +1239,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        assert_upgrade_to_current(&db, 59);
 
         assert_eq!(get_few_shot_examples(&db, "legacy-query", 10).unwrap().len(), 1);
         db.connection()

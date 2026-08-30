@@ -83,7 +83,9 @@ pub struct SpeechSegment {
     pub cloud_call: bool,
     /// Hash of decoder/runtime settings that materially affect the transcript.
     pub decoder_config_hash: Option<String>,
-    /// Version of the Sorani normalizer used for normalized_transcript / metrics.
+    /// Producer version for `normalized_transcript`: the Sorani normalizer, or the explicitly
+    /// versioned refinement/LOOP0 review projection when normalization is disabled. The column name
+    /// is historical; a non-null derived transcript and producer marker always travel together.
     pub normalizer_version: Option<String>,
     // ── Per-segment processing provenance (Migration v41, P0.4) ────
     /// Whether the denoiser ACTUALLY ran for this segment at import (`settings.enable_denoising` AND the
@@ -160,6 +162,62 @@ pub enum HumanDecisionUndoOutcome {
     Conflict { segment: SpeechSegment },
 }
 
+/// Immutable identity of the one desktop decision currently eligible for exact Undo. Every field
+/// is rechecked inside the inverse transaction so a restore cannot make a reused integer row id
+/// authorize a different segment or decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DesktopHumanDecisionUndoAuthority {
+    pub effect_event_id: i64,
+    pub segment_id: String,
+    pub action: String,
+    pub decision_operation_id: String,
+    pub decision_payload_hash: String,
+}
+
+/// Closed renderer-visible classification for a review flag. The structured technical rationale
+/// contains source fingerprints and remains database-private; only its audited reason code crosses
+/// the IPC boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DesktopReviewFlagKind {
+    Generic,
+    TechnicalUnusable(String),
+}
+
+/// Immutable identity of the one desktop flag currently eligible for exact Undo. The payload hash
+/// binds the complete database rationale without exposing technical source fingerprints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DesktopReviewFlagUndoAuthority {
+    pub effect_event_id: i64,
+    pub segment_id: String,
+    pub flag_operation_id: String,
+    pub prior_revision: i64,
+    pub flag_revision: i64,
+    pub flag_payload_hash: String,
+    pub flag_kind: DesktopReviewFlagKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DesktopReviewUndoAuthority {
+    Decision(DesktopHumanDecisionUndoAuthority),
+    Flag(DesktopReviewFlagUndoAuthority),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DesktopReviewUndoBlockReason {
+    LegacyHistory,
+    LatestDecisionUndone,
+    LatestFlagUndone,
+    DecisionShadowed,
+    FlagShadowed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DesktopReviewUndoAvailability {
+    NoHistory,
+    Blocked(DesktopReviewUndoBlockReason),
+    Available(DesktopReviewUndoAuthority),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HumanFlagCommit {
@@ -177,12 +235,12 @@ pub enum HumanFlagUndoOutcome {
     Applied {
         #[serde(rename = "restoredRevision")]
         restored_revision: i64,
-        segment: SpeechSegment,
+        segment: Box<SpeechSegment>,
     },
     #[serde(rename = "alreadyApplied")]
-    AlreadyApplied { segment: SpeechSegment },
+    AlreadyApplied,
     #[serde(rename = "conflict")]
-    Conflict { segment: SpeechSegment },
+    Conflict,
 }
 
 #[derive(Debug)]
@@ -191,6 +249,8 @@ struct DecisionEffectSnapshot {
     segment_id: String,
     reviewer: Option<String>,
     source: String,
+    operation_id: Option<String>,
+    operation_payload_hash: Option<String>,
     action: String,
     decision_transcript: Option<String>,
     decision_annotated_transcript: Option<String>,
@@ -236,6 +296,8 @@ struct DesktopReplayEffect {
 #[derive(Debug)]
 struct FlagEffectSnapshot {
     segment_id: String,
+    operation_id: String,
+    prior_revision: i64,
     flag_revision: i64,
     prior_verdict: Option<String>,
     prior_rationale: Option<String>,
@@ -544,6 +606,23 @@ pub(crate) fn desktop_review_v1_payload_hash(
     hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Server-derived immutable identity for one desktop review flag. The exact rationale is included
+/// because it is part of the effect's owned post-state, but only this digest is exposed to the
+/// renderer (technical rationales embed private source fingerprints).
+pub(crate) fn desktop_review_flag_payload_hash(segment_id: &str, prior_revision: i64, flag_rationale: &str) -> String {
+    fn framed(hash: &mut Sha256, value: &[u8]) {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+
+    let mut hash = Sha256::new();
+    hash.update(b"cortex-desktop-review-flag-v1\0");
+    framed(&mut hash, segment_id.as_bytes());
+    hash.update(prior_revision.to_be_bytes());
+    framed(&mut hash, flag_rationale.as_bytes());
+    hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// Historical typed-desktop digest used only to validate/read effects written before policy 4
 /// persisted the exact authorizing receipt. New writes and new replays must use
 /// `desktop_review_v1_payload_hash`, which includes that immutable authority ID.
@@ -828,7 +907,7 @@ impl RecordingRights {
 }
 
 /// P3.3: which distinct source audio files are missing on disk.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioHealth {
     pub total_files: usize,
@@ -837,7 +916,7 @@ pub struct AudioHealth {
 }
 
 /// P3.3: outcome of a basename-based relink.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct RelinkResult {
     pub relinked: usize,
@@ -853,6 +932,13 @@ pub struct ImportJob {
     pub total_files: usize,
     pub completed_paths: Vec<String>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiscardImportJobOutcome {
+    Discarded,
+    NotFound,
+    Changed,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -911,6 +997,8 @@ pub struct SourceTranscriptRecord {
 
 mod core;
 pub use core::*;
+pub mod batch_jobs;
+pub use batch_jobs::*;
 mod decisions;
 mod finalization;
 mod history;
@@ -930,6 +1018,8 @@ impl Database {
         let independent_collision: bool = conn.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM independent_review_decisions WHERE operation_id=?1
+                 UNION ALL
+                 SELECT 1 FROM independent_review_reversals WHERE operation_id=?1
              )",
             [operation_id],
             |row| row.get(0),
@@ -1288,13 +1378,35 @@ impl Database {
         Ok(Self::from_connection(conn, path.to_string()))
     }
 
+    /// Copy a manifest-bound, single-file SQLite authority into a writable in-memory database.
+    ///
+    /// Unlike [`Self::open_detached_read_snapshot`], this deliberately uses SQLite's `immutable=1`
+    /// source contract: sibling WAL/SHM files are ignored and cannot be created or consulted. Callers
+    /// must independently prove that `path` is a frozen, journal-free authority before using it.
+    pub fn open_detached_immutable_snapshot(path: &Path) -> AppResult<Self> {
+        let source = Self::open_immutable_connection(path)?;
+        source.execute_batch("PRAGMA busy_timeout=10000;")?;
+        let mut conn = Connection::open_in_memory()?;
+        {
+            let backup = backup::Backup::new(&source, &mut conn)?;
+            backup.run_to_completion(Self::BACKUP_PAGES_PER_STEP, Self::BACKUP_STEP_PAUSE, None)?;
+        }
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             PRAGMA cache_size=-64000;
+             PRAGMA busy_timeout=10000;",
+        )?;
+        Ok(Self::from_connection(conn, path.to_string_lossy().into_owned()))
+    }
+
     /// Open the database with a retry policy for corruption.
     ///
-    /// Recovery is fail-CLOSED: `recover_database_at` is DESTRUCTIVE (it renames the live db away and
-    /// opens a fresh empty one), so it must fire ONLY on genuine corruption. A transient error — an
+    /// Recovery is fail-CLOSED. Genuine corruption produces a stable, byte-verified COPY of the
+    /// complete SQLite main/WAL/SHM bundle, leaves the source bundle untouched, and aborts startup.
+    /// Cortex never opens a fresh empty library behind the owner's back. A transient error — an
     /// external process holding the file locked past busy_timeout, a disk I/O hiccup, OOM during the
-    /// integrity check — must NOT quarantine a healthy database (that would be silent data loss);
-    /// instead it aborts startup so the user can clear the locker / fix the disk and retry intact.
+    /// integrity check — does not even create a quarantine copy; it simply aborts so the owner can
+    /// clear the locker / fix the disk and retry the original authority intact.
     pub fn open_with_retry(path: &str) -> AppResult<Self> {
         match Self::open(path) {
             Ok(db) => {
@@ -1310,7 +1422,9 @@ impl Database {
                         // a HEALTHY db on that transient signal is silent total data loss. Mirror the
                         // Err branch's discipline: abort startup WITHOUT quarantine so the user can retry
                         // with their data intact.
-                        tracing::error!("Database integrity check returned a transient I/O message (not corruption); aborting startup without quarantine: {result}");
+                        tracing::error!(
+                            "Database integrity check returned a transient I/O message (not corruption); aborting startup without quarantine: {result}"
+                        );
                         return Err(AppError::Other(format!(
                             "Database integrity check could not complete (transient, not corruption): {result}"
                         )));
@@ -1327,18 +1441,20 @@ impl Database {
                     }
                     Err(e) => {
                         // Transient/non-corruption error — do NOT destroy a possibly-healthy database.
-                        tracing::error!("Database integrity check could not complete (transient, not corruption); aborting startup without quarantine: {e}");
+                        tracing::error!(
+                            "Database integrity check could not complete (transient, not corruption); aborting startup without quarantine: {e}"
+                        );
                         return Err(e);
                     }
                 }
                 drop(db);
-                recover_database_at(path)?;
-                Self::open(path)
+                let quarantine = recover_database_at(path)?;
+                Err(corrupt_database_hard_stop(&quarantine))
             }
             Err(e) if is_corruption_error(&e) => {
-                tracing::error!("Failed to open database with a corruption code: {e}. Attempting recovery...");
-                recover_database_at(path)?;
-                Self::open(path)
+                tracing::error!("Failed to open database with a corruption code: {e}. Preserving a quarantine copy...");
+                let quarantine = recover_database_at(path)?;
+                Err(corrupt_database_hard_stop(&quarantine))
             }
             Err(e) => {
                 // A non-corruption open failure (lock contention, permissions, transient I/O) must not
@@ -1419,6 +1535,14 @@ impl Database {
             validate_current_schema_contract(&self.conn)?;
         }
         validate_policy4_effect_authority(&self.conn)?;
+        // Batch headers and items are a second immutable effect ledger.  Validate their canonical
+        // request/projection hashes at the same boundary as policy-4 authority so both normal
+        // startup and an isolated staged restore fail closed before exposing forged or torn work.
+        self.validate_batch_job_authority_v1()?;
+        // v69 is an immutable total-order ledger. Prove its complete set equality and inverse
+        // ordering once at startup; interactive Undo availability can then read only the journal
+        // tail under the append-only triggers instead of rescanning the complete history.
+        self.validate_desktop_review_action_journal()?;
         Ok(())
     }
 
@@ -1427,7 +1551,8 @@ impl Database {
     /// read-only authority here lets higher-level cross-ledger checks fail closed after any
     /// characterization mutation without copying or weakening the canonical proof.
     pub(crate) fn validate_policy4_restore_authority(&self) -> AppResult<()> {
-        validate_policy4_effect_authority(&self.conn)
+        validate_policy4_effect_authority(&self.conn)?;
+        batch_jobs::validate_batch_job_authority_on(&self.conn)
     }
 
     pub(crate) fn cleanup_savepoint_after_error(&self, savepoint: &str) {
@@ -1456,8 +1581,8 @@ impl Database {
 }
 
 /// True only when an error indicates the database FILE itself is corrupt / not a database — the only
-/// conditions under which the destructive `recover_database_at` quarantine is warranted. Transient
-/// errors (SQLITE_BUSY/LOCKED, disk I/O, OOM) return false so a healthy db is never quarantined.
+/// conditions under which a forensic quarantine COPY is warranted. Transient errors
+/// (SQLITE_BUSY/LOCKED, disk I/O, OOM) return false so a healthy db is never copied or displaced.
 fn is_corruption_error(err: &AppError) -> bool {
     use rusqlite::ErrorCode;
     matches!(
@@ -1483,47 +1608,200 @@ fn integrity_result_looks_transient(result: &str) -> bool {
         || r.contains("out of memory")
 }
 
-fn recover_database_at(path: &str) -> AppResult<()> {
+fn corrupt_database_hard_stop(quarantine: &Path) -> AppError {
+    AppError::Other(format!(
+        "Database corruption was confirmed. Cortex preserved a byte-verified quarantine bundle at {} and left the original database untouched. Automatic empty-library recovery is refused; restore a validated snapshot or repair the quarantined copy before continuing.",
+        quarantine.display()
+    ))
+}
+
+/// Preserve a stable forensic copy of the complete SQLite authority without mutating the source.
+///
+/// The old implementation renamed the main file first and moved WAL/SHM best-effort. A crash or a
+/// Windows sharing violation in that gap stranded committed WAL pages beside a missing main file;
+/// SQLite then created a fresh database and discarded the orphan WAL on restart. Here every present
+/// part is copied, flushed, and hash-verified twice while the original remains in place. Staged
+/// sidecars are promoted first and the quarantine main file last, so a `*.corrupt.*` main name is a
+/// completion marker rather than evidence of a partial bundle. Startup still hard-stops afterward.
+fn recover_database_at(path: &str) -> AppResult<PathBuf> {
     let path_buf = Path::new(path);
     if !path_buf.exists() {
-        return Ok(());
+        return Err(AppError::Other(
+            "database corruption recovery lost its source before a forensic copy could be made; refusing to create an empty library"
+                .into(),
+        ));
     }
 
     let backup_path = unique_corrupt_backup_path(path_buf, chrono::Utc::now().timestamp());
-    std::fs::rename(path_buf, &backup_path)?;
-    tracing::info!("Corrupt database moved to {:?}", backup_path);
-
-    move_sqlite_sidecar(path_buf, &backup_path, "-wal");
-    move_sqlite_sidecar(path_buf, &backup_path, "-shm");
-    Ok(())
+    copy_database_bundle_with(path_buf, &backup_path, |source, destination| {
+        std::fs::copy(source, destination).map(|_| ())
+    })?;
+    tracing::error!(
+        "Corrupt database preserved without source mutation at {}; startup remains blocked",
+        backup_path.display()
+    );
+    Ok(backup_path)
 }
 
 fn unique_corrupt_backup_path(db_path: &Path, timestamp: i64) -> PathBuf {
     let base = db_path.with_extension(format!("corrupt.{timestamp}"));
-    if !base.exists() {
+    if quarantine_path_is_available(&base) {
         return base;
     }
 
     for suffix in 1..1000 {
         let candidate = db_path.with_extension(format!("corrupt.{timestamp}.{suffix}"));
-        if !candidate.exists() {
+        if quarantine_path_is_available(&candidate) {
             return candidate;
         }
     }
 
-    db_path.with_extension(format!("corrupt.{timestamp}.{}", std::process::id()))
+    loop {
+        let candidate = db_path.with_extension(format!("corrupt.{timestamp}.{}", uuid::Uuid::new_v4()));
+        if quarantine_path_is_available(&candidate) {
+            return candidate;
+        }
+    }
 }
 
-fn move_sqlite_sidecar(original_db: &Path, backup_db: &Path, suffix: &str) {
-    let original = sqlite_sidecar_path(original_db, suffix);
-    if !original.exists() {
-        return;
+fn quarantine_path_is_available(path: &Path) -> bool {
+    !path.exists() && !sqlite_sidecar_path(path, "-wal").exists() && !sqlite_sidecar_path(path, "-shm").exists()
+}
+
+fn copy_database_bundle_with(
+    source_db: &Path,
+    backup_db: &Path,
+    mut copy_file: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> AppResult<()> {
+    // Staging names intentionally do not contain `.corrupt.`. Recovery notices and snapshot pins
+    // treat that token on a main file as the completed-quarantine marker, so a crash during copy
+    // must never manufacture a false completed bundle.
+    let source_name = source_db.file_name().and_then(|name| name.to_str()).unwrap_or("cortex-speech.db");
+    let staging_db = source_db.with_file_name(format!(".{source_name}.quarantine-staging-{}", uuid::Uuid::new_v4()));
+    let _staging_guard = QuarantineStagingGuard::new(staging_db.clone());
+    let mut parts: Vec<(PathBuf, PathBuf, PathBuf, u64, [u8; 32])> = Vec::new();
+    let expected_sidecars = [
+        ("-wal", sqlite_sidecar_path(source_db, "-wal").exists()),
+        ("-shm", sqlite_sidecar_path(source_db, "-shm").exists()),
+    ];
+
+    // Copy the main file first so an injected/faulting WAL copy proves the source main was never
+    // renamed. Nothing is promoted until every present part is stable and verified.
+    for suffix in ["", "-wal", "-shm"] {
+        let source = if suffix.is_empty() { source_db.to_path_buf() } else { sqlite_sidecar_path(source_db, suffix) };
+        if !source.exists() {
+            continue;
+        }
+        let staging = if suffix.is_empty() { staging_db.clone() } else { sqlite_sidecar_path(&staging_db, suffix) };
+        let final_path =
+            if suffix.is_empty() { backup_db.to_path_buf() } else { sqlite_sidecar_path(backup_db, suffix) };
+        copy_file(&source, &staging)?;
+        std::fs::OpenOptions::new().write(true).open(&staging)?.sync_all()?;
+        let source_len = std::fs::metadata(&source)?.len();
+        let source_hash = sha256_file_bytes(&source)?;
+        if std::fs::metadata(&staging)?.len() != source_len || sha256_file_bytes(&staging)? != source_hash {
+            return Err(AppError::Other(format!(
+                "forensic quarantine copy verification failed for {}; original database bundle is unchanged",
+                source.display()
+            )));
+        }
+        parts.push((source, staging, final_path, source_len, source_hash));
+    }
+    let Some((captured_main, _, _, _, _)) = parts.first() else {
+        return Err(AppError::Other(
+            "forensic quarantine did not capture the SQLite main file; original database bundle is unchanged".into(),
+        ));
+    };
+    if captured_main != source_db {
+        return Err(AppError::Other(
+            "forensic quarantine did not capture the SQLite main file first; original database bundle is unchanged"
+                .into(),
+        ));
     }
 
-    let backup = sqlite_sidecar_path(backup_db, suffix);
-    if let Err(e) = std::fs::rename(&original, &backup) {
-        tracing::warn!("Failed to quarantine SQLite sidecar {} to {}: {e}", original.display(), backup.display());
+    // Detect a concurrent/external writer after the copies. Hashing every source again makes a mixed
+    // generation fail closed; no original path has been renamed or deleted.
+    for (source, _, _, expected_len, expected_hash) in &parts {
+        if std::fs::metadata(source)?.len() != *expected_len || sha256_file_bytes(source)? != *expected_hash {
+            return Err(AppError::Other(format!(
+                "database bundle changed while forensic quarantine was being copied ({}); original remains authoritative and startup is blocked",
+                source.display()
+            )));
+        }
     }
+    for (suffix, was_present) in expected_sidecars {
+        if sqlite_sidecar_path(source_db, suffix).exists() != was_present {
+            return Err(AppError::Other(format!(
+                "database bundle membership changed while forensic quarantine was being copied ({suffix}); original remains authoritative and startup is blocked"
+            )));
+        }
+    }
+
+    // The main quarantine name is the completion marker. Promote sidecars first, main last.
+    for (_, staging, final_path, _, _) in parts.iter().filter(|(_, _, final_path, _, _)| final_path != backup_db) {
+        std::fs::rename(staging, final_path)?;
+        crate::atomic_file::fsync_parent_dir(final_path);
+    }
+    // Close the last meaningful race before publishing the main completion marker. A supported
+    // single-owner process has no writer here, but an unexpected external SQLite writer must not
+    // silently add/remove a WAL or SHM generation while quarantine is being assembled.
+    for (suffix, was_present) in expected_sidecars {
+        if sqlite_sidecar_path(source_db, suffix).exists() != was_present {
+            return Err(AppError::Other(format!(
+                "database bundle membership changed before forensic quarantine publication ({suffix}); original remains authoritative and startup is blocked"
+            )));
+        }
+    }
+    let (_, staging_main, final_main, _, _) = &parts[0];
+    std::fs::rename(staging_main, final_main)?;
+    crate::atomic_file::fsync_parent_dir(final_main);
+    Ok(())
+}
+
+struct QuarantineStagingGuard {
+    main: PathBuf,
+}
+
+impl QuarantineStagingGuard {
+    fn new(main: PathBuf) -> Self {
+        Self { main }
+    }
+}
+
+impl Drop for QuarantineStagingGuard {
+    fn drop(&mut self) {
+        // Best-effort cleanup is safe because these UUID-named files are private staging artifacts;
+        // the source authority and any fully promoted `.corrupt.*` bundle are different paths.
+        for path in
+            [sqlite_sidecar_path(&self.main, "-shm"), sqlite_sidecar_path(&self.main, "-wal"), self.main.clone()]
+        {
+            if let Err(error) = std::fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "Could not remove incomplete quarantine staging artifact {}: {}",
+                        path.display(),
+                        error
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn sha256_file_bytes(path: &Path) -> AppResult<[u8; 32]> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(hash.finalize().into())
 }
 
 fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {

@@ -5,7 +5,10 @@ import contextlib
 import importlib.util
 import io
 import json
+import socket
 import sys
+import tempfile
+import threading
 from pathlib import Path
 
 _spec = importlib.util.spec_from_file_location(
@@ -39,6 +42,26 @@ def _identity_response(**extra):
     return value
 
 
+def _write_pointer(path: Path, *, model_id: str, deployment_sha: str) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema": 2,
+                "champions": {
+                    "omniasr-7b": {
+                        "modelVersionId": model_id,
+                        "deploymentManifestPath": "/models/deployment_manifest.json",
+                        "deploymentSha256": deployment_sha,
+                        "source": "test",
+                        "license": "test",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_health_mode_never_resolves_the_database() -> None:
     original_request = _client.request_server
     original_resolve = _client.resolve_db_path
@@ -65,6 +88,151 @@ def test_health_mode_never_resolves_the_database() -> None:
         _client.request_server = original_request
         _client.resolve_db_path = original_resolve
         sys.argv = original_argv
+
+
+def test_health_mode_is_bound_to_the_exact_current_pointer() -> None:
+    """A structurally valid stale champion must never produce a READY marker."""
+    original_request = _client.request_server
+    original_argv = sys.argv
+    try:
+        with tempfile.TemporaryDirectory() as name:
+            pointer = Path(name) / "champion.json"
+            _write_pointer(
+                pointer,
+                model_id="omniasr-7b-current@abcdef",
+                deployment_sha="a" * 64,
+            )
+            _client.request_server = lambda request, timeout: _identity_response(
+                modelVersionId="omniasr-7b-stale@012345",
+                deploymentSha256="b" * 64,
+            )
+            sys.argv = [
+                "cortex_7b_client.py",
+                "--health",
+                "--expected-pointer",
+                str(pointer),
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    _client.main()
+            except SystemExit as exc:
+                assert exc.code == _client.EX_SERVER
+            else:
+                raise AssertionError("stale valid champion was accepted as current")
+            assert "__HEALTH__=" not in stdout.getvalue()
+            assert "does not match the current champion pointer" in stderr.getvalue()
+
+            matching = _identity_response(
+                modelVersionId="omniasr-7b-current@abcdef",
+                deploymentSha256="a" * 64,
+            )
+            _client.request_server = lambda request, timeout: matching
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                _client.main()
+            assert json.loads(stdout.getvalue().strip().removeprefix("__HEALTH__=")) == matching
+    finally:
+        _client.request_server = original_request
+        sys.argv = original_argv
+
+
+def test_well_formed_stale_loopback_listener_cannot_claim_ready() -> None:
+    """Exercise the former false-READY path through a real bounded TCP exchange."""
+    original_host = _client.HOST
+    original_port = _client.PORT
+    original_argv = sys.argv
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    server_error = []
+
+    def serve_stale_identity() -> None:
+        try:
+            connection, _address = listener.accept()
+            with connection:
+                request = bytearray()
+                while b"\n" not in request:
+                    chunk = connection.recv(4096)
+                    if not chunk:
+                        break
+                    request.extend(chunk)
+                assert json.loads(bytes(request).decode("utf-8")) == {"op": "health"}
+                stale = _identity_response(
+                    modelVersionId="omniasr-7b-stale@012345",
+                    deploymentSha256="b" * 64,
+                )
+                connection.sendall((json.dumps(stale) + "\n").encode("utf-8"))
+        except Exception as exc:  # surfaced in the main test thread below
+            server_error.append(exc)
+
+    worker = threading.Thread(target=serve_stale_identity, daemon=True)
+    worker.start()
+    try:
+        with tempfile.TemporaryDirectory() as name:
+            pointer = Path(name) / "champion.json"
+            _write_pointer(
+                pointer,
+                model_id="omniasr-7b-current@abcdef",
+                deployment_sha="a" * 64,
+            )
+            _client.HOST = "127.0.0.1"
+            _client.PORT = port
+            sys.argv = [
+                "cortex_7b_client.py",
+                "--health",
+                "--expected-pointer",
+                str(pointer),
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    _client.main()
+            except SystemExit as exc:
+                assert exc.code == _client.EX_SERVER
+            else:
+                raise AssertionError("stale loopback listener produced READY")
+            assert "__HEALTH__=" not in stdout.getvalue()
+            assert "does not match the current champion pointer" in stderr.getvalue()
+    finally:
+        listener.close()
+        worker.join(timeout=2)
+        _client.HOST = original_host
+        _client.PORT = original_port
+        sys.argv = original_argv
+    assert not worker.is_alive(), "fake loopback listener did not terminate"
+    assert not server_error, server_error
+
+
+def test_expected_pointer_is_bounded_and_duplicate_key_safe() -> None:
+    with tempfile.TemporaryDirectory() as name:
+        pointer = Path(name) / "champion.json"
+        _write_pointer(
+            pointer,
+            model_id="model",
+            deployment_sha="a" * 64,
+        )
+        ambiguous = pointer.read_text(encoding="utf-8").replace(
+            '"schema": 2', '"schema": 2, "schema": 2', 1
+        )
+        pointer.write_text(ambiguous, encoding="utf-8")
+        try:
+            _client.load_expected_champion_identity(pointer)
+        except ValueError as exc:
+            assert "duplicate JSON key" in str(exc)
+        else:
+            raise AssertionError("ambiguous champion pointer was accepted")
+
+        pointer.write_bytes(b"x" * (_client.MAX_POINTER_BYTES + 1))
+        try:
+            _client.load_expected_champion_identity(pointer)
+        except ValueError as exc:
+            assert "no larger than" in str(exc)
+        else:
+            raise AssertionError("oversized champion pointer was accepted")
 
 
 def test_result_marker_persists_exact_served_identity() -> None:
@@ -121,6 +289,9 @@ def test_busy_replica_is_retried_until_an_identity_bound_reply_arrives() -> None
 
 if __name__ == "__main__":
     test_health_mode_never_resolves_the_database()
+    test_health_mode_is_bound_to_the_exact_current_pointer()
+    test_well_formed_stale_loopback_listener_cannot_claim_ready()
+    test_expected_pointer_is_bounded_and_duplicate_key_safe()
     test_result_marker_persists_exact_served_identity()
     test_missing_or_partial_identity_is_rejected()
     test_busy_replica_is_retried_until_an_identity_bound_reply_arrives()

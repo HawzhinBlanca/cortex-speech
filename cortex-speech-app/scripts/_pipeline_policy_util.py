@@ -8,7 +8,7 @@ def pipeline_surface(src_root: Path) -> str:
     root = src_root / "pipeline.rs"
     module_dir = src_root / "pipeline"
     root_text = root.read_text(encoding="utf-8")
-    for declaration in ("mod import_flow;", "mod transcription;"):
+    for declaration in ("mod import_flow;", "mod source_reference;", "mod transcription;"):
         if declaration not in root_text:
             raise AssertionError(f"pipeline composition root lost `{declaration}`")
     modules = sorted(module_dir.rglob("*.rs")) if module_dir.is_dir() else []

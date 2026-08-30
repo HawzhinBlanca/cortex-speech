@@ -34,6 +34,27 @@ pub enum AppError {
     Other(String),
 }
 
+impl AppError {
+    /// Classify retryable SQLite writer contention without leaking database-backend types into
+    /// command handlers. The text fallback preserves classification for errors that crossed an
+    /// older string-only boundary before becoming an `AppError`.
+    pub(crate) fn is_database_busy(&self) -> bool {
+        if matches!(
+            self,
+            Self::Database(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        ) {
+            return true;
+        }
+
+        let normalized = self.to_string().to_ascii_lowercase();
+        normalized.contains("database is locked") || normalized.contains("database is busy")
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum AudioError {
     #[error("Unsupported codec: {0}")]
@@ -86,3 +107,19 @@ impl serde::Serialize for AppError {
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::AppError;
+
+    #[test]
+    fn database_busy_classification_handles_structured_and_legacy_errors() {
+        for result_code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let structured =
+                AppError::Database(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(result_code), None));
+            assert!(structured.is_database_busy());
+        }
+        assert!(AppError::Other("database is locked by another writer".into()).is_database_busy());
+        assert!(!AppError::Other("database file is corrupt".into()).is_database_busy());
+    }
+}

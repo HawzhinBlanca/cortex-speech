@@ -29,6 +29,11 @@ export const commands = {
 	 */
 	markSegmentUnusableV1: (request: MarkSegmentUnusableRequestV1) => typedError<MarkedSegmentUnusableV1, CommandErrorV1>(__TAURI_INVOKE("mark_segment_unusable_v1", { request })),
 	/**
+	 *  Compare-and-swap generic owner review flag. The exact renderer-observed revision is part of the
+	 *  idempotency payload, so stale UI state cannot flag a newer clip state.
+	 */
+	recordReviewFlag: (request: RecordReviewFlagRequestV1) => typedError<RecordedReviewFlagV1, CommandErrorV1>(__TAURI_INVOKE("record_review_flag", { request })),
+	/**
 	 *  Start a policy-4 desktop playback attempt bound to one live media grant and the current immutable
 	 *  clip identity.  The server creates the receipt capability before the media element can play; the
 	 *  capability alone never authorizes a decision.
@@ -56,7 +61,11 @@ export const commands = {
 	text: string,
 	updatedAt: string,
 } | null, CommandErrorV1>(__TAURI_INVOKE("get_review_draft_v1", { segmentId })),
-	// Reserve the exact next draft mutation before starting a possibly slow native write.
+	/**
+	 *  Reserve the exact next draft mutation before starting a possibly slow native write. A later
+	 *  reservation fences an older invocation whose renderer response timed out or whose surface was
+	 *  replaced, while a write already at its commit point completes before this reservation returns.
+	 */
 	reserveReviewDraftWriteV1: (segmentId: string, operationId: string) => typedError<null, CommandErrorV1>(__TAURI_INVOKE("reserve_review_draft_write_v1", { segmentId, operationId })),
 	/**
 	 *  Durably replace one clip's desktop draft. The server owns the timestamp; the renderer supplies
@@ -68,6 +77,18 @@ export const commands = {
 	 *  saved against a newer server state.
 	 */
 	deleteReviewDraftV1: (segmentId: string, baseRevision: number, operationId: string) => typedError<boolean, CommandErrorV1>(__TAURI_INVOKE("delete_review_draft_v1", { segmentId, baseRevision, operationId })),
+	/**
+	 *  Discover the globally latest database-proven active desktop decision or flag. The tagged target
+	 *  is restore-generation-bound and carries only server-derived immutable authority, so Backspace
+	 *  cannot cross-route colliding decision/flag effect ids after restart.
+	 */
+	getDesktopReviewUndoTargetV1: () => typedError<DesktopReviewUndoAvailabilityV1, CommandErrorV1>(__TAURI_INVOKE("get_desktop_review_undo_target_v1")),
+	/**
+	 *  Reverse one server-owned desktop decision or flag snapshot with a stable idempotency UUID. The
+	 *  renderer supplies only the tagged immutable target; it cannot provide or overwrite restored row
+	 *  truth or private technical-flag rationale.
+	 */
+	undoDesktopReviewActionV1: (request: UndoDesktopReviewRequestV1) => typedError<DesktopReviewUndoOutcomeV1, CommandErrorV1>(__TAURI_INVOKE("undo_desktop_review_action_v1", { request })),
 	/**
 	 *  Read one authoritative settings snapshot and its opaque compare-and-swap revision atomically.
 	 *  API-key values and private app-owned paths are absent from the generated renderer contract.
@@ -190,6 +211,18 @@ export const commands = {
 	 *  rather than guess a path.
 	 */
 	startChampionEngine: () => typedError<null, CommandErrorV1>(__TAURI_INVOKE("start_champion_engine")),
+	listAgentImportReports: (limit: number | null) => typedError<AgentImportReportV1[], CommandErrorV1>(__TAURI_INVOKE("list_agent_import_reports", { limit })),
+	getAgentImportReportByRunId: (runId: string) => typedError<{
+	id: string,
+	agentRunId: string | null,
+	source: AgentImportSourceV1,
+	status: AgentStageStatusV1,
+	summary: AgentImportSummaryV1,
+	errorCode: AgentImportErrorCodeV1 | null,
+	createdAt: string,
+} | null, CommandErrorV1>(__TAURI_INVOKE("get_agent_import_report_by_run_id", { runId })),
+	listAgentStageEvents: (runId: string | null, limit: number | null) => typedError<AgentStageEventV1[], CommandErrorV1>(__TAURI_INVOKE("list_agent_stage_events", { runId, limit })),
+	checkAgenticReadiness: () => typedError<AgenticReadinessV1, CommandErrorV1>(__TAURI_INVOKE("check_agentic_readiness")),
 	// The model registry, newest-first within each family — what a registry panel lists.
 	listModelVersions: () => typedError<ModelVersionSummaryV1[], CommandErrorV1>(__TAURI_INVOKE("list_model_versions")),
 	/**
@@ -246,6 +279,84 @@ export const commands = {
 	acknowledgeQuarantine: () => typedError<number, CommandErrorV1>(__TAURI_INVOKE("acknowledge_quarantine")),
 	listDbSnapshots: () => typedError<SnapshotInfoV1[], CommandErrorV1>(__TAURI_INVOKE("list_db_snapshots")),
 	restoreDbFromSnapshot: (name: string) => typedError<null, CommandErrorV1>(__TAURI_INVOKE("restore_db_from_snapshot", { name })),
+	openAudioFile: () => typedError<string | null, CommandErrorV1>(__TAURI_INVOKE("open_audio_file")),
+	importDirectory: (runId: string) => typedError<DirectoryImportStartedV1, CommandErrorV1>(__TAURI_INVOKE("import_directory", { runId })),
+	importAudioFile: (path: string, runId: string) => typedError<FileImportStartedV1, CommandErrorV1>(__TAURI_INVOKE("import_audio_file", { path, runId })),
+	transcribeSegment: (segmentId: string | null, audioPath: string, alignmentJson: string | null) => typedError<TranscribedSegmentV1, CommandErrorV1>(__TAURI_INVOKE("transcribe_segment", { segmentId, audioPath, alignmentJson })),
+	alignSegment: (audioPath: string, text: string, alignmentJson: string | null, segmentId: string | null) => typedError<WordTimestampV1[], CommandErrorV1>(__TAURI_INVOKE("align_segment", { audioPath, text, alignmentJson, segmentId })),
+	/**
+	 *  Offline best-of-N consensus DRAFT for a segment: an ability-weighted vote over its ASR hypotheses
+	 *  (no cloud) so review can start from a transcript better than any single model and highlight exactly
+	 *  where the models disagreed. Empty when the segment has no hypotheses to vote over.
+	 */
+	getSegmentConsensus: (segmentId: string) => typedError<SegmentConsensusV1, CommandErrorV1>(__TAURI_INVOKE("get_segment_consensus", { segmentId })),
+	getWaveform: (path: string, numPoints: number, alignmentJson: string | null) => typedError<number[], CommandErrorV1>(__TAURI_INVOKE("get_waveform", { path, numPoints, alignmentJson })),
+	exportDataset: (path: string, format: string) => typedError<null, CommandErrorV1>(__TAURI_INVOKE("export_dataset", { path, format })),
+	/**
+	 *  Export a plain, human-facing transcript / subtitle file (txt | srt | vtt) from the library —
+	 *  distinct from the ML dataset export. Path is validated the same way; unknown formats fall to txt.
+	 */
+	exportTranscript: (path: string, format: string) => typedError<null, CommandErrorV1>(__TAURI_INVOKE("export_transcript", { path, format })),
+	// P3.3: report which distinct source audio files are missing on disk (moved/renamed/deleted).
+	getAudioHealth: () => typedError<AudioHealth, CommandErrorV1>(__TAURI_INVOKE("get_audio_health")),
+	// P3.3: relink missing source audio by basename against a folder the owner picks.
+	relinkAudio: (searchDir: string) => typedError<RelinkResult, CommandErrorV1>(__TAURI_INVOKE("relink_audio", { searchDir })),
+	validateDatasetCmd: () => typedError<ValidationReport, CommandErrorV1>(__TAURI_INVOKE("validate_dataset_cmd")),
+	exportAudio: (segmentIds: string[], options: AudioExportOptionsV1) => typedError<AudioExportResultV1, CommandErrorV1>(__TAURI_INVOKE("export_audio", { segmentIds, options })),
+	mergeDatasetJson: (jsonContent: string) => typedError<MergeDatasetResultV1, CommandErrorV1>(__TAURI_INVOKE("merge_dataset_json", { jsonContent })),
+	exportHuggingfaceDataset: (path: string) => typedError<null, CommandErrorV1>(__TAURI_INVOKE("export_huggingface_dataset", { path })),
+	/**
+	 *  Turn the human-corrected segments of one source file into a holdout GOLD benchmark entry. Run it
+	 *  after correcting a file in the Review inbox: it concatenates the corrected transcripts into the
+	 *  gold reference (excluded from all training). Returns the number of gold rows created.
+	 */
+	createGoldFromFile: (audioPath: string) => typedError<number, CommandErrorV1>(__TAURI_INVOKE("create_gold_from_file", { audioPath })),
+	// M2.7 / P1.6: bulk-promote every reviewed source file into the gold set. Returns rows created.
+	importVerifiedSegmentsAsGold: () => typedError<number, CommandErrorV1>(__TAURI_INVOKE("import_verified_segments_as_gold")),
+	/**
+	 *  M2.7 / P1.6: export the gold set as a portable eval set (manifest.jsonl + 16 kHz WAV clips) under
+	 *  `out_dir`. Returns the export summary (counts + manifest path).
+	 */
+	exportGoldEvalSet: (outDir: string) => typedError<GoldEvalExport, CommandErrorV1>(__TAURI_INVOKE("export_gold_eval_set", { outDir })),
+	/**
+	 *  M5.1 / P5.1: export a fine-tune training pack (trainer manifest + 16 kHz clips) from human-verified
+	 *  segments under `out_dir`, EXCLUDING holdout gold (the leak guard). Returns the pack summary.
+	 */
+	exportFinetunePack: (outDir: string) => typedError<FinetunePackResult, CommandErrorV1>(__TAURI_INVOKE("export_finetune_pack", { outDir })),
+	/**
+	 *  Build a reproducible accuracy scorecard from already-computed gold-eval results:
+	 *  micro WER/CER with bootstrap confidence intervals, plus an optional MAPSSWE
+	 *  significance comparison against a baseline run. Pure and deterministic.
+	 */
+	buildScorecard: (system: EvalRunResultV1, baseline: {
+	run: EvalRunV1,
+	segments: EvalSegmentResultV1[],
+} | null) => typedError<ScorecardResponse, CommandErrorV1>(__TAURI_INVOKE("build_scorecard", { system, baseline })),
+	computeSignalAnomalyScores: () => typedError<number, CommandErrorV1>(__TAURI_INVOKE("compute_signal_anomaly_scores")),
+	getActiveLearningQueue: (targetError: number, confidenceLevel: number, limit: number) => typedError<SpeechSegment[], CommandErrorV1>(__TAURI_INVOKE("get_active_learning_queue", { targetError, confidenceLevel, limit })),
+	getEscalationQueue: (limit: number) => typedError<SpeechSegment[], CommandErrorV1>(__TAURI_INVOKE("get_escalation_queue", { limit })),
+	getEscalationRateTrend: () => typedError<EscalationTrendPointV1[], CommandErrorV1>(__TAURI_INVOKE("get_escalation_rate_trend")),
+	/**
+	 *  Intelligence read-side: LOOP-0 shadow precision (the C5 go-live evidence) + auto-accept
+	 *  precision (C4) joined against subsequent human decisions.
+	 */
+	getIntelligenceReport: () => typedError<IntelligenceReportV1, CommandErrorV1>(__TAURI_INVOKE("get_intelligence_report")),
+	listEvalRuns: () => typedError<EvalRunV1[], CommandErrorV1>(__TAURI_INVOKE("list_eval_runs")),
+	/**
+	 *  Closed-loop gold eval: runs the exact registered WSL7B champion over gold audio and scores the
+	 *  produced hypotheses. The renderer supplies neither text nor a model label.
+	 */
+	runGoldEvalAsr: () => typedError<EvalRunResultV1, CommandErrorV1>(__TAURI_INVOKE("run_gold_eval_asr")),
+	runJuryPipeline: (segmentIds: string[]) => typedError<JuryPipelineReportV1, CommandErrorV1>(__TAURI_INVOKE("run_jury_pipeline", { segmentIds })),
+	/**
+	 *  `run_t2_for_segment` — run Gemini audio judge on a single segment directly.
+	 *
+	 *  Useful for re-running T2 from the Review Inbox or a manual trigger without
+	 *  going through the full pipeline again.
+	 */
+	runT2ForSegment: (segmentId: string, apiKey: string) => typedError<T2ResultV1, CommandErrorV1>(__TAURI_INVOKE("run_t2_for_segment", { segmentId, apiKey })),
+	runWslRefinement: (limitFiles: number | null, limitSegments: number | null, dryRun: boolean, testOne: boolean) => typedError<WslRefinementStartedV1, CommandErrorV1>(__TAURI_INVOKE("run_wsl_refinement", { limitFiles, limitSegments, dryRun, testOne })),
+	rediarizeSegments: (ids: string[]) => typedError<number, CommandErrorV1>(__TAURI_INVOKE("rediarize_segments", { ids })),
 	/**
 	 *  P3.2: the crashed directory import to resume, if any. Query at STARTUP — when no import is active,
 	 *  a still-'running' job is a crash.
@@ -256,6 +367,35 @@ export const commands = {
 	completedCount: number,
 	createdAt: string,
 } | null, CommandErrorV1>(__TAURI_INVOKE("get_interrupted_import")),
+	getImportRunStatus: (runId: string) => typedError<ImportRunStatusResponseV1, CommandErrorV1>(__TAURI_INVOKE("get_import_run_status", { runId })),
+	getBatchRunStatus: (operationId: string) => typedError<BatchRunStatusResponseV1, CommandErrorV1>(__TAURI_INVOKE("get_batch_run_status", { operationId })),
+	/**
+	 *  The sole durable operation eligible for renderer remount adoption. This includes a just-settled
+	 *  process-local run until the renderer explicitly acknowledges presenting its exact durable
+	 *  outcome, closing the terminalization-between-discovery-calls race without replaying old results
+	 *  after a full process restart.
+	 */
+	getActiveBatchRun: () => typedError<{
+	operationId: string,
+	operation: BatchOperationV1 | null,
+	status: BatchRunStatusV1,
+	// Exact durable request cardinality. Unknown/pre-admission identities have no trusted total.
+	total: number | null,
+	outcome: BatchRunOutcomeV1 | null,
+} | null, CommandErrorV1>(__TAURI_INVOKE("get_active_batch_run")),
+	/**
+	 *  Acknowledge only an exact terminal result that this process retained for renderer recovery. The
+	 *  call is idempotent, and a lost response leaves the result eligible for safe replay.
+	 */
+	acknowledgeBatchRun: (operationId: string) => typedError<boolean, CommandErrorV1>(__TAURI_INVOKE("acknowledge_batch_run", { operationId })),
+	/**
+	 *  Start one exact-champion batch whose immutable request, before images, item outcomes, canonical
+	 *  writes and undo authority all share the schema-68 journal. Inference is deliberately sequential
+	 *  for the owner workstation: correctness, deterministic hard-stop behavior and bounded pressure
+	 *  outrank speculative provider fan-out.
+	 */
+	batchTranscribe: (ids: string[], operationId: string) => typedError<BatchStartedV1, CommandErrorV1>(__TAURI_INVOKE("batch_transcribe", { ids, operationId })),
+	batchNormalize: (ids: string[], operationId: string) => typedError<BatchStartedV1, CommandErrorV1>(__TAURI_INVOKE("batch_normalize", { ids, operationId })),
 	// P3.2: discard an interrupted import job (the user chose not to resume).
 	discardInterruptedImport: (jobId: string) => typedError<null, CommandErrorV1>(__TAURI_INVOKE("discard_interrupted_import", { jobId })),
 	/**
@@ -263,7 +403,7 @@ export const commands = {
 	 *  in the crashed run (their segments persisted per-file). Retires the old crashed job so it is not
 	 *  offered again; the fresh import job now tracks progress.
 	 */
-	resumeInterruptedImport: (jobId: string) => typedError<ImportResumeV1, CommandErrorV1>(__TAURI_INVOKE("resume_interrupted_import", { jobId })),
+	resumeInterruptedImport: (jobId: string, runId: string) => typedError<ImportResumeV1, CommandErrorV1>(__TAURI_INVOKE("resume_interrupted_import", { jobId, runId })),
 };
 
 /* Types */
@@ -275,6 +415,182 @@ export const commands = {
 export type ActiveVoiceFocusV1 = {
 	focusId: string,
 	segmentCount: number,
+};
+
+export type AgentHypothesisCoverageBlockerV1 = {
+	segmentId: string,
+	grade: string,
+	trainingReady: boolean,
+	coverage: AgentHypothesisCoverageV1,
+};
+
+/**
+ *  Only aggregate coverage evidence is public. Raw model strings in a corrupt/legacy report cannot
+ *  become an accidental diagnostic side channel through the blocker panel.
+ */
+export type AgentHypothesisCoverageV1 = {
+	minimumNonEmptyModelCount: number,
+	nonEmptyModelCount: number,
+	passesMinimum: boolean,
+};
+
+export type AgentImportErrorCodeV1 = "IMPORT_REPORT_FAILED";
+
+// The renderer never receives `audio_paths`, the jury JSON, or a free-form persisted error.
+export type AgentImportReportV1 = {
+	id: string,
+	agentRunId: string | null,
+	source: AgentImportSourceV1,
+	status: AgentStageStatusV1,
+	summary: AgentImportSummaryV1,
+	errorCode: AgentImportErrorCodeV1 | null,
+	createdAt: string,
+};
+
+export type AgentImportSourceV1 = "file" | "directory" | "unknown";
+
+export type AgentImportSummaryV1 = {
+	totalSegments: number,
+	agenticReadiness: AgenticReadinessV1 | null,
+	sourceReferences: AgentSourceReferenceV1[],
+	sourceReferenceCount: number,
+	sourceReferenceRequired: boolean,
+	requiredSourceReferenceModels: string[],
+	requiredSourceReferenceModelCount: number,
+	sourceReferenceModels: string[],
+	sourceReferenceModelCount: number,
+	sourceReferenceCoverage: AgentSourceReferenceCoverageV1[],
+	sourceReferenceCoverageCount: number,
+	longFileDossiers: AgentLongFileDossierV1[],
+	longFileDossierCount: number,
+	hypothesisModels: string[],
+	hypothesisModelCount: number,
+	hypothesisModelCounts: { [key in string]: number },
+	hypothesisModelKindCount: number,
+	verdictCounts: { [key in string]: number },
+	verdictKindCount: number,
+	escalatedSegments: string[],
+	escalatedSegmentCount: number,
+	trainingGradeSummary: TrainingGradeSummary,
+	trainingGradeReasonCounts: { [key in string]: number },
+	trainingGradeReasonKindCount: number,
+	hypothesisCoverageBlockers: AgentHypothesisCoverageBlockerV1[],
+	hypothesisCoverageBlockerCount: number,
+	orchestrationStages: AgentOrchestrationStageV1[],
+	orchestrationStageCount: number,
+};
+
+export type AgentLongFileDossierV1 = {
+	audioFileLabel: string,
+	chunkCount: number,
+	totalDurationMs: number,
+	sourceReferences: AgentSourceReferenceV1[],
+	sourceReferenceCount: number,
+	sourceReferenceCoverage: AgentSourceReferenceCoverageV1,
+	hypothesisModelCounts: { [key in string]: number },
+	hypothesisModelKindCount: number,
+	verdictCounts: { [key in string]: number },
+	verdictKindCount: number,
+	trainingReadySegments: number,
+	escalatedSegments: string[],
+	escalatedSegmentCount: number,
+	promotionStatus: AgentStageStatusV1,
+	promotionBlockerCodes: AgentPromotionBlockerCodeV1[],
+	promotionBlockerCount: number,
+};
+
+/**
+ *  A public orchestration row contains only closed codes and a count. Backend-authored summaries
+ *  and blocker strings can include paths, segment diagnostics, or database errors and stay native.
+ */
+export type AgentOrchestrationStageV1 = {
+	stage: AgentStageCodeV1,
+	status: AgentStageStatusV1,
+	detailCode: AgentStageDetailCodeV1,
+	blockerCount: number,
+};
+
+export type AgentPromotionBlockerCodeV1 = "no_speech_chunks" | "source_reference_incomplete" | "missing_source_reference_models" | "missing_hypothesis_coverage" | "no_training_ready_segments" | "unknown";
+
+export type AgentReadinessCheckCodeV1 = "source_reference" | "primary_asr" | "hypothesis_coverage" | "readiness_snapshot" | "unknown";
+
+export type AgentReadinessCheckV1 = {
+	code: AgentReadinessCheckCodeV1,
+	status: AgentStageStatusV1,
+};
+
+export type AgentSourceReferenceCoverageV1 = {
+	audioFileLabel: string,
+	requiredModels: string[],
+	requiredModelCount: number,
+	presentModels: string[],
+	presentModelCount: number,
+	missingModels: string[],
+	missingModelCount: number,
+	complete: boolean,
+};
+
+export type AgentSourceReferenceV1 = {
+	audioFileLabel: string,
+	modelId: string,
+	audioContentHash: string | null,
+	audioSizeBytes: number | null,
+	transcriptFileLabel: string,
+	textChars: number,
+};
+
+/**
+ *  Closed stage identities used by both live import events and persisted import history. Unknown
+ *  legacy/database values remain visible as `unknown`, but their raw text never crosses into the
+ *  renderer.
+ */
+export type AgentStageCodeV1 = "source_reference" | "audio_chunking" | "multi_model_hypotheses" | "jury_adjudication" | "agent_report" | "dataset_promotion" | "unknown";
+
+/**
+ *  A localization key, not backend-authored prose. It deliberately mirrors the closed status set:
+ *  the stage code and progress counters provide all additional public context the UI needs.
+ */
+export type AgentStageDetailCodeV1 = "running" | "completed" | "ready" | "blocked" | "needs_review" | "not_required" | "skipped" | "failed" | "degraded" | "unprocessed" | "unknown";
+
+export type AgentStageEventV1 = {
+	id: number,
+	runId: string,
+	source: AgentImportSourceV1,
+	stage: AgentStageCodeV1,
+	status: AgentStageStatusV1,
+	fileLabel: string,
+	detailCode: AgentStageDetailCodeV1,
+	current: number,
+	total: number,
+	createdAt: string,
+};
+
+/**
+ *  Renderer-safe live stage event. Private `detail` remains in native logs / the durable database;
+ *  the webview gets a closed code and a basename-only file label.
+ */
+export type AgentStageProgressV1 = {
+	runId: string,
+	stage: AgentStageCodeV1,
+	status: AgentStageStatusV1,
+	fileLabel: string,
+	detailCode: AgentStageDetailCodeV1,
+	current: number,
+	total: number,
+};
+
+export type AgentStageStatusV1 = "running" | "completed" | "ready" | "blocked" | "needs_review" | "not_required" | "skipped" | "failed" | "degraded" | "unprocessed" | "unknown";
+
+export type AgenticReadinessV1 = {
+	status: AgentStageStatusV1,
+	ready: boolean,
+	sourceReferenceModels: string[],
+	sourceReferenceModelCount: number,
+	availableHypothesisModels: string[],
+	availableHypothesisModelCount: number,
+	requiredHypothesisModels: number,
+	checks: AgentReadinessCheckV1[],
+	checkCount: number,
 };
 
 /**
@@ -312,9 +628,96 @@ export type AssignedSpeakersV1 = {
 	unchangedCount: number,
 };
 
+export type AudioExportFormatV1 = "Wav" | "Flac";
+
+export type AudioExportOptionsV1 = {
+	output_dir: string,
+	format: AudioExportFormatV1,
+	sample_rate: number,
+	include_metadata: boolean,
+};
+
+export type AudioExportResultV1 = {
+	total: number,
+	succeeded: number,
+	failed: number,
+	output_dir: string,
+	files: string[],
+	errors: string[],
+};
+
+// P3.3: which distinct source audio files are missing on disk.
+export type AudioHealth = {
+	totalFiles: number,
+	missingFiles: number,
+	missingPaths: string[],
+};
+
+export type AutoAcceptPrecisionV1 = {
+	t0Accepts: number,
+	t1Escalations: number,
+	t0HumanConfirmed: number,
+	t0HumanContradicted: number,
+};
+
 export type BackupVerificationV1 = {
 	integrityOk: boolean,
 	segmentCount: number,
+};
+
+export type BaselineComparisonV1 = {
+	baselineModelId: string,
+	pairedSegments: number,
+	baselineMicroWer: number,
+	systemMicroWer: number,
+	baselineMicroCer: number,
+	systemMicroCer: number,
+	mapsswePValue: number,
+	significantAt05: boolean,
+	beatsBaseline: boolean,
+	sliceRegressions: string[],
+	evaluatedSlices: number,
+};
+
+/**
+ *  Public identity for the two long-running local batch domains. The operation is included in
+ *  status responses and every event so a delayed normalization notification can never settle a
+ *  transcription run (or vice versa).
+ */
+export type BatchOperationV1 = "transcribe" | "normalize";
+
+export type BatchRunDispositionV1 = "completed" | "halted" | "cancelled" | "panicked";
+
+export type BatchRunOutcomeV1 = {
+	disposition: BatchRunDispositionV1,
+	total: number,
+	succeeded: number,
+	failed: number,
+	skipped: number,
+	abandoned: number,
+	cancelled: boolean,
+	errorCode: string | null,
+};
+
+export type BatchRunStatusResponseV1 = {
+	operationId: string,
+	operation: BatchOperationV1 | null,
+	status: BatchRunStatusV1,
+	// Exact durable request cardinality. Unknown/pre-admission identities have no trusted total.
+	total: number | null,
+	outcome: BatchRunOutcomeV1 | null,
+};
+
+export type BatchRunStatusV1 =
+// Exact process-local identity is in cancellable preflight; no durable journal exists yet.
+"starting" | "running" | "settled" | "rejected" | "unknown";
+
+export type BatchStartStatusV1 = "started";
+
+export type BatchStartedV1 = {
+	status: BatchStartStatusV1,
+	operationId: string,
+	operation: BatchOperationV1,
 };
 
 // Consent remains an explicit privacy transaction instead of an ordinary preference field.
@@ -349,6 +752,26 @@ export type CommittedReviewV1 = {
 	decisionId: string,
 };
 
+export type ConfidenceIntervalV1 = {
+	point: number,
+	lower: number,
+	upper: number,
+	confidence: number,
+};
+
+export type ConformalCalibrationBucketV1 = {
+	bucket: string,
+	verifiedWithReference: number,
+	minNeededAtZeroCer: number,
+};
+
+export type ConformalCalibrationProgressV1 = {
+	targetErrorCer: number,
+	perBucketDelta: number,
+	minNeededAtZeroCer: number,
+	buckets: ConformalCalibrationBucketV1[],
+};
+
 export type ConformalCertificate = {
 	targetError: number,
 	confidenceLevel: number,
@@ -376,6 +799,14 @@ export type ConformalCertificate = {
 	 *  every one from a cloud engine that returns no confidence — is advice that cannot work.
 	 */
 	calibrationNoConfidence: number,
+};
+
+export type ConsensusWordV1 = {
+	text: string,
+	agreement: number,
+	modelsAgreeing: number,
+	totalModels: number,
+	alternatives: string[],
 };
 
 export type DatasetQuality = {
@@ -433,6 +864,13 @@ export type DeletedSegmentsV1 = {
 	deletedCount: number,
 };
 
+/**
+ *  The one active desktop review action the database can still reverse exactly after a renderer or
+ *  application restart. Effect ids are table-local, so every authority and outcome carries its
+ *  closed action kind as well as its immutable payload identity.
+ */
+export type DesktopHumanDecisionV1 = "accept" | "edit" | "reject";
+
 export type DesktopPlaybackReceiptV1 = {
 	playbackReceiptId: string,
 	segmentId: string,
@@ -450,6 +888,18 @@ export type DesktopPlaybackSessionV1 = {
 	expiresAtMs: number,
 };
 
+export type DesktopReviewFlagKindV1 = { kind: "generic" } | { kind: "technicalUnusable"; reason: TechnicalUnusableReasonV1 };
+
+export type DesktopReviewUndoAvailabilityV1 = { status: "available"; target: DesktopReviewUndoTargetV1 } | { status: "none" } | { status: "blocked"; reason: DesktopReviewUndoBlockReasonV1 };
+
+export type DesktopReviewUndoBlockReasonV1 = "legacyHistory" | "latestDecisionUndone" | "latestFlagUndone" | "decisionShadowed" | "flagShadowed";
+
+export type DesktopReviewUndoEffectKindV1 = "decision" | "flag";
+
+export type DesktopReviewUndoOutcomeV1 = { status: "applied"; effectKind: DesktopReviewUndoEffectKindV1; effectEventId: number; restoredRevision: number; segment: SpeechSegment } | { status: "alreadyApplied"; effectKind: DesktopReviewUndoEffectKindV1; effectEventId: number } | { status: "conflict"; effectKind: DesktopReviewUndoEffectKindV1; effectEventId: number };
+
+export type DesktopReviewUndoTargetV1 = { kind: "decision"; effectEventId: number; segmentId: string; decision: DesktopHumanDecisionV1; sourceOperationId: string; sourcePayloadHash: string; databaseGeneration: number } | { kind: "flag"; effectEventId: number; segmentId: string; sourceOperationId: string; sourcePayloadHash: string; priorRevision: number; flagRevision: number; flagKind: DesktopReviewFlagKindV1; databaseGeneration: number };
+
 export type DiffChange = {
 	op: DiffOp,
 	value: string,
@@ -463,6 +913,11 @@ export type DiffStats = {
 	changed_words: number,
 	unchanged_words: number,
 	similarity: number,
+};
+
+export type DirectoryImportStartedV1 = {
+	status: ImportStartStatusV1,
+	runId: string,
 };
 
 export type DuplicateGroup = {
@@ -497,12 +952,94 @@ export type EngineStatusV1 = {
 	reason: string | null,
 };
 
+export type EscalationTrendPointV1 = {
+	date: string,
+	escalationRate: number,
+	total: number,
+	escalated: number,
+};
+
+export type EvalRunResultV1 = {
+	run: EvalRunV1,
+	segments: EvalSegmentResultV1[],
+};
+
+export type EvalRunV1 = {
+	id: string,
+	modelId: string,
+	runAt: string,
+	numSegs: number,
+	wer: number,
+	cer: number,
+	metaJson: string | null,
+};
+
+export type EvalSegmentResultV1 = {
+	goldId: string,
+	audioPath: string,
+	reference: string,
+	hypothesis: string,
+	wer: number,
+	cer: number,
+};
+
+export type FileImportStartedV1 = {
+	status: ImportStartStatusV1,
+	source: ImportSourceV1,
+	runId: string,
+};
+
+// Summary of an `export_finetune_pack` run.
+export type FinetunePackResult = {
+	manifestPath: string,
+	// P5.5: pins the exact rows this pack contains — the corpus-ledger key a champion traces back to.
+	manifestSha256: string,
+	totalVerified: number,
+	// Verified segments dropped because their audio is a HOLDOUT gold clip (the eval-set leak guard).
+	excludedUnexportable: number,
+	/**
+	 *  Verified segments the training-grade rubric refused (the B1 guard): human-rejected (mark-bad
+	 *  carries verified=true only to leave the review queue), severe audio issues, placeholder text,
+	 *  or any other non-training-ready grade. Without this filter a REJECTED clip's bad draft would
+	 *  ship as a training label.
+	 */
+	excludedNotTrainingReady: number,
+	emitted: number,
+	// Skipped for an empty transcript, a duplicate, or undecodable audio.
+	skipped: number,
+	/**
+	 *  Emitted rows that carry NO live human decision — batch-verified, or a verdict the reviewer
+	 *  undid (undo clears the decision but leaves `verified = 1`). The rubric grades these SILVER,
+	 *  so they are machine labels, correctly marked; this counter makes the quantity visible.
+	 */
+	emittedWithoutHumanDecision: number,
+	/**
+	 *  Content id of this selection (the manifest hash). A training run cites this; `dataset_runs`
+	 *  holds the sealed record, and the same rows always produce the same id.
+	 */
+	snapshotId: string,
+	// False when an identical snapshot was already sealed — the export was reproducible, not new.
+	newlySealed: boolean,
+};
+
+// Summary of an `export_gold_eval_set` run.
+export type GoldEvalExport = {
+	manifestPath: string,
+	totalGold: number,
+	exported: number,
+	/**
+	 *  Gold rows whose source audio could not be decoded (missing/corrupt) — excluded so the eval set
+	 *  stays self-consistent (every manifest row has a real clip).
+	 */
+	skipped: number,
+};
+
 /**
  *  Stable action identity for global machine/source history. This is intentionally an enum rather
  *  than backend-authored display text so every locale owns its own copy and unknown future variants
  *  fail at the generated TypeScript boundary.
  */
-export type HistoryActionV1 = "updateSegment" | "deleteSegments" | "batchTranscribe" | "speakerAssignment";
+export type HistoryActionV1 = "updateSegment" | "deleteSegments" | "batchTranscribe" | "batchNormalize" | "speakerAssignment";
 
 /**
  *  Server-confirmed history transition and the exact post-transition stack state. `action = None`
@@ -540,7 +1077,25 @@ export type ImportResumeV1 = {
 	status: ImportResumeStatusV1,
 	resuming: boolean,
 	importJobId: string,
+	runId: string,
 };
+
+export type ImportRunStatusResponseV1 = {
+	runId: string,
+	status: ImportRunStatusV1,
+};
+
+/**
+ *  Exact in-process admission truth used only to reconcile an import command whose response may
+ *  have been lost after the backend accepted it. It intentionally makes no claim about durable
+ *  transcript success; terminal import events and refreshed database reads remain authoritative for
+ *  that result.
+ */
+export type ImportRunStatusV1 = "running" | "settled" | "rejected" | "unknown";
+
+export type ImportSourceV1 = "file";
+
+export type ImportStartStatusV1 = "started";
 
 export type InferenceKindStatsV1 = {
 	calls: number,
@@ -554,6 +1109,16 @@ export type InferenceStatsV1 = {
 	asr: InferenceKindStatsV1,
 	model_load_ms: number,
 };
+
+export type IntelligenceReportV1 = {
+	loop0Shadow: Loop0ShadowV1,
+	autoAcceptPrecision: AutoAcceptPrecisionV1,
+	conformalCalibration: ConformalCalibrationProgressV1,
+};
+
+export type IssueCategory = "MissingAudio" | "EmptyTranscript" | "DuplicateFingerprint" | "DurationMismatch" | "InvalidSpeaker" | "CorruptAudio" | "AnnotationIncomplete" | "HighWer" | "HighCer" | "QualityGateFailed" | "ClippingDetected" | "LowRmsVolume" | "AlignmentHeuristic" | "Other";
+
+export type IssueSeverity = "Error" | "Warning";
 
 /**
  *  Recent durable jobs (newest first) for a UI activity surface — a long op bracketed via
@@ -571,6 +1136,36 @@ export type JobV1 = {
 	total: number | null,
 	errorCode: string | null,
 };
+
+export type JuryPipelineCompletedV1 = {
+	totalInput: number,
+	t0AutoAccepted: number,
+	t0Escalated: number,
+	referenceCommitted: number,
+	referenceGuarded: number,
+	hypothesisGuarded: number,
+	t1Committed: number,
+	t2Committed: number,
+	humanInbox: number,
+};
+
+export type JuryPipelineModeV1 = "not_required";
+
+export type JuryPipelineNotRequiredV1 = {
+	mode: JuryPipelineModeV1,
+	totalInput: number,
+	t0AutoAccepted: number,
+	t0Escalated: number,
+	referenceCommitted: number,
+	referenceGuarded: number,
+	hypothesisGuarded: number,
+	t1Committed: number,
+	t2Committed: number,
+	humanInbox: number,
+	reason: string,
+};
+
+export type JuryPipelineReportV1 = JuryPipelineNotRequiredV1 | JuryPipelineCompletedV1;
 
 /**
  *  Measured raw-ASR vs post-jury label-quality lift (blueprint M3.1). Over segments that carry a
@@ -591,6 +1186,14 @@ export type LabelQualityLift = {
 	liftCiHigh: number,
 };
 
+export type Loop0ShadowV1 = {
+	totalObservations: number,
+	wouldFire: number,
+	firedButHumanAcceptedOriginal: number,
+	firedAndHumanEdited: number,
+	firedAndHumanRejected: number,
+};
+
 export type MarkSegmentUnusableRequestV1 = {
 	operationId: string,
 	segmentId: string,
@@ -608,6 +1211,11 @@ export type MarkedSegmentUnusableV1 = {
 export type MediaGrant = {
 	id: string,
 	expiresAt: string,
+};
+
+export type MergeDatasetResultV1 = {
+	created: number,
+	updated: number,
 };
 
 /**
@@ -650,7 +1258,21 @@ export type ModelVersionSummaryV1 = {
 	status: string,
 };
 
-export type OperationEventV1 = { type: "started"; operationId: string } | { type: "progress"; operationId: string; completed: number; total: number } | { type: "completed"; operationId: string } | { type: "failed"; operationId: string; error: CommandErrorV1 } | { type: "cancelled"; operationId: string } | { type: "halted"; operationId: string; haltedBy: string };
+export type OperationEventV1 = { type: "started"; operationId: string } | { type: "progress"; operationId: string; completed: number; total: number } | { type: "completed"; operationId: string } | { type: "failed"; operationId: string; error: CommandErrorV1 } | { type: "cancelled"; operationId: string } | { type: "halted"; operationId: string; error: CommandErrorV1 };
+
+/**
+ *  Closed presentation state for ordinary import progress. Backend-authored prose and raw paths
+ *  never cross this boundary; the renderer localizes the code and receives a sanitized label.
+ */
+export type PipelineProgressStatusV1 = "resuming" | "processing" | "reference_transcribing" | "transcribing" | "adjudicating" | "unknown";
+
+export type PipelineProgressV1 = {
+	runId: string,
+	current: number,
+	total: number,
+	fileLabel: string,
+	status: PipelineProgressStatusV1,
+};
 
 export type PlaybackIntervalV1 = {
 	startMs: number,
@@ -688,6 +1310,32 @@ export type QuarantineNoticeV1 = {
 	quarantinedFileCount: number,
 	snapshotCount: number,
 	newestSnapshotSegments: number | null,
+};
+
+/**
+ *  Exact compare-and-swap authority for a generic owner review flag. The revision is part of the
+ *  idempotency payload: reusing an operation UUID with a different revision is a conflict, while an
+ *  exact response-loss retry can return the original immutable effect.
+ */
+export type RecordReviewFlagRequestV1 = {
+	operationId: string,
+	segmentId: string,
+	baseRevision: number,
+	rationale: string,
+};
+
+export type RecordedReviewFlagV1 = {
+	effectEventId: number,
+	segmentId: string,
+	priorRevision: number,
+	flagRevision: number,
+	segment: SpeechSegment,
+};
+
+// P3.3: outcome of a basename-based relink.
+export type RelinkResult = {
+	relinked: number,
+	stillMissing: number,
 };
 
 /**
@@ -759,7 +1407,7 @@ export type RendererSettingsV1 = {
 	jury_t1_threshold: number,
 };
 
-export type ReviewDecisionV1 = "accept" | "edit" | "reject" | "skip";
+export type ReviewDecisionV1 = "accept" | "edit" | "reject";
 
 export type ReviewDraftV1 = {
 	segmentId: string,
@@ -797,6 +1445,41 @@ export type ReviewTimingStats = {
 	medianSeconds: number | null,
 	// Number of consecutive-decision deltas that fell within a session and fed the median.
 	samples: number,
+};
+
+/**
+ *  Response for `build_scorecard`: the structured scorecard plus a ready-to-paste
+ *  Markdown rendering (for a README / HuggingFace model card).
+ */
+export type ScorecardResponse = {
+	scorecard: ScorecardV1,
+	markdown: string,
+};
+
+export type ScorecardV1 = ScorecardWithBaselineV1 | ScorecardWithoutBaselineV1;
+
+export type ScorecardWithBaselineV1 = {
+	system: SystemScoreV1,
+	vsBaseline: BaselineComparisonV1,
+	bootstrapResamples: number,
+	confidence: number,
+	seed: number,
+};
+
+export type ScorecardWithoutBaselineV1 = {
+	system: SystemScoreV1,
+	bootstrapResamples: number,
+	confidence: number,
+	seed: number,
+};
+
+export type SegmentConsensusV1 = {
+	draft: string,
+	words: ConsensusWordV1[],
+	modelCount: number,
+	minAgreement: number,
+	meanAgreement: number,
+	models: string[],
 };
 
 /**
@@ -929,7 +1612,11 @@ export type SpeechSegment = {
 	cloudCall: boolean,
 	// Hash of decoder/runtime settings that materially affect the transcript.
 	decoderConfigHash: string | null,
-	// Version of the Sorani normalizer used for normalized_transcript / metrics.
+	/**
+	 *  Producer version for `normalized_transcript`: the Sorani normalizer, or the explicitly
+	 *  versioned refinement/LOOP0 review projection when normalization is disabled. The column name
+	 *  is historical; a non-null derived transcript and producer marker always travel together.
+	 */
 	normalizerVersion: string | null,
 	/**
 	 *  Whether the denoiser ACTUALLY ran for this segment at import (`settings.enable_denoising` AND the
@@ -969,6 +1656,41 @@ export type SpeechSegment = {
 };
 
 export type SuggestedActionV1 = "retry" | "openHealth" | "openModels" | "reloadClip";
+
+export type SystemScoreV1 = {
+	modelId: string,
+	numSegments: number,
+	scoredSegments: number,
+	microWer: number,
+	microCer: number,
+	macroWer: number,
+	substitutions: number,
+	deletions: number,
+	insertions: number,
+	werCi: ConfidenceIntervalV1,
+	cerCi: ConfidenceIntervalV1,
+};
+
+export type T2EvidenceV1 = {
+	tool: string,
+	result: string,
+	supportsHypothesis: boolean,
+};
+
+export type T2ResultV1 = {
+	verdict: T2VerdictV1 | null,
+	mustEscalate: boolean,
+	error: string | null,
+};
+
+export type T2VerdictV1 = {
+	transcript: string,
+	reason: string,
+	confidence: number,
+	evidence: T2EvidenceV1[],
+	selfConsistencyAgreement: boolean,
+	votes: number,
+};
 
 /**
  *  A closed technical classification, never a human transcript decision. Wire spellings are stable
@@ -1016,6 +1738,21 @@ export type TrainingGradeSummary = {
 	rejectedSegments: number,
 };
 
+export type TranscribedSegmentV1 = {
+	text: string,
+	rawTranscript: string,
+	confidence: number | null,
+	confidenceSource: string | null,
+	modelVersionId: string | null,
+	cloudCall: boolean,
+	segmentId: string,
+};
+
+export type UndoDesktopReviewRequestV1 = {
+	target: DesktopReviewUndoTargetV1,
+	operationId: string,
+};
+
 export type UpdateSegmentMetadataRequestV1 = {
 	segmentId: string,
 	changes: SegmentMetadataChangeV1[],
@@ -1032,11 +1769,42 @@ export type UpdatedSegmentMetadataV1 = {
 	changed: boolean,
 };
 
+export type ValidationIssue = {
+	severity: IssueSeverity,
+	category: IssueCategory,
+	segmentId: string | null,
+	field: string,
+	message: string,
+	details: string | null,
+};
+
+export type ValidationReport = {
+	totalSegments: number,
+	totalAudioFiles: number,
+	passed: number,
+	warnings: ValidationIssue[],
+	errors: ValidationIssue[],
+	summary: string,
+};
+
 export type WerOutlier = {
 	segmentId: string,
 	wer: number,
 	cer: number,
 	referencePreview: string,
+};
+
+export type WordTimestampV1 = {
+	word: string,
+	start: number,
+	end: number,
+	confidence: number,
+};
+
+export type WslRefinementStartStatusV1 = "started";
+
+export type WslRefinementStartedV1 = {
+	status: WslRefinementStartStatusV1,
 };
 
 /* Tauri Specta runtime */

@@ -20,6 +20,7 @@ describe('typed history command boundary', () => {
     expect(historyActionTranslationKey('updateSegment')).toBe('history.action.updateSegment');
     expect(historyActionTranslationKey('deleteSegments')).toBe('history.action.deleteSegments');
     expect(historyActionTranslationKey('batchTranscribe')).toBe('history.action.batchTranscribe');
+    expect(historyActionTranslationKey('batchNormalize')).toBe('history.action.batchNormalize');
     expect(historyActionTranslationKey('speakerAssignment')).toBe(
       'history.action.speakerAssignment',
     );

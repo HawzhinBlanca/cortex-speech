@@ -5005,19 +5005,624 @@ pub static MIGRATIONS: &[Migration] = &[
              DROP TABLE desktop_playback_sessions_v4;",
         ),
     },
+    Migration {
+        version: 68,
+        description: "Add exact crash-safe batch operation item authority",
+        // A jobs row is the durable operation header, but a 100,000-item JSON payload cannot be
+        // rewritten after every clip without quadratic I/O and cannot attribute a row mutation in the
+        // same transaction. This strict child ledger captures every exact before projection before a
+        // worker starts and terminalizes each item in the same writer transaction as its effect.
+        // segment_id deliberately has no FK: batch evidence must survive a later segment deletion.
+        up_sql: "CREATE TABLE batch_job_items_v1 (
+                     job_id                    TEXT NOT NULL
+                         CHECK(job_id=lower(trim(job_id))
+                           AND length(job_id)=36
+                           AND substr(job_id,9,1)='-'
+                           AND substr(job_id,14,1)='-'
+                           AND substr(job_id,19,1)='-'
+                           AND substr(job_id,24,1)='-'
+                           AND length(replace(job_id,'-',''))=32
+                           AND replace(job_id,'-','') NOT GLOB '*[^0-9a-f]*'),
+                     ordinal                   INTEGER NOT NULL CHECK(ordinal>=0 AND ordinal<100000),
+                     segment_id                TEXT NOT NULL CHECK(length(trim(segment_id))>0),
+                     base_revision             INTEGER NOT NULL CHECK(base_revision>=0),
+                     source_identity_sha256     TEXT NOT NULL
+                         CHECK(length(source_identity_sha256)=64
+                           AND source_identity_sha256=lower(source_identity_sha256)
+                           AND source_identity_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     before_projection_json    TEXT NOT NULL
+                         CHECK(json_valid(before_projection_json)=1
+                           AND json_type(before_projection_json)='object'),
+                     before_projection_sha256  TEXT NOT NULL
+                         CHECK(length(before_projection_sha256)=64
+                           AND before_projection_sha256=lower(before_projection_sha256)
+                           AND before_projection_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     state                      TEXT NOT NULL DEFAULT 'pending'
+                         CHECK(state IN ('pending','applied','skipped','failed','abandoned')),
+                     after_projection_json     TEXT
+                         CHECK(after_projection_json IS NULL OR
+                           (json_valid(after_projection_json)=1
+                            AND json_type(after_projection_json)='object')),
+                     after_projection_sha256   TEXT
+                         CHECK(after_projection_sha256 IS NULL OR
+                           (length(after_projection_sha256)=64
+                            AND after_projection_sha256=lower(after_projection_sha256)
+                            AND after_projection_sha256 NOT GLOB '*[^0-9a-f]*')),
+                     effect_revision           INTEGER CHECK(effect_revision IS NULL OR effect_revision>base_revision),
+                     result_code               TEXT
+                         CHECK(result_code IS NULL OR
+                           (length(result_code) BETWEEN 1 AND 64
+                            AND result_code NOT GLOB '*[^A-Z0-9_]*')),
+                     created_at                TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                     terminal_at               TEXT,
+                     PRIMARY KEY(job_id,ordinal),
+                     UNIQUE(job_id,segment_id),
+                     FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE RESTRICT,
+                     CHECK(
+                         (state='pending'
+                          AND after_projection_json IS NULL
+                          AND after_projection_sha256 IS NULL
+                          AND effect_revision IS NULL
+                          AND result_code IS NULL
+                          AND terminal_at IS NULL)
+                         OR
+                         (state='applied'
+                          AND after_projection_json IS NOT NULL
+                          AND after_projection_sha256 IS NOT NULL
+                          AND effect_revision>base_revision
+                          AND result_code IS NULL
+                          AND terminal_at IS NOT NULL)
+                         OR
+                         (state IN ('skipped','failed','abandoned')
+                          AND after_projection_json IS NULL
+                          AND after_projection_sha256 IS NULL
+                          AND effect_revision IS NULL
+                          AND result_code IS NOT NULL
+                          AND terminal_at IS NOT NULL)
+                     )
+                 ) STRICT;
+                 CREATE INDEX idx_batch_job_items_v1_pending
+                     ON batch_job_items_v1(job_id,ordinal) WHERE state='pending';
+                 CREATE UNIQUE INDEX idx_jobs_one_live_batch_v1
+                     ON jobs((1))
+                     WHERE kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                       AND state IN ('queued','running');
+
+                 -- Hypotheses are part of machine truth and of the exact batch projection. Before
+                 -- v68 they could change without advancing the segment CAS revision, so a stale
+                 -- worker could not detect a hypothesis-only concurrent writer. Advance the same
+                 -- monotonic authority on every hypothesis mutation. Explicitly changing the
+                 -- revision avoids double-incrementing through v53's row-update trigger.
+                 CREATE TRIGGER segment_hypotheses_v68_revision_insert
+                 AFTER INSERT ON segment_hypotheses
+                 BEGIN
+                     UPDATE speech_segments
+                        SET review_revision=review_revision+1
+                      WHERE id=NEW.segment_id;
+                 END;
+                 CREATE TRIGGER segment_hypotheses_v68_revision_delete
+                 AFTER DELETE ON segment_hypotheses
+                 BEGIN
+                     UPDATE speech_segments
+                        SET review_revision=review_revision+1
+                      WHERE id=OLD.segment_id;
+                 END;
+                 CREATE TRIGGER segment_hypotheses_v68_revision_update
+                 AFTER UPDATE ON segment_hypotheses
+                 BEGIN
+                     UPDATE speech_segments
+                        SET review_revision=review_revision+1
+                      WHERE id=OLD.segment_id;
+                     UPDATE speech_segments
+                        SET review_revision=review_revision+1
+                      WHERE id=NEW.segment_id AND NEW.segment_id<>OLD.segment_id;
+                 END;
+
+                 CREATE TRIGGER jobs_v68_batch_validate_insert
+                 BEFORE INSERT ON jobs
+                 WHEN NEW.kind IN ('batch_transcribe_v1','batch_normalize_v1') AND (
+                      typeof(NEW.id)<>'text'
+                      OR typeof(NEW.idempotency_key)<>'text'
+                      OR NEW.id<>lower(trim(NEW.id))
+                      OR length(NEW.id)<>36
+                      OR substr(NEW.id,9,1)<>'-'
+                      OR substr(NEW.id,14,1)<>'-'
+                      OR substr(NEW.id,19,1)<>'-'
+                      OR substr(NEW.id,24,1)<>'-'
+                      OR length(replace(NEW.id,'-',''))<>32
+                      OR replace(NEW.id,'-','') GLOB '*[^0-9a-f]*'
+                      OR NEW.state<>'queued'
+                      OR NEW.idempotency_key IS NOT ('batch-v1:'||NEW.id)
+                      OR typeof(NEW.total)<>'integer' OR NEW.total<1 OR NEW.total>100000
+                      OR NEW.completed<>0 OR NEW.progress<>0.0
+                      OR NEW.error_code IS NOT NULL OR NEW.error_detail IS NOT NULL
+                      OR json_valid(NEW.payload_json)<>1 OR json_type(NEW.payload_json)<>'object'
+                      OR json_extract(NEW.payload_json,'$.schema') IS NOT 1
+                      OR typeof(json_extract(NEW.payload_json,'$.operationId'))<>'text'
+                      OR json_extract(NEW.payload_json,'$.operationId') IS NOT NEW.id
+                      OR json_extract(NEW.payload_json,'$.kind') IS NOT NEW.kind
+                      OR typeof(json_extract(NEW.payload_json,'$.requestSha256'))<>'text'
+                      OR length(json_extract(NEW.payload_json,'$.requestSha256'))<>64
+                      OR json_extract(NEW.payload_json,'$.requestSha256') GLOB '*[^0-9a-f]*'
+                      OR typeof(json_extract(NEW.payload_json,'$.configSha256'))<>'text'
+                      OR length(json_extract(NEW.payload_json,'$.configSha256'))<>64
+                      OR json_extract(NEW.payload_json,'$.configSha256') GLOB '*[^0-9a-f]*'
+                      OR typeof(json_extract(NEW.payload_json,'$.executorGitSha'))<>'text'
+                      OR length(json_extract(NEW.payload_json,'$.executorGitSha'))<>40
+                      OR json_extract(NEW.payload_json,'$.executorGitSha') GLOB '*[^0-9a-f]*'
+                      OR typeof(json_extract(NEW.payload_json,'$.attemptGeneration'))<>'integer'
+                      OR json_extract(NEW.payload_json,'$.attemptGeneration')<1
+                      OR typeof(json_extract(NEW.payload_json,'$.executorTokenSha256'))<>'text'
+                      OR length(json_extract(NEW.payload_json,'$.executorTokenSha256'))<>64
+                      OR json_extract(NEW.payload_json,'$.executorTokenSha256') GLOB '*[^0-9a-f]*'
+                      OR (SELECT count(*) FROM json_each(NEW.payload_json))<>8
+                 )
+                 BEGIN SELECT RAISE(ABORT,'invalid batch job header'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_kind_transition_forbidden
+                 BEFORE UPDATE OF kind ON jobs
+                 WHEN NEW.kind IS NOT OLD.kind AND (
+                      OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                      OR NEW.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                 )
+                 BEGIN SELECT RAISE(ABORT,'jobs cannot enter, leave, or switch batch authority kind'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_payload_validate_update
+                 BEFORE UPDATE OF payload_json ON jobs
+                 WHEN NEW.kind IN ('batch_transcribe_v1','batch_normalize_v1') AND (
+                      json_valid(NEW.payload_json)<>1 OR json_type(NEW.payload_json)<>'object'
+                      OR json_extract(NEW.payload_json,'$.schema') IS NOT 1
+                      OR json_extract(NEW.payload_json,'$.operationId') IS NOT NEW.id
+                      OR json_extract(NEW.payload_json,'$.kind') IS NOT NEW.kind
+                      OR typeof(json_extract(NEW.payload_json,'$.requestSha256'))<>'text'
+                      OR length(json_extract(NEW.payload_json,'$.requestSha256'))<>64
+                      OR json_extract(NEW.payload_json,'$.requestSha256') GLOB '*[^0-9a-f]*'
+                      OR typeof(json_extract(NEW.payload_json,'$.configSha256'))<>'text'
+                      OR length(json_extract(NEW.payload_json,'$.configSha256'))<>64
+                      OR json_extract(NEW.payload_json,'$.configSha256') GLOB '*[^0-9a-f]*'
+                      OR typeof(json_extract(NEW.payload_json,'$.executorGitSha'))<>'text'
+                      OR length(json_extract(NEW.payload_json,'$.executorGitSha'))<>40
+                      OR json_extract(NEW.payload_json,'$.executorGitSha') GLOB '*[^0-9a-f]*'
+                      OR typeof(json_extract(NEW.payload_json,'$.attemptGeneration'))<>'integer'
+                      OR json_extract(NEW.payload_json,'$.attemptGeneration')<1
+                      OR typeof(json_extract(NEW.payload_json,'$.executorTokenSha256'))<>'text'
+                      OR length(json_extract(NEW.payload_json,'$.executorTokenSha256'))<>64
+                      OR json_extract(NEW.payload_json,'$.executorTokenSha256') GLOB '*[^0-9a-f]*'
+                      OR (SELECT count(*) FROM json_each(NEW.payload_json))<>8
+                 )
+                 BEGIN SELECT RAISE(ABORT,'invalid updated batch job payload'); END;
+
+                 CREATE TRIGGER batch_job_items_v1_validate_insert
+                 BEFORE INSERT ON batch_job_items_v1
+                 WHEN NOT EXISTS (
+                     SELECT 1 FROM jobs parent
+                      WHERE parent.id=NEW.job_id
+                        AND parent.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                        AND parent.state='queued'
+                        AND NEW.ordinal<parent.total
+                 )
+                 BEGIN SELECT RAISE(ABORT,'batch item requires matching queued parent and ordinal'); END;
+
+                 CREATE TRIGGER batch_job_items_v1_identity_immutable
+                 BEFORE UPDATE OF job_id,ordinal,segment_id,base_revision,source_identity_sha256,
+                                  before_projection_json,before_projection_sha256,created_at
+                 ON batch_job_items_v1
+                 BEGIN SELECT RAISE(ABORT,'batch item identity and before authority are immutable'); END;
+
+                 CREATE TRIGGER batch_job_items_v1_terminal_immutable
+                 BEFORE UPDATE ON batch_job_items_v1
+                 WHEN OLD.state<>'pending'
+                 BEGIN SELECT RAISE(ABORT,'terminal batch item evidence is immutable'); END;
+
+                 CREATE TRIGGER batch_job_items_v1_transition_validate
+                 BEFORE UPDATE ON batch_job_items_v1
+                 WHEN OLD.state='pending' AND NEW.state NOT IN ('applied','skipped','failed','abandoned')
+                 BEGIN SELECT RAISE(ABORT,'batch item permits one pending-to-terminal transition'); END;
+
+                 CREATE TRIGGER batch_job_items_v1_immutable_delete
+                 BEFORE DELETE ON batch_job_items_v1
+                 BEGIN SELECT RAISE(ABORT,'batch item evidence is append-only'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_identity_immutable
+                 BEFORE UPDATE OF id,kind,idempotency_key,total,payload_json ON jobs
+                 WHEN OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1') AND (
+                      NEW.id IS NOT OLD.id
+                      OR NEW.kind IS NOT OLD.kind
+                      OR NEW.idempotency_key IS NOT OLD.idempotency_key
+                      OR NEW.total IS NOT OLD.total
+                      -- The executor identity is evidence, not mutable retry state.  A prior version
+                      -- compared only five decoded fields and therefore allowed executorGitSha,
+                      -- attemptGeneration, executorTokenSha256, whitespace, or duplicate JSON keys
+                      -- to be rewritten after admission.  Exact byte immutability closes every one
+                      -- of those aliases and keeps the request hash tied to one actual executor.
+                      OR NEW.payload_json IS NOT OLD.payload_json
+                 )
+                 BEGIN SELECT RAISE(ABORT,'batch job request identity is immutable'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_terminal_immutable
+                 BEFORE UPDATE ON jobs
+                 WHEN OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                  AND OLD.state IN ('succeeded','failed','cancelled')
+                 BEGIN SELECT RAISE(ABORT,'terminal batch header evidence is immutable'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_start_validate
+                 BEFORE UPDATE OF state ON jobs
+                 WHEN OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                  AND NEW.state='running' AND (
+                       OLD.state<>'queued'
+                       OR NEW.started_at IS NULL
+                       OR NEW.finished_at IS NOT NULL
+                       OR NEW.error_code IS NOT NULL
+                       OR NEW.error_detail IS NOT NULL
+                       OR NEW.completed<>0 OR NEW.progress<>0.0
+                       OR (SELECT count(*) FROM batch_job_items_v1 item WHERE item.job_id=OLD.id)<>OLD.total
+                       OR (SELECT min(ordinal) FROM batch_job_items_v1 item WHERE item.job_id=OLD.id) IS NOT 0
+                       OR (SELECT max(ordinal) FROM batch_job_items_v1 item WHERE item.job_id=OLD.id) IS NOT OLD.total-1
+                  )
+                 BEGIN SELECT RAISE(ABORT,'batch cannot run before its exact contiguous item set exists'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_lifecycle_validate
+                 BEFORE UPDATE OF state ON jobs
+                 WHEN OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                  AND NEW.state<>OLD.state
+                  AND NOT (
+                       (OLD.state='queued' AND NEW.state='running')
+                       OR (OLD.state='running' AND NEW.state IN ('succeeded','failed','cancelled'))
+                  )
+                 BEGIN SELECT RAISE(ABORT,'invalid batch job lifecycle transition'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_running_fields_validate
+                 BEFORE UPDATE ON jobs
+                 WHEN OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                  AND OLD.state='running' AND NEW.state='running' AND (
+                       NEW.started_at IS NOT OLD.started_at
+                       OR NEW.finished_at IS NOT NULL
+                       OR NEW.error_code IS NOT NULL
+                       OR NEW.error_detail IS NOT NULL
+                  )
+                 BEGIN SELECT RAISE(ABORT,'running batch lifecycle fields are immutable'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_progress_validate
+                 BEFORE UPDATE OF completed,progress ON jobs
+                 WHEN OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                  AND NEW.state='running' AND (
+                       NEW.completed IS NOT (
+                           SELECT count(*) FROM batch_job_items_v1 item
+                            WHERE item.job_id=OLD.id AND item.state<>'pending'
+                       )
+                       OR abs(NEW.progress-(CAST(NEW.completed AS REAL)/CAST(NEW.total AS REAL)))>0.000000001
+                  )
+                 BEGIN SELECT RAISE(ABORT,'batch progress must equal durable terminal item count'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_terminal_validate
+                 BEFORE UPDATE OF state ON jobs
+                 WHEN OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                  AND NEW.state IN ('succeeded','failed','cancelled') AND (
+                       OLD.state<>'running'
+                       OR EXISTS (SELECT 1 FROM batch_job_items_v1 item WHERE item.job_id=OLD.id AND item.state='pending')
+                       OR NEW.completed<>NEW.total
+                       OR abs(NEW.progress-1.0)>0.000000001
+                       OR NEW.started_at IS NOT OLD.started_at
+                       OR NEW.finished_at IS NULL
+                       OR NEW.payload_json IS NOT OLD.payload_json
+                       OR (NEW.state='succeeded' AND
+                           (NEW.error_code IS NOT NULL OR NEW.error_detail IS NOT NULL))
+                       OR (NEW.state IN ('failed','cancelled') AND (
+                           typeof(NEW.error_code)<>'text'
+                           OR length(NEW.error_code) NOT BETWEEN 1 AND 64
+                           OR NEW.error_code GLOB '*[^A-Z0-9_]*'
+                           OR NEW.error_detail IS NOT NULL
+                       ))
+                       OR (NEW.state='succeeded' AND EXISTS (
+                           SELECT 1 FROM batch_job_items_v1 item
+                            WHERE item.job_id=OLD.id AND item.state IN ('failed','abandoned')
+                       ))
+                       OR (NEW.state='failed' AND NOT EXISTS (
+                           SELECT 1 FROM batch_job_items_v1 item
+                            WHERE item.job_id=OLD.id AND item.state IN ('failed','abandoned')
+                       ))
+                       OR (NEW.state='cancelled' AND NOT EXISTS (
+                           SELECT 1 FROM batch_job_items_v1 item
+                            WHERE item.job_id=OLD.id AND item.state='abandoned'
+                       ))
+                       OR (NEW.state='cancelled' AND EXISTS (
+                           SELECT 1 FROM batch_job_items_v1 item
+                            WHERE item.job_id=OLD.id AND item.state='failed'
+                       ))
+                  )
+                 BEGIN SELECT RAISE(ABORT,'batch terminal state disagrees with durable item evidence'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_immutable_delete
+                 BEFORE DELETE ON jobs
+                 WHEN OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                 BEGIN SELECT RAISE(ABORT,'batch job evidence is append-only'); END;",
+        down_sql: Some(
+            "CREATE TEMP TABLE batch_v68_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero=0)
+             );
+             INSERT INTO batch_v68_rollback_guard(must_be_zero)
+              SELECT 1 WHERE EXISTS (SELECT 1 FROM batch_job_items_v1)
+                          OR EXISTS (
+                              SELECT 1 FROM jobs
+                               WHERE kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                          );
+             DROP TABLE batch_v68_rollback_guard;
+             DROP TRIGGER jobs_v68_batch_immutable_delete;
+             DROP TRIGGER jobs_v68_batch_terminal_validate;
+             DROP TRIGGER jobs_v68_batch_progress_validate;
+             DROP TRIGGER jobs_v68_batch_running_fields_validate;
+             DROP TRIGGER jobs_v68_batch_lifecycle_validate;
+             DROP TRIGGER jobs_v68_batch_start_validate;
+             DROP TRIGGER jobs_v68_batch_terminal_immutable;
+             DROP TRIGGER jobs_v68_batch_identity_immutable;
+             DROP TRIGGER batch_job_items_v1_immutable_delete;
+             DROP TRIGGER batch_job_items_v1_transition_validate;
+             DROP TRIGGER batch_job_items_v1_terminal_immutable;
+             DROP TRIGGER batch_job_items_v1_identity_immutable;
+             DROP TRIGGER batch_job_items_v1_validate_insert;
+             DROP TRIGGER jobs_v68_batch_payload_validate_update;
+             DROP TRIGGER jobs_v68_batch_kind_transition_forbidden;
+             DROP TRIGGER jobs_v68_batch_validate_insert;
+             DROP TRIGGER segment_hypotheses_v68_revision_update;
+             DROP TRIGGER segment_hypotheses_v68_revision_delete;
+             DROP TRIGGER segment_hypotheses_v68_revision_insert;
+             DROP INDEX idx_jobs_one_live_batch_v1;
+             DROP INDEX idx_batch_job_items_v1_pending;
+             DROP TABLE batch_job_items_v1;",
+        ),
+    },
+    Migration {
+        version: 69,
+        description: "Add exact global desktop review action order for restart-safe Undo",
+        // Decision and flag effects have independent AUTOINCREMENT sequences and their historical
+        // timestamps have only second precision. This append-only journal is therefore the sole
+        // authority for the latest desktop review action after v69. Existing histories receive one
+        // conservative barrier; no pre-v69 action is guessed into a total order.
+        up_sql: "CREATE TABLE desktop_review_legacy_actions_v1 (
+                     source_kind     TEXT NOT NULL
+                         CHECK(source_kind IN ('decision','decision_undo','flag','flag_undo')),
+                     effect_event_id INTEGER NOT NULL CHECK(effect_event_id>0),
+                     PRIMARY KEY(source_kind,effect_event_id)
+                 ) STRICT;
+
+                 INSERT INTO desktop_review_legacy_actions_v1(source_kind,effect_event_id)
+                 SELECT 'decision',id FROM human_decision_effect_events
+                  WHERE source='desktop' AND reviewer IS NULL;
+                 INSERT INTO desktop_review_legacy_actions_v1(source_kind,effect_event_id)
+                 SELECT 'decision_undo',reversal.effect_event_id
+                   FROM human_decision_effect_reversals reversal
+                   JOIN human_decision_effect_events effect ON effect.id=reversal.effect_event_id
+                  WHERE effect.source='desktop' AND effect.reviewer IS NULL;
+                 INSERT INTO desktop_review_legacy_actions_v1(source_kind,effect_event_id)
+                 SELECT 'flag',id FROM review_flag_effect_events;
+                 INSERT INTO desktop_review_legacy_actions_v1(source_kind,effect_event_id)
+                 SELECT 'flag_undo',flag_effect_event_id FROM review_flag_effect_reversals;
+
+                 CREATE TRIGGER desktop_review_legacy_actions_v1_sealed_insert
+                 BEFORE INSERT ON desktop_review_legacy_actions_v1
+                 BEGIN SELECT RAISE(ABORT,'desktop legacy review baseline is sealed'); END;
+                 CREATE TRIGGER desktop_review_legacy_actions_v1_immutable_update
+                 BEFORE UPDATE ON desktop_review_legacy_actions_v1
+                 BEGIN SELECT RAISE(ABORT,'desktop legacy review baseline is immutable'); END;
+                 CREATE TRIGGER desktop_review_legacy_actions_v1_immutable_delete
+                 BEFORE DELETE ON desktop_review_legacy_actions_v1
+                 BEGIN SELECT RAISE(ABORT,'desktop legacy review baseline is immutable'); END;
+
+                 CREATE TABLE desktop_review_action_events_v1 (
+                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                     action_kind     TEXT NOT NULL
+                         CHECK(action_kind IN ('legacy_barrier','decision','decision_undo','flag','flag_undo')),
+                     effect_event_id INTEGER,
+                     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                     CHECK(
+                         (action_kind='legacy_barrier' AND effect_event_id IS NULL)
+                         OR (action_kind<>'legacy_barrier' AND effect_event_id IS NOT NULL AND effect_event_id>0)
+                     ),
+                     UNIQUE(action_kind,effect_event_id)
+                 ) STRICT;
+                 CREATE UNIQUE INDEX idx_desktop_review_action_one_legacy_barrier_v1
+                     ON desktop_review_action_events_v1(action_kind)
+                     WHERE action_kind='legacy_barrier';
+
+                 INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id,created_at)
+                 SELECT 'legacy_barrier',NULL,'1970-01-01T00:00:00.000Z'
+                  WHERE EXISTS (SELECT 1 FROM desktop_review_legacy_actions_v1);
+
+                 CREATE TRIGGER desktop_review_action_events_v1_validate_insert
+                 BEFORE INSERT ON desktop_review_action_events_v1
+                 WHEN (NEW.action_kind<>'legacy_barrier' AND EXISTS (
+                           SELECT 1 FROM desktop_review_legacy_actions_v1 legacy
+                            WHERE legacy.source_kind=NEW.action_kind
+                              AND legacy.effect_event_id=NEW.effect_event_id
+                       ))
+                    OR (NEW.action_kind='decision' AND NOT EXISTS (
+                           SELECT 1 FROM human_decision_effect_events effect
+                            WHERE effect.id=NEW.effect_event_id
+                              AND effect.source='desktop' AND effect.reviewer IS NULL
+                       ))
+                    OR (NEW.action_kind='decision_undo' AND NOT EXISTS (
+                           SELECT 1
+                             FROM human_decision_effect_reversals reversal
+                             JOIN human_decision_effect_events effect
+                               ON effect.id=reversal.effect_event_id
+                            WHERE reversal.effect_event_id=NEW.effect_event_id
+                              AND effect.source='desktop' AND effect.reviewer IS NULL
+                       ))
+                    OR (NEW.action_kind='flag' AND NOT EXISTS (
+                           SELECT 1 FROM review_flag_effect_events flag
+                            WHERE flag.id=NEW.effect_event_id
+                       ))
+                    OR (NEW.action_kind='flag_undo' AND NOT EXISTS (
+                           SELECT 1 FROM review_flag_effect_reversals reversal
+                            WHERE reversal.flag_effect_event_id=NEW.effect_event_id
+                       ))
+                 BEGIN SELECT RAISE(ABORT,'desktop review action journal requires its exact effect'); END;
+
+                 CREATE TRIGGER desktop_review_action_events_v1_immutable_update
+                 BEFORE UPDATE ON desktop_review_action_events_v1
+                 BEGIN SELECT RAISE(ABORT,'desktop review action journal is append-only'); END;
+                 CREATE TRIGGER desktop_review_action_events_v1_immutable_delete
+                 BEFORE DELETE ON desktop_review_action_events_v1
+                 BEGIN SELECT RAISE(ABORT,'desktop review action journal is append-only'); END;
+
+                 CREATE TRIGGER human_decision_effect_events_v69_desktop_action_insert
+                 AFTER INSERT ON human_decision_effect_events
+                 WHEN NEW.source='desktop' AND NEW.reviewer IS NULL
+                 BEGIN
+                     INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id)
+                     VALUES('decision',NEW.id);
+                 END;
+                 CREATE TRIGGER review_events_v69_operation_namespace_insert
+                 BEFORE INSERT ON review_events
+                 WHEN NEW.operation_id IS NOT NULL
+                  AND (
+                       EXISTS (SELECT 1 FROM independent_review_decisions WHERE operation_id=NEW.operation_id)
+                       OR EXISTS (SELECT 1 FROM independent_review_reversals WHERE operation_id=NEW.operation_id)
+                  )
+                 BEGIN
+                     SELECT RAISE(ABORT,'canonical review event operation UUID belongs to independent review truth');
+                 END;
+                 CREATE TRIGGER human_decision_effect_events_v69_operation_namespace_insert
+                 BEFORE INSERT ON human_decision_effect_events
+                 WHEN NEW.operation_id IS NOT NULL
+                  AND (
+                       EXISTS (SELECT 1 FROM independent_review_decisions WHERE operation_id=NEW.operation_id)
+                       OR EXISTS (SELECT 1 FROM independent_review_reversals WHERE operation_id=NEW.operation_id)
+                  )
+                 BEGIN
+                     SELECT RAISE(ABORT,'canonical decision operation UUID belongs to independent review truth');
+                 END;
+                 CREATE TRIGGER human_decision_effect_reversals_v69_desktop_operation_namespace_insert
+                 BEFORE INSERT ON human_decision_effect_reversals
+                 WHEN EXISTS (
+                          SELECT 1 FROM human_decision_effect_events effect
+                           WHERE effect.id=NEW.effect_event_id
+                             AND effect.source='desktop' AND effect.reviewer IS NULL
+                      )
+                  AND (
+                       EXISTS (SELECT 1 FROM review_events WHERE operation_id=NEW.operation_id)
+                       OR EXISTS (SELECT 1 FROM human_decision_effect_events WHERE operation_id=NEW.operation_id)
+                       OR EXISTS (SELECT 1 FROM review_flag_effect_events WHERE operation_id=NEW.operation_id)
+                       OR EXISTS (SELECT 1 FROM review_flag_effect_reversals WHERE operation_id=NEW.operation_id)
+                       OR EXISTS (SELECT 1 FROM independent_review_decisions WHERE operation_id=NEW.operation_id)
+                       OR EXISTS (SELECT 1 FROM independent_review_reversals WHERE operation_id=NEW.operation_id)
+                  )
+                 BEGIN
+                     SELECT RAISE(ABORT,'desktop decision undo operation UUID belongs to another review action');
+                 END;
+                 CREATE TRIGGER human_decision_effect_reversals_v69_desktop_action_insert
+                 AFTER INSERT ON human_decision_effect_reversals
+                 WHEN EXISTS (
+                     SELECT 1 FROM human_decision_effect_events effect
+                      WHERE effect.id=NEW.effect_event_id
+                        AND effect.source='desktop' AND effect.reviewer IS NULL
+                 )
+                 BEGIN
+                     INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id)
+                     VALUES('decision_undo',NEW.effect_event_id);
+                 END;
+                 CREATE TRIGGER review_flag_effect_events_v69_desktop_action_insert
+                 AFTER INSERT ON review_flag_effect_events
+                 BEGIN
+                     INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id)
+                     VALUES('flag',NEW.id);
+                 END;
+                 CREATE TRIGGER review_flag_effect_events_v69_operation_namespace_insert
+                 BEFORE INSERT ON review_flag_effect_events
+                 WHEN EXISTS (SELECT 1 FROM review_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM human_decision_effect_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM human_decision_effect_reversals WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM review_flag_effect_reversals WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM independent_review_decisions WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM independent_review_reversals WHERE operation_id=NEW.operation_id)
+                 BEGIN
+                     SELECT RAISE(ABORT,'review flag operation UUID belongs to another review action');
+                 END;
+                 CREATE TRIGGER review_flag_effect_reversals_v69_operation_namespace_insert
+                 BEFORE INSERT ON review_flag_effect_reversals
+                 WHEN EXISTS (SELECT 1 FROM review_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM human_decision_effect_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM human_decision_effect_reversals WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM review_flag_effect_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM independent_review_decisions WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM independent_review_reversals WHERE operation_id=NEW.operation_id)
+                 BEGIN
+                     SELECT RAISE(ABORT,'review flag undo operation UUID belongs to another review action');
+                 END;
+                 CREATE TRIGGER review_flag_effect_reversals_v69_desktop_action_insert
+                 AFTER INSERT ON review_flag_effect_reversals
+                 BEGIN
+                     INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id)
+                     VALUES('flag_undo',NEW.flag_effect_event_id);
+                 END;
+                 CREATE TRIGGER independent_review_reversals_v69_operation_namespace_insert
+                 BEFORE INSERT ON independent_review_reversals
+                 WHEN EXISTS (SELECT 1 FROM review_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM human_decision_effect_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM human_decision_effect_reversals WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM review_flag_effect_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM review_flag_effect_reversals WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM independent_review_decisions WHERE operation_id=NEW.operation_id)
+                 BEGIN
+                     SELECT RAISE(ABORT,'independent reversal operation UUID belongs to another review action');
+                 END;
+                 CREATE TRIGGER independent_review_decisions_v69_operation_namespace_insert
+                 BEFORE INSERT ON independent_review_decisions
+                 WHEN EXISTS (SELECT 1 FROM review_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM human_decision_effect_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM human_decision_effect_reversals WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM review_flag_effect_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM review_flag_effect_reversals WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM independent_review_reversals WHERE operation_id=NEW.operation_id)
+                 BEGIN
+                     SELECT RAISE(ABORT,'independent decision operation UUID belongs to another review action');
+                 END;",
+        down_sql: Some(
+            "CREATE TEMP TABLE desktop_review_action_v69_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero=0)
+             );
+             INSERT INTO desktop_review_action_v69_rollback_guard(must_be_zero)
+             SELECT 1 WHERE EXISTS (
+                 SELECT 1 FROM desktop_review_action_events_v1
+                  WHERE action_kind<>'legacy_barrier'
+             );
+             DROP TABLE desktop_review_action_v69_rollback_guard;
+             DROP TRIGGER independent_review_decisions_v69_operation_namespace_insert;
+             DROP TRIGGER independent_review_reversals_v69_operation_namespace_insert;
+             DROP TRIGGER review_flag_effect_reversals_v69_desktop_action_insert;
+             DROP TRIGGER review_flag_effect_reversals_v69_operation_namespace_insert;
+             DROP TRIGGER review_flag_effect_events_v69_operation_namespace_insert;
+             DROP TRIGGER review_flag_effect_events_v69_desktop_action_insert;
+             DROP TRIGGER human_decision_effect_reversals_v69_desktop_action_insert;
+             DROP TRIGGER human_decision_effect_reversals_v69_desktop_operation_namespace_insert;
+             DROP TRIGGER human_decision_effect_events_v69_operation_namespace_insert;
+             DROP TRIGGER review_events_v69_operation_namespace_insert;
+             DROP TRIGGER human_decision_effect_events_v69_desktop_action_insert;
+             DROP TRIGGER desktop_review_action_events_v1_immutable_delete;
+             DROP TRIGGER desktop_review_action_events_v1_immutable_update;
+             DROP TRIGGER desktop_review_action_events_v1_validate_insert;
+             DROP INDEX idx_desktop_review_action_one_legacy_barrier_v1;
+             DROP TABLE desktop_review_action_events_v1;
+             DROP TRIGGER desktop_review_legacy_actions_v1_immutable_delete;
+             DROP TRIGGER desktop_review_legacy_actions_v1_immutable_update;
+             DROP TRIGGER desktop_review_legacy_actions_v1_sealed_insert;
+             DROP TABLE desktop_review_legacy_actions_v1;",
+        ),
+    },
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::Database;
+    use rusqlite::params;
 
     fn database_at_v57() -> Database {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 10).unwrap(),
-            vec![67, 66, 65, 64, 63, 62, 61, 60, 59, 58],
+            rollback(&db, 12).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58],
             "fixture must stop immediately before v58"
         );
         assert_eq!(get_current_version(&db).unwrap(), 57);
@@ -5028,8 +5633,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 8).unwrap(),
-            vec![67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "fixture must expose the populated-v59 boundary"
         );
         assert_eq!(get_current_version(&db).unwrap(), 59);
@@ -5039,7 +5644,11 @@ mod tests {
     fn database_at_v60() -> Database {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 7).unwrap(), vec![67, 66, 65, 64, 63, 62, 61], "fixture must expose the v60 boundary");
+        assert_eq!(
+            rollback(&db, 9).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61],
+            "fixture must expose the v60 boundary"
+        );
         assert_eq!(get_current_version(&db).unwrap(), 60);
         db
     }
@@ -5319,8 +5928,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 8).unwrap(),
-            vec![67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "fixture must expose the v59 layer directly"
         );
         assert_eq!(get_current_version(&db).unwrap(), 59);
@@ -5411,10 +6020,10 @@ mod tests {
 
         let empty = Database::open(":memory:").unwrap();
         empty.initialize().unwrap();
-        assert_eq!(rollback(&empty, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(rollback(&empty, 10).unwrap(), vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60]);
         assert_eq!(rollback(&empty, 1).unwrap(), vec![59]);
         assert_eq!(get_current_version(&empty).unwrap(), 58);
-        assert_eq!(run_migrations(&empty).unwrap(), vec![59, 60, 61, 62, 63, 64, 65, 66, 67]);
+        assert_eq!(run_migrations(&empty).unwrap(), vec![59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
     }
 
     #[test]
@@ -5468,8 +6077,12 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
-        assert_eq!(rollback(&db, 7).unwrap(), vec![67, 66, 65, 64, 63, 62, 61], "this test isolates the v60 migration");
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+        assert_eq!(
+            rollback(&db, 9).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61],
+            "this test isolates the v60 migration"
+        );
         assert_eq!(get_current_version(&db).unwrap(), 60);
         let state: (i64, i64) = db
             .connection()
@@ -5770,7 +6383,7 @@ mod tests {
                  VALUES ('delete-memory-proof', 'w', 'r', 'slot', 'phon', 'delete-memory');",
             )
             .unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
 
         assert_eq!(
             db.connection().execute("DELETE FROM speech_segments WHERE id='delete-clean'", []).unwrap(),
@@ -7300,13 +7913,12 @@ mod tests {
         assert!(reviewer_mismatch.contains("exact human-decision effect"));
 
         for (sql, expected) in [
-            (
-                format!("UPDATE human_decision_effect_events SET action='accept' WHERE id={first_effect}"),
-                "append-only",
-            ),
+            (format!("UPDATE human_decision_effect_events SET action='accept' WHERE id={first_effect}"), "append-only"),
             (format!("DELETE FROM human_decision_effect_events WHERE id={first_effect}"), "append-only"),
             (
-                format!("UPDATE human_decision_effect_reversals SET operation_id='changed' WHERE effect_event_id={second_effect}"),
+                format!(
+                    "UPDATE human_decision_effect_reversals SET operation_id='changed' WHERE effect_event_id={second_effect}"
+                ),
                 "append-only",
             ),
             (
@@ -7562,8 +8174,8 @@ mod tests {
         let with_reversal = database_at_v59();
         let (_, baseline_entry) =
             insert_review_original(&with_reversal, "baseline-reversal", "baseline-work", "Sara", "legacy");
-        assert_eq!(run_migrations(&with_reversal).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
-        assert_eq!(rollback(&with_reversal, 7).unwrap(), vec![67, 66, 65, 64, 63, 62, 61]);
+        assert_eq!(run_migrations(&with_reversal).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+        assert_eq!(rollback(&with_reversal, 9).unwrap(), vec![69, 68, 67, 66, 65, 64, 63, 62, 61]);
         reverse_review_entry(&with_reversal, &baseline_entry, "post-v60-baseline-undo").unwrap();
         let reversal_error = rollback(&with_reversal, 1)
             .expect_err("the ledger cutoff must distinguish a reversal appended after migration")
@@ -7593,8 +8205,8 @@ mod tests {
                          1, 'human correction', 'edit', '2026-08-20 00:00:00', 'Sara', 1);",
             )
             .unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
-        assert_eq!(rollback(&db, 7).unwrap(), vec![67, 66, 65, 64, 63, 62, 61]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+        assert_eq!(rollback(&db, 9).unwrap(), vec![69, 68, 67, 66, 65, 64, 63, 62, 61]);
 
         let (machine_snapshots, human_overlap, exact): (i64, i64, i64) = db
             .connection()
@@ -7657,8 +8269,8 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(run_migrations(&drifted).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
-        assert_eq!(rollback(&drifted, 7).unwrap(), vec![67, 66, 65, 64, 63, 62, 61]);
+        assert_eq!(run_migrations(&drifted).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+        assert_eq!(rollback(&drifted, 9).unwrap(), vec![69, 68, 67, 66, 65, 64, 63, 62, 61]);
         drifted
             .connection()
             .execute("UPDATE speech_segments SET rationale='forged rationale' WHERE id='legacy-machine-drift'", [])
@@ -7875,6 +8487,23 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("v64 excluded-review trigger exists at HEAD");
+        // v68 advances the segment CAS revision from child-table hypothesis writes. Unlike triggers
+        // defined ON speech_segments, SQLite does not remove these when the synthetic replay drops
+        // the parent table; leaving them installed makes the historical v40 CREATE/INSERT fail with
+        // `no such table: main.speech_segments`. A real ordered rollback removes v68 first, so this
+        // HEAD-only replay must preserve, remove, and restore all three exact future triggers.
+        let hypothesis_revision_trigger_sql: Vec<String> = [
+            "segment_hypotheses_v68_revision_insert",
+            "segment_hypotheses_v68_revision_delete",
+            "segment_hypotheses_v68_revision_update",
+        ]
+        .iter()
+        .map(|name| {
+            db.connection()
+                .query_row("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1", [name], |row| row.get(0))
+                .unwrap_or_else(|error| panic!("v68 hypothesis revision trigger {name} exists at HEAD: {error}"))
+        })
+        .collect();
         db.connection()
             .execute_batch(
                 "DROP TRIGGER playback_receipts_v60_span_validate_insert;
@@ -7883,7 +8512,10 @@ mod tests {
                  DROP TRIGGER review_pool_member_validate_insert;
                  DROP TRIGGER review_pool_v63_decision_terminal_guard;
                  DROP TRIGGER review_pool_duplicate_exclusion_validate_insert;
-                 DROP TRIGGER speech_segments_v64_excluded_review_guard;",
+                 DROP TRIGGER speech_segments_v64_excluded_review_guard;
+                 DROP TRIGGER segment_hypotheses_v68_revision_insert;
+                 DROP TRIGGER segment_hypotheses_v68_revision_delete;
+                 DROP TRIGGER segment_hypotheses_v68_revision_update;",
             )
             .expect("synthetic historical replay can temporarily remove the future trigger");
         {
@@ -7947,6 +8579,11 @@ mod tests {
         db.connection()
             .execute_batch(&excluded_review_trigger_sql)
             .expect("restore the exact v64 excluded-review trigger after synthetic v40 replay");
+        for trigger_sql in hypothesis_revision_trigger_sql {
+            db.connection()
+                .execute_batch(&trigger_sql)
+                .expect("restore the exact v68 hypothesis revision trigger after synthetic v40 replay");
+        }
 
         let conn = db.connection();
         // (1) STRICT is actually declared, and now REJECTS a type-violating raw write.
@@ -8268,7 +8905,7 @@ mod tests {
     fn v63_partial_migration_failure_is_atomic_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 5).unwrap(), vec![67, 66, 65, 64, 63]);
+        assert_eq!(rollback(&db, 7).unwrap(), vec![69, 68, 67, 66, 65, 64, 63]);
         assert_eq!(get_current_version(&db).unwrap(), 62);
         db.connection().execute("CREATE TABLE review_pool_owner_adjudications(collision INTEGER)", []).unwrap();
         let error = run_migrations(&db).expect_err("a v63 object collision must fail the entire migration");
@@ -8287,15 +8924,15 @@ mod tests {
             .unwrap();
         assert_eq!(leaked_objects, 0, "failed v63 leaked later tables or triggers");
         db.connection().execute("DROP TABLE review_pool_owner_adjudications", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![63, 64, 65, 66, 67]);
-        assert_eq!(get_current_version(&db).unwrap(), 67);
+        assert_eq!(run_migrations(&db).unwrap(), vec![63, 64, 65, 66, 67, 68, 69]);
+        assert_eq!(get_current_version(&db).unwrap(), 69);
     }
 
     #[test]
     fn v64_partial_migration_failure_is_atomic_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 4).unwrap(), vec![67, 66, 65, 64]);
+        assert_eq!(rollback(&db, 6).unwrap(), vec![69, 68, 67, 66, 65, 64]);
         assert_eq!(get_current_version(&db).unwrap(), 63);
         db.connection().execute("CREATE TABLE review_pool_dedup_manifests(collision INTEGER)", []).unwrap();
         let error = run_migrations(&db).expect_err("a v64 object collision must fail the entire migration");
@@ -8314,15 +8951,15 @@ mod tests {
             .unwrap();
         assert_eq!(leaked_objects, 0, "failed v64 leaked later tables or triggers");
         db.connection().execute("DROP TABLE review_pool_dedup_manifests", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![64, 65, 66, 67]);
-        assert_eq!(get_current_version(&db).unwrap(), 67);
+        assert_eq!(run_migrations(&db).unwrap(), vec![64, 65, 66, 67, 68, 69]);
+        assert_eq!(get_current_version(&db).unwrap(), 69);
     }
 
     #[test]
     fn v65_partial_migration_failure_is_atomic_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 3).unwrap(), vec![67, 66, 65]);
+        assert_eq!(rollback(&db, 5).unwrap(), vec![69, 68, 67, 66, 65]);
         assert_eq!(get_current_version(&db).unwrap(), 64);
         let v64_trigger_sql: String = db
             .connection()
@@ -8339,8 +8976,8 @@ mod tests {
         assert!(error.to_string().contains("no such trigger"), "unexpected v65 failure: {error}");
         assert_eq!(get_current_version(&db).unwrap(), 64, "failed v65 must not record its migration row");
         db.connection().execute_batch(&v64_trigger_sql).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![65, 66, 67]);
-        assert_eq!(get_current_version(&db).unwrap(), 67);
+        assert_eq!(run_migrations(&db).unwrap(), vec![65, 66, 67, 68, 69]);
+        assert_eq!(get_current_version(&db).unwrap(), 69);
         let v65_trigger_sql: String = db
             .connection()
             .query_row(
@@ -8357,7 +8994,7 @@ mod tests {
     fn v66_review_draft_migration_is_additive_atomic_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 2).unwrap(), vec![67, 66]);
+        assert_eq!(rollback(&db, 4).unwrap(), vec![69, 68, 67, 66]);
         assert_eq!(get_current_version(&db).unwrap(), 65);
         db.connection().execute("CREATE TABLE review_drafts(collision INTEGER)", []).unwrap();
         let error = run_migrations(&db).expect_err("a v66 object collision must fail the entire migration");
@@ -8371,8 +9008,8 @@ mod tests {
             .unwrap();
         assert_eq!(leaked_index, 0, "failed v66 leaked its later index");
         db.connection().execute("DROP TABLE review_drafts", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![66, 67]);
-        assert_eq!(get_current_version(&db).unwrap(), 67);
+        assert_eq!(run_migrations(&db).unwrap(), vec![66, 67, 68, 69]);
+        assert_eq!(get_current_version(&db).unwrap(), 69);
         let strict_sql: String = db
             .connection()
             .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'review_drafts'", [], |row| {
@@ -8386,7 +9023,7 @@ mod tests {
     fn v67_desktop_playback_authority_migration_is_atomic_strict_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 1).unwrap(), vec![67]);
+        assert_eq!(rollback(&db, 3).unwrap(), vec![69, 68, 67]);
         assert_eq!(get_current_version(&db).unwrap(), 66);
 
         db.connection().execute("CREATE TABLE desktop_playback_sessions_v4(collision INTEGER)", []).unwrap();
@@ -8418,8 +9055,8 @@ mod tests {
         assert_eq!(receipt_columns, 0, "failed v67 leaked additive receipt columns");
 
         db.connection().execute("DROP TABLE desktop_playback_sessions_v4", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![67]);
-        assert_eq!(get_current_version(&db).unwrap(), 67);
+        assert_eq!(run_migrations(&db).unwrap(), vec![67, 68, 69]);
+        assert_eq!(get_current_version(&db).unwrap(), 69);
         let paid_identity_trigger: String = db
             .connection()
             .query_row(
@@ -8457,7 +9094,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(rollback(&db, 1).unwrap(), vec![67]);
+        assert_eq!(rollback(&db, 3).unwrap(), vec![69, 68, 67]);
         assert_eq!(
             db.connection()
                 .query_row(
@@ -8476,8 +9113,518 @@ mod tests {
             66,
             "a never-finalized playback attempt is ephemeral and must not make schema 67 irreversible",
         );
-        assert_eq!(run_migrations(&db).unwrap(), vec![67]);
-        assert_eq!(get_current_version(&db).unwrap(), 67);
+        assert_eq!(run_migrations(&db).unwrap(), vec![67, 68, 69]);
+        assert_eq!(get_current_version(&db).unwrap(), 69);
+    }
+
+    #[test]
+    fn v68_batch_item_authority_is_strict_exact_append_only_and_rollback_guarded() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(rollback(&db, 1).unwrap(), vec![69], "this test isolates the v68 migration");
+        assert_eq!(get_current_version(&db).unwrap(), 68);
+        let conn = db.connection();
+
+        let strict: i64 = conn
+            .query_row("SELECT strict FROM pragma_table_list WHERE name='batch_job_items_v1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(strict, 1);
+
+        conn.execute(
+            "INSERT INTO speech_segments(id,audio_path,duration_ms)
+             VALUES ('revision-bound-segment','C:/proof/revision.wav',1000)",
+            [],
+        )
+        .unwrap();
+        let revision = || {
+            conn.query_row("SELECT review_revision FROM speech_segments WHERE id='revision-bound-segment'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(revision(), 0);
+        conn.execute(
+            "INSERT INTO segment_hypotheses(segment_id,model_id,transcript)
+             VALUES ('revision-bound-segment','model-a','draft-a')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(revision(), 1, "hypothesis insertion must advance the segment CAS authority");
+        conn.execute(
+            "UPDATE segment_hypotheses SET transcript='draft-b'
+              WHERE segment_id='revision-bound-segment' AND model_id='model-a'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(revision(), 2, "hypothesis replacement must advance the segment CAS authority");
+        conn.execute(
+            "DELETE FROM segment_hypotheses
+              WHERE segment_id='revision-bound-segment' AND model_id='model-a'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(revision(), 3, "hypothesis deletion must advance the segment CAS authority");
+
+        // SQLite rowid tables historically permit NULL in a non-INTEGER PRIMARY KEY. Every UUID
+        // predicate also evaluates to NULL for a NULL value, so type checks are required to keep an
+        // unaddressable header from permanently occupying the one-live-batch index.
+        let null_identity_payload = serde_json::json!({
+            "schema": 1,
+            "operationId": serde_json::Value::Null,
+            "kind": "batch_transcribe_v1",
+            "requestSha256": "a".repeat(64),
+            "configSha256": "b".repeat(64),
+            "executorGitSha": "1".repeat(40),
+            "attemptGeneration": 1,
+            "executorTokenSha256": "2".repeat(64),
+        })
+        .to_string();
+        assert!(conn
+            .execute(
+                "INSERT INTO jobs(id,kind,state,idempotency_key,total,payload_json)
+                 VALUES (NULL,'batch_transcribe_v1','queued',NULL,1,?1)",
+                [null_identity_payload],
+            )
+            .is_err());
+
+        let operation_id = "00000000-0000-4000-8000-000000000068";
+        let payload = serde_json::json!({
+            "schema": 1,
+            "operationId": operation_id,
+            "kind": "batch_transcribe_v1",
+            "requestSha256": "a".repeat(64),
+            "configSha256": "b".repeat(64),
+            "executorGitSha": "1".repeat(40),
+            "attemptGeneration": 1,
+            "executorTokenSha256": "2".repeat(64),
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO jobs(id,kind,state,idempotency_key,total,payload_json)
+             VALUES (?1,'batch_transcribe_v1','queued',?2,2,?3)",
+            params![operation_id, format!("batch-v1:{operation_id}"), payload],
+        )
+        .unwrap();
+
+        let rewritten_executor_payload = serde_json::json!({
+            "schema": 1,
+            "operationId": operation_id,
+            "kind": "batch_transcribe_v1",
+            "requestSha256": "a".repeat(64),
+            "configSha256": "b".repeat(64),
+            "executorGitSha": "1".repeat(40),
+            "attemptGeneration": 2,
+            "executorTokenSha256": "9".repeat(64),
+        })
+        .to_string();
+        assert!(
+            conn.execute(
+                "UPDATE jobs SET payload_json=?2 WHERE id=?1",
+                params![operation_id, rewritten_executor_payload],
+            )
+            .is_err(),
+            "executor provenance must be byte-immutable after durable admission"
+        );
+
+        assert!(conn
+            .execute("UPDATE jobs SET state='running', started_at=datetime('now') WHERE id=?1", params![operation_id],)
+            .is_err());
+
+        for (ordinal, segment_id) in [(0_i64, "segment-a"), (1_i64, "segment-b")] {
+            conn.execute(
+                "INSERT INTO batch_job_items_v1(
+                     job_id,ordinal,segment_id,base_revision,source_identity_sha256,
+                     before_projection_json,before_projection_sha256
+                 ) VALUES (?1,?2,?3,0,?4,?5,?6)",
+                params![
+                    operation_id,
+                    ordinal,
+                    segment_id,
+                    "c".repeat(64),
+                    serde_json::json!({"segmentId": segment_id, "revision": 0}).to_string(),
+                    if ordinal == 0 { "d".repeat(64) } else { "e".repeat(64) },
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute("UPDATE jobs SET state='running', started_at=datetime('now') WHERE id=?1", params![operation_id])
+            .unwrap();
+
+        let second_id = "00000000-0000-4000-8000-000000000069";
+        let second_payload = serde_json::json!({
+            "schema": 1,
+            "operationId": second_id,
+            "kind": "batch_normalize_v1",
+            "requestSha256": "f".repeat(64),
+            "configSha256": "1".repeat(64),
+            "executorGitSha": "2".repeat(40),
+            "attemptGeneration": 1,
+            "executorTokenSha256": "3".repeat(64),
+        })
+        .to_string();
+        assert!(conn
+            .execute(
+                "INSERT INTO jobs(id,kind,state,idempotency_key,total,payload_json)
+                 VALUES (?1,'batch_normalize_v1','queued',?2,1,?3)",
+                params![second_id, format!("batch-v1:{second_id}"), second_payload],
+            )
+            .is_err());
+
+        conn.execute(
+            "UPDATE batch_job_items_v1
+                SET state='applied', after_projection_json=?2, after_projection_sha256=?3,
+                    effect_revision=1, terminal_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+              WHERE job_id=?1 AND ordinal=0",
+            params![
+                operation_id,
+                serde_json::json!({"segmentId": "segment-a", "revision": 1}).to_string(),
+                "2".repeat(64)
+            ],
+        )
+        .unwrap();
+        conn.execute("UPDATE jobs SET completed=1, progress=0.5 WHERE id=?1", params![operation_id]).unwrap();
+        conn.execute(
+            "UPDATE batch_job_items_v1
+                SET state='skipped', result_code='SOURCE_CHANGED',
+                    terminal_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+              WHERE job_id=?1 AND ordinal=1",
+            params![operation_id],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE batch_job_items_v1 SET result_code='REWRITTEN' WHERE job_id=?1 AND ordinal=1",
+                params![operation_id],
+            )
+            .is_err());
+        conn.execute("UPDATE jobs SET completed=2, progress=1.0 WHERE id=?1", params![operation_id]).unwrap();
+        conn.execute(
+            "UPDATE jobs SET state='succeeded', finished_at=datetime('now') WHERE id=?1",
+            params![operation_id],
+        )
+        .unwrap();
+        assert!(conn.execute("DELETE FROM batch_job_items_v1 WHERE job_id=?1", params![operation_id]).is_err());
+        assert!(conn.execute("DELETE FROM jobs WHERE id=?1", params![operation_id]).is_err());
+        assert!(
+            conn.execute(
+                "UPDATE jobs SET completed=0,progress=0,error_code='REWRITTEN' WHERE id=?1",
+                params![operation_id],
+            )
+            .is_err()
+        );
+
+        conn.execute(
+            "INSERT INTO jobs(id,kind,state,total,completed,progress)
+             VALUES ('ordinary','other','running',1,0,0)",
+            [],
+        )
+        .unwrap();
+        assert!(conn.execute("UPDATE jobs SET kind='batch_transcribe_v1' WHERE id='ordinary'", []).is_err());
+
+        let rollback_error = rollback(&db, 1).unwrap_err().to_string();
+        assert!(rollback_error.contains("CHECK constraint failed"), "unexpected rollback refusal: {rollback_error}");
+        assert_eq!(get_current_version(&db).unwrap(), 68);
+
+        let empty = Database::open(":memory:").unwrap();
+        empty.initialize().unwrap();
+        assert_eq!(rollback(&empty, 1).unwrap(), vec![69], "this test isolates the v68 migration");
+        assert_eq!(rollback(&empty, 1).unwrap(), vec![68]);
+        assert_eq!(get_current_version(&empty).unwrap(), 67);
+        assert_eq!(run_migrations(&empty).unwrap(), vec![68, 69]);
+        assert_eq!(get_current_version(&empty).unwrap(), 69);
+    }
+
+    #[test]
+    fn v69_desktop_review_journal_is_strict_complete_ordered_and_rollback_guarded() {
+        use crate::db::{DesktopReviewUndoAuthority, DesktopReviewUndoAvailability, DesktopReviewUndoBlockReason};
+
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(get_current_version(&db).unwrap(), 69);
+        let conn = db.connection();
+
+        for table in ["desktop_review_legacy_actions_v1", "desktop_review_action_events_v1"] {
+            let strict: i64 = conn
+                .query_row("SELECT strict FROM pragma_table_list WHERE name=?1", [table], |row| row.get(0))
+                .unwrap();
+            assert_eq!(strict, 1, "{table} must use SQLite STRICT typing");
+        }
+        for trigger in [
+            "desktop_review_legacy_actions_v1_sealed_insert",
+            "desktop_review_legacy_actions_v1_immutable_update",
+            "desktop_review_legacy_actions_v1_immutable_delete",
+            "desktop_review_action_events_v1_validate_insert",
+            "desktop_review_action_events_v1_immutable_update",
+            "desktop_review_action_events_v1_immutable_delete",
+            "human_decision_effect_events_v69_desktop_action_insert",
+            "review_events_v69_operation_namespace_insert",
+            "human_decision_effect_events_v69_operation_namespace_insert",
+            "human_decision_effect_reversals_v69_desktop_operation_namespace_insert",
+            "human_decision_effect_reversals_v69_desktop_action_insert",
+            "review_flag_effect_events_v69_desktop_action_insert",
+            "review_flag_effect_events_v69_operation_namespace_insert",
+            "review_flag_effect_reversals_v69_operation_namespace_insert",
+            "review_flag_effect_reversals_v69_desktop_action_insert",
+            "independent_review_reversals_v69_operation_namespace_insert",
+            "independent_review_decisions_v69_operation_namespace_insert",
+        ] {
+            let present: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?1", [trigger], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(present, 1, "v69 trigger {trigger} must exist exactly once");
+        }
+        assert_eq!(db.desktop_review_undo_availability().unwrap(), DesktopReviewUndoAvailability::NoHistory);
+
+        conn.execute(
+            "INSERT INTO speech_segments
+                (id,audio_path,raw_transcript,annotated_transcript,verified,verdict,
+                 verdict_transcript,human_decision,corrected_at,review_revision)
+             VALUES
+                ('v69-decision','/v69-decision.wav','served transcript',NULL,1,'human_edit',
+                 'decision transcript','edit','2026-08-22 00:00:00',1)",
+            [],
+        )
+        .unwrap();
+        let decision = insert_effect_event_with_action(&db, None, "v69-decision", None, "desktop", "edit", 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT action_kind,effect_event_id FROM desktop_review_action_events_v1 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+            ("decision".to_string(), decision),
+        );
+        assert!(matches!(
+            db.desktop_review_undo_availability().unwrap(),
+            DesktopReviewUndoAvailability::Available(DesktopReviewUndoAuthority::Decision(authority))
+                if authority.effect_event_id == decision
+        ));
+
+        conn.execute(
+            "INSERT INTO speech_segments(id,audio_path,raw_transcript,review_revision)
+             VALUES ('v69-flag','/v69-flag.wav','machine draft',0)",
+            [],
+        )
+        .unwrap();
+        let flag = insert_flag_effect_event(&db, "v69-flag", 0, None, None, false);
+        conn.execute(
+            "UPDATE speech_segments
+                SET review_revision=1, verdict='escalated', rationale='flagged for review',
+                    escalated=1, human_decision=NULL
+              WHERE id='v69-flag'",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            db.desktop_review_undo_availability().unwrap(),
+            DesktopReviewUndoAvailability::Available(DesktopReviewUndoAuthority::Flag(authority))
+                if authority.effect_event_id == flag
+        ));
+        conn.execute(
+            "INSERT INTO review_flag_effect_reversals(flag_effect_event_id,operation_id) VALUES (?1,?2)",
+            params![flag, "00000000-0000-4000-8000-000000000690"],
+        )
+        .unwrap();
+        assert_eq!(
+            db.desktop_review_undo_availability().unwrap(),
+            DesktopReviewUndoAvailability::Blocked(DesktopReviewUndoBlockReason::LatestFlagUndone)
+        );
+
+        assert!(conn.execute("UPDATE desktop_review_action_events_v1 SET action_kind='flag' WHERE id=1", []).is_err());
+        assert!(conn.execute("DELETE FROM desktop_review_action_events_v1 WHERE id=1", []).is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO desktop_review_legacy_actions_v1(source_kind,effect_event_id) VALUES ('flag',999)",
+                [],
+            )
+            .is_err());
+
+        let rollback_error = rollback(&db, 1).unwrap_err().to_string();
+        assert!(
+            rollback_error.contains("CHECK constraint failed"),
+            "unexpected v69 rollback refusal: {rollback_error}"
+        );
+        assert_eq!(get_current_version(&db).unwrap(), 69);
+
+        let empty = Database::open(":memory:").unwrap();
+        empty.initialize().unwrap();
+        assert_eq!(rollback(&empty, 1).unwrap(), vec![69]);
+        assert_eq!(get_current_version(&empty).unwrap(), 68);
+        assert_eq!(run_migrations(&empty).unwrap(), vec![69]);
+    }
+
+    #[test]
+    fn v69_inverse_operation_namespace_triggers_reject_cross_action_collisions_without_journal_mutation() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+
+        let decision = insert_effect_event_with_action(&db, None, "v69-collision-decision", None, "desktop", "edit", 1);
+        let decision_operation: String = conn
+            .query_row("SELECT operation_id FROM human_decision_effect_events WHERE id=?1", [decision], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let journal_before: i64 =
+            conn.query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get(0)).unwrap();
+        let decision_error = conn
+            .execute(
+                "INSERT INTO human_decision_effect_reversals(effect_event_id,operation_id) VALUES (?1,?2)",
+                params![decision, decision_operation],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(decision_error.contains("belongs to another review action"), "{decision_error}");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM human_decision_effect_reversals", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            journal_before,
+            "a rejected decision inverse must not append journal authority"
+        );
+
+        let flag = insert_flag_effect_event(&db, "v69-collision-flag", 0, None, None, false);
+        let flag_operation: String = conn
+            .query_row("SELECT operation_id FROM review_flag_effect_events WHERE id=?1", [flag], |row| row.get(0))
+            .unwrap();
+        let journal_before: i64 =
+            conn.query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get(0)).unwrap();
+        let flag_error = conn
+            .execute(
+                "INSERT INTO review_flag_effect_reversals(flag_effect_event_id,operation_id) VALUES (?1,?2)",
+                params![flag, flag_operation],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(flag_error.contains("belongs to another review action"), "{flag_error}");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM review_flag_effect_reversals", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            journal_before,
+            "a rejected flag inverse must not append journal authority"
+        );
+    }
+
+    #[test]
+    fn v69_same_timestamp_cross_segment_actions_are_ordered_only_by_journal_id() {
+        use crate::db::{DesktopReviewUndoAuthority, DesktopReviewUndoAvailability};
+
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+        conn.execute_batch(
+            "DROP TRIGGER human_decision_effect_events_v69_desktop_action_insert;
+             DROP TRIGGER review_flag_effect_events_v69_desktop_action_insert;",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO speech_segments
+                (id,audio_path,raw_transcript,annotated_transcript,verified,verdict,
+                 verdict_transcript,human_decision,corrected_at,review_revision)
+             VALUES
+                ('same-time-decision','/same-time-decision.wav','served transcript',NULL,1,'human_edit',
+                 'decision transcript','edit','2026-08-22 00:00:00',1)",
+            [],
+        )
+        .unwrap();
+        let decision = insert_effect_event_with_action(&db, None, "same-time-decision", None, "desktop", "edit", 1);
+        conn.execute(
+            "INSERT INTO speech_segments(id,audio_path,raw_transcript,review_revision)
+             VALUES ('same-time-flag','/same-time-flag.wav','machine draft',0)",
+            [],
+        )
+        .unwrap();
+        let flag = insert_flag_effect_event(&db, "same-time-flag", 0, None, None, false);
+        conn.execute(
+            "UPDATE speech_segments
+                SET review_revision=1, verdict='escalated', rationale='flagged for review',
+                    escalated=1, human_decision=NULL
+              WHERE id='same-time-flag'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id,created_at)
+             VALUES('decision',?1,'2026-08-28T12:00:00.000Z')",
+            [decision],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id,created_at)
+             VALUES('flag',?1,'2026-08-28T12:00:00.000Z')",
+            [flag],
+        )
+        .unwrap();
+
+        db.validate_desktop_review_action_journal().unwrap();
+        assert!(
+            matches!(
+                db.desktop_review_undo_availability().unwrap(),
+                DesktopReviewUndoAvailability::Available(DesktopReviewUndoAuthority::Flag(authority))
+                    if authority.effect_event_id == flag
+            ),
+            "equal wall-clock timestamps must preserve the journal's total action order"
+        );
+    }
+
+    #[test]
+    fn v69_legacy_baseline_prevents_promotion_and_detects_missing_post_boundary_journal_rows() {
+        use crate::db::{DesktopReviewUndoAvailability, DesktopReviewUndoBlockReason};
+
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(rollback(&db, 1).unwrap(), vec![69]);
+        let legacy_decision =
+            insert_effect_event_with_action(&db, None, "legacy-v69-decision", None, "desktop", "accept", 1);
+        let legacy_flag = insert_flag_effect_event(&db, "legacy-v69-flag", 0, None, None, false);
+        db.connection()
+            .execute(
+                "INSERT INTO review_flag_effect_reversals(flag_effect_event_id,operation_id) VALUES (?1,?2)",
+                params![legacy_flag, "00000000-0000-4000-8000-000000000691"],
+            )
+            .unwrap();
+
+        assert_eq!(run_migrations(&db).unwrap(), vec![69]);
+        assert_eq!(
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM desktop_review_legacy_actions_v1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3,
+            "every pre-v69 source action must be enumerated in the sealed baseline"
+        );
+        assert_eq!(
+            db.desktop_review_undo_availability().unwrap(),
+            DesktopReviewUndoAvailability::Blocked(DesktopReviewUndoBlockReason::LegacyHistory)
+        );
+        assert!(
+            db.connection()
+                .execute(
+                    "INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id) VALUES ('decision',?1)",
+                    [legacy_decision],
+                )
+                .is_err(),
+            "a pre-v69 decision cannot be promoted past the conservative barrier"
+        );
+
+        db.connection().execute("DROP TRIGGER human_decision_effect_events_v69_desktop_action_insert", []).unwrap();
+        insert_effect_event_with_action(&db, None, "missing-v69-journal", None, "desktop", "edit", 1);
+        let error = db
+            .validate_desktop_review_action_journal()
+            .expect_err("a post-boundary source action without its journal row must fail closed");
+        assert!(error.to_string().contains("does not exactly match"), "unexpected integrity error: {error}");
     }
 
     #[test]
@@ -8691,8 +9838,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 8).unwrap(),
-            vec![67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 v20 surface"
         );
         let conn = db.connection();
@@ -8755,8 +9902,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 8).unwrap(),
-            vec![67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 v32 surface"
         );
         let conn = db.connection();
@@ -8786,8 +9933,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 8).unwrap(),
-            vec![67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 FK behavior"
         );
         let conn = db.connection();
@@ -8819,8 +9966,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 8).unwrap(),
-            vec![67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 v21 surface"
         );
         let conn = db.connection();
@@ -8860,8 +10007,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 8).unwrap(),
-            vec![67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 FK behavior"
         );
         let conn = db.connection();
@@ -9073,8 +10220,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 8).unwrap(),
-            vec![67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates v46's historical surface"
         );
         assert!(get_current_version(&db).unwrap() >= 46, "v46 must have applied");
@@ -9131,8 +10278,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 11).unwrap(),
-            vec![67, 66, 65, 64, 63, 62, 61, 60, 59, 58, 57],
+            rollback(&db, 13).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58, 57],
             "fixture must return to the v56 schema"
         );
 
@@ -9154,7 +10301,7 @@ mod tests {
             .unwrap();
         let legacy_event_id = db.connection().last_insert_rowid();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
         let cutoff: i64 = db
             .connection()
             .query_row(
@@ -9178,8 +10325,8 @@ mod tests {
         assert_eq!(before.legacy_events_pending_reconciliation, 1);
 
         assert_eq!(
-            rollback(&db, 8).unwrap(),
-            vec![67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "the remainder of this test isolates v57 accounting"
         );
         let (priced_event_id, _) = insert_review_original(&db, "pay-cutoff", "prospective-paid-work", "Sara", "couch");
@@ -9194,8 +10341,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 8).unwrap(),
-            vec![67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates v57's immutable ledger"
         );
         db.insert_segment(&crate::db::SpeechSegment {
@@ -9325,8 +10472,8 @@ mod tests {
             let db = Database::open(":memory:").unwrap();
             db.initialize().unwrap();
             assert_eq!(
-                rollback(&db, 10).unwrap(),
-                vec![67, 66, 65, 64, 63, 62, 61, 60, 59, 58],
+                rollback(&db, 12).unwrap(),
+                vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58],
                 "fixture must target v57 rollback semantics"
             );
             db.insert_segment(&crate::db::SpeechSegment {
@@ -9457,7 +10604,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
         assert_eq!(foreign_key_violation_count(db.connection()), 0);
         let archive_counts: (i64, i64) = db
             .connection()
@@ -9704,7 +10851,7 @@ mod tests {
         // Once an operator separately resolves the unknown class, the same pending migration can
         // safely run and preserve the known orphan. No manual schema surgery or retry flag is needed.
         db.connection().execute("DELETE FROM playback_receipts WHERE segment_id = 'v58-unrelated-orphan'", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
         assert_eq!(foreign_key_violation_count(db.connection()), 0);
         let archived: i64 = db
             .connection()
@@ -9734,11 +10881,11 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
 
         assert_eq!(
-            rollback(&db, 9).unwrap(),
-            vec![67, 66, 65, 64, 63, 62, 61, 60, 59],
+            rollback(&db, 11).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59],
             "the empty v63/v62/v61/v60/v59 layers must be removed before probing v58"
         );
 
@@ -9810,7 +10957,7 @@ mod tests {
 
         // Re-applying v58 after a safe rollback sees valid parents, archives nothing, and leaves both
         // restored children in place. This pins the full up/down/up round trip.
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
         let reapply_counts: (i64, i64, i64, i64) = db
             .connection()
             .query_row(

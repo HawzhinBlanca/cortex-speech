@@ -35,7 +35,7 @@ test.describe('Accessibility smoke tests', () => {
   test('toast notifications have role="alert"', async ({ page }) => {
     await page.goto('/');
 
-    const toastContainer = page.locator('[aria-live="polite"]');
+    const toastContainer = page.locator('div[aria-live="polite"]');
     await expect(toastContainer).toBeAttached();
   });
 

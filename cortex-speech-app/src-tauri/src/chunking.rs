@@ -67,6 +67,29 @@ pub fn merge_word_timestamps(existing: Option<&str>, words: &[crate::aligner::Wo
     }
 }
 
+/// Remove transcript-dependent word timings while preserving source-span metadata and every unrelated
+/// extension key byte-semantically. A new transcript must never inherit word boundaries or alignment
+/// quality calculated for the text it replaced.
+pub fn without_word_timestamps(existing: Option<&str>) -> Option<String> {
+    let source = existing?;
+    match serde_json::from_str::<serde_json::Value>(source) {
+        // Legacy bare arrays contain only word timings, so invalidating them leaves no alignment data.
+        Ok(serde_json::Value::Array(_)) => None,
+        Ok(mut value) if value.is_object() => {
+            let Some(map) = value.as_object_mut() else { return Some(source.to_string()) };
+            if map.remove("words").is_some() {
+                Some(value.to_string())
+            } else {
+                // Avoid rewriting/reordering JSON when there was no transcript-dependent field.
+                Some(source.to_string())
+            }
+        }
+        // Historical malformed/scalar data is not a recognizable word-timing payload. Preserve it;
+        // source binding will still fail closed if it cannot prove a usable clip span.
+        Ok(_) | Err(_) => Some(source.to_string()),
+    }
+}
+
 /// Update a segment's source bounds in its alignment JSON, PRESERVING everything else in the object.
 ///
 /// This used to REBUILD the JSON from `SegmentSourceMeta` (4 fields) and then re-merge one whitelisted
@@ -786,6 +809,32 @@ mod tests {
         assert_eq!(kept.len(), 2, "both word timestamps must survive a bounds edit, not be dropped");
         assert_eq!(kept[0].word, "سڵاو");
         assert_eq!(kept[1].word, "دنیا");
+    }
+
+    #[test]
+    fn transcript_replacement_invalidates_only_word_timings() {
+        let existing = r#"{
+            "source_start_ms":100,
+            "source_end_ms":900,
+            "chunk_index":1,
+            "chunk_count":3,
+            "custom":"keep-me",
+            "words":[{"word":"old","start":0.1,"end":0.2,"confidence":0.9}]
+        }"#;
+        let cleared = without_word_timestamps(Some(existing)).expect("source metadata remains");
+        let value: serde_json::Value = serde_json::from_str(&cleared).unwrap();
+        assert!(value.get("words").is_none());
+        assert_eq!(value["source_start_ms"], 100);
+        assert_eq!(value["source_end_ms"], 900);
+        assert_eq!(value["chunk_index"], 1);
+        assert_eq!(value["chunk_count"], 3);
+        assert_eq!(value["custom"], "keep-me");
+    }
+
+    #[test]
+    fn transcript_replacement_discards_legacy_words_only_array() {
+        assert_eq!(without_word_timestamps(Some(r#"[{"word":"old","start":0.1,"end":0.2}]"#)), None);
+        assert_eq!(without_word_timestamps(None), None);
     }
 
     #[test]

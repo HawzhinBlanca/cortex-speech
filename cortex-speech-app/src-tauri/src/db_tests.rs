@@ -13,6 +13,39 @@ fn make_db() -> Database {
     db
 }
 
+fn make_file_db(path: &Path) -> Database {
+    let db = Database::open(path.to_string_lossy().as_ref()).unwrap();
+    db.initialize().unwrap();
+    db
+}
+
+fn undo_latest_desktop_decision(db: &Database, operation_id: &str) -> AppResult<HumanDecisionUndoOutcome> {
+    let DesktopReviewUndoAvailability::Available(DesktopReviewUndoAuthority::Decision(authority)) =
+        db.desktop_review_undo_availability()?
+    else {
+        return Err(AppError::Validation("test fixture has no current typed desktop Undo authority".into()));
+    };
+    db.undo_latest_desktop_human_decision(&authority, operation_id)
+}
+
+fn current_test_schema_version() -> i64 {
+    crate::migrations::max_supported_version()
+}
+
+fn assert_rollback_to(db: &Database, target_version: i64) {
+    let head = current_test_schema_version();
+    assert!(target_version <= head, "test target v{target_version} is newer than migration head v{head}");
+    let expected = ((target_version + 1)..=head).rev().collect::<Vec<_>>();
+    assert_eq!(crate::migrations::rollback(db, expected.len()).unwrap(), expected);
+    assert_eq!(crate::migrations::get_current_version(db).unwrap(), target_version);
+}
+
+fn assert_upgrade_to_current(db: &Database, source_version: i64) {
+    let expected = ((source_version + 1)..=current_test_schema_version()).collect::<Vec<_>>();
+    assert_eq!(crate::migrations::run_migrations(db).unwrap(), expected);
+    assert_eq!(crate::migrations::get_current_version(db).unwrap(), current_test_schema_version());
+}
+
 #[test]
 fn detached_read_snapshot_cannot_mutate_its_source_database() {
     let temp = tempfile::tempdir().unwrap();
@@ -22,7 +55,10 @@ fn detached_read_snapshot_cannot_mutate_its_source_database() {
         db.initialize().unwrap();
     }
     let snapshot = Database::open_detached_read_snapshot(path.to_str().unwrap()).unwrap();
-    assert_eq!(crate::migrations::validate_applied_history(snapshot.connection()).unwrap(), 67);
+    assert_eq!(
+        crate::migrations::validate_applied_history(snapshot.connection()).unwrap(),
+        current_test_schema_version()
+    );
     snapshot.connection().execute("INSERT INTO settings(key,value) VALUES('must-not-write','x')", []).unwrap();
     assert_eq!(snapshot.integrity_check().unwrap(), "ok", "FTS5 validation runs on the writable private copy");
     drop(snapshot);
@@ -35,6 +71,38 @@ fn detached_read_snapshot_cannot_mutate_its_source_database() {
 }
 
 #[test]
+fn detached_immutable_snapshot_ignores_sibling_journals_and_cannot_mutate_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("immutable-authority.db");
+    {
+        let db = Database::open(path.to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        db.connection().execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;").unwrap();
+    }
+    let wal = PathBuf::from(format!("{}-wal", path.to_string_lossy()));
+    let sentinel = b"not-a-real-wal-proof-sentinel";
+    std::fs::write(&wal, sentinel).unwrap();
+
+    let snapshot = Database::open_detached_immutable_snapshot(&path).unwrap();
+    assert_eq!(
+        crate::migrations::validate_applied_history(snapshot.connection()).unwrap(),
+        current_test_schema_version()
+    );
+    snapshot.connection().execute("INSERT INTO settings(key,value) VALUES('must-not-write','x')", []).unwrap();
+    drop(snapshot);
+
+    assert_eq!(std::fs::read(&wal).unwrap(), sentinel, "immutable snapshot must not consult or alter sibling WAL");
+    assert!(!PathBuf::from(format!("{}-shm", path.to_string_lossy())).exists());
+    std::fs::remove_file(&wal).unwrap();
+    let source = Database::open(path.to_str().unwrap()).unwrap();
+    let persisted: i64 = source
+        .connection()
+        .query_row("SELECT COUNT(*) FROM settings WHERE key='must-not-write'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(persisted, 0);
+}
+
+#[test]
 fn direct_read_only_connection_measures_the_source_but_cannot_write_it() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("query-only.db");
@@ -43,7 +111,10 @@ fn direct_read_only_connection_measures_the_source_but_cannot_write_it() {
         db.initialize().unwrap();
     }
     let reader = Database::open_read_only(path.to_str().unwrap()).unwrap();
-    assert_eq!(crate::migrations::validate_applied_history(reader.connection()).unwrap(), 67);
+    assert_eq!(
+        crate::migrations::validate_applied_history(reader.connection()).unwrap(),
+        current_test_schema_version()
+    );
     assert!(reader.connection().execute("INSERT INTO settings(key,value) VALUES('must-not-write','x')", []).is_err());
     drop(reader);
 
@@ -63,6 +134,58 @@ fn make_segment(id: &str, audio_path: &str) -> SpeechSegment {
         duration_ms: 1000,
         ..SpeechSegment::default()
     }
+}
+
+fn write_relink_test_wav(path: &Path, signal: i16) -> String {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec).unwrap();
+    for index in 0..3_200_i16 {
+        writer.write_sample(signal.wrapping_add(index % 97)).unwrap();
+    }
+    writer.finalize().unwrap();
+    crate::export_bundle::current_canonical_pcm_blake3(path).unwrap()
+}
+
+fn set_relink_segment_hash(db: &Database, segment_id: &str, content_hash: &str) {
+    db.connection()
+        .execute("UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1", params![segment_id, content_hash])
+        .unwrap();
+}
+
+fn insert_relink_source_records(db: &Database, audio_path: &str) -> (String, i64) {
+    let reference_identity = crate::pipeline::source_audio_identity(Path::new(audio_path)).unwrap();
+    db.connection()
+        .execute(
+            "INSERT INTO source_audio_provenance
+                (audio_path, processing, separator_model, timeline_preserved, manifest_path)
+             VALUES (?1, 'neural separation; no cuts', 'separator-v1', 1, 'manifest.json')",
+            params![audio_path],
+        )
+        .unwrap();
+    db.connection()
+        .execute(
+            "INSERT INTO source_transcripts
+                (audio_path, model_id, audio_content_hash, audio_size_bytes, transcript_path, transcript_text)
+             VALUES (?1, 'reference-v1', ?2, ?3, 'reference.txt', 'whole-file reference')",
+            params![audio_path, reference_identity.content_hash, reference_identity.size_bytes],
+        )
+        .unwrap();
+    (reference_identity.content_hash, reference_identity.size_bytes)
+}
+
+fn relink_path_row_count(db: &Database, table: &str, audio_path: &str) -> i64 {
+    let sql = match table {
+        "speech_segments" => "SELECT COUNT(*) FROM speech_segments WHERE audio_path=?1",
+        "source_audio_provenance" => "SELECT COUNT(*) FROM source_audio_provenance WHERE audio_path=?1",
+        "source_transcripts" => "SELECT COUNT(*) FROM source_transcripts WHERE audio_path=?1",
+        _ => panic!("unexpected relink authority table: {table}"),
+    };
+    db.connection().query_row(sql, params![audio_path], |row| row.get(0)).unwrap()
 }
 
 #[test]
@@ -766,7 +889,8 @@ fn redecision_undo_restores_the_database_owned_prior_decision_exactly() {
     let prior = db.get_segment_by_id("s1").unwrap().unwrap();
     db.record_human_decision("s1", "edit", Some("gemini text خۆ"), None).unwrap();
     let second_effect = latest_human_effect_id(&db, "s1");
-    let outcome = db.undo_human_decision(second_effect, None, "00000000-0000-4000-8000-000000000201").unwrap();
+    assert_eq!(latest_human_effect_id(&db, "s1"), second_effect);
+    let outcome = undo_latest_desktop_decision(&db, "00000000-0000-4000-8000-000000000201").unwrap();
     assert!(matches!(outcome, HumanDecisionUndoOutcome::Applied { .. }));
     let restored = db.get_segment_by_id("s1").unwrap().unwrap();
     assert_eq!(restored.human_decision, prior.human_decision);
@@ -1590,6 +1714,8 @@ fn bound_champion_commit_refuses_cross_segment_and_source_drift_without_side_eff
             None,
             Some("external_provider"),
             false,
+            &"d".repeat(64),
+            None,
             &snapshot_a,
         )
         .unwrap_err();
@@ -1617,6 +1743,8 @@ fn bound_champion_commit_refuses_cross_segment_and_source_drift_without_side_eff
             None,
             Some("external_provider"),
             false,
+            &"d".repeat(64),
+            None,
             &snapshot_a,
         )
         .unwrap_err();
@@ -1628,6 +1756,390 @@ fn bound_champion_commit_refuses_cross_segment_and_source_drift_without_side_eff
     assert_eq!(stored_b.raw_transcript, "incumbent b");
     assert_eq!(db.get_hypotheses_for_segment("bound-a").unwrap()[0].transcript, "prior vote a");
     assert_eq!(db.get_hypotheses_for_segment("bound-b").unwrap()[0].transcript, "prior vote b");
+}
+
+#[test]
+fn bound_champion_commit_replaces_stale_transcript_provenance_atomically() {
+    let db = make_db();
+    let mut segment = make_segment("bound-provenance", "/recording.wav");
+    segment.raw_transcript = "old draft".into();
+    segment.normalized_transcript = Some("old normalized".into());
+    segment.decoder_config_hash = Some("a".repeat(64));
+    segment.normalizer_version = Some("legacy-normalizer".into());
+    db.insert_segment(&segment).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+            rusqlite::params![segment.id, "b".repeat(64)],
+        )
+        .unwrap();
+    db.insert_hypothesis(&SegmentHypothesis {
+        segment_id: segment.id.clone(),
+        model_id: "prior-model".into(),
+        transcript: "old vote".into(),
+        confidence: Some(0.2),
+    })
+    .unwrap();
+
+    let source = db.champion_transcription_source_snapshot(&segment.id).unwrap().unwrap();
+    let champion = SegmentHypothesis {
+        segment_id: segment.id.clone(),
+        model_id: "omniasr-wsl-7b".into(),
+        transcript: "new champion draft".into(),
+        confidence: Some(0.97),
+    };
+    let new_config = "c".repeat(64);
+    assert!(db
+        .commit_bound_champion_transcript_if_unreviewed(
+            &champion,
+            None,
+            Some("new refined final"),
+            Some("external_provider"),
+            false,
+            &new_config,
+            Some(crate::pipeline::MACHINE_REVIEW_FINAL_VERSION),
+            &source,
+        )
+        .unwrap());
+
+    let stored = db.get_segment_by_id(&segment.id).unwrap().unwrap();
+    assert_eq!(stored.raw_transcript, "new champion draft");
+    assert_eq!(stored.normalized_transcript.as_deref(), Some("new refined final"));
+    assert_eq!(stored.decoder_config_hash.as_deref(), Some(new_config.as_str()));
+    assert_eq!(stored.normalizer_version.as_deref(), Some(crate::pipeline::MACHINE_REVIEW_FINAL_VERSION));
+    let hypotheses = db.get_hypotheses_for_segment(&segment.id).unwrap();
+    assert_eq!(hypotheses.len(), 1);
+    assert_eq!(hypotheses[0].model_id, champion.model_id);
+    assert_eq!(hypotheses[0].transcript, champion.transcript);
+}
+
+#[test]
+fn bound_champion_history_restores_and_reapplies_exact_hypothesis_authority() {
+    fn stored_hypotheses(db: &Database, segment_id: &str) -> Vec<crate::db::BatchStoredHypothesisV1> {
+        let mut statement = db
+            .connection()
+            .prepare(
+                "SELECT segment_id,model_id,transcript,confidence,model_version_id,created_at
+                   FROM segment_hypotheses WHERE segment_id=?1 ORDER BY model_id",
+            )
+            .unwrap();
+        statement
+            .query_map([segment_id], |row| {
+                Ok(crate::db::BatchStoredHypothesisV1 {
+                    segment_id: row.get(0)?,
+                    model_id: row.get(1)?,
+                    transcript: row.get(2)?,
+                    confidence: row.get(3)?,
+                    model_version_id: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    let db = make_db();
+    let mut segment = make_segment("single-history", "/single-history.wav");
+    segment.raw_transcript = "old machine draft".into();
+    segment.normalized_transcript = Some("old normalized".into());
+    segment.confidence = Some(0.21);
+    segment.confidence_source = Some("old-posterior".into());
+    segment.model_version_id = Some("old-model".into());
+    segment.decoder_config_hash = Some("a".repeat(64));
+    segment.normalizer_version = Some("old-normalizer".into());
+    segment.alignment_json = Some(
+        r#"{"source_start_ms":100,"source_end_ms":900,"chunk_index":0,"chunk_count":1,"custom":"preserve","words":[{"word":"old","start":0.1,"end":0.2,"confidence":0.9}]}"#
+            .into(),
+    );
+    segment.alignment_quality = Some("ctc_forced".into());
+    segment.ctc_score = Some(-0.14);
+    db.insert_segment(&segment).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+            rusqlite::params![segment.id, "b".repeat(64)],
+        )
+        .unwrap();
+    for (model, transcript, confidence) in [("old-a", "old vote a", 0.2), ("old-b", "old vote b", 0.3)] {
+        db.insert_hypothesis(&SegmentHypothesis {
+            segment_id: segment.id.clone(),
+            model_id: model.into(),
+            transcript: transcript.into(),
+            confidence: Some(confidence),
+        })
+        .unwrap();
+    }
+
+    let source = db.champion_transcription_source_snapshot(&segment.id).unwrap().unwrap();
+    let champion = SegmentHypothesis {
+        segment_id: segment.id.clone(),
+        model_id: "new-champion".into(),
+        transcript: "new machine draft".into(),
+        confidence: Some(0.98),
+    };
+    let cleared_alignment = crate::chunking::without_word_timestamps(segment.alignment_json.as_deref());
+    let (before, after) = db
+        .commit_bound_champion_transcript_with_history(
+            &champion,
+            None,
+            Some("new refined final"),
+            Some("external_provider"),
+            false,
+            &"c".repeat(64),
+            Some(crate::pipeline::MACHINE_REVIEW_FINAL_VERSION),
+            cleared_alignment.as_deref(),
+            None,
+            &source,
+        )
+        .unwrap()
+        .expect("unreviewed bound commit");
+    assert!(
+        after.review_revision > before.review_revision,
+        "speech + hypothesis publication must advance the database-owned CAS revision"
+    );
+    assert_eq!(before.hypotheses.len(), 2);
+    assert_eq!(before.hypotheses[0].transcript, "old vote a");
+    assert_eq!(before.hypotheses[1].transcript, "old vote b");
+    // The live endpoint is the `after` side and includes the sole champion hypothesis.
+    assert_eq!(stored_hypotheses(&db, &segment.id), after.hypotheses);
+    assert_eq!(after.hypotheses.len(), 1);
+    assert_eq!(after.segment.raw_transcript, "new machine draft");
+    assert_eq!(after.segment.normalized_transcript.as_deref(), Some("new refined final"));
+    assert_eq!(crate::quality::effective_transcript(&after.segment), "new machine draft");
+    let after_alignment: serde_json::Value =
+        serde_json::from_str(after.segment.alignment_json.as_deref().expect("source metadata remains")).unwrap();
+    assert!(after_alignment.get("words").is_none(), "new text must not inherit old word timings");
+    assert_eq!(after_alignment["custom"], "preserve", "unrelated alignment metadata survives");
+    assert_eq!(after.segment.alignment_quality, None);
+    assert_eq!(after.segment.ctc_score, None);
+
+    let history = crate::history::HistoryManager::new(10);
+    history.record_machine_transcription(before.clone(), after.clone()).unwrap();
+    assert_eq!(history.undo(&db).unwrap(), Some(crate::history::HistoryAction::UpdateSegment));
+    let (restored, restored_revision) = db.get_segment_by_id_with_revision(&segment.id).unwrap().unwrap();
+    assert!(restored_revision > after.review_revision, "Undo restores semantic content as a new monotonic revision");
+    assert_eq!(restored.raw_transcript, before.segment.raw_transcript);
+    assert_eq!(restored.normalized_transcript, before.segment.normalized_transcript);
+    assert_eq!(restored.decoder_config_hash, before.segment.decoder_config_hash);
+    assert_eq!(restored.normalizer_version, before.segment.normalizer_version);
+    assert_eq!(crate::quality::effective_transcript(&restored), "old machine draft");
+    assert_eq!(restored.alignment_json, before.segment.alignment_json);
+    assert_eq!(restored.alignment_quality, before.segment.alignment_quality);
+    assert_eq!(restored.ctc_score, before.segment.ctc_score);
+    assert_eq!(stored_hypotheses(&db, &segment.id), before.hypotheses);
+
+    assert_eq!(history.redo(&db).unwrap(), Some(crate::history::HistoryAction::UpdateSegment));
+    let (reapplied, reapplied_revision) = db.get_segment_by_id_with_revision(&segment.id).unwrap().unwrap();
+    assert!(reapplied_revision > restored_revision, "Redo must rotate to a fresh CAS endpoint");
+    assert_eq!(reapplied.raw_transcript, after.segment.raw_transcript);
+    assert_eq!(reapplied.normalized_transcript, after.segment.normalized_transcript);
+    assert_eq!(reapplied.decoder_config_hash, after.segment.decoder_config_hash);
+    assert_eq!(reapplied.normalizer_version, after.segment.normalizer_version);
+    assert_eq!(crate::quality::effective_transcript(&reapplied), "new machine draft");
+    assert_eq!(reapplied.alignment_json, after.segment.alignment_json);
+    assert_eq!(reapplied.alignment_quality, after.segment.alignment_quality);
+    assert_eq!(reapplied.ctc_score, after.segment.ctc_score);
+    assert_eq!(stored_hypotheses(&db, &segment.id), after.hypotheses);
+
+    assert_eq!(history.undo(&db).unwrap(), Some(crate::history::HistoryAction::UpdateSegment));
+    let (restored_again, restored_again_revision) = db.get_segment_by_id_with_revision(&segment.id).unwrap().unwrap();
+    assert!(restored_again_revision > reapplied_revision, "a second Undo must use the rotated Redo endpoint");
+    assert_eq!(restored_again.raw_transcript, before.segment.raw_transcript);
+    assert_eq!(restored_again.alignment_json, before.segment.alignment_json);
+    assert_eq!(stored_hypotheses(&db, &segment.id), before.hypotheses);
+
+    assert_eq!(history.redo(&db).unwrap(), Some(crate::history::HistoryAction::UpdateSegment));
+    let (reapplied_again, reapplied_again_revision) = db.get_segment_by_id_with_revision(&segment.id).unwrap().unwrap();
+    assert!(reapplied_again_revision > restored_again_revision);
+    assert_eq!(reapplied_again.raw_transcript, after.segment.raw_transcript);
+    assert_eq!(crate::quality::effective_transcript(&reapplied_again), "new machine draft");
+    assert_eq!(reapplied_again.alignment_json, after.segment.alignment_json);
+    assert_eq!(stored_hypotheses(&db, &segment.id), after.hypotheses);
+}
+
+#[test]
+fn bound_champion_history_treats_explicit_full_file_span_as_the_same_null_alignment_source() {
+    let db = make_db();
+    let mut segment = make_segment("single-history-full-file", "/single-history-full-file.wav");
+    segment.raw_transcript = "before".into();
+    assert!(segment.alignment_json.is_none());
+    db.insert_segment(&segment).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+            rusqlite::params![segment.id, "9".repeat(64)],
+        )
+        .unwrap();
+    let source = db.champion_transcription_source_snapshot(&segment.id).unwrap().unwrap();
+    let explicit_span = crate::chunking::SegmentSourceMeta {
+        source_start_ms: 0,
+        source_end_ms: segment.duration_ms,
+        chunk_index: 0,
+        chunk_count: 1,
+    }
+    .to_alignment_json();
+    let aligned = crate::chunking::merge_word_timestamps(
+        Some(&explicit_span),
+        &[crate::aligner::WordTimestamp { word: "after".into(), start: 0.0, end: 0.5, confidence: 0.9 }],
+    );
+    let champion = SegmentHypothesis {
+        segment_id: segment.id.clone(),
+        model_id: "champion-model".into(),
+        transcript: "after".into(),
+        confidence: Some(0.9),
+    };
+    let (before, after) = db
+        .commit_bound_champion_transcript_with_history(
+            &champion,
+            None,
+            None,
+            Some("external_provider"),
+            false,
+            &"8".repeat(64),
+            None,
+            Some(&aligned),
+            Some("ctc_forced"),
+            &source,
+        )
+        .unwrap()
+        .expect("explicit full-file span is the same immutable source as NULL alignment");
+    assert!(before.segment.alignment_json.is_none());
+    assert_eq!(after.segment.alignment_json.as_deref(), Some(aligned.as_str()));
+
+    let history = crate::history::HistoryManager::new(10);
+    history.record_machine_transcription(before, after).unwrap();
+    history.undo(&db).unwrap();
+    assert!(db.get_segment_by_id(&segment.id).unwrap().unwrap().alignment_json.is_none());
+    history.redo(&db).unwrap();
+    assert_eq!(db.get_segment_by_id(&segment.id).unwrap().unwrap().alignment_json.as_deref(), Some(aligned.as_str()));
+}
+
+#[test]
+fn bound_champion_history_refuses_stale_hypothesis_state_without_partial_undo() {
+    let db = make_db();
+    let mut segment = make_segment("single-history-stale", "/single-history-stale.wav");
+    segment.raw_transcript = "before".into();
+    db.insert_segment(&segment).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+            rusqlite::params![segment.id, "d".repeat(64)],
+        )
+        .unwrap();
+    db.insert_hypothesis(&SegmentHypothesis {
+        segment_id: segment.id.clone(),
+        model_id: "before-model".into(),
+        transcript: "before vote".into(),
+        confidence: Some(0.1),
+    })
+    .unwrap();
+    let source = db.champion_transcription_source_snapshot(&segment.id).unwrap().unwrap();
+    let champion = SegmentHypothesis {
+        segment_id: segment.id.clone(),
+        model_id: "champion-model".into(),
+        transcript: "after".into(),
+        confidence: Some(0.9),
+    };
+    let (before, after) = db
+        .commit_bound_champion_transcript_with_history(
+            &champion,
+            None,
+            None,
+            Some("external_provider"),
+            false,
+            &"e".repeat(64),
+            None,
+            None,
+            None,
+            &source,
+        )
+        .unwrap()
+        .unwrap();
+    let history = crate::history::HistoryManager::new(10);
+    history.record_machine_transcription(before, after).unwrap();
+
+    db.insert_hypothesis(&SegmentHypothesis {
+        segment_id: segment.id.clone(),
+        model_id: "later-machine".into(),
+        transcript: "later independent vote".into(),
+        confidence: Some(0.7),
+    })
+    .unwrap();
+    let error = history.undo(&db).unwrap_err();
+    assert!(error.to_string().contains("stale history"), "{error}");
+    let unchanged = db.get_segment_by_id(&segment.id).unwrap().unwrap();
+    assert_eq!(unchanged.raw_transcript, "after");
+    let hypotheses = db.get_hypotheses_for_segment(&segment.id).unwrap();
+    assert_eq!(hypotheses.len(), 2, "failed Undo must preserve both current hypotheses");
+    assert!(history.can_undo(), "a stale failure must retain the exact Undo endpoint for inspection/retry");
+}
+
+#[test]
+fn bound_champion_history_refuses_a_later_human_review_without_mutating_either_authority() {
+    let db = make_db();
+    let mut segment = make_segment("single-history-reviewed", "/single-history-reviewed.wav");
+    segment.raw_transcript = "before".into();
+    db.insert_segment(&segment).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+            rusqlite::params![segment.id, "f".repeat(64)],
+        )
+        .unwrap();
+    db.insert_hypothesis(&SegmentHypothesis {
+        segment_id: segment.id.clone(),
+        model_id: "before-model".into(),
+        transcript: "before vote".into(),
+        confidence: Some(0.2),
+    })
+    .unwrap();
+    let source = db.champion_transcription_source_snapshot(&segment.id).unwrap().unwrap();
+    let champion = SegmentHypothesis {
+        segment_id: segment.id.clone(),
+        model_id: "champion-model".into(),
+        transcript: "after".into(),
+        confidence: Some(0.95),
+    };
+    let (before, after) = db
+        .commit_bound_champion_transcript_with_history(
+            &champion,
+            None,
+            Some("after refined"),
+            Some("external_provider"),
+            false,
+            &"a".repeat(64),
+            Some(crate::pipeline::MACHINE_REVIEW_FINAL_VERSION),
+            None,
+            None,
+            &source,
+        )
+        .unwrap()
+        .unwrap();
+    let history = crate::history::HistoryManager::new(10);
+    history.record_machine_transcription(before, after.clone()).unwrap();
+
+    db.finalize_human_review(&segment.id, "accept", Some("after refined"), Some(1_000), None)
+        .expect("later review is durable human authority");
+    let (reviewed, reviewed_revision) = db.get_segment_by_id_with_revision(&segment.id).unwrap().unwrap();
+    let reviewed_hypotheses = db.get_hypotheses_for_segment(&segment.id).unwrap();
+    assert!(reviewed_revision > after.review_revision);
+    assert!(reviewed.verified);
+    assert_eq!(crate::quality::effective_transcript(&reviewed), "after refined");
+
+    let error = history.undo(&db).unwrap_err();
+    assert!(error.to_string().contains("stale history"), "unexpected refusal: {error}");
+    let (unchanged, unchanged_revision) = db.get_segment_by_id_with_revision(&segment.id).unwrap().unwrap();
+    assert_eq!(unchanged_revision, reviewed_revision, "refused Undo must not even advance the revision");
+    assert!(review_owned_projection_matches(&unchanged, &reviewed));
+    assert_eq!(unchanged.raw_transcript, reviewed.raw_transcript);
+    assert_eq!(unchanged.normalized_transcript, reviewed.normalized_transcript);
+    assert_eq!(crate::quality::effective_transcript(&unchanged), "after refined");
+    assert_eq!(
+        serde_json::to_value(db.get_hypotheses_for_segment(&segment.id).unwrap()).unwrap(),
+        serde_json::to_value(reviewed_hypotheses).unwrap()
+    );
+    assert!(history.can_undo(), "the exact action remains inspectable after a stale human-review refusal");
 }
 
 #[test]
@@ -1974,9 +2486,8 @@ fn exact_human_effect_undo_restores_the_prior_machine_state() {
     db.record_human_decision("cl1", "edit", Some("human gold"), None).unwrap();
     assert_eq!(db.get_segment_by_id("cl1").unwrap().unwrap().verdict.as_deref(), Some("human_edit"));
 
-    let effect_id = latest_human_effect_id(&db, "cl1");
     assert!(matches!(
-        db.undo_human_decision(effect_id, None, "00000000-0000-4000-8000-000000000202").unwrap(),
+        undo_latest_desktop_decision(&db, "00000000-0000-4000-8000-000000000202").unwrap(),
         HumanDecisionUndoOutcome::Applied { .. }
     ));
     let restored = db.get_segment_by_id("cl1").unwrap().unwrap();
@@ -2009,10 +2520,12 @@ fn human_decision_undo_refuses_rationale_drift() {
             [],
         )
         .unwrap();
-    assert!(matches!(
-        db.undo_human_decision(effect_id, None, "00000000-0000-4000-8000-000000000205").unwrap(),
-        HumanDecisionUndoOutcome::Conflict { .. }
-    ));
+    assert_eq!(
+        db.desktop_review_undo_availability().unwrap(),
+        DesktopReviewUndoAvailability::Blocked(DesktopReviewUndoBlockReason::DecisionShadowed),
+        "post-decision rationale drift must suppress the typed Undo target before any write"
+    );
+    assert!(db.undo_human_decision(effect_id, None, "00000000-0000-4000-8000-000000000205").is_err());
     let kept = db.get_segment_by_id("undo-rationale-cas").unwrap().unwrap();
     assert_eq!(kept.human_decision.as_deref(), Some("accept"));
     assert_eq!(kept.rationale.as_deref(), Some("out-of-band rationale"));
@@ -2023,7 +2536,11 @@ fn exact_review_flag_effect_undo_is_idempotent_and_conflict_safe() {
     let db = make_db();
     db.insert_segment(&make_segment("fl1", "/fl1.wav")).unwrap();
     let commit = db
-        .record_review_flag("fl1", "Flagged for second-pass adjudication", "00000000-0000-4000-8000-000000000901")
+        .record_review_flag_for_test(
+            "fl1",
+            "Flagged for second-pass adjudication",
+            "00000000-0000-4000-8000-000000000901",
+        )
         .unwrap();
     let flagged = commit.segment;
     assert!(flagged.escalated && flagged.verdict.as_deref() == Some("escalated"));
@@ -2038,19 +2555,30 @@ fn exact_review_flag_effect_undo_is_idempotent_and_conflict_safe() {
     assert_eq!(un.rationale, None, "the flag rationale must be cleared");
     assert!(matches!(
         db.undo_review_flag(commit.effect_event_id, "00000000-0000-4000-8000-000000000203").unwrap(),
-        HumanFlagUndoOutcome::AlreadyApplied { .. }
+        HumanFlagUndoOutcome::AlreadyApplied
     ));
 
-    // A later human decision wins; the stale flag undo is a no-mutation conflict.
+    // A later human decision wins. Schema-69 global action order now rejects the stale flag inverse
+    // before the row-level conflict path; either way, it is a proven no-mutation refusal.
     db.insert_segment(&make_segment("fl2", "/fl2.wav")).unwrap();
-    let stale = db.record_review_flag("fl2", "flag", "00000000-0000-4000-8000-000000000902").unwrap();
+    let stale = db.record_review_flag_for_test("fl2", "flag", "00000000-0000-4000-8000-000000000902").unwrap();
     db.record_human_decision("fl2", "accept", None, None).unwrap();
-    assert!(matches!(
-        db.undo_review_flag(stale.effect_event_id, "00000000-0000-4000-8000-000000000204").unwrap(),
-        HumanFlagUndoOutcome::Conflict { .. }
-    ));
+    let revision_before = db.segment_review_revision("fl2").unwrap().unwrap();
+    let reversal_count_before: i64 =
+        db.connection().query_row("SELECT COUNT(*) FROM review_flag_effect_reversals", [], |row| row.get(0)).unwrap();
+    let refusal = db
+        .undo_review_flag(stale.effect_event_id, "00000000-0000-4000-8000-000000000204")
+        .expect_err("a flag inverse cannot jump over the newer desktop decision");
+    assert!(refusal.to_string().contains("globally current desktop action"), "{refusal}");
     let kept = db.get_segment_by_id("fl2").unwrap().unwrap();
     assert_eq!(kept.human_decision.as_deref(), Some("accept"), "a human-decided row must be untouched");
+    assert_eq!(db.segment_review_revision("fl2").unwrap(), Some(revision_before));
+    assert_eq!(
+        db.connection()
+            .query_row("SELECT COUNT(*) FROM review_flag_effect_reversals", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        reversal_count_before
+    );
 }
 
 #[test]
@@ -2058,7 +2586,7 @@ fn generic_review_flags_cannot_forge_or_overwrite_the_technical_unusable_namespa
     let db = make_db();
     db.insert_segment(&make_segment("reserved-technical-flag", "/reserved.wav")).unwrap();
     let forged = db
-        .record_review_flag(
+        .record_review_flag_for_test(
             "reserved-technical-flag",
             "technical_unusable:v1:decodeFailed",
             "00000000-0000-4000-8000-000000000921",
@@ -2078,11 +2606,71 @@ fn generic_review_flags_cannot_forge_or_overwrite_the_technical_unusable_namespa
     )
     .unwrap();
     let overwrite = db
-        .record_review_flag("reserved-technical-flag", "generic concern", "00000000-0000-4000-8000-000000000923")
+        .record_review_flag_for_test(
+            "reserved-technical-flag",
+            "generic concern",
+            "00000000-0000-4000-8000-000000000923",
+        )
         .expect_err("a generic flag must not remove an active technical export exclusion");
     assert!(overwrite.to_string().contains("undo its exact effect first"), "{overwrite}");
     let row = db.get_segment_by_id("reserved-technical-flag").unwrap().unwrap();
     assert_eq!(crate::quality::technical_unusable_reason(&row), Some("permissionDenied"));
+}
+
+#[test]
+fn malformed_reserved_technical_flag_corruption_disables_hydration_and_undo_without_mutation() {
+    let db = make_db();
+    db.insert_segment(&make_segment("malformed-technical-flag", "/malformed.wav")).unwrap();
+    let commit = db
+        .record_review_flag_for_test(
+            "malformed-technical-flag",
+            "ordinary generic concern",
+            "00000000-0000-4000-8000-000000000924",
+        )
+        .unwrap();
+    let malformed = format!("{}not-a-closed-reason", crate::quality::TECHNICAL_UNUSABLE_RATIONALE_PREFIX);
+
+    // Simulate on-disk corruption after explicitly removing the append-only trigger. Public write
+    // paths cannot create this row; both read-side hydration and the inverse must still fail closed.
+    db.connection().execute_batch("DROP TRIGGER review_flag_effect_events_immutable_update;").unwrap();
+    db.connection()
+        .execute(
+            "UPDATE review_flag_effect_events SET flag_rationale=?2 WHERE id=?1",
+            rusqlite::params![commit.effect_event_id, malformed],
+        )
+        .unwrap();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET rationale=?2 WHERE id=?1",
+            rusqlite::params!["malformed-technical-flag", malformed],
+        )
+        .unwrap();
+
+    let revision_before = db.segment_review_revision("malformed-technical-flag").unwrap().unwrap();
+    let reversals_before: i64 =
+        db.connection().query_row("SELECT COUNT(*) FROM review_flag_effect_reversals", [], |row| row.get(0)).unwrap();
+    let hydration_error = db
+        .desktop_review_undo_availability()
+        .expect_err("malformed reserved rationale must never hydrate as generic or technical Undo");
+    assert!(
+        hydration_error.to_string().contains("malformed reserved technical rationale"),
+        "unexpected hydration refusal: {hydration_error}"
+    );
+    let undo_error = db
+        .undo_review_flag(commit.effect_event_id, "00000000-0000-4000-8000-000000000925")
+        .expect_err("malformed reserved rationale must refuse the inverse before mutation");
+    assert!(
+        undo_error.to_string().contains("malformed reserved technical rationale"),
+        "unexpected Undo refusal: {undo_error}"
+    );
+    assert_eq!(db.segment_review_revision("malformed-technical-flag").unwrap(), Some(revision_before));
+    assert_eq!(
+        db.connection()
+            .query_row("SELECT COUNT(*) FROM review_flag_effect_reversals", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        reversals_before,
+        "corrupt authority refusal must not append an Undo reversal"
+    );
 }
 
 #[test]
@@ -2099,7 +2687,11 @@ fn review_flag_requires_clean_or_immutable_legacy_human_baseline() {
         )
         .unwrap();
     let error = forged
-        .record_review_flag("flag-unbound", "must not launder this row", "00000000-0000-4000-8000-000000000903")
+        .record_review_flag_for_test(
+            "flag-unbound",
+            "must not launder this row",
+            "00000000-0000-4000-8000-000000000903",
+        )
         .unwrap_err();
     assert!(
         error.to_string().contains("no immutable legacy or decision-effect authority"),
@@ -2133,7 +2725,7 @@ fn review_flag_requires_clean_or_immutable_legacy_human_baseline() {
             "{column} must independently make the baseline unauthorized"
         );
         let error = db
-            .record_review_flag(
+            .record_review_flag_for_test(
                 &segment_id,
                 "must reject every unbound marker",
                 match suffix {
@@ -2155,14 +2747,18 @@ fn review_flag_requires_clean_or_immutable_legacy_human_baseline() {
     }
 
     let legacy = make_db();
-    assert_eq!(crate::migrations::rollback(&legacy, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+    assert_rollback_to(&legacy, 59);
     let mut legacy_reviewed = make_segment("flag-legacy", "/flag-legacy.wav");
     legacy_reviewed.verified = true;
     legacy_reviewed.annotated_transcript = Some("immutable legacy truth".into());
     legacy.insert_segment_full(&legacy_reviewed).unwrap();
-    assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+    assert_upgrade_to_current(&legacy, 59);
     let commit = legacy
-        .record_review_flag("flag-legacy", "legacy row needs adjudication", "00000000-0000-4000-8000-000000000904")
+        .record_review_flag_for_test(
+            "flag-legacy",
+            "legacy row needs adjudication",
+            "00000000-0000-4000-8000-000000000904",
+        )
         .expect("an exact immutable pre-v60 reviewed baseline remains flaggable");
     assert!(commit.segment.escalated);
     assert_eq!(commit.segment.annotated_transcript.as_deref(), Some("immutable legacy truth"));
@@ -2278,7 +2874,7 @@ fn get_segment_by_audio_path_returns_none_when_absent() {
 }
 
 #[test]
-fn open_with_retry_quarantines_db_when_integrity_check_fails_after_open() {
+fn open_with_retry_preserves_corrupt_authority_and_refuses_an_empty_reset() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().join("recover.db");
     {
@@ -2305,18 +2901,24 @@ fn open_with_retry_quarantines_db_when_integrity_check_fails_after_open() {
         assert_ne!(integrity.trim(), "ok", "fixture must reproduce a post-open integrity failure");
     }
 
-    let recovered = Database::open_with_retry(path.to_str().expect("db path")).expect("recover database");
-    recovered.initialize().expect("initialize recovered db");
+    let exact_corrupt_source = std::fs::read(&path).expect("capture corrupt authority");
+    let error = match Database::open_with_retry(path.to_str().expect("db path")) {
+        Ok(_) => panic!("confirmed corruption must never be replaced by an empty library"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("Automatic empty-library recovery is refused"), "{error}");
+    assert_eq!(std::fs::read(&path).expect("original remains"), exact_corrupt_source);
 
-    assert_eq!(recovered.integrity_check().expect("integrity after recovery").trim(), "ok");
-    assert_eq!(recovered.segment_count().expect("fresh segment count"), 0);
-    assert!(
-        std::fs::read_dir(tmp.path())
-            .expect("read temp dir")
-            .flatten()
-            .any(|entry| entry.file_name().to_string_lossy().starts_with("recover.corrupt.")),
-        "corrupt database should be retained as a quarantine file"
-    );
+    let quarantine = std::fs::read_dir(tmp.path())
+        .expect("read temp dir")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|entry| {
+            let name = entry.file_name().unwrap().to_string_lossy();
+            name.starts_with("recover.corrupt.") && !name.ends_with("-wal") && !name.ends_with("-shm")
+        })
+        .expect("complete quarantine copy");
+    assert_eq!(std::fs::read(quarantine).expect("quarantine bytes"), exact_corrupt_source);
 }
 
 #[test]
@@ -2379,29 +2981,82 @@ fn corrupt_backup_path_avoids_same_second_collision() {
 }
 
 #[test]
-fn recover_database_at_quarantines_sqlite_sidecars() {
+fn recover_database_at_copies_exact_sqlite_bundle_without_mutating_source() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().join("recover.db");
     std::fs::write(&path, "main").expect("seed db");
     std::fs::write(sqlite_sidecar_path(&path, "-wal"), "wal").expect("seed wal");
     std::fs::write(sqlite_sidecar_path(&path, "-shm"), "shm").expect("seed shm");
 
-    recover_database_at(path.to_str().expect("db path")).expect("recover database");
+    let quarantine = recover_database_at(path.to_str().expect("db path")).expect("copy database bundle");
 
-    assert!(!path.exists());
-    assert!(!sqlite_sidecar_path(&path, "-wal").exists());
-    assert!(!sqlite_sidecar_path(&path, "-shm").exists());
-
-    let quarantine = std::fs::read_dir(tmp.path())
-        .expect("read temp dir")
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|entry| entry.file_name().unwrap().to_string_lossy().starts_with("recover.corrupt."))
-        .expect("main quarantine file");
+    assert_eq!(std::fs::read_to_string(&path).expect("original main"), "main");
+    assert_eq!(std::fs::read_to_string(sqlite_sidecar_path(&path, "-wal")).expect("original wal"), "wal");
+    assert_eq!(std::fs::read_to_string(sqlite_sidecar_path(&path, "-shm")).expect("original shm"), "shm");
 
     assert_eq!(std::fs::read_to_string(&quarantine).expect("read quarantined main"), "main");
     assert_eq!(std::fs::read_to_string(sqlite_sidecar_path(&quarantine, "-wal")).expect("read quarantined wal"), "wal");
     assert_eq!(std::fs::read_to_string(sqlite_sidecar_path(&quarantine, "-shm")).expect("read quarantined shm"), "shm");
+}
+
+#[test]
+fn recover_database_at_preserves_a_real_committed_wal_generation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("wal-authority.db");
+    let source = rusqlite::Connection::open(&path).expect("open source database");
+    source
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE durable_truth (id INTEGER PRIMARY KEY, transcript TEXT NOT NULL);
+             PRAGMA wal_checkpoint(TRUNCATE);
+             INSERT INTO durable_truth (transcript) VALUES ('committed only in wal');",
+        )
+        .expect("create a committed WAL generation");
+
+    let wal = sqlite_sidecar_path(&path, "-wal");
+    assert!(wal.is_file() && std::fs::metadata(&wal).unwrap().len() > 32, "fixture must retain a real WAL frame");
+    let exact_source_main = std::fs::read(&path).expect("capture source main");
+    let exact_source_wal = std::fs::read(&wal).expect("capture source WAL");
+
+    let quarantine = recover_database_at(path.to_str().expect("db path")).expect("copy live WAL bundle");
+
+    assert_eq!(std::fs::read(&path).expect("source main remains"), exact_source_main);
+    assert_eq!(std::fs::read(&wal).expect("source WAL remains"), exact_source_wal);
+    let copied = rusqlite::Connection::open(&quarantine).expect("open copied WAL generation");
+    let transcript: String = copied
+        .query_row("SELECT transcript FROM durable_truth WHERE id = 1", [], |row| row.get(0))
+        .expect("committed WAL row must be visible from the copied authority");
+    assert_eq!(transcript, "committed only in wal");
+}
+
+#[test]
+fn quarantine_copy_failure_never_moves_the_main_or_strands_the_wal() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("recover.db");
+    let backup = tmp.path().join("recover.corrupt.injected");
+    std::fs::write(&path, "main").expect("seed db");
+    std::fs::write(sqlite_sidecar_path(&path, "-wal"), "committed wal").expect("seed wal");
+    std::fs::write(sqlite_sidecar_path(&path, "-shm"), "shm").expect("seed shm");
+
+    let result = copy_database_bundle_with(&path, &backup, |source, destination| {
+        if source == sqlite_sidecar_path(&path, "-wal") {
+            return Err(std::io::Error::other("injected WAL sharing violation"));
+        }
+        std::fs::copy(source, destination).map(|_| ())
+    });
+    assert!(result.is_err(), "the injected WAL copy failure must abort quarantine");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "main");
+    assert_eq!(std::fs::read_to_string(sqlite_sidecar_path(&path, "-wal")).unwrap(), "committed wal");
+    assert_eq!(std::fs::read_to_string(sqlite_sidecar_path(&path, "-shm")).unwrap(), "shm");
+    assert!(!backup.exists(), "a partial staging copy must never publish a complete quarantine marker");
+    let residue: Vec<String> = std::fs::read_dir(tmp.path())
+        .expect("read quarantine directory")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("quarantine-staging") || name.starts_with("recover.corrupt.injected"))
+        .collect();
+    assert!(residue.is_empty(), "a failed copy must clean private staging and publish nothing: {residue:?}");
 }
 
 #[test]
@@ -3466,7 +4121,7 @@ fn restore_stages_pending_migrations_and_foreign_keys_before_overwriting_live_da
     {
         let candidate = Database::open(migration_fail_path.to_str().unwrap()).unwrap();
         candidate.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&candidate, 10).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60, 59, 58]);
+        assert_rollback_to(&candidate, 57);
         candidate
             .connection()
             .execute_batch(
@@ -3633,18 +4288,22 @@ fn restore_of_an_older_snapshot_migrates_it_forward_to_head() {
 
 #[test]
 fn audio_health_detects_missing_and_relink_repoints_by_basename() {
-    // P3.3: a moved/renamed source file becomes "missing"; pointing relink at the new folder
-    // repoints every segment on that path (basename match).
+    // A basename only locates the candidate. Publication is authorized by the identical canonical
+    // decoded-PCM hash stored on every segment, and all source-keyed rows move together.
     let tmp = tempfile::TempDir::new().unwrap();
     let src = tmp.path().join("clip.wav");
-    std::fs::write(&src, b"audio").unwrap();
-    let db = make_db();
+    let content_hash = write_relink_test_wav(&src, 700);
+    let old_path = src.to_str().unwrap();
+    let db_path = tmp.path().join("relink-success.db");
+    let db = make_file_db(&db_path);
     for id in ["a", "b"] {
-        db.insert_segment(&make_segment(id, &src.to_string_lossy())).unwrap();
+        db.insert_segment(&make_segment(id, old_path)).unwrap();
+        set_relink_segment_hash(&db, id, &content_hash);
     }
+    let expected_reference_identity = insert_relink_source_records(&db, old_path);
     assert_eq!(db.audio_health().unwrap().missing_files, 0, "present file -> healthy");
 
-    // Owner reorganizes: move the file to a new folder (same name).
+    // Owner reorganizes: the exact file moves to a new folder under the same name.
     let newdir = tmp.path().join("moved");
     std::fs::create_dir(&newdir).unwrap();
     let moved = newdir.join("clip.wav");
@@ -3654,15 +4313,236 @@ fn audio_health_detects_missing_and_relink_repoints_by_basename() {
     assert_eq!(health.total_files, 1, "two segments, one distinct source file");
     assert_eq!(health.missing_files, 1, "the moved file is missing");
 
-    let result = db.relink_audio(&newdir).unwrap();
+    let mut table_updates = Vec::new();
+    let result = db
+        .relink_audio_with_test_hook(&newdir, |table| {
+            let synchronous: i64 = db.connection().query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+            assert_eq!(synchronous, 2, "every authority table moves under SQLite FULL durability");
+            table_updates.push(table);
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(result.relinked, 1);
     assert_eq!(result.still_missing, 0);
+    assert_eq!(table_updates, ["speech_segments", "source_audio_provenance", "source_transcripts"]);
     assert_eq!(db.audio_health().unwrap().missing_files, 0, "relinked -> healthy");
     assert_eq!(
         db.get_segment_by_id("a").unwrap().unwrap().audio_path,
-        moved.to_string_lossy().to_string(),
+        moved.to_str().unwrap(),
         "both segments repointed to the found file"
     );
+    for (table, expected_rows) in [("speech_segments", 2), ("source_audio_provenance", 1), ("source_transcripts", 1)] {
+        assert_eq!(relink_path_row_count(&db, table, old_path), 0, "{table} retained the stale path");
+        assert_eq!(
+            relink_path_row_count(&db, table, moved.to_str().unwrap()),
+            expected_rows,
+            "{table} did not move atomically"
+        );
+    }
+    let moved_reference_identity: (String, i64) = db
+        .connection()
+        .query_row(
+            "SELECT audio_content_hash,audio_size_bytes FROM source_transcripts WHERE audio_path=?1",
+            params![moved.to_str().unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(moved_reference_identity, expected_reference_identity, "raw reference identity is preserved");
+    let current_reference_identity = crate::pipeline::source_audio_identity(&moved).unwrap();
+    assert_eq!(
+        moved_reference_identity,
+        (current_reference_identity.content_hash, current_reference_identity.size_bytes),
+        "the moved reference still identifies the exact encoded source bytes"
+    );
+    let synchronous: i64 = db.connection().query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap();
+    assert_eq!(synchronous, 1, "successful relink restores the normal connection mode");
+
+    let replay = db.relink_audio(&newdir).unwrap();
+    assert_eq!(replay.relinked, 0, "a lost-response retry cannot duplicate an already committed move");
+    assert_eq!(replay.still_missing, 0);
+    drop(db);
+    let reopened = make_file_db(&db_path);
+    for (table, expected_rows) in [("speech_segments", 2), ("source_audio_provenance", 1), ("source_transcripts", 1)] {
+        assert_eq!(relink_path_row_count(&reopened, table, old_path), 0, "{table} reverted after reopen");
+        assert_eq!(relink_path_row_count(&reopened, table, moved.to_str().unwrap()), expected_rows);
+    }
+}
+
+#[test]
+fn audio_health_treats_a_directory_at_the_recorded_audio_path_as_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory_disguised_as_audio = temp.path().join("clip.wav");
+    std::fs::create_dir(&directory_disguised_as_audio).unwrap();
+    let db = make_db();
+    db.insert_segment(&make_segment("directory-is-not-audio", directory_disguised_as_audio.to_str().unwrap())).unwrap();
+
+    let health = db.audio_health().unwrap();
+    assert_eq!(health.total_files, 1);
+    assert_eq!(health.missing_files, 1);
+    assert_eq!(health.missing_paths, [directory_disguised_as_audio.to_str().unwrap().to_string()]);
+}
+
+#[test]
+fn relink_rejects_wrong_same_basename_audio_without_moving_any_authority() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let old_dir = tmp.path().join("old");
+    let candidate_dir = tmp.path().join("candidate");
+    std::fs::create_dir_all(&old_dir).unwrap();
+    std::fs::create_dir_all(&candidate_dir).unwrap();
+    let old = old_dir.join("interview.wav");
+    let expected_hash = write_relink_test_wav(&old, 100);
+    let old_path = old.to_str().unwrap();
+    let db = make_db();
+    db.insert_segment(&make_segment("wrong-name", old_path)).unwrap();
+    set_relink_segment_hash(&db, "wrong-name", &expected_hash);
+    let _ = insert_relink_source_records(&db, old_path);
+    std::fs::remove_file(&old).unwrap();
+
+    let candidate = candidate_dir.join("interview.wav");
+    let candidate_hash = write_relink_test_wav(&candidate, 900);
+    assert_ne!(candidate_hash, expected_hash, "the drill must use different decoded audio");
+    let error = db.relink_audio(&candidate_dir).unwrap_err();
+    assert!(error.to_string().contains("different audio"), "{error}");
+
+    for table in ["speech_segments", "source_audio_provenance", "source_transcripts"] {
+        assert!(relink_path_row_count(&db, table, old_path) > 0, "{table} lost its original path");
+        assert_eq!(
+            relink_path_row_count(&db, table, candidate.to_str().unwrap()),
+            0,
+            "{table} accepted the wrong same-basename recording"
+        );
+    }
+}
+
+#[test]
+fn relink_rejects_source_with_no_stored_pcm_authority() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let candidate_dir = tmp.path().join("candidate");
+    std::fs::create_dir(&candidate_dir).unwrap();
+    write_relink_test_wav(&candidate_dir.join("clip.wav"), 500);
+    let old_path = tmp.path().join("gone").join("clip.wav");
+    let db = make_db();
+    db.insert_segment(&make_segment("no-authority", old_path.to_str().unwrap())).unwrap();
+
+    let error = db.relink_audio(&candidate_dir).unwrap_err();
+    assert!(error.to_string().contains("without canonical decoded-PCM identity"), "{error}");
+    assert_eq!(db.get_segment_by_id("no-authority").unwrap().unwrap().audio_path, old_path.to_str().unwrap());
+}
+
+#[test]
+fn relink_rejects_any_missing_blank_or_noncanonical_sibling_pcm_authority() {
+    for (case, stored_hash) in [("missing", None), ("blank", Some("")), ("malformed", Some("ABCDEF"))] {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let candidate_dir = tmp.path().join("candidate");
+        std::fs::create_dir(&candidate_dir).unwrap();
+        let trusted_hash = write_relink_test_wav(&candidate_dir.join("clip.wav"), 500);
+        let old_path = tmp.path().join("gone").join("clip.wav");
+        let db = make_db();
+        let trusted_id = format!("trusted-{case}");
+        db.insert_segment(&make_segment(&trusted_id, old_path.to_str().unwrap())).unwrap();
+        set_relink_segment_hash(&db, &trusted_id, &trusted_hash);
+        db.insert_segment(&make_segment(case, old_path.to_str().unwrap())).unwrap();
+        if let Some(stored_hash) = stored_hash {
+            db.connection()
+                .execute("UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1", params![case, stored_hash])
+                .unwrap();
+        }
+
+        let error = db.relink_audio(&candidate_dir).unwrap_err();
+        assert!(error.to_string().contains("canonical decoded-PCM identity"), "{case}: {error}");
+        assert_eq!(db.get_segment_by_id(&trusted_id).unwrap().unwrap().audio_path, old_path.to_str().unwrap());
+        assert_eq!(db.get_segment_by_id(case).unwrap().unwrap().audio_path, old_path.to_str().unwrap());
+    }
+}
+
+#[test]
+fn relink_rejects_conflicting_segment_pcm_authority() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let candidate_dir = tmp.path().join("candidate");
+    std::fs::create_dir(&candidate_dir).unwrap();
+    let expected_hash = write_relink_test_wav(&candidate_dir.join("clip.wav"), 321);
+    let old_path = tmp.path().join("gone").join("clip.wav");
+    let db = make_db();
+    for id in ["conflict-a", "conflict-b"] {
+        db.insert_segment(&make_segment(id, old_path.to_str().unwrap())).unwrap();
+    }
+    set_relink_segment_hash(&db, "conflict-a", &expected_hash);
+    set_relink_segment_hash(&db, "conflict-b", &"f".repeat(64));
+
+    let error = db.relink_audio(&candidate_dir).unwrap_err();
+    assert!(error.to_string().contains("conflicting decoded-PCM identities"), "{error}");
+    assert_eq!(relink_path_row_count(&db, "speech_segments", old_path.to_str().unwrap()), 2);
+    assert_eq!(relink_path_row_count(&db, "speech_segments", candidate_dir.join("clip.wav").to_str().unwrap()), 0);
+}
+
+#[test]
+fn relink_injected_failure_after_each_authority_update_rolls_back_every_path() {
+    for fail_after in ["speech_segments", "source_audio_provenance", "source_transcripts"] {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let old = tmp.path().join("clip.wav");
+        let content_hash = write_relink_test_wav(&old, 777);
+        let old_path = old.to_str().unwrap();
+        let db_path = tmp.path().join(format!("relink-fault-{fail_after}.db"));
+        let db = make_file_db(&db_path);
+        db.insert_segment(&make_segment("atomic-relink", old_path)).unwrap();
+        set_relink_segment_hash(&db, "atomic-relink", &content_hash);
+        let _ = insert_relink_source_records(&db, old_path);
+        let before: (String, i64) = db
+            .connection()
+            .query_row("SELECT updated_at, review_revision FROM speech_segments WHERE id='atomic-relink'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+
+        let new_dir = tmp.path().join("moved");
+        std::fs::create_dir(&new_dir).unwrap();
+        let moved = new_dir.join("clip.wav");
+        std::fs::rename(&old, &moved).unwrap();
+        let error = db
+            .relink_audio_with_test_hook(&new_dir, |updated_table| {
+                let synchronous: i64 = db.connection().query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+                assert_eq!(synchronous, 2, "fault point {updated_table} ran outside FULL durability");
+                if updated_table == fail_after {
+                    Err(AppError::Other(format!("injected failure after {fail_after}")))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("injected failure"), "{fail_after}: {error}");
+
+        for (table, expected_rows) in
+            [("speech_segments", 1), ("source_audio_provenance", 1), ("source_transcripts", 1)]
+        {
+            assert_eq!(
+                relink_path_row_count(&db, table, old_path),
+                expected_rows,
+                "{table} changed after the {fail_after} fault"
+            );
+            assert_eq!(
+                relink_path_row_count(&db, table, moved.to_str().unwrap()),
+                0,
+                "{table} leaked a partial move after the {fail_after} fault"
+            );
+        }
+        let after: (String, i64) = db
+            .connection()
+            .query_row("SELECT updated_at, review_revision FROM speech_segments WHERE id='atomic-relink'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(after, before, "segment metadata/revision also rolls back at {fail_after}");
+        let synchronous: i64 = db.connection().query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap();
+        assert_eq!(synchronous, 1, "failed relink restores the normal connection mode");
+        drop(db);
+        let reopened = make_file_db(&db_path);
+        for (table, expected_rows) in
+            [("speech_segments", 1), ("source_audio_provenance", 1), ("source_transcripts", 1)]
+        {
+            assert_eq!(relink_path_row_count(&reopened, table, old_path), expected_rows);
+            assert_eq!(relink_path_row_count(&reopened, table, moved.to_str().unwrap()), 0);
+        }
+    }
 }
 
 #[test]
@@ -4572,6 +5452,38 @@ fn scoped_audio_identity_publication_refuses_same_path_replacement_and_rolls_bac
     let direct_error = db.set_audio_identity(audio_path, &replacement_identity).unwrap_err();
     assert!(direct_error.to_string().contains("SOURCE_IDENTITY_DRIFT"));
     assert_eq!(db.segment_audio_content_hash("older").unwrap().as_deref(), Some(older_identity.content.as_str()));
+}
+
+#[test]
+fn scoped_audio_identity_accepts_same_content_when_only_the_candidate_bucket_changed() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let audio_path = r"C:\Audio\route-change.wav";
+    db.insert_segment(&SpeechSegment {
+        id: "older-route".into(),
+        audio_path: audio_path.into(),
+        raw_transcript: "same recording".into(),
+        ..SpeechSegment::default()
+    })
+    .unwrap();
+    let content = "e".repeat(64);
+    db.set_audio_identity(audio_path, &crate::fingerprint::AudioIdentity { spectral: 11, content: content.clone() })
+        .unwrap();
+
+    let replay = SpeechSegment {
+        id: "new-route".into(),
+        audio_path: audio_path.into(),
+        raw_transcript: "same recording, recomputed candidate bucket".into(),
+        ..SpeechSegment::default()
+    };
+    db.insert_segments_with_audio_identity_batch(
+        &[replay],
+        &crate::fingerprint::AudioIdentity { spectral: 22, content: content.clone() },
+    )
+    .expect("a candidate-bucket change cannot overrule matching definitive PCM identity");
+
+    assert_eq!(db.segment_audio_content_hash("older-route").unwrap().as_deref(), Some(content.as_str()));
+    assert_eq!(db.segment_audio_content_hash("new-route").unwrap().as_deref(), Some(content.as_str()));
 }
 
 #[test]
@@ -6276,9 +7188,9 @@ fn pilot_hidden_key_reservation_serializes_the_final_two_slots_across_connection
 }
 
 #[test]
-fn schema_v58_upgrades_through_v67_without_reinterpreting_live_baseline_863() {
+fn schema_v58_upgrades_through_current_without_reinterpreting_live_baseline_863() {
     let db = make_db();
-    assert_eq!(crate::migrations::rollback(&db, 9).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60, 59]);
+    assert_rollback_to(&db, 58);
     db.connection()
         .execute(
             "INSERT INTO review_events
@@ -6287,7 +7199,7 @@ fn schema_v58_upgrades_through_v67_without_reinterpreting_live_baseline_863() {
             [],
         )
         .unwrap();
-    assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![59, 60, 61, 62, 63, 64, 65, 66, 67]);
+    assert_upgrade_to_current(&db, 58);
     let policy = "8".repeat(64);
     assert_eq!(
         db.reserve_review_pilot_hidden_keys(&policy, 863, "Sara", &["baseline-863-hidden".into()], 2).unwrap(),
@@ -6366,6 +7278,317 @@ fn undo_and_its_signed_reversal_are_atomic_and_idempotent() {
         })
         .unwrap();
     assert_eq!(count, 2);
+}
+
+#[test]
+fn desktop_undo_availability_requires_the_live_segment_exact_post_decision_state() {
+    let live = make_db();
+    seed_for_provenance(&live, "desktop-undo-live", "served desktop text");
+    live.record_human_decision("desktop-undo-live", "accept", Some("served desktop text"), Some(1_000)).unwrap();
+    assert!(matches!(live.desktop_review_undo_availability().unwrap(), DesktopReviewUndoAvailability::Available(_)));
+
+    live.set_speaker_change_score("desktop-undo-live", 0.25).unwrap();
+    assert!(
+        matches!(live.desktop_review_undo_availability().unwrap(), DesktopReviewUndoAvailability::Available(_)),
+        "unrelated revision advances must not shadow an otherwise exact decision"
+    );
+    live.connection()
+        .execute("UPDATE speech_segments SET verdict_transcript='forged post-state' WHERE id='desktop-undo-live'", [])
+        .unwrap();
+    assert_eq!(
+        live.desktop_review_undo_availability().unwrap(),
+        DesktopReviewUndoAvailability::Blocked(DesktopReviewUndoBlockReason::DecisionShadowed),
+        "a journal row cannot authorize Undo after its exact post-decision fields drift"
+    );
+
+    let missing = make_db();
+    seed_for_provenance(&missing, "desktop-undo-missing", "served desktop text");
+    missing.record_human_decision("desktop-undo-missing", "accept", Some("served desktop text"), Some(1_000)).unwrap();
+    missing
+        .connection()
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DROP TRIGGER speech_segments_v60_review_authority_immutable_delete;
+             DELETE FROM speech_segments WHERE id='desktop-undo-missing';",
+        )
+        .unwrap();
+    assert_eq!(
+        missing.desktop_review_undo_availability().unwrap(),
+        DesktopReviewUndoAvailability::Blocked(DesktopReviewUndoBlockReason::DecisionShadowed),
+        "an orphan journal/effect pair must never expose an Undo target"
+    );
+}
+
+#[test]
+fn desktop_undo_collision_is_zero_mutation_but_phone_inverse_reuse_remains_compatible() {
+    let desktop = make_db();
+    seed_for_provenance(&desktop, "desktop-undo-collision", "served desktop text");
+    desktop
+        .record_human_decision("desktop-undo-collision", "accept", Some("served desktop text"), Some(1_000))
+        .unwrap();
+    let DesktopReviewUndoAvailability::Available(DesktopReviewUndoAuthority::Decision(authority)) =
+        desktop.desktop_review_undo_availability().unwrap()
+    else {
+        panic!("the desktop fixture must expose an exact Undo authority");
+    };
+    let generation_before = desktop.restore_generation_sha256().unwrap();
+    let journal_before: i64 = desktop
+        .connection()
+        .query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get(0))
+        .unwrap();
+    let error = desktop.undo_latest_desktop_human_decision(&authority, &authority.decision_operation_id).unwrap_err();
+    assert!(error.to_string().contains("already bound to another review action"), "{error}");
+    assert_eq!(desktop.restore_generation_sha256().unwrap(), generation_before);
+    assert_eq!(
+        desktop
+            .connection()
+            .query_row("SELECT COUNT(*) FROM human_decision_effect_reversals", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        desktop
+            .connection()
+            .query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        journal_before
+    );
+
+    let phone = make_db();
+    let mut segment = make_segment("phone-inverse-reuse", "/phone-inverse-reuse.wav");
+    segment.raw_transcript = "هەڵە".into();
+    phone.insert_segment(&segment).unwrap();
+    ensure_test_audio_content_hash(&phone, "phone-inverse-reuse");
+    let served_revision = phone.segment_review_revision("phone-inverse-reuse").unwrap().unwrap();
+    let operation_id = "00000000-0000-4000-8000-0000000006c0";
+    phone
+        .record_phone_human_decision_by_at_revision_with_operation(
+            "phone-inverse-reuse",
+            "edit",
+            Some("ڕاست"),
+            "Sara",
+            served_revision,
+            operation_id,
+            &review_operation_payload_hash("phone-inverse-reuse", "edit", "ڕاست", "Sara"),
+        )
+        .unwrap()
+        .unwrap();
+    let effect_id = latest_human_effect_id(&phone, "phone-inverse-reuse");
+    assert!(
+        matches!(
+            phone.undo_human_decision(effect_id, Some("Sara"), operation_id).unwrap(),
+            HumanDecisionUndoOutcome::Applied { .. }
+        ),
+        "the deployed bodyless Couch inverse may reuse its decision operation UUID across tables"
+    );
+}
+
+#[test]
+fn restore_authority_requires_exact_legacy_baseline_and_append_only_desktop_journal_prefix() {
+    fn append_decision(db: &Database, id: &str) {
+        seed_for_provenance(db, id, &format!("served {id}"));
+        db.record_human_decision(id, "accept", Some(&format!("served {id}")), Some(1_000)).unwrap();
+    }
+    fn clone_to(source: &Database, path: &Path) -> Database {
+        source.backup(path).unwrap();
+        Database::open(path.to_string_lossy().as_ref()).unwrap()
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let floor_path = temp.path().join("journal-floor.db");
+    let floor = make_file_db(&floor_path);
+    append_decision(&floor, "journal-floor-a");
+    append_decision(&floor, "journal-floor-b");
+
+    let extension = clone_to(&floor, &temp.path().join("journal-extension.db"));
+    append_decision(&extension, "journal-target-c");
+    crate::restore_service::require_durable_review_history_superset(&floor, &extension)
+        .expect("a valid target may append a new journal suffix");
+
+    let missing = clone_to(&floor, &temp.path().join("journal-missing.db"));
+    missing
+        .connection()
+        .execute_batch(
+            "DROP TRIGGER desktop_review_action_events_v1_immutable_delete;
+             DELETE FROM desktop_review_action_events_v1 WHERE id=(SELECT MIN(id) FROM desktop_review_action_events_v1);",
+        )
+        .unwrap();
+    let error = crate::restore_service::require_durable_review_history_superset(&floor, &missing).unwrap_err();
+    assert!(error.contains("desktop_review_action_events_v1") || error.contains("action journal"), "{error}");
+
+    let retyped = clone_to(&floor, &temp.path().join("journal-retyped.db"));
+    retyped
+        .connection()
+        .execute_batch(
+            "DROP TRIGGER desktop_review_action_events_v1_immutable_update;
+             UPDATE desktop_review_action_events_v1 SET action_kind='flag'
+              WHERE id=(SELECT MIN(id) FROM desktop_review_action_events_v1);",
+        )
+        .unwrap();
+    let error = crate::restore_service::require_durable_review_history_superset(&floor, &retyped).unwrap_err();
+    assert!(error.contains("desktop_review_action_events_v1") || error.contains("action journal"), "{error}");
+
+    let reordered = clone_to(&floor, &temp.path().join("journal-reordered.db"));
+    reordered
+        .connection()
+        .execute_batch(
+            "DROP TRIGGER desktop_review_action_events_v1_immutable_update;
+             UPDATE desktop_review_action_events_v1 SET id=-id;
+             UPDATE desktop_review_action_events_v1
+                SET id=CASE id WHEN -1 THEN 2 WHEN -2 THEN 1 ELSE -id END;",
+        )
+        .unwrap();
+    let error = crate::restore_service::require_durable_review_history_superset(&floor, &reordered).unwrap_err();
+    assert!(error.contains("desktop_review_action_events_v1") || error.contains("action journal"), "{error}");
+
+    let malformed = clone_to(&floor, &temp.path().join("journal-malformed.db"));
+    malformed
+        .connection()
+        .execute_batch(
+            "DROP TRIGGER desktop_review_action_events_v1_validate_insert;
+             INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id)
+             VALUES('flag',9223372036854770000);",
+        )
+        .unwrap();
+    let error = crate::restore_service::validate_restore_target_semantics(&malformed).unwrap_err();
+    assert!(error.contains("desktop review action journal"), "{error}");
+
+    let baseline = make_db();
+    assert_eq!(crate::migrations::rollback(&baseline, 1).unwrap(), vec![69]);
+    append_decision(&baseline, "legacy-baseline-decision");
+    assert_eq!(crate::migrations::run_migrations(&baseline).unwrap(), vec![69]);
+    let pseudo_legacy = clone_to(&baseline, &temp.path().join("pseudo-legacy.db"));
+    pseudo_legacy
+        .connection()
+        .execute_batch(
+            "DROP TRIGGER desktop_review_legacy_actions_v1_sealed_insert;
+             INSERT INTO desktop_review_legacy_actions_v1(source_kind,effect_event_id)
+             VALUES('flag',9223372036854770000);",
+        )
+        .unwrap();
+    let error = crate::restore_service::require_durable_review_history_superset(&baseline, &pseudo_legacy).unwrap_err();
+    assert!(error.contains("pseudo-legacy additions are forbidden"), "{error}");
+}
+
+#[test]
+fn restore_authority_accepts_same_segment_forward_undo_recommit_but_semantics_reject_projection_tampering() {
+    fn clone_to(source: &Database, path: &Path) -> Database {
+        source.backup(path).unwrap();
+        Database::open(path.to_string_lossy().as_ref()).unwrap()
+    }
+    fn commit_finalized_desktop_decision(db: &Database, segment_id: &str, transcript: &str) {
+        db.record_human_decision_by_with_finalize(
+            segment_id,
+            "edit",
+            Some(transcript),
+            Some(1_000),
+            None,
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("the exact finalized desktop decision must commit");
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let floor_path = temp.path().join("same-segment-forward-floor.db");
+    let floor = make_file_db(&floor_path);
+    seed_for_provenance(&floor, "same-segment-forward", "served original text");
+    commit_finalized_desktop_decision(&floor, "same-segment-forward", "first human correction");
+
+    let target = clone_to(&floor, &temp.path().join("same-segment-forward-target.db"));
+    undo_latest_desktop_decision(&target, "00000000-0000-4000-8000-000000000701").unwrap();
+    commit_finalized_desktop_decision(&target, "same-segment-forward", "second human correction");
+
+    crate::restore_service::require_durable_review_history_superset(&floor, &target)
+        .expect("a valid target may extend immutable history while replacing the same segment projection");
+    crate::restore_service::validate_restore_target_semantics(&target)
+        .expect("the extended immutable effect chain must authorize its new terminal projection");
+
+    let tampered = clone_to(&target, &temp.path().join("same-segment-forward-tampered.db"));
+    tampered
+        .connection()
+        .execute(
+            "UPDATE speech_segments
+                SET annotated_transcript='forged unbound transcript'
+              WHERE id='same-segment-forward'",
+            [],
+        )
+        .unwrap();
+    let error = crate::restore_service::validate_restore_target_semantics(&tampered).unwrap_err();
+    assert!(
+        error.contains("unbound human transcript/verification state")
+            || error.contains("latest active human-decision effect"),
+        "current projection tampering must remain fail-closed after removing the false append-only projection check: {error}"
+    );
+}
+
+#[test]
+fn delayed_v68_clones_migrate_to_one_deterministic_legacy_barrier_and_remain_restore_compatible() {
+    let directory = tempfile::tempdir().unwrap();
+    let floor_path = directory.path().join("legacy-floor.db");
+    let floor = make_file_db(&floor_path);
+    assert_eq!(crate::migrations::rollback(&floor, 1).unwrap(), vec![69]);
+    seed_for_provenance(&floor, "legacy-delayed-restore", "served legacy text");
+    floor.record_human_decision("legacy-delayed-restore", "accept", Some("served legacy text"), Some(1_000)).unwrap();
+    let target_path = directory.path().join("legacy-target.db");
+    floor.backup(&target_path).unwrap();
+
+    assert_eq!(crate::migrations::run_migrations(&floor).unwrap(), vec![69]);
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    let target = Database::open(target_path.to_string_lossy().as_ref()).unwrap();
+    assert_eq!(crate::migrations::run_migrations(&target).unwrap(), vec![69]);
+
+    let floor_barrier: (i64, String) = floor
+        .connection()
+        .query_row(
+            "SELECT id,created_at FROM desktop_review_action_events_v1 WHERE action_kind='legacy_barrier'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let target_barrier: (i64, String) = target
+        .connection()
+        .query_row(
+            "SELECT id,created_at FROM desktop_review_action_events_v1 WHERE action_kind='legacy_barrier'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(floor_barrier, (1, "1970-01-01T00:00:00.000Z".to_string()));
+    assert_eq!(target_barrier, floor_barrier);
+    crate::restore_service::require_durable_review_history_superset(&floor, &target)
+        .expect("the same v68 authority migrated at different times must remain restore-compatible");
+}
+
+#[test]
+fn either_v69_desktop_action_table_counts_as_durable_restore_activity() {
+    let baseline = make_db();
+    assert!(!crate::restore_service::has_durable_review_activity(&baseline).unwrap());
+    baseline
+        .connection()
+        .execute_batch(
+            "DROP TRIGGER desktop_review_legacy_actions_v1_sealed_insert;
+             INSERT INTO desktop_review_legacy_actions_v1(source_kind,effect_event_id) VALUES('flag',1);",
+        )
+        .unwrap();
+    assert!(crate::restore_service::has_durable_review_activity(&baseline).unwrap());
+
+    let journal = make_db();
+    journal
+        .connection()
+        .execute_batch(
+            "DROP TRIGGER desktop_review_action_events_v1_validate_insert;
+             INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id) VALUES('flag',1);",
+        )
+        .unwrap();
+    assert!(crate::restore_service::has_durable_review_activity(&journal).unwrap());
 }
 
 #[test]
@@ -6626,7 +7849,8 @@ fn deletion_is_allowed_only_for_authority_free_segments() {
     assert!(db.get_segment_by_id("delete-clean").unwrap().is_none());
 
     db.insert_segment(&make_segment("delete-flag", "/delete-flag.wav")).unwrap();
-    db.record_review_flag("delete-flag", "human escalation evidence", "00000000-0000-4000-8000-000000000401").unwrap();
+    db.record_review_flag_for_test("delete-flag", "human escalation evidence", "00000000-0000-4000-8000-000000000401")
+        .unwrap();
     assert_refused(&db, "delete-flag");
 
     insert_playback_segment(&db, "delete-playback", 1_000);
@@ -6667,7 +7891,7 @@ fn deletion_is_allowed_only_for_authority_free_segments() {
     assert_refused(&db, "delete-spot");
 
     let legacy = make_db();
-    assert_eq!(crate::migrations::rollback(&legacy, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+    assert_rollback_to(&legacy, 59);
     let mut reviewed = make_segment("delete-legacy", "/delete-legacy.wav");
     reviewed.verified = true;
     reviewed.human_decision = Some("accept".into());
@@ -6675,7 +7899,7 @@ fn deletion_is_allowed_only_for_authority_free_segments() {
     reviewed.verdict_transcript = Some("legacy truth".into());
     reviewed.annotated_transcript = Some("legacy truth".into());
     legacy.insert_segment_full(&reviewed).unwrap();
-    assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+    assert_upgrade_to_current(&legacy, 59);
     assert_refused(&legacy, "delete-legacy");
 
     db.insert_segment(&make_segment("delete-batch-clean", "/delete-batch-clean.wav")).unwrap();
@@ -7184,7 +8408,7 @@ fn phone_undo_rolls_back_every_effect_when_reversal_insert_fails_then_retries_cl
     );
 }
 #[test]
-fn alignment_cas_never_overwrites_concurrent_boundary_metadata() {
+fn alignment_cas_never_overwrites_concurrent_transcript_or_boundary_metadata() {
     let db = make_db();
     let original = r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":2,"words":[]}"#;
     let concurrent = r#"{"source_start_ms":1000,"source_end_ms":2000,"chunk_index":1,"chunk_count":2,"words":[]}"#;
@@ -7192,18 +8416,33 @@ fn alignment_cas_never_overwrites_concurrent_boundary_metadata() {
     let mut segment = make_segment("align-cas", "/align-cas.wav");
     segment.alignment_json = Some(original.into());
     db.insert_segment(&segment).unwrap();
+    let (_, original_revision) = db.get_segment_by_id_with_revision("align-cas").unwrap().unwrap();
+
+    // Timings belong to the exact transcript read before inference, not merely to the same source
+    // span. A concurrent correction with unchanged alignment metadata must still defeat the CAS.
+    db.connection()
+        .execute("UPDATE speech_segments SET raw_transcript='new authoritative text' WHERE id='align-cas'", [])
+        .unwrap();
+    let changed = db
+        .update_segment_alignment_if_unchanged("align-cas", original_revision, Some(original), inferred, "ctc_forced")
+        .unwrap();
+    assert!(!changed, "stale transcript inference must lose the compare-and-swap");
+    let (_, transcript_revision) = db.get_segment_by_id_with_revision("align-cas").unwrap().unwrap();
 
     // Simulate the boundary editor winning while forced alignment is still running.
     db.update_segment_alignment("align-cas", concurrent, "energy_heuristic").unwrap();
-    let changed =
-        db.update_segment_alignment_if_unchanged("align-cas", Some(original), inferred, "ctc_forced").unwrap();
+    let changed = db
+        .update_segment_alignment_if_unchanged("align-cas", transcript_revision, Some(original), inferred, "ctc_forced")
+        .unwrap();
     assert!(!changed, "stale inference must lose the compare-and-swap");
     let row = db.get_segment_by_id("align-cas").unwrap().unwrap();
     assert_eq!(row.alignment_json.as_deref(), Some(concurrent));
     assert_eq!(row.alignment_quality.as_deref(), Some("energy_heuristic"));
 
-    let applied =
-        db.update_segment_alignment_if_unchanged("align-cas", Some(concurrent), inferred, "ctc_forced").unwrap();
+    let (_, current_revision) = db.get_segment_by_id_with_revision("align-cas").unwrap().unwrap();
+    let applied = db
+        .update_segment_alignment_if_unchanged("align-cas", current_revision, Some(concurrent), inferred, "ctc_forced")
+        .unwrap();
     assert!(applied);
     let row = db.get_segment_by_id("align-cas").unwrap().unwrap();
     assert_eq!(row.alignment_json.as_deref(), Some(inferred));
@@ -7239,6 +8478,31 @@ fn accepting_the_champions_own_text_stays_an_accept() {
     db.record_human_decision("acc-1", "accept", Some("کاک لە ئەمە شتێکی تر"), None).unwrap();
     let seg = db.get_segment_by_id("acc-1").unwrap().unwrap();
     assert_eq!(seg.human_decision.as_deref(), Some("accept"), "a genuine ASR accept must stay an accept");
+}
+
+#[test]
+fn accept_without_explicit_text_never_promotes_a_machine_jury_verdict() {
+    // Legacy/test callers may still omit the text. The fallback must mirror the served Verbatim-Law
+    // baseline, not the spot-check/jury answer-key column merely because it is non-blank.
+    let db = make_db();
+    seed_for_provenance(&db, "accept-machine-verdict", "champion raw");
+    db.connection()
+        .execute(
+            "UPDATE speech_segments
+                SET verdict='jury_accept', verdict_transcript='machine jury proposal'
+              WHERE id='accept-machine-verdict'",
+            [],
+        )
+        .unwrap();
+
+    db.record_human_decision("accept-machine-verdict", "accept", None, None).unwrap();
+    let segment = db.get_segment_by_id("accept-machine-verdict").unwrap().unwrap();
+    assert_eq!(segment.human_decision.as_deref(), Some("accept"));
+    assert_eq!(
+        segment.verdict_transcript.as_deref(),
+        Some("champion raw"),
+        "a machine jury proposal must never become human truth through an omitted accept transcript"
+    );
 }
 
 #[test]
@@ -7663,7 +8927,9 @@ fn desktop_policy4_receipt_is_exact_interval_authority_and_replays_idempotently(
         )
         .unwrap()
         .expect("the exact policy-4 receipt must authorize its current clip");
-    let rollback_error = crate::migrations::rollback(&db, 1)
+    let rollback_count_through_policy4 = usize::try_from(current_test_schema_version() - 66)
+        .expect("migration head must include the schema-67 policy-4 authority");
+    let rollback_error = crate::migrations::rollback(&db, rollback_count_through_policy4)
         .expect_err("a finalized policy-4 receipt is durable evidence and cannot be downgraded away");
     assert!(rollback_error.to_string().contains("CHECK constraint failed"), "{rollback_error}");
     assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 67);
@@ -8362,7 +9628,7 @@ fn desktop_decision_retry_returns_the_original_commit_and_uuid_reuse_or_late_ret
     assert!(reused.to_string().contains("different canonical payload"), "{reused}");
 
     assert!(matches!(
-        db.undo_human_decision(first.effect_event_id, None, "00000000-0000-4000-8000-000000000309",).unwrap(),
+        undo_latest_desktop_decision(&db, "00000000-0000-4000-8000-000000000309").unwrap(),
         HumanDecisionUndoOutcome::Applied { .. }
     ));
     let stale_replay = db
@@ -8411,7 +9677,7 @@ fn desktop_decision_refuses_uuid_already_bound_to_a_review_flag() {
         source_lease: None,
     };
     let operation_id = "21111111-2222-4333-8444-555555555555";
-    db.record_review_flag("desktop-cross-action", "second-pass review", operation_id).unwrap();
+    db.record_review_flag("desktop-cross-action", revision, "second-pass review", operation_id).unwrap();
 
     let error = db
         .finalize_human_review_with_playback(

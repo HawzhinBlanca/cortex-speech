@@ -10,6 +10,8 @@
     chipText: (word: WordTimestamp, index: number) => string;
     confidenceClass: (confidence: number | null | undefined) => string;
     isEdited: (index: number) => boolean;
+    editingDisabled?: boolean;
+    editingDisabledDescriptionId?: string;
     onReplay: () => void;
     onPlay: (word: WordTimestamp) => void;
     onStartEdit: (word: WordTimestamp, index: number) => void;
@@ -24,6 +26,8 @@
     chipText,
     confidenceClass,
     isEdited,
+    editingDisabled = false,
+    editingDisabledDescriptionId,
     onReplay,
     onPlay,
     onStartEdit,
@@ -57,6 +61,8 @@
       type="button"
       class="ring-focus shrink-0 rounded-token px-2 py-1 text-xs text-subtle transition-colors hover:text-default"
       onclick={onReplay}
+      disabled={editingDisabled}
+      aria-describedby={editingDisabled ? editingDisabledDescriptionId : undefined}
     >
       {$t('review.replay')}
     </button>
@@ -76,6 +82,8 @@
           style={`width: ${Math.max(5, chipText(word, index).length + 3)}ch`}
           value={chipText(word, index)}
           aria-label={$t('review.editWordAria')}
+          disabled={editingDisabled}
+          aria-describedby={editingDisabled ? editingDisabledDescriptionId : undefined}
           onblur={(event) =>
             onCommitEdit(index, word, (event.target as HTMLInputElement).value, true)}
           onkeydown={(event) => {
@@ -95,6 +103,8 @@
       {:else}
         <button
           type="button"
+          disabled={editingDisabled}
+          aria-describedby={editingDisabled ? editingDisabledDescriptionId : undefined}
           data-chip={index}
           class="review-word {isEdited(index)
             ? 'word-edited'
@@ -131,6 +141,10 @@
   }
   .review-word:hover {
     background: var(--surface-3);
+  }
+  .review-word:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
   }
   .conf-mid {
     background: color-mix(in srgb, var(--warning) 18%, transparent);

@@ -115,19 +115,20 @@ def test_drafts_never_enter_truth_export_eval_payment_or_serving_queries() -> No
 
 def test_frontend_recovers_without_automatic_merge_or_direct_tauri_access() -> None:
     review = read(REPO / "src" / "lib" / "ReviewMode.svelte")
+    draft = read(REPO / "src" / "lib" / "reviewModeDraft.svelte.ts")
     for required in (
         "api.getReviewDraftV1",
         "api.saveReviewDraftV1",
         "api.deleteReviewDraftV1",
         "draft.baseRevision === baseRevision",
-        "draftConflict = draft",
-        "Never merge human text automatically",
+        "baseline !== state.lastOriginal && draft.text !== baseline",
+        "state.conflict = draft",
         "ReviewDraftWriteCoordinator",
-        "draftWrites.flushAll()",
+        "writes.flushAll()",
     ):
-        if required not in review:
+        if required not in draft:
             raise AssertionError(f"ReviewMode lost draft-recovery behavior: {required}")
-    if "@tauri-apps" in review or "generatedCommands" in review:
+    if "@tauri-apps" in review or "generatedCommands" in review or "@tauri-apps" in draft or "generatedCommands" in draft:
         raise AssertionError("ReviewMode must call domain command adapters, never Tauri/generated IPC directly")
     coordinator = read(REPO / "src" / "lib" / "reviewDraftWriteCoordinator.ts")
     for required in (

@@ -75,48 +75,82 @@ pub async fn run_gold_eval(
 /// Closed-loop gold eval: runs the exact registered WSL7B champion over gold audio and scores the
 /// produced hypotheses. The renderer supplies neither text nor a model label.
 #[tauri::command]
-pub async fn run_gold_eval_asr(state: State<'_, AppState>) -> Result<crate::eval::EvalRunResult, String> {
-    RATE_LIMITER.check("run_gold_eval_asr")?;
-    let mutation = super::begin_mutation()?;
+#[specta::specta]
+pub async fn run_gold_eval_asr(
+    state: State<'_, AppState>,
+) -> Result<crate::ipc_contract::EvalRunResultV1, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER
+        .check("run_gold_eval_asr")
+        .map_err(|_| crate::ipc_contract::owner_analysis_rate_limited("run_gold_eval_asr"))?;
+    let mutation = super::begin_mutation().map_err(|error| {
+        tracing::warn!("Owner gold evaluation admission failed: {error}");
+        crate::ipc_contract::public_gold_eval_error(&error)
+    })?;
     // Clone the pipeline so the (potentially long) ASR loop does not hold the pipeline lock, and run
     // it OFF the main thread.
     let pipeline = state.lock_pipeline().clone();
-    run_blocking(move || {
+    let result = run_blocking(move || {
         let _mutation = mutation;
         pipeline.run_gold_eval_asr().map_err(|e| e.to_string())
     })
-    .await
+    .await;
+    result.map(crate::ipc_contract::EvalRunResultV1::from).map_err(|error| {
+        tracing::warn!("Owner gold evaluation failed: {error}");
+        crate::ipc_contract::public_gold_eval_error(&error)
+    })
 }
 
 /// Turn the human-corrected segments of one source file into a holdout GOLD benchmark entry. Run it
 /// after correcting a file in the Review inbox: it concatenates the corrected transcripts into the
 /// gold reference (excluded from all training). Returns the number of gold rows created.
 #[tauri::command]
-pub async fn create_gold_from_file(audio_path: String, state: State<'_, AppState>) -> Result<usize, String> {
-    STRICT_RATE_LIMITER.check("create_gold_from_file")?;
+#[specta::specta]
+pub async fn create_gold_from_file(
+    audio_path: String,
+    state: State<'_, AppState>,
+) -> Result<usize, crate::ipc_contract::CommandErrorV1> {
+    STRICT_RATE_LIMITER
+        .check("create_gold_from_file")
+        .map_err(|_| crate::ipc_contract::owner_critical_rate_limited("create_gold_from_file"))?;
     if audio_path.contains('\0') {
-        return Err("Audio path contains null bytes".to_string());
+        return Err(crate::ipc_contract::invalid_gold_audio_path_error());
     }
     let database = state.db_runtime();
-    run_blocking(move || {
-        let mutation = database.begin_mutation()?;
+    let result = run_blocking(move || {
+        let mutation = database.begin_mutation().map_err(|error| error.to_string())?;
         let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
         crate::eval::create_gold_from_verified_file(&db, &audio_path).map_err(|e| e.to_string())
     })
-    .await
+    .await;
+    result.map_err(|error| {
+        tracing::warn!("Owner create-gold command failed: {error}");
+        crate::ipc_contract::public_owner_data_error(crate::ipc_contract::OwnerDataOperationV1::CreateGold, &error)
+    })
 }
 
 /// M2.7 / P1.6: bulk-promote every reviewed source file into the gold set. Returns rows created.
 #[tauri::command]
-pub async fn import_verified_segments_as_gold(state: State<'_, AppState>) -> Result<usize, String> {
-    STRICT_RATE_LIMITER.check("import_verified_segments_as_gold")?;
+#[specta::specta]
+pub async fn import_verified_segments_as_gold(
+    state: State<'_, AppState>,
+) -> Result<usize, crate::ipc_contract::CommandErrorV1> {
+    STRICT_RATE_LIMITER
+        .check("import_verified_segments_as_gold")
+        .map_err(|_| crate::ipc_contract::owner_critical_rate_limited("import_verified_segments_as_gold"))?;
     let database = state.db_runtime();
-    run_blocking(move || {
-        let mutation = database.begin_mutation()?;
+    let result = run_blocking(move || {
+        let mutation = database.begin_mutation().map_err(|error| error.to_string())?;
         let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
         crate::eval::import_verified_segments_as_gold(&db).map_err(|e| e.to_string())
     })
-    .await
+    .await;
+    result.map_err(|error| {
+        tracing::warn!("Owner verified-gold import command failed: {error}");
+        crate::ipc_contract::public_owner_data_error(
+            crate::ipc_contract::OwnerDataOperationV1::ImportVerifiedGold,
+            &error,
+        )
+    })
 }
 
 #[cfg(test)]

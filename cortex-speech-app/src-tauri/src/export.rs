@@ -1023,12 +1023,10 @@ pub(crate) fn write_sha256sums(dir: &std::path::Path) -> AppResult<()> {
 }
 
 /// Like `write_sha256sums` but covers ONLY the named files (relative to `dir`) instead of scanning the
-/// whole directory. `write_sha256sums`'s whole-dir scan is correct for exporters that stage into a CLEAN
-/// dir, but the audio export writes into a caller-chosen dir it does not stage: a re-export of a smaller
-/// selection leaves ORPHAN clips from a prior run, and a whole-dir manifest would then vouch for a stale
-/// clip that this export's metadata.csv omits — an integrity manifest asserting a file the dataset itself
-/// does not list (sibling of the bundle orphan-source fix). Pass the export's own file list so the
-/// manifest describes exactly this dataset. Missing entries are skipped; `SHA256SUMS` is never self-listed.
+/// whole directory. The reviewed-audio exporter passes the same explicit inventory to its staged-tree
+/// verifier and public result, so the command result, metadata and integrity manifest cannot drift.
+/// Missing entries are skipped here for compatibility with other callers; the reviewed-audio verifier
+/// immediately rejects any such omission before publication. `SHA256SUMS` is never self-listed.
 pub(crate) fn write_sha256sums_for(dir: &std::path::Path, rel_files: &[String]) -> AppResult<()> {
     let mut files: Vec<(String, String)> = Vec::new();
     for rel in rel_files {
@@ -1358,8 +1356,8 @@ pub fn export_huggingface_dataset(
                             false,
                         )? {
                             tracing::warn!(
-                                    "Skipping segment {} in HF export: machine training-ready row is missing multi-model hypothesis coverage, ready agentic promotion coverage, or configured source-reference model coverage/current audio identity",
-                                    seg.id
+                                "Skipping segment {} in HF export: machine training-ready row is missing multi-model hypothesis coverage, ready agentic promotion coverage, or configured source-reference model coverage/current audio identity",
+                                seg.id
                             );
                             continue;
                         }

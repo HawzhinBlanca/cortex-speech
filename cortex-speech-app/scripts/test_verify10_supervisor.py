@@ -31,6 +31,7 @@ VERIFY = REPO_ROOT / "scripts" / "verify_10.py"
 SUPERVISOR = REPO_ROOT / "scripts" / "verify10_supervisor.py"
 ASSERT_RAN = REPO_ROOT / "cortex-speech-app" / "scripts" / "assert_ran.py"
 VITEST_CONFIG = REPO_ROOT / "cortex-speech-app" / "vitest.config.ts"
+FRONTEND_COVERAGE_CONTRACT = REPO_ROOT / "cortex-speech-app" / "scripts" / "frontend_coverage_contract.v1.json"
 
 
 def load_module(name: str, path: Path):
@@ -47,6 +48,89 @@ class Verify10SupervisorTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.supervisor = load_module("verify10_supervisor_fault_test", SUPERVISOR)
         cls.verify = load_module("verify10_fault_test", VERIFY)
+
+    def test_frontend_snapshot_matches_node_case_sensitive_lexical_order(self) -> None:
+        app_svelte = self.verify.APP / "src" / "App.svelte"
+        app_css = self.verify.APP / "src" / "app.css"
+        rows, digest = self.verify._frontend_snapshot([app_css, app_svelte])
+        expected = [
+            {
+                "path": "src/App.svelte",
+                "sha256": self.verify.sha256_file(app_svelte),
+            },
+            {
+                "path": "src/app.css",
+                "sha256": self.verify.sha256_file(app_css),
+            },
+        ]
+        expected_digest = hashlib.sha256(
+            "\n".join(
+                f"{item['path']}\0{item['sha256']}" for item in expected
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(rows, expected)
+        self.assertEqual(digest, expected_digest)
+
+    def test_owner_evidence_paths_reject_symlink_and_windows_junction_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            alias = root / "alias"
+            alias.mkdir()
+            relative = self.verify.PurePosixPath("alias/evidence.json")
+
+            with mock.patch.object(
+                Path,
+                "is_symlink",
+                lambda path: path == alias,
+            ):
+                with self.assertRaisesRegex(
+                    self.verify.EvidenceError, "link or junction"
+                ):
+                    self.verify._owner_evidence_path(root, relative)
+
+            with mock.patch.object(
+                Path,
+                "is_junction",
+                lambda path: path == alias,
+                create=True,
+            ):
+                with self.assertRaisesRegex(
+                    self.verify.EvidenceError, "link or junction"
+                ):
+                    self.verify._owner_evidence_path(root, relative)
+                with self.assertRaisesRegex(
+                    self.verify.EvidenceError, "contains a link"
+                ):
+                    self.verify._owner_campaign_file_inventory(root)
+
+            outside = root.parent / f"{root.name}-hardlink-source.bin"
+            outside.write_bytes(b"shared evidence bytes")
+            hardlink = root / "hardlink.bin"
+            os.link(outside, hardlink)
+            try:
+                with self.assertRaisesRegex(
+                    self.verify.EvidenceError, "hard-link alias"
+                ):
+                    self.verify._owner_campaign_file_inventory(root)
+            finally:
+                hardlink.unlink()
+                outside.unlink()
+
+    def test_owner_evidence_relative_paths_reject_windows_alias_spellings(self) -> None:
+        for value in (
+            "folder//artifact.json",
+            "folder/./artifact.json",
+            "artifact.json.",
+            "artifact.json ",
+            "stream:payload",
+            "CON.txt",
+            "LPT9",
+            "control\x1fbyte.json",
+        ):
+            with self.subTest(value=value), self.assertRaises(
+                self.verify.EvidenceError
+            ):
+                self.verify._safe_owner_evidence_relative(value, label="test path")
 
     def _llvm_coverage_payload(
         self,
@@ -203,6 +287,172 @@ class Verify10SupervisorTests(unittest.TestCase):
             "completedAt": phase["endedAt"],
             "expiresAt": phase["expiresAt"],
             "commandRegistryHash": phase["commandRegistry"]["registrySha256"],
+        }
+
+    @staticmethod
+    def _stable_active_release_binding(full_sha: str) -> list[dict[str, object]]:
+        """Keep aggregate unit tests independent from a concurrently rebuilt workspace binary."""
+
+        return [
+            {
+                "role": "application-executable",
+                "name": "cortex-speech-app.exe",
+                "sha256": "a" * 64,
+                "bytes": 42,
+                "buildGitSha": full_sha,
+                "matchesFullGitSha": True,
+                "authority": "active-immutable-release",
+                "activeReleasePointerSha256": "b" * 64,
+                "activeReleaseGitSha": full_sha,
+            }
+        ]
+
+    def _write_owner_campaign_shell(
+        self,
+        root: Path,
+        class_id: str,
+        *,
+        sha: str,
+        registry_hash: str,
+        checkout_digest: str,
+        environment: dict[str, object],
+        token_suffix: int,
+    ) -> Path:
+        token = f"{token_suffix:032x}"
+        campaign = root / class_id / token
+        campaign.mkdir(parents=True)
+        started = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=2)
+        ended = started + timedelta(minutes=1)
+        expires = ended + timedelta(
+            seconds=self.verify._owner_campaign_fresh_seconds(class_id)
+        )
+        for name in self.verify.OWNER_EVIDENCE_RAW_ARTIFACTS[class_id]:
+            path = campaign.joinpath(*Path(name).parts)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if name == self.verify.OWNER_EVIDENCE_SOURCE_EVENTS:
+                continue
+            path.write_text("{}\n", encoding="utf-8")
+        events = [
+            {
+                "schema": 1,
+                "sequence": 1,
+                "runToken": token,
+                "event": "campaign_start",
+                "at": self.verify._format_utc(started),
+                "classId": class_id,
+                "profile": self.verify.PROFILE_OWNER,
+                "fullGitSha": sha,
+                "sourceTreeDigest": self.verify._source_tree_digest_for_sha(sha),
+                "checkoutStateDigest": checkout_digest,
+                "gateRegistryHash": registry_hash,
+                "environmentDigest": self.verify._document_digest(environment),
+                "attemptCount": 1,
+                "retryPolicy": "none",
+            },
+            {
+                "schema": 1,
+                "sequence": 2,
+                "runToken": token,
+                "event": "campaign_end",
+                "at": self.verify._format_utc(ended),
+                "classId": class_id,
+                "passed": True,
+                "failures": [],
+                "retryCount": 0,
+                "skipCount": 0,
+            },
+        ]
+        events_path = campaign / self.verify.OWNER_EVIDENCE_SOURCE_EVENTS
+        events_path.write_text(
+            "".join(json.dumps(item, sort_keys=True) + "\n" for item in events),
+            encoding="utf-8",
+            newline="\n",
+        )
+        artifacts = []
+        for name in self.verify.OWNER_EVIDENCE_RAW_ARTIFACTS[class_id]:
+            path = campaign.joinpath(*Path(name).parts)
+            artifacts.append(
+                {
+                    "path": name,
+                    "sha256": self.supervisor.sha256_file(path),
+                    "bytes": path.stat().st_size,
+                }
+            )
+        manifest = {
+            "schema": 1,
+            "type": self.verify.OWNER_EVIDENCE_SOURCE_TYPES[class_id],
+            "classId": class_id,
+            "runToken": token,
+            "profile": self.verify.PROFILE_OWNER,
+            "fullGitSha": sha,
+            "sourceTreeDigest": self.verify._source_tree_digest_for_sha(sha),
+            "gateRegistryHash": registry_hash,
+            "checkoutStateDigest": checkout_digest,
+            "environmentDigest": self.verify._document_digest(environment),
+            "startedAt": self.verify._format_utc(started),
+            "endedAt": self.verify._format_utc(ended),
+            "expiresAt": self.verify._format_utc(expires),
+            "attemptCount": 1,
+            "retryCount": 0,
+            "skipCount": 0,
+            "artifacts": artifacts,
+            "passed": True,
+            "failures": [],
+        }
+        manifest_path = campaign / self.verify.OWNER_EVIDENCE_SOURCE_MANIFEST
+        self.supervisor.atomic_write_json(manifest_path, manifest)
+        return manifest_path
+
+    def _write_owner_proof_fixture(self, root: Path, sha: str) -> dict[str, Path]:
+        root.mkdir(parents=True, exist_ok=True)
+        contract_source = REPO_ROOT / "cortex-speech-app" / "scripts" / "owner_proof_input_contract.v1.json"
+        contract = root / "owner_proof_input_contract.v1.json"
+        shutil.copyfile(contract_source, contract)
+        required_roles = [
+            "proof-input-contract",
+            "real-media-mp4",
+            "real-media-mov",
+            "real-media-flac",
+            "long-audiobook-mp3",
+            "scale-database-authority",
+            "campaign-database-authority",
+            "scale-database-derived-current",
+            "database-migration-helper",
+            "database-migration-helper-source",
+        ]
+        files = []
+        for index, role in enumerate(required_roles, start=1):
+            files.append(
+                {
+                    "role": role,
+                    "relativePath": f"fixtures/{index}-{role}",
+                    "sha256": (
+                        self.supervisor.sha256_file(contract)
+                        if role == "proof-input-contract"
+                        else hashlib.sha256(role.encode()).hexdigest()
+                    ),
+                    "sizeBytes": contract.stat().st_size if role == "proof-input-contract" else index,
+                    "readOnlyHashBound": True,
+                }
+            )
+        manifest = {
+            "schema": 1,
+            "bundleId": "cortex-owner-product-proof-inputs-v1",
+            "releaseGitSha": sha,
+            "contractSha256": self.supervisor.sha256_file(contract),
+            "helperSha256": "a" * 64,
+            "helperSourceSha256": "b" * 64,
+            "helperBuild": {},
+            "files": files,
+            "sourcePreservation": {},
+            "databases": {},
+            "safety": {},
+        }
+        manifest_path = root / "manifest.v1.json"
+        self.supervisor.atomic_write_json(manifest_path, manifest)
+        return {
+            "owner-proof/manifest.v1.json": manifest_path,
+            "owner-proof/owner_proof_input_contract.v1.json": contract,
         }
 
     def _write_fault_campaign(
@@ -376,13 +626,13 @@ class Verify10SupervisorTests(unittest.TestCase):
             frontend_coverage_argv,
         )
         coverage_config = VITEST_CONFIG.read_text(encoding="utf-8")
-        for exact_threshold in (
-            "statements: 85",
-            "branches: 80",
-            "functions: 80",
-            "lines: 85",
-        ):
-            self.assertIn(exact_threshold, coverage_config)
+        coverage_contract = json.loads(FRONTEND_COVERAGE_CONTRACT.read_text(encoding="utf-8"))
+        self.assertEqual(
+            coverage_contract["thresholds"],
+            {"statements": 85, "branches": 80, "functions": 80, "lines": 85},
+        )
+        self.assertIn("frontend_coverage_contract.v1.json", coverage_config)
+        self.assertIn("...coverageContract.thresholds", coverage_config)
         self.assertIn("json-summary", coverage_config)
         source = VERIFY.read_text(encoding="utf-8")
         self.assertNotIn("shell=True", source)
@@ -401,6 +651,15 @@ class Verify10SupervisorTests(unittest.TestCase):
         self.assertIn("--all-features", coverage_registry["measurementArgv"])
         self.assertIn("+nightly-2026-07-11", coverage_registry["measurementArgv"])
         self.assertNotIn("+nightly", coverage_registry["measurementArgv"])
+        self.assertEqual(
+            coverage_registry["criticalDomainThresholds"],
+            {
+                "lines": 95.0,
+                "regions": 95.0,
+                "functions": 90.0,
+                "branches": 90.0,
+            },
+        )
         contract = coverage_registry["coverageToolchainContract"]
         self.assertEqual(contract["toolchain"], "nightly-2026-07-11")
         self.assertRegex(str(contract["sha256"]), r"^[0-9a-f]{64}$")
@@ -439,6 +698,19 @@ class Verify10SupervisorTests(unittest.TestCase):
             wrong_toolchain["environment"]["coverageToolchain"]["toolchain"] = "nightly-2099-01-01"
             self.supervisor.atomic_write_json(manifest_path, wrong_toolchain)
             with self.assertRaisesRegex(self.verify.EvidenceError, "nightly identity"):
+                self.verify._validate_rust_coverage_phase(
+                    manifest_path,
+                    expected_sha=sha,
+                    expected_checkout_digest=checkout_digest,
+                    require_fresh=False,
+                    require_current_environment=False,
+                )
+            self.supervisor.atomic_write_json(manifest_path, manifest)
+
+            boolean_schema = json.loads(json.dumps(manifest))
+            boolean_schema["schema"] = True
+            self.supervisor.atomic_write_json(manifest_path, boolean_schema)
+            with self.assertRaisesRegex(self.verify.EvidenceError, "completion/run identity"):
                 self.verify._validate_rust_coverage_phase(
                     manifest_path,
                     expected_sha=sha,
@@ -556,6 +828,33 @@ class Verify10SupervisorTests(unittest.TestCase):
         clean_source_profiles = self.verify._gate_by_id("clean-source-tree").profiles
         self.assertEqual(clean_source_profiles, self.verify.PROFILES)
         self.assertTrue(owner_gates <= windows_gates)
+        external_review_gates = set(self.verify.EXTERNAL_REVIEW_GATE_IDS)
+        self.assertTrue(external_review_gates <= windows_gates)
+        self.assertTrue(
+            owner_gates.isdisjoint(external_review_gates),
+            "owner-product must not depend on remote reviewers or the separately operated pool",
+        )
+        self.assertIn("branch-protection", windows_gates)
+        self.assertNotIn(
+            "branch-protection",
+            owner_gates,
+            "one exact local owner binary must not depend on remote repository administration",
+        )
+        self.assertTrue(
+            {
+                "database-integrity-live",
+                "review-schema-contract-live",
+                "dataset-duplicates",
+                "review-serving-provenance",
+                "owner-workstation-health-live",
+                "real-app-e2e",
+                "champion-7b-preflight",
+                "durability-drill",
+                "export-kill-drill",
+            }
+            <= owner_gates,
+            "owner-product must retain every local data, champion, review, and recovery authority",
+        )
         self.assertTrue(
             {
                 "database-integrity-live",
@@ -573,6 +872,10 @@ class Verify10SupervisorTests(unittest.TestCase):
 
         owner_evidence = set(self.verify.PROFILE_REQUIRED_EVIDENCE[self.verify.PROFILE_OWNER])
         windows_evidence = set(self.verify.PROFILE_REQUIRED_EVIDENCE[self.verify.PROFILE_WINDOWS])
+        self.assertIn(
+            self.verify.PROFILE_OWNER,
+            self.verify._gate_by_id("license-compat").profiles,
+        )
         self.assertTrue(owner_evidence <= windows_evidence)
         self.assertTrue(
             {
@@ -611,9 +914,17 @@ class Verify10SupervisorTests(unittest.TestCase):
                 registry_by_id[gate_id]["diagnosticOverrideAllowlist"],
                 list(self.verify.LIVE_AUTHORITY_OVERRIDE_ENVIRONMENT),
             )
-            self.assertFalse(
+            overlap = (
                 set(registry_by_id[gate_id]["environmentAllowlist"])
                 & set(self.verify.LIVE_AUTHORITY_OVERRIDE_ENVIRONMENT)
+            )
+            self.assertEqual(
+                overlap,
+                (
+                    {"CORTEX_APP_EXE"}
+                    if gate_id in {"exe-freshness", "playback-enforcement-readiness"}
+                    else set()
+                ),
             )
         freshness = registry["evidenceContract"]["freshnessPolicy"]
         self.assertEqual(freshness["state"], "PARTIAL_CLASS_SPECIFIC_FAIL_CLOSED")
@@ -638,7 +949,8 @@ class Verify10SupervisorTests(unittest.TestCase):
             classes["known-defect-ledger"]["validatorGate"],
             "known-defect-ledger-evidence",
         )
-        self.assertIsNone(classes["owner-field-sessions"]["validatorGate"])
+        for class_id, gate_id in self.verify.OWNER_EVIDENCE_CLASS_GATE_IDS.items():
+            self.assertEqual(classes[class_id]["validatorGate"], gate_id)
 
     def test_evidence_and_release_contracts_fail_closed_on_omission_or_substitution(self) -> None:
         profile = self.verify.PROFILE_WINDOWS
@@ -756,6 +1068,1822 @@ class Verify10SupervisorTests(unittest.TestCase):
                     expected_sha=sha,
                 )
 
+    def test_all_six_owner_evidence_classes_bind_exact_campaign_artifacts_and_fail_closed(self) -> None:
+        sha = self.verify._full_git_sha()
+        registry_hash = self.verify.gate_registry_hash()
+        checkout_digest = self.verify._checkout_state_digest()
+        environment = self.verify._environment_document()
+        classes = tuple(self.verify.OWNER_EVIDENCE_CLASS_GATE_IDS)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_root = root / "source"
+            gate_roots: dict[str, Path] = {}
+            for index, class_id in enumerate(classes, start=1):
+                self._write_owner_campaign_shell(
+                    source_root,
+                    class_id,
+                    sha=sha,
+                    registry_hash=registry_hash,
+                    checkout_digest=checkout_digest,
+                    environment=environment,
+                    token_suffix=index,
+                )
+                gate_root = root / f"gate-{index}"
+                gate_root.mkdir()
+                gate_roots[class_id] = gate_root
+                original = self.verify.OWNER_EVIDENCE_AUTHORITY_ROOT, self.verify.LOG_DIR
+                try:
+                    self.verify.OWNER_EVIDENCE_AUTHORITY_ROOT = source_root
+                    self.verify.LOG_DIR = gate_root
+                    with mock.patch.object(
+                        self.verify,
+                        "_validate_owner_campaign_semantics",
+                        return_value={"semanticClass": class_id},
+                    ), mock.patch.object(
+                        self.verify, "_full_git_sha", return_value=sha
+                    ), mock.patch.object(
+                        self.verify, "gate_registry_hash", return_value=registry_hash
+                    ), mock.patch.object(
+                        self.verify, "_checkout_state_digest", return_value=checkout_digest
+                    ), mock.patch.object(
+                        self.verify, "_environment_document", return_value=environment
+                    ):
+                        report = self.verify._build_owner_class_evidence(
+                            class_id,
+                            profile=self.verify.PROFILE_OWNER,
+                        )
+                finally:
+                    self.verify.OWNER_EVIDENCE_AUTHORITY_ROOT, self.verify.LOG_DIR = original
+                artifact = gate_root / self.verify.OWNER_EVIDENCE_CLASS_ARTIFACTS[class_id]
+                self.supervisor.atomic_write_json(artifact, report)
+                with mock.patch.object(
+                    self.verify,
+                    "_validate_owner_campaign_semantics",
+                    return_value={"semanticClass": class_id},
+                ):
+                    self.verify._validate_class_evidence_artifact(
+                        class_id,
+                        artifact,
+                        expected_sha=sha,
+                        expected_profile=self.verify.PROFILE_OWNER,
+                        expected_registry_hash=registry_hash,
+                        expected_checkout_digest=checkout_digest,
+                        expected_environment=environment,
+                    )
+                forged = json.loads(json.dumps(report))
+                forged["observations"] = {"semanticClass": "substituted"}
+                self.supervisor.atomic_write_json(artifact, forged)
+                with mock.patch.object(
+                    self.verify,
+                    "_validate_owner_campaign_semantics",
+                    return_value={"semanticClass": class_id},
+                ), self.assertRaises(self.verify.EvidenceError, msg=class_id):
+                    self.verify._validate_class_evidence_artifact(
+                        class_id,
+                        artifact,
+                        expected_sha=sha,
+                        expected_profile=self.verify.PROFILE_OWNER,
+                        expected_registry_hash=registry_hash,
+                        expected_checkout_digest=checkout_digest,
+                        expected_environment=environment,
+                    )
+
+            # Every class must reject a retry/skip/cross-SHA source even if the raw report says pass.
+            for index, class_id in enumerate(classes, start=1):
+                manifest_path = (
+                    source_root
+                    / class_id
+                    / f"{index:032x}"
+                    / self.verify.OWNER_EVIDENCE_SOURCE_MANIFEST
+                )
+                original_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                for field, value in (
+                    ("attemptCount", True),
+                    ("retryCount", 1),
+                    ("skipCount", 1),
+                    ("fullGitSha", "0" * 40),
+                ):
+                    mutated = json.loads(json.dumps(original_manifest))
+                    mutated[field] = value
+                    self.supervisor.atomic_write_json(manifest_path, mutated)
+                    with self.subTest(class_id=class_id, field=field), mock.patch.object(
+                        self.verify,
+                        "_validate_owner_campaign_semantics",
+                        return_value={"semanticClass": class_id},
+                    ), self.assertRaises(self.verify.EvidenceError):
+                        self.verify._validate_owner_source_campaign(
+                            class_id,
+                            manifest_path,
+                            expected_sha=sha,
+                            expected_registry_hash=registry_hash,
+                            expected_checkout_digest=checkout_digest,
+                            expected_environment=environment,
+                            require_fresh=True,
+                        )
+                self.supervisor.atomic_write_json(manifest_path, original_manifest)
+
+            duplicate_path = (
+                source_root
+                / classes[0]
+                / f"{1:032x}"
+                / self.verify.OWNER_EVIDENCE_SOURCE_MANIFEST
+            )
+            duplicate_path.write_text('{"schema":1,"schema":1}\n', encoding="utf-8")
+            with self.assertRaisesRegex(self.verify.EvidenceError, "duplicate JSON key"):
+                self.verify._load_json_without_duplicate_keys(duplicate_path)
+
+            future_manifest = (
+                source_root
+                / classes[1]
+                / f"{2:032x}"
+                / self.verify.OWNER_EVIDENCE_SOURCE_MANIFEST
+            )
+            future = json.loads(future_manifest.read_text(encoding="utf-8"))
+            future_start = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(hours=1)
+            future_end = future_start + timedelta(minutes=1)
+            future["startedAt"] = self.verify._format_utc(future_start)
+            future["endedAt"] = self.verify._format_utc(future_end)
+            future["expiresAt"] = self.verify._format_utc(
+                future_end
+                + timedelta(
+                    seconds=self.verify._owner_campaign_fresh_seconds(classes[1])
+                )
+            )
+            self.supervisor.atomic_write_json(future_manifest, future)
+            with self.assertRaisesRegex(self.verify.EvidenceError, "stale"):
+                self.verify._validate_owner_source_campaign(
+                    classes[1],
+                    future_manifest,
+                    expected_sha=sha,
+                    expected_registry_hash=registry_hash,
+                    expected_checkout_digest=checkout_digest,
+                    expected_environment=environment,
+                    require_fresh=True,
+                )
+
+    def test_terminal_frontend_coverage_replay_rejects_timeout_nonzero_and_malformed_output(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            frontend_root = Path(temporary) / "frontend"
+            frontend_root.mkdir()
+            manifest_path = frontend_root / "frontend-coverage-raw-manifest.json"
+            bundle_path = frontend_root / "frontend-coverage-raw.v1.bin"
+            manifest_path.write_text("{}\n", encoding="utf-8")
+            bundle_path.write_bytes(b"CORTEX_FRONTEND_COVERAGE_RAW_V1\nfixture")
+            metric = {"total": 10, "covered": 10, "skipped": 0, "pct": 100.0}
+            summary = {
+                name: dict(metric) for name in ("lines", "statements", "branches", "functions")
+            }
+            critical = {
+                domain: {name: dict(metric) for name in summary}
+                for domain in ("audio-state-machine", "review-truth-reducers")
+            }
+            run_token = "01234567-89ab-4cde-8fab-0123456789ab"
+            evidence = {
+                "runToken": run_token,
+                "fullE2ETests": 119,
+                "instrumentedE2ETests": 110,
+                "e2eRawFiles": 110,
+                "e2eConvertedSourceFiles": 12,
+            }
+            replay = {
+                "schema": 1,
+                "type": "FrontendCoverageReplayV1",
+                "certificationEligible": True,
+                "runToken": run_token,
+                "sourceTreeSha256": "a" * 64,
+                "campaignInputsSha256": "b" * 64,
+                "manifestSha256": self.supervisor.sha256_file(manifest_path),
+                "bundleSha256": self.supervisor.sha256_file(bundle_path),
+                "fullE2ETests": 119,
+                "instrumentedE2ETests": 110,
+                "e2eRawFiles": 110,
+                "e2eConvertedSourceFiles": 12,
+                "summary": summary,
+                "criticalDomains": critical,
+            }
+            paths = {
+                "frontend/frontend-coverage-raw-manifest.json": manifest_path,
+                "frontend/frontend-coverage-raw.v1.bin": bundle_path,
+            }
+
+            def completed(
+                value: object = replay,
+                *,
+                returncode: int = 0,
+                stderr: str = "",
+                stdout: str | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                rendered = (
+                    json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    + "\n"
+                    if stdout is None
+                    else stdout
+                )
+                return subprocess.CompletedProcess([], returncode, rendered, stderr)
+
+            with mock.patch.object(
+                self.verify.subprocess,
+                "run",
+                return_value=completed(),
+            ) as run:
+                observed = self.verify._run_frontend_coverage_replay(
+                    paths,
+                    evidence=evidence,
+                    source_digest="a" * 64,
+                    campaign_digest="b" * 64,
+                    summary=summary,
+                    critical_summaries=critical,
+                )
+            self.assertEqual(observed, replay)
+            self.assertEqual(run.call_args.kwargs["timeout"], 600)
+            self.assertFalse(run.call_args.kwargs["shell"])
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[2:4], ["--replay", "--manifest"])
+            self.assertEqual(Path(argv[4]), manifest_path.resolve())
+            self.assertEqual(argv[5], "--bundle")
+            self.assertEqual(Path(argv[6]), bundle_path.resolve())
+            self.assertEqual(argv[7], "--temporary-parent")
+
+            original_bundle = bundle_path.read_bytes()
+
+            def replace_frontend_authority_during_replay(
+                *_args: object, **_kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                bundle_path.write_bytes(original_bundle + b"swapped")
+                return completed(
+                    {
+                        **replay,
+                        "bundleSha256": self.supervisor.sha256_file(bundle_path),
+                    }
+                )
+
+            try:
+                with mock.patch.object(
+                    self.verify.subprocess,
+                    "run",
+                    side_effect=replace_frontend_authority_during_replay,
+                ), self.assertRaisesRegex(self.verify.EvidenceError, "changed during replay"):
+                    self.verify._run_frontend_coverage_replay(
+                        paths,
+                        evidence=evidence,
+                        source_digest="a" * 64,
+                        campaign_digest="b" * 64,
+                        summary=summary,
+                        critical_summaries=critical,
+                    )
+            finally:
+                bundle_path.write_bytes(original_bundle)
+
+            forged_summary = json.loads(json.dumps(replay))
+            forged_summary["summary"]["lines"]["covered"] = 9
+            attacks = {
+                "nonzero": completed(returncode=1),
+                "stderr": completed(stderr="warning"),
+                "malformed-json": completed(stdout="not-json\n"),
+                "duplicate-key": completed(stdout='{"schema":1,"schema":1}\n'),
+                "noncanonical-json": completed(stdout=json.dumps(replay) + "\n"),
+                "noncertifying": completed({**replay, "certificationEligible": False}),
+                "wrong-bundle-hash": completed({**replay, "bundleSha256": "0" * 64}),
+                "boolean-count": completed({**replay, "e2eRawFiles": True}),
+                "forged-summary": completed(forged_summary),
+            }
+            for label, result in attacks.items():
+                with self.subTest(label=label), mock.patch.object(
+                    self.verify.subprocess,
+                    "run",
+                    return_value=result,
+                ), self.assertRaises(self.verify.EvidenceError):
+                    self.verify._run_frontend_coverage_replay(
+                        paths,
+                        evidence=evidence,
+                        source_digest="a" * 64,
+                        campaign_digest="b" * 64,
+                        summary=summary,
+                        critical_summaries=critical,
+                    )
+            with mock.patch.object(
+                self.verify.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(["node"], 600),
+            ), self.assertRaisesRegex(self.verify.EvidenceError, "explicit timeout"):
+                self.verify._run_frontend_coverage_replay(
+                    paths,
+                    evidence=evidence,
+                    source_digest="a" * 64,
+                    campaign_digest="b" * 64,
+                    summary=summary,
+                    critical_summaries=critical,
+                )
+
+    def test_terminal_mutation_replay_rejects_timeout_nonzero_and_malformed_output(self) -> None:
+        sha = self.verify._full_git_sha()
+        checkout_digest = self.verify._checkout_state_digest()
+        with tempfile.TemporaryDirectory() as temporary:
+            mutation_root = Path(temporary) / "mutation"
+            mutation_root.mkdir()
+            manifest_path = mutation_root / "owner-mutation-raw-manifest.json"
+            bundle_path = mutation_root / "owner-mutation-raw.v1.bin"
+            bundle_path.write_bytes(b"CORTEX_OWNER_MUTATION_RAW_V1\nfixture")
+            backend_domains = {
+                domain: {"mutants": 1, "killed": 1, "scorePercent": 100.0}
+                for domain in self.verify._rust_quality_module().CRITICAL_COVERAGE_DOMAINS
+            }
+            observations = {
+                "backend": {
+                    "mutants": len(backend_domains),
+                    "killed": len(backend_domains),
+                    "domains": backend_domains,
+                },
+                "frontend": {
+                    "mutants": 2,
+                    "killed": 2,
+                    "domains": {
+                        "audio-state-machine": {
+                            "mutants": 1,
+                            "killed": 1,
+                            "scorePercent": 100.0,
+                        },
+                        "review-truth-reducers": {
+                            "mutants": 1,
+                            "killed": 1,
+                            "scorePercent": 100.0,
+                        },
+                    },
+                },
+            }
+            raw_manifest = {
+                "schema": 1,
+                "type": "OwnerMutationRawAuthorityV1",
+                "runToken": "01234567-89ab-4cde-8fab-0123456789ab",
+                "scope": ["backend", "frontend"],
+                "certificationEligible": True,
+                "fullGitSha": sha,
+                "checkoutStateDigest": checkout_digest,
+                "contractSha256": "a" * 64,
+                "campaignSha256": "b" * 64,
+                "authorities": {},
+                "tools": {
+                    "cargoMutants": "27.1.0",
+                    "stryker": "10.0.0",
+                    "strykerVitestRunner": "10.0.0",
+                    "vitest": "4.1.10",
+                },
+                "runtime": {},
+                "bundle": {
+                    "format": "CORTEX_OWNER_MUTATION_RAW_V1",
+                    "sha256": self.supervisor.sha256_file(bundle_path),
+                    "bytes": bundle_path.stat().st_size,
+                    "entries": [],
+                },
+            }
+            self.supervisor.atomic_write_json(manifest_path, raw_manifest)
+            replay = {
+                "fullGitSha": sha,
+                "scope": ["backend", "frontend"],
+                "certificationEligible": True,
+                "observations": observations,
+                "manifestSha256": self.supervisor.sha256_file(manifest_path),
+                "bundleSha256": self.supervisor.sha256_file(bundle_path),
+            }
+            paths = {
+                "mutation/owner-mutation-raw-manifest.json": manifest_path,
+                "mutation/owner-mutation-raw.v1.bin": bundle_path,
+            }
+
+            def completed(
+                value: object = replay,
+                *,
+                returncode: int = 0,
+                stderr: str = "",
+                stdout: str | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                rendered = (
+                    json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n"
+                    if stdout is None
+                    else stdout
+                )
+                return subprocess.CompletedProcess([], returncode, rendered, stderr)
+
+            with mock.patch.object(
+                self.verify.subprocess,
+                "run",
+                return_value=completed(),
+            ) as run:
+                observed, observed_manifest = self.verify._run_owner_mutation_replay(
+                    paths,
+                    expected_sha=sha,
+                    expected_checkout_digest=checkout_digest,
+                )
+            self.assertEqual(observed, replay)
+            self.assertEqual(observed_manifest, raw_manifest)
+            self.assertEqual(run.call_args.kwargs["timeout"], 600)
+            self.assertFalse(run.call_args.kwargs["shell"])
+            self.assertEqual(run.call_args.args[0][-1], "--replay")
+            self.assertEqual(run.call_args.args[0][-3], "--output")
+            self.assertEqual(Path(run.call_args.args[0][-2]), mutation_root.resolve())
+
+            original_manifest = manifest_path.read_bytes()
+
+            def replace_mutation_authority_during_replay(
+                *_args: object, **_kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                manifest_path.write_bytes(original_manifest + b" ")
+                return completed(
+                    {
+                        **replay,
+                        "manifestSha256": self.supervisor.sha256_file(manifest_path),
+                    }
+                )
+
+            try:
+                with mock.patch.object(
+                    self.verify.subprocess,
+                    "run",
+                    side_effect=replace_mutation_authority_during_replay,
+                ), self.assertRaisesRegex(self.verify.EvidenceError, "changed during replay"):
+                    self.verify._run_owner_mutation_replay(
+                        paths,
+                        expected_sha=sha,
+                        expected_checkout_digest=checkout_digest,
+                    )
+            finally:
+                manifest_path.write_bytes(original_manifest)
+
+            attacks = {
+                "nonzero": completed(returncode=1),
+                "stderr": completed(stderr="warning"),
+                "malformed-json": completed(stdout="not-json\n"),
+                "duplicate-key": completed(
+                    stdout='{"scope":[],"scope":["backend","frontend"]}\n'
+                ),
+                "noncanonical-json": completed(stdout=json.dumps(replay) + "  \n"),
+                "partial-scope": completed({**replay, "scope": ["frontend"]}),
+                "noncertifying": completed({**replay, "certificationEligible": False}),
+                "wrong-manifest-hash": completed({**replay, "manifestSha256": "0" * 64}),
+                "malformed-observation": completed(
+                    {
+                        **replay,
+                        "observations": {
+                            **observations,
+                            "frontend": {
+                                **observations["frontend"],
+                                "mutants": True,
+                            },
+                        },
+                    }
+                ),
+            }
+            for label, result in attacks.items():
+                with self.subTest(label=label), mock.patch.object(
+                    self.verify.subprocess,
+                    "run",
+                    return_value=result,
+                ), self.assertRaises(self.verify.EvidenceError):
+                    self.verify._run_owner_mutation_replay(
+                        paths,
+                        expected_sha=sha,
+                        expected_checkout_digest=checkout_digest,
+                    )
+            with mock.patch.object(
+                self.verify.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(["python"], 600),
+            ), self.assertRaisesRegex(self.verify.EvidenceError, "explicit timeout"):
+                self.verify._run_owner_mutation_replay(
+                    paths,
+                    expected_sha=sha,
+                    expected_checkout_digest=checkout_digest,
+                )
+
+            partial_manifest = json.loads(json.dumps(raw_manifest))
+            partial_manifest["scope"] = ["frontend"]
+            partial_manifest["certificationEligible"] = False
+            self.supervisor.atomic_write_json(manifest_path, partial_manifest)
+            with mock.patch.object(
+                self.verify.subprocess,
+                "run",
+                return_value=completed(),
+            ) as run, self.assertRaisesRegex(self.verify.EvidenceError, "partial-scope"):
+                self.verify._run_owner_mutation_replay(
+                    paths,
+                    expected_sha=sha,
+                    expected_checkout_digest=checkout_digest,
+                )
+            run.assert_not_called()
+
+    def test_coverage_mutation_semantics_count_every_non_killed_outcome_against_locked_floors(self) -> None:
+        sha = self.verify._full_git_sha()
+        checkout_digest = self.verify._checkout_state_digest()
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def write_report(path: Path, *, backend: bool) -> dict[str, object]:
+                mutants = []
+                if backend:
+                    quality = self.verify._rust_quality_module()
+                    for index, (domain, patterns) in enumerate(
+                        quality.CRITICAL_COVERAGE_DOMAINS.items(), start=1
+                    ):
+                        candidates = []
+                        for pattern in patterns:
+                            candidates.extend((REPO_ROOT / "cortex-speech-app").glob(pattern))
+                        source = next(path for path in candidates if path.is_file())
+                        mutants.append(
+                            {
+                                "id": f"backend-{index}",
+                                "domain": domain,
+                                "sourcePath": source.relative_to(REPO_ROOT).as_posix(),
+                                "outcome": "KILLED",
+                            }
+                        )
+                else:
+                    for index, (domain, source_name) in enumerate(
+                        (
+                            ("audio-state-machine", "audioMachine.ts"),
+                            ("review-truth-reducers", "reviewCommitOperation.ts"),
+                        ),
+                        start=1,
+                    ):
+                        mutants.append(
+                            {
+                                "id": f"frontend-{index}",
+                                "domain": domain,
+                                "sourcePath": (
+                                    Path("cortex-speech-app") / "src" / "lib" / source_name
+                                ).as_posix(),
+                                "outcome": "KILLED",
+                            }
+                        )
+                report = {
+                    "schema": 1,
+                    "type": (
+                        "BackendCriticalMutationReportV1"
+                        if backend
+                        else "FrontendReducerMutationReportV1"
+                    ),
+                    "fullGitSha": sha,
+                    "sourceTreeDigest": self.verify._source_tree_digest_for_sha(sha),
+                    "checkoutStateDigest": checkout_digest,
+                    "startedAt": self.verify._format_utc(now - timedelta(minutes=2)),
+                    "endedAt": self.verify._format_utc(now - timedelta(minutes=1)),
+                    "expiresAt": self.verify._format_utc(
+                        now
+                        - timedelta(minutes=1)
+                        + timedelta(seconds=self.verify.OWNER_EVIDENCE_FRESH_SECONDS)
+                    ),
+                    "attemptCount": 1,
+                    "retryCount": 0,
+                    "skipCount": 0,
+                    "tool": {
+                        "name": "cargo-mutants" if backend else "frontend-mutation-runner",
+                        "version": "1.0.0-test",
+                        "commandRegistrySha256": "c" * 64,
+                    },
+                    "mutants": mutants,
+                }
+                self.supervisor.atomic_write_json(path, report)
+                return report
+
+            backend_path = root / "backend.json"
+            frontend_path = root / "frontend.json"
+            backend = write_report(backend_path, backend=True)
+            frontend = write_report(frontend_path, backend=False)
+            for path, is_backend in ((backend_path, True), (frontend_path, False)):
+                with self.assertRaisesRegex(
+                    self.verify.EvidenceError,
+                    self.verify.UNSUPPORTED_UNBACKED_EVIDENCE,
+                ):
+                    self.verify._validate_mutation_report(
+                        path,
+                        backend=is_backend,
+                        expected_sha=sha,
+                        expected_checkout_digest=checkout_digest,
+                        require_fresh=True,
+                    )
+            wrong_domain = json.loads(json.dumps(frontend))
+            wrong_domain["mutants"][0]["sourcePath"] = (
+                Path("cortex-speech-app") / "src" / "lib" / "reviewCommitOperation.ts"
+            ).as_posix()
+            self.supervisor.atomic_write_json(frontend_path, wrong_domain)
+            with self.assertRaisesRegex(self.verify.EvidenceError, "critical reducer domain"):
+                self.verify._validate_mutation_report(
+                    frontend_path,
+                    backend=False,
+                    expected_sha=sha,
+                    expected_checkout_digest=checkout_digest,
+                    require_fresh=True,
+                )
+            for label, original, path, is_backend in (
+                ("survivor", backend, backend_path, True),
+                ("timeout", frontend, frontend_path, False),
+                ("build-error", backend, backend_path, True),
+                ("unexplained-exclusion", frontend, frontend_path, False),
+            ):
+                forged = json.loads(json.dumps(original))
+                forged["mutants"][0]["outcome"] = {
+                    "survivor": "SURVIVED",
+                    "timeout": "TIMEOUT",
+                    "build-error": "BUILD_ERROR",
+                    "unexplained-exclusion": "EXCLUDED_UNEXPLAINED",
+                }[label]
+                self.supervisor.atomic_write_json(path, forged)
+                with self.subTest(label=label), self.assertRaises(self.verify.EvidenceError):
+                    self.verify._validate_mutation_report(
+                        path,
+                        backend=is_backend,
+                        expected_sha=sha,
+                        expected_checkout_digest=checkout_digest,
+                        require_fresh=True,
+                    )
+            relaxed = json.loads(json.dumps(frontend))
+            relaxed["thresholdPercent"] = 0
+            self.supervisor.atomic_write_json(frontend_path, relaxed)
+            with self.assertRaisesRegex(self.verify.EvidenceError, "non-canonical envelope"):
+                self.verify._validate_mutation_report(
+                    frontend_path,
+                    backend=False,
+                    expected_sha=sha,
+                    expected_checkout_digest=checkout_digest,
+                    require_fresh=True,
+                )
+            boolean_counter = json.loads(json.dumps(frontend))
+            boolean_counter["attemptCount"] = True
+            self.supervisor.atomic_write_json(frontend_path, boolean_counter)
+            with self.assertRaisesRegex(self.verify.EvidenceError, "retried"):
+                self.verify._validate_mutation_report(
+                    frontend_path,
+                    backend=False,
+                    expected_sha=sha,
+                    expected_checkout_digest=checkout_digest,
+                    require_fresh=True,
+                )
+
+            raw_manifest = {
+                "campaignSha256": "d" * 64,
+                "tools": {"cargoMutants": "27.1.0", "stryker": "10.0.0"},
+            }
+            observations = {}
+            for label, report in (("backend", backend), ("frontend", frontend)):
+                by_domain: dict[str, list[dict[str, object]]] = {}
+                for mutant in report["mutants"]:
+                    by_domain.setdefault(str(mutant["domain"]), []).append(mutant)
+                observations[label] = {
+                    "mutants": len(report["mutants"]),
+                    "killed": sum(
+                        1 for mutant in report["mutants"] if mutant["outcome"] == "KILLED"
+                    ),
+                    "domains": {
+                        domain: {
+                            "mutants": len(rows),
+                            "killed": sum(1 for row in rows if row["outcome"] == "KILLED"),
+                            "scorePercent": sum(
+                                1 for row in rows if row["outcome"] == "KILLED"
+                            )
+                            * 100.0
+                            / len(rows),
+                        }
+                        for domain, rows in by_domain.items()
+                    },
+                }
+            replay = {
+                "manifestSha256": "a" * 64,
+                "bundleSha256": "b" * 64,
+                "observations": observations,
+            }
+            terminal_reports = []
+            for report, backend_report, path, label in (
+                (backend, True, backend_path, "backend"),
+                (frontend, False, frontend_path, "frontend"),
+            ):
+                terminal = json.loads(json.dumps(report))
+                terminal["tool"]["version"] = (
+                    raw_manifest["tools"]["cargoMutants"]
+                    if backend_report
+                    else raw_manifest["tools"]["stryker"]
+                )
+                terminal["tool"]["commandRegistrySha256"] = raw_manifest[
+                    "campaignSha256"
+                ]
+                terminal["rawAuthorityManifestSha256"] = replay["manifestSha256"]
+                terminal["rawAuthorityBundleSha256"] = replay["bundleSha256"]
+                terminal["observation"] = observations[label]
+                terminal_reports.append((terminal, backend_report, path))
+                self.supervisor.atomic_write_json(path, terminal)
+                validated = self.verify._validate_mutation_report(
+                    path,
+                    backend=backend_report,
+                    expected_sha=sha,
+                    expected_checkout_digest=checkout_digest,
+                    require_fresh=True,
+                    replay=replay,
+                    raw_manifest=raw_manifest,
+                )
+                self.assertEqual(validated["mutants"], observations[label]["mutants"])
+                self.assertEqual(
+                    validated["rawAuthorityManifestSha256"], replay["manifestSha256"]
+                )
+
+            for label, terminal, backend_report, path in (
+                ("manifest-hash", *terminal_reports[0]),
+                ("observation", *terminal_reports[1]),
+                ("tool-version", *terminal_reports[0]),
+            ):
+                forged = json.loads(json.dumps(terminal))
+                if label == "manifest-hash":
+                    forged["rawAuthorityManifestSha256"] = "0" * 64
+                elif label == "observation":
+                    forged["observation"]["killed"] -= 1
+                else:
+                    forged["tool"]["version"] = "substituted"
+                self.supervisor.atomic_write_json(path, forged)
+                with self.subTest(label=label), self.assertRaisesRegex(
+                    self.verify.EvidenceError, "exact projection"
+                ):
+                    self.verify._validate_mutation_report(
+                        path,
+                        backend=backend_report,
+                        expected_sha=sha,
+                        expected_checkout_digest=checkout_digest,
+                        require_fresh=True,
+                        replay=replay,
+                        raw_manifest=raw_manifest,
+                    )
+
+    def test_istanbul_recomputation_accepts_only_the_real_canonical_metadata_shape(self) -> None:
+        source = (REPO_ROOT / "cortex-speech-app" / "src" / "lib" / "audioMachine.ts").resolve()
+        row = {
+            "path": str(source),
+            "statementMap": {"0": {"start": {"line": 1}}},
+            "fnMap": {"0": {}},
+            "branchMap": {"0": {"locations": [{}, {}]}},
+            "s": {"0": 1},
+            "f": {"0": 0},
+            "b": {"0": [1, 0]},
+            "meta": {
+                "lastBranch": 1,
+                "lastFunction": 1,
+                "lastStatement": 1,
+                "seen": {},
+                "fnNames": {},
+            },
+        }
+        summary, observed = self.verify._istanbul_coverage_summary({str(source): row})
+        self.assertEqual(observed, {"lib/audiomachine.ts"})
+        self.assertEqual(summary["statements"]["pct"], 100.0)
+        self.assertEqual(summary["functions"]["pct"], 0.0)
+        self.assertEqual(summary["branches"]["pct"], 50.0)
+        forged = json.loads(json.dumps(row))
+        forged["meta"]["unbound"] = True
+        with self.assertRaisesRegex(self.verify.EvidenceError, "metadata"):
+            self.verify._istanbul_coverage_summary({str(source): forged})
+        alias = str(source.parent / ".." / source.parent.name / source.name)
+        aliased = json.loads(json.dumps(row))
+        aliased["path"] = alias
+        with self.assertRaisesRegex(self.verify.EvidenceError, "alias-free"):
+            self.verify._istanbul_coverage_summary({alias: aliased})
+
+    def test_fabricated_all_covered_istanbul_map_cannot_certify_without_raw_runner_authority(self) -> None:
+        """A complete-looking Istanbul projection is not evidence that its counters were observed."""
+
+        shipped = self.verify._frontend_shipped_sources()
+        forged_map: dict[str, object] = {}
+        for source in shipped:
+            absolute = str(source.resolve())
+            forged_map[absolute] = {
+                "path": absolute,
+                "statementMap": {"0": {"start": {"line": 1}}},
+                "fnMap": {"0": {}},
+                "branchMap": {"0": {"locations": [{}, {}]}},
+                "s": {"0": 1},
+                "f": {"0": 1},
+                "b": {"0": [1, 1]},
+            }
+        summary, observed = self.verify._istanbul_coverage_summary(forged_map)
+        self.assertEqual(
+            observed,
+            {
+                path.resolve().relative_to((REPO_ROOT / "cortex-speech-app" / "src").resolve())
+                .as_posix()
+                .casefold()
+                for path in shipped
+            },
+        )
+        self.assertTrue(all(row["pct"] == 100.0 for row in summary.values()))
+        forged_critical: dict[str, object] = {}
+        for domain, relative_sources in {
+            "audio-state-machine": ["src/lib/audioMachine.ts"],
+            "review-truth-reducers": [
+                "src/lib/reviewCommitOperation.ts",
+                "src/lib/reviewCommitResult.ts",
+            ],
+        }.items():
+            domain_map = {
+                str((REPO_ROOT / "cortex-speech-app" / relative).resolve()): forged_map[
+                    str((REPO_ROOT / "cortex-speech-app" / relative).resolve())
+                ]
+                for relative in relative_sources
+            }
+            domain_summary, _domain_observed = self.verify._istanbul_coverage_summary(
+                domain_map
+            )
+            forged_critical[domain] = domain_summary
+
+        sha = self.verify._full_git_sha()
+        checkout_digest = self.verify._checkout_state_digest()
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        expires = now + timedelta(days=1)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            contract_path = root / "frontend-coverage-contract.v1.json"
+            shutil.copy2(
+                REPO_ROOT
+                / "cortex-speech-app"
+                / "scripts"
+                / "frontend_coverage_contract.v1.json",
+                contract_path,
+            )
+            coverage_path = root / "coverage-final.json"
+            summary_path = root / "coverage-summary.json"
+            evidence_path = root / "frontend-coverage-evidence.json"
+            raw_manifest_path = root / "frontend-coverage-raw-manifest.json"
+            raw_bundle_path = root / "frontend-coverage-raw.v1.bin"
+            self.supervisor.atomic_write_json(coverage_path, forged_map)
+            raw_bundle_path.write_bytes(b"CORTEX_FRONTEND_COVERAGE_RAW_V1\n" + b"x")
+            self.supervisor.atomic_write_json(
+                summary_path,
+                {
+                    "total": {
+                        **summary,
+                        "branchesTrue": {
+                            "total": 0,
+                            "covered": 0,
+                            "skipped": 0,
+                            "pct": 100,
+                        },
+                    }
+                },
+            )
+            source_rows, source_digest = self.verify._frontend_snapshot(shipped)
+            campaign_rows, campaign_digest = self.verify._frontend_snapshot(
+                self.verify._frontend_campaign_inputs()
+            )
+            run_token = "01234567-89ab-4cde-8fab-0123456789ab"
+            authority_paths = {
+                "contract": "scripts/frontend_coverage_contract.v1.json",
+                "runner": "scripts/run_merged_frontend_coverage.mjs",
+                "packageLock": "package-lock.json",
+                "vitestConfig": "vitest.config.ts",
+                "playwrightConfig": "playwright.config.ts",
+            }
+            self.supervisor.atomic_write_json(
+                raw_manifest_path,
+                {
+                    "schema": 1,
+                    "type": "FrontendCoverageRawAuthorityV1",
+                    "runToken": run_token,
+                    "sourceTree": {"entries": source_rows, "sha256": source_digest},
+                    "campaignInputs": {
+                        "entries": campaign_rows,
+                        "sha256": campaign_digest,
+                    },
+                    "authorities": {
+                        role: {
+                            "path": relative,
+                            "sha256": self.supervisor.sha256_file(
+                                REPO_ROOT / "cortex-speech-app" / Path(relative)
+                            ),
+                        }
+                        for role, relative in authority_paths.items()
+                    },
+                    "runtime": {
+                        "node": "v-test",
+                        "platform": "test",
+                        "architecture": "x64",
+                    },
+                    "commands": [
+                        {
+                            "argv": ["node", "vitest", "run", "--coverage"],
+                            "cwd": ".",
+                            "environment": {"CORTEX_MERGED_COVERAGE": "1"},
+                            "logPath": "raw-authority/unit.log",
+                            "status": 0,
+                            "signal": None,
+                        },
+                        {
+                            "argv": [
+                                "node",
+                                "playwright",
+                                "test",
+                                "--project=chromium",
+                                "--workers=1",
+                                "--retries=0",
+                                "--reporter=line,json",
+                            ],
+                            "cwd": ".",
+                            "environment": {"CORTEX_E2E_COVERAGE": "1"},
+                            "logPath": "raw-authority/playwright.log",
+                            "status": 0,
+                            "signal": None,
+                        },
+                    ],
+                    "bundle": {
+                        "format": "CORTEX_FRONTEND_COVERAGE_RAW_V1",
+                        "sha256": self.supervisor.sha256_file(raw_bundle_path),
+                        "bytes": raw_bundle_path.stat().st_size,
+                        "entries": [
+                            {
+                                "bytes": 1,
+                                "path": "logs/unit.log",
+                                "sha256": hashlib.sha256(b"x").hexdigest(),
+                            }
+                        ],
+                    },
+                },
+            )
+            self.supervisor.atomic_write_json(
+                evidence_path,
+                {
+                    "schema": 1,
+                    "runToken": run_token,
+                    "contractSha256": self.supervisor.sha256_file(contract_path),
+                    "sourceTreeSha256": source_digest,
+                    "campaignInputsSha256": campaign_digest,
+                    # These four hashes were previously accepted without the named raw files.
+                    "unitCoverageSha256": "1" * 64,
+                    "playwrightReportSha256": "2" * 64,
+                    "rawCoverageSha256": "3" * 64,
+                    "browserCoverageSha256": "4" * 64,
+                    "mergedCoverageSha256": self.supervisor.sha256_file(coverage_path),
+                    "rawAuthorityManifestSha256": self.supervisor.sha256_file(
+                        raw_manifest_path
+                    ),
+                    "rawAuthorityBundleSha256": self.supervisor.sha256_file(raw_bundle_path),
+                    "shippedSourceFiles": len(shipped),
+                    "fullE2ETests": 100,
+                    "instrumentedE2ETests": 75,
+                    "e2eRawFiles": 75,
+                    "e2eConvertedSourceFiles": 10,
+                    "semanticMapMatch": {
+                        metric: {
+                            "incomingItems": 1,
+                            "matchedItems": 1,
+                            "unmatchedItems": 0,
+                            "pct": 100.0,
+                        }
+                        for metric in ("statements", "functions", "branches")
+                    },
+                    "summary": summary,
+                    "criticalDomains": forged_critical,
+                },
+            )
+            paths = {
+                "rust/rust-coverage-manifest.json": root / "unused-rust.json",
+                "frontend/frontend-coverage-contract.v1.json": contract_path,
+                "frontend/frontend-coverage-evidence.json": evidence_path,
+                "frontend/frontend-coverage-raw-manifest.json": raw_manifest_path,
+                "frontend/frontend-coverage-raw.v1.bin": raw_bundle_path,
+                "frontend/coverage-final.json": coverage_path,
+                "frontend/coverage-summary.json": summary_path,
+                "mutation/backend-mutation.json": root / "unused-backend.json",
+                "mutation/frontend-mutation.json": root / "unused-frontend.json",
+            }
+            prerequisite = {
+                "coverage": {"passed": True},
+                "expiresAt": self.verify._format_utc(expires),
+            }
+            mutation = {"expiresAt": self.verify._format_utc(expires)}
+            original_contract = contract_path.read_bytes()
+            boolean_contract = json.loads(original_contract.decode("utf-8"))
+            boolean_contract["schema"] = True
+            self.supervisor.atomic_write_json(contract_path, boolean_contract)
+            boolean_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            boolean_evidence["contractSha256"] = self.supervisor.sha256_file(contract_path)
+            self.supervisor.atomic_write_json(evidence_path, boolean_evidence)
+            with mock.patch.object(
+                self.verify,
+                "_validate_rust_coverage_phase",
+                return_value=prerequisite,
+            ), self.assertRaisesRegex(self.verify.EvidenceError, "contract is substituted"):
+                self.verify._validate_coverage_mutation_semantics(
+                    paths,
+                    manifest={"expiresAt": self.verify._format_utc(expires)},
+                    expected_sha=sha,
+                    expected_checkout_digest=checkout_digest,
+                    require_fresh=True,
+                )
+            contract_path.write_bytes(original_contract)
+            boolean_evidence["contractSha256"] = self.supervisor.sha256_file(contract_path)
+            self.supervisor.atomic_write_json(evidence_path, boolean_evidence)
+            with mock.patch.object(
+                self.verify,
+                "_validate_rust_coverage_phase",
+                return_value=prerequisite,
+            ), mock.patch.object(
+                self.verify,
+                "_validate_mutation_report",
+                return_value=mutation,
+            ), mock.patch.object(
+                self.verify,
+                "_run_owner_mutation_replay",
+                return_value=(
+                    {
+                        "manifestSha256": "a" * 64,
+                        "bundleSha256": "b" * 64,
+                        "observations": {"backend": {}, "frontend": {}},
+                    },
+                    {},
+                ),
+            ), mock.patch.object(
+                self.verify,
+                "_run_frontend_coverage_replay",
+                side_effect=self.verify.EvidenceError(
+                    self.verify.UNSUPPORTED_UNBACKED_EVIDENCE
+                ),
+            ), self.assertRaisesRegex(
+                self.verify.EvidenceError,
+                self.verify.UNSUPPORTED_UNBACKED_EVIDENCE,
+            ):
+                self.verify._validate_coverage_mutation_semantics(
+                    paths,
+                    manifest={"expiresAt": self.verify._format_utc(expires)},
+                    expected_sha=sha,
+                    expected_checkout_digest=checkout_digest,
+                    require_fresh=True,
+                )
+
+    def test_owner_proof_manifest_hash_claims_do_not_substitute_for_the_bound_files(self) -> None:
+        sha = self.verify._full_git_sha()
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._write_owner_proof_fixture(Path(temporary) / "owner-proof", sha)
+            with self.assertRaisesRegex(
+                self.verify.EvidenceError,
+                "file-role inventory|absent or differs|substituted",
+            ):
+                self.verify._validate_owner_proof_binding(paths, expected_sha=sha)
+
+    def test_product_attestation_rejects_boolean_integer_substitution(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text("{}\n", encoding="utf-8")
+            manifest = {
+                "runToken": "a" * 32,
+                "profile": self.verify.PROFILE_OWNER,
+                "fullGitSha": "b" * 40,
+                "sourceTreeDigest": "c" * 64,
+                "checkoutStateDigest": "d" * 64,
+                "gateRegistryHash": "e" * 64,
+                "evidenceContractHash": "f" * 64,
+                "environment": {},
+                "runAuthority": {},
+                "schemaAuthority": {},
+                "releaseArtifacts": [],
+                "windowsReleaseAuthority": None,
+                "rustCoveragePrerequisite": None,
+                "knownDefectDigest": "1" * 64,
+                "modelAttestation": None,
+                "staleTakeover": {"occurred": False, "abandonedRunToken": None},
+                "certificationEligible": False,
+                "verdict": "INCOMPLETE",
+            }
+            attestation = self.verify._product_attestation_document(
+                manifest_path, manifest
+            )
+            attestation["schema"] = True
+            attestation_path = root / self.verify.PRODUCT_ATTESTATION_NAME
+            self.supervisor.atomic_write_json(attestation_path, attestation)
+            with self.assertRaisesRegex(self.verify.EvidenceError, "substituted"):
+                self.verify._validate_product_attestation(
+                    attestation_path, manifest_path, manifest
+                )
+
+    def test_schema_clone_restore_semantics_reject_omission_future_acceptance_and_same_volume(self) -> None:
+        sha = self.verify._full_git_sha()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self._write_owner_proof_fixture(root / "owner-proof", sha)
+            truth = "d" * 64
+            schema_pairs = {
+                "fresh-schema69-install": (0, 69),
+                "schema65-to69-live-sized-clone": (65, 69),
+                "schema69-reopen": (69, 69),
+                "interrupted-migration-recovery": (65, 69),
+                "future-schema-refusal": (70, 70),
+                "local-snapshot-isolated-restore": (69, 69),
+                "offsite-snapshot-isolated-restore": (69, 69),
+            }
+            segment_count = 43_774
+            phases = []
+            for index, phase_id in enumerate(self.verify.SCHEMA_CAMPAIGN_PHASES, start=1):
+                before, after = schema_pairs[phase_id]
+                phases.append(
+                    {
+                        "id": phase_id,
+                        "status": "PASS",
+                        "attemptCount": 1,
+                        "retryCount": 0,
+                        "skipCount": 0,
+                        "schemaBefore": before,
+                        "schemaAfter": after,
+                        "quickCheck": "ok",
+                        "integrityCheck": "ok",
+                        "foreignKeyViolations": 0,
+                        "segmentCount": 0 if phase_id == "fresh-schema69-install" else segment_count,
+                        "truthDigest": (
+                            hashlib.sha256(b"").hexdigest()
+                            if phase_id == "fresh-schema69-install"
+                            else truth
+                        ),
+                        "restoreGeneration": (
+                            index
+                            if phase_id.endswith("isolated-restore")
+                            else 0
+                        ),
+                        "databaseSha256": hashlib.sha256(phase_id.encode()).hexdigest(),
+                    }
+                )
+            report = {
+                "schema": 1,
+                "type": "SchemaCloneRestoreMeasurementsV1",
+                "fullGitSha": sha,
+                "runToken": "1" * 32,
+                "attemptCount": 1,
+                "retryCount": 0,
+                "skipCount": 0,
+                "sourceSchema": 65,
+                "targetSchema": 69,
+                "sourceSegmentCount": segment_count,
+                "cloneSegmentCount": segment_count,
+                "authoritativeTruthDigest": truth,
+                "phases": phases,
+                "snapshots": [
+                    {
+                        "kind": kind,
+                        "volumeIdentitySha256": volume,
+                        "manifestSha256": hashlib.sha256((kind + "m").encode()).hexdigest(),
+                        "databaseSha256": hashlib.sha256((kind + "d").encode()).hexdigest(),
+                        "schema": 69,
+                        "segmentCount": segment_count,
+                        "truthDigest": truth,
+                    }
+                    for kind, volume in (("local", "a" * 64), ("offsite", "b" * 64))
+                ],
+                "passed": True,
+                "failures": [],
+            }
+            report_path = root / "schema-clone-and-restore.json"
+            self.supervisor.atomic_write_json(report_path, report)
+            paths["schema-clone-and-restore.json"] = report_path
+            proof_projection = {
+                "campaignSegments": segment_count,
+                "scaleSegments": 30_373,
+            }
+            with mock.patch.object(
+                self.verify,
+                "_validate_owner_proof_binding",
+                return_value=proof_projection,
+            ), self.assertRaisesRegex(
+                self.verify.EvidenceError, self.verify.UNSUPPORTED_UNBACKED_EVIDENCE
+            ):
+                self.verify._validate_schema_restore_semantics(paths, expected_sha=sha)
+            with mock.patch.object(
+                self.verify,
+                "_validate_owner_proof_binding",
+                return_value=proof_projection,
+            ), self.assertRaises(self.verify.EvidenceError):
+                self.verify._validate_schema_restore_semantics(
+                    paths, expected_sha=sha, expected_run_token="f" * 32
+                )
+            mutations = {}
+            omitted = json.loads(json.dumps(report))
+            omitted["phases"].pop(3)
+            mutations["omitted-phase"] = omitted
+            accepted_future = json.loads(json.dumps(report))
+            future = next(
+                item for item in accepted_future["phases"] if item["id"] == "future-schema-refusal"
+            )
+            future["schemaAfter"] = 69
+            mutations["future-schema-accepted"] = accepted_future
+            same_volume = json.loads(json.dumps(report))
+            same_volume["snapshots"][1]["volumeIdentitySha256"] = "a" * 64
+            mutations["same-volume"] = same_volume
+            for label, forged in mutations.items():
+                self.supervisor.atomic_write_json(report_path, forged)
+                with self.subTest(label=label), mock.patch.object(
+                    self.verify,
+                    "_validate_owner_proof_binding",
+                    return_value=proof_projection,
+                ), self.assertRaises(self.verify.EvidenceError):
+                    self.verify._validate_schema_restore_semantics(paths, expected_sha=sha)
+
+    def test_concurrency_performance_semantics_recompute_raw_p95_duration_and_heap(self) -> None:
+        sha = self.verify._full_git_sha()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self._write_owner_proof_fixture(root / "owner-proof", sha)
+            report = {
+                "schema": 1,
+                "type": "ConcurrencyPerformanceMeasurementsV1",
+                "fullGitSha": sha,
+                "runToken": "2" * 32,
+                "attemptCount": 1,
+                "retryCount": 0,
+                "skipCount": 0,
+                "fixedSeed": 3_232_997_711,
+                "hammer": {
+                    "segmentCount": 50_000,
+                    "durationSeconds": 1_800,
+                    "reviewWorkers": 4,
+                    "importWorkers": 2,
+                    "backupWorkers": 1,
+                    "expectedWrites": 10_000,
+                    "committedWrites": 10_000,
+                    "lockFailures": 0,
+                    "lostWrites": 0,
+                    "staleClobbers": 0,
+                    "invalidRestoreAdmissions": 0,
+                    "integrityCheck": "ok",
+                    "foreignKeyViolations": 0,
+                    "durableDecisionMilliseconds": [100] * 10_000,
+                    "queueMilliseconds": [200] * 10_000,
+                },
+                "frontend": {
+                    "segmentCount": 100_000,
+                    "decisionCount": 1_000,
+                    "initialJavaScriptGzipBytes": 120 * 1024,
+                    "initialCssGzipBytes": 14 * 1024,
+                    "coldShellInteractiveMilliseconds": 900,
+                    "reviewUsableMilliseconds": 1_400,
+                    "searchFilterMilliseconds": [100] * 1_000,
+                    "actionFeedbackMilliseconds": [80] * 1_000,
+                    "sameSourceAudioMilliseconds": [200] * 1_000,
+                    "newSourceAudioMilliseconds": [600] * 1_000,
+                    "interactionTaskMilliseconds": [40] * 1_000,
+                    "scrollFramesPerSecond": [60] * 1_000,
+                    "retainedHeapStartBytes": 100_000_000,
+                    "retainedHeapEndBytes": 110_000_000,
+                    "residentListPages": 3,
+                    "residentPrefetchedClips": 3,
+                },
+                "passed": True,
+                "failures": [],
+            }
+            report_path = root / "concurrency-performance-and-memory.json"
+            self.supervisor.atomic_write_json(report_path, report)
+            paths["concurrency-performance-and-memory.json"] = report_path
+            proof_projection = {"campaignSegments": 43_774, "scaleSegments": 30_373}
+            with mock.patch.object(
+                self.verify,
+                "_validate_owner_proof_binding",
+                return_value=proof_projection,
+            ), self.assertRaisesRegex(
+                self.verify.EvidenceError, self.verify.UNSUPPORTED_UNBACKED_EVIDENCE
+            ):
+                self.verify._validate_concurrency_performance_semantics(paths, expected_sha=sha)
+            with mock.patch.object(
+                self.verify,
+                "_validate_owner_proof_binding",
+                return_value=proof_projection,
+            ), self.assertRaises(self.verify.EvidenceError):
+                self.verify._validate_concurrency_performance_semantics(
+                    paths, expected_sha=sha, expected_run_token="f" * 32
+                )
+            mutations = {}
+            short = json.loads(json.dumps(report))
+            short["hammer"]["durationSeconds"] = 1_799
+            mutations["short-hammer"] = short
+            lost = json.loads(json.dumps(report))
+            lost["hammer"]["lostWrites"] = 1
+            mutations["lost-write"] = lost
+            omitted_sample = json.loads(json.dumps(report))
+            omitted_sample["hammer"]["durableDecisionMilliseconds"].pop()
+            mutations["omitted-write-sample"] = omitted_sample
+            p95 = json.loads(json.dumps(report))
+            p95["frontend"]["searchFilterMilliseconds"][-51:] = [151] * 51
+            mutations["p95"] = p95
+            heap = json.loads(json.dumps(report))
+            heap["frontend"]["retainedHeapEndBytes"] = 100_000_000 + 20 * 1024 * 1024
+            mutations["heap"] = heap
+            javascript = json.loads(json.dumps(report))
+            javascript["frontend"]["initialJavaScriptGzipBytes"] = 125 * 1024 + 1
+            mutations["javascript-budget"] = javascript
+            css = json.loads(json.dumps(report))
+            css["frontend"]["initialCssGzipBytes"] = 15 * 1024 + 1
+            mutations["css-budget"] = css
+            seed = json.loads(json.dumps(report))
+            seed["fixedSeed"] += 1
+            mutations["seed"] = seed
+            for label, forged in mutations.items():
+                self.supervisor.atomic_write_json(report_path, forged)
+                with self.subTest(label=label), mock.patch.object(
+                    self.verify,
+                    "_validate_owner_proof_binding",
+                    return_value=proof_projection,
+                ), self.assertRaises(self.verify.EvidenceError):
+                    self.verify._validate_concurrency_performance_semantics(paths, expected_sha=sha)
+
+    def test_owner_workflow_semantics_reject_missing_step_retry_wrong_champion_and_truth_loss(self) -> None:
+        sha = self.verify._full_git_sha()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self._write_owner_proof_fixture(root / "owner-proof", sha)
+            export_hash = "e" * 64
+            report = {
+                "schema": 1,
+                "type": "OwnerWorkflowRecoveryMeasurementsV1",
+                "fullGitSha": sha,
+                "runToken": "3" * 32,
+                "attemptCount": 1,
+                "retryCount": 0,
+                "skipCount": 0,
+                "executable": {"sha256": "a" * 64, "bytes": 1_000, "buildGitSha": sha},
+                "databaseSchema": 69,
+                "champion": {
+                    "modelId": "omniasr-7b",
+                    "deploymentSha256": "b" * 64,
+                    "servedDeploymentSha256": "b" * 64,
+                    "exactIdentityMatched": True,
+                    "hardStopBeforeTruthOnMismatch": True,
+                },
+                "mediaRoles": ["real-media-mp4", "real-media-mov", "real-media-flac"],
+                "workflowSteps": [
+                    {
+                        "id": step_id,
+                        "status": "PASS",
+                        "attemptCount": 1,
+                        "retryCount": 0,
+                        "skipCount": 0,
+                        "operationId": f"00000000-0000-4000-8000-{index:012x}",
+                        "artifactSha256": hashlib.sha256(step_id.encode()).hexdigest(),
+                    }
+                    for index, step_id in enumerate(self.verify.OWNER_WORKFLOW_STEPS, start=1)
+                ],
+                "recoveryDrills": [
+                    {
+                        "id": drill_id,
+                        "status": "PASS",
+                        "attemptCount": 1,
+                        "retryCount": 0,
+                        "skipCount": 0,
+                        "hardStoppedBeforeTruth": drill_id
+                        in {"wsl-unavailable-hard-stop", "wrong-model-hard-stop"},
+                        "draftRetained": True,
+                        "databaseIntegrity": "ok",
+                        "lostDecisions": 0,
+                        "duplicateDecisions": 0,
+                    }
+                    for drill_id in self.verify.OWNER_RECOVERY_DRILLS
+                ],
+                "truthInvariants": {
+                    "lostDecisions": 0,
+                    "duplicateDecisions": 0,
+                    "misattributedDecisions": 0,
+                    "unpaidExternalDecisions": 0,
+                    "silentCorruptions": 0,
+                    "placeholderTruthRows": 0,
+                },
+                "exportBeforeRestartSha256": export_hash,
+                "exportAfterRestartSha256": export_hash,
+                "passed": True,
+                "failures": [],
+            }
+            report_path = root / "owner-workflow-and-recovery.json"
+            self.supervisor.atomic_write_json(report_path, report)
+            paths["owner-workflow-and-recovery.json"] = report_path
+            proof_projection = {"campaignSegments": 43_774, "scaleSegments": 30_373}
+            with mock.patch.object(
+                self.verify,
+                "_validate_owner_proof_binding",
+                return_value=proof_projection,
+            ), self.assertRaisesRegex(
+                self.verify.EvidenceError, self.verify.UNSUPPORTED_UNBACKED_EVIDENCE
+            ):
+                self.verify._validate_owner_workflow_semantics(paths, expected_sha=sha)
+            with mock.patch.object(
+                self.verify,
+                "_validate_owner_proof_binding",
+                return_value=proof_projection,
+            ), self.assertRaises(self.verify.EvidenceError):
+                self.verify._validate_owner_workflow_semantics(
+                    paths, expected_sha=sha, expected_run_token="f" * 32
+                )
+            mutations = {}
+            omitted = json.loads(json.dumps(report))
+            omitted["workflowSteps"].pop()
+            mutations["omitted-step"] = omitted
+            retried = json.loads(json.dumps(report))
+            retried["recoveryDrills"][2]["retryCount"] = 1
+            mutations["retry"] = retried
+            wrong = json.loads(json.dumps(report))
+            wrong["champion"]["servedDeploymentSha256"] = "c" * 64
+            mutations["wrong-champion"] = wrong
+            lost = json.loads(json.dumps(report))
+            lost["truthInvariants"]["lostDecisions"] = 1
+            mutations["lost-decision"] = lost
+            export = json.loads(json.dumps(report))
+            export["exportAfterRestartSha256"] = "f" * 64
+            mutations["export-drift"] = export
+            for label, forged in mutations.items():
+                self.supervisor.atomic_write_json(report_path, forged)
+                with self.subTest(label=label), mock.patch.object(
+                    self.verify,
+                    "_validate_owner_proof_binding",
+                    return_value=proof_projection,
+                ), self.assertRaises(self.verify.EvidenceError):
+                    self.verify._validate_owner_workflow_semantics(paths, expected_sha=sha)
+
+    def test_owner_field_sessions_semantics_require_thirty_hash_chained_incident_free_days(self) -> None:
+        sha = self.verify._full_git_sha()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ledger = root / "owner-field-sessions.jsonl"
+            summary_path = root / "owner-field-session-summary.json"
+            previous = "0" * 64
+            records = []
+            base = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=31)
+            for ordinal in range(1, 31):
+                started = base + timedelta(days=ordinal, hours=1)
+                ended = started + timedelta(minutes=30)
+                record = {
+                    "schema": 1,
+                    "type": "AutomaticOwnerFieldSessionV1",
+                    "sessionId": f"00000000-0000-4000-8000-{ordinal:012x}",
+                    "ordinal": ordinal,
+                    "fullGitSha": sha,
+                    "executableSha256": "a" * 64,
+                    "databaseSchema": 69,
+                    "startedAt": self.verify._format_utc(started),
+                    "endedAt": self.verify._format_utc(ended),
+                    "durableDecisionCount": 3,
+                    "playbackCount": 3,
+                    "retryCount": 0,
+                    "skipCount": 0,
+                    "dataLossCount": 0,
+                    "duplicateDecisionCount": 0,
+                    "misattributedDecisionCount": 0,
+                    "silentCorruptionCount": 0,
+                    "incidents": [],
+                    "previousHash": previous,
+                    "recordHash": "",
+                }
+                record["recordHash"] = self.verify._field_session_record_hash(record)
+                previous = record["recordHash"]
+                records.append(record)
+            ledger.write_text(
+                "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+                encoding="utf-8",
+                newline="\n",
+            )
+            summary = {
+                "schema": 1,
+                "type": "OwnerFieldSessionSummaryV1",
+                "fullGitSha": sha,
+                "sessionCount": 30,
+                "distinctUtcDates": 30,
+                "firstStartedAt": records[0]["startedAt"],
+                "lastEndedAt": records[-1]["endedAt"],
+                "totalDurableDecisions": 90,
+                "executableSha256": "a" * 64,
+                "databaseSchema": 69,
+                "finalRecordHash": previous,
+                "passed": True,
+                "failures": [],
+            }
+            self.supervisor.atomic_write_json(summary_path, summary)
+            paths = {
+                "owner-field-sessions.jsonl": ledger,
+                "owner-field-session-summary.json": summary_path,
+            }
+            with self.assertRaisesRegex(
+                self.verify.EvidenceError, self.verify.UNSUPPORTED_UNBACKED_EVIDENCE
+            ):
+                self.verify._validate_owner_field_session_semantics(paths, expected_sha=sha)
+            field_manifest = {
+                "runToken": "5" * 32,
+                "startedAt": records[0]["startedAt"],
+                "endedAt": records[-1]["endedAt"],
+            }
+            with self.assertRaisesRegex(
+                self.verify.EvidenceError, self.verify.UNSUPPORTED_UNBACKED_EVIDENCE
+            ):
+                self.verify._validate_owner_campaign_semantics(
+                    "owner-field-sessions",
+                    paths,
+                    manifest=field_manifest,
+                    expected_sha=sha,
+                    expected_checkout_digest="a" * 64,
+                    require_fresh=True,
+                )
+            with self.assertRaises(self.verify.EvidenceError):
+                self.verify._validate_owner_campaign_semantics(
+                    "owner-field-sessions",
+                    paths,
+                    manifest={**field_manifest, "startedAt": records[1]["startedAt"]},
+                    expected_sha=sha,
+                    expected_checkout_digest="a" * 64,
+                    require_fresh=True,
+                )
+            attacks = {}
+            incident = json.loads(json.dumps(records))
+            incident[10]["incidents"] = [{"severity": "P1"}]
+            attacks["incident"] = incident
+            duplicate = json.loads(json.dumps(records))
+            duplicate[1]["sessionId"] = duplicate[0]["sessionId"]
+            attacks["duplicate"] = duplicate
+            executable = json.loads(json.dumps(records))
+            executable[-1]["executableSha256"] = "b" * 64
+            attacks["executable"] = executable
+            retry = json.loads(json.dumps(records))
+            retry[5]["retryCount"] = 1
+            attacks["retry"] = retry
+            for label, forged in attacks.items():
+                ledger.write_text(
+                    "".join(json.dumps(record, sort_keys=True) + "\n" for record in forged),
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                with self.subTest(label=label), self.assertRaises(self.verify.EvidenceError):
+                    self.verify._validate_owner_field_session_semantics(paths, expected_sha=sha)
+
+    def test_owner_deployment_semantics_require_candidate_then_active_and_distinct_cold_boot(self) -> None:
+        sha = self.verify._full_git_sha()
+        with tempfile.TemporaryDirectory() as temporary:
+            report_path = Path(temporary) / "owner-deployment-and-reboot.json"
+            release_manifest = "d" * 64
+            phases = [
+                {
+                    "id": phase_id,
+                    "proofRunToken": f"{index:032x}",
+                    "manifestSha256": hashlib.sha256((phase_id + "m").encode()).hexdigest(),
+                    "productAttestationSha256": hashlib.sha256(
+                        (phase_id + "a").encode()
+                    ).hexdigest(),
+                    "releaseAuthority": authority,
+                    "bootIdentitySha256": boot,
+                    "deployedReleaseManifestSha256": release_manifest,
+                }
+                for index, (phase_id, authority, boot) in enumerate(
+                    (
+                        ("pre-deployment", "staged-owner-candidate", "a" * 64),
+                        ("post-deployment", "active-immutable-release", "a" * 64),
+                        ("post-cold-reboot", "active-immutable-release", "b" * 64),
+                    ),
+                    start=1,
+                )
+            ]
+            report = {
+                "schema": 1,
+                "type": "OwnerDeploymentRebootMeasurementsV1",
+                "fullGitSha": sha,
+                "runToken": "4" * 32,
+                "attemptCount": 1,
+                "retryCount": 0,
+                "skipCount": 0,
+                "executableSha256": "c" * 64,
+                "executableBytes": 1_000,
+                "databaseSchema": 69,
+                "phases": phases,
+                "passed": True,
+                "failures": [],
+            }
+            self.supervisor.atomic_write_json(report_path, report)
+
+            def projected(phase, **_kwargs):
+                return dict(phase)
+
+            with mock.patch.object(
+                self.verify, "_validate_deployment_phase_control", side_effect=projected
+            ):
+                with self.assertRaisesRegex(
+                    self.verify.EvidenceError, self.verify.UNSUPPORTED_UNBACKED_EVIDENCE
+                ):
+                    self.verify._validate_owner_deployment_semantics(
+                        {"owner-deployment-and-reboot.json": report_path},
+                        manifest={"gateRegistryHash": self.verify.gate_registry_hash()},
+                        expected_sha=sha,
+                        expected_checkout_digest=self.verify._checkout_state_digest(),
+                    )
+            mutations = {}
+            wrong_authority = json.loads(json.dumps(report))
+            wrong_authority["phases"][0]["releaseAuthority"] = "active-immutable-release"
+            mutations["predeploy-not-candidate"] = wrong_authority
+            same_boot = json.loads(json.dumps(report))
+            same_boot["phases"][2]["bootIdentitySha256"] = "a" * 64
+            mutations["no-cold-reboot"] = same_boot
+            different_release = json.loads(json.dumps(report))
+            different_release["phases"][2]["deployedReleaseManifestSha256"] = "e" * 64
+            mutations["release-substitution"] = different_release
+            retried = json.loads(json.dumps(report))
+            retried["retryCount"] = 1
+            mutations["retry"] = retried
+            for label, forged in mutations.items():
+                self.supervisor.atomic_write_json(report_path, forged)
+                with self.subTest(label=label), mock.patch.object(
+                    self.verify,
+                    "_validate_deployment_phase_control",
+                    side_effect=projected,
+                ), self.assertRaises(self.verify.EvidenceError):
+                    self.verify._validate_owner_deployment_semantics(
+                        {"owner-deployment-and-reboot.json": report_path},
+                        manifest={"gateRegistryHash": self.verify.gate_registry_hash()},
+                        expected_sha=sha,
+                        expected_checkout_digest=self.verify._checkout_state_digest(),
+                    )
+
+    def test_deployment_phase_control_binds_run_mode_phase_and_staged_manifest(self) -> None:
+        sha = self.verify._full_git_sha()
+        registry_hash = self.verify.gate_registry_hash()
+        checkout_digest = self.verify._checkout_state_digest()
+        token = "1" * 32
+        release_manifest_sha = "d" * 64
+        candidate = {
+            "releaseId": "candidate-release",
+            "manifestSha256": release_manifest_sha,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prefix = "phases/pre-deployment/"
+            paths: dict[str, Path] = {}
+            for name in (
+                "manifest.json",
+                "product-attestation.json",
+                "events.jsonl",
+                "gate-registry.json",
+                "environment.json",
+                "evidence-contract.json",
+                self.verify.RUN_AUTHORITY_NAME,
+            ):
+                path = root / name
+                paths[prefix + name] = path
+            environment: dict[str, object] = {}
+            run_authority = {
+                "releasePhase": "pre-deployment",
+                "stagedCandidate": candidate,
+            }
+            application = {
+                "role": "application-executable",
+                "sha256": "c" * 64,
+                "bytes": 1_000,
+                "buildGitSha": sha,
+                "matchesFullGitSha": True,
+                "authority": "staged-owner-candidate",
+                "releasePhase": "pre-deployment",
+                "stagedReleaseId": "candidate-release",
+                "stagedReleaseManifestSha256": release_manifest_sha,
+            }
+            results = [
+                {
+                    "gateId": gate.id,
+                    "attemptCount": 1,
+                    "retryCount": 0,
+                    "retryReasons": [],
+                    "status": self.verify.PASS,
+                }
+                for gate in self.verify.GATES
+                if self.verify.PROFILE_OWNER in gate.profiles
+            ]
+            manifest = {
+                "schema": 1,
+                "complete": True,
+                "runToken": token,
+                "startedAt": "2026-08-28T10:00:00Z",
+                "endedAt": "2026-08-28T10:01:00Z",
+                "fullGitSha": sha,
+                "sourceTreeDigest": self.verify._source_tree_digest_for_sha(sha),
+                "checkoutStateDigest": checkout_digest,
+                "profile": self.verify.PROFILE_OWNER,
+                "quick": False,
+                "gateRegistryHash": registry_hash,
+                "environment": environment,
+                "staleTakeover": {"occurred": False, "abandonedRunToken": None},
+                "runAuthority": run_authority,
+                "evidenceContractHash": self.verify.evidence_contract_hash(),
+                "schemaAuthority": {"latestVersion": 69},
+                "releaseArtifacts": [application],
+                "results": results,
+            }
+            self.supervisor.atomic_write_json(paths[prefix + "manifest.json"], manifest)
+            self.supervisor.atomic_write_json(paths[prefix + "product-attestation.json"], {})
+            self.supervisor.atomic_write_json(
+                paths[prefix + "gate-registry.json"], self.verify.gate_registry_document()
+            )
+            self.supervisor.atomic_write_json(paths[prefix + "environment.json"], environment)
+            self.supervisor.atomic_write_json(
+                paths[prefix + "evidence-contract.json"], self.verify.evidence_contract_document()
+            )
+            self.supervisor.atomic_write_json(paths[prefix + self.verify.RUN_AUTHORITY_NAME], run_authority)
+            paths[prefix + "events.jsonl"].write_text(
+                "".join(
+                    json.dumps(event, sort_keys=True) + "\n"
+                    for event in (
+                        {
+                            "schema": 1,
+                            "sequence": 1,
+                            "runToken": token,
+                            "event": "run_start",
+                        },
+                        {
+                            "schema": 1,
+                            "sequence": 2,
+                            "runToken": token,
+                            "event": "run_end",
+                        },
+                    )
+                ),
+                encoding="utf-8",
+                newline="\n",
+            )
+            phase = {
+                "id": "pre-deployment",
+                "proofRunToken": token,
+                "manifestSha256": self.supervisor.sha256_file(paths[prefix + "manifest.json"]),
+                "productAttestationSha256": self.supervisor.sha256_file(
+                    paths[prefix + "product-attestation.json"]
+                ),
+                "releaseAuthority": "staged-owner-candidate",
+                "bootIdentitySha256": "a" * 64,
+                "deployedReleaseManifestSha256": release_manifest_sha,
+            }
+
+            def validate(*, authority_mode="staged-owner-candidate", candidate_value=candidate):
+                with mock.patch.object(
+                    self.verify,
+                    "_validate_run_authority",
+                    return_value=(authority_mode, "e" * 64),
+                ), mock.patch.object(
+                    self.verify,
+                    "_validate_product_attestation",
+                ), mock.patch.object(
+                    self.verify,
+                    "_validate_staged_candidate_authority",
+                    return_value=candidate_value,
+                ):
+                    return self.verify._validate_deployment_phase_control(
+                        phase,
+                        paths=paths,
+                        expected_sha=sha,
+                        expected_registry_hash=registry_hash,
+                        expected_checkout_digest=checkout_digest,
+                        expected_environment=environment,
+                        expected_executable_sha256="c" * 64,
+                        expected_executable_bytes=1_000,
+                    )
+
+            validate()
+            with self.assertRaises(self.verify.EvidenceError):
+                validate(authority_mode="windows-known-folders-live")
+            run_authority["releasePhase"] = "routine"
+            self.supervisor.atomic_write_json(paths[prefix + self.verify.RUN_AUTHORITY_NAME], run_authority)
+            manifest["runAuthority"] = run_authority
+            self.supervisor.atomic_write_json(paths[prefix + "manifest.json"], manifest)
+            phase["manifestSha256"] = self.supervisor.sha256_file(paths[prefix + "manifest.json"])
+            with self.assertRaises(self.verify.EvidenceError):
+                validate()
+            run_authority["releasePhase"] = "pre-deployment"
+            self.supervisor.atomic_write_json(paths[prefix + self.verify.RUN_AUTHORITY_NAME], run_authority)
+            manifest["runAuthority"] = run_authority
+            self.supervisor.atomic_write_json(paths[prefix + "manifest.json"], manifest)
+            phase["manifestSha256"] = self.supervisor.sha256_file(paths[prefix + "manifest.json"])
+            with self.assertRaises(self.verify.EvidenceError):
+                validate(candidate_value={**candidate, "manifestSha256": "f" * 64})
+
+    def test_missing_genuine_owner_campaigns_emit_required_durable_red_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "absent"
+            source.mkdir()
+            original = (
+                self.verify.OWNER_EVIDENCE_AUTHORITY_ROOT,
+                self.verify.LOG_DIR,
+                self.verify._ACTIVE_WORKER_PROFILE,
+            )
+            try:
+                self.verify.OWNER_EVIDENCE_AUTHORITY_ROOT = source
+                self.verify._ACTIVE_WORKER_PROFILE = self.verify.PROFILE_OWNER
+                for index, class_id in enumerate(
+                    self.verify.OWNER_EVIDENCE_CLASS_GATE_IDS, start=1
+                ):
+                    gate_root = root / f"red-{index}"
+                    gate_root.mkdir()
+                    self.verify.LOG_DIR = gate_root
+                    self.assertFalse(self.verify._fn_owner_evidence_class(class_id), class_id)
+                    artifact = gate_root / self.verify.OWNER_EVIDENCE_CLASS_ARTIFACTS[class_id]
+                    self.assertTrue(artifact.is_file(), class_id)
+                    value = self.verify._load_json_without_duplicate_keys(artifact)
+                    self.assertEqual(value["classId"], class_id)
+                    self.assertFalse(value["passed"])
+                    self.assertEqual(value["machineArtifacts"], [])
+                    self.assertTrue(value["failures"])
+            finally:
+                (
+                    self.verify.OWNER_EVIDENCE_AUTHORITY_ROOT,
+                    self.verify.LOG_DIR,
+                    self.verify._ACTIVE_WORKER_PROFILE,
+                ) = original
+
     def test_fault_campaign_evidence_rejects_self_authored_retry_stale_and_incomplete_reports(self) -> None:
         sha = self.verify._full_git_sha()
         registry_hash = self.verify.gate_registry_hash()
@@ -842,6 +2970,48 @@ class Verify10SupervisorTests(unittest.TestCase):
             with self.assertRaises(self.verify.EvidenceError):
                 validate()
 
+            future_manifest = self._write_fault_campaign(
+                root / "future-campaign",
+                token="e" * 32,
+                started=now + timedelta(hours=1),
+                sha=sha,
+                registry_hash=registry_hash,
+                checkout_digest=checkout_digest,
+                environment=environment,
+            )
+            with self.assertRaisesRegex(self.verify.EvidenceError, "chronology"):
+                self.verify._validate_fault_campaign_manifest(
+                    future_manifest,
+                    expected_sha=sha,
+                    expected_registry_hash=registry_hash,
+                    expected_checkout_digest=checkout_digest,
+                    expected_environment=environment,
+                    require_fresh=True,
+                    require_pass=True,
+                )
+            boolean_manifest = self._write_fault_campaign(
+                root / "boolean-campaign",
+                token="d" * 32,
+                started=now - timedelta(minutes=2),
+                sha=sha,
+                registry_hash=registry_hash,
+                checkout_digest=checkout_digest,
+                environment=environment,
+            )
+            boolean_value = json.loads(boolean_manifest.read_text(encoding="utf-8"))
+            boolean_value["schema"] = True
+            self.supervisor.atomic_write_json(boolean_manifest, boolean_value)
+            with self.assertRaisesRegex(self.verify.EvidenceError, "schema/type/run"):
+                self.verify._validate_fault_campaign_manifest(
+                    boolean_manifest,
+                    expected_sha=sha,
+                    expected_registry_hash=registry_hash,
+                    expected_checkout_digest=checkout_digest,
+                    expected_environment=environment,
+                    require_fresh=True,
+                    require_pass=True,
+                )
+
             incomplete_token = "f" * 32
             incomplete = campaign_root / incomplete_token
             incomplete.mkdir()
@@ -882,7 +3052,10 @@ class Verify10SupervisorTests(unittest.TestCase):
                     ),
                     4,
                 )
-                with self.assertRaisesRegex(self.verify.EvidenceError, "incomplete"):
+                # The builder must reject the incomplete fourth attempt. Depending on whether the
+                # earlier tamper probe invalidated the three copied exact-authority logs first, the
+                # fail-closed diagnostic may report either missing exact attempts or incompleteness.
+                with self.assertRaises(self.verify.EvidenceError):
                     self.verify._build_verifier_fault_campaign_evidence()
             finally:
                 self.verify.VERIFIER_FAULT_CAMPAIGN_ROOT, self.verify.LOG_DIR = original
@@ -1073,6 +3246,10 @@ class Verify10SupervisorTests(unittest.TestCase):
                     self.verify,
                     "_consume_rust_coverage_prerequisite",
                     side_effect=self._synthetic_coverage_binding,
+                ), mock.patch.object(
+                    self.verify,
+                    "_release_artifact_bindings",
+                    side_effect=self._stable_active_release_binding,
                 ):
                     for _index in range(3):
                         self.assertEqual(
@@ -1489,6 +3666,17 @@ class Verify10SupervisorTests(unittest.TestCase):
                     diagnostic_overrides=False
                 )
                 live_mode, live_digest = self.verify._validate_run_authority(live_authority)
+                boolean_schema_authority = json.loads(json.dumps(live_authority))
+                boolean_schema_authority["schema"] = True
+                boolean_schema_authority["authorityDigest"] = self.verify._document_digest(
+                    {
+                        key: value
+                        for key, value in boolean_schema_authority.items()
+                        if key != "authorityDigest"
+                    }
+                )
+                with self.assertRaisesRegex(self.verify.EvidenceError, "wrong schema"):
+                    self.verify._validate_run_authority(boolean_schema_authority)
                 live_environment = self.verify._gate_environment(gate, live_mode)
                 self.assertNotIn("CORTEX_DB", live_environment)
                 self.assertEqual(Path(live_environment["APPDATA"]), actual_roaming)
@@ -1646,6 +3834,10 @@ class Verify10SupervisorTests(unittest.TestCase):
                     self.verify,
                     "_consume_rust_coverage_prerequisite",
                     side_effect=self._synthetic_coverage_binding,
+                ), mock.patch.object(
+                    self.verify,
+                    "_release_artifact_bindings",
+                    side_effect=self._stable_active_release_binding,
                 ):
                     code = self.verify.aggregate_main(
                         quick=False,
@@ -1709,6 +3901,58 @@ class Verify10SupervisorTests(unittest.TestCase):
                     second.acquire()
             finally:
                 first.release()
+
+    def test_dead_legacy_lock_self_heals_but_the_recovery_invocation_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            original = self.verify.LEGACY_RUN_LOCK
+            try:
+                self.verify.LEGACY_RUN_LOCK = Path(temporary) / "legacy.lock"
+                self.verify.LEGACY_RUN_LOCK.write_text("11456\n", encoding="utf-8")
+                with mock.patch.object(self.verify, "_pid_alive", return_value=False):
+                    with self.assertRaisesRegex(
+                        self.verify.LeaseError,
+                        "recovery invocation cannot certify",
+                    ):
+                        self.verify._retire_legacy_run_lock()
+                self.assertFalse(self.verify.LEGACY_RUN_LOCK.exists())
+                # The next invocation has no recovery event and may proceed to the typed lease.
+                self.verify._retire_legacy_run_lock()
+            finally:
+                self.verify.LEGACY_RUN_LOCK = original
+
+    def test_live_or_pid_reused_legacy_lock_is_never_terminated_or_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            original = self.verify.LEGACY_RUN_LOCK
+            try:
+                self.verify.LEGACY_RUN_LOCK = Path(temporary) / "legacy.lock"
+                self.verify.LEGACY_RUN_LOCK.write_text("24680\n", encoding="utf-8")
+                with mock.patch.object(self.verify, "_pid_alive", return_value=True):
+                    with self.assertRaisesRegex(
+                        self.verify.LeaseError,
+                        "creation-time/token identity",
+                    ):
+                        self.verify._retire_legacy_run_lock()
+                self.assertEqual(
+                    self.verify.LEGACY_RUN_LOCK.read_text(encoding="utf-8"),
+                    "24680\n",
+                )
+            finally:
+                self.verify.LEGACY_RUN_LOCK = original
+
+    def test_malformed_legacy_lock_fails_closed_without_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            original = self.verify.LEGACY_RUN_LOCK
+            try:
+                self.verify.LEGACY_RUN_LOCK = Path(temporary) / "legacy.lock"
+                self.verify.LEGACY_RUN_LOCK.write_text("11456 extra\n", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    self.verify.LeaseError,
+                    "unknown legacy verifier lock identity",
+                ):
+                    self.verify._retire_legacy_run_lock()
+                self.assertTrue(self.verify.LEGACY_RUN_LOCK.exists())
+            finally:
+                self.verify.LEGACY_RUN_LOCK = original
 
     def test_two_concurrent_starts_have_exactly_one_winner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2254,6 +4498,68 @@ class Verify10SupervisorTests(unittest.TestCase):
             finally:
                 lease.release()
 
+    def test_declared_gate_timeout_is_the_exact_parent_hard_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lease = self.supervisor.LeaseManager(
+                root / "lease.json", "e" * 40, "owner-product", "timeout"
+            )
+            lease.acquire()
+            journal = self.supervisor.EvidenceJournal(root / "events.jsonl", "timeout")
+            gate = replace(
+                self.verify._gate_by_id("manifest-alignment"), timeout_seconds=7
+            )
+            authority = self.verify._run_authority_document(diagnostic_overrides=False)
+            authority_mode, authority_digest = self.verify._validate_run_authority(authority)
+
+            class FakeProcess:
+                pid = 424_243
+
+            observed_timeouts: list[float] = []
+
+            def timed_out_wait(_process, _job, *, timeout, heartbeat):
+                observed_timeouts.append(timeout)
+                heartbeat()
+                return None, True
+
+            try:
+                with mock.patch.object(
+                    self.verify,
+                    "spawn_isolated",
+                    return_value=(FakeProcess(), object()),
+                ), mock.patch.object(
+                    self.verify,
+                    "wait_isolated",
+                    side_effect=timed_out_wait,
+                ):
+                    (
+                        status,
+                        seconds,
+                        detail,
+                        _artifacts,
+                        _environment_authority,
+                        attempt_authority,
+                    ) = self.verify._run_gate_worker(
+                        gate,
+                        root / "run",
+                        "timeout",
+                        lease,
+                        journal,
+                        profile=self.verify.PROFILE_OWNER,
+                        authority_mode=authority_mode,
+                        run_authority_digest=authority_digest,
+                    )
+            finally:
+                lease.release()
+            self.assertEqual(observed_timeouts, [7])
+            self.assertEqual(status, self.verify.FAIL)
+            self.assertEqual(seconds, 7.0)
+            self.assertIn("declared hard timeout 7s", detail)
+            self.assertEqual(
+                attempt_authority,
+                {"attemptCount": 1, "retryCount": 0, "retryReasons": []},
+            )
+
     @unittest.skipUnless(os.name == "nt", "real Windows console interrupt proof")
     def test_real_console_interrupt_terminates_worker_and_publishes_no_status(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2514,6 +4820,34 @@ class Verify10SupervisorTests(unittest.TestCase):
                 journal = self.supervisor.EvidenceJournal(root, "token")
                 journal.append("run_start")
 
+    def test_authority_json_rejects_duplicate_keys_and_nonfinite_numbers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            nonfinite = root / "nonfinite.json"
+            with self.assertRaisesRegex(
+                self.supervisor.EvidenceError, "not canonical or finite"
+            ):
+                self.supervisor.atomic_write_json(
+                    nonfinite, {"schema": 1, "seconds": float("nan")}
+                )
+            self.assertFalse(nonfinite.exists())
+
+            duplicate = root / "duplicate.json"
+            duplicate.write_text(
+                '{"schema":1,"runToken":"first","runToken":"second"}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(self.supervisor.LeaseError, "duplicate key"):
+                self.supervisor.read_json_object(duplicate)
+            with self.assertRaisesRegex(self.verify.EvidenceError, "duplicate JSON key"):
+                self.verify._load_json_without_duplicate_keys(duplicate)
+
+            journal = self.supervisor.EvidenceJournal(root / "events.jsonl", "token")
+            with self.assertRaisesRegex(
+                self.supervisor.EvidenceError, "cannot append verifier evidence"
+            ):
+                journal.append("heartbeat", seconds=float("inf"))
+
     def test_probe_crash_fails_only_its_gate(self) -> None:
         def crash():
             raise RuntimeError("injected probe crash")
@@ -2577,6 +4911,7 @@ class Verify10SupervisorTests(unittest.TestCase):
             killer = threading.Thread(target=terminate_node_with_abnormal_status, daemon=True)
             killer.start()
             try:
+                attempt_authority = self.verify.GateRunMetadata()
                 status, _seconds, detail = self.verify.run_gate(
                     "abnormal-node-campaign",
                     "cmd",
@@ -2584,6 +4919,7 @@ class Verify10SupervisorTests(unittest.TestCase):
                     root,
                     None,
                     timeout=60,
+                    metadata=attempt_authority,
                 )
                 killer.join(timeout=10)
                 self.assertFalse(killer.is_alive())
@@ -2591,6 +4927,12 @@ class Verify10SupervisorTests(unittest.TestCase):
                 self.assertEqual(len(killed_identity), 1)
                 self.assertEqual(status, self.verify.PASS_AFTER_RETRY)
                 self.assertIn("re-ran once", detail)
+                self.assertEqual(attempt_authority.attempt_count, 2)
+                self.assertEqual(attempt_authority.retry_count, 1)
+                self.assertEqual(
+                    attempt_authority.retry_reasons,
+                    ("OS-terminated before verdict (exit 3221226505)",),
+                )
                 self.assertEqual(len(list(root.glob("abnormal-node-campaign.attempt-*.log"))), 2)
                 code, _verdict = self.verify._profile_verdict(
                     self.verify.PROFILE_OWNER,
@@ -2820,16 +5162,21 @@ class Verify10SupervisorTests(unittest.TestCase):
                 gate = self.verify._gate_by_id("manifest-alignment")
                 authority = self.verify._run_authority_document(diagnostic_overrides=False)
                 authority_mode, authority_digest = self.verify._validate_run_authority(authority)
-                status, _seconds, _detail, artifacts, environment_authority = (
-                    self.verify._run_gate_worker(
-                        gate,
-                        root / "run",
-                        "token",
-                        lease,
-                        journal,
-                        authority_mode=authority_mode,
-                        run_authority_digest=authority_digest,
-                    )
+                (
+                    status,
+                    _seconds,
+                    _detail,
+                    artifacts,
+                    environment_authority,
+                    attempt_authority,
+                ) = self.verify._run_gate_worker(
+                    gate,
+                    root / "run",
+                    "token",
+                    lease,
+                    journal,
+                    authority_mode=authority_mode,
+                    run_authority_digest=authority_digest,
                 )
             finally:
                 lease.release()
@@ -2837,6 +5184,122 @@ class Verify10SupervisorTests(unittest.TestCase):
             self.assertTrue(artifacts)
             self.assertTrue(all(len(str(artifact["sha256"])) == 64 for artifact in artifacts))
             self.assertEqual(environment_authority["runAuthorityDigest"], authority_digest)
+            self.assertEqual(
+                attempt_authority,
+                {"attemptCount": 1, "retryCount": 0, "retryReasons": []},
+            )
+
+    def test_retry_is_structured_in_worker_result_and_fsynced_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir = root / "run"
+            lease = self.supervisor.LeaseManager(
+                root / "lease.json", "e" * 40, "owner-product", "retry-token"
+            )
+            lease.acquire()
+            journal = self.supervisor.EvidenceJournal(
+                root / "events.jsonl", "retry-token"
+            )
+            gate = self.verify._gate_by_id("manifest-alignment")
+            authority = self.verify._run_authority_document(diagnostic_overrides=False)
+            authority_mode, authority_digest = self.verify._validate_run_authority(authority)
+            expected_environment = self.verify._gate_environment_authority(
+                gate,
+                self.verify._gate_environment(gate, authority_mode),
+                authority_mode=authority_mode,
+                run_authority_digest=authority_digest,
+            )
+
+            class FakeProcess:
+                pid = 424_244
+
+            def complete_with_retry(_process, _job, *, timeout, heartbeat):
+                self.assertEqual(timeout, gate.timeout_seconds)
+                heartbeat()
+                gate_dir = run_dir / "gates" / gate.id
+                artifacts = []
+                for attempt in (1, 2):
+                    attempt_path = gate_dir / f"attempt-{attempt}.log"
+                    attempt_path.write_text(f"attempt {attempt}\n", encoding="utf-8")
+                    artifacts.append(
+                        {
+                            "path": attempt_path.name,
+                            "sha256": self.supervisor.sha256_file(attempt_path),
+                            "bytes": attempt_path.stat().st_size,
+                        }
+                    )
+                self.supervisor.atomic_write_json(
+                    gate_dir / "worker-result.json",
+                    {
+                        "schema": 1,
+                        "runToken": "retry-token",
+                        "gateId": gate.id,
+                        "startedAt": "2026-08-28T00:00:00Z",
+                        "endedAt": "2026-08-28T00:00:01Z",
+                        "status": self.verify.PASS_AFTER_RETRY,
+                        "seconds": 1.0,
+                        "detail": "diagnostic retry",
+                        "attemptCount": 2,
+                        "retryCount": 1,
+                        "retryReasons": ["LNK1104 linker file-lock flake"],
+                        "artifacts": artifacts,
+                        "environmentAuthority": expected_environment,
+                    },
+                )
+                return 0, False
+
+            try:
+                with mock.patch.object(
+                    self.verify,
+                    "spawn_isolated",
+                    return_value=(FakeProcess(), object()),
+                ), mock.patch.object(
+                    self.verify,
+                    "wait_isolated",
+                    side_effect=complete_with_retry,
+                ):
+                    (
+                        status,
+                        _seconds,
+                        _detail,
+                        _artifacts,
+                        _environment_authority,
+                        attempt_authority,
+                    ) = self.verify._run_gate_worker(
+                        gate,
+                        run_dir,
+                        "retry-token",
+                        lease,
+                        journal,
+                        authority_mode=authority_mode,
+                        run_authority_digest=authority_digest,
+                    )
+            finally:
+                lease.release()
+
+            self.assertEqual(status, self.verify.PASS_AFTER_RETRY)
+            self.assertEqual(
+                attempt_authority,
+                {
+                    "attemptCount": 2,
+                    "retryCount": 1,
+                    "retryReasons": ["LNK1104 linker file-lock flake"],
+                },
+            )
+            events = [
+                json.loads(line)
+                for line in (root / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            retry_events = [event for event in events if event["event"] == "retry"]
+            self.assertEqual(len(retry_events), 1)
+            self.assertEqual(retry_events[0]["attempt"], 2)
+            self.assertEqual(
+                retry_events[0]["reason"], "LNK1104 linker file-lock flake"
+            )
+            self.assertLess(
+                retry_events[0]["sequence"],
+                next(event["sequence"] for event in events if event["event"] == "gate_end"),
+            )
 
     def test_completed_manifest_is_the_only_status_and_latest_pointer_authority(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2867,6 +5330,10 @@ class Verify10SupervisorTests(unittest.TestCase):
                     self.verify,
                     "_consume_rust_coverage_prerequisite",
                     side_effect=self._synthetic_coverage_binding,
+                ), mock.patch.object(
+                    self.verify,
+                    "_release_artifact_bindings",
+                    side_effect=self._stable_active_release_binding,
                 ):
                     code = self.verify.aggregate_main(
                         quick=False,
@@ -2884,18 +5351,23 @@ class Verify10SupervisorTests(unittest.TestCase):
                     pointer["productAttestationSha256"],
                     self.supervisor.sha256_file(attestation_path),
                 )
-                self.verify._validate_latest_proof(
-                    self.verify.LATEST_PROOF, pointer["fullGitSha"]
-                )
-                with self.assertRaisesRegex(
-                    self.verify.EvidenceError,
-                    "not certification-eligible",
+                with mock.patch.object(
+                    self.verify,
+                    "_release_artifact_bindings",
+                    side_effect=self._stable_active_release_binding,
                 ):
-                    self.verify._require_latest_certifying_proof(
-                        self.verify.LATEST_PROOF,
-                        self.verify.PROFILE_OWNER,
-                        pointer["fullGitSha"],
+                    self.verify._validate_latest_proof(
+                        self.verify.LATEST_PROOF, pointer["fullGitSha"]
                     )
+                    with self.assertRaisesRegex(
+                        self.verify.EvidenceError,
+                        "not certification-eligible",
+                    ):
+                        self.verify._require_latest_certifying_proof(
+                            self.verify.LATEST_PROOF,
+                            self.verify.PROFILE_OWNER,
+                            pointer["fullGitSha"],
+                        )
                 with mock.patch.object(
                     self.verify,
                     "_revalidate_latest_release_executable",
@@ -2955,6 +5427,123 @@ class Verify10SupervisorTests(unittest.TestCase):
                 status = (manifest_path.parent / "STATUS.md").read_text(encoding="utf-8")
                 self.assertIn(pointer["fullGitSha"], status)
                 self.assertIn("owner-product", status)
+
+                forged_status_run = (
+                    self.verify.PROOF_ROOT / "forged-status" / pointer["runToken"]
+                )
+                forged_status_run.parent.mkdir(parents=True, exist_ok=False)
+                shutil.copytree(manifest_path.parent, forged_status_run)
+                forged_status_path = forged_status_run / "STATUS.md"
+                forged_status_path.write_text(
+                    status.replace("**Verdict:**", "**Verdict:** FALSE OWNER CLAIM —"),
+                    encoding="utf-8",
+                )
+                forged_status_manifest_path = forged_status_run / "manifest.json"
+                forged_status_manifest = json.loads(
+                    forged_status_manifest_path.read_text(encoding="utf-8")
+                )
+                for artifact in forged_status_manifest["artifacts"]:
+                    if artifact["path"] == "STATUS.md":
+                        artifact["sha256"] = self.supervisor.sha256_file(
+                            forged_status_path
+                        )
+                        artifact["bytes"] = forged_status_path.stat().st_size
+                        break
+                self.supervisor.atomic_write_json(
+                    forged_status_manifest_path, forged_status_manifest
+                )
+                self.supervisor.atomic_write_json(
+                    forged_status_run / self.verify.PRODUCT_ATTESTATION_NAME,
+                    self.verify._product_attestation_document(
+                        forged_status_manifest_path, forged_status_manifest
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    self.verify.EvidenceError, "canonical manifest projection"
+                ):
+                    self.verify._validate_completed_manifest(
+                        forged_status_manifest_path,
+                        pointer["fullGitSha"],
+                        pointer["runToken"],
+                    )
+
+                # Re-hashing a changed worker result and both public envelopes must not let the
+                # manifest report different gate truth. The worker document is an independent
+                # authority, not merely another opaque file in the global hash inventory.
+                forged_worker_run = (
+                    self.verify.PROOF_ROOT / "forged-worker-result" / pointer["runToken"]
+                )
+                forged_worker_run.parent.mkdir(parents=True, exist_ok=False)
+                shutil.copytree(manifest_path.parent, forged_worker_run)
+                forged_worker_result_path = (
+                    forged_worker_run
+                    / "gates"
+                    / "manifest-alignment"
+                    / "worker-result.json"
+                )
+                forged_worker_result = json.loads(
+                    forged_worker_result_path.read_text(encoding="utf-8")
+                )
+                forged_worker_result["detail"] = "rehashed but contradictory worker truth"
+                self.supervisor.atomic_write_json(
+                    forged_worker_result_path, forged_worker_result
+                )
+                forged_worker_manifest_path = forged_worker_run / "manifest.json"
+                forged_worker_manifest = json.loads(
+                    forged_worker_manifest_path.read_text(encoding="utf-8")
+                )
+                worker_result_relative = str(
+                    forged_worker_result_path.relative_to(forged_worker_run)
+                )
+                for artifact in forged_worker_manifest["artifacts"]:
+                    if artifact["path"] == worker_result_relative:
+                        artifact["sha256"] = self.supervisor.sha256_file(
+                            forged_worker_result_path
+                        )
+                        artifact["bytes"] = forged_worker_result_path.stat().st_size
+                        break
+                else:
+                    self.fail("synthetic proof omitted its worker-result binding")
+                for artifact in forged_worker_manifest["results"][0]["artifacts"]:
+                    if artifact["path"] == worker_result_relative:
+                        artifact["sha256"] = self.supervisor.sha256_file(
+                            forged_worker_result_path
+                        )
+                        artifact["bytes"] = forged_worker_result_path.stat().st_size
+                        break
+                else:
+                    self.fail("synthetic gate result omitted its worker-result binding")
+                self.supervisor.atomic_write_json(
+                    forged_worker_manifest_path, forged_worker_manifest
+                )
+                self.supervisor.atomic_write_json(
+                    forged_worker_run / self.verify.PRODUCT_ATTESTATION_NAME,
+                    self.verify._product_attestation_document(
+                        forged_worker_manifest_path, forged_worker_manifest
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    self.verify.EvidenceError,
+                    "differs from its independently written worker result",
+                ):
+                    self.verify._validate_completed_manifest(
+                        forged_worker_manifest_path,
+                        pointer["fullGitSha"],
+                        pointer["runToken"],
+                    )
+
+                duplicate_manifest_path = root / "duplicate-manifest.json"
+                duplicate_manifest_path.write_text(
+                    '{"schema":1,"schema":1}\n', encoding="utf-8"
+                )
+                with self.assertRaisesRegex(
+                    self.verify.EvidenceError, "duplicate JSON key"
+                ):
+                    self.verify._validate_completed_manifest(
+                        duplicate_manifest_path,
+                        pointer["fullGitSha"],
+                        pointer["runToken"],
+                    )
                 with self.assertRaises(self.verify.EvidenceError):
                     self.verify._validate_completed_manifest(
                         manifest_path, "f" * 40, pointer["runToken"]
@@ -3129,6 +5718,10 @@ class Verify10SupervisorTests(unittest.TestCase):
                     self.verify,
                     "_consume_rust_coverage_prerequisite",
                     side_effect=self._synthetic_coverage_binding,
+                ), mock.patch.object(
+                    self.verify,
+                    "_release_artifact_bindings",
+                    side_effect=self._stable_active_release_binding,
                 ):
                     code = self.verify.aggregate_main(
                         quick=False,
@@ -3181,6 +5774,33 @@ class Verify10SupervisorTests(unittest.TestCase):
                     forged_manifest["certificationEvidence"],
                 )
                 forged_manifest["verdict"] = forged_verdict
+                forged_status_path = forged_run / "STATUS.md"
+                self.supervisor.atomic_write_bytes(
+                    forged_status_path,
+                    self.verify._status_md_text(
+                        forged_manifest["fullGitSha"],
+                        forged_manifest["quick"],
+                        [
+                            (
+                                result["gateId"],
+                                result["status"],
+                                result["seconds"],
+                                result["detail"],
+                            )
+                            for result in forged_manifest["results"]
+                        ],
+                        forged_manifest["verdict"],
+                        forged_manifest["profile"],
+                        forged_manifest["certificationEvidence"],
+                    ).encode("utf-8"),
+                )
+                for artifact in forged_manifest["artifacts"]:
+                    if artifact["path"] == "STATUS.md":
+                        artifact["sha256"] = self.supervisor.sha256_file(
+                            forged_status_path
+                        )
+                        artifact["bytes"] = forged_status_path.stat().st_size
+                        break
                 self.supervisor.atomic_write_json(forged_manifest_path, forged_manifest)
                 self.supervisor.atomic_write_json(
                     forged_run / self.verify.PRODUCT_ATTESTATION_NAME,

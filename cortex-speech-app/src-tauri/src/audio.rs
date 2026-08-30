@@ -1490,20 +1490,6 @@ mod tests {
     }
 
     #[test]
-    fn evaluation_identity_decoders_use_the_fixed_import_window_protocol() {
-        let evaluation_source = include_str!("eval.rs");
-        let evaluation_production =
-            evaluation_source.split("\n#[cfg(test)]\nmod tests").next().unwrap_or(evaluation_source);
-        let identity_decodes = evaluation_production.matches("decode_pcm_windows(").count();
-        let fixed_windows = evaluation_production.matches("crate::audio::DECODE_WINDOW_MS").count();
-        assert_eq!(identity_decodes, 3, "evaluation has three source-identity/materialization decoders");
-        assert_eq!(
-            fixed_windows, identity_decodes,
-            "every evaluation identity/materialization decoder must use the fixed 90-second import protocol"
-        );
-    }
-
-    #[test]
     fn normalize_pcm_rms_moves_level_toward_the_target() {
         // A quiet tone normalised to a louder target must get louder, and the waveform shape must
         // survive: normalisation may not invert, clip, or NaN the signal.

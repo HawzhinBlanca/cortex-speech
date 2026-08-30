@@ -1,0 +1,176 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { invoke } from '@tauri-apps/api/core';
+import {
+  acknowledgeBatchRun,
+  acknowledgeQuarantine,
+  appGitSha,
+  appHealth,
+  batchNormalize,
+  batchTranscribe,
+  beginDesktopPlaybackSessionV1,
+  cancelDesktopPlaybackSessionV1,
+  cancelOperation,
+  cancelWslRefinement,
+  checkAgenticReadiness,
+  clearTracingSpans,
+  computeSignalAnomalyScores,
+  dbBackup,
+  dbRestore,
+  dbVacuum,
+  deleteReviewDraftV1,
+  discardInterruptedImport,
+  getActiveBatchRun,
+  getActiveVoiceFocusV1,
+  getAgentImportReportByRunId,
+  getAudioHealth,
+  getBatchRunStatus,
+  getConfiguredProviders,
+  getDatasetCertificate,
+  getDatasetQuality,
+  getHistoryStatusV1,
+  getImportRunStatus,
+  getInferenceStats,
+  getInterruptedImport,
+  getJobs,
+  getLabelQualityLift,
+  getMediaAssetUrl,
+  getQuarantineNotice,
+  getRecentSpans,
+  getReviewDraftV1,
+  getSegment,
+  getSignalAnomalySegments,
+  getSpeakerInventoryV1,
+  getTrainingGradeBreakdown,
+  getTracingStats,
+  listAgentImportReports,
+  listAgentStageEvents,
+  listDbSnapshots,
+  listEvalRuns,
+  listModelVersions,
+  modelsDownloadAll,
+  modelsStatus,
+  redo,
+  registerMediaAsset,
+  registerReviewMediaAsset,
+  relinkAudio,
+  restoreDbFromSnapshot,
+  restoreSession,
+  runWslRefinement,
+  saveReviewDraftV1,
+  startChampionEngine,
+  takeLastCrash,
+  undo,
+  validateDataset,
+} from '../../src/lib/commands';
+
+const invokeMock = vi.mocked(invoke);
+
+const refusal = {
+  schema: 1 as const,
+  code: 'OWNER_COMMAND_REFUSED',
+  message: 'The owner-local operation was refused.',
+  retryable: false,
+  suggestedAction: 'openHealth' as const,
+  operationId: null,
+};
+
+const ownerCommandCalls: Array<[string, () => Promise<unknown>]> = [
+  ['getInterruptedImport', () => getInterruptedImport()],
+  ['getImportRunStatus', () => getImportRunStatus('import-run')],
+  ['getBatchRunStatus', () => getBatchRunStatus('batch-run')],
+  ['getActiveBatchRun', () => getActiveBatchRun()],
+  ['acknowledgeBatchRun', () => acknowledgeBatchRun('batch-run')],
+  ['discardInterruptedImport', () => discardInterruptedImport('job-one')],
+  ['cancelOperation', () => cancelOperation()],
+  ['batchTranscribe', () => batchTranscribe(['seg-one'], 'batch-transcribe')],
+  ['getSegment', () => getSegment('seg-one')],
+  ['getActiveVoiceFocusV1', () => getActiveVoiceFocusV1()],
+  ['getReviewDraftV1', () => getReviewDraftV1('seg-one')],
+  ['saveReviewDraftV1', () => saveReviewDraftV1('seg-one', 4, 'owner draft')],
+  ['deleteReviewDraftV1', () => deleteReviewDraftV1('seg-one', 4)],
+  ['getSignalAnomalySegments', () => getSignalAnomalySegments()],
+  ['getJobs', () => getJobs()],
+  ['startChampionEngine', () => startChampionEngine()],
+  ['listAgentImportReports', () => listAgentImportReports()],
+  ['getAgentImportReportByRunId', () => getAgentImportReportByRunId('agent-run')],
+  ['listAgentStageEvents', () => listAgentStageEvents()],
+  ['registerMediaAsset', () => registerMediaAsset('C:\\audio\\clip.wav')],
+  ['registerReviewMediaAsset', () => registerReviewMediaAsset('C:\\audio\\clip.wav')],
+  ['getMediaAssetUrl', () => getMediaAssetUrl('grant-one')],
+  [
+    'beginDesktopPlaybackSessionV1',
+    () =>
+      beginDesktopPlaybackSessionV1(
+        'seg-one',
+        'grant-one',
+        3,
+        '11111111-1111-4111-8111-111111111111',
+      ),
+  ],
+  [
+    'cancelDesktopPlaybackSessionV1',
+    () =>
+      cancelDesktopPlaybackSessionV1(
+        '22222222-2222-4222-8222-222222222222',
+        '11111111-1111-4111-8111-111111111111',
+      ),
+  ],
+  ['getConfiguredProviders', () => getConfiguredProviders()],
+  ['listModelVersions', () => listModelVersions()],
+  ['restoreSession', () => restoreSession()],
+  ['getTracingStats', () => getTracingStats()],
+  ['getRecentSpans', () => getRecentSpans()],
+  ['clearTracingSpans', () => clearTracingSpans()],
+  ['getAudioHealth', () => getAudioHealth()],
+  ['relinkAudio', () => relinkAudio('C:\\audio')],
+  ['getQuarantineNotice', () => getQuarantineNotice()],
+  ['listDbSnapshots', () => listDbSnapshots()],
+  ['restoreDbFromSnapshot', () => restoreDbFromSnapshot('snapshot-one')],
+  ['getSpeakerInventoryV1', () => getSpeakerInventoryV1()],
+  ['getDatasetQuality', () => getDatasetQuality()],
+  ['getTrainingGradeBreakdown', () => getTrainingGradeBreakdown()],
+  ['validateDataset', () => validateDataset()],
+  ['batchNormalize', () => batchNormalize(['seg-one'], 'batch-normalize')],
+  ['undo', () => undo()],
+  ['redo', () => redo()],
+  ['getHistoryStatusV1', () => getHistoryStatusV1()],
+  ['dbBackup', () => dbBackup('C:\\backup\\owner.db')],
+  ['acknowledgeQuarantine', () => acknowledgeQuarantine()],
+  ['dbRestore', () => dbRestore('C:\\backup\\owner.db')],
+  ['dbVacuum', () => dbVacuum()],
+  ['modelsStatus', () => modelsStatus()],
+  ['modelsDownloadAll', () => modelsDownloadAll()],
+  ['getInferenceStats', () => getInferenceStats()],
+  ['appHealth', () => appHealth()],
+  ['takeLastCrash', () => takeLastCrash()],
+  ['checkAgenticReadiness', () => checkAgenticReadiness()],
+  [
+    'runWslRefinement',
+    () =>
+      runWslRefinement({
+        limit_files: 1,
+        limit_segments: 2,
+        dry_run: true,
+        test_one: false,
+      }),
+  ],
+  ['cancelWslRefinement', () => cancelWslRefinement()],
+  ['getDatasetCertificate', () => getDatasetCertificate(0.05, 0.95)],
+  ['computeSignalAnomalyScores', () => computeSignalAnomalyScores()],
+  ['appGitSha', () => appGitSha()],
+  ['listEvalRuns', () => listEvalRuns()],
+  ['getLabelQualityLift', () => getLabelQualityLift()],
+];
+
+describe('owner-local generated command failure contract', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it.each(ownerCommandCalls)('%s preserves one structured refusal', async (_name, call) => {
+    invokeMock.mockRejectedValueOnce(refusal);
+
+    await expect(call()).rejects.toBe(refusal);
+    expect(invokeMock).toHaveBeenCalledOnce();
+  });
+});

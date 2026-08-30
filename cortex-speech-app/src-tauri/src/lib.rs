@@ -3,6 +3,14 @@
 // `#[allow(clippy::unwrap_used)]` plus justification (see e.g. `normalizer.rs`).
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+// Cargo's `rustc-link-arg-tests` reaches declared integration-test targets but not this package's
+// library unit-test harness. Link the compiled RT_MANIFEST resource from the test-configured crate
+// itself. Normal binaries compile the library without `cfg(test)`, so they cannot receive this
+// second manifest resource.
+#[cfg(all(test, target_os = "windows"))]
+#[link(name = "windows-test-common-controls-object-archive", kind = "static", modifiers = "+whole-archive")]
+unsafe extern "C" {}
+
 pub mod agentic;
 pub mod aligner;
 pub mod api_keys;
@@ -111,6 +119,7 @@ use normalizer::SoraniNormalizer;
 use pipeline::ProcessingPipeline;
 use session::SessionManager;
 use settings::AppSettings;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -153,10 +162,274 @@ pub enum ImportState {
     Running,
 }
 
+/// Exact, renderer-queryable admission state for one caller-generated import run identity.
+///
+/// The import command response can be lost after the worker has already been admitted. Keeping this
+/// authority beside the single-flight gate lets the renderer distinguish that ambiguous transport
+/// failure from a definite pre-admission refusal without guessing from progress events. Terminal
+/// identities are retained only for the short reconciliation window; UUID collision/replay outside
+/// the window remains cryptographically negligible and every live identity is always exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImportRunAdmission {
+    Running,
+    Settled,
+    Rejected,
+    Unknown,
+}
+
+const IMPORT_RUN_TERMINAL_HISTORY: usize = 64;
+
+#[derive(Debug, Default)]
+struct ImportRunTracker {
+    active: Option<String>,
+    terminal: VecDeque<(String, ImportRunAdmission)>,
+}
+
+impl ImportRunTracker {
+    fn terminal_status(&self, run_id: &str) -> ImportRunAdmission {
+        self.terminal
+            .iter()
+            .rev()
+            .find_map(|(known_id, status)| (known_id == run_id).then_some(*status))
+            .unwrap_or(ImportRunAdmission::Unknown)
+    }
+
+    fn status(&self, run_id: &str) -> ImportRunAdmission {
+        if self.active.as_deref() == Some(run_id) {
+            ImportRunAdmission::Running
+        } else {
+            self.terminal_status(run_id)
+        }
+    }
+
+    fn remember_terminal(&mut self, run_id: String, status: ImportRunAdmission) {
+        self.terminal.retain(|(known_id, _)| known_id != &run_id);
+        self.terminal.push_back((run_id, status));
+        while self.terminal.len() > IMPORT_RUN_TERMINAL_HISTORY {
+            self.terminal.pop_front();
+        }
+    }
+}
+
+/// Holds the import single-flight mutex while an interrupted-import journal is inspected or
+/// mutated. Recovery commands must keep this guard alive for the complete database operation: a
+/// check followed by an unlocked read/delete lets a new worker enter between the two and turns its
+/// live journal into something the renderer can discard.
+#[must_use = "dropping the admission reopens the import gate"]
+pub(crate) struct ImportRecoveryAdmission<'a> {
+    _state: MutexGuard<'a, ImportState>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchState {
     Idle,
     Running,
+}
+
+/// Exact operation kind attached to a caller-generated batch identity. Keeping the kind in the
+/// backend authority prevents a delayed event or status response for one batch domain from being
+/// mistaken for another merely because both share the process-wide single-flight gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchOperation {
+    Transcribe,
+    Normalize,
+}
+
+/// Renderer-queryable admission truth for an exact batch operation identity. Like import-run
+/// admission, this only proves whether native work was admitted and has stopped; refreshed database
+/// reads and terminal events remain authoritative for the work's result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchRunAdmission {
+    Running,
+    Settled,
+    Rejected,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchRunDisposition {
+    Completed,
+    Halted,
+    Cancelled,
+    Panicked,
+}
+
+/// Bounded terminal result retained beside admission truth. Desktop events are best-effort; this
+/// snapshot makes a lost terminal event distinguishable from a clean completion and makes a worker
+/// panic an explicit hard stop rather than an apparently successful settlement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BatchRunOutcome {
+    pub disposition: BatchRunDisposition,
+    pub total: usize,
+    pub succeeded: u32,
+    pub failed: u32,
+    pub skipped: u32,
+    pub abandoned: u32,
+    pub cancelled: bool,
+    pub error_code: Option<String>,
+}
+
+impl BatchRunOutcome {
+    fn panicked(total: usize) -> Self {
+        Self {
+            disposition: BatchRunDisposition::Panicked,
+            total,
+            succeeded: 0,
+            failed: 0,
+            skipped: 0,
+            abandoned: total as u32,
+            cancelled: false,
+            error_code: Some("BATCH_WORKER_PANICKED".into()),
+        }
+    }
+}
+
+/// Pre-worker batch admission claim. If OS thread creation or any setup after gate acquisition
+/// fails, Drop records the exact operation as rejected and reopens the single-flight gate.
+#[must_use = "disarm only after the batch worker has been created"]
+pub(crate) struct ClaimedBatchStart<'a> {
+    state: &'a AppState,
+    operation_id: &'a str,
+    operation: BatchOperation,
+    armed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchStartCommitError {
+    Cancelled,
+    AuthorityLost,
+}
+
+/// Short linearization guard for a cancellation check/start transition. Never hold it across the
+/// streamed durable admission; the UI-facing Cancel control must stay responsive while up to
+/// 100,000 journal items are inserted. Commands acquire it once before admission and once around
+/// the final OS spawn, checking the atomic token between those phases.
+#[must_use = "hold this guard only across one short batch-start transition"]
+pub(crate) struct BatchStartCommit<'a> {
+    _cancel_slot: MutexGuard<'a, Option<CancellationToken>>,
+}
+
+impl<'a> ClaimedBatchStart<'a> {
+    pub(crate) fn new(state: &'a AppState, operation_id: &'a str, operation: BatchOperation) -> Self {
+        Self { state, operation_id, operation, armed: true }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ClaimedBatchStart<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state.abort_batch_start(self.operation_id, self.operation);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveBatchRun {
+    operation_id: String,
+    operation: BatchOperation,
+    total: usize,
+    phase: BatchRunPhase,
+    outcome: Option<BatchRunOutcome>,
+    renderer_acknowledged: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchRunPhase {
+    Starting,
+    Durable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalBatchRun {
+    operation_id: String,
+    operation: BatchOperation,
+    admission: BatchRunAdmission,
+    outcome: Option<BatchRunOutcome>,
+    renderer_acknowledged: bool,
+}
+
+const BATCH_RUN_TERMINAL_HISTORY: usize = 64;
+
+#[derive(Debug, Default)]
+struct BatchRunTracker {
+    active: Option<ActiveBatchRun>,
+    terminal: VecDeque<TerminalBatchRun>,
+}
+
+impl BatchRunTracker {
+    fn status(&self, operation_id: &str) -> (BatchRunAdmission, Option<BatchOperation>, Option<BatchRunOutcome>) {
+        if let Some(active) = self.active.as_ref().filter(|active| active.operation_id == operation_id) {
+            return (BatchRunAdmission::Running, Some(active.operation), active.outcome.clone());
+        }
+        self.terminal
+            .iter()
+            .rev()
+            .find_map(|known| {
+                (known.operation_id == operation_id).then_some((
+                    known.admission,
+                    Some(known.operation),
+                    known.outcome.clone(),
+                ))
+            })
+            .unwrap_or((BatchRunAdmission::Unknown, None, None))
+    }
+
+    fn remember_terminal(
+        &mut self,
+        operation_id: String,
+        operation: BatchOperation,
+        admission: BatchRunAdmission,
+        outcome: Option<BatchRunOutcome>,
+        renderer_acknowledged: bool,
+    ) {
+        self.terminal.retain(|known| known.operation_id != operation_id);
+        let renderer_acknowledged =
+            renderer_acknowledged || admission != BatchRunAdmission::Settled || outcome.is_none();
+        self.terminal.push_back(TerminalBatchRun {
+            operation_id,
+            operation,
+            admission,
+            outcome,
+            renderer_acknowledged,
+        });
+        while self.terminal.len() > BATCH_RUN_TERMINAL_HISTORY {
+            self.terminal.pop_front();
+        }
+    }
+
+    /// Exact process-local identity eligible for renderer adoption. The active run remains eligible
+    /// even if its durable header terminalized between two discovery reads; a settled result remains
+    /// eligible until the renderer explicitly acknowledges presenting it.
+    fn adoptable_identity(&self) -> Option<(String, BatchOperation)> {
+        self.active.as_ref().map(|active| (active.operation_id.clone(), active.operation)).or_else(|| {
+            self.terminal.iter().rev().find_map(|known| {
+                (!known.renderer_acknowledged
+                    && known.admission == BatchRunAdmission::Settled
+                    && known.outcome.is_some())
+                .then_some((known.operation_id.clone(), known.operation))
+            })
+        })
+    }
+
+    fn acknowledge_renderer(&mut self, operation_id: &str) -> bool {
+        if let Some(active) = self.active.as_mut().filter(|active| active.operation_id == operation_id) {
+            active.renderer_acknowledged = true;
+            return true;
+        }
+        let Some(known) = self.terminal.iter_mut().rev().find(|known| {
+            known.operation_id == operation_id
+                && known.admission == BatchRunAdmission::Settled
+                && known.outcome.is_some()
+        }) else {
+            return false;
+        };
+        known.renderer_acknowledged = true;
+        true
+    }
 }
 
 /// Stable machine code returned by every production audio-import entry point when the cross-run
@@ -167,6 +440,9 @@ pub const DEDUP_INDEX_UNAVAILABLE_CODE: &str = "DEDUP_INDEX_UNAVAILABLE";
 /// leading machine code is deliberately separate from the human action text so callers never need to
 /// classify a database error or a localized sentence.
 pub const DEDUP_INDEX_UNAVAILABLE_MESSAGE: &str = "DEDUP_INDEX_UNAVAILABLE: Audio import is disabled because the cross-run duplicate index could not be verified. Repair or backfill audio identities, then restart Cortex.";
+pub const INTERRUPTED_IMPORT_RECOVERY_REQUIRED_MESSAGE: &str =
+    "IMPORT_RECOVERY_REQUIRED: Resume or discard the interrupted import before starting another import.";
+pub const IMPORT_RECOVERY_AUTHORITY_UNAVAILABLE_MESSAGE: &str = "IMPORT_RECOVERY_AUTHORITY_UNAVAILABLE: Cortex could not verify interrupted-import recovery state. Retry the recovery check before importing.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DedupUnavailableReason {
@@ -264,15 +540,17 @@ pub struct AppState {
     settings_write: Mutex<()>,
     pub data_dir: Mutex<Option<PathBuf>>,
     pub model_manager: Mutex<ModelManager>,
-    /// Separate cancellation slots per long-running operation kind. Imports (start_cancel_token) and
-    /// batches (ensure_cancel_token) run under independent gates, so sharing ONE slot let starting one
-    /// detach the other's token — a Cancel could then miss a still-running operation or hit the wrong
-    /// one. With a slot each, cancel_current_operation cancels BOTH, so the single Cancel control
-    /// reliably stops everything that is running.
+    /// Separate cancellation slots per operation kind. Native file pickers have no import-run
+    /// identity yet, so they need their own slot; imports and batches each retain their existing
+    /// gates. The single Cancel control signals every slot and therefore cannot miss a picker whose
+    /// callback was lost by the Windows dialog bridge.
+    pub file_picker_cancel_token: Mutex<Option<CancellationToken>>,
     pub import_cancel_token: Mutex<Option<CancellationToken>>,
     pub batch_cancel_token: Mutex<Option<CancellationToken>>,
     pub import_state: Mutex<ImportState>,
+    import_run_tracker: Mutex<ImportRunTracker>,
     pub batch_state: Mutex<BatchState>,
+    batch_run_tracker: Mutex<BatchRunTracker>,
     pub media_registry: Arc<Mutex<MediaRegistry>>,
     pub(crate) media_materializer: Arc<crate::media::MediaMaterializationCoordinator>,
 }
@@ -287,9 +565,30 @@ impl AppState {
         })
     }
 
+    fn lock_import_run_tracker(&self) -> MutexGuard<'_, ImportRunTracker> {
+        self.import_run_tracker.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned import run tracker lock");
+            poisoned.into_inner()
+        })
+    }
+
+    pub(crate) fn remember_import_rejection(&self, run_id: &str) {
+        let mut tracker = self.lock_import_run_tracker();
+        if tracker.status(run_id) == ImportRunAdmission::Unknown {
+            tracker.remember_terminal(run_id.to_string(), ImportRunAdmission::Rejected);
+        }
+    }
+
     fn lock_import_cancel_token(&self) -> MutexGuard<'_, Option<CancellationToken>> {
         self.import_cancel_token.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("Recovering poisoned import cancellation token lock");
+            poisoned.into_inner()
+        })
+    }
+
+    fn lock_file_picker_cancel_token(&self) -> MutexGuard<'_, Option<CancellationToken>> {
+        self.file_picker_cancel_token.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned file-picker cancellation token lock");
             poisoned.into_inner()
         })
     }
@@ -304,6 +603,13 @@ impl AppState {
     fn lock_batch_state(&self) -> MutexGuard<'_, BatchState> {
         self.batch_state.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("Recovering poisoned batch state lock");
+            poisoned.into_inner()
+        })
+    }
+
+    fn lock_batch_run_tracker(&self) -> MutexGuard<'_, BatchRunTracker> {
+        self.batch_run_tracker.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned batch run tracker lock");
             poisoned.into_inner()
         })
     }
@@ -413,6 +719,12 @@ impl AppState {
         crate::stores::JobStore::new(self.db.clone())
     }
 
+    /// Durable batch admission, execution and recovery boundary.  The returned store can create a
+    /// lease that keeps restore exclusion alive across long-running inference.
+    pub(crate) fn batch_store(&self) -> crate::stores::BatchStore {
+        crate::stores::BatchStore::new(self.db.clone())
+    }
+
     /// Segment deletion/history and speaker-rename mutation boundary.
     pub(crate) fn segment_writes(&self) -> crate::stores::SegmentWriteStore {
         crate::stores::SegmentWriteStore::new(self.db.clone(), Arc::clone(&self.history))
@@ -489,8 +801,9 @@ impl AppState {
         }
     }
 
-    /// Returns the active BATCH cancellation token, creating one if none exists. Batches reuse a
-    /// token for the operation's duration (so a cancel request stays in effect), hence reuse-or-create.
+    /// Regression helper for cancellation-slot poisoning and import/batch isolation tests. Real
+    /// batches receive a fresh exact token atomically from `try_start_batch_for_run`.
+    #[cfg(test)]
     pub fn ensure_cancel_token(&self) -> Result<CancellationToken, String> {
         let mut guard = self.lock_batch_cancel_token();
         if let Some(token) = guard.as_ref() {
@@ -515,10 +828,35 @@ impl AppState {
         token
     }
 
+    /// Claim the one native file-picker slot and arm it for the shared Cancel control. A second
+    /// backend caller is rejected even if it bypasses the renderer's synchronous re-entry guard.
+    pub(crate) fn try_start_file_picker(&self) -> Result<CancellationToken, String> {
+        let mut guard = self.lock_file_picker_cancel_token();
+        if guard.as_ref().is_some_and(|token| !token.is_cancelled()) {
+            return Err("E_FILE_PICKER_BUSY".into());
+        }
+        let token = CancellationToken::new();
+        *guard = Some(token.clone());
+        Ok(token)
+    }
+
+    /// Clear only the picker that owns `token`. Exact identity prevents a late command drop from
+    /// erasing the cancellation authority of a newer picker.
+    pub(crate) fn finish_file_picker(&self, token: &CancellationToken) {
+        let mut guard = self.lock_file_picker_cancel_token();
+        if guard.as_ref().is_some_and(|current| current.same_instance(token)) {
+            *guard = None;
+        }
+    }
+
     /// Cancel every running operation. Both slots are signalled so the single Cancel control reliably
     /// stops a running import AND a running batch, regardless of which started last.
     pub fn cancel_current_operation(&self) -> bool {
         let mut cancelled_any = false;
+        if let Some(token) = self.lock_file_picker_cancel_token().as_ref() {
+            token.cancel();
+            cancelled_any = true;
+        }
         if let Some(token) = self.lock_import_cancel_token().as_ref() {
             token.cancel();
             cancelled_any = true;
@@ -531,7 +869,8 @@ impl AppState {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.lock_import_cancel_token().as_ref().is_some_and(|t| t.is_cancelled())
+        self.lock_file_picker_cancel_token().as_ref().is_some_and(|t| t.is_cancelled())
+            || self.lock_import_cancel_token().as_ref().is_some_and(|t| t.is_cancelled())
             || self.lock_batch_cancel_token().as_ref().is_some_and(|t| t.is_cancelled())
     }
 
@@ -539,20 +878,67 @@ impl AppState {
         self.dedup_readiness.require_import_ready()
     }
 
+    /// Admit one recovery-journal operation only while no import worker can be live. The returned
+    /// guard deliberately owns the same mutex used by `try_start_import`, closing the entire
+    /// check/read-or-delete/start race instead of exposing a racy `is_import_active()` snapshot.
+    pub(crate) fn try_import_recovery_admission(&self) -> Option<ImportRecoveryAdmission<'_>> {
+        let state = self.lock_import_state();
+        if *state == ImportState::Running {
+            return None;
+        }
+        Some(ImportRecoveryAdmission { _state: state })
+    }
+
     pub fn try_start_import(&self) -> Result<(), String> {
+        self.try_start_import_for_run(&uuid::Uuid::new_v4().to_string())
+    }
+
+    pub(crate) fn try_start_import_for_run(&self, run_id: &str) -> Result<(), String> {
+        self.try_start_import_for_run_with_recovery(run_id, false)
+    }
+
+    pub(crate) fn try_start_import_for_recovery_run(&self, run_id: &str) -> Result<(), String> {
+        self.try_start_import_for_run_with_recovery(run_id, true)
+    }
+
+    fn try_start_import_for_run_with_recovery(&self, run_id: &str, recovering: bool) -> Result<(), String> {
         // Import alone degrades when startup could not prove the durable cross-run identity index.
         // This check precedes the Running transition, cancellation-token creation, worker spawn,
         // decoding, and durable import-journal creation for every desktop audio-import command.
-        self.require_audio_import_ready().map_err(|error| error.to_string())?;
+        if let Err(error) = self.require_audio_import_ready() {
+            self.remember_import_rejection(run_id);
+            return Err(error.to_string());
+        }
         let mut import = self.lock_import_state();
         // P1.3b: refuse to start while a DB restore is reserved. Checked UNDER the import_state lock (and
         // set-Running is under the same lock) so it can't race prepare_restore's writers_active() read.
         if crate::database_runtime::restore_pending() {
+            self.remember_import_rejection(run_id);
             return Err(crate::database_runtime::RESTORE_IN_PROGRESS_MSG.into());
         }
         if *import == ImportState::Running {
+            self.remember_import_rejection(run_id);
             return Err("Import already in progress".into());
         }
+        if !recovering {
+            match self.job_store().find_interrupted_import() {
+                Ok(Some(_)) => {
+                    self.remember_import_rejection(run_id);
+                    return Err(INTERRUPTED_IMPORT_RECOVERY_REQUIRED_MESSAGE.into());
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(%error, "Import refused because interrupted-import authority could not be read");
+                    self.remember_import_rejection(run_id);
+                    return Err(IMPORT_RECOVERY_AUTHORITY_UNAVAILABLE_MESSAGE.into());
+                }
+            }
+        }
+        let mut tracker = self.lock_import_run_tracker();
+        if tracker.status(run_id) != ImportRunAdmission::Unknown {
+            return Err("Import run identity already used".into());
+        }
+        tracker.active = Some(run_id.to_string());
         *import = ImportState::Running;
         Ok(())
     }
@@ -566,30 +952,226 @@ impl AppState {
         // cancel_current_operation could never stop it. Opening the gate LAST means a new import can
         // only begin after this call has fully finished, so it can never lose its token to us.
         *self.lock_import_cancel_token() = None;
-        *self.lock_import_state() = ImportState::Idle;
+        let mut import = self.lock_import_state();
+        let mut tracker = self.lock_import_run_tracker();
+        if let Some(run_id) = tracker.active.take() {
+            tracker.remember_terminal(run_id, ImportRunAdmission::Settled);
+        }
+        *import = ImportState::Idle;
     }
 
-    pub fn try_start_batch(&self) -> Result<(), String> {
+    /// Undo a claimed import gate when no worker was started. This is deliberately distinct from
+    /// `finish_import`: the renderer may safely surface the original command error only for a
+    /// definitively rejected run, while a settled run proves that admission and execution occurred.
+    pub(crate) fn abort_import_start(&self, run_id: &str) {
+        *self.lock_import_cancel_token() = None;
+        let mut import = self.lock_import_state();
+        let mut tracker = self.lock_import_run_tracker();
+        if tracker.active.as_deref() == Some(run_id) {
+            tracker.active = None;
+            tracker.remember_terminal(run_id.to_string(), ImportRunAdmission::Rejected);
+            *import = ImportState::Idle;
+        } else {
+            tracing::error!(run_id, "Refusing to abort a different or untracked import run");
+        }
+    }
+
+    pub(crate) fn import_run_admission(&self, run_id: &str) -> ImportRunAdmission {
+        self.lock_import_run_tracker().status(run_id)
+    }
+
+    pub(crate) fn remember_batch_rejection(&self, operation_id: &str, operation: BatchOperation) {
+        let mut tracker = self.lock_batch_run_tracker();
+        if tracker.status(operation_id).0 == BatchRunAdmission::Unknown {
+            tracker.remember_terminal(operation_id.to_string(), operation, BatchRunAdmission::Rejected, None, true);
+        }
+    }
+
+    pub(crate) fn try_start_batch_for_run(
+        &self,
+        operation_id: &str,
+        operation: BatchOperation,
+        total: usize,
+    ) -> Result<CancellationToken, String> {
         let mut batch = self.lock_batch_state();
+        let mut tracker = self.lock_batch_run_tracker();
+        if tracker.status(operation_id).0 != BatchRunAdmission::Unknown {
+            return Err("Batch operation identity already used".into());
+        }
         // P1.3b: refuse to start a batch while a DB restore is reserved (checked under the batch_state lock).
         if crate::database_runtime::restore_pending() {
+            tracker.remember_terminal(operation_id.to_string(), operation, BatchRunAdmission::Rejected, None, true);
             return Err(crate::database_runtime::RESTORE_IN_PROGRESS_MSG.into());
         }
-        if *batch == BatchState::Running {
+        if *batch == BatchState::Running || tracker.active.is_some() {
+            tracker.remember_terminal(operation_id.to_string(), operation, BatchRunAdmission::Rejected, None, true);
             return Err("Batch operation already in progress".into());
         }
+        tracker.active = Some(ActiveBatchRun {
+            operation_id: operation_id.to_string(),
+            operation,
+            total,
+            phase: BatchRunPhase::Starting,
+            outcome: None,
+            renderer_acknowledged: false,
+        });
+        // Arm cancellation before opening any preflight/worker-start window. This assignment occurs
+        // only after every refusal check, so a rejected second caller cannot detach the live run.
+        let token = CancellationToken::new();
+        *self.lock_batch_cancel_token() = Some(token.clone());
         *batch = BatchState::Running;
-        Ok(())
+        Ok(token)
     }
 
-    pub fn finish_batch(&self) {
-        // Clear the (possibly-cancelled) token BEFORE opening the gate. A new batch can only start
-        // once batch_state is Idle, and the mutex release/acquire chain guarantees that any thread
-        // observing Idle also observes the token already cleared — so it can never inherit the stale
-        // token through the gap between these two statements (round-15 TOCTOU). ensure_cancel_token is
-        // additionally hardened to never return a cancelled token, as belt-and-suspenders.
+    /// Briefly validate exact ownership and serialize one cancellation check. The returned guard is
+    /// intentionally cancel-slot-only: callers must drop it before streamed database admission, then
+    /// reacquire it for the short final thread spawn.
+    pub(crate) fn commit_batch_start<'a>(
+        &'a self,
+        operation_id: &str,
+        operation: BatchOperation,
+        token: &CancellationToken,
+    ) -> Result<BatchStartCommit<'a>, BatchStartCommitError> {
+        let batch = self.lock_batch_state();
+        let tracker = self.lock_batch_run_tracker();
+        let owns_gate = *batch == BatchState::Running
+            && tracker
+                .active
+                .as_ref()
+                .is_some_and(|active| active.operation_id == operation_id && active.operation == operation);
+        if !owns_gate {
+            return Err(BatchStartCommitError::AuthorityLost);
+        }
+
+        let cancel_slot = self.lock_batch_cancel_token();
+        if !cancel_slot.as_ref().is_some_and(|current| current.same_instance(token)) {
+            return Err(BatchStartCommitError::AuthorityLost);
+        }
+        if token.is_cancelled() {
+            return Err(BatchStartCommitError::Cancelled);
+        }
+        drop(tracker);
+        drop(batch);
+        Ok(BatchStartCommit { _cancel_slot: cancel_slot })
+    }
+
+    /// Record the completed journal admission without holding cancellation or batch-state locks.
+    pub(crate) fn mark_batch_durable_admitted(&self, operation_id: &str, operation: BatchOperation) -> bool {
+        let mut tracker = self.lock_batch_run_tracker();
+        let Some(active) = tracker.active.as_mut() else {
+            return false;
+        };
+        if active.operation_id != operation_id
+            || active.operation != operation
+            || active.phase != BatchRunPhase::Starting
+        {
+            return false;
+        }
+        active.phase = BatchRunPhase::Durable;
+        true
+    }
+
+    /// Exact process-local authority for the pre-journal preflight window. This is intentionally
+    /// separate from durable running truth so status code can never mistake a missing journal after
+    /// admission for a harmless start phase.
+    pub(crate) fn starting_batch_run(&self, operation_id: &str) -> Option<(BatchOperation, usize)> {
+        self.lock_batch_run_tracker().active.as_ref().and_then(|active| {
+            (active.operation_id == operation_id && active.phase == BatchRunPhase::Starting)
+                .then_some((active.operation, active.total))
+        })
+    }
+
+    /// Persist terminal truth before publishing the best-effort terminal event. A second/different
+    /// result for the same live identity is refused so competing worker paths cannot rewrite the
+    /// outcome that response-loss reconciliation will later expose.
+    pub(crate) fn record_batch_outcome(
+        &self,
+        operation_id: &str,
+        operation: BatchOperation,
+        outcome: BatchRunOutcome,
+    ) -> bool {
+        let mut tracker = self.lock_batch_run_tracker();
+        let Some(active) = tracker.active.as_mut() else {
+            tracing::error!(operation_id, ?operation, "Refusing outcome for an untracked batch run");
+            return false;
+        };
+        if active.operation_id != operation_id || active.operation != operation || active.total != outcome.total {
+            tracing::error!(operation_id, ?operation, "Refusing mismatched batch terminal outcome");
+            return false;
+        }
+        if active.outcome.is_some() {
+            tracing::error!(operation_id, ?operation, "Refusing duplicate batch terminal outcome");
+            return false;
+        }
+        active.outcome = Some(outcome);
+        true
+    }
+
+    /// Release only the exact worker that owns the gate. The state/tracker locks remain held while
+    /// the cancellation slot is cleared and the terminal record is committed, so a newer batch can
+    /// neither enter nor lose its token to a delayed old guard.
+    pub(crate) fn finish_batch_for_run(&self, operation_id: &str, operation: BatchOperation) -> bool {
+        let mut batch = self.lock_batch_state();
+        let mut tracker = self.lock_batch_run_tracker();
+        let owns_gate = tracker
+            .active
+            .as_ref()
+            .is_some_and(|active| active.operation_id == operation_id && active.operation == operation);
+        if !owns_gate {
+            tracing::error!(operation_id, ?operation, "Refusing to finish a different or untracked batch run");
+            return false;
+        }
+
+        let Some(active) = tracker.active.take() else {
+            tracing::error!(operation_id, ?operation, "Batch ownership disappeared during exact settlement");
+            return false;
+        };
         *self.lock_batch_cancel_token() = None;
-        *self.lock_batch_state() = BatchState::Idle;
+        let outcome = active.outcome.or_else(|| Some(BatchRunOutcome::panicked(active.total)));
+        tracker.remember_terminal(
+            operation_id.to_string(),
+            operation,
+            BatchRunAdmission::Settled,
+            outcome,
+            active.renderer_acknowledged,
+        );
+        *batch = BatchState::Idle;
+        true
+    }
+
+    /// Undo a claimed batch gate when worker creation fails. This records a definitive rejection so
+    /// a renderer whose command channel failed can reconcile without guessing that native work ran.
+    pub(crate) fn abort_batch_start(&self, operation_id: &str, operation: BatchOperation) {
+        let mut batch = self.lock_batch_state();
+        let mut tracker = self.lock_batch_run_tracker();
+        let owns_gate = tracker
+            .active
+            .as_ref()
+            .is_some_and(|active| active.operation_id == operation_id && active.operation == operation);
+        if !owns_gate {
+            tracing::error!(operation_id, ?operation, "Refusing to abort a different or untracked batch run");
+            return;
+        }
+
+        *self.lock_batch_cancel_token() = None;
+        tracker.active = None;
+        tracker.remember_terminal(operation_id.to_string(), operation, BatchRunAdmission::Rejected, None, true);
+        *batch = BatchState::Idle;
+    }
+
+    pub(crate) fn batch_run_admission(
+        &self,
+        operation_id: &str,
+    ) -> (BatchRunAdmission, Option<BatchOperation>, Option<BatchRunOutcome>) {
+        self.lock_batch_run_tracker().status(operation_id)
+    }
+
+    pub(crate) fn adoptable_batch_run_identity(&self) -> Option<(String, BatchOperation)> {
+        self.lock_batch_run_tracker().adoptable_identity()
+    }
+
+    pub(crate) fn acknowledge_batch_run_renderer(&self, operation_id: &str) -> bool {
+        self.lock_batch_run_tracker().acknowledge_renderer(operation_id)
     }
 
     pub fn update_pipeline_settings(&self, settings: AppSettings) {
@@ -765,6 +1347,32 @@ pub fn run() {
         Err(e) => fatal_app_error(format!("Failed to safely initialize database schema: {e}")),
     }
 
+    // A live schema-68 batch belongs to a process that no longer exists.  Reconcile it from its
+    // immutable item ledger before the generic reaper, snapshots, dedup rehydration, or any worker
+    // can observe the database.  This owner-only release deliberately hard-stops interrupted work;
+    // it preserves applied items and marks every pending item abandoned instead of guessing how to
+    // reconstruct result-affecting runtime configuration after a restart.
+    let recovered_batch_history_token = match db.recover_active_batch_job_v1() {
+        Ok(Some(status)) => {
+            tracing::warn!(
+                operation_id = %status.operation_id,
+                kind = ?status.kind,
+                state = ?status.state,
+                "reconciled an interrupted durable batch before startup"
+            );
+            match db.batch_execution_history_token_v1(&status.operation_id) {
+                Ok(token) => token,
+                Err(error) => fatal_app_error(format!(
+                    "Recovered batch effects could not be bound to exact Undo authority: {error}"
+                )),
+            }
+        }
+        Ok(None) => None,
+        Err(e) => {
+            fatal_app_error(format!("Interrupted batch evidence could not be validated and reconciled safely: {e}"))
+        }
+    };
+
     // P0 #3 Job Supervisor: any durable job still `running` at startup is a crash residue (a clean run
     // always reaches a terminal state) — reap it to failed/INTERRUPTED so the activity surface shows the
     // honest "interrupted", never a ghost that spins forever. Best-effort: never blocks startup.
@@ -877,6 +1485,11 @@ pub fn run() {
     );
 
     let history = HistoryManager::new(500);
+    if let Some(token) = recovered_batch_history_token {
+        if let Err(error) = history.record_batch_token(token) {
+            fatal_app_error(format!("Recovered batch Undo authority could not be installed: {error}"));
+        }
+    }
     let mut session = SessionManager::new(data_dir.join("session"));
 
     let model_manager = ModelManager::new(data_dir.join("models"));
@@ -935,10 +1548,13 @@ pub fn run() {
             settings_write: Mutex::new(()),
             data_dir: Mutex::new(Some(data_dir)),
             model_manager: Mutex::new(model_manager),
+            file_picker_cancel_token: Mutex::new(None),
             import_cancel_token: Mutex::new(None),
             batch_cancel_token: Mutex::new(None),
             import_state: Mutex::new(ImportState::Idle),
+            import_run_tracker: Mutex::new(ImportRunTracker::default()),
             batch_state: Mutex::new(BatchState::Idle),
+            batch_run_tracker: Mutex::new(BatchRunTracker::default()),
             media_registry,
             media_materializer: Arc::new(crate::media::MediaMaterializationCoordinator::default()),
         })
@@ -948,6 +1564,10 @@ pub fn run() {
             commands::app_git_sha,
             commands::open_audio_file,
             commands::import_directory,
+            commands::get_import_run_status,
+            commands::get_batch_run_status,
+            commands::get_active_batch_run,
+            commands::acknowledge_batch_run,
             commands::get_interrupted_import,
             commands::resume_interrupted_import,
             commands::discard_interrupted_import,
@@ -974,6 +1594,7 @@ pub fn run() {
             commands::export_dataset_bundle,
             commands::export_huggingface_dataset,
             commands::list_agent_import_reports,
+            commands::get_agent_import_report_by_run_id,
             commands::list_agent_stage_events,
             commands::list_model_versions,
             commands::import_model_checkpoint,
@@ -1068,9 +1689,9 @@ pub fn run() {
             commands::reserve_review_draft_write_v1,
             commands::save_review_draft_v1,
             commands::delete_review_draft_v1,
-            commands::undo_human_decision,
+            commands::get_desktop_review_undo_target_v1,
+            commands::undo_desktop_review_action_v1,
             commands::record_review_flag,
-            commands::undo_review_flag,
             commands::begin_desktop_playback_session_v1,
             commands::cancel_desktop_playback_session_v1,
             commands::finalize_desktop_playback_session_v1,
@@ -1414,6 +2035,50 @@ mod tests {
         assert!(!is_cdp_remote_debug(None), "a real interactive launch (no such env) shows the dialog");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn every_windows_rust_test_harness_requests_common_controls_v6() {
+        // This test can only execute if the just-linked harness itself passed Windows loader
+        // activation. Keep a source-level assertion too, so a build-script cleanup cannot silently
+        // remove the dependency and make the next clean test run die before reporting any test.
+        let build_script = include_str!("../build.rs");
+        for required in [
+            "embed_resource::compile_for_tests",
+            "cc::windows_registry::find_tool",
+            "cvtres.exe",
+            "windows-test-common-controls-object-archive.lib",
+            "cargo:rustc-link-search=native=",
+            "windows-test-common-controls.manifest",
+            "windows-test-common-controls.rc",
+        ] {
+            assert!(build_script.contains(required), "Windows test linker lost required binding: {required}");
+        }
+        for forbidden in ["cargo:rustc-link-arg=/MANIFEST", "cargo:rustc-link-arg=/MANIFESTINPUT"] {
+            assert!(
+                !build_script.contains(forbidden),
+                "a package-wide manifest directive would corrupt normal Tauri binaries: {forbidden}"
+            );
+        }
+        let library_source = include_str!("lib.rs");
+        for required in [
+            "cfg(all(test, target_os = \"windows\"))",
+            "link(name = \"windows-test-common-controls-object-archive\", kind = \"static\", modifiers = \"+whole-archive\")",
+        ] {
+            assert!(library_source.contains(required), "unit-test harness lost scoped resource linkage: {required}");
+        }
+        let resource = include_str!("../windows-test-common-controls.rc");
+        assert!(
+            resource.contains("1 24 \"windows-test-common-controls.manifest\""),
+            "Windows test resource must embed numeric RT_MANIFEST type 24 at ID 1"
+        );
+        let manifest = include_str!("../windows-test-common-controls.manifest");
+        for required in
+            ["Microsoft.Windows.Common-Controls", "version=\"6.0.0.0\"", "publicKeyToken=\"6595b64144ccf1df\""]
+        {
+            assert!(manifest.contains(required), "Windows test manifest lost required binding: {required}");
+        }
+    }
+
     fn test_app_state(data_dir: PathBuf) -> AppState {
         let normalizer = Arc::new(SoraniNormalizer::new());
         let cache = Arc::new(TranscriptCache::new(10));
@@ -1429,8 +2094,14 @@ mod tests {
             Arc::new(ModelManager::new(data_dir.join("models"))),
         );
 
+        // DatabaseRuntime::open_read creates an independent connection. A SQLite `:memory:` database
+        // is private to one connection, so recovery-authority reads would falsely see "no schema".
+        // Use a disposable file to characterize the same multi-connection behavior as production.
+        let db = Database::open(data_dir.join("app-state.db").to_string_lossy().as_ref()).unwrap();
+        db.initialize().unwrap();
+
         AppState {
-            db: DatabaseRuntime::new(Database::open(":memory:").unwrap()),
+            db: DatabaseRuntime::new(db),
             pipeline: Mutex::new(pipeline),
             normalizer,
             cache,
@@ -1442,13 +2113,63 @@ mod tests {
             settings_write: Mutex::new(()),
             data_dir: Mutex::new(Some(data_dir)),
             model_manager: Mutex::new(model_manager),
+            file_picker_cancel_token: Mutex::new(None),
             import_cancel_token: Mutex::new(None),
             batch_cancel_token: Mutex::new(None),
             import_state: Mutex::new(ImportState::Idle),
+            import_run_tracker: Mutex::new(ImportRunTracker::default()),
             batch_state: Mutex::new(BatchState::Idle),
+            batch_run_tracker: Mutex::new(BatchRunTracker::default()),
             media_registry: Arc::new(Mutex::new(MediaRegistry::default())),
             media_materializer: Arc::new(crate::media::MediaMaterializationCoordinator::default()),
         }
+    }
+
+    fn admit_test_normalize_guard(
+        state: &Arc<AppState>,
+        operation_id: &str,
+        segment_ids: &[String],
+    ) -> crate::commands::DurableBatchWorkerGuard {
+        {
+            let db = state.db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for segment_id in segment_ids {
+                db.insert_segment(&crate::db::SpeechSegment {
+                    id: segment_id.clone(),
+                    audio_path: format!("C:/fixtures/{segment_id}.wav"),
+                    raw_transcript: format!("raw-{segment_id}"),
+                    ..Default::default()
+                })
+                .expect("insert batch-guard fixture");
+            }
+        }
+        let cancel = state
+            .try_start_batch_for_run(operation_id, BatchOperation::Normalize, segment_ids.len())
+            .expect("claim exact batch process gate");
+        let mut claimed = ClaimedBatchStart::new(state.as_ref(), operation_id, BatchOperation::Normalize);
+        let restore_generation =
+            crate::database_runtime::capture_restore_generation().expect("capture restore generation");
+        let (lease, admitted) = state
+            .batch_store()
+            .admit(crate::stores::BatchAdmissionV1 {
+                operation_id,
+                kind: crate::db::BatchJobKindV1::Normalize,
+                segment_ids,
+                config_sha256: &"a".repeat(64),
+                executor: crate::commands::new_batch_executor_identity(),
+                cancel: cancel.as_atomic(),
+                restore_generation,
+            })
+            .expect("durably admit guard fixture");
+        assert_eq!(usize::try_from(admitted.total).unwrap(), segment_ids.len());
+        let guard = crate::commands::DurableBatchWorkerGuard::new_for_test(
+            Arc::clone(state),
+            operation_id.to_string(),
+            BatchOperation::Normalize,
+            lease,
+        );
+        assert!(state.mark_batch_durable_admitted(operation_id, BatchOperation::Normalize));
+        claimed.disarm();
+        guard
     }
 
     #[test]
@@ -1476,8 +2197,11 @@ mod tests {
         // The degraded state is deliberately capability-scoped: the application remains usable for
         // existing-library work. Batch state is an independent gate and is representative of the app
         // not entering a global fatal/maintenance mode merely because new audio cannot be admitted.
-        state.try_start_batch().expect("non-import capability remains available");
-        state.finish_batch();
+        let operation_id = uuid::Uuid::from_u128(0x1001).to_string();
+        state
+            .try_start_batch_for_run(&operation_id, BatchOperation::Normalize, 1)
+            .expect("non-import capability remains available");
+        assert!(state.finish_batch_for_run(&operation_id, BatchOperation::Normalize));
     }
 
     #[test]
@@ -1588,7 +2312,8 @@ mod tests {
         *state.lock_batch_state() = BatchState::Idle;
 
         // Batch 2 starts in that window and requests its token.
-        state.try_start_batch().expect("start batch 2");
+        let operation_id = uuid::Uuid::from_u128(0x2002).to_string();
+        state.try_start_batch_for_run(&operation_id, BatchOperation::Normalize, 1).expect("start batch 2");
         let t2 = state.ensure_cancel_token().expect("batch token 2");
         assert!(!t2.is_cancelled(), "a new batch must never inherit a cancelled token from a torn slot");
     }
@@ -1628,6 +2353,27 @@ mod tests {
     }
 
     #[test]
+    fn file_picker_is_exclusive_cancellable_and_only_its_owner_can_clear_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+
+        let picker = state.try_start_file_picker().expect("claim picker");
+        assert_eq!(state.try_start_file_picker().err().as_deref(), Some("E_FILE_PICKER_BUSY"));
+        assert!(state.cancel_current_operation(), "the shared control must reach a native picker");
+        assert!(picker.is_cancelled());
+
+        let unrelated = CancellationToken::new();
+        state.finish_file_picker(&unrelated);
+        assert!(state.cancel_current_operation(), "an unrelated finisher cannot erase the slot");
+        state.finish_file_picker(&picker);
+        assert!(!state.cancel_current_operation(), "the exact owner releases the picker slot");
+
+        let next = state.try_start_file_picker().expect("a fresh picker is admitted");
+        assert!(!next.is_cancelled(), "a new picker must not inherit cancellation");
+        state.finish_file_picker(&next);
+    }
+
+    #[test]
     fn second_batch_gets_a_fresh_token_after_cancel() {
         // Round-2 audit HIGH: ensure_cancel_token is reuse-or-create, so a cancelled batch left a
         // permanently-cancelled token in the slot and every later batch inherited it and no-op'd.
@@ -1635,13 +2381,15 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let state = test_app_state(dir.path().to_path_buf());
 
-        state.try_start_batch().expect("start batch 1");
+        let first = uuid::Uuid::from_u128(0x3001).to_string();
+        state.try_start_batch_for_run(&first, BatchOperation::Normalize, 1).expect("start batch 1");
         let t1 = state.ensure_cancel_token().expect("batch token 1");
         assert!(state.cancel_current_operation());
         assert!(t1.is_cancelled());
-        state.finish_batch(); // Drop-guard equivalent — must clear the cancelled token
+        assert!(state.finish_batch_for_run(&first, BatchOperation::Normalize));
 
-        state.try_start_batch().expect("start batch 2");
+        let second = uuid::Uuid::from_u128(0x3002).to_string();
+        state.try_start_batch_for_run(&second, BatchOperation::Normalize, 1).expect("start batch 2");
         let t2 = state.ensure_cancel_token().expect("batch token 2");
         assert!(!t2.is_cancelled(), "the second batch must NOT inherit the cancelled token");
     }
@@ -1664,6 +2412,504 @@ mod tests {
     }
 
     #[test]
+    fn import_run_tracker_distinguishes_running_settled_rejected_and_unknown_exactly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        let completed = "00000000-0000-4000-8000-000000000001";
+        let rejected = "00000000-0000-4000-8000-000000000002";
+        let unknown = "00000000-0000-4000-8000-000000000003";
+
+        assert_eq!(state.import_run_admission(unknown), ImportRunAdmission::Unknown);
+        state.try_start_import_for_run(completed).expect("admit exact run");
+        assert_eq!(state.import_run_admission(completed), ImportRunAdmission::Running);
+        assert_eq!(state.import_run_admission(unknown), ImportRunAdmission::Unknown);
+        state.finish_import();
+        assert_eq!(state.import_run_admission(completed), ImportRunAdmission::Settled);
+
+        state.try_start_import_for_run(rejected).expect("admit second exact run");
+        let picker_cancel = state.start_cancel_token();
+        assert!(state.cancel_current_operation(), "claimed picker must be cancellable");
+        assert!(picker_cancel.is_cancelled());
+        state.abort_import_start(rejected);
+        assert_eq!(state.import_run_admission(rejected), ImportRunAdmission::Rejected);
+        assert_eq!(*state.lock_import_state(), ImportState::Idle);
+        assert!(!state.cancel_current_operation(), "aborting picker admission must clear its token");
+        assert_eq!(
+            state.try_start_import_for_run(rejected),
+            Err("Import run identity already used".to_string()),
+            "a recently terminal identity cannot be replayed"
+        );
+    }
+
+    #[test]
+    fn import_run_tracker_bounds_terminal_reconciliation_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        let first = uuid::Uuid::from_u128(1).to_string();
+        let last = uuid::Uuid::from_u128((IMPORT_RUN_TERMINAL_HISTORY + 1) as u128).to_string();
+
+        for value in 1..=(IMPORT_RUN_TERMINAL_HISTORY + 1) {
+            let run_id = uuid::Uuid::from_u128(value as u128).to_string();
+            state.try_start_import_for_run(&run_id).expect("admit retained run");
+            state.finish_import();
+        }
+
+        assert_eq!(state.import_run_admission(&first), ImportRunAdmission::Unknown);
+        assert_eq!(state.import_run_admission(&last), ImportRunAdmission::Settled);
+        assert_eq!(state.lock_import_run_tracker().terminal.len(), IMPORT_RUN_TERMINAL_HISTORY);
+    }
+
+    #[test]
+    fn batch_run_tracker_is_exact_kind_bound_and_late_guards_cannot_release_a_live_worker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        let active = uuid::Uuid::from_u128(0x5001).to_string();
+        let refused = uuid::Uuid::from_u128(0x5002).to_string();
+
+        assert_eq!(state.batch_run_admission(&active), (BatchRunAdmission::Unknown, None, None));
+        state.try_start_batch_for_run(&active, BatchOperation::Transcribe, 2).expect("admit exact batch");
+        let live_token = state.ensure_cancel_token().expect("arm exact batch token");
+        assert_eq!(
+            state.batch_run_admission(&active),
+            (BatchRunAdmission::Running, Some(BatchOperation::Transcribe), None)
+        );
+
+        assert_eq!(
+            state.try_start_batch_for_run(&refused, BatchOperation::Normalize, 2).err().as_deref(),
+            Some("Batch operation already in progress")
+        );
+        assert_eq!(
+            state.batch_run_admission(&refused),
+            (BatchRunAdmission::Rejected, Some(BatchOperation::Normalize), None)
+        );
+
+        assert!(
+            !state.finish_batch_for_run(&active, BatchOperation::Normalize),
+            "a wrong-kind delayed guard must fail closed"
+        );
+        assert_eq!(*state.lock_batch_state(), BatchState::Running);
+        assert!(
+            state.lock_batch_cancel_token().as_ref().is_some_and(|token| token.same_instance(&live_token)),
+            "a wrong guard must not erase the live worker's cancellation authority"
+        );
+
+        assert!(state.finish_batch_for_run(&active, BatchOperation::Transcribe));
+        assert_eq!(*state.lock_batch_state(), BatchState::Idle);
+        assert!(state.lock_batch_cancel_token().is_none());
+        let (admission, operation, outcome) = state.batch_run_admission(&active);
+        assert_eq!(admission, BatchRunAdmission::Settled);
+        assert_eq!(operation, Some(BatchOperation::Transcribe));
+        assert_eq!(outcome.expect("missing terminal outcome").disposition, BatchRunDisposition::Panicked);
+        assert_eq!(
+            state.try_start_batch_for_run(&active, BatchOperation::Transcribe, 2).err().as_deref(),
+            Some("Batch operation identity already used"),
+            "a terminal operation identity must not be replayable"
+        );
+    }
+
+    #[test]
+    fn claimed_batch_start_records_rejection_when_worker_creation_does_not_complete() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        let operation_id = uuid::Uuid::from_u128(0x5101).to_string();
+
+        state.try_start_batch_for_run(&operation_id, BatchOperation::Normalize, 1).expect("claim pre-worker gate");
+        let token = state.ensure_cancel_token().expect("arm pre-worker token");
+        {
+            let _claim = ClaimedBatchStart::new(&state, &operation_id, BatchOperation::Normalize);
+        }
+
+        assert_eq!(*state.lock_batch_state(), BatchState::Idle);
+        assert!(state.lock_batch_cancel_token().is_none());
+        assert!(!token.is_cancelled(), "rejection releases rather than falsely reporting cancellation");
+        assert_eq!(
+            state.batch_run_admission(&operation_id),
+            (BatchRunAdmission::Rejected, Some(BatchOperation::Normalize), None)
+        );
+    }
+
+    #[test]
+    fn batch_claim_arms_exact_cancellation_before_preflight_and_cancel_refuses_commit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        let operation_id = uuid::Uuid::from_u128(0x5102).to_string();
+
+        let token = state
+            .try_start_batch_for_run(&operation_id, BatchOperation::Transcribe, 3)
+            .expect("claim and arm preflight");
+        let claim = ClaimedBatchStart::new(&state, &operation_id, BatchOperation::Transcribe);
+        assert!(
+            state.lock_batch_cancel_token().as_ref().is_some_and(|current| current.same_instance(&token)),
+            "the exact cancellation authority must exist in the same completed admission call"
+        );
+        assert_eq!(state.starting_batch_run(&operation_id), Some((BatchOperation::Transcribe, 3)));
+
+        assert!(state.cancel_current_operation(), "Cancel must reach a still-preflighting batch");
+        assert!(token.is_cancelled());
+        assert_eq!(
+            state.commit_batch_start(&operation_id, BatchOperation::Transcribe, &token).err(),
+            Some(BatchStartCommitError::Cancelled),
+            "cancel-before-commit must prevent durable admission and worker start"
+        );
+
+        drop(claim);
+        assert_eq!(
+            state.batch_run_admission(&operation_id),
+            (BatchRunAdmission::Rejected, Some(BatchOperation::Transcribe), None),
+            "a cancelled preflight remains a definite rejected run for response-loss reconciliation"
+        );
+        assert!(state.lock_batch_cancel_token().is_none());
+    }
+
+    #[test]
+    fn batch_start_commit_serializes_one_cancel_check_at_the_spawn_boundary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        let operation_id = uuid::Uuid::from_u128(0x5103).to_string();
+        let token = state
+            .try_start_batch_for_run(&operation_id, BatchOperation::Normalize, 1)
+            .expect("claim normalization preflight");
+        let claim = ClaimedBatchStart::new(&state, &operation_id, BatchOperation::Normalize);
+        let commit = state
+            .commit_batch_start(&operation_id, BatchOperation::Normalize, &token)
+            .expect("commit exact start authority");
+        assert!(
+            state.batch_cancel_token.try_lock().is_err(),
+            "one short start check must own the exact cancel slot until its boundary is released"
+        );
+        drop(commit);
+        assert!(state.cancel_current_operation());
+
+        assert!(token.is_cancelled(), "the same token reaches the worker immediately after handoff");
+        drop(claim);
+    }
+
+    #[test]
+    fn streamed_admission_keeps_cancel_and_status_locks_responsive() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        let operation_id = uuid::Uuid::from_u128(0x5105).to_string();
+        let token = state
+            .try_start_batch_for_run(&operation_id, BatchOperation::Normalize, 100_000)
+            .expect("claim large batch");
+        let claim = ClaimedBatchStart::new(&state, &operation_id, BatchOperation::Normalize);
+
+        let admission_check = state
+            .commit_batch_start(&operation_id, BatchOperation::Normalize, &token)
+            .expect("enter admission boundary");
+        drop(admission_check);
+        assert!(state.batch_run_tracker.try_lock().is_ok(), "status must not block on streamed admission");
+        assert!(state.cancel_current_operation(), "Cancel must remain responsive during streamed admission");
+        assert_eq!(
+            state.commit_batch_start(&operation_id, BatchOperation::Normalize, &token).err(),
+            Some(BatchStartCommitError::Cancelled),
+            "a cancellation that wins during admission must prevent worker spawn"
+        );
+        drop(claim);
+    }
+
+    #[test]
+    fn starting_authority_is_one_way_and_disappears_after_durable_admission() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        let operation_id = uuid::Uuid::from_u128(0x5104).to_string();
+        let token = state
+            .try_start_batch_for_run(&operation_id, BatchOperation::Normalize, 4)
+            .expect("claim starting identity");
+        assert_eq!(state.starting_batch_run(&operation_id), Some((BatchOperation::Normalize, 4)));
+
+        let commit =
+            state.commit_batch_start(&operation_id, BatchOperation::Normalize, &token).expect("commit exact start");
+        drop(commit);
+        assert!(state.mark_batch_durable_admitted(&operation_id, BatchOperation::Normalize));
+        assert_eq!(state.starting_batch_run(&operation_id), None);
+        assert!(state.finish_batch_for_run(&operation_id, BatchOperation::Normalize));
+    }
+
+    #[test]
+    fn durable_batch_guard_drop_before_worker_entry_records_start_failure_and_reopens_exact_gate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = Arc::new(test_app_state(dir.path().to_path_buf()));
+        let operation_id = uuid::Uuid::from_u128(0x5301).to_string();
+        let segment_ids = vec!["guard-start-failure".to_string()];
+        let guard = admit_test_normalize_guard(&state, &operation_id, &segment_ids);
+
+        // This is the exact ownership shape of an OS `spawn` refusal: the captured closure (and
+        // therefore its not-yet-entered guard) is dropped synchronously on the caller thread.
+        drop(guard);
+
+        let status = state.batch_store().status(&operation_id).unwrap().expect("durable terminal status");
+        assert_eq!(status.state, crate::db::BatchJobLifecycleV1::Failed);
+        assert_eq!(status.error_code.as_deref(), Some("BATCH_WORKER_START_FAILED"));
+        assert_eq!(status.counts.abandoned, 1);
+        let (admission, operation, outcome) = state.batch_run_admission(&operation_id);
+        assert_eq!(admission, BatchRunAdmission::Settled);
+        assert_eq!(operation, Some(BatchOperation::Normalize));
+        let outcome = outcome.expect("exact durable outcome retained");
+        assert_eq!(outcome.disposition, BatchRunDisposition::Halted);
+        assert_eq!(outcome.error_code.as_deref(), Some("BATCH_WORKER_START_FAILED"));
+        assert_eq!(*state.lock_batch_state(), BatchState::Idle);
+        assert!(state.lock_batch_cancel_token().is_none());
+        assert!(!state.lock_history().can_undo(), "a zero-effect start refusal must not mint an undo action");
+
+        let next = uuid::Uuid::from_u128(0x5302).to_string();
+        state
+            .try_start_batch_for_run(&next, BatchOperation::Normalize, 1)
+            .expect("verified terminal settlement reopens the single-flight gate");
+        state.abort_batch_start(&next, BatchOperation::Normalize);
+    }
+
+    #[test]
+    fn durable_batch_guard_drop_after_worker_entry_records_panic_and_exact_prefix_undo_redo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = Arc::new(test_app_state(dir.path().to_path_buf()));
+        let operation_id = uuid::Uuid::from_u128(0x5303).to_string();
+        let segment_ids = vec!["guard-panic-applied".to_string(), "guard-panic-pending".to_string()];
+        let mut guard = admit_test_normalize_guard(&state, &operation_id, &segment_ids);
+        guard.mark_worker_entered();
+        let page = guard.lease().unwrap().pending_page(None).expect("read exact pending page");
+        assert_eq!(page.len(), 2);
+        assert!(matches!(
+            guard
+                .lease()
+                .unwrap()
+                .commit_normalization(page[0].ordinal, "normalized-applied", "guard-test-v1")
+                .expect("commit first exact item"),
+            crate::db::BatchItemCommitOutcomeV1::Applied { .. }
+        ));
+
+        // Simulate an unwind before the worker's normal finish/outcome/event path.
+        drop(guard);
+
+        let status = state.batch_store().status(&operation_id).unwrap().expect("durable panic terminal");
+        assert_eq!(status.state, crate::db::BatchJobLifecycleV1::Failed);
+        assert_eq!(status.error_code.as_deref(), Some("BATCH_WORKER_PANICKED"));
+        assert_eq!(status.counts.applied, 1);
+        assert_eq!(status.counts.abandoned, 1);
+        let (_, _, outcome) = state.batch_run_admission(&operation_id);
+        let outcome = outcome.expect("panic outcome retained from durable counts");
+        assert_eq!(outcome.disposition, BatchRunDisposition::Panicked);
+        assert_eq!(outcome.succeeded, 1);
+        assert_eq!(outcome.abandoned, 1);
+        assert!(state.lock_history().can_undo(), "an applied panic prefix must publish exact undo authority");
+
+        {
+            let db = state.db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let history = state.lock_history();
+            assert_eq!(history.undo(&db).unwrap(), Some(crate::history::HistoryAction::BatchNormalize));
+            assert_eq!(db.get_segment_by_id(&segment_ids[0]).unwrap().unwrap().normalized_transcript, None);
+            assert_eq!(db.get_segment_by_id(&segment_ids[1]).unwrap().unwrap().normalized_transcript, None);
+            assert_eq!(history.redo(&db).unwrap(), Some(crate::history::HistoryAction::BatchNormalize));
+            assert_eq!(
+                db.get_segment_by_id(&segment_ids[0]).unwrap().unwrap().normalized_transcript.as_deref(),
+                Some("normalized-applied")
+            );
+            assert_eq!(
+                db.get_segment_by_id(&segment_ids[1]).unwrap().unwrap().normalized_transcript,
+                None,
+                "redo must not touch the item that was pending when the worker panicked"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_batch_guard_retains_process_gate_when_terminal_database_proof_is_unreadable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = Arc::new(test_app_state(dir.path().to_path_buf()));
+        let operation_id = uuid::Uuid::from_u128(0x5304).to_string();
+        let segment_ids = vec!["guard-corrupt-journal".to_string()];
+        let guard = admit_test_normalize_guard(&state, &operation_id, &segment_ids);
+        state
+            .db
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .connection()
+            .execute_batch("DROP TABLE batch_job_items_v1")
+            .expect("inject unreadable durable journal");
+
+        drop(guard);
+
+        assert!(state.batch_store().status(&operation_id).is_err(), "terminal evidence must remain unreadable");
+        assert_eq!(
+            state.batch_run_admission(&operation_id),
+            (BatchRunAdmission::Running, Some(BatchOperation::Normalize), None),
+            "RAM must not invent a terminal outcome or acknowledge an unreadable durable journal"
+        );
+        assert_eq!(*state.lock_batch_state(), BatchState::Running);
+        assert!(state.lock_batch_cancel_token().is_some());
+        let refused = uuid::Uuid::from_u128(0x5305).to_string();
+        assert_eq!(
+            state.try_start_batch_for_run(&refused, BatchOperation::Normalize, 1).err().as_deref(),
+            Some("Batch operation already in progress"),
+            "a second batch must remain blocked until restart recovery can validate durable truth"
+        );
+    }
+
+    #[test]
+    fn terminal_batch_publication_and_ack_wait_for_exact_guard_settlement() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(test_app_state(directory.path().to_path_buf()));
+        let operation_id = uuid::Uuid::from_u128(0x4f02).to_string();
+        let segment_ids = vec!["guard-terminal-publication".to_string()];
+        let mut guard = admit_test_normalize_guard(&state, &operation_id, &segment_ids);
+        guard.mark_worker_entered();
+        let item = guard.lease().unwrap().pending_page(None).unwrap().pop().expect("one pending publication fixture");
+        assert!(matches!(
+            guard
+                .lease()
+                .unwrap()
+                .commit_normalization(item.ordinal, "normalized-publication", "guard-test-v1")
+                .unwrap(),
+            crate::db::BatchItemCommitOutcomeV1::Applied { .. }
+        ));
+        let stale_running = state.batch_store().status(&operation_id).unwrap().expect("running status snapshot");
+        assert_eq!(stale_running.state, crate::db::BatchJobLifecycleV1::Running);
+        let terminal = guard.finish(crate::db::BatchTerminalIntentV1::Succeeded).unwrap();
+        assert_eq!(terminal.state, crate::db::BatchJobLifecycleV1::Succeeded);
+        assert!(state.lock_history().can_undo(), "exact history must exist before process settlement");
+        assert_eq!(state.batch_run_admission(&operation_id).0, BatchRunAdmission::Running);
+
+        // Exact regression: a renderer poll after the durable header commit but before Guard::drop
+        // must not observe or acknowledge terminal success. The guard still owns the physical gate.
+        let finalizing = crate::commands::get_batch_run_status_blocking_for_test(operation_id.clone(), &state)
+            .expect("read process-aware finalizing state");
+        assert_eq!(finalizing.status, crate::ipc_contract::BatchRunStatusV1::Running);
+        assert_eq!(finalizing.outcome, None);
+        let early_ack = crate::commands::acknowledge_batch_run_blocking_for_test(operation_id.clone(), &state)
+            .expect_err("terminal durable truth alone must not be acknowledgeable");
+        assert_eq!(early_ack.code, "BATCH_RUN_NOT_SETTLED");
+        assert_eq!(state.batch_run_admission(&operation_id).0, BatchRunAdmission::Running);
+
+        drop(guard);
+        let raced = crate::commands::publishable_durable_batch_status(&state, stale_running)
+            .expect("a pre-terminal DB snapshot must refresh against exact settled process truth");
+        assert_eq!(raced.status, crate::ipc_contract::BatchRunStatusV1::Settled);
+        assert!(raced.outcome.is_some());
+        let settled = crate::commands::get_batch_run_status_blocking_for_test(operation_id.clone(), &state)
+            .expect("read exactly settled state");
+        assert_eq!(settled.status, crate::ipc_contract::BatchRunStatusV1::Settled);
+        assert!(settled.outcome.is_some());
+        assert!(crate::commands::acknowledge_batch_run_blocking_for_test(operation_id.clone(), &state)
+            .expect("acknowledge exact settled result"));
+
+        // A new process has no RAM tracker entry. Its immutable terminal journal remains the status
+        // authority, while ACK correctly stays process-local and non-adoptable.
+        let restarted = test_app_state(directory.path().to_path_buf());
+        let recovered = crate::commands::get_batch_run_status_blocking_for_test(operation_id.clone(), &restarted)
+            .expect("read terminal journal without a process tracker");
+        assert_eq!(recovered.status, crate::ipc_contract::BatchRunStatusV1::Settled);
+        assert!(recovered.outcome.is_some());
+        let restart_ack = crate::commands::acknowledge_batch_run_blocking_for_test(operation_id, &restarted)
+            .expect_err("an untracked historical result is not awaiting renderer acknowledgment");
+        assert_eq!(restart_ack.code, "BATCH_RUN_NOT_ADOPTABLE");
+    }
+
+    #[test]
+    fn batch_terminal_outcome_is_single_assignment_and_survives_event_loss() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        let operation_id = uuid::Uuid::from_u128(0x5201).to_string();
+        state
+            .try_start_batch_for_run(&operation_id, BatchOperation::Transcribe, 3)
+            .expect("admit outcome-bearing batch");
+        assert_eq!(state.adoptable_batch_run_identity(), Some((operation_id.clone(), BatchOperation::Transcribe)));
+
+        let outcome = BatchRunOutcome {
+            disposition: BatchRunDisposition::Halted,
+            total: 3,
+            succeeded: 1,
+            failed: 1,
+            skipped: 0,
+            abandoned: 1,
+            cancelled: false,
+            error_code: Some("BATCH_TRANSCRIPT_WRITE_FAILED".into()),
+        };
+        assert!(state.record_batch_outcome(&operation_id, BatchOperation::Transcribe, outcome.clone()));
+        assert!(
+            !state.record_batch_outcome(&operation_id, BatchOperation::Transcribe, outcome.clone()),
+            "terminal truth is immutable once recorded"
+        );
+        assert!(state.finish_batch_for_run(&operation_id, BatchOperation::Transcribe));
+
+        let (admission, operation, retained) = state.batch_run_admission(&operation_id);
+        assert_eq!(admission, BatchRunAdmission::Settled);
+        assert_eq!(operation, Some(BatchOperation::Transcribe));
+        assert_eq!(retained, Some(outcome));
+        assert_eq!(
+            state.adoptable_batch_run_identity(),
+            Some((operation_id.clone(), BatchOperation::Transcribe)),
+            "terminalization between reload discovery calls must not erase the result"
+        );
+        assert!(state.acknowledge_batch_run_renderer(&operation_id));
+        assert!(state.acknowledge_batch_run_renderer(&operation_id), "acknowledgment replay must be idempotent");
+        assert_eq!(state.adoptable_batch_run_identity(), None);
+    }
+
+    #[test]
+    fn batch_run_tracker_bounds_terminal_reconciliation_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        let first = uuid::Uuid::from_u128(0x6000).to_string();
+        let last = uuid::Uuid::from_u128(0x6000 + BATCH_RUN_TERMINAL_HISTORY as u128).to_string();
+
+        for value in 0..=BATCH_RUN_TERMINAL_HISTORY {
+            let operation_id = uuid::Uuid::from_u128(0x6000 + value as u128).to_string();
+            state
+                .try_start_batch_for_run(&operation_id, BatchOperation::Normalize, 1)
+                .expect("admit retained batch run");
+            assert!(state.finish_batch_for_run(&operation_id, BatchOperation::Normalize));
+        }
+
+        assert_eq!(state.batch_run_admission(&first), (BatchRunAdmission::Unknown, None, None));
+        let (last_status, last_operation, last_outcome) = state.batch_run_admission(&last);
+        assert_eq!(last_status, BatchRunAdmission::Settled);
+        assert_eq!(last_operation, Some(BatchOperation::Normalize));
+        assert_eq!(last_outcome.expect("missing retained outcome").disposition, BatchRunDisposition::Panicked);
+        assert_eq!(state.lock_batch_run_tracker().terminal.len(), BATCH_RUN_TERMINAL_HISTORY);
+    }
+
+    #[test]
+    fn ordinary_import_cannot_supersede_an_interrupted_journal_but_exact_resume_can() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        state.job_store().begin_import("C:/owner/audio", 3).expect("create interrupted journal");
+        let ordinary = "00000000-0000-4000-8000-000000000011";
+        let recovery = "00000000-0000-4000-8000-000000000012";
+
+        assert_eq!(
+            state.try_start_import_for_run(ordinary),
+            Err(INTERRUPTED_IMPORT_RECOVERY_REQUIRED_MESSAGE.to_string())
+        );
+        assert_eq!(state.import_run_admission(ordinary), ImportRunAdmission::Rejected);
+        assert_eq!(*state.lock_import_state(), ImportState::Idle);
+
+        state.try_start_import_for_recovery_run(recovery).expect("resume path may claim the existing journal");
+        assert_eq!(state.import_run_admission(recovery), ImportRunAdmission::Running);
+        state.finish_import();
+    }
+
+    #[test]
+    fn import_recovery_admission_is_mutually_exclusive_with_a_live_worker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+
+        state.try_start_import().expect("start live import");
+        assert!(
+            state.try_import_recovery_admission().is_none(),
+            "a live worker's journal must not be exposed as interrupted"
+        );
+        state.finish_import();
+
+        let admission = state.try_import_recovery_admission().expect("idle recovery admission");
+        assert!(
+            state.import_state.try_lock().is_err(),
+            "the recovery admission must hold the exact mutex used by import startup"
+        );
+        drop(admission);
+        assert!(state.import_state.try_lock().is_ok(), "dropping recovery admission reopens startup");
+    }
+
+    #[test]
     fn app_state_batch_state_recovers_poisoned_lock() {
         let dir = tempfile::TempDir::new().unwrap();
         let state = test_app_state(dir.path().to_path_buf());
@@ -1673,10 +2919,15 @@ mod tests {
             panic!("poison batch state");
         }));
 
-        state.try_start_batch().expect("recover and start batch");
+        let first = uuid::Uuid::from_u128(0x4001).to_string();
+        state.try_start_batch_for_run(&first, BatchOperation::Transcribe, 1).expect("recover and start batch");
         assert_eq!(*state.lock_batch_state(), BatchState::Running);
-        assert_eq!(state.try_start_batch(), Err("Batch operation already in progress".to_string()));
-        state.finish_batch();
+        let second = uuid::Uuid::from_u128(0x4002).to_string();
+        assert_eq!(
+            state.try_start_batch_for_run(&second, BatchOperation::Normalize, 1).err().as_deref(),
+            Some("Batch operation already in progress")
+        );
+        assert!(state.finish_batch_for_run(&first, BatchOperation::Transcribe));
         assert_eq!(*state.lock_batch_state(), BatchState::Idle);
     }
 

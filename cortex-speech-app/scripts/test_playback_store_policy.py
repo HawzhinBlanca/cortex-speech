@@ -31,7 +31,8 @@ def test_store_is_backend_only_and_serialized() -> None:
     for required in (
         "struct PlaybackObservation",
         "struct PlaybackWriteStore",
-        "self.runtime.lock()",
+        "self.runtime.begin_mutation().map_err(AppError::Other)?",
+        "self.runtime.lock_after_mutation(&mutation)",
         "database.record_playback_observation",
     ):
         if required not in store:

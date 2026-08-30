@@ -1,7 +1,8 @@
+use crate::db::batch_jobs::{BatchHistorySideV1, BatchHistoryTokenV1, BatchJobKindV1, BatchSegmentProjectionV1};
 use crate::db::{SpeakerAssignmentChange, SpeechSegment};
 use crate::error::AppResult;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Mutex, MutexGuard};
 
 const MAX_HISTORY_BYTES: usize = 64 * 1024 * 1024;
@@ -14,14 +15,22 @@ pub enum Command {
         previous: Box<SpeechSegment>,
         current: Box<SpeechSegment>,
     },
+    /// One bound champion replacement, including the exact pre/post hypothesis sets. Generic
+    /// `UpdateSegment` snapshots cannot represent hypothesis deletion/replacement and therefore must
+    /// never be used for per-clip retranscription.
+    MachineTranscription {
+        segment_id: String,
+        previous: Box<BatchSegmentProjectionV1>,
+        current: Box<BatchSegmentProjectionV1>,
+    },
     DeleteSegments {
         segments: Vec<SpeechSegment>,
     },
-    BatchTranscribe {
-        /// Full snapshots immediately before and after the batch's durable ASR writes. Both endpoints
-        /// are required for compare-and-set Undo and deterministic Redo.
-        previous_segments: Vec<SpeechSegment>,
-        current_segments: Vec<SpeechSegment>,
+    BatchJob {
+        /// Compact current-session cursor over immutable schema-68 journal evidence. Segment and
+        /// hypothesis endpoints remain server-owned in SQLite; history retains only the durable job
+        /// identity and the exact endpoint that must still be current.
+        token: BatchHistoryTokenV1,
     },
     SpeakerAssignment {
         changes: Vec<SpeakerAssignmentChange>,
@@ -35,6 +44,7 @@ pub enum HistoryAction {
     UpdateSegment,
     DeleteSegments,
     BatchTranscribe,
+    BatchNormalize,
     SpeakerAssignment,
 }
 
@@ -47,9 +57,12 @@ struct HistoryEntry {
 impl Command {
     pub fn action(&self) -> HistoryAction {
         match self {
-            Command::UpdateSegment { .. } => HistoryAction::UpdateSegment,
+            Command::UpdateSegment { .. } | Command::MachineTranscription { .. } => HistoryAction::UpdateSegment,
             Command::DeleteSegments { .. } => HistoryAction::DeleteSegments,
-            Command::BatchTranscribe { .. } => HistoryAction::BatchTranscribe,
+            Command::BatchJob { token } => match token.kind {
+                BatchJobKindV1::Transcribe => HistoryAction::BatchTranscribe,
+                BatchJobKindV1::Normalize => HistoryAction::BatchNormalize,
+            },
             Command::SpeakerAssignment { .. } => HistoryAction::SpeakerAssignment,
         }
     }
@@ -58,6 +71,7 @@ impl Command {
 pub struct HistoryManager {
     undo_stack: Mutex<VecDeque<HistoryEntry>>,
     redo_stack: Mutex<VecDeque<HistoryEntry>>,
+    recorded_batch_jobs: Mutex<HashSet<String>>,
     max_history: usize,
     max_bytes: usize,
 }
@@ -71,6 +85,7 @@ impl HistoryManager {
         Self {
             undo_stack: Mutex::new(VecDeque::with_capacity(max_history.min(256))),
             redo_stack: Mutex::new(VecDeque::new()),
+            recorded_batch_jobs: Mutex::new(HashSet::new()),
             max_history,
             max_bytes,
         }
@@ -90,7 +105,22 @@ impl HistoryManager {
         })
     }
 
-    pub fn push(&self, cmd: Command) {
+    fn lock_recorded_batch_jobs(&self) -> MutexGuard<'_, HashSet<String>> {
+        self.recorded_batch_jobs.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned recorded-batch history set");
+            poisoned.into_inner()
+        })
+    }
+
+    fn push_internal(&self, cmd: Command) -> bool {
+        if let Command::BatchJob { token } = &cmd {
+            // The durable operation id is the idempotency key. A lost IPC response or terminal
+            // status replay must not put the same committed effect on the Undo stack twice, even
+            // after its older entry was evicted by the bounded history window.
+            if !self.lock_recorded_batch_jobs().insert(token.operation_id.clone()) {
+                return false;
+            }
+        }
         {
             let mut stack = self.lock_undo_stack();
             // Serialized size is a conservative, schema-aware proxy for retained heap. Measure once
@@ -109,6 +139,11 @@ impl HistoryManager {
         }
         // Clear redo stack on new action.
         self.lock_redo_stack().clear();
+        true
+    }
+
+    pub fn push(&self, cmd: Command) {
+        self.push_internal(cmd);
     }
 
     /// Records an update to an existing segment for undo/redo.
@@ -118,6 +153,44 @@ impl HistoryManager {
             previous: Box::new(previous),
             current: Box::new(current),
         });
+    }
+
+    /// Record the complete exact endpoint returned by the database-owned champion commit.
+    pub(crate) fn record_machine_transcription(
+        &self,
+        previous: BatchSegmentProjectionV1,
+        current: BatchSegmentProjectionV1,
+    ) -> AppResult<()> {
+        if previous.segment.id != current.segment.id {
+            return Err(crate::error::AppError::Validation(
+                "machine transcription history endpoints identify different segments".into(),
+            ));
+        }
+        self.push(Command::MachineTranscription {
+            segment_id: current.segment.id.clone(),
+            previous: Box::new(previous),
+            current: Box::new(current),
+        });
+        Ok(())
+    }
+
+    /// Record one terminal durable batch if it has any applied effects. The inverse is always
+    /// reconstructed from the immutable schema-68 journal, never from renderer-supplied snapshots.
+    /// A terminal batch containing only skipped/failed/abandoned items correctly creates no history.
+    pub fn record_batch_token(&self, token: BatchHistoryTokenV1) -> AppResult<bool> {
+        if token.expected_side != BatchHistorySideV1::After || token.items.is_empty() {
+            return Err(crate::error::AppError::Other(
+                "durable batch history returned an invalid initial endpoint".into(),
+            ));
+        }
+        let recorded = self.push_internal(Command::BatchJob { token });
+        Ok(recorded)
+    }
+
+    /// Database-facade convenience for call sites that do not already own a batch execution lease.
+    pub fn record_batch_job(&self, db: &crate::db::Database, operation_id: &str) -> AppResult<bool> {
+        let Some(token) = db.batch_job_history_token_v1(operation_id)? else { return Ok(false) };
+        self.record_batch_token(token)
     }
 
     /// Persists a segment update and records history when updating an existing row.
@@ -151,14 +224,16 @@ impl HistoryManager {
             stack.pop_back()
         };
         match cmd {
-            Some(entry) => {
+            Some(mut entry) => {
                 let action = entry.command.action();
                 // Apply BEFORE moving the command to the redo stack, and on failure put it BACK on the
                 // undo stack it came from — never drop it from BOTH stacks. Popping first and pushing only
                 // on success means a failing apply (e.g. a DB error) would destroy the command and desync
                 // the stacks, corrupting history and mis-ordering future undo/redo.
-                match self.apply_undo(db, &entry.command) {
+                match self.apply_undo(db, &mut entry.command) {
                     Ok(()) => {
+                        entry.estimated_bytes =
+                            serde_json::to_vec(&entry.command).map_or(usize::MAX, |bytes| bytes.len());
                         self.lock_redo_stack().push_back(entry);
                         Ok(Some(action))
                     }
@@ -178,16 +253,17 @@ impl HistoryManager {
             stack.pop_back()
         };
         match cmd {
-            Some(entry) => {
+            Some(mut entry) => {
                 let action = entry.command.action();
                 // Same invariant as undo: only move the command to the undo stack if the redo actually
                 // applied, and keep it on the redo stack if apply_redo fails. An unsupported redo
-                // (Command::BatchTranscribe returns Err) would otherwise DESTROY the popped command,
-                // leaving can_redo()=false and the DB stranded in the undone state with no recovery, and
-                // corrupting the stacks. Re-pushing on failure preserves the entry so the user is never
-                // silently stranded.
-                match self.apply_redo(db, &entry.command) {
+                // A failed durable compare-and-set would otherwise destroy the popped command,
+                // leaving can_redo()=false and the DB stranded in the undone state. Re-pushing on
+                // failure preserves the exact endpoint token so the action remains retryable.
+                match self.apply_redo(db, &mut entry.command) {
                     Ok(()) => {
+                        entry.estimated_bytes =
+                            serde_json::to_vec(&entry.command).map_or(usize::MAX, |bytes| bytes.len());
                         self.lock_undo_stack().push_back(entry);
                         Ok(Some(action))
                     }
@@ -201,20 +277,32 @@ impl HistoryManager {
         }
     }
 
-    fn apply_undo(&self, db: &crate::db::Database, cmd: &Command) -> AppResult<()> {
+    fn apply_undo(&self, db: &crate::db::Database, cmd: &mut Command) -> AppResult<()> {
         match cmd {
             Command::UpdateSegment { previous, current, .. } => {
                 // The atomic compare-and-set refuses missing or stale rows and leaves the command on
                 // the undo stack on failure; a no-op can never be reported as a successful Undo.
                 db.apply_history_machine_snapshot_atomic(current, previous)?;
             }
+            Command::MachineTranscription { previous, current, .. } => {
+                // The immutable semantic "before" side is materialized as a new database write, so
+                // its review revision advances. Rotate that fresh exact projection into the command;
+                // Redo must compare against this revision, never against the historical one.
+                **previous = db.apply_history_machine_projection_atomic(current, previous)?;
+            }
             Command::DeleteSegments { segments } => {
                 // Validate and restore every row inside one writer-held savepoint. A trigger, disk
                 // error, stale id, or commit failure must restore zero rows rather than a prefix.
                 db.apply_deleted_segments_history(segments, false)?;
             }
-            Command::BatchTranscribe { previous_segments, current_segments } => {
-                db.apply_batch_transcription_history(previous_segments, current_segments, false)?;
+            Command::BatchJob { token } => {
+                if token.expected_side != BatchHistorySideV1::After {
+                    return Err(crate::error::AppError::Validation(
+                        "batch Undo requires an exact after-effect history endpoint".into(),
+                    ));
+                }
+                let next = db.apply_batch_job_history_v1(token)?;
+                *token = next;
             }
             Command::SpeakerAssignment { changes } => {
                 db.apply_speaker_assignment_history(changes, false)?;
@@ -223,18 +311,29 @@ impl HistoryManager {
         Ok(())
     }
 
-    fn apply_redo(&self, db: &crate::db::Database, cmd: &Command) -> AppResult<()> {
+    fn apply_redo(&self, db: &crate::db::Database, cmd: &mut Command) -> AppResult<()> {
         match cmd {
             Command::UpdateSegment { previous, current, .. } => {
                 db.apply_history_machine_snapshot_atomic(previous, current)?;
+            }
+            Command::MachineTranscription { previous, current, .. } => {
+                // Symmetric token rotation makes every later Undo/Redo a real monotonic CAS instead
+                // of accepting an old revision or pretending the clock can move backwards.
+                **current = db.apply_history_machine_projection_atomic(previous, current)?;
             }
             Command::DeleteSegments { segments } => {
                 // Redo is compare-and-set against the exact restored snapshots. If any row was
                 // edited, removed, or gained authority after Undo, delete none of them.
                 db.apply_deleted_segments_history(segments, true)?;
             }
-            Command::BatchTranscribe { previous_segments, current_segments } => {
-                db.apply_batch_transcription_history(previous_segments, current_segments, true)?;
+            Command::BatchJob { token } => {
+                if token.expected_side != BatchHistorySideV1::Before {
+                    return Err(crate::error::AppError::Validation(
+                        "batch Redo requires an exact before-effect history endpoint".into(),
+                    ));
+                }
+                let next = db.apply_batch_job_history_v1(token)?;
+                *token = next;
             }
             Command::SpeakerAssignment { changes } => {
                 db.apply_speaker_assignment_history(changes, true)?;
@@ -254,6 +353,7 @@ impl HistoryManager {
     pub fn clear(&self) {
         self.lock_undo_stack().clear();
         self.lock_redo_stack().clear();
+        self.lock_recorded_batch_jobs().clear();
     }
 
     pub fn undo_action(&self) -> Option<HistoryAction> {
@@ -268,7 +368,13 @@ impl HistoryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::batch_jobs::{BatchChampionDraftV1, BatchExecutorIdentityV1, BatchTerminalIntentV1};
     use crate::db::Database;
+
+    const BATCH_CONFIG_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const BATCH_TOKEN_SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const BATCH_GIT_SHA: &str = "cccccccccccccccccccccccccccccccccccccccc";
+    const BATCH_DEPLOYMENT_SHA: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
     fn setup_db() -> Database {
         let db = Database::open(":memory:").unwrap();
@@ -297,6 +403,43 @@ mod tests {
             signal_anomaly_score: None,
             ..SpeechSegment::default()
         }
+    }
+
+    fn batch_executor() -> BatchExecutorIdentityV1 {
+        BatchExecutorIdentityV1 {
+            git_sha: BATCH_GIT_SHA.into(),
+            token_sha256: BATCH_TOKEN_SHA.into(),
+            attempt_generation: 1,
+        }
+    }
+
+    fn commit_champion_batch(db: &Database, operation_id: &str, ids: &[&str]) {
+        db.connection()
+            .execute(
+                "INSERT OR IGNORE INTO model_versions(
+                     id,family,checkpoint_sha256,checkpoint_path,source,license,status)
+                 VALUES('history-champion','omniasr-7b',?1,'C:/model','user-finetuned','Apache-2.0','champion')",
+                [BATCH_DEPLOYMENT_SHA],
+            )
+            .unwrap();
+        let segment_ids = ids.iter().map(|id| (*id).to_string()).collect::<Vec<_>>();
+        let executor = batch_executor();
+        db.admit_batch_job_v1(operation_id, BatchJobKindV1::Transcribe, &segment_ids, BATCH_CONFIG_SHA, &executor)
+            .unwrap();
+        for (ordinal, id) in ids.iter().enumerate() {
+            let draft = BatchChampionDraftV1 {
+                raw_transcript: format!("champion-{id}"),
+                normalized_transcript: Some(format!("normalized-{id}")),
+                confidence: Some(0.91),
+                confidence_source: Some("posterior".into()),
+                model_version_id: "history-champion".into(),
+                deployment_sha256: BATCH_DEPLOYMENT_SHA.into(),
+                cloud_call: false,
+                normalizer_version: Some("history-normalizer-v1".into()),
+            };
+            db.commit_batch_champion_draft_v1(operation_id, ordinal as i64, &draft, &executor).unwrap();
+        }
+        db.finish_batch_job_v1(operation_id, BatchTerminalIntentV1::Succeeded, &executor).unwrap();
     }
 
     #[test]
@@ -550,16 +693,128 @@ mod tests {
         let history = HistoryManager::new(100);
         let prev = make_segment("b1", "old");
         db.insert_segment(&prev).unwrap();
-        let previous = db.get_segment_by_id("b1").unwrap().unwrap();
-        let mut updated = previous.clone();
-        updated.raw_transcript = "champion draft".into();
-        db.insert_segment(&updated).unwrap();
-        let current = db.get_segment_by_id("b1").unwrap().unwrap();
-        history.push(Command::BatchTranscribe { previous_segments: vec![previous], current_segments: vec![current] });
+        commit_champion_batch(&db, "30000000-0000-4000-8000-000000000101", &["b1"]);
+        let applied_revision: i64 = db
+            .connection()
+            .query_row("SELECT review_revision FROM speech_segments WHERE id='b1'", [], |row| row.get(0))
+            .unwrap();
+        assert!(history.record_batch_job(&db, "30000000-0000-4000-8000-000000000101").unwrap());
         history.undo(&db).unwrap(); // moves it to the redo stack
         assert!(history.can_redo());
+        let undo_revision: i64 = db
+            .connection()
+            .query_row("SELECT review_revision FROM speech_segments WHERE id='b1'", [], |row| row.get(0))
+            .unwrap();
+        assert!(undo_revision > applied_revision, "Undo must advance, never rewind, review_revision");
         assert_eq!(history.redo(&db).unwrap(), Some(HistoryAction::BatchTranscribe));
-        assert_eq!(db.get_segment_by_id("b1").unwrap().unwrap().raw_transcript, "champion draft");
+        let redone = db.get_segment_by_id("b1").unwrap().unwrap();
+        assert_eq!(redone.raw_transcript, "champion-b1");
+        let redo_revision: i64 = db
+            .connection()
+            .query_row("SELECT review_revision FROM speech_segments WHERE id='b1'", [], |row| row.get(0))
+            .unwrap();
+        assert!(redo_revision > undo_revision, "Redo must receive a fresh monotonic revision");
+    }
+
+    #[test]
+    fn durable_normalize_history_has_its_own_action_and_rotates_exact_revisions() {
+        let db = setup_db();
+        let history = HistoryManager::new(100);
+        let mut original = make_segment("normalize-history", "raw input");
+        original.normalized_transcript = Some("old normalized".into());
+        original.normalizer_version = Some("old-normalizer".into());
+        db.insert_segment(&original).unwrap();
+
+        let operation_id = "30000000-0000-4000-8000-000000000105";
+        let executor = batch_executor();
+        db.admit_batch_job_v1(
+            operation_id,
+            BatchJobKindV1::Normalize,
+            &["normalize-history".into()],
+            BATCH_CONFIG_SHA,
+            &executor,
+        )
+        .unwrap();
+        db.commit_batch_normalization_v1(operation_id, 0, "new normalized", "new-normalizer", &executor).unwrap();
+        db.finish_batch_job_v1(operation_id, BatchTerminalIntentV1::Succeeded, &executor).unwrap();
+        let applied_revision: i64 = db
+            .connection()
+            .query_row("SELECT review_revision FROM speech_segments WHERE id='normalize-history'", [], |row| row.get(0))
+            .unwrap();
+
+        assert!(history.record_batch_job(&db, operation_id).unwrap());
+        assert_eq!(history.undo_action(), Some(HistoryAction::BatchNormalize));
+        assert_eq!(history.undo(&db).unwrap(), Some(HistoryAction::BatchNormalize));
+        let undone = db.get_segment_by_id("normalize-history").unwrap().unwrap();
+        assert_eq!(undone.normalized_transcript.as_deref(), Some("old normalized"));
+        assert_eq!(undone.normalizer_version.as_deref(), Some("old-normalizer"));
+        let undo_revision: i64 = db
+            .connection()
+            .query_row("SELECT review_revision FROM speech_segments WHERE id='normalize-history'", [], |row| row.get(0))
+            .unwrap();
+        assert!(undo_revision > applied_revision);
+
+        assert_eq!(history.redo_action(), Some(HistoryAction::BatchNormalize));
+        assert_eq!(history.redo(&db).unwrap(), Some(HistoryAction::BatchNormalize));
+        let redone = db.get_segment_by_id("normalize-history").unwrap().unwrap();
+        assert_eq!(redone.normalized_transcript.as_deref(), Some("new normalized"));
+        assert_eq!(redone.normalizer_version.as_deref(), Some("new-normalizer"));
+        let redo_revision: i64 = db
+            .connection()
+            .query_row("SELECT review_revision FROM speech_segments WHERE id='normalize-history'", [], |row| row.get(0))
+            .unwrap();
+        assert!(redo_revision > undo_revision);
+    }
+
+    #[test]
+    fn interrupted_applied_prefix_can_be_rehydrated_and_undone_after_restart_recovery() {
+        let db = setup_db();
+        let history = HistoryManager::new(100);
+        let first = make_segment("recovered-prefix-1", "first before");
+        let second = make_segment("recovered-prefix-2", "second before");
+        db.insert_segment(&first).unwrap();
+        db.insert_segment(&second).unwrap();
+        let operation_id = "30000000-0000-4000-8000-000000000106";
+        let executor = batch_executor();
+        db.admit_batch_job_v1(
+            operation_id,
+            BatchJobKindV1::Normalize,
+            &[first.id.clone(), second.id.clone()],
+            BATCH_CONFIG_SHA,
+            &executor,
+        )
+        .unwrap();
+        db.commit_batch_normalization_v1(operation_id, 0, "first after", "restart-normalizer", &executor).unwrap();
+
+        let recovered = db.recover_active_batch_job_v1().unwrap().expect("interrupted batch");
+        assert_eq!(recovered.counts.applied, 1);
+        assert_eq!(recovered.counts.abandoned, 1);
+        assert!(history.record_batch_job(&db, operation_id).unwrap());
+        assert_eq!(history.undo(&db).unwrap(), Some(HistoryAction::BatchNormalize));
+        assert_eq!(
+            db.get_segment_by_id(&first.id).unwrap().unwrap().normalized_transcript,
+            first.normalized_transcript
+        );
+        assert_eq!(
+            db.get_segment_by_id(&second.id).unwrap().unwrap().normalized_transcript,
+            second.normalized_transcript,
+            "never-applied pending work must remain untouched"
+        );
+    }
+
+    #[test]
+    fn durable_batch_operation_id_is_recorded_once_after_a_lost_response_replay() {
+        let db = setup_db();
+        let history = HistoryManager::new(100);
+        db.insert_segment(&make_segment("batch-replay", "before")).unwrap();
+        let operation_id = "30000000-0000-4000-8000-000000000106";
+        commit_champion_batch(&db, operation_id, &["batch-replay"]);
+
+        assert!(history.record_batch_job(&db, operation_id).unwrap());
+        assert!(!history.record_batch_job(&db, operation_id).unwrap());
+        assert_eq!(history.undo(&db).unwrap(), Some(HistoryAction::BatchTranscribe));
+        assert!(!history.can_undo(), "the replay must not create a second inverse for one durable effect");
+        assert!(history.can_redo());
     }
 
     #[test]
@@ -651,12 +906,9 @@ mod tests {
         let history = HistoryManager::new(100);
         let seg = make_segment("bt1", "before");
         db.insert_segment(&seg).unwrap();
-        let previous = db.get_segment_by_id("bt1").unwrap().unwrap();
-        let mut updated = previous.clone();
-        updated.raw_transcript = "batch endpoint".into();
-        db.insert_segment(&updated).unwrap();
-        let current = db.get_segment_by_id("bt1").unwrap().unwrap();
-        history.push(Command::BatchTranscribe { previous_segments: vec![previous], current_segments: vec![current] });
+        let operation_id = "30000000-0000-4000-8000-000000000102";
+        commit_champion_batch(&db, operation_id, &["bt1"]);
+        assert!(history.record_batch_job(&db, operation_id).unwrap());
         history.undo(&db).unwrap(); // moves the command onto the redo stack
         assert!(history.can_redo(), "redo is available after undo");
 
@@ -758,39 +1010,99 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_transcribe_undo_restores_all_fields() {
-        // Verifies that undoing a batch transcription restores not just raw_transcript
-        // but also normalized_transcript and confidence — the complete previous state.
+    fn batch_transcribe_undo_restores_machine_fields_and_complete_hypothesis_authority() {
         let db = setup_db();
         let history = HistoryManager::new(100);
 
-        // Insert segment with pre-existing normalized transcript and confidence.
         let mut original = make_segment("bt1", "old raw");
         original.normalized_transcript = Some("old normalized".to_string());
         original.confidence = Some(0.9);
+        original.confidence_source = Some("old-posterior".into());
+        original.model_version_id = Some("old-model@2".into());
+        original.decoder_config_hash = Some("old-decoder".into());
+        original.normalizer_version = Some("old-normalizer".into());
         db.insert_segment(&original).unwrap();
+        for (model_id, transcript, created_at) in [
+            ("old-a", "old hypothesis one", "2026-01-01T00:00:00Z"),
+            ("old-b", "old hypothesis two", "2026-01-02T00:00:00Z"),
+        ] {
+            db.connection()
+                .execute(
+                    "INSERT INTO segment_hypotheses(
+                         segment_id,model_id,transcript,confidence,model_version_id,created_at)
+                     VALUES('bt1',?1,?2,0.25,?3,?4)",
+                    rusqlite::params![model_id, transcript, format!("{model_id}@1"), created_at],
+                )
+                .unwrap();
+        }
+        let operation_id = "30000000-0000-4000-8000-000000000103";
+        commit_champion_batch(&db, operation_id, &["bt1"]);
+        let applied_revision: i64 = db
+            .connection()
+            .query_row("SELECT review_revision FROM speech_segments WHERE id='bt1'", [], |row| row.get(0))
+            .unwrap();
+        assert!(history.record_batch_job(&db, operation_id).unwrap());
 
-        // Simulate batch transcription: update all three fields.
-        let mut updated = original.clone();
-        updated.raw_transcript = "new raw".to_string();
-        updated.normalized_transcript = Some("new normalized".to_string());
-        updated.confidence = Some(0.5);
-        db.insert_segment(&updated).unwrap();
-        let updated = db.get_segment_by_id("bt1").unwrap().unwrap();
-
-        // Record undo with full snapshot of original.
-        history.push(Command::BatchTranscribe {
-            previous_segments: vec![original.clone()],
-            current_segments: vec![updated],
-        });
-
-        // Undo — should restore ALL fields.
         let desc = history.undo(&db).unwrap();
-        assert!(desc.is_some());
+        assert_eq!(desc, Some(HistoryAction::BatchTranscribe));
         let restored = db.get_segment_by_id("bt1").unwrap().unwrap();
         assert_eq!(restored.raw_transcript, "old raw");
         assert_eq!(restored.normalized_transcript.as_deref(), Some("old normalized"));
         assert!((restored.confidence.unwrap() - 0.9).abs() < 1e-9, "confidence not fully restored");
+        assert_eq!(restored.confidence_source.as_deref(), Some("old-posterior"));
+        assert_eq!(restored.model_version_id.as_deref(), Some("old-model@2"));
+        assert_eq!(restored.decoder_config_hash.as_deref(), Some("old-decoder"));
+        assert_eq!(restored.normalizer_version.as_deref(), Some("old-normalizer"));
+        let restored_hypotheses = db
+            .connection()
+            .prepare(
+                "SELECT model_id,transcript,model_version_id,created_at
+                   FROM segment_hypotheses WHERE segment_id='bt1' ORDER BY model_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            restored_hypotheses,
+            vec![
+                ("old-a".into(), "old hypothesis one".into(), "old-a@1".into(), "2026-01-01T00:00:00Z".into(),),
+                ("old-b".into(), "old hypothesis two".into(), "old-b@1".into(), "2026-01-02T00:00:00Z".into(),),
+            ]
+        );
+        let undo_revision: i64 = db
+            .connection()
+            .query_row("SELECT review_revision FROM speech_segments WHERE id='bt1'", [], |row| row.get(0))
+            .unwrap();
+        assert!(undo_revision > applied_revision);
+
+        assert_eq!(history.redo(&db).unwrap(), Some(HistoryAction::BatchTranscribe));
+        let redone = db.get_segment_by_id("bt1").unwrap().unwrap();
+        assert_eq!(redone.raw_transcript, "champion-bt1");
+        let hypothesis_count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM segment_hypotheses
+                  WHERE segment_id='bt1' AND model_id='history-champion'
+                    AND transcript='champion-bt1' AND model_version_id='history-champion'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hypothesis_count, 1);
+        let redo_revision: i64 = db
+            .connection()
+            .query_row("SELECT review_revision FROM speech_segments WHERE id='bt1'", [], |row| row.get(0))
+            .unwrap();
+        assert!(redo_revision > undo_revision);
     }
 
     #[test]
@@ -851,15 +1163,9 @@ mod tests {
         for id in ["batch-a", "batch-b"] {
             db.insert_segment(&make_segment(id, &format!("old-{id}"))).unwrap();
         }
-        let ids = vec!["batch-a".to_string(), "batch-b".to_string()];
-        let previous = db.get_segments_by_ids(&ids).unwrap();
-        for id in &ids {
-            let mut updated = db.get_segment_by_id(id).unwrap().unwrap();
-            updated.raw_transcript = format!("new-{id}");
-            db.insert_segment(&updated).unwrap();
-        }
-        let current = db.get_segments_by_ids(&ids).unwrap();
-        history.push(Command::BatchTranscribe { previous_segments: previous, current_segments: current });
+        let operation_id = "30000000-0000-4000-8000-000000000104";
+        commit_champion_batch(&db, operation_id, &["batch-a", "batch-b"]);
+        assert!(history.record_batch_job(&db, operation_id).unwrap());
         db.connection()
             .execute_batch(
                 "CREATE TRIGGER fail_second_batch_history_restore
@@ -870,8 +1176,8 @@ mod tests {
             .unwrap();
 
         assert!(history.undo(&db).is_err());
-        assert_eq!(db.get_segment_by_id("batch-a").unwrap().unwrap().raw_transcript, "new-batch-a");
-        assert_eq!(db.get_segment_by_id("batch-b").unwrap().unwrap().raw_transcript, "new-batch-b");
+        assert_eq!(db.get_segment_by_id("batch-a").unwrap().unwrap().raw_transcript, "champion-batch-a");
+        assert_eq!(db.get_segment_by_id("batch-b").unwrap().unwrap().raw_transcript, "champion-batch-b");
         assert!(history.can_undo());
 
         db.connection().execute_batch("DROP TRIGGER fail_second_batch_history_restore;").unwrap();

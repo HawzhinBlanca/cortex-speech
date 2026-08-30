@@ -1,108 +1,38 @@
 <script lang="ts">
   import type { AgentImportReport, AgentStageEvent } from './commands';
-  import { t, type TranslationKey } from './i18n';
+  import { t } from './i18n';
+  import AgentReportDecisionEvidence from './AgentReportDecisionEvidence.svelte';
+  import AgentReportEvidence from './AgentReportEvidence.svelte';
+  import {
+    agentCheckLabel,
+    agentStageTone,
+    agentStatusLabel,
+    compactAgentReportModels,
+    formatAgentReportDate,
+    formatAgentReportPercent,
+    publicAgentReportIdentifier,
+    topAgentReportCounts,
+  } from './agentReportPresentation';
 
   let {
     report,
     stageEvents = [],
   }: { report: AgentImportReport | null; stageEvents?: AgentStageEvent[] } = $props();
 
-  function countFor(key: string): number {
-    return report?.summary.verdictCounts[key] ?? 0;
-  }
-
-  function fmtDate(value: string): string {
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) return value;
-    return date.toLocaleString();
-  }
-
-  function pct(ready: number, total: number): string {
-    if (total <= 0) return '0%';
-    return `${Math.round((ready / total) * 100)}%`;
-  }
-
-  function compactModels(models: string[]): string {
-    if (!models.length) return $t('agentReport.none');
-    return models.slice(0, 3).join(', ') + (models.length > 3 ? ` +${models.length - 3}` : '');
-  }
-
-  function shortPath(value: string): string {
-    const parts = value.split(/[\\/]/).filter(Boolean);
-    return parts.length ? parts[parts.length - 1] : value;
-  }
-
-  function sourceReferenceIdentity(
-    reference: NonNullable<AgentImportReport>['summary']['sourceReferences'][number],
-  ): string {
-    const hash = reference.audioContentHash ? reference.audioContentHash.slice(0, 12) : '';
-    const size =
-      typeof reference.audioSizeBytes === 'number' && Number.isFinite(reference.audioSizeBytes)
-        ? $t('agentReport.byteCount', { count: String(reference.audioSizeBytes) })
-        : '';
-    return [hash ? $t('agentReport.hashValue', { hash }) : '', size].filter(Boolean).join(' | ');
-  }
-
-  function topCounts(
+  const countFor = (key: string): number => report?.summary.verdictCounts[key] ?? 0;
+  const fmtDate = (value: string): string => formatAgentReportDate(value, $t);
+  const pct = (ready: number, total: number): string => formatAgentReportPercent(ready, total);
+  const compactModels = (models: string[], total: number): string =>
+    compactAgentReportModels(models, total, $t);
+  const publicIdentifier = (value: string): string => publicAgentReportIdentifier(value);
+  const topCounts = (
     counts: Record<string, number> | undefined,
     limit: number,
-  ): Array<[string, number]> {
-    return Object.entries(counts ?? {})
-      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-      .slice(0, limit);
-  }
+  ): Array<[string, number]> => topAgentReportCounts(counts, limit);
 
-  function coverageBlockers(): NonNullable<AgentImportReport>['summary']['hypothesisCoverageBlockers'] {
-    return report?.summary.hypothesisCoverageBlockers ?? [];
-  }
-
-  function sourceReferenceCoverage(): NonNullable<AgentImportReport>['summary']['sourceReferenceCoverage'] {
-    return report?.summary.sourceReferenceCoverage ?? [];
-  }
-
-  function longFileDossiers(): NonNullable<AgentImportReport>['summary']['longFileDossiers'] {
-    return report?.summary.longFileDossiers ?? [];
-  }
-
-  function orchestrationStages(): NonNullable<AgentImportReport>['summary']['orchestrationStages'] {
-    return report?.summary.orchestrationStages ?? [];
-  }
-
-  function recentStageEvents(): AgentStageEvent[] {
-    return stageEvents ?? [];
-  }
-
-  function stageTone(status: string): string {
-    // `not_required` is NEUTRAL, never emerald. An optional dependency the owner switched off is a
-    // valid configuration, but it is not proven coverage, and painting both the same green meant a
-    // reviewer could not tell them apart at a glance (deep audit 2026-08-05). Not amber either — this
-    // is not a degradation to fix, so it must not read as a warning.
-    if (status === 'not_required') return 'text-cortex-300 bg-cortex-800/40 border-cortex-700/40';
-    if (status === 'ready') return 'text-emerald-300 bg-emerald-950/30 border-emerald-800/40';
-    if (status === 'completed') return 'text-emerald-300 bg-emerald-950/30 border-emerald-800/40';
-    if (status === 'running') return 'text-amber-300 bg-amber-950/30 border-amber-800/40';
-    if (status === 'degraded') return 'text-amber-300 bg-amber-950/30 border-amber-800/40';
-    if (status === 'needs_review') return 'text-amber-300 bg-amber-950/30 border-amber-800/40';
-    if (status === 'blocked') return 'text-red-300 bg-red-950/30 border-red-800/40';
-    return 'text-cortex-300 bg-cortex-900/50 border-cortex-800/40';
-  }
-
-  const statusKeys: Readonly<Record<string, TranslationKey>> = {
-    not_required: 'agentReport.status.notRequired',
-    ready: 'agentReport.status.ready',
-    completed: 'agentReport.status.completed',
-    failed: 'agentReport.status.failed',
-    running: 'agentReport.status.running',
-    degraded: 'agentReport.status.degraded',
-    needs_review: 'agentReport.status.needsReview',
-    blocked: 'agentReport.status.blocked',
-    unprocessed: 'agentReport.status.unprocessed',
-  };
-
-  function statusLabel(status: string): string {
-    const key = statusKeys[status];
-    return key ? $t(key) : status;
-  }
+  const stageTone = (status: string): string => agentStageTone(status);
+  const statusLabel = (status: string): string => agentStatusLabel(status, $t);
+  const checkLabel = (id: string): string => agentCheckLabel(id, $t);
 </script>
 
 {#if report}
@@ -145,12 +75,14 @@
         <div class="text-[10px] text-cortex-400">{$t('agentReport.trainingReady')}</div>
       </div>
       <div class="bg-cortex-800/30 rounded-lg p-2">
-        <div class="text-lg font-bold text-cyan-300">{report.summary.sourceReferences.length}</div>
+        <div class="text-lg font-bold text-cyan-300" data-testid="agent-report-source-ref-count">
+          {report.summary.sourceReferenceCount}
+        </div>
         <div class="text-[10px] text-cortex-400">{$t('agentReport.sourceRefs')}</div>
       </div>
       <div class="bg-cortex-800/30 rounded-lg p-2">
-        <div class="text-lg font-bold text-amber-300">
-          {report.summary.escalatedSegments.length}
+        <div class="text-lg font-bold text-amber-300" data-testid="agent-report-escalated-count">
+          {report.summary.escalatedSegmentCount}
         </div>
         <div class="text-[10px] text-cortex-400">{$t('agentReport.reviewQueue')}</div>
       </div>
@@ -162,9 +94,16 @@
         <span
           dir="ltr"
           class="text-cortex-200 text-end truncate"
-          title={report.summary.sourceReferenceModels.join(', ')}
+          title={compactModels(
+            report.summary.sourceReferenceModels,
+            report.summary.sourceReferenceModelCount,
+          )}
+          data-testid="agent-report-source-reference-models"
         >
-          {compactModels(report.summary.sourceReferenceModels)}
+          {compactModels(
+            report.summary.sourceReferenceModels,
+            report.summary.sourceReferenceModelCount,
+          )}
         </span>
       </div>
       <div class="flex justify-between gap-2">
@@ -172,9 +111,16 @@
         <span
           dir="ltr"
           class="text-cortex-200 text-end truncate"
-          title={report.summary.requiredSourceReferenceModels.join(', ')}
+          title={compactModels(
+            report.summary.requiredSourceReferenceModels,
+            report.summary.requiredSourceReferenceModelCount,
+          )}
+          data-testid="agent-report-required-reference-models"
         >
-          {compactModels(report.summary.requiredSourceReferenceModels)}
+          {compactModels(
+            report.summary.requiredSourceReferenceModels,
+            report.summary.requiredSourceReferenceModelCount,
+          )}
         </span>
       </div>
       <div class="flex justify-between gap-2">
@@ -182,9 +128,13 @@
         <span
           dir="ltr"
           class="text-cortex-200 text-end truncate"
-          title={report.summary.hypothesisModels.join(', ')}
+          title={compactModels(
+            report.summary.hypothesisModels,
+            report.summary.hypothesisModelCount,
+          )}
+          data-testid="agent-report-hypothesis-models"
         >
-          {compactModels(report.summary.hypothesisModels)}
+          {compactModels(report.summary.hypothesisModels, report.summary.hypothesisModelCount)}
         </span>
       </div>
     </div>
@@ -212,9 +162,16 @@
             <span
               dir="ltr"
               class="text-cortex-200 text-end truncate"
-              title={report.summary.agenticReadiness.sourceReferenceModels.join(', ')}
+              title={compactModels(
+                report.summary.agenticReadiness.sourceReferenceModels,
+                report.summary.agenticReadiness.sourceReferenceModelCount,
+              )}
+              data-testid="agent-report-ready-reference-models"
             >
-              {compactModels(report.summary.agenticReadiness.sourceReferenceModels)}
+              {compactModels(
+                report.summary.agenticReadiness.sourceReferenceModels,
+                report.summary.agenticReadiness.sourceReferenceModelCount,
+              )}
             </span>
           </div>
           <div class="flex justify-between gap-2">
@@ -222,31 +179,37 @@
             <span
               dir="ltr"
               class="text-cortex-200 text-end truncate"
-              title={report.summary.agenticReadiness.availableHypothesisModels.join(', ')}
+              title={compactModels(
+                report.summary.agenticReadiness.availableHypothesisModels,
+                report.summary.agenticReadiness.availableHypothesisModelCount,
+              )}
+              data-testid="agent-report-ready-hypothesis-models"
             >
-              {compactModels(report.summary.agenticReadiness.availableHypothesisModels)}
+              {compactModels(
+                report.summary.agenticReadiness.availableHypothesisModels,
+                report.summary.agenticReadiness.availableHypothesisModelCount,
+              )}
             </span>
           </div>
           <div class="flex justify-between gap-2">
             <span>{$t('agentReport.requiredHypothesisCount')}</span>
             <span class="text-cortex-200 font-mono">
-              {report.summary.agenticReadiness.availableHypothesisModels.length}/{report.summary
+              {report.summary.agenticReadiness.availableHypothesisModelCount}/{report.summary
                 .agenticReadiness.requiredHypothesisModels}
             </span>
           </div>
         </div>
         <div class="space-y-1">
           {#each report.summary.agenticReadiness.checks.slice(0, 4) as check}
-            <div class="space-y-0.5 text-[10px]" title={check.detail}>
+            <div class="space-y-0.5 text-[10px]" title={statusLabel(check.status)}>
               <div class="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
-                <span class="text-cortex-300 truncate">{check.label}</span>
+                <span class="text-cortex-300 truncate">{checkLabel(check.code)}</span>
                 <span
                   class={`font-mono border rounded px-1 py-0.5 shrink-0 ${stageTone(check.status)}`}
                 >
                   {statusLabel(check.status)}
                 </span>
               </div>
-              <div class="text-cortex-500 truncate">{check.detail}</div>
             </div>
           {/each}
         </div>
@@ -263,7 +226,7 @@
         </div>
         {#each topCounts(report.summary.hypothesisModelCounts, 4) as [model, count]}
           <div class="flex justify-between gap-2 text-[10px]">
-            <span class="text-cortex-300 font-mono truncate">{model}</span>
+            <span class="text-cortex-300 font-mono truncate">{publicIdentifier(model)}</span>
             <span class="text-cortex-200 shrink-0">
               {count}/{report.summary.totalSegments}
             </span>
@@ -272,153 +235,9 @@
       </div>
     {/if}
 
-    {#if sourceReferenceCoverage().length}
-      <div
-        class="rounded bg-cortex-900/40 border border-cortex-800/40 p-2 space-y-1"
-        data-testid="agent-report-source-reference-coverage"
-      >
-        <div class="text-[10px] text-cortex-500 uppercase tracking-wider">
-          {$t('agentReport.referenceCoverage')}
-        </div>
-        {#each sourceReferenceCoverage().slice(0, 4) as coverage}
-          <div
-            class="grid grid-cols-[minmax(0,1fr)_auto] gap-2 text-[10px]"
-            title={coverage.audioPath}
-          >
-            <bdi class="text-cortex-300 truncate" dir="auto">{shortPath(coverage.audioPath)}</bdi>
-            <span
-              class={`font-mono border rounded px-1 py-0.5 shrink-0 ${
-                coverage.complete
-                  ? 'text-emerald-300 bg-emerald-950/30 border-emerald-800/40'
-                  : 'text-red-300 bg-red-950/30 border-red-800/40'
-              }`}
-              title={coverage.missingModels.join(', ')}
-            >
-              {coverage.presentModels.length}/{coverage.requiredModels.length ||
-                coverage.presentModels.length}
-              {#if !coverage.complete}
-                {$t('agentReport.missing')}
-              {/if}
-            </span>
-          </div>
-        {/each}
-        {#if sourceReferenceCoverage().length > 4}
-          <div class="text-[10px] text-cortex-500 text-end">
-            {$t('agentReport.more', { count: String(sourceReferenceCoverage().length - 4) })}
-          </div>
-        {/if}
-      </div>
-    {/if}
+    <AgentReportEvidence {report} {stageEvents} />
 
-    {#if longFileDossiers().length}
-      <div
-        class="rounded bg-cortex-900/40 border border-cortex-800/40 p-2 space-y-1"
-        data-testid="agent-report-long-file-dossiers"
-      >
-        <div class="text-[10px] text-cortex-500 uppercase tracking-wider">
-          {$t('agentReport.longFileDossiers')}
-        </div>
-        {#each longFileDossiers().slice(0, 3) as dossier}
-          <div class="space-y-1 text-[10px]" title={dossier.audioPath}>
-            <div class="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
-              <bdi class="text-cortex-300 truncate" dir="auto">{shortPath(dossier.audioPath)}</bdi>
-              <span
-                class={`font-mono border rounded px-1 py-0.5 shrink-0 ${stageTone(dossier.promotionStatus)}`}
-              >
-                {statusLabel(dossier.promotionStatus)}
-              </span>
-            </div>
-            <div class="flex justify-between gap-2 text-cortex-500">
-              <span>
-                {dossier.chunkCount}
-                {$t('agentReport.chunks')} - {dossier.trainingReadySegments}
-                {$t('agentReport.readyShort')}
-              </span>
-              <bdi
-                class="truncate text-end"
-                dir="auto"
-                title={dossier.promotionBlockers.join(', ')}
-              >
-                {#if dossier.promotionBlockers.length}
-                  {dossier.promotionBlockers.slice(0, 2).join(', ')}
-                {:else}
-                  {$t('agentReport.noBlockers')}
-                {/if}
-              </bdi>
-            </div>
-          </div>
-        {/each}
-        {#if longFileDossiers().length > 3}
-          <div class="text-[10px] text-cortex-500 text-end">
-            {$t('agentReport.more', { count: String(longFileDossiers().length - 3) })}
-          </div>
-        {/if}
-      </div>
-    {/if}
-
-    {#if recentStageEvents().length}
-      <div
-        class="rounded bg-cortex-900/40 border border-cortex-800/40 p-2 space-y-1"
-        data-testid="agent-report-persisted-stage-events"
-      >
-        <div class="text-[10px] text-cortex-500 uppercase tracking-wider">
-          {$t('agentReport.persistedStages')}
-        </div>
-        {#each recentStageEvents().slice(-6) as event}
-          <div class="space-y-0.5 text-[10px]" title={`${event.file}: ${event.detail}`}>
-            <div class="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
-              <bdi class="text-cortex-300 truncate" dir="auto">{event.stage}</bdi>
-              <span
-                class={`font-mono border rounded px-1 py-0.5 shrink-0 ${stageTone(event.status)}`}
-              >
-                {statusLabel(event.status)}
-                {#if event.total}
-                  {event.current}/{event.total}
-                {/if}
-              </span>
-            </div>
-            <div class="text-cortex-500 truncate">{event.detail}</div>
-          </div>
-        {/each}
-      </div>
-    {/if}
-
-    {#if report.summary.sourceReferences.length}
-      <div
-        class="rounded bg-cortex-900/40 border border-cortex-800/40 p-2 space-y-1"
-        data-testid="agent-report-source-files"
-      >
-        <div class="text-[10px] text-cortex-500 uppercase tracking-wider">
-          {$t('agentReport.sourceFiles')}
-        </div>
-        {#each report.summary.sourceReferences.slice(0, 3) as reference}
-          <div
-            class="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-[10px]"
-            title={`${reference.audioPath} | ${reference.transcriptPath} | ${sourceReferenceIdentity(reference)}`}
-          >
-            <bdi class="text-cyan-300 font-mono shrink-0 row-span-2" dir="ltr"
-              >{reference.modelId}</bdi
-            >
-            <bdi class="text-cortex-300 text-end truncate min-w-0" dir="auto">
-              {shortPath(reference.transcriptPath)} - {reference.textChars}
-              {$t('agentReport.chars')}
-            </bdi>
-            {#if sourceReferenceIdentity(reference)}
-              <bdi class="text-cortex-500 text-end truncate min-w-0" dir="ltr">
-                {sourceReferenceIdentity(reference)}
-              </bdi>
-            {/if}
-          </div>
-        {/each}
-        {#if report.summary.sourceReferences.length > 3}
-          <div class="text-[10px] text-cortex-500 text-end">
-            {$t('agentReport.more', { count: String(report.summary.sourceReferences.length - 3) })}
-          </div>
-        {/if}
-      </div>
-    {/if}
-
-    {#if report.summary.escalatedSegments.length}
+    {#if report.summary.escalatedSegmentCount}
       <div
         class="rounded bg-amber-950/20 border border-amber-900/30 p-2 space-y-1"
         data-testid="agent-report-escalated-ids"
@@ -427,81 +246,19 @@
           {$t('agentReport.escalatedIds')}
         </div>
         <div class="text-[10px] text-cortex-300 font-mono break-all">
-          {report.summary.escalatedSegments.slice(0, 6).join(', ')}
-          {#if report.summary.escalatedSegments.length > 6}
-            {$t('agentReport.more', { count: String(report.summary.escalatedSegments.length - 6) })}
+          {report.summary.escalatedSegments
+            .slice(0, 6)
+            .map(publicIdentifier)
+            .filter(Boolean)
+            .join(', ')}
+          {#if report.summary.escalatedSegmentCount > 6}
+            {$t('agentReport.more', { count: String(report.summary.escalatedSegmentCount - 6) })}
           {/if}
         </div>
       </div>
     {/if}
 
-    {#if orchestrationStages().length}
-      <div
-        class="rounded bg-cortex-900/40 border border-cortex-800/40 p-2 space-y-1"
-        data-testid="agent-report-orchestration-stages"
-      >
-        <div class="text-[10px] text-cortex-500 uppercase tracking-wider">
-          {$t('agentReport.orchestrationStages')}
-        </div>
-        {#each orchestrationStages().slice(0, 5) as stage}
-          <div class="grid grid-cols-[minmax(0,1fr)_auto] gap-2 text-[10px]" title={stage.summary}>
-            <bdi class="text-cortex-300 truncate" dir="auto">{stage.stage}</bdi>
-            <span
-              class={`font-mono border rounded px-1 py-0.5 shrink-0 ${stageTone(stage.status)}`}
-            >
-              {statusLabel(stage.status)}
-              {#if stage.blockerCount}
-                - {stage.blockerCount}
-              {/if}
-            </span>
-          </div>
-        {/each}
-      </div>
-    {/if}
-
-    {#if coverageBlockers().length}
-      <div
-        class="rounded bg-amber-950/20 border border-amber-900/30 p-2 space-y-1"
-        data-testid="agent-report-coverage-blockers"
-      >
-        <div class="flex justify-between gap-2 text-[10px] text-amber-300 uppercase tracking-wider">
-          <span>{$t('agentReport.coverageBlockers')}</span>
-          <span class="font-mono">{coverageBlockers().length}</span>
-        </div>
-        {#each coverageBlockers().slice(0, 4) as blocker}
-          <div class="flex justify-between gap-2 text-[10px]">
-            <span class="text-cortex-300 font-mono truncate" title={blocker.segmentId}
-              >{blocker.segmentId}</span
-            >
-            <span class="text-cortex-200 shrink-0">
-              {blocker.coverage.nonEmptyModelCount}/{blocker.coverage.minimumNonEmptyModelCount}
-            </span>
-          </div>
-        {/each}
-        {#if coverageBlockers().length > 4}
-          <div class="text-[10px] text-cortex-500 text-end">
-            {$t('agentReport.more', { count: String(coverageBlockers().length - 4) })}
-          </div>
-        {/if}
-      </div>
-    {/if}
-
-    {#if topCounts(report.summary.trainingGradeReasonCounts, 4).length}
-      <div
-        class="rounded bg-cortex-900/40 border border-cortex-800/40 p-2 space-y-1"
-        data-testid="agent-report-grade-reasons"
-      >
-        <div class="text-[10px] text-cortex-500 uppercase tracking-wider">
-          {$t('agentReport.gradeReasons')}
-        </div>
-        {#each topCounts(report.summary.trainingGradeReasonCounts, 4) as [reason, count]}
-          <div class="flex justify-between gap-2 text-[10px]">
-            <bdi class="text-cortex-300 truncate" dir="auto" title={reason}>{reason}</bdi>
-            <span class="text-cortex-200 font-mono shrink-0">{count}</span>
-          </div>
-        {/each}
-      </div>
-    {/if}
+    <AgentReportDecisionEvidence {report} />
 
     <div class="grid grid-cols-4 gap-1 text-center">
       <div class="rounded bg-cortex-900/50 border border-cortex-800/30 px-1.5 py-2">
@@ -522,9 +279,9 @@
       </div>
     </div>
 
-    {#if report.error}
+    {#if report.errorCode}
       <div class="text-[10px] text-red-300 bg-red-950/30 border border-red-900/40 rounded p-2">
-        <span dir="auto">{report.error}</span>
+        <span dir="auto">{$t('agentReport.runFailedDetail')}</span>
       </div>
     {/if}
   </section>

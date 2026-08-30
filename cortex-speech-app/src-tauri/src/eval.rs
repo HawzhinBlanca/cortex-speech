@@ -286,7 +286,7 @@ pub fn import_verified_segments_as_gold(db: &Database) -> AppResult<usize> {
 }
 
 /// Summary of an `export_gold_eval_set` run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct GoldEvalExport {
     pub manifest_path: String,
@@ -543,7 +543,7 @@ fn export_gold_eval_set_inner(db: &Database, out_dir: &std::path::Path) -> AppRe
 }
 
 /// Summary of an `export_finetune_pack` run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct FinetunePackResult {
     pub manifest_path: String,

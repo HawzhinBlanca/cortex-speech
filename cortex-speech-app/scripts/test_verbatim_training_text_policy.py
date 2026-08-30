@@ -13,12 +13,15 @@ retrieval) — they just cannot masquerade as the transcript.
 
 Static source checks, sandbox-safe:
   1. quality.rs::training_transcript_with_source — no normalized fallback, no machine-verdict rung.
-  2. corrections.rs::loop0_draft_text (aligner/LOOP-0 text) — annotated ▸ raw only.
-  3. segmentQuality.ts::effectiveTranscript — the frontend mirror, same order.
-  4. ReviewMode.svelte::originalText — the reviewer-facing draft, annotated ▸ raw only.
-  5. Flat/Hugging Face/fine-tune primary labels preserve exact stored codepoints; normalization may
-     still serve as an explicitly derived field or variant-aware dedup key.
-  6. No `normalizedTranscript ??` fallback anywhere in a .svelte file — the tell-tale shape of
+  2. quality.rs::effective_transcript — public product/export projection stays on that same law.
+  3. corrections.rs::loop0_draft_text (aligner/LOOP-0 text) — annotated ▸ raw only.
+  4. transcribe.rs response/alignment projections — annotated ▸ champion raw only.
+  5. reviewTranscriptAuthority.ts::reviewTranscript — the shared frontend authority.
+  6. segmentQuality.ts::effectiveTranscript — the frontend mirror, same order.
+  7. ReviewMode.svelte::originalText — the reviewer-facing draft delegates to that authority.
+  8. jury/learning.rs::export_lm_corpus — primary LM labels are emitted byte-exact, not normalized.
+  9. segmentQuality.ts::hasRealTranscript — normalized-only evidence cannot mint shippable content.
+ 10. No `normalizedTranscript ??` fallback anywhere in a .svelte file — the tell-tale shape of
      machine-processed text outranking the verbatim draft in a display/align chain.
 """
 
@@ -60,15 +63,45 @@ def main() -> int:
             ["normalized_transcript", "jury_verdict"],
         ),
         (
+            APP / "src-tauri" / "src" / "quality.rs",
+            r"pub fn effective_transcript",
+            "effective_transcript",
+            ["normalized_transcript"],
+        ),
+        (
             APP / "src-tauri" / "src" / "corrections.rs",
             r"pub fn loop0_draft_text",
             "loop0_draft_text",
             ["normalized"],
         ),
         (
+            APP / "src-tauri" / "src" / "commands" / "transcribe.rs",
+            r"fn machine_review_text",
+            "machine_review_text",
+            ["normalized_transcript"],
+        ),
+        (
+            APP / "src-tauri" / "src" / "commands" / "transcribe.rs",
+            r"fn prospective_champion_review_text",
+            "prospective_champion_review_text",
+            ["normalized_transcript"],
+        ),
+        (
+            APP / "src" / "lib" / "reviewTranscriptAuthority.ts",
+            r"export function reviewTranscript",
+            "reviewTranscript",
+            ["normalizedTranscript"],
+        ),
+        (
             APP / "src" / "lib" / "segmentQuality.ts",
             r"export function effectiveTranscript",
             "effectiveTranscript",
+            ["normalizedTranscript"],
+        ),
+        (
+            APP / "src" / "lib" / "segmentQuality.ts",
+            r"export function hasRealTranscript",
+            "hasRealTranscript",
             ["normalizedTranscript"],
         ),
         (
@@ -84,6 +117,23 @@ def main() -> int:
             if term in body:
                 failures.append(f"{path.name}::{name} references {term} — machine text must never be the transcript")
 
+    learning_path = APP / "src-tauri" / "src" / "jury" / "learning.rs"
+    learning_source = learning_path.read_text(encoding="utf-8")
+    lm_body = fn_body(learning_path, r"pub fn export_lm_corpus", "export_lm_corpus")
+    for term in ("SoraniNormalizer", "canonical_training_text", "normalizer.normalize", "to_nfc("):
+        if term in lm_body:
+            failures.append(
+                f"learning.rs::export_lm_corpus references {term} — a primary LM label must remain byte-exact"
+            )
+    if not re.search(
+        r"DpoPair\s*\{[^}]*chosen:\s*row\.human_fix\s*,\s*rejected:\s*row\.wrong_transcript",
+        learning_source,
+        re.DOTALL,
+    ):
+        failures.append(
+            "learning.rs DPO emission no longer serializes the stored human/machine pair directly — verify no trim/canonicalization"
+        )
+
     export_source = (APP / "src-tauri" / "src" / "export.rs").read_text(encoding="utf-8")
     export_tests = (APP / "src-tauri" / "src" / "export_tests.rs").read_text(encoding="utf-8")
     eval_source = (APP / "src-tauri" / "src" / "eval.rs").read_text(encoding="utf-8")
@@ -97,6 +147,36 @@ def main() -> int:
         failures.append("all primary export formats need an exact-codepoint Verbatim-Law regression")
     if "finetune_pack_preserves_the_selected_verbatim_label_and_dedups_variants" not in eval_source:
         failures.append("fine-tune export needs exact-label plus variant-dedup regression evidence")
+
+    # The old normalized-only setter had zero production callers but remained a compiled public
+    # mutation path. It may stay as a storage fixture only while cfg(test) removes it from production.
+    segments_source = (APP / "src-tauri" / "src" / "db" / "segments.rs").read_text(encoding="utf-8")
+    if "fn update_normalized_transcript" in segments_source and not re.search(
+        r"#\[cfg\(test\)\]\s*pub\(crate\)\s+fn update_normalized_transcript",
+        segments_source,
+    ):
+        failures.append(
+            "db/segments.rs::update_normalized_transcript is compiled outside cfg(test) — normalized-only truth mutation is forbidden"
+        )
+
+    jobs_source = (APP / "src-tauri" / "src" / "db" / "jobs_rights.rs").read_text(encoding="utf-8")
+    if "fn update_segment_consensus_batch" in jobs_source and not re.search(
+        r"#\[cfg\(test\)\]\s*pub\s+fn update_segment_consensus_batch",
+        jobs_source,
+    ):
+        failures.append(
+            "db/jobs_rights.rs::update_segment_consensus_batch is compiled outside cfg(test) — machine consensus cannot replace champion raw"
+        )
+
+    # `stats.rs` keeps an O(1) SQL mirror instead of calling the Rust helper row-by-row. Pin the
+    # mirror itself so dashboard counts cannot drift back to machine-refined text while unit tests
+    # happen to exercise only rows whose raw and normalized values match.
+    stats_source = (APP / "src-tauri" / "src" / "stats.rs").read_text(encoding="utf-8")
+    effective_sql = re.search(r'const EFFECTIVE: &str = "(.*?)";', stats_source, re.DOTALL)
+    if effective_sql is None:
+        failures.append("stats.rs::EFFECTIVE SQL mirror not found — renamed? update this policy test")
+    elif "normalized_transcript" in effective_sql.group(1):
+        failures.append("stats.rs::EFFECTIVE references normalized_transcript — dashboard authority violates Verbatim Law")
 
     # The tell-tale fallback shape in any display/align chain. `?? ''` is exempt: that is a plain
     # null-to-empty render of the normalized COLUMN itself (a labeled field), not machine text
@@ -113,7 +193,7 @@ def main() -> int:
             print(f"FAIL: {f}")
         print(f"VERBATIM-TRAINING-TEXT: {len(failures)} violation(s)")
         return 1
-    print("VERBATIM-TRAINING-TEXT: primary labels preserve human verdict > annotation > champion raw")
+    print("VERBATIM-TRAINING-TEXT: transcript precedence is human verdict > annotation > champion raw everywhere")
     return 0
 
 

@@ -179,7 +179,11 @@ def test_removed_mms_and_single_file_ipc_cannot_be_reintroduced() -> None:
     backend = command_surface(APP / "src-tauri" / "src")
     lib = (APP / "src-tauri" / "src" / "lib.rs").read_text(encoding="utf-8")
     frontend = (APP / "src" / "lib" / "commands.ts").read_text(encoding="utf-8")
-    stats = (APP / "src" / "lib" / "StatsDashboard.svelte").read_text(encoding="utf-8")
+    stats_root = APP / "src" / "lib"
+    stats = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(stats_root.glob("Stats*.svelte"))
+    )
     registry = (APP / "src" / "lib" / "ModelRegistry.svelte").read_text(encoding="utf-8").lower()
 
     for source in (backend, lib, frontend, stats):

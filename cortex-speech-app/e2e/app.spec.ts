@@ -27,6 +27,7 @@ test.describe('App smoke tests', () => {
 
   test('keyboard shortcuts modal opens with ? key', async ({ page }) => {
     await page.goto('/');
+    await expect(page.getByLabel('Keyboard Shortcuts')).toBeVisible();
 
     await page.keyboard.press('?');
     const modal = page.getByTestId('shortcuts-modal');

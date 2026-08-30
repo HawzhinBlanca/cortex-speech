@@ -49,10 +49,31 @@ def main() -> None:
     settings = read("src-tauri/src/settings.rs")
     migrations = read("src-tauri/src/migrations/mod.rs")
     lib_rs = read("src-tauri/src/lib.rs")
+    ipc_contract = read("src-tauri/src/ipc_contract.rs")
     commands_ts = read("src/lib/commands.ts")
-    app = read("src/Workstation.svelte")
+    generated_ipc = read("src/lib/generated/ipc.ts")
+    app_owner = read("src/Workstation.svelte")
+    app = "\n".join(
+        [
+            app_owner,
+            read("src/lib/workstationDataController.svelte.ts"),
+            read("src/lib/workstationExportActions.ts"),
+            read("src/lib/WorkstationStatsPanel.svelte"),
+        ]
+    )
+    assert "createWorkstationDataController" in app_owner
+    assert "<WorkstationStatsPanel" in app_owner
+    import_coordinator = read("src/lib/importOperationCoordinator.ts")
     status_bar = read("src/lib/StatusBar.svelte")
     agent_report_panel = read("src/lib/AgentReportPanel.svelte")
+    agent_report_surface = "\n".join(
+        [
+            agent_report_panel,
+            read("src/lib/AgentReportEvidence.svelte"),
+            read("src/lib/AgentReportDecisionEvidence.svelte"),
+            read("src/lib/agentReportPresentation.ts"),
+        ]
+    )
     settings_store = read("src/lib/stores/settingsStore.ts")
     events = read("src/lib/events.ts")
     ui_store = read("src/lib/stores/uiStore.ts")
@@ -133,23 +154,49 @@ def main() -> None:
     assert "refusing to continue with incomplete source-reference evidence" in pipeline, (
         "partial source-reference failures must be explicit before chunking"
     )
+    for needle in (
+        "create_private_source_reference_snapshot",
+        "generate_bound_source_reference_artifact",
+        "verify_private_source_reference_snapshot",
+        "let cleanup = snapshot.cleanup();",
+    ):
+        assert needle in pipeline, f"source-reference generation must retain immutable snapshot authority: {needle}"
+    assert "generate_whole_file_reference_transcript(path, &model" not in pipeline, (
+        "source-reference generation must never upload the mutable owner path"
+    )
+    snapshot_scope = pipeline.split("fn generate_bound_source_reference_artifact", 1)[1].split(
+        "impl ProcessingPipeline", 1
+    )[0]
+    assert snapshot_scope.index("cleanup?;") < snapshot_scope.index("let artifact = persist(&transcript)"), (
+        "private snapshot cleanup must succeed before any durable transcript artifact can be written"
+    )
+    assert "generate_whole_file_reference_text_from_input" in agentic
+    assert "persist_whole_file_reference_transcript" in agentic
+    assert "private_source_reference_input_is_redacted_from_external_errors" in agentic
     assert "Skipping whole-file reference transcript" not in pipeline, (
         "enabled source-reference mode must not silently fall back when the API key is missing"
     )
     assert "Whole-file reference transcript skipped" not in pipeline, (
         "configured source-reference failures must not be logged and ignored"
     )
+    compact_pipeline = " ".join(pipeline.split())
     assert "run_primary_wsl_pass_for_import" in pipeline, "WSL 7B imports must attempt the primary ASR pass before jury"
     champion_import_call = "self.run_primary_wsl_pass_for_import(&mut prepared, cancel)?"
     assert pipeline.count(champion_import_call) == 2, (
         "streaming and non-streaming imports must finish the WSL 7B primary pass in memory before publication"
     )
-    champion_publish_call = (
-        "import_writes.publish_champion_segments(&prepared, deployment_sha256, Some(&identity))?"
-    )
+    champion_publish_call = "import_writes.publish_champion_segments("
     assert pipeline.count(champion_publish_call) == 2, (
         "streaming and non-streaming imports must atomically publish only fully champion-drafted segments"
     )
+    for provenance_binding in ("source_provenance.as_ref(),", "source_provenance,"):
+        expected_publish = (
+            "import_writes.publish_champion_segments( &prepared, deployment_sha256, Some(&identity), "
+            f"{provenance_binding} )?"
+        )
+        assert expected_publish in compact_pipeline, (
+            "each champion publication path must atomically bind its exact source provenance"
+        )
     assert pipeline.index(champion_import_call) < pipeline.index(champion_publish_call), (
         "champion inference must precede the first canonical file publication"
     )
@@ -227,50 +274,53 @@ def main() -> None:
     assert "resume_authority_rejects_placeholder_wrong_model_cloud_and_blank_drafts" in pipeline, (
         "placeholder, wrong-model, cloud, and blank drafts need an adversarial resume-authority regression"
     )
-    assert pipeline.count("committed_by_pipeline: commit_champion") == 1, (
-        "the champion result must report the exact conditional commit owner"
+    assert "enum TranscriptionPersistence" not in pipeline and "committed_by_pipeline" not in pipeline, (
+        "inference is structurally draft-only; a dead write-capable mode/flag would recreate two commit owners"
     )
-    compact_pipeline = " ".join(pipeline.split())
-    bound_commit_call = (
-        "self.transcribe_with_champion_commit( Some(&source.snapshot.segment.id), "
-        "&source.snapshot.segment.audio_path, source.snapshot.segment.alignment_json.as_deref(), "
-        "cancel, true, Some(&source.snapshot), )"
+    assert "fn transcribe_draft_only(" in pipeline and "fn transcribe_import_draft_only(" in pipeline, (
+        "single, batch, and import inference must share an explicitly side-effect-free primitive"
     )
-    assert bound_commit_call in compact_pipeline, (
-        "normal re-transcription must commit only through the immutable id/path/span/content source snapshot"
+    bound_draft_call = (
+        "self.transcribe_draft_only( Some(&source.snapshot.segment.id), "
+        "&source.snapshot.segment.audio_path, source.snapshot.segment.alignment_json.as_deref(), cancel, )"
+    )
+    assert bound_draft_call in compact_pipeline, (
+        "normal re-transcription must infer only from its immutable id/path/span/content source snapshot"
     )
     import_draft_call = (
-        "self.transcribe_with_champion_commit( Some(segment_id), audio_path, alignment_json, cancel, false, None, )"
+        "self.transcribe_import_draft_only(segment_id, audio_path, alignment_json, cancel)"
     )
     assert import_draft_call in compact_pipeline, (
-        "import drafting must explicitly disable per-segment publication and carry no false source authority"
-    )
-    assert "if commit_champion && expected_source.is_none()" in pipeline, (
-        "the shared transcription primitive must reject every commit that lacks immutable source authority"
+        "import drafting must use the side-effect-free import intent, never a boolean write switch"
     )
     assert "E_TRANSCRIPTION_SOURCE_UNBOUND" in pipeline, (
-        "an unbound transcription commit needs a stable fail-closed error"
+        "an existing-segment request still needs a stable fail-closed source-binding error"
     )
-    assert ".commit_bound_champion_transcript_if_unreviewed(" in pipeline, (
-        "the immediate champion writer must revalidate the bound source snapshot inside its transaction"
-    )
-    assert "expected_source.ok_or_else" in pipeline, (
-        "the final commit call must not synthesize or omit source authority"
+    for forbidden in (
+        "transcribe_with_champion_commit",
+        ".commit_bound_champion_transcript_if_unreviewed(",
+        "populate_hypotheses_reusing_primary(&db, id",
+    ):
+        assert forbidden not in pipeline, (
+            f"draft-only inference regained a pre-publication write capability: {forbidden}"
+        )
+    assert ".commit_bound_champion_transcript_with_history(" in commands, (
+        "single transcription must publish once through the atomic source/revision/history boundary"
     )
     assert "pipeline.bind_existing_transcription_source_cached(" in commands, (
         "batch transcription must bind each segment to the current database/audio snapshot before inference"
     )
-    assert "pipeline.transcribe_bound(&source, Some(cancel.as_atomic()))" in commands, (
-        "batch transcription must pass only the bound source into the committing pipeline path"
+    assert "pipeline.transcribe_bound_draft_only(&bound_source, Some(cancel.as_atomic()))" in commands, (
+        "batch transcription must infer only a side-effect-free draft from the bound source"
     )
     assert ".bind_existing_transcription_source(id, Some(&audio_path), alignment_json.as_deref())" in commands, (
         "single transcription must refuse caller id/path substitution by binding server source truth"
     )
-    assert "pipeline.transcribe_bound(&source, None)" in commands, (
-        "single transcription must use the same bound commit path as batch transcription"
+    assert "pipeline.transcribe_bound_draft_only(&source, None)" in commands, (
+        "single transcription must infer side-effect-free before its atomic commit"
     )
-    assert "Ok(draft) if draft.committed_by_pipeline =>" in commands, (
-        "batch_transcribe must not re-write a draft the pipeline already committed (one inference, one commit, one owner)"
+    assert "authority.commit_champion_draft(item.ordinal, &draft)" in commands, (
+        "the durable batch journal must be the sole commit owner after side-effect-free inference"
     )
     assert "run_wsl_segment_transcript_direct" in pipeline, (
         "the champion transport is the direct Rust->server protocol, not a per-segment WSL subprocess with a DB copy"
@@ -310,13 +360,29 @@ def main() -> None:
     assert "commands::check_agentic_readiness" in lib_rs, "Tauri handler must register agentic readiness preflight"
     assert "AgenticReadiness" in commands_ts, "frontend command API must type agentic readiness"
     assert "checkAgenticReadiness" in commands_ts, "frontend command API must expose agentic readiness"
-    assert "agenticReadiness?: AgenticReadiness | null" in commands_ts, (
-        "frontend agent report summary must type the persisted readiness snapshot"
+    assert "export type AgenticReadiness = AgenticReadinessV1" in commands_ts, (
+        "frontend agent readiness must use the generated renderer-safe contract"
     )
-    assert "warnAgenticReadinessBeforeImport" in app, "file and directory imports must run the agentic readiness preflight"
-    assert "api.checkAgenticReadiness()" in app, "import preflight must call the backend readiness command"
-    assert "agenticReadiness.blocked" in app, "blocked readiness must be visible before import"
-    assert "agenticReadiness.degraded" in app, "degraded readiness must be visible before import"
+    open_file = import_coordinator.split("async function openFile()", 1)[1].split(
+        "async function importDirectory()", 1
+    )[0]
+    import_directory = import_coordinator.split("async function importDirectory()", 1)[1].split(
+        "async function resume(", 1
+    )[0]
+    for label, scope in [("file", open_file), ("directory", import_directory)]:
+        assert "await warnReadiness();" in scope, f"{label} import must run the readiness preflight"
+        assert scope.index("await warnReadiness();") < scope.index("beginProgress("), (
+            f"{label} import must finish readiness before it admits the authoritative run"
+        )
+    assert "api.checkAgenticReadiness()" in import_coordinator, (
+        "import preflight must call the backend readiness command"
+    )
+    assert "agenticReadiness.blocked" in import_coordinator, (
+        "blocked readiness must be visible before import"
+    )
+    assert "agenticReadiness.degraded" in import_coordinator, (
+        "degraded readiness must be visible before import"
+    )
     assert "Post-import jury adjudication failed after directory import" in pipeline, (
         "directory import must fail visibly when post-import jury adjudication fails"
     )
@@ -364,16 +430,36 @@ def main() -> None:
     assert "listAgentStageEvents" in commands_ts, "frontend command wrapper must expose stage event listing"
     assert "AgentImportReport" in commands_ts, "frontend must type agent import reports"
     assert "AgentStageEvent" in commands_ts, "frontend must type persisted agent stage events"
-    assert "agentRunId" in commands_ts, "frontend must type the report-to-stage run id"
+    assert "agentRunId" in generated_ipc, "generated IPC must type the report-to-stage run id"
+    for contract in ["AgentStageProgressV1", "AgentStageEventV1", "AgentImportReportV1", "AgenticReadinessV1"]:
+        assert contract in ipc_contract, f"renderer-safe agent IPC contract missing {contract}"
+    assert "pub audio_paths" not in ipc_contract.split("pub struct AgentImportReportV1", 1)[1].split("}", 1)[0]
+    assert "pub jury_report" not in ipc_contract.split("pub struct AgentImportReportV1", 1)[1].split("}", 1)[0]
+    assert "pub error: Option<String>" not in ipc_contract.split("pub struct AgentImportReportV1", 1)[1].split("}", 1)[0]
+    assert "generatedCommands.listAgentImportReports" in commands_ts
+    assert "generatedCommands.listAgentStageEvents" in commands_ts
+    assert "generatedCommands.checkAgenticReadiness" in commands_ts
     assert "AgentReportPanel" in app, "app must render the latest agent import report"
     assert "agentPipelineStages" in status_bar, "status bar must render live agent pipeline stages"
     assert "data-testid=\"agent-pipeline-timeline\"" in status_bar, "live agent timeline needs a stable UI hook"
-    assert "loadLatestAgentReport" in app, "app must refresh the latest agent import report"
-    assert "loadLatestAgentStageEvents" in app, "app must refresh persisted agent stage events"
-    assert "latestAgentReport?.agentRunId" in app, "app must load the stage log for the latest report run id"
-    assert "await loadLatestAgentReport()" in app, "import completion must refresh the latest agent report"
-    assert "await loadLatestAgentStageEvents()" in app, "import completion must refresh the persisted stage log"
-    assert "stageEvents={latestAgentStageEvents}" in app, "agent report panel must receive persisted stage events"
+    assert "async function loadLatestAgentHistory(" in app, (
+        "app must refresh the report and its persisted stage history through one generation guard"
+    )
+    assert "api.getAgentImportReportByRunId(expectedRunId)" in app, (
+        "completion refresh must bind the report lookup to the exact import run"
+    )
+    assert "candidate?.agentRunId !== expectedRunId" in app, (
+        "a mismatched latest report must never be presented as the completed run"
+    )
+    assert "api.listAgentStageEvents(runId, 25)" in app, (
+        "the stage log must be loaded from the accepted report run id"
+    )
+    assert import_coordinator.count("options.loadLatestAgentHistory(payload.runId, context)") >= 2, (
+        "import completion and enrichment must refresh exact-run report evidence"
+    )
+    assert "componentProps={{ report: latestAgentReport, stageEvents: latestAgentStageEvents }}" in app, (
+        "the lazy agent report panel must receive persisted stage events"
+    )
     assert "dataset_promotion" in app, "HF export UI must inspect the dataset promotion stage"
     assert "trainingExportBlocked" in app, "HF export UI must block when promotion readiness is blocked"
     assert "exportHuggingface.blocked" in app, "HF export block reason must be user-visible"
@@ -395,7 +481,7 @@ def main() -> None:
         "orchestrationStages",
         "verdictCounts",
         "escalatedSegments",
-        "transcriptPath",
+        "transcriptFileLabel",
         "audioContentHash",
         "audioSizeBytes",
         "agent-report-source-files",
@@ -409,7 +495,7 @@ def main() -> None:
         "agent-report-coverage-blockers",
         "agent-report-grade-reasons",
     ]:
-        assert needle in agent_report_panel, f"agent report panel must surface {needle}"
+        assert needle in agent_report_surface, f"agent report panel must surface {needle}"
     required_runs = [
         "pub struct AgentStageEvent",
         "record_agent_stage_event",

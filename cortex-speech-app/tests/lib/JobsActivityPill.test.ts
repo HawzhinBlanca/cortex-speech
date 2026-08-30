@@ -38,7 +38,10 @@ describe('JobsActivityPill', () => {
   });
 
   it('shows a running count while work is in progress', async () => {
-    invokeMock.mockResolvedValue([job({ id: 'a', state: 'running' }), job({ id: 'b', state: 'running' })]);
+    invokeMock.mockResolvedValue([
+      job({ id: 'a', state: 'running' }),
+      job({ id: 'b', state: 'running' }),
+    ]);
     render(JobsActivityPill);
     await waitFor(() => expect(screen.getByTestId('jobs-activity')).toBeInTheDocument());
     expect(screen.getByText('2 running')).toBeInTheDocument();
@@ -59,6 +62,19 @@ describe('JobsActivityPill', () => {
     expect(screen.getByTestId('jobs-activity')).toHaveAttribute('data-mode', 'interrupted');
   });
 
+  it('surfaces a startup-reconciled durable batch as interrupted', async () => {
+    invokeMock.mockResolvedValue([
+      job({
+        kind: 'batch_transcribe_v1',
+        state: 'failed',
+        errorCode: 'PROCESS_INTERRUPTED',
+      }),
+    ]);
+    render(JobsActivityPill);
+    await waitFor(() => expect(screen.getByText('A task was interrupted')).toBeInTheDocument());
+    expect(screen.getByTestId('jobs-activity')).toHaveAttribute('data-mode', 'interrupted');
+  });
+
   it('prioritizes running work over a past failure', async () => {
     // get_jobs is newest-first; a fresh running job outranks an older failed one.
     invokeMock.mockResolvedValue([
@@ -66,7 +82,9 @@ describe('JobsActivityPill', () => {
       job({ id: 'old', state: 'failed', errorCode: 'EXPORT_FAILED' }),
     ]);
     render(JobsActivityPill);
-    await waitFor(() => expect(screen.getByTestId('jobs-activity')).toHaveAttribute('data-mode', 'running'));
+    await waitFor(() =>
+      expect(screen.getByTestId('jobs-activity')).toHaveAttribute('data-mode', 'running'),
+    );
     expect(screen.getByText('1 running')).toBeInTheDocument();
   });
 
@@ -89,7 +107,9 @@ describe('JobsActivityPill', () => {
       job({ id: 'f', state: 'failed', errorCode: 'EXPORT_FAILED' }),
     ]);
     render(JobsActivityPill);
-    await waitFor(() => expect(screen.getByTestId('jobs-activity')).toHaveAttribute('data-mode', 'failed'));
+    await waitFor(() =>
+      expect(screen.getByTestId('jobs-activity')).toHaveAttribute('data-mode', 'failed'),
+    );
   });
 
   it('never throws to the UI when the jobs read fails', async () => {

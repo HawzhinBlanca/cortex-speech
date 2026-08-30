@@ -292,6 +292,11 @@ async fn restore_db_from_snapshot_inner(name: String, state: State<'_, AppState>
                     completed_selector, name
                 ));
             }
+            if !crate::recovery::completed_named_restore_matches_live(&data_dir, &pending)? {
+                return Err(format!(
+                    "restore '{completed_selector}' has a completion marker but the live SQLite generation does not match it; restart Cortex so fail-closed recovery can replay the exact target or verified original"
+                ));
+            }
             clear_review_pilot_restore_pending(&data_dir)?;
             restore_reservation.commit_named_restore()?;
             tracing::info!("completed pending restore-barrier cleanup for auto-snapshot {name}");
@@ -323,7 +328,7 @@ async fn restore_db_from_snapshot_inner(name: String, state: State<'_, AppState>
     let restored = install_snapshot_restore_plan(&restore_plan, &data_dir, &live_controls)?;
     *state.lock_settings() = restored.clone();
     state.update_pipeline_settings(restored);
-    mark_named_restore_completed(&data_dir, &name)?;
+    mark_named_restore_completed(&data_dir, &name, &restore_plan.expected_db_generation_sha256)?;
     clear_review_pilot_restore_pending(&data_dir)?;
     restore_reservation.commit_named_restore()?;
     drop(restore_reservation);

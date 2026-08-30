@@ -1,0 +1,61 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "mutate": [
+    "src/lib/audioMachine.ts",
+    "src/lib/reviewCommitOperation.ts",
+    "src/lib/reviewCommitResult.ts"
+  ],
+  "testFiles": [
+    "tests/lib/audioMachine.test.ts",
+    "src/lib/reviewCommitOperation.test.ts",
+    "src/lib/reviewCommitResult.test.ts"
+  ],
+  "testRunner": "vitest",
+  "plugins": ["@stryker-mutator/vitest-runner"],
+  "vitest": {
+    "configFile": "vitest.mutation.config.ts",
+    "related": false
+  },
+  "ignorePatterns": [
+    "/.policy-python/**",
+    "/artifacts/**",
+    "/coverage/**",
+    "/dist/**",
+    "/docs/**",
+    "/e2e/**",
+    "/logs/**",
+    "/manifests/**",
+    "/playwright-report/**",
+    "/scripts/**",
+    "/src-tauri/**",
+    "/test-results/**",
+    "/vendor/**"
+  ],
+  "coverageAnalysis": "perTest",
+  "reporters": ["clear-text", "json", "event-recorder"],
+  "jsonReporter": {
+    "fileName": "reports/owner-mutation/frontend/stryker-report.json"
+  },
+  "eventReporter": {
+    "baseDir": "reports/owner-mutation/frontend/events"
+  },
+  "thresholds": {
+    "high": 100,
+    "low": 80,
+    "break": 80
+  },
+  "allowEmpty": false,
+  "incremental": false,
+  "ignoreStatic": false,
+  "disableBail": false,
+  "concurrency": 1,
+  "maxTestRunnerReuse": 0,
+  "timeoutMS": 30000,
+  "timeoutFactor": 2.0,
+  "dryRunTimeoutMinutes": 5,
+  "cleanTempDir": "always",
+  "tempDirName": ".stryker-owner-critical",
+  "fileLogLevel": "trace",
+  "logLevel": "info",
+  "allowConsoleColors": false
+}

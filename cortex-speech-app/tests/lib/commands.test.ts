@@ -4,17 +4,33 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AudioExportFormat,
   ASR_7B_UNAVAILABLE_TAG,
+  alignSegment,
   appGitSha,
   appHealth,
   cancelDesktopPlaybackSessionV1,
   commitReviewV1,
+  computeSignalAnomalyScores,
   computeDiff,
   clearTracingSpans,
   deleteReviewDraftV1,
+  createGoldFromFile,
+  exportAudio,
+  exportDataset,
+  exportFinetunePack,
+  exportGoldEvalSet,
+  exportHuggingfaceDataset,
+  exportTranscript,
+  buildScorecard,
+  getAudioHealth,
   getSettings,
   getActiveVoiceFocusV1,
+  getActiveLearningQueue,
+  getEscalationQueue,
+  getEscalationRateTrend,
   getHistoryStatusV1,
+  getSegmentConsensus,
   getInferenceStats,
+  getIntelligenceReport,
   getRecentSpans,
   getReviewDraftV1,
   getSegment,
@@ -23,24 +39,473 @@ import {
   getSignalAnomalySegments,
   getVoiceFocusReviewPageV1,
   getTracingStats,
+  getWaveform,
   authoritativeSettingsFromWriteError,
   is7bUnavailableError,
+  isCommandErrorV1,
+  importAudioFile,
+  importDirectory,
+  importVerifiedSegmentsAsGold,
   listAgentImportReports,
   listAgentStageEvents,
+  listEvalRuns,
   markSegmentUnusableV1,
+  mergeDatasetJson,
   normalizeText,
+  openAudioFile,
   recordHumanDecision,
   recordReviewFlag,
+  relinkAudio,
   redo,
+  runGoldEvalAsr,
+  runJuryPipeline,
+  runT2ForSegment,
+  runWslRefinement,
   saveReviewDraftV1,
   takeLastCrash,
+  transcribeSegment,
   updateSettings,
   undo,
+  validateDataset,
 } from '../../src/lib/commands';
 import { defaultSettings } from '../../src/lib/stores/settingsStore';
 import type { RendererSettingsV1 } from '../../src/lib/generated/ipc';
 
 const invokeMock = vi.mocked(invoke);
+
+describe('typed command-error classification', () => {
+  it('recognizes a complete V1 refusal and an optional exact code', () => {
+    const refusal = {
+      schema: 1,
+      code: 'STALE_REVISION',
+      message: 'The segment changed.',
+      retryable: false,
+    };
+
+    expect(isCommandErrorV1(refusal)).toBe(true);
+    expect(isCommandErrorV1(refusal, 'STALE_REVISION')).toBe(true);
+    expect(isCommandErrorV1(refusal, 'SEGMENT_NOT_FOUND')).toBe(false);
+  });
+
+  it('is total for hostile IPC values and reads each required field once', () => {
+    const throwing = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error('hostile getter');
+        },
+      },
+    );
+    expect(() => isCommandErrorV1(throwing, 'STALE_REVISION')).not.toThrow();
+    expect(isCommandErrorV1(throwing, 'STALE_REVISION')).toBe(false);
+
+    const reads = new Map<PropertyKey, number>();
+    const stateful = new Proxy(
+      {},
+      {
+        get(_target, property) {
+          reads.set(property, (reads.get(property) ?? 0) + 1);
+          if (property === 'schema') return 1;
+          if (property === 'code') return 'STALE_REVISION';
+          if (property === 'message') return 'The segment changed.';
+          if (property === 'retryable') return false;
+          return undefined;
+        },
+      },
+    );
+
+    expect(isCommandErrorV1(stateful, 'STALE_REVISION')).toBe(true);
+    expect(Object.fromEntries(reads)).toEqual({ schema: 1, code: 1, message: 1, retryable: 1 });
+  });
+});
+
+describe('generated owner critical-loop contract', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('uses the nine generated commands with exact arguments and preserves their wire results', async () => {
+    const runId = '85c9ce7e-9a91-4bd4-b1f0-e3f278ad5f7a';
+    const transcription = {
+      text: 'دەقی پاک',
+      rawTranscript: 'دەقی خام',
+      confidence: 0.94,
+      confidenceSource: 'real_posterior',
+      modelVersionId: 'champion-sha',
+      cloudCall: false,
+      segmentId: 'segment-1',
+    };
+    const timestamps = [{ word: 'دەقی', start: 0, end: 0.4, confidence: 0.9 }];
+    const consensus = {
+      draft: 'دەقی پاک',
+      words: [
+        {
+          text: 'دەقی',
+          agreement: 1,
+          modelsAgreeing: 1,
+          totalModels: 1,
+          alternatives: [],
+        },
+      ],
+      modelCount: 1,
+      minAgreement: 1,
+      meanAgreement: 1,
+      models: ['champion-sha'],
+    };
+    invokeMock
+      .mockResolvedValueOnce('D:/audio/source.wav')
+      .mockResolvedValueOnce({ status: 'started', runId })
+      .mockResolvedValueOnce({ status: 'started', source: 'file', runId })
+      .mockResolvedValueOnce(transcription)
+      .mockResolvedValueOnce(timestamps)
+      .mockResolvedValueOnce(consensus)
+      .mockResolvedValueOnce([0.1, 0.4, 0.2])
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null);
+
+    await expect(openAudioFile()).resolves.toBe('D:/audio/source.wav');
+    await expect(importDirectory(runId)).resolves.toEqual({ status: 'started', runId });
+    await expect(importAudioFile('D:/audio/source.wav', runId)).resolves.toEqual({
+      status: 'started',
+      source: 'file',
+      runId,
+    });
+    await expect(
+      transcribeSegment(
+        'D:/audio/source.wav',
+        '{"source_start_ms":0,"source_end_ms":1000}',
+        'segment-1',
+      ),
+    ).resolves.toEqual(transcription);
+    await expect(
+      alignSegment(
+        'D:/audio/source.wav',
+        'دەقی پاک',
+        '{"source_start_ms":0,"source_end_ms":1000}',
+        'segment-1',
+      ),
+    ).resolves.toEqual(timestamps);
+    await expect(getSegmentConsensus('segment-1')).resolves.toEqual(consensus);
+    await expect(getWaveform('D:/audio/source.wav', 512, null)).resolves.toEqual([0.1, 0.4, 0.2]);
+    await expect(exportDataset('D:/proof/library.jsonl', 'jsonl')).resolves.toBeUndefined();
+    await expect(exportTranscript('D:/proof/library.txt', 'txt')).resolves.toBeUndefined();
+
+    expect(invokeMock.mock.calls).toEqual([
+      ['open_audio_file'],
+      ['import_directory', { runId }],
+      ['import_audio_file', { path: 'D:/audio/source.wav', runId }],
+      [
+        'transcribe_segment',
+        {
+          segmentId: 'segment-1',
+          audioPath: 'D:/audio/source.wav',
+          alignmentJson: '{"source_start_ms":0,"source_end_ms":1000}',
+        },
+      ],
+      [
+        'align_segment',
+        {
+          audioPath: 'D:/audio/source.wav',
+          text: 'دەقی پاک',
+          alignmentJson: '{"source_start_ms":0,"source_end_ms":1000}',
+          segmentId: 'segment-1',
+        },
+      ],
+      ['get_segment_consensus', { segmentId: 'segment-1' }],
+      ['get_waveform', { path: 'D:/audio/source.wav', numPoints: 512, alignmentJson: null }],
+      ['export_dataset', { path: 'D:/proof/library.jsonl', format: 'jsonl' }],
+      ['export_transcript', { path: 'D:/proof/library.txt', format: 'txt' }],
+    ]);
+  });
+
+  it('preserves a structured champion hard-stop without converting it to a string', async () => {
+    const refusal = {
+      schema: 1,
+      code: ASR_7B_UNAVAILABLE_TAG,
+      message: `${ASR_7B_UNAVAILABLE_TAG}: The pinned champion is unavailable.`,
+      retryable: true,
+      suggestedAction: 'openModels' as const,
+      operationId: null,
+      details: {},
+    };
+    invokeMock.mockRejectedValueOnce(refusal);
+
+    await expect(transcribeSegment('D:/audio/source.wav', null, 'segment-1')).rejects.toBe(refusal);
+    expect(is7bUnavailableError(refusal)).toBe(true);
+  });
+});
+
+describe('generated owner analysis contract', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('uses the eleven generated commands with exact arguments and preserves their wire results', async () => {
+    const evalRun = {
+      id: 'eval-1',
+      modelId: 'omniasr-7b@champion-sha',
+      runAt: '2026-08-28T10:00:00.000Z',
+      numSegs: 1,
+      wer: 0.1,
+      cer: 0.05,
+      metaJson: null,
+    };
+    const evalResult = {
+      run: evalRun,
+      segments: [
+        {
+          goldId: 'gold-1',
+          audioPath: 'D:/private/gold-1.wav',
+          reference: 'دەقی ڕاست',
+          hypothesis: 'دەقی ڕاست',
+          wer: 0,
+          cer: 0,
+        },
+      ],
+    };
+    const intelligence = {
+      loop0Shadow: {
+        totalObservations: 10,
+        wouldFire: 2,
+        firedButHumanAcceptedOriginal: 0,
+        firedAndHumanEdited: 2,
+        firedAndHumanRejected: 0,
+      },
+      autoAcceptPrecision: {
+        t0Accepts: 0,
+        t1Escalations: 10,
+        t0HumanConfirmed: 0,
+        t0HumanContradicted: 0,
+      },
+      conformalCalibration: {
+        targetErrorCer: 0.02,
+        perBucketDelta: 0.002,
+        minNeededAtZeroCer: 1497,
+        buckets: [{ bucket: 'unknown', verifiedWithReference: 10, minNeededAtZeroCer: 1497 }],
+      },
+    };
+    const trend = [{ date: '2026-08-28', escalationRate: 1, total: 10, escalated: 10 }];
+    const jury = {
+      mode: 'not_required' as const,
+      totalInput: 1,
+      t0AutoAccepted: 0,
+      t0Escalated: 0,
+      referenceCommitted: 0,
+      referenceGuarded: 0,
+      hypothesisGuarded: 0,
+      t1Committed: 0,
+      t2Committed: 0,
+      humanInbox: 0,
+      reason: 'Human review is authoritative.',
+    };
+    const t2 = { verdict: null, mustEscalate: true, error: 'T2_JUDGE_UNAVAILABLE' };
+    const scorecard = {
+      scorecard: {
+        system: {
+          modelId: evalRun.modelId,
+          numSegments: 1,
+          scoredSegments: 1,
+          microWer: 0,
+          microCer: 0,
+          macroWer: 0,
+          substitutions: 0,
+          deletions: 0,
+          insertions: 0,
+          werCi: { lower: 0, upper: 0 },
+          cerCi: { lower: 0, upper: 0 },
+        },
+        bootstrapResamples: 1000,
+        confidence: 0.95,
+        seed: 42,
+      },
+      markdown: '# Scorecard',
+    };
+    const segment = { id: 'segment-1' };
+
+    invokeMock
+      .mockResolvedValueOnce(intelligence)
+      .mockResolvedValueOnce({ status: 'started' })
+      .mockResolvedValueOnce(7)
+      .mockResolvedValueOnce([segment])
+      .mockResolvedValueOnce(evalResult)
+      .mockResolvedValueOnce(scorecard)
+      .mockResolvedValueOnce([evalRun])
+      .mockResolvedValueOnce([segment])
+      .mockResolvedValueOnce(trend)
+      .mockResolvedValueOnce(jury)
+      .mockResolvedValueOnce(t2);
+
+    await expect(getIntelligenceReport()).resolves.toEqual(intelligence);
+    await expect(
+      runWslRefinement({ limit_files: 3, limit_segments: 12, dry_run: true, test_one: false }),
+    ).resolves.toEqual({ status: 'started' });
+    await expect(computeSignalAnomalyScores()).resolves.toBe(7);
+    await expect(getActiveLearningQueue(0.02, 0.95, 25)).resolves.toEqual([segment]);
+    await expect(runGoldEvalAsr()).resolves.toEqual(evalResult);
+    await expect(buildScorecard(evalResult, null)).resolves.toEqual(scorecard);
+    await expect(listEvalRuns()).resolves.toEqual([evalRun]);
+    await expect(getEscalationQueue(40)).resolves.toEqual([segment]);
+    await expect(getEscalationRateTrend()).resolves.toEqual(trend);
+    await expect(runJuryPipeline(['segment-1'])).resolves.toEqual(jury);
+    await expect(runT2ForSegment('segment-1', 'renderer-secret')).resolves.toEqual(t2);
+
+    expect(invokeMock.mock.calls).toEqual([
+      ['get_intelligence_report'],
+      ['run_wsl_refinement', { limitFiles: 3, limitSegments: 12, dryRun: true, testOne: false }],
+      ['compute_signal_anomaly_scores'],
+      ['get_active_learning_queue', { targetError: 0.02, confidenceLevel: 0.95, limit: 25 }],
+      ['run_gold_eval_asr'],
+      ['build_scorecard', { system: evalResult, baseline: null }],
+      ['list_eval_runs'],
+      ['get_escalation_queue', { limit: 40 }],
+      ['get_escalation_rate_trend'],
+      ['run_jury_pipeline', { segmentIds: ['segment-1'] }],
+      ['run_t2_for_segment', { segmentId: 'segment-1', apiKey: 'renderer-secret' }],
+    ]);
+  });
+
+  it('preserves a structured owner-analysis refusal without retry or string coercion', async () => {
+    const refusal = {
+      schema: 1,
+      code: 'ANALYSIS_UNAVAILABLE',
+      message: 'The analysis could not be completed. Try again.',
+      retryable: true,
+      suggestedAction: 'retry' as const,
+      operationId: null,
+      details: {},
+    };
+    invokeMock.mockRejectedValueOnce(refusal);
+
+    await expect(getIntelligenceReport()).rejects.toBe(refusal);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('generated owner data and export contract', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('uses the ten generated commands with exact arguments and complete wire results', async () => {
+    const audioHealth = {
+      totalFiles: 3,
+      missingFiles: 1,
+      missingPaths: ['D:/owner/missing.wav'],
+    };
+    const relink = { relinked: 1, stillMissing: 0 };
+    const validation = {
+      totalSegments: 2,
+      totalAudioFiles: 1,
+      passed: 1,
+      warnings: [
+        {
+          severity: 'Warning',
+          category: 'AlignmentHeuristic',
+          segmentId: 'segment-2',
+          field: 'alignment_json',
+          message: 'Alignment requires review.',
+          details: null,
+        },
+      ],
+      errors: [],
+      summary: '1 passed, 1 warning',
+    } as const;
+    const audioExport = {
+      total: 2,
+      succeeded: 1,
+      failed: 1,
+      output_dir: 'D:/proof/audio',
+      files: ['segment-1.wav'],
+      errors: ['AUDIO_EXPORT_ITEM_FAILED'],
+    };
+    const goldExport = {
+      manifestPath: 'D:/proof/gold/manifest.jsonl',
+      totalGold: 2,
+      exported: 2,
+      skipped: 0,
+    };
+    const finetuneExport = {
+      manifestPath: 'D:/proof/train/manifest.jsonl',
+      manifestSha256: 'abc123',
+      totalVerified: 4,
+      excludedUnexportable: 1,
+      excludedNotTrainingReady: 1,
+      emitted: 2,
+      skipped: 0,
+      emittedWithoutHumanDecision: 0,
+      snapshotId: 'abc123',
+      newlySealed: true,
+    };
+    invokeMock
+      .mockResolvedValueOnce(audioHealth)
+      .mockResolvedValueOnce(relink)
+      .mockResolvedValueOnce(validation)
+      .mockResolvedValueOnce(audioExport)
+      .mockResolvedValueOnce({ created: 2, updated: 1 })
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(3)
+      .mockResolvedValueOnce(4)
+      .mockResolvedValueOnce(goldExport)
+      .mockResolvedValueOnce(finetuneExport);
+
+    await expect(getAudioHealth()).resolves.toEqual(audioHealth);
+    await expect(relinkAudio('D:/owner/audio')).resolves.toEqual(relink);
+    await expect(validateDataset()).resolves.toEqual(validation);
+    await expect(
+      exportAudio(['segment-1', 'segment-2'], {
+        output_dir: 'D:/proof/audio',
+        format: AudioExportFormat.Wav,
+        sample_rate: 16_000,
+        include_metadata: true,
+      }),
+    ).resolves.toEqual(audioExport);
+    await expect(mergeDatasetJson('{"segments":[]}')).resolves.toEqual({ created: 2, updated: 1 });
+    await expect(exportHuggingfaceDataset('D:/proof/hf')).resolves.toBeUndefined();
+    await expect(createGoldFromFile('D:/owner/source.wav')).resolves.toBe(3);
+    await expect(importVerifiedSegmentsAsGold()).resolves.toBe(4);
+    await expect(exportGoldEvalSet('D:/proof/gold')).resolves.toEqual(goldExport);
+    await expect(exportFinetunePack('D:/proof/train')).resolves.toEqual(finetuneExport);
+
+    expect(invokeMock.mock.calls).toEqual([
+      ['get_audio_health'],
+      ['relink_audio', { searchDir: 'D:/owner/audio' }],
+      ['validate_dataset_cmd'],
+      [
+        'export_audio',
+        {
+          segmentIds: ['segment-1', 'segment-2'],
+          options: {
+            output_dir: 'D:/proof/audio',
+            format: 'Wav',
+            sample_rate: 16_000,
+            include_metadata: true,
+          },
+        },
+      ],
+      ['merge_dataset_json', { jsonContent: '{"segments":[]}' }],
+      ['export_huggingface_dataset', { path: 'D:/proof/hf' }],
+      ['create_gold_from_file', { audioPath: 'D:/owner/source.wav' }],
+      ['import_verified_segments_as_gold'],
+      ['export_gold_eval_set', { outDir: 'D:/proof/gold' }],
+      ['export_finetune_pack', { outDir: 'D:/proof/train' }],
+    ]);
+  });
+
+  it('preserves structured private-safe refusals without string coercion', async () => {
+    const refusal = {
+      schema: 1,
+      code: 'DATASET_VALIDATION_FAILED',
+      message: 'Dataset validation could not produce a complete report.',
+      retryable: false,
+      suggestedAction: 'openHealth' as const,
+      operationId: null,
+      details: {},
+    };
+    invokeMock.mockRejectedValueOnce(refusal);
+
+    await expect(validateDataset()).rejects.toBe(refusal);
+  });
+});
 
 describe('generated library read contract', () => {
   beforeEach(() => {
@@ -697,8 +1162,9 @@ describe('revision-bound desktop review drafts', () => {
 
     const saveOperationId = (invokeMock.mock.calls[1][1] as { operationId: string }).operationId;
     const deleteOperationId = (invokeMock.mock.calls[3][1] as { operationId: string }).operationId;
-    expect(saveOperationId).toMatch(/^[0-9a-f-]{36}$/i);
-    expect(deleteOperationId).toMatch(/^[0-9a-f-]{36}$/i);
+    const operationUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    expect(saveOperationId).toMatch(operationUuid);
+    expect(deleteOperationId).toMatch(operationUuid);
     expect(deleteOperationId).not.toBe(saveOperationId);
     expect(invokeMock.mock.calls).toEqual([
       ['get_review_draft_v1', { segmentId: draft.segmentId }],
@@ -806,6 +1272,7 @@ describe('desktop review flag idempotency', () => {
   });
 
   it('replays one uncertain invoke with the exact same flag operation identity and payload', async () => {
+    const operationId = '70000000-0000-4000-8000-000000000052';
     const commit = {
       effectEventId: 52,
       segmentId: 'segment-2',
@@ -817,7 +1284,14 @@ describe('desktop review flag idempotency', () => {
       .mockRejectedValueOnce(new Error('transport response lost'))
       .mockResolvedValueOnce(commit);
 
-    await expect(recordReviewFlag('segment-2', 'needs a second listen')).resolves.toBe(commit);
+    await expect(
+      recordReviewFlag({
+        segmentId: 'segment-2',
+        baseRevision: 7,
+        rationale: 'needs a second listen',
+        operationId,
+      }),
+    ).resolves.toBe(commit);
 
     expect(invokeMock).toHaveBeenCalledTimes(2);
     const first = invokeMock.mock.calls[0];
@@ -826,11 +1300,12 @@ describe('desktop review flag idempotency', () => {
     expect(second[0]).toBe('record_review_flag');
     expect(second[1]).toEqual(first[1]);
     expect(first[1]).toMatchObject({
-      segmentId: 'segment-2',
-      rationale: 'needs a second listen',
-      operationId: expect.stringMatching(
-        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-      ),
+      request: {
+        segmentId: 'segment-2',
+        baseRevision: 7,
+        rationale: 'needs a second listen',
+        operationId,
+      },
     });
   });
 });

@@ -11,6 +11,7 @@ import type { CommandErrorV1, ImportJobV1, ImportResumeV1 } from './generated/ip
 const invokeMock = vi.mocked(invoke);
 
 describe('generated interrupted-import command boundary', () => {
+  const runId = '00000000-0000-4000-8000-000000000001';
   beforeEach(() => invokeMock.mockReset());
 
   it('uses exact command arguments and returns only the renderer-safe progress DTO', async () => {
@@ -24,6 +25,7 @@ describe('generated interrupted-import command boundary', () => {
       status: 'started',
       resuming: true,
       importJobId: 'import-job-2',
+      runId,
     };
     invokeMock
       .mockResolvedValueOnce(job)
@@ -31,12 +33,12 @@ describe('generated interrupted-import command boundary', () => {
       .mockResolvedValueOnce(null);
 
     await expect(getInterruptedImport()).resolves.toEqual(job);
-    await expect(resumeInterruptedImport('import-job-1')).resolves.toEqual(resumed);
+    await expect(resumeInterruptedImport('import-job-1', runId)).resolves.toEqual(resumed);
     await expect(discardInterruptedImport('import-job-2')).resolves.toBeUndefined();
 
     expect(invokeMock.mock.calls).toEqual([
       ['get_interrupted_import'],
-      ['resume_interrupted_import', { jobId: 'import-job-1' }],
+      ['resume_interrupted_import', { jobId: 'import-job-1', runId }],
       ['discard_interrupted_import', { jobId: 'import-job-2' }],
     ]);
     expectTypeOf<ImportJob>().toEqualTypeOf<ImportJobV1>();
@@ -56,6 +58,6 @@ describe('generated interrupted-import command boundary', () => {
     };
     invokeMock.mockRejectedValueOnce(refusal);
 
-    await expect(resumeInterruptedImport('import-job-1')).rejects.toEqual(refusal);
+    await expect(resumeInterruptedImport('import-job-1', runId)).rejects.toEqual(refusal);
   });
 });

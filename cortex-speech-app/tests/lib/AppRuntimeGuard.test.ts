@@ -66,10 +66,9 @@ function blockedAgentReportFixture() {
     agentRunId: 'run-blocked-1',
     source: 'file',
     status: 'completed',
-    audioPaths: ['C:\\audio\\long.wav'],
-    segmentIds: ['seg-1'],
     summary: {
       totalSegments: 1,
+      agenticReadiness: null,
       sourceReferences: [],
       sourceReferenceRequired: false,
       requiredSourceReferenceModels: [],
@@ -94,14 +93,12 @@ function blockedAgentReportFixture() {
         {
           stage: 'dataset_promotion',
           status: 'blocked',
-          summary: '1 training-ready machine segment still lacks multi-model coverage.',
+          detailCode: 'blocked',
           blockerCount: 1,
-          blockers: ['seg-1'],
         },
       ],
     },
-    juryReport: null,
-    error: null,
+    errorCode: null,
     createdAt: '2026-06-16T12:00:00Z',
   };
 }
@@ -123,6 +120,11 @@ function datasetStatsFixture() {
 }
 
 describe('App desktop runtime guard', () => {
+  async function openOverflowMenu(): Promise<void> {
+    await fireEvent.click(await screen.findByTestId('header-overflow-btn'));
+    await screen.findByTestId('header-overflow-menu');
+  }
+
   beforeEach(() => {
     invokeMock.mockReset();
     delete window.__TAURI__;
@@ -147,6 +149,7 @@ describe('App desktop runtime guard', () => {
 
   it('starts in browser mode without invoking Tauri and disables desktop-only actions', async () => {
     render(App);
+    await openOverflowMenu();
 
     const openButton = await screen.findByRole('button', { name: 'Open audio file' });
 
@@ -160,9 +163,14 @@ describe('App desktop runtime guard', () => {
   });
 
   it('blocks HF training export when the latest dataset promotion stage is blocked', async () => {
-    window.__TAURI__ = {};
+    window.__TAURI_INTERNALS__ = {
+      metadata: { currentWindow: { label: 'main' } },
+      transformCallback: vi.fn(() => 1),
+    };
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_segments') return Promise.resolve([segmentFixture()]);
+      if (command === 'get_segments_page') {
+        return Promise.resolve({ items: [segmentFixture()], total: 1, nextCursor: null });
+      }
       if (command === 'list_agent_import_reports')
         return Promise.resolve([blockedAgentReportFixture()]);
       if (command === 'list_agent_stage_events') return Promise.resolve([]);
@@ -196,16 +204,15 @@ describe('App desktop runtime guard', () => {
     });
 
     render(App);
+    await openOverflowMenu();
 
     const hfExport = await screen.findByTestId('hf-export-btn');
 
     await waitFor(() =>
-      expect(hfExport).toHaveAttribute(
-        'title',
-        expect.stringContaining(
-          '1 training-ready machine segment still lacks multi-model coverage.',
-        ),
-      ),
+      expect(hfExport).toHaveAttribute('title', expect.stringContaining('1 blocker(s)')),
+    );
+    expect(hfExport.getAttribute('title')).not.toContain(
+      'training-ready machine segment still lacks multi-model coverage',
     );
     expect(invokeMock).toHaveBeenCalledWith('list_agent_stage_events', {
       runId: 'run-blocked-1',
@@ -217,6 +224,7 @@ describe('App desktop runtime guard', () => {
 
   it('opens settings in browser mode without persisting through Tauri', async () => {
     render(App);
+    await openOverflowMenu();
 
     await fireEvent.click(await screen.findByRole('button', { name: 'Open settings' }));
     expect(await screen.findByTestId('settings-panel')).toBeInTheDocument();

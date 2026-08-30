@@ -117,6 +117,63 @@ pub(super) struct DecisionBody {
     clip_duration_ms: Option<i64>,
 }
 
+/// Durable identity for an HTTP pool undo. Unlike the legacy bodyless endpoint, this request keeps
+/// the exact decision and reversal operation stable across a lost response, renderer reload, and
+/// app restart. All three fields are one contract: partial coordinates are refused rather than
+/// guessed from the mutable "latest effective" view.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct UndoBody {
+    #[serde(default, rename = "poolDecisionId")]
+    pool_decision_id: Option<String>,
+    #[serde(default, rename = "decisionOperationId")]
+    decision_operation_id: Option<String>,
+    #[serde(default, rename = "reversalOperationId")]
+    reversal_operation_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub(super) struct PoolUndoTarget {
+    decision_id: i64,
+    decision_operation_id: String,
+    reversal_operation_id: String,
+}
+
+fn canonical_request_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.hyphenated().to_string() == value)
+}
+
+fn parse_undo_body(body: &[u8]) -> Result<Option<PoolUndoTarget>, String> {
+    let parsed = if body.is_empty() {
+        UndoBody::default()
+    } else {
+        serde_json::from_slice::<UndoBody>(body).map_err(|error| format!("bad json: {error}"))?
+    };
+    match (parsed.pool_decision_id, parsed.decision_operation_id, parsed.reversal_operation_id) {
+        (None, None, None) => Ok(None),
+        (Some(decision_id), Some(decision_operation_id), Some(reversal_operation_id)) => {
+            let decision_id = decision_id
+                .parse::<i64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| "poolDecisionId must be a positive decimal database identity".to_string())?;
+            if !canonical_request_uuid(&decision_operation_id) {
+                return Err("decisionOperationId must be a lowercase hyphenated UUID".to_string());
+            }
+            if !canonical_request_uuid(&reversal_operation_id) {
+                return Err("reversalOperationId must be a lowercase hyphenated UUID".to_string());
+            }
+            if decision_operation_id == reversal_operation_id {
+                return Err("the decision and reversal operation IDs must be distinct".to_string());
+            }
+            Ok(Some(PoolUndoTarget { decision_id, decision_operation_id, reversal_operation_id }))
+        }
+        _ => {
+            Err("pool undo requires poolDecisionId, decisionOperationId, and reversalOperationId together".to_string())
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReviewOperationState {
     New,
@@ -357,10 +414,12 @@ pub(super) fn api_independent_decision(
             playback_receipt_id,
         ) {
             Ok(Some(proof)) => proof,
-            Ok(None) => return err_reply(
-                428,
-                "E_NO_PLAYBACK_EVIDENCE: playback authority does not match this reviewer, session, clip, or revision",
-            ),
+            Ok(None) => {
+                return err_reply(
+                    428,
+                    "E_NO_PLAYBACK_EVIDENCE: playback authority does not match this reviewer, session, clip, or revision",
+                );
+            }
             Err(error) => return playback_error_reply(&error.to_string()),
         };
         (Some(content_hash), Some(source_span), Some(proof))
@@ -413,7 +472,7 @@ pub(super) fn api_independent_decision(
             Ok(Some(_)) => return err_reply(409, "operation UUID is already bound to another decision"),
             Ok(None) => return err_reply(500, &error),
             Err(lookup_error) => {
-                return err_reply(500, &format!("{error}; operation receipt lookup failed: {lookup_error}"))
+                return err_reply(500, &format!("{error}; operation receipt lookup failed: {lookup_error}"));
             }
         },
     };
@@ -597,7 +656,7 @@ pub(super) fn api_pool_decision(
                         .err()
                         .map(|error| error.to_string())
                         .unwrap_or_else(|| "E_NO_PLAYBACK_EVIDENCE".to_string()),
-                )
+                );
             }
             Err(error) => return err_reply(500, &format!("playback evidence check failed: {error}")),
         }
@@ -652,11 +711,11 @@ pub(super) fn api_pool_decision(
             }
             Ok(Some(_)) => return err_reply(409, "operation UUID is already bound to another pool decision"),
             Ok(None) if error.contains("duplicated") || error.contains("independent") => {
-                return err_reply(409, "this clip already has your review — reload for another one")
+                return err_reply(409, "this clip already has your review — reload for another one");
             }
             Ok(None) => return err_reply(500, &error),
             Err(lookup_error) => {
-                return err_reply(500, &format!("{error}; operation receipt lookup failed: {lookup_error}"))
+                return err_reply(500, &format!("{error}; operation receipt lookup failed: {lookup_error}"));
             }
         },
     };
@@ -914,7 +973,7 @@ pub(super) fn api_decision_authenticated(
                 return err_reply(
                     409,
                     "this legacy interrupted decision requires offline repair before review can continue; no corpus state was changed",
-                )
+                );
             }
             Ok(_) => {}
             Err(error) => return err_reply(500, &format!("schema authority lookup failed: {error}")),
@@ -992,10 +1051,10 @@ pub(super) fn api_decision_authenticated(
     }
     match pilot_policy.as_ref() {
         Some(policy) if parsed.pilot_after_review_event_id != Some(policy.after_review_event_id) => {
-            return err_reply(409, "controlled review pilot changed — reload the queue before deciding")
+            return err_reply(409, "controlled review pilot changed — reload the queue before deciding");
         }
         None if parsed.pilot_after_review_event_id.is_some() => {
-            return err_reply(409, "controlled review pilot is no longer active — reload the queue before deciding")
+            return err_reply(409, "controlled review pilot is no longer active — reload the queue before deciding");
         }
         _ => {}
     }
@@ -1146,7 +1205,7 @@ pub(super) fn api_decision_authenticated(
         if let Some(policy) = current.as_ref() {
             match pilot_remaining_slots(db, reviewer, policy) {
                 Ok(0) => {
-                    return err_reply(409, "controlled review pilot complete — no more review actions are authorized")
+                    return err_reply(409, "controlled review pilot complete — no more review actions are authorized");
                 }
                 Ok(_) => {}
                 Err(error) => return err_reply(503, &format!("controlled review pilot is unavailable: {error}")),
@@ -1172,7 +1231,7 @@ pub(super) fn api_decision_authenticated(
             return err_reply(
                 503,
                 "playback identity is unavailable — this clip has no canonical server-derived audio content hash",
-            )
+            );
         }
         Err(error) => return err_reply(500, &format!("playback identity lookup failed: {error}")),
     };
@@ -1206,10 +1265,12 @@ pub(super) fn api_decision_authenticated(
             playback_receipt_id,
         ) {
             Ok(Some(proof)) => Some(proof),
-            Ok(None) => return err_reply(
-                428,
-                "E_NO_PLAYBACK_EVIDENCE: playback authority does not match this reviewer, session, clip, or revision",
-            ),
+            Ok(None) => {
+                return err_reply(
+                    428,
+                    "E_NO_PLAYBACK_EVIDENCE: playback authority does not match this reviewer, session, clip, or revision",
+                );
+            }
             Err(error) => return playback_error_reply(&error.to_string()),
         }
     };
@@ -1518,12 +1579,19 @@ pub(super) fn api_independent_undo(
         },
     };
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    let reversal_operation_id = match crate::review_campaign::independent_reversal_operation_id(&entry.operation_id) {
+        Ok(operation_id) => operation_id,
+        Err(error) => {
+            lock_state(state).independent_undo.entry(reviewer.to_string()).or_default().push(entry);
+            return err_reply(500, &format!("independent undo identity cannot be derived: {error}"));
+        }
+    };
     if let Err(error) = crate::review_campaign::reverse_independent_decision(
         db,
         campaign,
         entry.decision_id,
         reviewer,
-        &entry.operation_id,
+        &reversal_operation_id,
         now_ms,
     ) {
         lock_state(state).independent_undo.entry(reviewer.to_string()).or_default().push(entry);
@@ -1557,27 +1625,28 @@ pub(super) fn api_pool_undo(
     reviewer: &str,
     state: &Mutex<CouchState>,
     pool: &crate::review_pool::ReviewPool,
+    target: &PoolUndoTarget,
 ) -> Reply {
-    let entry = lock_state(state).pool_undo.get_mut(reviewer).and_then(|stack| stack.pop());
-    let entry = match entry {
-        Some(entry) => entry,
-        None => match crate::review_pool::latest_decision(db, &pool.pool_id, reviewer) {
-            Ok(Some((decision_id, seg_id, operation_id, _))) => {
-                IndependentUndoEntry { operation_id, seg_id, decision_id }
-            }
-            Ok(None) => return err_reply(409, "nothing to undo"),
-            Err(error) => return err_reply(500, &format!("pool undo target lookup failed: {error}")),
-        },
-    };
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    if let Err(error) =
-        crate::review_pool::reverse_decision(db, pool, entry.decision_id, reviewer, &entry.operation_id, now_ms)
-    {
-        lock_state(state).pool_undo.entry(reviewer.to_string()).or_default().push(entry);
-        return err_reply(500, &error);
-    }
-    let id = entry.seg_id.clone();
-    remember_pool_undo(state, reviewer, &entry.operation_id, &entry.seg_id, entry.decision_id);
+    let id = match crate::review_pool::reverse_decision_addressed(
+        db,
+        pool,
+        target.decision_id,
+        reviewer,
+        &target.decision_operation_id,
+        &target.reversal_operation_id,
+        now_ms,
+    ) {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return err_reply(
+                409,
+                "pool undo target is stale or does not match this reviewer — reload before retrying",
+            );
+        }
+        Err(error) => return err_reply(500, &error),
+    };
+    remember_pool_undo(state, reviewer, &target.decision_operation_id, &id, target.decision_id);
     {
         let mut guard = lock_state(state);
         guard.leases.insert(id.clone(), (reviewer.to_string(), Instant::now()));
@@ -1592,7 +1661,14 @@ pub(super) fn api_pool_undo(
         .to_string();
     json_reply_with_accounting(
         200,
-        serde_json::json!({ "id": id, "rowVersion": row_version, "independent": true, "reviewPool": true }),
+        serde_json::json!({
+            "id": id,
+            "rowVersion": row_version,
+            "independent": true,
+            "reviewPool": true,
+            "poolDecisionId": target.decision_id,
+            "reversalOperationId": target.reversal_operation_id,
+        }),
         db,
         reviewer,
     )
@@ -1603,12 +1679,24 @@ pub(super) fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &M
     api_decision_authenticated(db, body, reviewer, &couch_session_binding_sha256("couch-test-session"), state)
 }
 
+#[cfg(test)]
 pub(super) fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply {
+    api_undo_with_body(db, &[], reviewer, state)
+}
+
+pub(super) fn api_undo_with_body(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchState>) -> Reply {
+    let pool_target = match parse_undo_body(body) {
+        Ok(target) => target,
+        Err(error) => return err_reply(400, &error),
+    };
     let pool = match active_pool_policy(db, state) {
         Ok(policy) => policy,
         Err(error) => return err_reply(503, &error),
     };
     if let Some(pool) = pool.as_ref() {
+        if let Some(target) = pool_target.as_ref() {
+            return api_pool_undo(db, reviewer, state, pool, target);
+        }
         let (has_pool_token, has_canonical_token) = {
             let guard = lock_state(state);
             (
@@ -1617,12 +1705,26 @@ pub(super) fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>)
             )
         };
         if has_pool_token && !has_canonical_token {
-            return api_pool_undo(db, reviewer, state, pool);
+            return err_reply(409, "pool undo requires the exact durable target from the decision response");
         }
         if !has_pool_token && !has_canonical_token {
-            let pool_latest = match crate::review_pool::latest_decision(db, &pool.pool_id, reviewer) {
+            // Read the append-only table, including decisions already reversed. The effective view
+            // drops the just-undone row and was the source of the lost-response/restart bug: a retry
+            // then selected the previous decision. A bodyless request may fall through to canonical
+            // undo only when canonical truth is durably newer than every pool action.
+            let pool_latest: Result<Option<i64>, _> = db
+                .connection()
+                .query_row(
+                    "SELECT created_at_ms FROM review_pool_decisions
+                      WHERE pool_id=?1 AND reviewer=?2 COLLATE NOCASE
+                      ORDER BY id DESC LIMIT 1",
+                    rusqlite::params![pool.pool_id, reviewer],
+                    |row| row.get(0),
+                )
+                .optional();
+            let pool_latest = match pool_latest {
                 Ok(value) => value,
-                Err(error) => return err_reply(500, &error),
+                Err(error) => return err_reply(500, &format!("pool undo order cannot be read: {error}")),
             };
             let canonical_latest: Result<Option<i64>, _> = db
                 .connection()
@@ -1641,10 +1743,12 @@ pub(super) fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>)
                 Err(error) => return err_reply(500, &format!("canonical undo order cannot be read: {error}")),
             };
             // map_or, not is_none_or: the latter is stable only since 1.82 and this crate's MSRV is 1.81.
-            if pool_latest.as_ref().is_some_and(|(_, _, _, at)| canonical_latest.map_or(true, |other| *at >= other)) {
-                return api_pool_undo(db, reviewer, state, pool);
+            if pool_latest.is_some_and(|at| canonical_latest.map_or(true, |other| at >= other)) {
+                return err_reply(409, "pool undo requires the exact durable target from the decision response");
             }
         }
+    } else if pool_target.is_some() {
+        return err_reply(409, "the addressed review pool is no longer active");
     }
     let campaign = match active_campaign_policy(db, reviewer, state) {
         Ok(policy) => policy,

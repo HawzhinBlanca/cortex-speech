@@ -743,6 +743,7 @@ fn join_wsl_log_reader(thread: std::thread::JoinHandle<()>, stream: &str) {
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn run_wsl_refinement(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -750,62 +751,65 @@ pub fn run_wsl_refinement(
     limit_segments: Option<u32>,
     dry_run: bool,
     test_one: bool,
-) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("run_wsl_refinement")?;
-    // P1.3b: don't start the 7B refinement loop (a background DB writer) while a restore is reserved.
-    if restore_pending() {
-        return Err(RESTORE_IN_PROGRESS_MSG.into());
-    }
-
-    // Single-run guard: claim the running flag atomically. If it was already true, a batch is in
-    // flight — refuse rather than starting a second concurrent loop over the same segments.
-    if WSL_REFINE_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return Err("WSL 7B refinement batch transcription is already running.".into());
-    }
-    // P1.3b (publish-then-recheck): the running flag is now PUBLISHED; re-read the reservation. This
-    // closes the atomic check-then-set race with prepare_restore (which sets RESTORE_PENDING then reads
-    // this flag via writers_active): either it already observed our flag (the fence refuses the restore),
-    // or we observe its reservation here and roll back — the two orderings can no longer both slip.
-    if restore_pending() {
-        WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-        return Err(RESTORE_IN_PROGRESS_MSG.into());
-    }
-    // The running flag is now OURS; every early return below MUST clear it or the guard would wedge.
-    // Reset CANCEL at the START of the run (standard cancellation-token pattern) rather than trusting
-    // the previous run's guard to have cleared it. The guard clears CANCEL then RUNNING as two separate
-    // atomic stores, so a `cancel` that read RUNNING==true just before the guard could set CANCEL=true
-    // AFTER the guard cleared it — leaking a stale cancel that would make THIS fresh batch abort
-    // immediately, doing zero work, with no error surfaced. Clearing it here, now that RUNNING is
-    // exclusively ours, drops that leaked value. (The only residual is a cancel landing in the tiny
-    // window between the claim above and this store; that is user-recoverable by clicking cancel again,
-    // whereas the leak was silent and unrecoverable.)
-    WSL_REFINE_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
-
-    // Read everything the worker needs under the locks NOW, then release them so the long per-segment
-    // loop holds no AppState lock. A 7B call can take seconds; holding a lock across the loop would
-    // freeze the UI's get_segments exactly like the jury-starvation bug we already fixed. The
-    // poison-recovering lock_* accessors never panic.
-    let setup = {
-        let settings = state.lock_settings();
-        let external_script = settings.external_asr_script_path();
-        let auto_normalize = settings.auto_normalize;
-        let verbalize_numbers = settings.verbalize_numbers;
-        drop(settings);
-        external_script.map(|script| (script, auto_normalize, verbalize_numbers))
-    };
-    let (external_script, auto_normalize, verbalize_numbers) = match setup {
-        Some(values) => values,
-        None => {
-            WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-            return Err("External ASR provider script is not configured in Settings.".into());
+) -> Result<crate::ipc_contract::WslRefinementStartedV1, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER
+        .check("run_wsl_refinement")
+        .map_err(|_| crate::ipc_contract::owner_analysis_rate_limited("run_wsl_refinement"))?;
+    let result = (|| -> Result<(), String> {
+        // P1.3b: don't start the 7B refinement loop (a background DB writer) while a restore is reserved.
+        if restore_pending() {
+            return Err(RESTORE_IN_PROGRESS_MSG.into());
         }
-    };
-    let db_path = state.lock_pipeline().db_path().to_string();
 
-    // Builder::spawn returns Err on OS thread-creation failure instead of PANICKING like thread::spawn,
-    // so a failed spawn can't leave WSL_REFINE_RUNNING wedged true (the RAII guard lives inside the
-    // closure and would never run on a spawn panic).
-    let spawned = std::thread::Builder::new().name("wsl-7b-batch".into()).spawn(move || {
+        // Single-run guard: claim the running flag atomically. If it was already true, a batch is in
+        // flight — refuse rather than starting a second concurrent loop over the same segments.
+        if WSL_REFINE_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err("WSL 7B refinement batch transcription is already running.".into());
+        }
+        // P1.3b (publish-then-recheck): the running flag is now PUBLISHED; re-read the reservation. This
+        // closes the atomic check-then-set race with prepare_restore (which sets RESTORE_PENDING then reads
+        // this flag via writers_active): either it already observed our flag (the fence refuses the restore),
+        // or we observe its reservation here and roll back — the two orderings can no longer both slip.
+        if restore_pending() {
+            WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+            return Err(RESTORE_IN_PROGRESS_MSG.into());
+        }
+        // The running flag is now OURS; every early return below MUST clear it or the guard would wedge.
+        // Reset CANCEL at the START of the run (standard cancellation-token pattern) rather than trusting
+        // the previous run's guard to have cleared it. The guard clears CANCEL then RUNNING as two separate
+        // atomic stores, so a `cancel` that read RUNNING==true just before the guard could set CANCEL=true
+        // AFTER the guard cleared it — leaking a stale cancel that would make THIS fresh batch abort
+        // immediately, doing zero work, with no error surfaced. Clearing it here, now that RUNNING is
+        // exclusively ours, drops that leaked value. (The only residual is a cancel landing in the tiny
+        // window between the claim above and this store; that is user-recoverable by clicking cancel again,
+        // whereas the leak was silent and unrecoverable.)
+        WSL_REFINE_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // Read everything the worker needs under the locks NOW, then release them so the long per-segment
+        // loop holds no AppState lock. A 7B call can take seconds; holding a lock across the loop would
+        // freeze the UI's get_segments exactly like the jury-starvation bug we already fixed. The
+        // poison-recovering lock_* accessors never panic.
+        let setup = {
+            let settings = state.lock_settings();
+            let external_script = settings.external_asr_script_path();
+            let auto_normalize = settings.auto_normalize;
+            let verbalize_numbers = settings.verbalize_numbers;
+            drop(settings);
+            external_script.map(|script| (script, auto_normalize, verbalize_numbers))
+        };
+        let (external_script, auto_normalize, verbalize_numbers) = match setup {
+            Some(values) => values,
+            None => {
+                WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+                return Err("External ASR provider script is not configured in Settings.".into());
+            }
+        };
+        let db_path = state.lock_pipeline().db_path().to_string();
+
+        // Builder::spawn returns Err on OS thread-creation failure instead of PANICKING like thread::spawn,
+        // so a failed spawn can't leave WSL_REFINE_RUNNING wedged true (the RAII guard lives inside the
+        // closure and would never run on a spawn panic).
+        let spawned = std::thread::Builder::new().name("wsl-7b-batch".into()).spawn(move || {
         // Clears WSL_REFINE_RUNNING + WSL_REFINE_CANCEL on every exit path, including a panic.
         let _running = WslRefineRunningGuard;
         // catch_unwind so a panic in the loop still emits a terminal wsl-status — otherwise the panel
@@ -848,12 +852,21 @@ pub fn run_wsl_refinement(
             serde_json::json!({ "status": status, "transcribed": transcribed, "failed": failed, "exit_code": exit_code }),
         );
     });
-    if let Err(error) = spawned {
-        WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-        return Err(format!("Failed to start the WSL 7B batch worker thread: {error}"));
-    }
+        if let Err(error) = spawned {
+            WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+            return Err(format!("Failed to start the WSL 7B batch worker thread: {error}"));
+        }
 
-    Ok(serde_json::json!({ "status": "started" }))
+        Ok(())
+    })();
+    result
+        .map(|()| crate::ipc_contract::WslRefinementStartedV1 {
+            status: crate::ipc_contract::WslRefinementStartStatusV1::Started,
+        })
+        .map_err(|error| {
+            tracing::warn!("Owner WSL refinement start failed: {error}");
+            crate::ipc_contract::public_wsl_refinement_error(&error)
+        })
 }
 
 struct WslRefinementSummary {
@@ -1046,6 +1059,29 @@ fn run_wsl_refinement_loop(
                 } else {
                     None
                 };
+                let normalizer_version = normalized.as_ref().map(|_| crate::normalizer::NORMALIZER_VERSION);
+                #[derive(serde::Serialize)]
+                #[serde(rename_all = "camelCase")]
+                struct WslRefinementCommitConfigV1<'a> {
+                    schema: u8,
+                    protocol: &'static str,
+                    build_git_sha: &'static str,
+                    model_version_id: &'a str,
+                    deployment_sha256: &'a str,
+                    auto_normalize: bool,
+                    verbalize_numbers: bool,
+                    normalizer_version: Option<&'static str>,
+                }
+                let decoder_config_sha256 = canonical_batch_config_sha256(&WslRefinementCommitConfigV1 {
+                    schema: 1,
+                    protocol: "wsl-refinement-commit-v1",
+                    build_git_sha: crate::GIT_SHA,
+                    model_version_id: &result.model_version_id,
+                    deployment_sha256: &result.deployment_sha256,
+                    auto_normalize,
+                    verbalize_numbers,
+                    normalizer_version,
+                })?;
                 let champion = crate::db::SegmentHypothesis {
                     segment_id: id.to_string(),
                     model_id: result.model_version_id,
@@ -1058,6 +1094,8 @@ fn run_wsl_refinement_loop(
                     normalized.as_deref(),
                     Some("external_provider"),
                     false,
+                    &decoder_config_sha256,
+                    normalizer_version,
                     &source_snapshot,
                 ) {
                     Ok(true) => {
@@ -1221,12 +1259,20 @@ pub async fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize
 }
 
 #[tauri::command]
-pub async fn compute_signal_anomaly_scores(state: State<'_, AppState>) -> Result<usize, String> {
-    RATE_LIMITER.check("compute_signal_anomaly_scores")?;
+#[specta::specta]
+pub async fn compute_signal_anomaly_scores(
+    state: State<'_, AppState>,
+) -> Result<usize, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER
+        .check("compute_signal_anomaly_scores")
+        .map_err(|_| crate::ipc_contract::owner_analysis_rate_limited("compute_signal_anomaly_scores"))?;
     let models_dir = state.lock_model_manager().models_dir.clone();
     let database = state.db_runtime();
-    run_blocking(move || {
-        let mutation = database.begin_mutation()?;
+    let result = run_blocking(move || {
+        let mutation = database.begin_mutation().map_err(|error| {
+            tracing::warn!("Owner signal-analysis admission failed: {error}");
+            error
+        })?;
         // P1.3: `WHERE signal_anomaly_score IS NULL` — see the CTC sibling above.
         let segments = {
             let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
@@ -1284,5 +1330,12 @@ pub async fn compute_signal_anomaly_scores(state: State<'_, AppState>) -> Result
 
         Ok(count)
     })
-    .await
+    .await;
+    result.map_err(|error| {
+        tracing::warn!("Owner signal-anomaly analysis failed: {error}");
+        crate::ipc_contract::public_owner_analysis_error(
+            crate::ipc_contract::OwnerAnalysisOperationV1::SignalAnomaly,
+            &error,
+        )
+    })
 }

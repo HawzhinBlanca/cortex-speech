@@ -433,6 +433,24 @@ impl Database {
         actor: Option<&str>,
         operation_id: &str,
     ) -> AppResult<HumanDecisionUndoOutcome> {
+        self.undo_human_decision_with_authority(effect_event_id, actor, operation_id, None)
+    }
+
+    pub(crate) fn undo_latest_desktop_human_decision(
+        &self,
+        authority: &DesktopHumanDecisionUndoAuthority,
+        operation_id: &str,
+    ) -> AppResult<HumanDecisionUndoOutcome> {
+        self.undo_human_decision_with_authority(authority.effect_event_id, None, operation_id, Some(authority))
+    }
+
+    fn undo_human_decision_with_authority(
+        &self,
+        effect_event_id: i64,
+        actor: Option<&str>,
+        operation_id: &str,
+        expected_desktop_authority: Option<&DesktopHumanDecisionUndoAuthority>,
+    ) -> AppResult<HumanDecisionUndoOutcome> {
         if effect_event_id <= 0 {
             return Err(AppError::Validation("human decision effect id must be positive".into()));
         }
@@ -446,7 +464,7 @@ impl Database {
                             decision_corrected_at, decision_rationale, prior_revision,
                             decision_revision, prior_verified, prior_annotated_transcript, prior_verdict,
                             prior_verdict_transcript, prior_rationale, prior_escalated, prior_human_decision,
-                            prior_corrected_at, prior_reviewed_by
+                            prior_corrected_at, prior_reviewed_by, operation_id, operation_payload_hash
                        FROM human_decision_effect_events WHERE id = ?1",
                     params![effect_event_id],
                     |row| {
@@ -455,6 +473,8 @@ impl Database {
                             segment_id: row.get(1)?,
                             reviewer: row.get(2)?,
                             source: row.get(3)?,
+                            operation_id: row.get(21)?,
+                            operation_payload_hash: row.get(22)?,
                             action: row.get(4)?,
                             decision_transcript: row.get(5)?,
                             decision_annotated_transcript: row.get(6)?,
@@ -478,12 +498,25 @@ impl Database {
                 .optional()?
                 .ok_or_else(|| AppError::Validation("unknown human decision effect id".into()))?;
             let actor_ok = match (effect.source.as_str(), effect.reviewer.as_deref(), actor.map(str::trim)) {
-                ("desktop", None, None) => true,
+                ("desktop", None, None) => expected_desktop_authority.is_some(),
                 ("couch", Some(owner), Some(candidate)) => owner.eq_ignore_ascii_case(candidate),
                 _ => false,
             };
             if !actor_ok {
                 return Err(AppError::Validation("human decision undo actor does not own this effect".into()));
+            }
+            if let Some(expected) = expected_desktop_authority {
+                let exact_identity = effect.source == "desktop"
+                    && effect.reviewer.is_none()
+                    && effect.segment_id == expected.segment_id
+                    && effect.action == expected.action
+                    && effect.operation_id.as_deref() == Some(expected.decision_operation_id.as_str())
+                    && effect.operation_payload_hash.as_deref() == Some(expected.decision_payload_hash.as_str());
+                if !exact_identity {
+                    return Err(AppError::Validation(
+                        "desktop Undo authority no longer identifies the same immutable decision".into(),
+                    ));
+                }
             }
             if effect.decision_rationale != effect.prior_rationale {
                 return Err(AppError::Other(
@@ -506,6 +539,37 @@ impl Database {
                 } else {
                     HumanDecisionUndoOutcome::Conflict { segment: current.0 }
                 });
+            }
+            if let Some(expected) = expected_desktop_authority {
+                // Phone inverses intentionally retain their deployed, bodyless idempotency contract:
+                // only the reversal table owns that operation UUID. Desktop Undo uses the global
+                // review-operation namespace because a cross-domain collision could otherwise make
+                // one renderer retry name two different durable actions.
+                let operation_collision_count: i64 = tx.query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM review_events WHERE operation_id=?1)
+                       + (SELECT COUNT(*) FROM human_decision_effect_events WHERE operation_id=?1)
+                       + (SELECT COUNT(*) FROM human_decision_effect_reversals WHERE operation_id=?1)
+                       + (SELECT COUNT(*) FROM review_flag_effect_events WHERE operation_id=?1)
+                       + (SELECT COUNT(*) FROM review_flag_effect_reversals WHERE operation_id=?1)",
+                    params![operation_id],
+                    |row| row.get(0),
+                )?;
+                if operation_collision_count != 0 {
+                    return Err(AppError::Validation(
+                        "human decision undo operation UUID is already bound to another review action".into(),
+                    ));
+                }
+                Self::require_canonical_operation_namespace_on(&tx, operation_id)?;
+                let current_authority = Self::desktop_review_undo_availability_on(&tx)?;
+                if current_authority
+                    != DesktopReviewUndoAvailability::Available(DesktopReviewUndoAuthority::Decision(expected.clone()))
+                {
+                    tx.rollback()?;
+                    return Err(AppError::Validation(
+                        "desktop Undo target is no longer the globally current review action".into(),
+                    ));
+                }
             }
             let expected_verdict = human_verdict_for_decision(&effect.action)?;
             let expected_verdict_transcript = if effect.action == "reject" {
@@ -655,9 +719,13 @@ impl Database {
     pub fn record_review_flag(
         &self,
         segment_id: &str,
+        base_revision: i64,
         rationale: &str,
         operation_id: &str,
     ) -> AppResult<HumanFlagCommit> {
+        if base_revision < 0 {
+            return Err(AppError::Validation("review flag base revision must be non-negative".into()));
+        }
         let rationale = to_nfc(rationale.trim());
         if rationale.is_empty() {
             return Err(AppError::Validation("review flag rationale must not be blank".into()));
@@ -688,7 +756,10 @@ impl Database {
                 )
                 .optional()?;
             if let Some((effect_event_id, replay_segment_id, prior_revision, flag_revision, replay_rationale)) = replay {
-                if replay_segment_id != segment_id || replay_rationale != rationale {
+                if replay_segment_id != segment_id
+                    || prior_revision != base_revision
+                    || replay_rationale != rationale
+                {
                     return Err(AppError::Validation(
                         "review flag operation UUID was already used for a different request".into(),
                     ));
@@ -743,11 +814,54 @@ impl Database {
                     segment: current.0,
                 });
             }
+            let operation_collision_count: i64 = tx.query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM review_events WHERE operation_id=?1)
+                   + (SELECT COUNT(*) FROM human_decision_effect_events WHERE operation_id=?1)
+                   + (SELECT COUNT(*) FROM human_decision_effect_reversals WHERE operation_id=?1)
+                   + (SELECT COUNT(*) FROM review_flag_effect_reversals WHERE operation_id=?1)",
+                params![operation_id],
+                |row| row.get(0),
+            )?;
+            if operation_collision_count != 0 {
+                return Err(AppError::Validation(
+                    "review flag operation UUID is already bound to another review action".into(),
+                ));
+            }
+            Self::require_canonical_operation_namespace_on(&tx, operation_id)?;
             let (prior, prior_revision, _) = Self::decision_snapshot_on(&tx, segment_id)?
-                .ok_or_else(|| AppError::Validation("cannot flag an unknown segment".into()))?;
+                .ok_or_else(|| AppError::Validation("E_REVIEW_FLAG_SEGMENT_NOT_FOUND".into()))?;
+            if prior_revision != base_revision {
+                return Err(AppError::Validation(format!(
+                    "E_STALE_REVIEW_FLAG_REVISION:{prior_revision}"
+                )));
+            }
             if crate::quality::is_technically_unusable(&prior) {
                 return Err(AppError::Validation(
                     "cannot replace a durable technical-unusable marker with a generic review flag; undo its exact effect first"
+                        .into(),
+                ));
+            }
+            // Exact response-loss replay was resolved above. A different UUID must not stack a
+            // second human flag on the same still-active effect after the renderer restarted and
+            // lost the original operation identity. Undo the exact effect before flagging again.
+            let active_flag: bool = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1
+                       FROM review_flag_effect_events effect
+                      WHERE effect.segment_id = ?1
+                        AND effect.flag_revision = ?2
+                        AND NOT EXISTS (
+                            SELECT 1 FROM review_flag_effect_reversals reversal
+                             WHERE reversal.flag_effect_event_id = effect.id
+                        )
+                 )",
+                params![segment_id, prior_revision],
+                |row| row.get(0),
+            )?;
+            if active_flag {
+                return Err(AppError::Validation(
+                    "review flag already has an active immutable effect; retry its original operation or undo it before flagging again"
                         .into(),
                 ));
             }
@@ -810,6 +924,21 @@ impl Database {
         })?;
         self.track_write()?;
         Ok(commit)
+    }
+
+    /// Characterization-only convenience for historical tests whose subject is not renderer CAS.
+    /// Production callers cannot derive authority from ambient database state.
+    #[cfg(test)]
+    pub(crate) fn record_review_flag_for_test(
+        &self,
+        segment_id: &str,
+        rationale: &str,
+        operation_id: &str,
+    ) -> AppResult<HumanFlagCommit> {
+        let base_revision = self
+            .segment_review_revision(segment_id)?
+            .ok_or_else(|| AppError::Validation("E_REVIEW_FLAG_SEGMENT_NOT_FOUND".into()))?;
+        self.record_review_flag(segment_id, base_revision, rationale, operation_id)
     }
 
     pub(super) fn replay_technical_unusable_on(
@@ -884,13 +1013,9 @@ impl Database {
                 "technical-unusable operation was committed, but its exact post-state is no longer current".into(),
             ));
         }
-        // A draft autosave can race just behind the first committed action, or be retried by a
-        // renderer that lost the success response. Re-delete only the original revision's stale
-        // draft; a draft for the committed/newer revision is never touched.
-        conn.execute(
-            "DELETE FROM review_drafts WHERE segment_id = ?1 AND base_revision = ?2",
-            params![segment_id, base_revision],
-        )?;
+        // Review drafts are non-authoritative human work. A technical media classification must
+        // not erase one: the exact flag inverse restores database truth, while the retained draft
+        // remains available after restart for repair/review.
         Ok(Some(HumanFlagCommit {
             effect_event_id,
             segment_id: replay_segment_id,
@@ -984,6 +1109,21 @@ impl Database {
                 tx.commit()?;
                 return Ok(replay);
             }
+            let operation_collision_count: i64 = tx.query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM review_events WHERE operation_id=?1)
+                   + (SELECT COUNT(*) FROM human_decision_effect_events WHERE operation_id=?1)
+                   + (SELECT COUNT(*) FROM human_decision_effect_reversals WHERE operation_id=?1)
+                   + (SELECT COUNT(*) FROM review_flag_effect_reversals WHERE operation_id=?1)",
+                params![operation_id],
+                |row| row.get(0),
+            )?;
+            if operation_collision_count != 0 {
+                return Err(AppError::Validation(
+                    "technical-unusable operation UUID is already bound to another review action".into(),
+                ));
+            }
+            Self::require_canonical_operation_namespace_on(&tx, operation_id)?;
 
             let (prior, current_revision, current_audio_content_hash) = Self::decision_snapshot_on(&tx, segment_id)?
                 .ok_or_else(|| {
@@ -1074,13 +1214,8 @@ impl Database {
             )?;
             let effect_event_id = tx.last_insert_rowid();
 
-            // A successful queue-terminal action clears only the draft bound to the exact state the
-            // renderer marked. It cannot erase a draft for a later revision, and a failed transaction
-            // leaves the draft intact.
-            tx.execute(
-                "DELETE FROM review_drafts WHERE segment_id = ?1 AND base_revision = ?2",
-                params![segment_id, base_revision],
-            )?;
+            // Technical classification is not a human transcript decision. Preserve any saved
+            // revision-bound draft so an exact Undo or later source repair cannot lose owner work.
 
             let segment = Self::decision_snapshot_on(&tx, segment_id)?
                 .ok_or_else(|| AppError::Other("segment disappeared inside technical-unusable transaction".into()))?
@@ -1098,7 +1233,27 @@ impl Database {
         Ok(commit)
     }
 
+    pub(crate) fn undo_latest_desktop_review_flag(
+        &self,
+        expected: &DesktopReviewFlagUndoAuthority,
+        operation_id: &str,
+    ) -> AppResult<HumanFlagUndoOutcome> {
+        self.undo_review_flag_with_authority(expected.effect_event_id, operation_id, Some(expected))
+    }
+
+    /// Characterization-only inverse for historical database tests. Production desktop callers
+    /// must supply the complete server-issued flag authority above.
+    #[cfg(test)]
     pub fn undo_review_flag(&self, effect_event_id: i64, operation_id: &str) -> AppResult<HumanFlagUndoOutcome> {
+        self.undo_review_flag_with_authority(effect_event_id, operation_id, None)
+    }
+
+    fn undo_review_flag_with_authority(
+        &self,
+        effect_event_id: i64,
+        operation_id: &str,
+        expected_desktop_authority: Option<&DesktopReviewFlagUndoAuthority>,
+    ) -> AppResult<HumanFlagUndoOutcome> {
         if effect_event_id <= 0 {
             return Err(AppError::Validation("review flag effect id must be positive".into()));
         }
@@ -1107,25 +1262,53 @@ impl Database {
             let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
             let effect = tx
                 .query_row(
-                    "SELECT segment_id, flag_revision, prior_verdict,
+                    "SELECT segment_id, operation_id, prior_revision, flag_revision, prior_verdict,
                             prior_rationale, flag_rationale, prior_escalated
                        FROM review_flag_effect_events WHERE id = ?1",
                     params![effect_event_id],
                     |row| {
                         Ok(FlagEffectSnapshot {
                             segment_id: row.get(0)?,
-                            flag_revision: row.get(1)?,
-                            prior_verdict: row.get(2)?,
-                            prior_rationale: row.get(3)?,
-                            flag_rationale: row.get(4)?,
-                            prior_escalated: row.get::<_, i32>(5)? != 0,
+                            operation_id: row.get(1)?,
+                            prior_revision: row.get(2)?,
+                            flag_revision: row.get(3)?,
+                            prior_verdict: row.get(4)?,
+                            prior_rationale: row.get(5)?,
+                            flag_rationale: row.get(6)?,
+                            prior_escalated: row.get::<_, i32>(7)? != 0,
                         })
                     },
                 )
                 .optional()?
                 .ok_or_else(|| AppError::Validation("unknown review flag effect id".into()))?;
-            let current = Self::decision_snapshot_on(&tx, &effect.segment_id)?
-                .ok_or_else(|| AppError::Validation("cannot undo a flag whose segment no longer exists".into()))?;
+            let flag_kind = match crate::quality::technical_unusable_reason_from_rationale(Some(&effect.flag_rationale))
+            {
+                Some(reason) => DesktopReviewFlagKind::TechnicalUnusable(reason.to_string()),
+                None if effect.flag_rationale.starts_with(crate::quality::TECHNICAL_UNUSABLE_RATIONALE_PREFIX) => {
+                    return Err(AppError::Other(
+                        "review flag effect contains a malformed reserved technical rationale".into(),
+                    ));
+                }
+                None => DesktopReviewFlagKind::Generic,
+            };
+            if let Some(expected) = expected_desktop_authority {
+                let exact_identity = effect_event_id == expected.effect_event_id
+                    && effect.segment_id == expected.segment_id
+                    && effect.operation_id == expected.flag_operation_id
+                    && effect.prior_revision == expected.prior_revision
+                    && effect.flag_revision == expected.flag_revision
+                    && desktop_review_flag_payload_hash(
+                        &effect.segment_id,
+                        effect.prior_revision,
+                        &effect.flag_rationale,
+                    ) == expected.flag_payload_hash
+                    && flag_kind == expected.flag_kind;
+                if !exact_identity {
+                    return Err(AppError::Validation(
+                        "desktop Undo authority no longer identifies the same immutable review flag".into(),
+                    ));
+                }
+            }
             let prior_reversal: Option<String> = tx
                 .query_row(
                     "SELECT operation_id FROM review_flag_effect_reversals WHERE flag_effect_event_id = ?1",
@@ -1136,10 +1319,41 @@ impl Database {
             if let Some(prior_operation) = prior_reversal {
                 tx.rollback()?;
                 return Ok(if prior_operation == operation_id {
-                    HumanFlagUndoOutcome::AlreadyApplied { segment: current.0 }
+                    HumanFlagUndoOutcome::AlreadyApplied
                 } else {
-                    HumanFlagUndoOutcome::Conflict { segment: current.0 }
+                    HumanFlagUndoOutcome::Conflict
                 });
+            }
+            let current = Self::decision_snapshot_on(&tx, &effect.segment_id)?
+                .ok_or_else(|| AppError::Validation("cannot undo a flag whose segment no longer exists".into()))?;
+            let operation_collision_count: i64 = tx.query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM review_events WHERE operation_id=?1)
+                   + (SELECT COUNT(*) FROM human_decision_effect_events WHERE operation_id=?1)
+                   + (SELECT COUNT(*) FROM human_decision_effect_reversals WHERE operation_id=?1)
+                   + (SELECT COUNT(*) FROM review_flag_effect_events WHERE operation_id=?1)
+                   + (SELECT COUNT(*) FROM review_flag_effect_reversals WHERE operation_id=?1)",
+                params![operation_id],
+                |row| row.get(0),
+            )?;
+            if operation_collision_count != 0 {
+                return Err(AppError::Validation(
+                    "review flag undo operation UUID is already bound to another review action".into(),
+                ));
+            }
+            Self::require_canonical_operation_namespace_on(&tx, operation_id)?;
+            if let Some(expected) = expected_desktop_authority {
+                let current_authority = Self::desktop_review_undo_availability_on(&tx)?;
+                if current_authority
+                    != DesktopReviewUndoAvailability::Available(DesktopReviewUndoAuthority::Flag(expected.clone()))
+                {
+                    tx.rollback()?;
+                    return Err(AppError::Validation(
+                        "desktop Undo target is no longer the globally current review action".into(),
+                    ));
+                }
+            } else {
+                Self::require_latest_desktop_review_action_on(&tx, "flag", effect_event_id)?;
             }
             let later_review_mutation: bool = tx.query_row(
                 "SELECT EXISTS(
@@ -1158,7 +1372,7 @@ impl Database {
             )?;
             if current.1 < effect.flag_revision || later_review_mutation {
                 tx.rollback()?;
-                return Ok(HumanFlagUndoOutcome::Conflict { segment: current.0 });
+                return Ok(HumanFlagUndoOutcome::Conflict);
             }
             let changed = tx.execute(
                 "UPDATE speech_segments
@@ -1179,7 +1393,7 @@ impl Database {
             )?;
             if changed == 0 {
                 tx.rollback()?;
-                return Ok(HumanFlagUndoOutcome::Conflict { segment: current.0 });
+                return Ok(HumanFlagUndoOutcome::Conflict);
             }
             let restored_revision: i64 = tx.query_row(
                 "SELECT review_revision FROM speech_segments WHERE id = ?1",
@@ -1198,7 +1412,7 @@ impl Database {
                 .ok_or_else(|| AppError::Other("segment disappeared inside review flag undo".into()))?
                 .0;
             tx.commit()?;
-            Ok(HumanFlagUndoOutcome::Applied { restored_revision, segment })
+            Ok(HumanFlagUndoOutcome::Applied { restored_revision, segment: Box::new(segment) })
         })?;
         if matches!(&outcome, HumanFlagUndoOutcome::Applied { .. }) {
             self.track_write()?;
@@ -1641,12 +1855,25 @@ impl Database {
             _ => {
                 let shipped: Option<String> = conn
                     .query_row(
-                        "SELECT COALESCE(NULLIF(TRIM(verdict_transcript), ''),                                  NULLIF(TRIM(annotated_transcript), ''),                                  raw_transcript)                          FROM speech_segments WHERE id = ?1",
+                        "SELECT CASE
+                                  WHEN (
+                                         lower(trim(COALESCE(human_decision, ''))) IN
+                                             ('accept','edit','human_accept','human_edit')
+                                      OR lower(trim(COALESCE(verdict, ''))) IN
+                                             ('human_accept','human_edit')
+                                       )
+                                   AND NULLIF(TRIM(verdict_transcript), '') IS NOT NULL
+                                  THEN verdict_transcript
+                                  WHEN NULLIF(TRIM(annotated_transcript), '') IS NOT NULL
+                                  THEN annotated_transcript
+                                  ELSE raw_transcript
+                                END
+                           FROM speech_segments WHERE id = ?1",
                         [segment_id],
                         |row| row.get(0),
                     )
                     .optional()?;
-                match shipped.map(|text| to_nfc(text.trim())).filter(|text| !text.is_empty()) {
+                match shipped.filter(|text| !text.trim().is_empty()) {
                     Some(text) => (text.clone(), Some(text)),
                     // Nothing to verify against; leave the caller's decision untouched rather than
                     // invent a classification.

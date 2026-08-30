@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ValidationReport {
     pub total_segments: usize,
@@ -20,7 +20,7 @@ pub struct ValidationReport {
     pub summary: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ValidationIssue {
     pub severity: IssueSeverity,
@@ -31,13 +31,13 @@ pub struct ValidationIssue {
     pub details: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, PartialEq)]
 pub enum IssueSeverity {
     Error,
     Warning,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, PartialEq)]
 pub enum IssueCategory {
     MissingAudio,
     EmptyTranscript,

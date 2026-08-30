@@ -178,6 +178,8 @@ pub(crate) fn validate_playback_receipt_semantics(db: &crate::db::Database) -> R
 }
 
 pub(crate) fn validate_restore_target_semantics(db: &crate::db::Database) -> Result<(), String> {
+    db.validate_desktop_review_action_journal()
+        .map_err(|error| format!("database restore refused: desktop review action journal is invalid: {error}"))?;
     validate_review_compensation_semantics(db)?;
     validate_review_effect_semantics(db)?;
     validate_playback_receipt_semantics(db)?;

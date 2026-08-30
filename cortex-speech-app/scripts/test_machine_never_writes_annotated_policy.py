@@ -10,8 +10,8 @@ draft sat invisible in ``raw_transcript``. The data was cleaned and a live-DB ga
      not touch ``annotated_transcript`` at all — it used to seed it with the LLM-refined machine
      paraphrase via ``COALESCE(annotated_transcript, ?8)``, which then outranked every later
      champion re-draft forever.
-  2. No Svelte handler may assign machine ASR output into ``annotatedTranscript`` — the remaining
-     production re-transcribe paths are the champion actions in App and ReviewMode.
+  2. No frontend handler may assign machine ASR output into ``annotatedTranscript`` — the remaining
+     production re-transcribe paths are the workstation segment service and ReviewMode.
 
 Static source checks: sandbox-safe, no DB required.
 """
@@ -65,7 +65,7 @@ def main() -> int:
     #    Human writers (submit/save/draft paths persisting the reviewer's editText) stay legal —
     #    provenance is per-function, so the check is function-scoped, not line-scoped.
     machine_handlers = {
-        APP / "src" / "Workstation.svelte": ["handleTranscribe"],
+        APP / "src" / "lib" / "workstationSegmentActions.ts": ["transcribe"],
         APP / "src" / "lib" / "ReviewMode.svelte": ["doRetranscribe"],
     }
     for path, names in machine_handlers.items():
@@ -79,11 +79,15 @@ def main() -> int:
                     "must write raw/normalized only; the human-only field is off limits"
                 )
 
-    # 3. Belt-and-braces net for NEW handlers: the tell-tale machine shape anywhere in a .svelte.
+    # 3. Belt-and-braces net for NEW handlers: the tell-tale machine shape anywhere in shipped
+    #    frontend source. Tests are evidence fixtures, not production writers.
     forbidden = re.compile(r"annotatedTranscript\s*[:=]\s*result\.\w+")
-    for svelte in sorted((APP / "src").rglob("*.svelte")):
-        rel = svelte.relative_to(APP)
-        for n, line in enumerate(svelte.read_text(encoding="utf-8").splitlines(), 1):
+    sources = sorted((APP / "src").rglob("*.svelte")) + sorted((APP / "src").rglob("*.ts"))
+    for source_path in sources:
+        if source_path.name.endswith((".test.ts", ".spec.ts")):
+            continue
+        rel = source_path.relative_to(APP)
+        for n, line in enumerate(source_path.read_text(encoding="utf-8").splitlines(), 1):
             if forbidden.search(line):
                 failures.append(f"{rel}:{n}: machine result assigned into annotatedTranscript: {line.strip()}")
 

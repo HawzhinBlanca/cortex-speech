@@ -98,61 +98,51 @@ def test_retranscribe_uses_authoritative_champion_row_and_guards_editor_writes()
 
 
 def test_submit_guards_editor_writes_against_navigation() -> None:
-    """ReviewMode.submit() (accept/edit): after the typed atomic commitReviewV1 await, the authoritative
-    returned row is applied to seg by id (correct even if the reviewer navigated away,
-    hundreds of ms), but editText/lastLoadedOriginal/editedChips belong to the CURRENT clip. Without a
-    current-vs-seg recheck, navigating mid-await puts seg's text into another clip's editor (and submit never
-    resets lastLoadedId, so that clip's load effect no-ops and never reloads its own text); a subsequent Save
-    persists it as that clip's human-verified gold — wrong-segment gold corruption (THE ONE LAW).
-
-    The windowed queue cannot simply early-return before removing the now-reviewed row: it captures the visible
-    id after the write, conditionally mutates editor state only when that id still belongs to seg, removes seg,
-    and then restores a genuinely navigated row. Pin that equivalent (and component-tested) state machine
-    instead of requiring the old literal early-return guard."""
-    body = _function_body(_read("src/lib/ReviewMode.svelte"), "async function submit(")
-    # v60 removes the second renderer-owned write completely: decision, verification and transcript
-    # commit together, and the UI consumes only the server-returned authoritative row.  The navigation
-    # invariant remains: that id-targeted store update must precede the guarded editor write.
-    base_revision = body.find("const baseRevision = reviewRevisions[seg.id];")
-    decision_commit = body.find("const commit = await api.commitReviewV1(")
-    store_write = body.find("segments.update((list)", decision_commit)
-    authoritative_text = body.find("commit.authoritativeTranscript", store_write)
-    visible_capture = body.find("const visibleId = current?.id ?? null;")
-    editor_guard = body.find("if (visibleId === seg.id)", visible_capture)
-    guard_open = body.find("{", editor_guard)
-    guard_close = _matching_brace(body, guard_open)
-    editor_write = body.find("editText = text;", editor_guard)
-    if -1 in (base_revision, decision_commit, store_write, authoritative_text, editor_write):
-        raise AssertionError("submit atomic-commit/store/editor markers are missing — gate vacuous")
-    if (
-        visible_capture == -1
-        or editor_guard == -1
-        or guard_open == -1
-        or guard_close == -1
-        or not (
-            base_revision
-            < decision_commit
-            < store_write
-            < authoritative_text
-            < visible_capture
-            < editor_guard
-            < guard_open
-            < editor_write
-            < guard_close
-        )
-    ):
+    """ReviewMode.submit() must bind the draft/playback/commit to one clip+revision and then reload
+    every rendered projection from database truth. It must not optimistically write the segment store or
+    editor after the await: navigation during the native commit could otherwise put one clip's transcript in
+    another editor or let a stale local row masquerade as the committed decision."""
+    body = _function_body(
+        _read("src/lib/reviewModeDecisions.svelte.ts"), "async function submit("
+    )
+    base_revision = body.find("const revision = baseRevision(segment);")
+    draft_flush = body.find("await deps.draft.flush();", base_revision)
+    navigation_guard = body.find("deps.queue.current()?.id !== segment.id", draft_flush)
+    playback = body.find("await deps.playback.finalize(segment, revision)", navigation_guard)
+    truth_guard = body.find("durableUndo.truthWriteStillCurrent(truthLease)", playback)
+    operation = body.find("const decisionOperationId = commitOperations.idFor(intent);", truth_guard)
+    decision_commit = body.find("const commit = await api.commitReviewV1({")
+    response_check = body.find("const effectId = committedEffectId(segment, revision, commit);", decision_commit)
+    projection_reload = body.find("await settleTruthProjection(truthLease", response_check)
+    markers = (
+        base_revision,
+        draft_flush,
+        navigation_guard,
+        playback,
+        truth_guard,
+        operation,
+        decision_commit,
+        response_check,
+        projection_reload,
+    )
+    if -1 in markers or list(markers) != sorted(markers):
         raise AssertionError(
-            "submit() writes editText without capturing the post-await visible id and guarding the editor "
-            "write with `if (visibleId === seg.id)`: navigating during the decision await would put seg's "
-            "text into another clip's editor and Save it as that clip's human gold."
+            "submit() lost its clip/revision guard, exact operation identity, response validation, or "
+            "database-projection settlement ordering"
         )
     if any(
         forbidden in body
-        for forbidden in ("api.updateSegmentFields(seg.id", "api.updateSegmentMetadataV1(seg.id", "api.updateSegment(")
+        for forbidden in (
+            "segments.update(",
+            "deps.setEditText(",
+            "api.updateSegmentFields(segment.id",
+            "api.updateSegmentMetadataV1(segment.id",
+            "api.updateSegment(",
+        )
     ):
         raise AssertionError(
-            "submit() performs a second renderer-owned segment write after the atomic human decision; "
-            "that can split verification from its immutable effect or clobber a fresher row"
+            "submit() performs a renderer-owned projection/editor write after the atomic human decision; "
+            "database truth must be reloaded through settleTruthProjection instead"
         )
 
 
@@ -160,19 +150,21 @@ def test_review_mode_drafts_are_session_local_until_atomic_decision() -> None:
     """A typed ReviewMode draft is not authoritative human truth until submit() atomically records the
     decision and all effects. Navigation may retain it in the in-session editCache, but navigation and
     teardown must never persist annotatedTranscript by themselves."""
-    src = _read("src/lib/ReviewMode.svelte")
-    body = _function_body(src, "async function go(")
+    shell = _read("src/lib/ReviewMode.svelte")
+    draft = _read("src/lib/reviewModeDraft.svelte.ts")
+    decisions = _read("src/lib/reviewModeDecisions.svelte.ts")
+    surface = "\n".join((shell, draft, decisions))
     for forbidden in ("api.updateSegmentFields(", "api.updateSegmentMetadataV1(", "api.updateSegment("):
-        if forbidden in src:
+        if forbidden in surface:
             raise AssertionError(
                 f"ReviewMode still contains {forbidden!r}; drafts must stay session-local until the atomic "
                 "recordHumanDecision commit"
             )
-    if "session-local editCache" not in body or "const editCache = new Map<string, string>()" not in src:
+    if "const editCache = new Map<string, string>()" not in draft or "void queueWrite(" not in draft:
         raise AssertionError(
             "ReviewMode navigation no longer proves that dirty drafts remain in its per-segment session cache"
         )
-    if "await api.commitReviewV1(" not in src:
+    if "await api.commitReviewV1({" not in decisions:
         raise AssertionError("ReviewMode lost its only durable human-review commit path")
 
 
@@ -182,10 +174,10 @@ def test_inbox_undo_bails_while_a_decision_is_in_flight() -> None:
     while its record is still in flight — losing the undo; and if the in-flight action then rejects, its
     catch does a second history.slice(0,-1), dropping a PREVIOUS segment's entry. The four persisting
     actions all guard isSubmitting; undo must too."""
-    body = _function_body(_read("src/lib/ReviewInbox.svelte"), "async function undo(")
-    if "if (isSubmitting) return;" not in body:
+    body = _function_body(_read("src/lib/reviewInboxDecisions.svelte.ts"), "async function undo(")
+    if "if (state.submitting || deps.draft.state.editing) return;" not in body:
         raise AssertionError(
-            "undo() has no `if (isSubmitting) return;` guard — a Backspace during an in-flight decision "
+            "undo() has no submitting/editing guard — a Backspace during an in-flight decision "
             "races clearHumanDecision against the record still in flight and can corrupt the history stack. "
             "Add the guard at the top of undo(), matching the four persisting actions."
         )
@@ -211,34 +203,36 @@ def test_frontend_has_no_generic_whole_row_segment_writer() -> None:
 
 
 def test_app_export_audio_excludes_human_rejected() -> None:
-    """Workstation.svelte handleExportAudio must filter ids with isVerifiedGood (verified AND NOT
+    """The workstation export service must filter ids with isVerifiedGood (verified AND NOT
     human-rejected), never raw s.verified: markBad finalizes a REJECTED clip with verified=true (to pull it
     out of the review queue), so a plain s.verified filter ships human-rejected clips + their bad transcripts
     into the 'verified audio' dataset as if human-gold — the export-honesty / count-must-exclude-rejected
     class. The SettingsPanel export and the Rust export_dataset (!is_human_rejected) already exclude them."""
-    body = _function_body(_read("src/Workstation.svelte"), "async function handleExportAudio(")
-    if "isVerifiedGood(s)" not in body:
+    body = _function_body(
+        _read("src/lib/workstationExportActions.ts"), "  async function exportAudio("
+    )
+    if ".filter((segment) => isVerifiedGood(segment))" not in body:
         raise AssertionError(
-            "handleExportAudio does not filter with isVerifiedGood — a raw s.verified filter exports "
+            "workstation exportAudio does not filter with isVerifiedGood — a raw verified filter exports "
             "human-rejected ('mark bad') clips as verified audio. Use `.filter((s) => isVerifiedGood(s))`."
         )
-    if ".filter((s) => s.verified)" in body:
-        raise AssertionError("handleExportAudio still filters raw s.verified; rejected clips leak into the export")
+    if re.search(r"\.filter\(\([^)]*\)\s*=>\s*[^)]*\.verified\)", body):
+        raise AssertionError("exportAudio still filters raw verified state; rejected clips leak into the export")
 
 
 def test_waveform_stretches_peaks_across_the_canvas() -> None:
-    """Waveform.draw() maps each bar to a FRACTIONAL slice of the fixed-length peak array so the peaks fill
+    """The waveform renderer maps each bar to a FRACTIONAL slice of the fixed-length peak array so the peaks fill
     the full canvas width. The old `samplesPerBar = max(1, floor(len/numBars))` with `startIdx =
     i*samplesPerBar` mapped 1 sample:1 bar whenever numBars>len (any zoom>1 / a card wider than
     ~len*barWidth px), cramming all peaks into the left strip while the ruler ticks, word-grid labels and
     the amber playhead span the full width via (t/duration)*w — a playhead-vs-waveform misalignment that
     misleads the reviewer inspecting word alignment (the exact purpose of the zoom slider)."""
-    src = _read("src/lib/Waveform.svelte")
-    if "Math.floor((i * waveform.length) / numBars)" not in src:
+    src = _read("src/lib/waveformRenderer.ts")
+    if "Math.floor((index * waveform.length) / numBars)" not in src:
         raise AssertionError(
             "Waveform.draw() does not map bars fractionally across the peak array — a 1-sample:1-bar map "
             "crams the waveform into the left while the playhead/labels span the full width. Use "
-            "`startIdx = Math.floor((i * waveform.length) / numBars)`."
+            "`startIndex = Math.floor((index * waveform.length) / numBars)`."
         )
     if "const samplesPerBar = Math.max(1, Math.floor(waveform.length / numBars));" in src:
         raise AssertionError("Waveform still uses the 1-sample:1-bar samplesPerBar clamp; peaks won't fill the width")
@@ -248,10 +242,17 @@ def test_library_review_truth_is_read_only_and_metadata_writer_is_narrow() -> No
     """The main library may play and inspect transcript/diff data, but only ReviewMode can correct and
     approve it. Its remaining partial writer is statically and dynamically limited to speaker/alignment
     metadata, and no frontend call may send annotatedTranscript or verified through it."""
-    app = _read("src/Workstation.svelte")
+    workstation = _read("src/Workstation.svelte")
+    transcript_panel = _read("src/lib/WorkstationTranscriptPanel.svelte")
+    annotation_panel = _read("src/lib/WorkstationAnnotationPanel.svelte")
+    playback_controller = _read("src/lib/workstationPlaybackController.svelte.ts")
+    segment_actions = _read("src/lib/workstationSegmentActions.ts")
+    app = "\n".join(
+        (workstation, transcript_panel, annotation_panel, playback_controller, segment_actions)
+    )
     commands = _read("src/lib/commands.ts")
     coordinator = _read("src/lib/segmentMetadataCoordinator.ts")
-    review_mode = _read("src/lib/ReviewMode.svelte")
+    review_mode = _read("src/lib/reviewModeDecisions.svelte.ts")
 
     forbidden_ui = (
         "handleSaveAnnotation",
@@ -278,8 +279,14 @@ def test_library_review_truth_is_read_only_and_metadata_writer_is_narrow() -> No
     transcript_end = app.find("</textarea>", transcript_start)
     if transcript_start == -1 or transcript_end == -1 or "readonly" not in app[transcript_start:transcript_end]:
         raise AssertionError("the library's annotated transcript surface is not explicitly read-only")
-    for retained in ("<DiffView", "function playWordClip(", "async function handleAlign(", "handleSaveSpeaker"):
-        if retained not in app:
+    retained_capabilities = (
+        (annotation_panel, "<DiffView"),
+        (playback_controller, "function playWordClip("),
+        (segment_actions, "async function align("),
+        (segment_actions, "async function saveSpeaker("),
+    )
+    for owner, retained in retained_capabilities:
+        if retained not in owner:
             raise AssertionError(f"the read-only/metadata library capability {retained!r} was removed")
 
     if "export type SegmentMetadataFields = Partial<" not in commands or (
@@ -329,7 +336,7 @@ def test_library_review_truth_is_read_only_and_metadata_writer_is_narrow() -> No
                     )
             cursor = closing + 1
 
-    if "await api.commitReviewV1(" not in review_mode:
+    if "await api.commitReviewV1({" not in review_mode:
         raise AssertionError("ReviewMode no longer owns the atomic human-decision path")
 
 
@@ -341,16 +348,18 @@ def test_settings_close_persist_routes_through_savequietly() -> None:
     maxSpeakers, jurySelfConsistencyN) then closing via the ✕/Escape gesture sent NaN->null and failed the
     ENTIRE backend write, silently discarding every settings edit the user did make (a settings-loss bug)
     while leaving NaN in the reactive store. save() and saveQuietly() both coerce first; onDestroy didn't."""
-    body = _function_body(_read("src/lib/SettingsPanel.svelte"), "onDestroy(() => {")
-    if "saveQuietly()" not in body:
+    panel_body = _function_body(_read("src/lib/SettingsPanel.svelte"), "onDestroy(() => {")
+    persistence = _read("src/lib/settingsPersistenceController.ts")
+    save_on_destroy = _function_body(persistence, "  function saveOnDestroy(")
+    if "persistence.saveOnDestroy()" not in panel_body or "void saveQuietly()" not in save_on_destroy:
         raise AssertionError(
-            "SettingsPanel onDestroy does not persist via saveQuietly() — the close-to-save path must reuse "
+            "SettingsPanel onDestroy does not route through saveOnDestroy -> saveQuietly — the close-to-save path must reuse "
             "it for NaN coercion + rollback + error toast. A bare api.updateSettings here silently discards "
             "all edits when a numeric field was cleared to NaN before the ✕/Escape close."
         )
-    if "api.updateSettings(localSettings).catch" in body:
+    if "api.updateSettings(" in panel_body:
         raise AssertionError(
-            "SettingsPanel onDestroy still fire-and-forgets api.updateSettings(localSettings).catch, which "
+            "SettingsPanel onDestroy still writes settings directly, which "
             "skips coerceSettingsForRuntime — route the close-to-save through saveQuietly() instead."
         )
 
@@ -362,10 +371,10 @@ def test_settings_persists_are_serialized_so_a_stale_rollback_cannot_clobber_a_n
     and every input back past the newer persisted state — worst case re-granting a cloud consent the
     user had successfully withdrawn (audit fix 2026-08-20). Every backend settings write must route
     through one queue so a rollback target is always the true last-persisted state."""
-    src = _read("src/lib/SettingsPanel.svelte")
+    src = _read("src/lib/settingsPersistenceController.ts")
     if "persistQueue.then(job)" not in src or "persistBusy" not in src:
         raise AssertionError(
-            "SettingsPanel no longer chains settings writes through persistQueue — overlapping saves "
+            "The settings persistence controller no longer chains writes through persistQueue — overlapping saves "
             "can interleave, and a stale rollback then reverts a newer successful save (consent included)."
         )
     for caller, needle in (("saveQuietly", "return enqueuePersist("), ("save", "await enqueuePersist(")):
@@ -389,14 +398,24 @@ def test_refinery_panel_renders_undefined_metric_for_a_zero_segment_eval() -> No
     "WER/CER are undefined (not 0%)" and the promotion gate returns "CANNOT EVALUATE … undefined, not 0".
     This panel is the one surface that shows the raw run.wer/run.cer, so it must mirror that convention:
     WER/CER go through a numSegs-guarded formatter, never a bare pct(run.wer)/pct(evalResult.run.wer)."""
-    src = _read("src/lib/RefineryPanel.svelte")
-    if "numSegs > 0 ? pct" not in src:
+    presentation = _read("src/lib/refineryPresentation.ts")
+    panel = _read("src/lib/RefineryPanel.svelte")
+    evidence = _read("src/lib/RefineryEvidence.svelte")
+    if "segmentCount > 0 ? formatRefineryPercent(value) : '—'" not in presentation:
         raise AssertionError(
             "RefineryPanel has no numSegs-guarded WER/CER formatter — a zero-segment eval renders as a "
             "perfect 0.0%. Add `const metric = (x, numSegs) => numSegs > 0 ? pct(x) : '—';` and use it."
         )
+    for required in (
+        "formatRefineryMetric(evalResult.run.cer, evalResult.run.numSegs)",
+        "formatRefineryMetric(evalResult.run.wer, evalResult.run.numSegs)",
+        "formatRefineryMetric(run.wer, run.numSegs)",
+        "formatRefineryMetric(run.cer, run.numSegs)",
+    ):
+        if required not in f"{panel}\n{evidence}":
+            raise AssertionError(f"Refinery evidence no longer routes {required!r} through the guarded formatter")
     for bare in ("pct(run.wer)", "pct(run.cer)", "pct(evalResult.run.wer)", "pct(evalResult.run.cer)"):
-        if bare in src:
+        if bare in f"{panel}\n{evidence}":
             raise AssertionError(
                 f"RefineryPanel still renders a raw {bare} — a zero-segment run prints 0.0% (reads as a "
                 f"perfect model from zero data). Route it through the numSegs-guarded metric() formatter."
@@ -410,8 +429,13 @@ def test_validation_signal_anomaly_distinguishes_not_screened_from_clean() -> No
     clean sheet. Conflating the two shows a green all-clear over audio nobody has screened. The tab must render a
     distinct 'not screened yet' state when signalAnomalySegments.length === 0, reserving noSignalAnomaly for a
     genuine post-screen all-clear (scores exist but none above threshold)."""
-    src = _read("src/lib/ValidationPanel.svelte")
-    if "signalAnomalySegments.length === 0" not in src:
+    owner = _read("src/lib/ValidationPanel.svelte")
+    src = _read("src/lib/ValidationSignalAnomalyTab.svelte")
+    if (
+        "<ValidationSignalAnomalyTab" not in owner
+        or "segments={signalAnomalySegments}" not in owner
+        or "segments.length === 0" not in src
+    ):
         raise AssertionError(
             "ValidationPanel's Signal-Anomaly empty state does not distinguish 'not screened yet' "
             "(signalAnomalySegments.length === 0) from a real all-clear — it shows noSignalAnomaly before any "
@@ -435,17 +459,18 @@ def test_audioplayer_autoplays_each_clip_not_only_on_source_reload() -> None:
     different-source reload is left to handleLoaded, avoiding a double play), keyed on identity so a word-tap
     (which only narrows startTime) does not re-autoplay. Both review consumers must pass clipKey."""
     ap = _read("src/lib/AudioPlayer.svelte")
+    controller = _read("src/lib/audioPlayerController.ts")
     if "clipKey" not in ap:
         raise AssertionError(
             "AudioPlayer has no clipKey prop — same-source consecutive clips never re-autoplay (autoplay dies "
             "after the first clip). Add a clipKey prop and an $effect that plays on clip-identity change."
         )
-    if "autoplayedClip" not in ap:
+    if "autoplayedClip" not in controller or "controller.autoplaySelection(marker)" not in ap:
         raise AssertionError(
             "AudioPlayer has no clip-identity autoplay effect (no autoplayedClip tracking) — a same-source clip "
             "advance won't autoplay because onloadedmetadata only fires on a src change."
         )
-    for consumer in ("src/lib/ReviewMode.svelte", "src/lib/ReviewInbox.svelte"):
+    for consumer in ("src/lib/ReviewModeAudio.svelte", "src/lib/ReviewInboxAudio.svelte"):
         if "clipKey=" not in _read(consumer):
             raise AssertionError(f"{consumer} does not pass clipKey to AudioPlayer — autoplay won't advance per clip")
 
@@ -480,7 +505,7 @@ def test_segment_reload_invalidates_the_frozen_search_scope() -> None:
     retypes. load() must invalidate searchResults on reload so the scope falls back to applySearchScope's LIVE
     substring predicate (the searchResults===null branch) instead of a stale FTS snapshot."""
     src = _read("src/lib/stores/segmentStore.ts")
-    anchor = "set(dedupeById(page.items));"
+    anchor = "rawSet(dedupeById(page.items));"
     idx = src.find(anchor)
     if idx == -1:
         raise AssertionError("segments load() page commit point not found — this gate would pass vacuously")
@@ -566,8 +591,8 @@ def test_batch_verify_controls_are_not_reachable_and_review_mode_owns_approval()
             + ", ".join(repr(marker) for marker in present_commands)
         )
 
-    review_mode = _read("src/lib/ReviewMode.svelte")
-    if "await api.commitReviewV1(" not in review_mode:
+    review_mode = _read("src/lib/reviewModeDecisions.svelte.ts")
+    if "await api.commitReviewV1({" not in review_mode:
         raise AssertionError(
             "ReviewMode must retain the revision-bound commitReviewV1 approval path after removing legacy batch verify"
         )
@@ -597,12 +622,17 @@ def test_selection_reseats_playback_centrally_for_store_only_selections() -> Non
     endTime while the UI shows the new clip — the reviewer verifies one clip while HEARING another. The reset
     MUST live in a $selectedSegmentId-keyed effect so EVERY selection path gets it. Runtime is Svelte reactive
     glue + an <audio> element, not unit-testable; source-pinned (hunt-4 / iter 160)."""
-    src = _read("src/Workstation.svelte")
-    marker = "const id = $selectedSegmentId;"
+    src = _read("src/lib/workstationPlaybackController.svelte.ts")
+    if "const selectedIdStore = fromStore(selectedSegmentId);" not in src:
+        raise AssertionError(
+            "the playback controller no longer subscribes to selectedSegmentId through fromStore — "
+            "store-only selection changes cannot reseat playback"
+        )
+    marker = "const segmentId = selectedIdStore.current;"
     start = src.find(marker)
     if start == -1:
         raise AssertionError(
-            "the $selectedSegmentId-keyed selection effect is gone — a store-only selection (ValidationPanel "
+            "the selectedSegmentId-keyed selection effect is gone — a store-only selection (ValidationPanel "
             "'Go to segment') would leave the AudioPlayer on the previous chunk. This gate would pass vacuously."
         )
     rest = src[start:]
@@ -661,11 +691,14 @@ def test_post_jury_cer_uses_the_independently_persisted_jury_transcript() -> Non
     verdict text. Exact jury/reference matches are now valid zero-error observations. The former
     `selfReferentialN` heuristic confused correctness with identity and hid a genuinely perfect jury.
     """
-    src = _read("src/lib/RefineryPanel.svelte")
-    if "{#if lift && lift.n > 0}" not in src:
+    owner = _read("src/lib/RefineryPanel.svelte")
+    evidence = _read("src/lib/RefineryEvidence.svelte")
+    if "<RefineryEvidence {evalRuns} {trend} {lift}" not in owner:
+        raise AssertionError("RefineryPanel no longer passes the independently measured lift to its evidence surface")
+    if "{#if lift && lift.n > 0}" not in evidence:
         raise AssertionError("RefineryPanel must display a non-empty independently measured lift")
     for stale in ("selfReferentialN", "refinery-lift-self-referential"):
-        if stale in src:
+        if stale in f"{owner}\n{evidence}":
             raise AssertionError(f"RefineryPanel revived the invalid verdict-vs-itself heuristic: {stale}")
 
     backend = _read("src-tauri/src/eval.rs")
@@ -688,7 +721,7 @@ def test_certified_segment_count_is_withheld_while_the_certificate_is_uncalibrat
     The count is left intact in the payload; the UI is what must not present it as an achievement. "—"
     is this panel's existing idiom for undefined-not-zero (the threshold tile already uses it).
     """
-    src = _read("src/lib/StatsDashboard.svelte")
+    src = _read("src/lib/StatsDatasetEvidence.svelte")
 
     if "cert.isCalibrated ? cert.totalCertified : '—'" not in src:
         raise AssertionError(
@@ -752,29 +785,38 @@ def test_a_failed_waveform_decode_is_not_rendered_as_a_silent_clip() -> None:
     found the identical swallow in Workstation.svelte's curate view. Fixing one caller and leaving the other
     is how a class of bug survives its own fix, so the guard pins both or it pins nothing.
     """
-    for component, testid in (
-        ("src/lib/ReviewMode.svelte", "review-waveform-error"),
-        ("src/Workstation.svelte", "curate-waveform-error"),
+    for controller, surface, testid in (
+        (
+            "src/lib/reviewModePlayback.svelte.ts",
+            "src/lib/ReviewModeAudio.svelte",
+            "review-waveform-error",
+        ),
+        (
+            "src/lib/workstationPlaybackController.svelte.ts",
+            "src/lib/WorkstationTranscriptPanel.svelte",
+            "curate-waveform-error",
+        ),
     ):
-        src = _read(component)
+        src = _read(controller)
+        rendered = _read(surface)
         body = _function_body(src, "  async function loadWaveform(")
 
         if "waveformError" not in body:
             raise AssertionError(
-                f"{component}: loadWaveform no longer records waveformError — an empty waveform is "
+                f"{controller}: loadWaveform no longer records waveformError — an empty waveform is "
                 "indistinguishable from a silent clip, so a failed decode reads as quiet audio"
             )
         if "notifications.error" not in body:
             raise AssertionError(
-                f"{component}: loadWaveform's catch no longer surfaces the failure. Swallowing it leaves "
+                f"{controller}: loadWaveform's catch no longer surfaces the failure. Swallowing it leaves "
                 "the reviewer looking at a flat strip with no indication the audio could not be read."
             )
         # The success path must CLEAR the error, or one bad clip poisons every later clip.
         if "waveformError = null" not in body:
-            raise AssertionError(f"{component}: loadWaveform must clear waveformError on success, or the notice sticks")
+            raise AssertionError(f"{controller}: loadWaveform must clear waveformError on success, or the notice sticks")
         # And the template has to actually branch on it, or the flag is dead state.
-        if f'data-testid="{testid}"' not in src:
-            raise AssertionError(f"{component} renders no distinct failed-waveform state — the flag never reaches the UI")
+        if f'data-testid="{testid}"' not in rendered:
+            raise AssertionError(f"{surface} renders no distinct failed-waveform state — the flag never reaches the UI")
 
 
 def test_the_uncalibrated_panel_names_the_real_cause_when_there_is_no_confidence_at_all() -> None:
@@ -793,7 +835,7 @@ def test_the_uncalibrated_panel_names_the_real_cause_when_there_is_no_confidence
     removed the only note that had explained anything. A guard here is what stops the next change
     quietly restoring the wrong advice.
     """
-    src = _read("src/lib/StatsDashboard.svelte")
+    src = _read("src/lib/StatsDatasetEvidence.svelte")
 
     if "cert.calibrationNoConfidence > 0" not in src:
         raise AssertionError(
@@ -913,7 +955,7 @@ def test_review_decisions_stay_on_screen_in_one_sticky_bar() -> None:
     tests cannot observe. What CAN regress silently is someone dropping the sticky positioning or
     moving a decision back out of the bar, and that is exactly what this catches.
     """
-    owner = _read("src/lib/ReviewMode.svelte")
+    owner = _read("src/lib/ReviewModeActive.svelte")
     bar_src = _read("src/lib/ReviewActionBar.svelte")
 
     # Follow the live composition seam instead of assuming the bar's markup and CSS remain embedded in
@@ -929,10 +971,10 @@ def test_review_decisions_stay_on_screen_in_one_sticky_bar() -> None:
         raise AssertionError("ReviewMode's ReviewActionBar mount is malformed")
     mount = owner[mount_start : mount_end + 2]
     for decision, callback in (
-        ("accept as-is", "onAccept={() => void submit(true)}"),
-        ("save & next", "onSave={() => void submit(false)}"),
-        ("mark bad audio", "onReject={() => void markBad()}"),
-        ("undo", "onUndo={() => void undoLast()}"),
+        ("accept as-is", "onAccept={() => void decisions.submit(true)}"),
+        ("save & next", "onSave={() => void decisions.submit(false)}"),
+        ("mark bad audio", "onReject={() => void decisions.markBad()}"),
+        ("undo", "onUndo={() => void decisions.undoLast()}"),
     ):
         if callback not in mount:
             raise AssertionError(
@@ -983,7 +1025,7 @@ def test_poor_audio_thresholds_match_the_rust_authority() -> None:
 
     P1.2. `snr < 5 dB` / `clipping > 0.1` was written out by hand in THREE independent places — the
     jury veto that refuses to auto-accept, the suspect-first SQL that orders the review queue, and
-    `hasPoorAudio()` in ReviewInbox.svelte — each with a comment saying it was "kept identical on
+    `poorAudio()` in ReviewInboxWorkspace.svelte — each with a comment saying it was "kept identical on
     purpose". The two Rust sites now share a constant and a unit test proves they agree at the
     boundary. TypeScript cannot import a Rust const, so this is the seam that remains, and it is the
     worst one to lose: if the UI's copy drifts above the jury's, the review screen shows a reassuring
@@ -993,7 +1035,7 @@ def test_poor_audio_thresholds_match_the_rust_authority() -> None:
     The copy stays. It can no longer drift SILENTLY.
     """
     rust = _read("src-tauri/src/quality.rs")
-    svelte = _read("src/lib/ReviewInbox.svelte")
+    svelte = _read("src/lib/ReviewInboxWorkspace.svelte")
 
     def rust_const(name: str) -> float:
         m = re.search(rf"pub const {name}: f64 = ([0-9.]+);", rust)
@@ -1008,14 +1050,14 @@ def test_poor_audio_thresholds_match_the_rust_authority() -> None:
     clip_rust = rust_const("POOR_AUDIO_CLIPPING_RATIO")
 
     m = re.search(
-        r"seg\.snrDb\s*<\s*([0-9.]+)\).*?seg\.clippingRatio\s*>\s*([0-9.]+)\)",
+        r"segment\.snrDb\s*<\s*([0-9.]+)\).*?segment\.clippingRatio\s*>\s*([0-9.]+)\)",
         svelte,
         re.DOTALL,
     )
     if not m:
         raise AssertionError(
-            "ReviewInbox.svelte's hasPoorAudio() no longer has the shape this gate reads "
-            "(seg.snrDb < N ... seg.clippingRatio > N). If it now takes the verdict from the backend "
+            "ReviewInboxWorkspace.svelte's poorAudio() no longer has the shape this gate reads "
+            "(segment.snrDb < N ... segment.clippingRatio > N). If it now takes the verdict from the backend "
             "instead of recomputing it, DELETE this check — that is strictly better than syncing."
         )
     snr_ts, clip_ts = float(m.group(1)), float(m.group(2))
@@ -1023,7 +1065,7 @@ def test_poor_audio_thresholds_match_the_rust_authority() -> None:
     if (snr_ts, clip_ts) != (snr_rust, clip_rust):
         raise AssertionError(
             f"poor-audio thresholds have DRIFTED: quality.rs says snr<{snr_rust} / clip>{clip_rust}, "
-            f"ReviewInbox.svelte says snr<{snr_ts} / clip>{clip_ts}. The review UI would disagree with "
+            f"ReviewInboxWorkspace.svelte says snr<{snr_ts} / clip>{clip_ts}. The review UI would disagree with "
             "the jury veto about which clips are untrustworthy."
         )
 
@@ -1042,9 +1084,10 @@ def test_every_declared_readiness_blocker_action_is_actually_rendered() -> None:
     to reintroduce it. So the two are compared directly — the union of declared actions must equal the
     set the template branches on.
     """
-    src = _read("src/lib/StatsDashboard.svelte")
+    model = _read("src/lib/statsDashboardModel.ts")
+    surface = _read("src/lib/StatsReadinessSection.svelte")
 
-    m = re.search(r"type Blocker = \{[^}]*action\?:\s*([^;}]+)", src)
+    m = re.search(r"type StatsBlocker = \{[^}]*action\?:\s*([^;}]+)", model)
     if not m:
         raise AssertionError(
             "the Blocker type no longer declares `action?:` in the shape this gate reads — "
@@ -1054,7 +1097,7 @@ def test_every_declared_readiness_blocker_action_is_actually_rendered() -> None:
     if not declared:
         raise AssertionError("no blocker actions parsed — this gate would pass vacuously")
 
-    rendered = set(re.findall(r"b\.action === '([a-zA-Z]+)'", src))
+    rendered = set(re.findall(r"blocker\.action === '([a-zA-Z]+)'", surface))
 
     unrendered = sorted(declared - rendered)
     if unrendered:

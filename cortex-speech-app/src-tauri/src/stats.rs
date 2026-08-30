@@ -461,6 +461,9 @@ mod tests {
         let pending = compute_stats(&db).unwrap();
         assert_eq!(pending.total_chars, 3, "an unreviewed clip must measure immutable champion raw");
 
+        // Legacy accepts predate frozen verdict_transcript. Once a human approved the raw text,
+        // a machine-derived slot added later cannot silently change what the dashboard says they
+        // approved. The SQL mirror must retain the same rule as quality::effective_transcript.
         db.connection()
             .execute("UPDATE speech_segments SET human_decision='accept', verified=1 WHERE id='derived'", [])
             .unwrap();

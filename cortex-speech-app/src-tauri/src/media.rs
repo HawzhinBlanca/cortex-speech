@@ -110,6 +110,152 @@ pub(crate) struct VerifiedMediaSourceLease {
     _source_guard: Arc<std::fs::File>,
 }
 
+/// Exact source object held immutable for one complete import attempt.
+///
+/// Import decoding and optional whole-file cloud reference work reopen the source by path. On the
+/// supported Windows workstation, keeping this read-share-only handle alive prevents an editor,
+/// sync client, or another process from writing, deleting, or replacing that file between decode
+/// and the atomic database publication. Reparse-point inputs are refused because a lease on their
+/// current target would not freeze the link's directory entry.
+#[derive(Debug)]
+pub(crate) struct ImportMediaSourceLease {
+    source_path: PathBuf,
+    // Decoders and optional reference providers reopen `source_path` instead of consuming this
+    // handle. On Windows a read-only lease on the file prevents replacement of the final entry, but
+    // it does not by itself prevent an ancestor directory from being renamed and a different tree
+    // appearing at the same textual path. Retain one no-delete handle for every parent component so
+    // every later reopen resolves through the exact directory chain established before decoding.
+    _path_guards: Vec<std::fs::File>,
+    _source_guard: std::fs::File,
+}
+
+impl ImportMediaSourceLease {
+    pub(crate) fn source_path(&self) -> &Path {
+        &self.source_path
+    }
+}
+
+#[cfg(windows)]
+fn reject_import_reparse_point(path: &Path) -> Result<(), String> {
+    use std::os::windows::fs::MetadataExt as _;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| format!("Inspect import source before sealing: {error}"))?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(
+            "Import source is a Windows reparse point; copy it to a regular local file before importing".to_string()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn seal_import_parent_chain(path: &Path) -> Result<Vec<std::fs::File>, String> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+    if !path.is_absolute() {
+        return Err("Import source must be an absolute Windows path so its directory chain can be sealed".to_string());
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| "Import source has no sealable parent directory".to_string())?;
+    let mut chain = parent.ancestors().collect::<Vec<_>>();
+    chain.reverse();
+
+    let mut guards = Vec::with_capacity(chain.len());
+    for directory in chain {
+        let before = std::fs::symlink_metadata(directory).map_err(|error| {
+            format!("Inspect import source directory {} before sealing: {error}", directory.display())
+        })?;
+        if !before.is_dir() || before.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!(
+                "Import source directory is not a regular non-reparse directory: {}",
+                directory.display()
+            ));
+        }
+
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            // Permit ordinary reads/writes below the directory while excluding FILE_SHARE_DELETE,
+            // the Windows share right required to rename or delete this exact directory object.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        let guard = options
+            .open(directory)
+            .map_err(|error| format!("Seal import source directory {}: {error}", directory.display()))?;
+        let opened = guard
+            .metadata()
+            .map_err(|error| format!("Inspect sealed import source directory {}: {error}", directory.display()))?;
+        if !opened.is_dir() || opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!(
+                "Sealed import source directory is not a regular non-reparse directory: {}",
+                directory.display()
+            ));
+        }
+        // Recheck the named entry after opening. A rename that won before `open` is harmless—the
+        // remaining child opens consistently traverse the newly sealed object. A rename after
+        // `open` is refused by the retained handle's missing FILE_SHARE_DELETE right.
+        let named = std::fs::symlink_metadata(directory)
+            .map_err(|error| format!("Recheck sealed import source directory {}: {error}", directory.display()))?;
+        if !named.is_dir() || named.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!(
+                "Import source directory changed to an unsafe entry while being sealed: {}",
+                directory.display()
+            ));
+        }
+        guards.push(guard);
+    }
+    Ok(guards)
+}
+
+#[cfg(not(windows))]
+fn seal_import_parent_chain(_path: &Path) -> Result<Vec<std::fs::File>, String> {
+    // Cortex's certified workstation target is Windows. The final source entry is still checked and
+    // leased on other development platforms, but only Windows exposes the no-delete directory-share
+    // contract used to freeze path reopens across the complete import.
+    Ok(Vec::new())
+}
+
+#[cfg(not(windows))]
+fn reject_import_reparse_point(path: &Path) -> Result<(), String> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| format!("Inspect import source before sealing: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err("Import source is a symbolic link; copy it to a regular file before importing".to_string());
+    }
+    Ok(())
+}
+
+/// Freeze one regular source path before any import decode or external transcript request.
+///
+/// The second reparse-point check closes the inspect/open race: if the directory entry changed to a
+/// link between the first check and `open`, the newly opened target is discarded and the import
+/// hard-stops. A normal-file replacement that wins before `open` is safe—the lease and every later
+/// reopen consistently observe the replacement—and no replacement can win after the handle opens.
+pub(crate) fn seal_import_source(path: &Path) -> Result<ImportMediaSourceLease, String> {
+    let path_guards = seal_import_parent_chain(path)?;
+    reject_import_reparse_point(path)?;
+    let source_guard = open_immutable_source_guard(path)?;
+    reject_import_reparse_point(path)?;
+    let metadata = source_guard.metadata().map_err(|error| format!("Inspect sealed import source: {error}"))?;
+    if !metadata.is_file() {
+        return Err(format!("Import source is not a regular file: {}", path.display()));
+    }
+    Ok(ImportMediaSourceLease {
+        source_path: path.to_path_buf(),
+        _path_guards: path_guards,
+        _source_guard: source_guard,
+    })
+}
+
 impl PartialEq for VerifiedMediaSourceLease {
     fn eq(&self, other: &Self) -> bool {
         self.source_path == other.source_path && self.audio_content_hash == other.audio_content_hash
@@ -908,7 +1054,7 @@ pub(crate) fn serve_media_protocol_request(
                     0,
                     Some(format!("bytes */{len}")),
                     Vec::new(),
-                )
+                );
             }
         }
     } else if len > MAX_MEDIA_PROTOCOL_RANGE_BYTES {
@@ -1777,6 +1923,41 @@ mod tests {
         assert!(!cached.exists(), "cache entry removed");
         assert!(src.exists(), "the source audio must survive removal of its cache copy");
         assert_eq!(std::fs::read(&src).unwrap(), b"keep me", "source content intact");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn import_source_lease_blocks_write_delete_and_path_replacement_until_release() {
+        let tmp = TempDir::new().unwrap();
+        let source_dir = tmp.path().join("source-tree");
+        let moved_dir = tmp.path().join("source-tree-old");
+        std::fs::create_dir(&source_dir).unwrap();
+        let audio = source_dir.join("import-source.wav");
+        let moved = source_dir.join("import-source-old.wav");
+        write_test_wav(&audio, 700);
+        let original = std::fs::read(&audio).unwrap();
+
+        let lease = seal_import_source(&audio).expect("regular local source must be sealable");
+        assert_eq!(lease.source_path(), audio.as_path());
+        assert!(
+            std::fs::OpenOptions::new().write(true).open(&audio).is_err(),
+            "no writer may open the source while inference/publication authority is live"
+        );
+        assert!(std::fs::remove_file(&audio).is_err(), "the live source path may not be deleted");
+        assert!(
+            std::fs::rename(&audio, &moved).is_err(),
+            "replacement cannot first move the leased source out of its directory entry"
+        );
+        assert!(
+            std::fs::rename(&source_dir, &moved_dir).is_err(),
+            "replacement cannot swap an ancestor directory while path-reopening inference is live"
+        );
+        assert_eq!(std::fs::read(&audio).unwrap(), original);
+
+        drop(lease);
+        std::fs::rename(&source_dir, &moved_dir)
+            .expect("owner directory edits resume after the import attempt releases its lease");
+        assert_eq!(std::fs::read(moved_dir.join("import-source.wav")).unwrap(), original);
     }
 
     #[cfg(windows)]

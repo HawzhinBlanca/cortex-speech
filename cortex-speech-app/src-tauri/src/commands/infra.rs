@@ -388,17 +388,18 @@ pub fn save_session(
             crate::error::AppError::Other(message)
                 if message == crate::database_runtime::RESTORE_IN_PROGRESS_MSG
         ) {
-            return public_session_error(
+            public_session_error(
                 "RESTORE_IN_PROGRESS",
-                "Session saving is paused while database recovery is active. Retry after recovery finishes.",
+                "The workspace is being restored. Retry the view save when recovery finishes.",
                 true,
-            );
+            )
+        } else {
+            public_session_error(
+                "SESSION_SAVE_FAILED",
+                "The workspace view could not be saved. Open Health for recovery options.",
+                false,
+            )
         }
-        public_session_error(
-            "SESSION_SAVE_FAILED",
-            "The workspace view could not be saved. Open Health for recovery options.",
-            false,
-        )
     })
 }
 

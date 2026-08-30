@@ -7,29 +7,31 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def test_audio_player_playback_failures_are_visible() -> None:
     audio_player = (REPO_ROOT / "src/lib/AudioPlayer.svelte").read_text(encoding="utf-8")
+    controller = (REPO_ROOT / "src/lib/audioPlayerController.ts").read_text(encoding="utf-8")
+    surface = f"{audio_player}\n{controller}"
     forbidden = [
         "audioEl.play().catch(() => {});",
         "notifications.error(message, { detail: String(cause) });",
         "notifications.error(message, { detail: formatUnknownError(cause) });",
     ]
-    present = [pattern for pattern in forbidden if pattern in audio_player]
+    present = [pattern for pattern in forbidden if pattern in surface]
     if present:
         formatted = "\n".join(f"- {entry}" for entry in present)
         raise AssertionError(f"AudioPlayer.svelte silently swallows playback failures:\n{formatted}")
 
     required = [
         "import { notifications } from './stores/notificationStore';",
-        "function reportPlaybackFailure(message: string, cause: unknown, binding: AudioAttemptBinding)",
+        "private reportPlaybackFailure(",
         # `audioError` is the $bindable prop the decision guards read (2026-08-17): a failure is not
         # just shown, it also blocks Accept/Reject on audio nobody could hear. The pin follows the
         # rename — the requirement is unchanged, every failure still lands in visible state.
-        "audioError = message;",
+        "this.output.setAudioError(message);",
         "notifications.error(message, { cause });",
-        "attemptPlay($t('audio.playbackFailed'));",
-        "attemptPlay($t('audio.loopFailed'));",
-        "audioError = $t('audio.loadFailed');",
+        "this.attemptPlay(this.output.translate('audio.playbackFailed'));",
+        "this.attemptPlay(this.output.translate('audio.loopFailed'));",
+        "this.output.setAudioError(this.output.translate('audio.loadFailed'));",
     ]
-    missing = [pattern for pattern in required if pattern not in audio_player]
+    missing = [pattern for pattern in required if pattern not in surface]
     if missing:
         formatted = "\n".join(f"- {entry}" for entry in missing)
         raise AssertionError(f"AudioPlayer.svelte must keep playback failures visible:\n{formatted}")
@@ -63,12 +65,13 @@ def test_audio_player_loop_failure_has_unit_coverage() -> None:
 
 def test_audio_state_machine_is_clip_attempt_bound_and_stress_tested() -> None:
     audio_player = (REPO_ROOT / "src/lib/AudioPlayer.svelte").read_text(encoding="utf-8")
+    controller = (REPO_ROOT / "src/lib/audioPlayerController.ts").read_text(encoding="utf-8")
     machine = (REPO_ROOT / "src/lib/audioMachine.ts").read_text(encoding="utf-8")
     tests = (REPO_ROOT / "tests/lib/audioMachine.test.ts").read_text(encoding="utf-8")
     player_pins = [
-        "isCurrentAudioAttempt(audioMachine, binding)",
-        "transitionAudio({ type: 'select', clipId, sourceId })",
-        "transitionAudio({ type: 'failed', binding, errorCode: 'AUDIO_DECODE_FAILED' })",
+        "isCurrentAudioAttempt(this.audioMachine, binding)",
+        "this.transition({ type: 'select', clipId, sourceId })",
+        "this.transition({ type: 'failed', binding, errorCode: 'AUDIO_DECODE_FAILED' })",
         "activePlayBinding",
         "mediaLoadBinding",
     ]
@@ -91,7 +94,7 @@ def test_audio_state_machine_is_clip_attempt_bound_and_stress_tested() -> None:
         "if (wasStale) expect(state).toBe(before);",
     ]
     missing = [
-        *(f"AudioPlayer: {pin}" for pin in player_pins if pin not in audio_player),
+        *(f"AudioPlayer controller: {pin}" for pin in player_pins if pin not in controller),
         *(f"audioMachine: {pin}" for pin in machine_pins if pin not in machine),
         *(f"audioMachine test: {pin}" for pin in test_pins if pin not in tests),
     ]

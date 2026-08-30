@@ -21,6 +21,8 @@
     onSelect: (index: number) => void;
     onLoadMore: () => void;
     onReloadStart: () => void;
+    navigationDisabled?: boolean;
+    navigationDisabledDescriptionId?: string;
   }
 
   let {
@@ -42,6 +44,8 @@
     onSelect,
     onLoadMore,
     onReloadStart,
+    navigationDisabled = false,
+    navigationDisabledDescriptionId,
   }: Props = $props();
 </script>
 
@@ -55,6 +59,8 @@
     tabindex="0"
     aria-labelledby="review-inbox-queue-label"
     aria-activedescendant={current ? optionId(currentIndex) : undefined}
+    aria-disabled={navigationDisabled}
+    aria-describedby={navigationDisabled ? navigationDisabledDescriptionId : undefined}
     bind:this={queueListbox}
     onkeydown={onListboxKey}
   >
@@ -68,9 +74,15 @@
         tabindex="-1"
         style="border-left-color:{bandColor(segment)}"
         aria-selected={index === currentIndex}
+        aria-disabled={navigationDisabled}
+        aria-describedby={navigationDisabled ? navigationDisabledDescriptionId : undefined}
         aria-label={optionLabel(segment, index)}
-        onclick={() => onSelect(index)}
-        onkeydown={(event) => onOptionKey(event, index)}
+        onclick={() => {
+          if (!navigationDisabled) onSelect(index);
+        }}
+        onkeydown={(event) => {
+          if (!navigationDisabled) onOptionKey(event, index);
+        }}
       >
         <span class="rail-id" aria-hidden="true">{segment.id.slice(0, 8)}…</span>
         {#if segment.humanDecision}
@@ -91,8 +103,12 @@
         type="button"
         class="btn btn-secondary btn-sm"
         onclick={onLoadMore}
-        disabled={isLoadingMore}
-        aria-describedby={loadMoreError ? 'inbox-load-more-error' : undefined}
+        disabled={isLoadingMore || navigationDisabled}
+        aria-describedby={navigationDisabled
+          ? navigationDisabledDescriptionId
+          : loadMoreError
+            ? 'inbox-load-more-error'
+            : undefined}
       >
         {isLoadingMore ? $t('inbox.pagination.loadingMore') : $t('inbox.pagination.loadMore')}
       </button>
@@ -104,7 +120,13 @@
       <p class="pagination-notice" data-testid="inbox-eviction-notice">
         {$t('inbox.pagination.evicted', { count: String(evictedCount) })}
       </p>
-      <button type="button" class="btn btn-secondary btn-sm" onclick={onReloadStart}>
+      <button
+        type="button"
+        class="btn btn-secondary btn-sm"
+        onclick={onReloadStart}
+        disabled={navigationDisabled}
+        aria-describedby={navigationDisabled ? navigationDisabledDescriptionId : undefined}
+      >
         {$t('inbox.pagination.reloadStart')}
       </button>
     {/if}
@@ -179,6 +201,9 @@
   }
   .rail-item.done {
     opacity: 0.45;
+  }
+  .rail-item[aria-disabled='true'] {
+    cursor: not-allowed;
   }
   .rail-id {
     flex: 1;

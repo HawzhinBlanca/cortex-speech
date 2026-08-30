@@ -10,7 +10,10 @@
     saving: boolean;
     retranscribing: boolean;
     previousDisabled: boolean;
-    undoAvailable: boolean;
+    undoDisabledKey: TranslationKey | null;
+    undoActionKey: TranslationKey;
+    undoErrorCode: string | null;
+    truthBlockedKey: TranslationKey | null;
     decisionBlocked: boolean;
     editHasText: boolean;
     onPrevious: () => void;
@@ -29,7 +32,10 @@
     saving,
     retranscribing,
     previousDisabled,
-    undoAvailable,
+    undoDisabledKey,
+    undoActionKey,
+    undoErrorCode,
+    truthBlockedKey,
     decisionBlocked,
     editHasText,
     onPrevious,
@@ -59,6 +65,15 @@
   {#if dirty}<span id="review-reject-disabled-reason" class="sr-only"
       >{$t('review.rejectDisabledEdited')}</span
     >{/if}
+  {#if undoDisabledKey}<span id="review-undo-disabled-reason" class="sr-only"
+      >{$t(undoDisabledKey)}</span
+    >{/if}
+  {#if truthBlockedKey}<span id="review-truth-disabled-reason" class="sr-only"
+      >{$t(truthBlockedKey)}</span
+    >{/if}
+  {#if undoErrorCode}<span class="text-xs text-amber-300" role="status"
+      >{$t('review.undoErrorCode', { code: undoErrorCode })}</span
+    >{/if}
 
   <button
     type="button"
@@ -73,10 +88,11 @@
     type="button"
     class="btn btn-secondary"
     onclick={onUndo}
-    disabled={!undoAvailable || saving || retranscribing}
-    title={$t('review.undoLastTitle')}
+    disabled={!!undoDisabledKey}
+    aria-describedby={undoDisabledKey ? 'review-undo-disabled-reason' : undefined}
+    title={$t(undoActionKey)}
   >
-    {$t('review.undoLast')}
+    {$t(undoActionKey)}
   </button>
   <button
     type="button"
@@ -87,11 +103,13 @@
       ? 'review-eligibility-disabled-reason'
       : audioUnavailable
         ? 'review-audio-disabled-reason'
-        : draftBlocked
-          ? 'review-draft-disabled-reason'
-          : dirty
-            ? 'review-reject-disabled-reason'
-            : undefined}
+        : truthBlockedKey
+          ? 'review-truth-disabled-reason'
+          : draftBlocked
+            ? 'review-draft-disabled-reason'
+            : dirty
+              ? 'review-reject-disabled-reason'
+              : undefined}
     title={$t('review.markBadTitle')}
   >
     {$t('review.markBad')}
@@ -106,11 +124,13 @@
         ? 'review-eligibility-disabled-reason'
         : audioUnavailable
           ? 'review-audio-disabled-reason'
-          : dirty
-            ? 'review-accept-disabled-reason'
-            : draftBlocked
-              ? 'review-draft-disabled-reason'
-              : undefined}
+          : truthBlockedKey
+            ? 'review-truth-disabled-reason'
+            : dirty
+              ? 'review-accept-disabled-reason'
+              : draftBlocked
+                ? 'review-draft-disabled-reason'
+                : undefined}
     >
       {$t('review.acceptAsIs')}
     </button>
@@ -126,9 +146,11 @@
         ? 'review-eligibility-disabled-reason'
         : audioUnavailable
           ? 'review-audio-disabled-reason'
-          : draftBlocked
-            ? 'review-draft-disabled-reason'
-            : undefined}
+          : truthBlockedKey
+            ? 'review-truth-disabled-reason'
+            : draftBlocked
+              ? 'review-draft-disabled-reason'
+              : undefined}
     >
       {$t('review.saveNext')}
     </button>

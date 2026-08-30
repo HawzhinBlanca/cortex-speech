@@ -4,6 +4,7 @@
   interface Props {
     pendingCount: number;
     isRunningJury: boolean;
+    runJuryDisabledKey: import('./i18n').TranslationKey | null;
     localOnly: boolean;
     autonomyLevel: AutonomyLevel;
     closePending: boolean;
@@ -15,6 +16,7 @@
   let {
     pendingCount,
     isRunningJury,
+    runJuryDisabledKey,
     localOnly,
     autonomyLevel,
     closePending,
@@ -35,8 +37,8 @@
   <button
     class="btn btn-primary btn-sm"
     onclick={onRunJury}
-    disabled={isRunningJury}
-    aria-describedby={isRunningJury ? 'inbox-run-jury-disabled-reason' : undefined}
+    disabled={!!runJuryDisabledKey}
+    aria-describedby={runJuryDisabledKey ? 'inbox-run-jury-disabled-reason' : undefined}
     title={$t('inbox.runJuryTitle')}
   >
     {#if isRunningJury}
@@ -46,9 +48,9 @@
       {$t('inbox.runJury')}
     {/if}
   </button>
-  {#if isRunningJury}
+  {#if runJuryDisabledKey}
     <span id="inbox-run-jury-disabled-reason" class="sr-only">
-      {$t('inbox.disabled.juryRunning')}
+      {$t(runJuryDisabledKey)}
     </span>
   {/if}
   {#if localOnly}
@@ -64,6 +66,7 @@
         class="dial-btn"
         class:active={autonomyLevel === level}
         aria-pressed={autonomyLevel === level}
+        disabled={isRunningJury}
         onclick={() => onSetAutonomy(level)}
         title={$t(autonomyLabelKey(level))}>{$t(autonomyLabelKey(level))}</button
       >
@@ -73,7 +76,7 @@
   <button
     class="close-btn"
     onclick={onClose}
-    disabled={closePending}
+    disabled={closePending || isRunningJury}
     aria-label={$t('inbox.close')}
   >
     {$t('inbox.close')}

@@ -563,19 +563,6 @@ pub(crate) fn take_pinned_snapshot_at(
         remove_staging_dir(&staging);
         return Err(error);
     }
-    match verify_snapshot_manifest_for_restore(&staging) {
-        Ok(true) => {}
-        Ok(false) => {
-            remove_staging_dir(&staging);
-            return Err(AppError::Other("new pinned snapshot staging unexpectedly has no manifest".to_string()));
-        }
-        Err(error) => {
-            remove_staging_dir(&staging);
-            return Err(AppError::Other(format!(
-                "pinned snapshot refused before promotion because its recovery contract is incomplete: {error}"
-            )));
-        }
-    }
     // Promote under the first FREE timestamped name — a same-second sibling bumps forward instead of
     // being overwritten.
     let mut final_ts = ts;
@@ -584,26 +571,20 @@ pub(crate) fn take_pinned_snapshot_at(
         final_ts += 1;
         snap_dir = pinned_root.join(format!("{label}_{final_ts:010}"));
     }
-    if let Err(e) = fs::rename(&staging, &snap_dir) {
+    if let Err(e) = commit_snapshot_generation(&staging, &snap_dir) {
         remove_staging_dir(&staging);
-        return Err(AppError::Io(e));
+        return Err(e);
     }
-    // Bound same-label accumulation (newest keep_pinned survive) so repeated upgrades/restores
-    // can't grow without limit; different labels never evict each other.
-    let mut same_label: Vec<PathBuf> = fs::read_dir(&pinned_root)
-        .map_err(AppError::Io)?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_dir() && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&format!("{label}_")))
-        })
-        .collect();
-    same_label.sort();
-    while same_label.len() > keep_pinned.max(1) {
-        let oldest = same_label.remove(0);
-        if let Err(e) = fs::remove_dir_all(&oldest) {
-            tracing::warn!("pinned snapshot: could not prune {}: {e}", oldest.display());
-        }
+
+    // Pruning is strictly post-commit. Once the new generation is durably promoted and reopened,
+    // failure to enumerate/delete an old pin may retain extras but must not turn the valid new pin
+    // into a reported failure (nor tempt a caller to rerun a migration/restore precondition).
+    if let Err(error) = maybe_inject_snapshot_fault(SnapshotFaultPoint::BeforePrune) {
+        tracing::warn!(
+            "pinned snapshot committed; retaining extra same-label pins because pruning was refused: {error}"
+        );
+    } else {
+        prune_same_label_pins_best_effort(&pinned_root, label, keep_pinned, &snap_dir);
     }
     Ok(snap_dir)
 }
@@ -723,27 +704,20 @@ pub(crate) fn take_snapshot_at_from(
         remove_staging_dir(&staging);
         return Err(e);
     }
-    match verify_snapshot_manifest_for_restore(&staging) {
-        Ok(true) => {}
-        Ok(false) => {
-            remove_staging_dir(&staging);
-            return Err(AppError::Other("new snapshot staging unexpectedly has no manifest".to_string()));
-        }
-        Err(error) => {
-            remove_staging_dir(&staging);
-            return Err(AppError::Other(format!(
-                "snapshot refused before promotion because its recovery contract is incomplete: {error}"
-            )));
-        }
-    }
 
     let snap_dir = root.join(format!("{SNAPSHOT_PREFIX}{ts:010}"));
-    if let Err(e) = fs::rename(&staging, &snap_dir) {
+    if let Err(e) = commit_snapshot_generation(&staging, &snap_dir) {
         remove_staging_dir(&staging);
-        return Err(AppError::Io(e));
+        return Err(e);
     }
 
-    prune_snapshots_from(&root, primary_data_dir, keep)?;
+    // The snapshot is already a durable, reopened recovery generation. Rotation is non-load-bearing
+    // cleanup: retain extras and warn on any failure rather than misreporting the successful commit.
+    let prune_result = maybe_inject_snapshot_fault(SnapshotFaultPoint::BeforePrune)
+        .and_then(|()| prune_snapshots_from_preserving(&root, primary_data_dir, keep, Some(&snap_dir)));
+    if let Err(error) = prune_result {
+        tracing::warn!("snapshot committed; retaining extra rotating snapshots because pruning failed: {error}");
+    }
     Ok(Some(snap_dir))
 }
 
@@ -1525,10 +1499,245 @@ pub(crate) fn manifest_missing_required(manifest: &serde_json::Value) -> Vec<Str
 /// Staging dirs start with '.', so no `snapshot_`/`<label>_` scan ever counts one.
 const STAGING_PREFIX: &str = ".staging_";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotFaultPoint {
+    AfterStageFilesSynced,
+    AfterStageDirectorySynced,
+    AfterStageVerified,
+    AfterRenameBeforeParentSync,
+    AfterDurablePromotion,
+    BeforePrune,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SNAPSHOT_FAULT: std::cell::Cell<Option<SnapshotFaultPoint>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn maybe_inject_snapshot_fault(point: SnapshotFaultPoint) -> AppResult<()> {
+    let injected = SNAPSHOT_FAULT.with(|fault| {
+        if fault.get() == Some(point) {
+            fault.set(None);
+            true
+        } else {
+            false
+        }
+    });
+    if injected {
+        Err(AppError::Other(format!("injected snapshot durability fault at {point:?}")))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_inject_snapshot_fault(_point: SnapshotFaultPoint) -> AppResult<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn with_snapshot_fault<T>(point: SnapshotFaultPoint, operation: impl FnOnce() -> T) -> T {
+    struct ResetSnapshotFault;
+    impl Drop for ResetSnapshotFault {
+        fn drop(&mut self) {
+            SNAPSHOT_FAULT.with(|fault| fault.set(None));
+        }
+    }
+
+    SNAPSHOT_FAULT.with(|fault| {
+        assert!(fault.replace(Some(point)).is_none(), "snapshot fault injection must not be nested");
+    });
+    let _reset = ResetSnapshotFault;
+    operation()
+}
+
+/// Flush every regular staged file (including `manifest.json`) and then the staging directory's
+/// entries. Verification happens only after both barriers, so a manifest cannot certify bytes that
+/// were never accepted by stable storage.
+fn sync_snapshot_staging(staging: &Path) -> AppResult<()> {
+    let files = snapshot_regular_files(staging).map_err(|error| {
+        AppError::Other(format!("snapshot staging could not be inventoried before durability sync: {error}"))
+    })?;
+    if !files.contains_key(MANIFEST_FILE) {
+        return Err(AppError::Other(format!("snapshot staging cannot be committed without {MANIFEST_FILE}")));
+    }
+    for (name, path) in files {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| AppError::Other(format!("snapshot staged file '{name}' could not be flushed: {error}")))?;
+    }
+    maybe_inject_snapshot_fault(SnapshotFaultPoint::AfterStageFilesSynced)?;
+    crate::atomic_file::fsync_directory_strict(staging).map_err(|error| {
+        AppError::Other(format!(
+            "snapshot staging directory entries could not be durably flushed at {}: {error}",
+            staging.display()
+        ))
+    })?;
+    maybe_inject_snapshot_fault(SnapshotFaultPoint::AfterStageDirectorySynced)
+}
+
+#[cfg(target_os = "windows")]
+fn rename_snapshot_directory_write_through(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
+    }
+
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let destination_wide: Vec<u16> = destination.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // SAFETY: both buffers are NUL-terminated and remain live for the call. No replacement flag is
+    // supplied, so an existing snapshot generation is never overwritten. WRITE_THROUGH is the
+    // Windows filesystem durability boundary for this same-volume directory promotion.
+    if unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn rename_snapshot_directory_write_through(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+fn promote_snapshot_directory(staging: &Path, final_path: &Path) -> AppResult<()> {
+    match fs::symlink_metadata(final_path) {
+        Ok(_) => {
+            return Err(AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("snapshot destination already exists: {}", final_path.display()),
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(AppError::Io(error)),
+    }
+    rename_snapshot_directory_write_through(staging, final_path).map_err(AppError::Io)?;
+    maybe_inject_snapshot_fault(SnapshotFaultPoint::AfterRenameBeforeParentSync)?;
+    crate::atomic_file::fsync_parent_dir_strict(final_path).map_err(|error| {
+        AppError::Other(format!(
+            "snapshot promotion reached {} but its parent rename could not be durably flushed: {error}",
+            final_path.display()
+        ))
+    })
+}
+
+/// Reopen the promoted SQLite file independently of the writer connection and then revalidate the
+/// complete manifest from its final name. This is the last commit boundary before any old recovery
+/// generation may be pruned.
+fn verify_promoted_snapshot(snapshot_dir: &Path) -> AppResult<()> {
+    match verify_snapshot_manifest_for_restore(snapshot_dir) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(AppError::Other(format!(
+                "promoted snapshot unexpectedly has no {MANIFEST_FILE}: {}",
+                snapshot_dir.display()
+            )))
+        }
+        Err(error) => {
+            return Err(AppError::Other(format!("promoted snapshot failed its final manifest verification: {error}")))
+        }
+    }
+
+    let database_path = snapshot_dir.join(DB_FILE);
+    let source = crate::db::Database::open_immutable_connection(&database_path).map_err(|error| {
+        AppError::Other(format!(
+            "promoted snapshot database could not be reopened immutable at {}: {error}",
+            database_path.display()
+        ))
+    })?;
+    // FTS5's integrity path may use temporary writes and can report "attempt to write a readonly
+    // database" against a perfectly healthy immutable source. Reopening the final file is still the
+    // authority; copy those exact pages into an isolated in-memory probe before quick_check, matching
+    // the restore-staging boundary without ever mutating the snapshot.
+    let mut probe = rusqlite::Connection::open_in_memory()
+        .map_err(|error| AppError::Other(format!("promoted snapshot final reopen probe could not start: {error}")))?;
+    {
+        let backup = rusqlite::backup::Backup::new(&source, &mut probe)
+            .map_err(|error| AppError::Other(format!("promoted snapshot final reopen probe failed: {error}")))?;
+        backup
+            .run_to_completion(4096, std::time::Duration::from_millis(1), None)
+            .map_err(|error| AppError::Other(format!("promoted snapshot final reopen probe failed: {error}")))?;
+    }
+    let quick_check = read_pragma_strings(&probe, "PRAGMA quick_check").map_err(|error| {
+        AppError::Other(format!("promoted snapshot database could not complete quick_check: {error}"))
+    })?;
+    if quick_check != ["ok"] {
+        return Err(AppError::Other(format!("promoted snapshot database failed final quick_check: {quick_check:?}")));
+    }
+    Ok(())
+}
+
+fn commit_snapshot_generation(staging: &Path, final_path: &Path) -> AppResult<()> {
+    sync_snapshot_staging(staging)?;
+    match verify_snapshot_manifest_for_restore(staging) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(AppError::Other(format!(
+                "snapshot staging unexpectedly has no {MANIFEST_FILE} after durability sync"
+            )))
+        }
+        Err(error) => {
+            return Err(AppError::Other(format!(
+                "snapshot refused before promotion because its durable recovery contract is incomplete: {error}"
+            )))
+        }
+    }
+    maybe_inject_snapshot_fault(SnapshotFaultPoint::AfterStageVerified)?;
+    promote_snapshot_directory(staging, final_path)?;
+    maybe_inject_snapshot_fault(SnapshotFaultPoint::AfterDurablePromotion)?;
+    verify_promoted_snapshot(final_path)
+}
+
+fn prune_same_label_pins_best_effort(pinned_root: &Path, label: &str, keep_pinned: usize, committed_pin: &Path) {
+    let entries = match fs::read_dir(pinned_root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(
+                "pinned snapshot committed; could not enumerate same-label pins under {} for pruning: {error}",
+                pinned_root.display()
+            );
+            return;
+        }
+    };
+    let prefix = format!("{label}_");
+    let mut same_label: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with(&prefix))
+        })
+        .collect();
+    same_label.sort();
+    let keep_count = keep_pinned.max(1);
+    let mut keep = std::collections::HashSet::from([committed_pin.to_path_buf()]);
+    for path in same_label.iter().rev().filter(|path| path.as_path() != committed_pin) {
+        if keep.len() >= keep_count {
+            break;
+        }
+        keep.insert(path.clone());
+    }
+    for old_pin in same_label {
+        if !keep.contains(&old_pin) {
+            if let Err(error) = fs::remove_dir_all(&old_pin) {
+                tracing::warn!("pinned snapshot: could not prune {}: {error}", old_pin.display());
+            }
+        }
+    }
+}
+
 /// Best-effort removal of a staging dir after a failed build (warn, never fail the caller further).
 fn remove_staging_dir(staging: &Path) {
-    if let Err(e) = fs::remove_dir_all(staging) {
-        tracing::warn!("snapshot: could not remove staging dir {}: {e}", staging.display());
+    if let Err(error) = fs::remove_dir_all(staging) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("snapshot: could not remove staging dir {}: {error}", staging.display());
+        }
     }
 }
 
@@ -1675,6 +1884,15 @@ pub fn prune_snapshots(snapshots_root: &Path, keep: usize) -> AppResult<()> {
 }
 
 pub(crate) fn prune_snapshots_from(snapshots_root: &Path, quarantine_dir: &Path, keep: usize) -> AppResult<()> {
+    prune_snapshots_from_preserving(snapshots_root, quarantine_dir, keep, None)
+}
+
+fn prune_snapshots_from_preserving(
+    snapshots_root: &Path,
+    quarantine_dir: &Path,
+    keep: usize,
+    committed_snapshot: Option<&Path>,
+) -> AppResult<()> {
     if !snapshots_root.is_dir() {
         return Ok(());
     }
@@ -1708,6 +1926,12 @@ pub(crate) fn prune_snapshots_from(snapshots_root: &Path, quarantine_dir: &Path,
         .collect();
     let keep_set = select_snapshots_to_keep(&snaps.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(), keep);
     for (ts, path) in snaps {
+        // The just-committed generation is load-bearing even if the wall clock moved backwards and
+        // its embedded timestamp sorts behind older snapshots. Returning success after pruning that
+        // exact directory would let a mandatory pre-migration pin vanish before migration begins.
+        if committed_snapshot.is_some_and(|committed| committed == path.as_path()) {
+            continue;
+        }
         if !keep_set.contains(&ts) {
             if let Err(e) = fs::remove_dir_all(&path) {
                 tracing::warn!("snapshot: could not prune {}: {e}", path.display());
@@ -1785,6 +2009,17 @@ pub fn record_snapshot_panic() {
 mod tests {
     use super::*;
 
+    fn current_test_schema_version() -> i64 {
+        crate::migrations::max_supported_version()
+    }
+
+    fn assert_rollback_to(db: &Database, target_version: i64) {
+        let head = current_test_schema_version();
+        let expected = ((target_version + 1)..=head).rev().collect::<Vec<_>>();
+        assert_eq!(crate::migrations::rollback(db, expected.len()).unwrap(), expected);
+        assert_eq!(crate::migrations::get_current_version(db).unwrap(), target_version);
+    }
+
     fn seeded_db() -> Database {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
@@ -1844,11 +2079,7 @@ mod tests {
     #[test]
     fn active_pilot_pre_migration_snapshot_accepts_exact_v59_and_rejects_drift() {
         let db = seeded_db();
-        assert_eq!(
-            crate::migrations::rollback(&db, 8).unwrap(),
-            vec![67, 66, 65, 64, 63, 62, 61, 60],
-            "fixture must exercise the exact pre-v60 schema boundary",
-        );
+        assert_rollback_to(&db, 59);
         let policy = pilot_policy();
 
         validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap();
@@ -2005,7 +2236,10 @@ mod tests {
         let schema1: serde_json::Value =
             serde_json::from_slice(&std::fs::read(snap.join(MANIFEST_FILE)).unwrap()).unwrap();
         let evidence = inspect_schema2_database_evidence(&snap.join(DB_FILE)).unwrap();
-        assert_eq!(evidence.schema_version, 67);
+        assert_eq!(
+            evidence.schema_version,
+            u64::try_from(current_test_schema_version()).expect("schema version must be non-negative")
+        );
         assert_eq!(evidence.row_counts.review_pilot_hidden_keys, Some(0));
         assert_eq!(evidence.row_counts.review_campaign_registry, Some(0));
         assert_eq!(evidence.row_counts.review_pool_registry, Some(0));
@@ -2341,7 +2575,7 @@ mod tests {
         let db_path = profile.path().join(DB_FILE);
         let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 10).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60, 59, 58]);
+        assert_rollback_to(&db, 57);
         db.insert_segment(&crate::db::SpeechSegment {
             id: "pre-upgrade-row".to_string(),
             audio_path: "/must-survive.wav".to_string(),
@@ -2361,7 +2595,7 @@ mod tests {
         let pin = initialize_with_required_pre_migration_pin(&db, profile.path())
             .unwrap()
             .expect("an established v57 profile requires a pin");
-        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 67);
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), current_test_schema_version());
         assert!(verify_snapshot_manifest_for_restore(&pin).unwrap(), "the migration pin must be self-verifying");
         let pinned = Database::open(pin.join(DB_FILE).to_string_lossy().as_ref()).unwrap();
         assert_eq!(crate::migrations::get_current_version(&pinned).unwrap(), 57);
@@ -2379,12 +2613,12 @@ mod tests {
         let db_path = profile.path().join(DB_FILE);
         let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 10).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60, 59, 58]);
+        assert_rollback_to(&db, 57);
 
         let pin = initialize_with_required_pre_migration_pin(&db, profile.path())
             .unwrap()
             .expect("a v57 profile requires a complete safety pin even when config uses defaults");
-        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 67);
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), current_test_schema_version());
         for state in OPTIONAL_SNAPSHOT_STATE {
             assert_eq!(std::fs::read(pin.join(state.absent_file)).unwrap(), state.absent_bytes);
         }
@@ -2473,6 +2707,131 @@ mod tests {
         let ok = take_snapshot_at(&db, data_dir, 5, 2000).unwrap();
         assert!(ok.is_some(), "a later snapshot succeeds after the failed attempt");
         assert!(root.join(format!("{SNAPSHOT_PREFIX}{:010}", 2000)).join(DB_FILE).is_file());
+    }
+
+    #[test]
+    fn durability_faults_before_promotion_preserve_every_old_rotating_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let db = seeded_db();
+        let root = data_dir.join("snapshots");
+        for ts in [100u64, 200] {
+            take_snapshot_at(&db, data_dir, 20, ts).unwrap().expect("seed recovery generation");
+        }
+        let old = [root.join("snapshot_0000000100"), root.join("snapshot_0000000200")];
+
+        for (index, point) in [
+            SnapshotFaultPoint::AfterStageFilesSynced,
+            SnapshotFaultPoint::AfterStageDirectorySynced,
+            SnapshotFaultPoint::AfterStageVerified,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let timestamp = 300 + u64::try_from(index).unwrap() * 100;
+            let result = with_snapshot_fault(point, || take_snapshot_at(&db, data_dir, 1, timestamp));
+            assert!(result.unwrap_err().to_string().contains("injected snapshot durability fault"));
+            assert!(old.iter().all(|path| path.is_dir()), "a pre-promotion failure must preserve every old snapshot");
+            assert!(
+                !root.join(format!("snapshot_{timestamp:010}")).exists(),
+                "a pre-promotion failure must never publish a final generation"
+            );
+            assert!(
+                fs::read_dir(&root)
+                    .unwrap()
+                    .flatten()
+                    .all(|entry| !entry.file_name().to_string_lossy().starts_with(STAGING_PREFIX)),
+                "a handled pre-promotion failure should leave no hidden staging residue"
+            );
+        }
+    }
+
+    #[test]
+    fn promotion_boundary_faults_never_prune_the_previous_mandatory_pin() {
+        for point in [SnapshotFaultPoint::AfterRenameBeforeParentSync, SnapshotFaultPoint::AfterDurablePromotion] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let data_dir = tmp.path();
+            let db = seeded_db();
+            seed_test_required_snapshot_state(data_dir).unwrap();
+            let old = take_pinned_snapshot_at(&db, data_dir, "prerestore", 5, 1000).unwrap();
+
+            let result = with_snapshot_fault(point, || take_pinned_snapshot_at(&db, data_dir, "prerestore", 1, 2000));
+            assert!(result.unwrap_err().to_string().contains(&format!("{point:?}")));
+            let promoted = data_dir.join("snapshots").join(PINNED_DIR).join("prerestore_0000002000");
+            assert!(old.is_dir(), "the previous mandatory pin must survive until final reopen succeeds");
+            assert!(promoted.is_dir(), "the directory rename completed before the injected crash boundary");
+            verify_promoted_snapshot(&promoted)
+                .expect("the complete post-rename generation remains independently valid in the no-power-loss test");
+        }
+    }
+
+    #[test]
+    fn prune_failure_retains_extras_without_invalidating_new_rotating_or_pinned_generations() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let db = seeded_db();
+        let root = data_dir.join("snapshots");
+        for ts in [100u64, 200] {
+            take_snapshot_at(&db, data_dir, 20, ts).unwrap().expect("seed rotating generation");
+        }
+        let rotating = with_snapshot_fault(SnapshotFaultPoint::BeforePrune, || take_snapshot_at(&db, data_dir, 1, 300))
+            .unwrap()
+            .expect("a prune failure cannot invalidate a committed rotating generation");
+        verify_promoted_snapshot(&rotating).unwrap();
+        assert!(root.join("snapshot_0000000100").is_dir() && root.join("snapshot_0000000200").is_dir());
+
+        seed_test_required_snapshot_state(data_dir).unwrap();
+        let old_pin = take_pinned_snapshot_at(&db, data_dir, "premigration", 5, 400).unwrap();
+        let new_pin = with_snapshot_fault(SnapshotFaultPoint::BeforePrune, || {
+            take_pinned_snapshot_at(&db, data_dir, "premigration", 1, 500)
+        })
+        .expect("a prune failure cannot invalidate a committed mandatory pin");
+        verify_promoted_snapshot(&new_pin).unwrap();
+        assert!(old_pin.is_dir(), "failed pin pruning retains the extra complete predecessor");
+    }
+
+    #[test]
+    fn a_backward_clock_can_never_prune_the_generation_just_reported_committed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let db = seeded_db();
+
+        take_snapshot_at(&db, data_dir, 5, 1000).unwrap().unwrap();
+        let clock_rollback_snapshot =
+            take_snapshot_at(&db, data_dir, 1, 500).unwrap().expect("the rollback-timestamp generation still commits");
+        assert!(clock_rollback_snapshot.is_dir(), "rotation must protect the exact committed path from pruning");
+        verify_promoted_snapshot(&clock_rollback_snapshot).unwrap();
+
+        seed_test_required_snapshot_state(data_dir).unwrap();
+        let old_pin = take_pinned_snapshot_at(&db, data_dir, "premigration", 5, 1000).unwrap();
+        let clock_rollback_pin = take_pinned_snapshot_at(&db, data_dir, "premigration", 1, 500).unwrap();
+        assert!(
+            clock_rollback_pin.is_dir(),
+            "a mandatory pin may not be deleted merely because its timestamp sorts behind an older pin"
+        );
+        assert!(!old_pin.exists(), "keep=1 retains the committed pin, not the clock-newest predecessor");
+        verify_promoted_snapshot(&clock_rollback_pin).unwrap();
+    }
+
+    #[test]
+    fn final_reopen_rejects_a_manifest_consistent_non_sqlite_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let snapshot = take_snapshot_at(&db, tmp.path(), 5, 1000).unwrap().unwrap();
+        fs::write(snapshot.join(DB_FILE), b"not a sqlite database").unwrap();
+        write_snapshot_manifest(&snapshot, 1000).unwrap();
+
+        assert!(
+            verify_snapshot_manifest_for_restore(&snapshot).unwrap(),
+            "schema-1 manifest verification alone only binds bytes and intentionally does not open an absent-policy database"
+        );
+        let error = verify_promoted_snapshot(&snapshot).unwrap_err().to_string();
+        assert!(
+            error.contains("could not be reopened immutable")
+                || error.contains("final reopen probe")
+                || error.contains("quick_check"),
+            "{error}"
+        );
     }
 
     #[test]

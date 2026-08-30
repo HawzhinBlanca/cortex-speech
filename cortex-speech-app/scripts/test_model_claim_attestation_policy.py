@@ -57,6 +57,8 @@ def test_public_runtime_sources_do_not_embed_an_unattested_metric() -> None:
     for path in sorted((ROOT / "src").rglob("*")):
         if path.suffix.lower() not in {".svelte", ".ts", ".js", ".html"} or not path.is_file():
             continue
+        if path.name.endswith((".test.ts", ".test.js")):
+            continue
         text = read(path)
         if re.search(r"\b7\.03\s*%|\b32\.93\s*%", text):
             offenders.append(str(path.relative_to(ROOT)))

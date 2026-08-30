@@ -32,6 +32,10 @@ multi-user, external-reviewer, or ASR-superiority claim.
 
 - Local library, import, exact champion transcription, playback, review, undo/redecision, restart,
   backup, restore, validation, and export.
+- Owner review truth consists of durable accept, correction, reject, and structured technical-
+  unusable flag actions. “Next — no decision” is navigation only: it writes no review event, changes
+  no revision, earns no credit, and is not an Undo target. A durable `skip` action is deliberately
+  outside the single-owner product contract.
 - Internal concurrency among the UI, database, import, ASR/WSL, backup, export, jobs, and recovery.
 - Fully offline default operation and renderer-safe errors.
 - Real schema-65 production-clone compatibility without touching the live database during
@@ -110,6 +114,8 @@ Work by authority domain and preserve one mutation path:
    private path, or raw native error.
 5. Preserve operation UUID replay, base revision conflicts, exact undo, playback receipts, draft
    transactionality, champion hard-stop, restore admission, and append-only migrations.
+   Exact Undo applies to every durable owner review action, including generic and technical flags;
+   navigation-only “Next — no decision” has no inverse because it has no durable effect.
 6. Do not edit pool/Couch/reviewer compensation implementation. If a shared seam fails, stop and
    coordinate against the pool agent's exact commit instead of creating simultaneous fixes.
 

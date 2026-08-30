@@ -21,11 +21,6 @@
   const tauriAvailable = isTauriRuntime();
 
   async function loadStatus() {
-    if (!tauriAvailable) {
-      models = [];
-      loading = false;
-      return;
-    }
     loading = true;
     try {
       models = await modelsStatus();
@@ -37,10 +32,6 @@
   }
 
   async function downloadAll() {
-    if (!tauriAvailable) {
-      notifications.info($t('desktopRuntimeRequired'));
-      return;
-    }
     downloading = true;
     modelProgress = {};
     try {

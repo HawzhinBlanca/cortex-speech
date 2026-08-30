@@ -9,10 +9,12 @@
 //! run_blocking so polling never freezes the UI (per the Week-1 responsiveness audit).
 
 use super::{
-    build_agentic_readiness, external_provider_status, run_blocking, AgenticReadiness, EngineStatusV1, RATE_LIMITER,
-    STRICT_RATE_LIMITER,
+    build_agentic_readiness, external_provider_status, run_blocking, validate, AgenticReadiness, EngineStatusV1,
+    RATE_LIMITER, STRICT_RATE_LIMITER,
 };
-use crate::ipc_contract::{CommandErrorV1, SuggestedActionV1};
+use crate::ipc_contract::{
+    AgentImportReportV1, AgentStageEventV1, AgenticReadinessV1, CommandErrorV1, SuggestedActionV1,
+};
 use crate::AppState;
 use tauri::State;
 
@@ -36,6 +38,35 @@ fn public_engine_block_reason(_private_detail: &str) -> String {
 
 fn public_engine_probe_failure_reason(_private_detail: &str) -> String {
     "Champion engine is offline or did not answer the health probe.".to_string()
+}
+
+fn agent_history_rate_limited() -> CommandErrorV1 {
+    CommandErrorV1::new("RATE_LIMITED", "Import history is busy. Retry in a moment.", true)
+        .suggested(SuggestedActionV1::Retry)
+}
+
+fn invalid_agent_run_id() -> CommandErrorV1 {
+    CommandErrorV1::new("INVALID_AGENT_RUN_ID", "The import run identity is invalid.", false)
+}
+
+fn agent_history_read_failed(kind: &'static str, private_detail: &str) -> CommandErrorV1 {
+    tracing::warn!(history_kind = kind, error = private_detail, "Could not read private agent import history");
+    CommandErrorV1::new(
+        "AGENT_HISTORY_READ_FAILED",
+        "Import history could not be read. Retry; if it continues, open Health.",
+        true,
+    )
+    .suggested(SuggestedActionV1::Retry)
+}
+
+fn agent_readiness_failed(private_detail: &str) -> CommandErrorV1 {
+    tracing::warn!(error = private_detail, "Agentic readiness probe failed");
+    CommandErrorV1::new(
+        "AGENTIC_READINESS_FAILED",
+        "Import readiness could not be checked. Retry; if it continues, open Health.",
+        true,
+    )
+    .suggested(SuggestedActionV1::Retry)
 }
 
 /// Bounded (~5s) health check of the champion 7B engine, for the UI status pill. Cheap + side-effect
@@ -167,32 +198,72 @@ mod typed_engine_ipc_tests {
             assert!(!wire.contains(forbidden));
         }
     }
+
+    #[test]
+    fn public_agent_history_and_readiness_errors_never_forward_private_diagnostics() {
+        let hostile = r"SQL failed at D:\private\cortex-speech.db token=secret";
+        let errors = [agent_history_read_failed("reports", hostile), agent_readiness_failed(hostile)];
+        let wire = serde_json::to_string(&errors).expect("serialize public errors");
+        assert!(wire.contains("AGENT_HISTORY_READ_FAILED"));
+        assert!(wire.contains("AGENTIC_READINESS_FAILED"));
+        for forbidden in ["SQL", "D:\\", "private", "cortex-speech.db", "token", "secret"] {
+            assert!(!wire.contains(forbidden), "public command error leaked {forbidden}: {wire}");
+        }
+    }
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn list_agent_import_reports(
     limit: Option<usize>,
     state: State<'_, AppState>,
-) -> Result<Vec<crate::runs::AgentImportReport>, String> {
-    RATE_LIMITER.check("list_agent_import_reports")?;
+) -> Result<Vec<AgentImportReportV1>, CommandErrorV1> {
+    RATE_LIMITER.check("list_agent_import_reports").map_err(|_| agent_history_rate_limited())?;
     let db = state.lock_db();
-    crate::runs::list_agent_import_reports(&db, limit).map_err(|e| e.to_string())
+    let reports = crate::runs::list_agent_import_reports(&db, limit)
+        .map_err(|error| agent_history_read_failed("import_reports", &error.to_string()))?;
+    Ok(reports.iter().map(AgentImportReportV1::from).collect())
 }
 
 #[tauri::command]
+#[specta::specta]
+pub fn get_agent_import_report_by_run_id(
+    run_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<AgentImportReportV1>, CommandErrorV1> {
+    RATE_LIMITER.check("get_agent_import_report_by_run_id").map_err(|_| agent_history_rate_limited())?;
+    validate::validate_identifier(&run_id).map_err(|_| invalid_agent_run_id())?;
+    let canonical = uuid::Uuid::parse_str(&run_id).map(|id| id.to_string()).map_err(|_| invalid_agent_run_id())?;
+    if canonical != run_id {
+        return Err(invalid_agent_run_id());
+    }
+    let db = state.lock_db();
+    crate::runs::get_agent_import_report_by_run_id(&db, &run_id)
+        .map(|report| report.as_ref().map(AgentImportReportV1::from))
+        .map_err(|error| agent_history_read_failed("import_report_by_run", &error.to_string()))
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn list_agent_stage_events(
     run_id: Option<String>,
     limit: Option<usize>,
     state: State<'_, AppState>,
-) -> Result<Vec<crate::runs::AgentStageEvent>, String> {
-    RATE_LIMITER.check("list_agent_stage_events")?;
+) -> Result<Vec<AgentStageEventV1>, CommandErrorV1> {
+    RATE_LIMITER.check("list_agent_stage_events").map_err(|_| agent_history_rate_limited())?;
+    if let Some(run_id) = run_id.as_deref().filter(|value| !value.trim().is_empty()) {
+        validate::validate_identifier(run_id).map_err(|_| invalid_agent_run_id())?;
+    }
     let db = state.lock_db();
-    crate::runs::list_agent_stage_events(&db, run_id.as_deref(), limit).map_err(|e| e.to_string())
+    let events = crate::runs::list_agent_stage_events(&db, run_id.as_deref(), limit)
+        .map_err(|error| agent_history_read_failed("stage_events", &error.to_string()))?;
+    Ok(events.iter().map(AgentStageEventV1::from).collect())
 }
 
 #[tauri::command]
-pub async fn check_agentic_readiness(state: State<'_, AppState>) -> Result<AgenticReadiness, String> {
-    RATE_LIMITER.check("check_agentic_readiness")?;
+#[specta::specta]
+pub async fn check_agentic_readiness(state: State<'_, AppState>) -> Result<AgenticReadinessV1, CommandErrorV1> {
+    RATE_LIMITER.check("check_agentic_readiness").map_err(|_| agent_history_rate_limited())?;
     // Grab the two cheap, lock-guarded inputs on the caller thread (a settings clone + a bounded
     // model-file stat), then run the SLOW part off the UI thread: external_provider_status shells out
     // to `wsl --status` (bounded at ~10s but that still froze the readiness poll). No lock is held
@@ -202,31 +273,64 @@ pub async fn check_agentic_readiness(state: State<'_, AppState>) -> Result<Agent
         let model_manager = state.lock_model_manager();
         model_manager.status()
     };
-    run_blocking(move || {
+    let readiness: AgenticReadiness = run_blocking(move || {
         let external_provider = external_provider_status(&settings);
         Ok(build_agentic_readiness(&settings, &model_status, &external_provider))
     })
     .await
+    .map_err(|error| agent_readiness_failed(&error))?;
+    Ok(AgenticReadinessV1::from(&readiness))
 }
 
 #[tauri::command]
-pub fn get_escalation_queue(state: State<'_, AppState>, limit: usize) -> Result<Vec<crate::db::SpeechSegment>, String> {
-    RATE_LIMITER.check("get_escalation_queue")?;
+#[specta::specta]
+pub fn get_escalation_queue(
+    state: State<'_, AppState>,
+    limit: usize,
+) -> Result<Vec<crate::db::SpeechSegment>, CommandErrorV1> {
+    RATE_LIMITER
+        .check("get_escalation_queue")
+        .map_err(|_| crate::ipc_contract::owner_analysis_rate_limited("get_escalation_queue"))?;
     // The Inbox is a SERVING PATH: it plays these clips, mints playback receipts for them, and
     // records accept/edit/reject against them. So the voice focus governs it exactly as it governs
     // the review page and every phone queue — found by review 2026-08-20, when narrowing the review
     // page still left the Inbox handing out the guest clips the focus exists to skip.
     let focus = {
         let dir = state.lock_data_dir().clone();
-        crate::voice_focus::resolve(dir.as_deref())?
+        crate::voice_focus::resolve(dir.as_deref()).map_err(|error| {
+            tracing::warn!("Owner escalation voice-focus resolution failed: {error}");
+            crate::ipc_contract::public_owner_analysis_error(
+                crate::ipc_contract::OwnerAnalysisOperationV1::EscalationQueue,
+                &error,
+            )
+        })?
     };
     let db = state.lock_db();
-    db.get_escalation_queue(limit, focus.as_deref()).map_err(|e| e.to_string())
+    db.get_escalation_queue(limit, focus.as_deref()).map_err(|error| {
+        tracing::warn!("Owner escalation queue read failed: {error}");
+        crate::ipc_contract::public_owner_analysis_error(
+            crate::ipc_contract::OwnerAnalysisOperationV1::EscalationQueue,
+            &error.to_string(),
+        )
+    })
 }
 
 #[tauri::command]
-pub fn get_escalation_rate_trend(state: State<'_, AppState>) -> Result<Vec<crate::jury::EscalationTrendPoint>, String> {
-    RATE_LIMITER.check("get_escalation_rate_trend")?;
+#[specta::specta]
+pub fn get_escalation_rate_trend(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::ipc_contract::EscalationTrendPointV1>, CommandErrorV1> {
+    RATE_LIMITER
+        .check("get_escalation_rate_trend")
+        .map_err(|_| crate::ipc_contract::owner_analysis_rate_limited("get_escalation_rate_trend"))?;
     let db = state.lock_db();
-    crate::jury::get_escalation_rate_trend(&db).map_err(|e| e.to_string())
+    crate::jury::get_escalation_rate_trend(&db).map(|points| points.into_iter().map(Into::into).collect()).map_err(
+        |error| {
+            tracing::warn!("Owner escalation trend read failed: {error}");
+            crate::ipc_contract::public_owner_analysis_error(
+                crate::ipc_contract::OwnerAnalysisOperationV1::EscalationTrend,
+                &error.to_string(),
+            )
+        },
+    )
 }

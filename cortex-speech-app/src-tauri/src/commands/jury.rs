@@ -79,13 +79,19 @@ pub async fn run_dpo_update(state: State<'_, AppState>, endpoint: String) -> Res
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn run_jury_pipeline(
     state: State<'_, AppState>,
     segment_ids: Vec<String>,
-) -> Result<serde_json::Value, String> {
-    STRICT_RATE_LIMITER.check("run_jury_pipeline")?;
+) -> Result<crate::ipc_contract::JuryPipelineReportV1, crate::ipc_contract::CommandErrorV1> {
+    STRICT_RATE_LIMITER
+        .check("run_jury_pipeline")
+        .map_err(|_| crate::ipc_contract::owner_analysis_rate_limited("run_jury_pipeline"))?;
     if super::restore_pending() {
-        return Err(super::RESTORE_IN_PROGRESS_MSG.into());
+        return Err(crate::ipc_contract::public_jury_error(
+            crate::ipc_contract::JuryOperationV1::Pipeline,
+            super::RESTORE_IN_PROGRESS_MSG,
+        ));
     }
     let settings = state.lock_settings().clone();
     // Run on a dedicated connection so the global db Mutex is not held across the jury's blocking T2
@@ -97,8 +103,11 @@ pub async fn run_jury_pipeline(
     // settings clone, segment_ids, jury_data_dir, and the Send JuryDbSource (path + Arc handle).
     let jury_data_dir = state.lock_data_dir().clone();
     let source = jury_db_source(&state);
-    let mutation = super::begin_mutation()?;
-    run_blocking(move || {
+    let mutation = super::begin_mutation().map_err(|error| {
+        tracing::warn!("Owner jury-pipeline admission failed: {error}");
+        crate::ipc_contract::public_jury_error(crate::ipc_contract::JuryOperationV1::Pipeline, &error)
+    })?;
+    let result = run_blocking(move || {
         // The guard must live in the blocking closure. Dropping/cancelling the command future does
         // not stop spawn_blocking; keeping it outside would let restore begin while detached jury
         // writes were still committing through their dedicated WAL connection.
@@ -106,6 +115,11 @@ pub async fn run_jury_pipeline(
         source.with(|db| run_jury_pipeline_core_via(db, &settings, segment_ids, jury_data_dir.as_deref()))
     })
     .await
+    .and_then(crate::ipc_contract::decode_jury_pipeline_report);
+    result.map_err(|error| {
+        tracing::warn!("Owner jury pipeline failed: {error}");
+        crate::ipc_contract::public_jury_error(crate::ipc_contract::JuryOperationV1::Pipeline, &error)
+    })
 }
 
 /// `run_t2_for_segment` — run Gemini audio judge on a single segment directly.
@@ -113,16 +127,31 @@ pub async fn run_jury_pipeline(
 /// Useful for re-running T2 from the Review Inbox or a manual trigger without
 /// going through the full pipeline again.
 #[tauri::command]
+#[specta::specta]
 pub async fn run_t2_for_segment(
     state: State<'_, AppState>,
     segment_id: String,
     api_key: String,
+) -> Result<crate::ipc_contract::T2ResultV1, crate::ipc_contract::CommandErrorV1> {
+    STRICT_RATE_LIMITER
+        .check("run_t2_for_segment")
+        .map_err(|_| crate::ipc_contract::owner_analysis_rate_limited("run_t2_for_segment"))?;
+    validate::validate_identifier(&segment_id).map_err(|_| crate::ipc_contract::invalid_segment_id_error())?;
+    let result = run_t2_for_segment_inner(state, segment_id, api_key).await;
+    result.map(crate::ipc_contract::T2ResultV1::from).map_err(|error| {
+        tracing::warn!("Owner T2 listening-judge command failed: {error}");
+        crate::ipc_contract::public_jury_error(crate::ipc_contract::JuryOperationV1::T2, &error)
+    })
+}
+
+async fn run_t2_for_segment_inner(
+    state: State<'_, AppState>,
+    segment_id: String,
+    api_key: String,
 ) -> Result<crate::jury::t2_listener::T2Result, String> {
-    STRICT_RATE_LIMITER.check("run_t2_for_segment")?;
     if super::restore_pending() {
         return Err(super::RESTORE_IN_PROGRESS_MSG.into());
     }
-    validate::validate_identifier(&segment_id)?;
 
     let settings = state.lock_settings().clone();
     let data_dir = state.lock_data_dir().clone();

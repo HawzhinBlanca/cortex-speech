@@ -116,30 +116,52 @@ pub async fn get_training_grade_breakdown(
 }
 
 #[tauri::command]
-pub async fn validate_dataset_cmd(state: State<'_, AppState>) -> Result<crate::validation::ValidationReport, String> {
+#[specta::specta]
+pub async fn validate_dataset_cmd(
+    state: State<'_, AppState>,
+) -> Result<crate::validation::ValidationReport, CommandErrorV1> {
     // Rate-limited like its read siblings: this runs a full-dataset validation scan under the db lock,
     // so an unthrottled webview loop would starve every other DB command.
-    RATE_LIMITER.check("validate_dataset_cmd")?;
+    RATE_LIMITER
+        .check("validate_dataset_cmd")
+        .map_err(|_| crate::ipc_contract::owner_critical_rate_limited("validate_dataset_cmd"))?;
     let settings = state.lock_settings().clone(); // snapshot before moving into the blocking task
     let db = state.db_arc();
-    run_blocking(move || {
+    let result = run_blocking(move || {
         let db = db.lock().unwrap_or_else(|p| p.into_inner());
         crate::validation::validate_dataset_with_settings(&db, &settings).map_err(|e| e.to_string())
     })
-    .await
+    .await;
+    result.map_err(|error| {
+        tracing::warn!("Owner dataset-validation command failed: {error}");
+        crate::ipc_contract::public_owner_data_error(crate::ipc_contract::OwnerDataOperationV1::ValidateDataset, &error)
+    })
 }
 
 /// Intelligence read-side: LOOP-0 shadow precision (the C5 go-live evidence) + auto-accept
 /// precision (C4) joined against subsequent human decisions.
 #[tauri::command]
-pub async fn get_intelligence_report(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("get_intelligence_report")?;
+#[specta::specta]
+pub async fn get_intelligence_report(
+    state: State<'_, AppState>,
+) -> Result<crate::ipc_contract::IntelligenceReportV1, CommandErrorV1> {
+    RATE_LIMITER
+        .check("get_intelligence_report")
+        .map_err(|_| crate::ipc_contract::owner_analysis_rate_limited("get_intelligence_report"))?;
     let db = state.db_arc();
-    run_blocking(move || {
+    let result = run_blocking(move || {
         let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        db.intelligence_report().map_err(|e| e.to_string())
+        let value = db.intelligence_report().map_err(|e| e.to_string())?;
+        crate::ipc_contract::decode_intelligence_report(value)
     })
-    .await
+    .await;
+    result.map_err(|error| {
+        tracing::warn!("Owner intelligence-report command failed: {error}");
+        crate::ipc_contract::public_owner_analysis_error(
+            crate::ipc_contract::OwnerAnalysisOperationV1::IntelligenceReport,
+            &error,
+        )
+    })
 }
 
 #[tauri::command]

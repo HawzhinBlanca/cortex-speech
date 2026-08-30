@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { installTauriMock } from './helpers/tauri-mock';
 import { openHeaderOverflow, openSettingsFromHeader } from './helpers/header';
 
@@ -32,7 +32,8 @@ test.describe('i18n and locale switching', () => {
     await toggle.click();
 
     // Now in English, the toggle offers Kurdish (endonym).
-    await expect(toggle).toHaveText('کوردی');
+    await openHeaderOverflow(page);
+    await expect(page.getByTestId('locale-toggle')).toHaveText('کوردی');
   });
 
   test('UI text updates when locale changes', async ({ page }) => {

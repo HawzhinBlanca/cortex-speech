@@ -373,7 +373,7 @@ pub fn export_finalized_voice_dataset(
                     return Err(AppError::Validation(format!(
                         "{}: unknown final adjudication action {other}",
                         row.segment_id
-                    )))
+                    )));
                 }
             }
         }

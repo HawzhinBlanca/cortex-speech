@@ -624,7 +624,7 @@ pub fn activate(db: &Database, pool_id: &str, inputs: &[PoolMemberInput]) -> Res
         }
         match assignments.insert(segment_id.to_string(), voice_name.to_string()) {
             Some(existing) if existing != voice_name => {
-                return Err(format!("segment {segment_id} is assigned to two voice characters"))
+                return Err(format!("segment {segment_id} is assigned to two voice characters"));
             }
             _ => {}
         }
@@ -1973,6 +1973,84 @@ pub fn reverse_decision(
     Ok(())
 }
 
+/// Reverse one exact HTTP-visible pool decision with a distinct durable reversal identity.
+///
+/// `Ok(None)` is a semantic conflict (wrong reviewer/pool/decision operation, or a stale target that
+/// is no longer this reviewer's newest pool action). Storage failures remain `Err`. The newest check
+/// reads the append-only base table, not the effective view, so an exact retry after the reversal is
+/// still bound to the same decision instead of sliding backward to older effective evidence.
+pub fn reverse_decision_addressed(
+    db: &Database,
+    pool: &ReviewPool,
+    decision_id: i64,
+    reviewer: &str,
+    decision_operation_id: &str,
+    reversal_operation_id: &str,
+    created_at_ms: i64,
+) -> Result<Option<String>, String> {
+    if decision_id <= 0 || created_at_ms <= 0 {
+        return Ok(None);
+    }
+    canonical_uuid(decision_operation_id, "review pool decision operation id")?;
+    canonical_uuid(reversal_operation_id, "review pool reversal operation id")?;
+    if decision_operation_id == reversal_operation_id {
+        return Ok(None);
+    }
+    with_pool_full_sync(db, || {
+        let tx = rusqlite::Transaction::new_unchecked(db.connection(), rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("addressed review pool reversal cannot lock the database: {error}"))?;
+        let target: Option<(String, String)> = tx
+            .query_row(
+                "SELECT segment_id, operation_id FROM review_pool_decisions
+                  WHERE id=?1 AND pool_id=?2 AND reviewer=?3 COLLATE NOCASE",
+                rusqlite::params![decision_id, pool.pool_id, reviewer],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("addressed review pool reversal target cannot be read: {error}"))?;
+        let Some((segment_id, stored_decision_operation_id)) = target else {
+            return Ok(None);
+        };
+        if stored_decision_operation_id != decision_operation_id {
+            return Ok(None);
+        }
+        let latest_decision_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM review_pool_decisions
+                  WHERE pool_id=?1 AND reviewer=?2 COLLATE NOCASE
+                  ORDER BY id DESC LIMIT 1",
+                rusqlite::params![pool.pool_id, reviewer],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("latest addressed review pool action cannot be read: {error}"))?;
+        if latest_decision_id != Some(decision_id) {
+            return Ok(None);
+        }
+        let existing: Option<(String, String)> = tx
+            .query_row(
+                "SELECT operation_id, reviewer FROM review_pool_reversals WHERE decision_id=?1",
+                [decision_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("addressed review pool reversal receipt cannot be read: {error}"))?;
+        if let Some((stored_reversal_operation_id, stored_reviewer)) = existing {
+            return Ok((stored_reversal_operation_id == reversal_operation_id
+                && stored_reviewer.eq_ignore_ascii_case(reviewer))
+            .then_some(segment_id));
+        }
+        tx.execute(
+            "INSERT INTO review_pool_reversals(decision_id, operation_id, reviewer, created_at_ms)
+             VALUES(?1, ?2, ?3, ?4)",
+            rusqlite::params![decision_id, reversal_operation_id, reviewer, created_at_ms],
+        )
+        .map_err(|error| format!("addressed review pool reversal cannot be written: {error}"))?;
+        tx.commit().map_err(|error| format!("addressed review pool reversal cannot commit: {error}"))?;
+        Ok(Some(segment_id))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2283,7 +2361,14 @@ mod tests {
         )
         .unwrap_err()
         .contains("outside the active review pool"));
-        assert!(crate::migrations::rollback(&db, 5).unwrap_err().to_string().contains("CHECK constraint failed"));
+        let rollback_through_dedup = crate::migrations::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version >= REVIEW_POOL_DEDUP_SCHEMA_VERSION)
+            .count();
+        assert!(crate::migrations::rollback(&db, rollback_through_dedup)
+            .unwrap_err()
+            .to_string()
+            .contains("CHECK constraint failed"));
     }
 
     #[test]
@@ -2502,6 +2587,101 @@ mod tests {
         tx.commit().unwrap();
         assert!(!registry_matches(&db, &pool).unwrap(), "champion rotation must pause the bound pool");
         assert!(load(&db).unwrap_err().contains("champion identity no longer matches"));
+    }
+
+    #[test]
+    fn addressed_pool_undo_replays_the_exact_latest_decision_after_restart() {
+        let (_dir, db, pool) = two_clip_pool(None);
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET verified=1, human_decision='edit', verdict='human_edit',
+                        verdict_transcript='دەقی دروست', annotated_transcript='دەقی دروست',
+                        reviewed_by='Rubar', review_revision=review_revision+1
+                  WHERE id IN ('a','b')",
+                [],
+            )
+            .unwrap();
+        let decide_segment = |segment_id: &str, operation_id: &str, created_at_ms: i64| {
+            let (_, revision) = db.get_segment_by_id_with_revision(segment_id).unwrap().unwrap();
+            let audio_hash = segment_id.repeat(64);
+            record_decision(
+                &db,
+                &pool,
+                &PoolDecisionInput {
+                    segment_id,
+                    reviewer: "Alle",
+                    action: "edit",
+                    submitted_transcript: Some("دەقی ئەلە"),
+                    served_transcript: "دەقی چامپیۆن",
+                    served_revision: revision,
+                    audio_content_hash: Some(&audio_hash),
+                    source_start_ms: Some(0),
+                    source_end_ms: Some(1_000),
+                    duration_ms: 1_000,
+                    requested_action: "edit",
+                    requested_transcript: "دەقی ئەلە",
+                    operation_id,
+                    operation_payload_hash: &"e".repeat(64),
+                    created_at_ms,
+                },
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let older_operation = "123e4567-e89b-42d3-a456-426614174060";
+        let latest_operation = "123e4567-e89b-42d3-a456-426614174061";
+        let older = decide_segment("a", older_operation, 10);
+        let latest = decide_segment("b", latest_operation, 20);
+        let reversal_operation = "123e4567-e89b-42d3-a456-426614174062";
+
+        assert_eq!(
+            reverse_decision_addressed(&db, &pool, latest, "Alle", latest_operation, reversal_operation, 30,)
+                .unwrap()
+                .as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            latest_decision(&db, &pool.pool_id, "Alle").unwrap().map(|value| value.0),
+            Some(older),
+            "the legacy effective fallback now points at the older decision that must not be touched"
+        );
+
+        // Model commit -> lost HTTP response -> app restart -> retry. No in-memory token exists; the
+        // exact request coordinates alone must replay the same durable reversal.
+        assert_eq!(
+            reverse_decision_addressed(&db, &pool, latest, "alle", latest_operation, reversal_operation, 40,)
+                .unwrap()
+                .as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            db.connection()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM review_pool_reversals", [], |row| row.get(0))
+                .unwrap(),
+            1
+        );
+        assert!(
+            db.connection()
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM effective_review_pool_decisions_v62 WHERE id=?1",
+                    [older],
+                    |row| row.get(0),
+                )
+                .unwrap()
+                == 1
+        );
+        assert!(reverse_decision_addressed(
+            &db,
+            &pool,
+            older,
+            "Alle",
+            older_operation,
+            "123e4567-e89b-42d3-a456-426614174063",
+            50,
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]

@@ -13,11 +13,20 @@ Fail-before: reverting resolve_clip_offsets to the old `m.get(...)`-then-whole-f
 offset-less / partial / unparseable cases return (None, None), and the asserts below fire.
 """
 import json
+import sqlite3
 import sys
+import tempfile
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cortex_7b_client import ClobberedAlignment, resolve_clip_offsets  # noqa: E402
+import cortex_7b_client as client  # noqa: E402
+from cortex_7b_client import (  # noqa: E402
+    ClobberedAlignment,
+    SegmentSnapshotError,
+    read_segment_from_snapshot,
+    resolve_clip_offsets,
+)
 
 
 def test_resolve_clip_offsets() -> None:
@@ -47,9 +56,151 @@ def test_resolve_clip_offsets() -> None:
             raise AssertionError(f"resolve_clip_offsets must REFUSE a present-but-offset-less alignment: {bad!r}")
 
 
+class _SnapshotCursor:
+    def __init__(self, row):
+        self._row = row
+
+    def fetchone(self):
+        return self._row
+
+
+class _SnapshotConnection:
+    def __init__(self, row):
+        self._row = row
+
+    def execute(self, _query, _parameters):
+        return _SnapshotCursor(self._row)
+
+    def close(self):
+        pass
+
+
+def test_wal_copy_failure_never_falls_back_to_main_file() -> None:
+    """An observed-but-uncopyable WAL is an EX_DB-class snapshot failure after retries."""
+    copies = []
+
+    def fail_wal_copy(source, _destination):
+        copies.append(source)
+        if source.endswith("-wal"):
+            raise OSError("simulated WAL copy failure")
+
+    with (
+        mock.patch.object(client.os.path, "exists", return_value=True),
+        mock.patch.object(client.shutil, "copyfile", side_effect=fail_wal_copy),
+        mock.patch.object(client.time, "sleep", return_value=None),
+    ):
+        try:
+            read_segment_from_snapshot("source.db", "seg", attempts=3)
+        except SegmentSnapshotError as exc:
+            assert "simulated WAL copy failure" in str(exc)
+        else:
+            raise AssertionError("WAL copy failure must not become a main-file-only EX_NOSEG result")
+
+    assert copies.count("source.db-wal") == 3, "the complete DB+WAL snapshot must be retried"
+
+
+def test_real_wal_snapshot_exposes_committed_segment() -> None:
+    """Exercise SQLite itself: the requested row exists only in the copied WAL, not the main file."""
+    with tempfile.TemporaryDirectory(prefix="cortex7b_wal_policy_") as directory:
+        db = str(Path(directory) / "source.db")
+        writer = sqlite3.connect(db)
+        try:
+            assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+            writer.execute(
+                "CREATE TABLE speech_segments (id TEXT PRIMARY KEY, audio_path TEXT, alignment_json TEXT)"
+            )
+            writer.commit()
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            writer.execute(
+                "INSERT INTO speech_segments VALUES (?, ?, ?)",
+                ("fresh", "audio.wav", '{"source_start_ms":0,"source_end_ms":10}'),
+            )
+            writer.commit()
+            assert Path(db + "-wal").stat().st_size > 0
+
+            row = read_segment_from_snapshot(db, "fresh", retry_base_seconds=0)
+            assert row == ("audio.wav", '{"source_start_ms":0,"source_end_ms":10}')
+        finally:
+            writer.close()
+
+
+def test_missing_wal_snapshot_row_is_retried_before_not_found() -> None:
+    """A valid-looking DB/WAL pair can cross a checkpoint; retry can recover the committed row."""
+    rows = iter([None, ("audio.wav", '{"source_start_ms":0,"source_end_ms":10}')])
+    connections = []
+
+    def connect(_path, uri):
+        assert uri is True
+        connection = _SnapshotConnection(next(rows))
+        connections.append(connection)
+        return connection
+
+    with (
+        mock.patch.object(client.os.path, "exists", return_value=True),
+        mock.patch.object(client.shutil, "copyfile", return_value=None),
+        mock.patch.object(client.sqlite3, "connect", side_effect=connect),
+        mock.patch.object(client.time, "sleep", return_value=None),
+    ):
+        row = read_segment_from_snapshot("source.db", "seg", attempts=3)
+
+    assert row == ("audio.wav", '{"source_start_ms":0,"source_end_ms":10}')
+    assert len(connections) == 2, "row=None with a WAL must not break the retry loop"
+
+
+def test_stably_missing_wal_snapshot_row_fails_as_unprovable() -> None:
+    """Even repeated WAL-backed misses cannot prove absence across a concurrent checkpoint."""
+    connections = []
+
+    def connect(_path, uri):
+        assert uri is True
+        connection = _SnapshotConnection(None)
+        connections.append(connection)
+        return connection
+
+    with (
+        mock.patch.object(client.os.path, "exists", return_value=True),
+        mock.patch.object(client.shutil, "copyfile", return_value=None),
+        mock.patch.object(client.sqlite3, "connect", side_effect=connect),
+        mock.patch.object(client.time, "sleep", return_value=None),
+    ):
+        try:
+            read_segment_from_snapshot("source.db", "missing", attempts=3)
+        except SegmentSnapshotError as exc:
+            assert "WAL-backed" in str(exc)
+        else:
+            raise AssertionError("exhausted WAL-backed misses must fail as EX_DB-class uncertainty")
+    assert len(connections) == 3
+
+
+def test_missing_row_without_wal_is_authoritative() -> None:
+    """EX_NOSEG remains available only when WAL absence brackets the successful read."""
+    connections = []
+
+    def connect(_path, uri):
+        assert uri is True
+        connection = _SnapshotConnection(None)
+        connections.append(connection)
+        return connection
+
+    with (
+        mock.patch.object(client.os.path, "exists", return_value=False),
+        mock.patch.object(client.shutil, "copyfile", return_value=None),
+        mock.patch.object(client.sqlite3, "connect", side_effect=connect),
+    ):
+        row = read_segment_from_snapshot("source.db", "missing", attempts=3)
+
+    assert row is None
+    assert len(connections) == 1
+
+
 def main() -> None:
     test_resolve_clip_offsets()
-    print("cortex_7b_client offset-guard policy passed")
+    test_wal_copy_failure_never_falls_back_to_main_file()
+    test_real_wal_snapshot_exposes_committed_segment()
+    test_missing_wal_snapshot_row_is_retried_before_not_found()
+    test_stably_missing_wal_snapshot_row_fails_as_unprovable()
+    test_missing_row_without_wal_is_authoritative()
+    print("cortex_7b_client offset + WAL snapshot policy passed")
 
 
 if __name__ == "__main__":

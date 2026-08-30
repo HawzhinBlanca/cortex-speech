@@ -93,6 +93,8 @@ test.describe('Navigation and panel interaction', () => {
 
   test('sidebar hidden button appears when sidebar is toggled off', async ({ page }) => {
     await page.goto('/');
+    const aside = page.locator('aside').first();
+    await expect(aside).toBeVisible();
 
     await page.keyboard.press('Shift+S');
 
@@ -101,6 +103,6 @@ test.describe('Navigation and panel interaction', () => {
     await expect(showBtn).toBeVisible();
 
     await showBtn.click();
-    await expect(page.locator('aside').first()).toBeVisible();
+    await expect(aside).toBeVisible();
   });
 });

@@ -4,9 +4,9 @@ use super::*;
 
 impl ProcessingPipeline {
     /// Draft an unbound standalone audio file without publishing it to an existing segment. Existing
-    /// segment callers must use [`Self::bind_existing_transcription_source`] +
-    /// [`Self::transcribe_bound`]; accepting an id here would recreate the ID/path mix-up this split
-    /// is designed to make unrepresentable.
+    /// segment callers must bind an immutable source and use the side-effect-free bound draft plus a
+    /// database-owned commit boundary; accepting an id here would recreate the ID/path mix-up this
+    /// split is designed to make unrepresentable.
     pub fn transcribe(
         &self,
         segment_id: Option<&str>,
@@ -20,7 +20,7 @@ impl ProcessingPipeline {
                     .into(),
             ));
         }
-        self.transcribe_with_champion_commit(None, audio_path, alignment_json, cancel, false, None)
+        self.transcribe_draft_only(None, audio_path, alignment_json, cancel)
     }
 
     /// Bind one already-imported segment to the exact database and decoded-PCM authority that will
@@ -113,40 +113,43 @@ impl ProcessingPipeline {
         Ok(BoundTranscriptionSource { snapshot, _source_lease: source_lease })
     }
 
-    /// Transcribe one source whose segment id, path, span, duration and decoded PCM are already bound.
-    pub(crate) fn transcribe_bound(
+    /// Infer a draft for an immutable bound source without publishing any canonical truth.
+    ///
+    /// Batch orchestration uses this path so its durable journal and the final segment/hypothesis
+    /// update can share one later transaction. The bound source still authorizes the exact segment,
+    /// path, span and decoded PCM used by inference, but it grants no write capability here.
+    pub(crate) fn transcribe_bound_draft_only(
         &self,
         source: &BoundTranscriptionSource,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> AppResult<TranscriptionDraft> {
-        self.transcribe_with_champion_commit(
+        self.transcribe_draft_only(
             Some(&source.snapshot.segment.id),
             &source.snapshot.segment.audio_path,
             source.snapshot.segment.alignment_json.as_deref(),
             cancel,
-            true,
-            Some(&source.snapshot),
         )
     }
 
-    /// Shared transcription implementation. Normal re-transcription commits the champion result
-    /// immediately; file import passes `commit_champion = false` so every chunk is completed in
-    /// memory before the file is atomically published.
-    pub(super) fn transcribe_with_champion_commit(
+    /// Import inference is side-effect-free. Canonical rows and any auxiliary hypotheses may only
+    /// be published by the later import transaction after every chunk has completed.
+    pub(super) fn transcribe_import_draft_only(
+        &self,
+        segment_id: &str,
+        audio_path: &str,
+        alignment_json: Option<&str>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> AppResult<TranscriptionDraft> {
+        self.transcribe_draft_only(Some(segment_id), audio_path, alignment_json, cancel)
+    }
+
+    fn transcribe_draft_only(
         &self,
         segment_id: Option<&str>,
         audio_path: &str,
         alignment_json: Option<&str>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
-        commit_champion: bool,
-        expected_source: Option<&ChampionTranscriptionSourceSnapshot>,
     ) -> AppResult<TranscriptionDraft> {
-        if commit_champion && expected_source.is_none() {
-            return Err(AppError::Validation(
-                "E_TRANSCRIPTION_SOURCE_UNBOUND: existing-segment transcription requires immutable source authority"
-                    .into(),
-            ));
-        }
         let path = Path::new(audio_path);
         let duration_ms = audio::get_duration_ms(path)?;
         if duration_ms == 0 {
@@ -161,7 +164,6 @@ impl ProcessingPipeline {
         // engine choice, and it keeps its precedence below.
         if self.should_use_wsl_primary_asr() && !self.finetuned_override_active() {
             let runtime = self.shared_database_runtime(&self.db_path)?;
-            let import_writes = crate::stores::ImportWriteStore::new(runtime.clone());
             let segment_queries = crate::stores::SegmentQueryStore::new(runtime.clone());
             let audio_path_str = path.to_string_lossy().to_string();
 
@@ -247,51 +249,11 @@ impl ProcessingPipeline {
                 // before it is returned/stored (opt-in; default off; best-effort).
                 let final_text = apply_loop0_firing(self.settings.loop0_firing_enabled, &db, &final_text);
 
-                // Commit ONCE, after every enabled refinement succeeds. The former early write stored
-                // raw 7B text before an enabled refiner could fail, then the command returned an error
-                // with a partially changed row. The backend is the sole writer; the frontend reloads
-                // this authoritative row and never whole-row-upserts a stale pre-inference snapshot.
-                let normalized_transcript = if self.settings.auto_normalize && !final_text.is_empty() {
-                    let norm_config = crate::normalizer::NormalizationConfig {
-                        normalize_numbers: self.settings.auto_normalize,
-                        verbalize_numbers: self.settings.verbalize_numbers,
-                        normalize_hamza: true,
-                        remove_diacritics: false,
-                    };
-                    let norm = SoraniNormalizer::with_config(norm_config);
-                    Some(norm.normalize(&final_text))
-                } else {
-                    None
-                };
+                // Inference returns a closed draft only. Single-clip, batch, and import orchestration
+                // each own one later atomic publication boundary; this function cannot create a
+                // transcript row or auxiliary hypothesis before that owner is ready.
                 let cloud_call = self.llm_refinement_uses_cloud();
-                let champion = SegmentHypothesis {
-                    segment_id: id.clone(),
-                    model_id: wsl_result.model_version_id.clone(),
-                    transcript: raw_transcript.clone(),
-                    confidence,
-                };
                 drop(db);
-                if commit_champion {
-                    let updated = import_writes
-                        .commit_bound_champion_transcript_if_unreviewed(
-                            &champion,
-                            Some(&wsl_result.deployment_sha256),
-                            normalized_transcript.as_deref(),
-                            Some("external_provider"),
-                            cloud_call,
-                            expected_source.ok_or_else(|| {
-                                AppError::Validation(
-                                    "E_TRANSCRIPTION_SOURCE_UNBOUND: champion commit lost its source authority".into(),
-                                )
-                            })?,
-                        )
-                        .map_err(|e| AppError::Other(format!("Failed to commit champion transcript: {e}")))?;
-                    if !updated {
-                        return Err(AppError::Validation(format!(
-                            "Segment {id} gained a human decision while the champion was running; its reviewed transcript was not overwritten"
-                        )));
-                    }
-                }
 
                 return Ok(TranscriptionDraft {
                     raw_text: raw_transcript,
@@ -301,7 +263,6 @@ impl ProcessingPipeline {
                     model_version_id: Some(wsl_result.model_version_id),
                     deployment_sha256: Some(wsl_result.deployment_sha256),
                     cloud_call,
-                    committed_by_pipeline: commit_champion,
                 });
             } else {
                 return Err(AppError::Other(
@@ -336,21 +297,6 @@ impl ProcessingPipeline {
                             None => raw_text.clone(),
                         };
                         let final_text = self.fire_loop0_if_enabled(&final_text);
-                        if let Some(id) = segment_id {
-                            if let Ok(db) = self.open_db() {
-                                let f32_pcm: Vec<f32> = chunk_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
-                                let primary = PrimaryHypothesis {
-                                    model_id: "finetuned-mms-ckb",
-                                    transcript: &raw_text,
-                                    confidence: None,
-                                };
-                                if let Err(error) =
-                                    self.populate_hypotheses_reusing_primary(&db, id, &f32_pcm, Some(primary))
-                                {
-                                    log_hypothesis_population_failure(id, &error);
-                                }
-                            }
-                        }
                         let cloud_call = self.llm_refinement_uses_cloud();
                         return Ok(TranscriptionDraft {
                             raw_text,
@@ -360,7 +306,6 @@ impl ProcessingPipeline {
                             model_version_id: Some("finetuned-mms-ckb".to_string()),
                             deployment_sha256: None,
                             cloud_call,
-                            committed_by_pipeline: false,
                         });
                     }
                     Ok(_) => {
@@ -406,7 +351,6 @@ impl ProcessingPipeline {
                 model_version_id: Some(model_id.clone()),
                 deployment_sha256: None,
                 cloud_call: self.llm_refinement_uses_cloud(),
-                committed_by_pipeline: false,
             });
         }
 
@@ -459,15 +403,6 @@ impl ProcessingPipeline {
             self.cache.set_chunk(path, chunk_suffix.as_deref(), entry);
         }
 
-        if let Some(id) = segment_id {
-            if let Ok(db) = self.open_db() {
-                let primary = PrimaryHypothesis { model_id: &model_id, transcript: &raw_text, confidence };
-                if let Err(error) = self.populate_hypotheses_reusing_primary(&db, id, &f32_pcm, Some(primary)) {
-                    log_hypothesis_population_failure(id, &error);
-                }
-            }
-        }
-
         let final_text = self.fire_loop0_if_enabled(&final_text);
         Ok(TranscriptionDraft {
             raw_text,
@@ -477,7 +412,6 @@ impl ProcessingPipeline {
             model_version_id: Some(model_id),
             deployment_sha256: None,
             cloud_call: self.llm_refinement_uses_cloud(),
-            committed_by_pipeline: false,
         })
     }
 

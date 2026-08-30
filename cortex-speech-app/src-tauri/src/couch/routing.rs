@@ -649,9 +649,10 @@ pub(super) fn handle_request(
             Ok(body) => with_live_reviewer(&token, reviewer, state, || api_renew(&body, reviewer, state)),
             Err(e) => err_reply(400, &e),
         },
-        (tiny_http::Method::Post, "/api/undo") => {
-            with_live_reviewer(&token, reviewer, state, || api_undo(db, reviewer, state))
-        }
+        (tiny_http::Method::Post, "/api/undo") => match read_body(request) {
+            Ok(body) => with_live_reviewer(&token, reviewer, state, || api_undo_with_body(db, &body, reviewer, state)),
+            Err(e) => err_reply(400, &e),
+        },
         _ => err_reply(404, "not found"),
     };
     (reply, None)

@@ -8,6 +8,8 @@
     skipDisabledKey: TranslationKey | null;
     flagDisabledKey: TranslationKey | null;
     undoDisabledKey: TranslationKey | null;
+    undoActionKey: TranslationKey;
+    undoErrorCode: string | null;
     onAccept: () => void;
     onEdit: () => void;
     onReject: () => void;
@@ -23,6 +25,8 @@
     skipDisabledKey,
     flagDisabledKey,
     undoDisabledKey,
+    undoActionKey,
+    undoErrorCode,
     onAccept,
     onEdit,
     onReject,
@@ -33,6 +37,9 @@
 </script>
 
 <div class="verb-bar" role="group" aria-label={$t('inbox.reviewActions')}>
+  {#if undoErrorCode}<span class="undo-error" role="status"
+      >{$t('review.undoErrorCode', { code: undoErrorCode })}</span
+    >{/if}
   <button
     class="verb-btn accept"
     onclick={onAccept}
@@ -106,12 +113,12 @@
   <button
     class="verb-btn undo"
     onclick={onUndo}
-    title={$t('inbox.undoTitle')}
+    title={$t(undoActionKey)}
     id="inbox-undo"
     disabled={!!undoDisabledKey}
     aria-describedby={undoDisabledKey ? 'inbox-undo-disabled-reason' : undefined}
   >
-    {$t('undo')}
+    {$t(undoActionKey)}
   </button>
   {#if undoDisabledKey}
     <span id="inbox-undo-disabled-reason" class="sr-only">{$t(undoDisabledKey)}</span>
@@ -128,6 +135,11 @@
     padding: 12px 0 4px;
     position: sticky;
     bottom: 0;
+  }
+  .undo-error {
+    width: 100%;
+    color: rgb(var(--amber-400-rgb));
+    font-size: 0.75rem;
   }
   .verb-btn {
     display: flex;

@@ -28,7 +28,7 @@ describe('320 CSS-pixel reflow policy', () => {
   });
 
   it('stacks the review queue rail above the focus card without clipping narrow content', () => {
-    const owner = readFileSync(resolve(root, 'src/lib/ReviewInbox.svelte'), 'utf8');
+    const owner = readFileSync(resolve(root, 'src/lib/ReviewInboxWorkspace.svelte'), 'utf8');
     const rail = readFileSync(resolve(root, 'src/lib/ReviewInboxQueueRail.svelte'), 'utf8');
     const header = readFileSync(resolve(root, 'src/lib/ReviewInboxHeader.svelte'), 'utf8');
     expect(owner).toContain("import ReviewInboxQueueRail from './ReviewInboxQueueRail.svelte'");
