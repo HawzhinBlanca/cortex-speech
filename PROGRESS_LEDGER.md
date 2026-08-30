@@ -12375,3 +12375,35 @@ ledger commit and exact push.
 Honest status before the iteration-16 remeasurement: the product chunk is green, but no coverage
 delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
 and P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-31 — Reliability iteration 17: exhaustive unsnapshotted prior truth
+
+Iteration 16's exact serialized measurement at pushed ledger commit
+`1042546c2e1c1de10f90876838fccd4e71d8a60d` completed 1,829 library tests with 0 failures and 8
+ignores, importer 14/14, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and all Criterion targets. The certifying wrapper exited red solely
+because the locked coverage thresholds remain unmet. The artifact (`8215c7138c704f8ba52c913f5277cb97`,
+SHA-256 `dbfcb5b8f07e0705c0f74d9c26cc7cc7caa1a0dd565a36577a8992316e4c3e5a`) proved all five intended
+typed-desktop conditions green. Overall branches reached 60.35%; restore reached 67.86%, reducing
+uncovered restore branches from 489 to 484, and the active effects target moved 90 to 85. The
+artifact gained five intended effects branches plus unrelated run variance of +2 in commands and
+-1 in normalizer; IPC returned to 42.80% (440/1,028). P1 remains red, P2 green, and P0 unknown
+because the production heartbeat is absent.
+
+The next reachable LLVM cluster contained seven unproved ways a first post-v60 mutation could claim
+unsnapshotted human prior truth. The new regression uses genuine production phone accepts rather
+than edits for decision cases, so no correction/example/memory evidence exists to intercept changes
+to prior annotation, human decision, reviewer, correction timestamp, or human verdict. Separate
+genuine review flags prove forged prior escalation and prior human verdict. Every clean fixture
+validates before exactly one immutable prior field is changed under the restored-file threat model,
+and every case must produce the exact unsnapshotted-human-truth refusal. No learning rows, linkage
+guards, or production validation were weakened or removed.
+
+The focused proof passed 1/1 across all seven mutations and the complete restore-effects suite passed
+31/31. Installed stable rustfmt passed; installed stable Clippy passed all targets/features with
+`-D warnings`. Product commit `cec922e430afcff3ea006033b60a394be07a7168` is ready for the
+ledger commit and exact push.
+
+Honest status before the iteration-17 remeasurement: the product chunk is green, but no coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
