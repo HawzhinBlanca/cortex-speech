@@ -2474,6 +2474,48 @@ mod tests {
     }
 
     #[test]
+    fn a_desktop_effect_cannot_cross_or_partially_erase_its_operation_boundary() {
+        // An unlinked desktop effect is accepted only as one exact anonymous operation. A restored
+        // file must not be able to re-label it as Couch work, attach a reviewer identity, or erase
+        // one member of the operation tuple while leaving reviewed-looking dataset truth behind.
+        for (label, sabotage) in [
+            ("Couch source without a review event", "UPDATE human_decision_effect_events SET source = 'couch'"),
+            (
+                "named reviewer on anonymous desktop work",
+                "UPDATE human_decision_effect_events SET reviewer = 'Reviewer'",
+            ),
+            ("missing operation id", "UPDATE human_decision_effect_events SET operation_id = NULL"),
+            ("missing operation payload hash", "UPDATE human_decision_effect_events SET operation_payload_hash = NULL"),
+            ("missing requested action", "UPDATE human_decision_effect_events SET requested_action = NULL"),
+            ("missing requested timestamp", "UPDATE human_decision_effect_events SET requested_timestamp_ms = NULL"),
+        ] {
+            let db = seeded_db("desktop-boundary");
+            let authority = "11111111-2222-4333-8444-555555555555";
+            let prior_revision = db.segment_review_revision("desktop-boundary").unwrap().unwrap();
+            let genuine = crate::db::desktop_review_v1_payload_hash(
+                "desktop-boundary",
+                prior_revision,
+                "edit",
+                Some("desktop corrected"),
+                authority,
+            );
+            insert_typed_desktop_effect(&db, "desktop-boundary", authority, &genuine);
+            validate_review_effect_semantics(&db).expect("the genuine desktop effect must validate first");
+
+            assert_eq!(
+                db.connection().execute(sabotage, []).unwrap(),
+                1,
+                "{label}: the corruption must apply, or this case proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("outside the exact anonymous desktop operation boundary"),
+                "{label}: expected the exact desktop-boundary refusal, got: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn a_forged_typed_desktop_review_is_still_refused() {
         // The other half: teaching the validator the v1 contract must not let anything through.
         // Each case is a row claiming contract 1 whose digest does not answer for its own contents.
