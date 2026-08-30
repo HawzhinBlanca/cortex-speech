@@ -3,6 +3,7 @@
 //! Stores own database interaction for one domain and deliberately have no Tauri or HTTP surface.
 
 mod batch;
+mod compensation;
 mod import_write;
 mod jobs;
 #[cfg(test)]
@@ -14,6 +15,7 @@ mod segment_query;
 mod segment_write;
 
 pub(crate) use batch::{BatchAdmissionV1, BatchExecutionLease, BatchStore};
+pub(crate) use compensation::CompensationStore;
 pub(crate) use import_write::ImportWriteStore;
 pub(crate) use jobs::JobStore;
 pub(crate) use review_draft::{ReviewDraftRecord, ReviewDraftStore};

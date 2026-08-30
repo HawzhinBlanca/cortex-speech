@@ -150,6 +150,33 @@ export async function getInterruptedImport(): Promise<ImportJob | null> {
   return result.data;
 }
 
+export type {
+  ReviewCompensationSettlementV1,
+  ReviewerCompensationOverviewV1,
+} from './generated/ipc';
+
+/** Every ledger payee with exact micro-IQD totals (decimal strings — never Number-rounded). */
+export async function getReviewCompensationOverview() {
+  const result = await generatedCommands.getReviewCompensationOverviewV1();
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+/** Record one immutable external payout through the exact boundary the overview reported. */
+export async function recordReviewCompensationSettlement(
+  reviewer: string,
+  throughLedgerIdInclusive: number,
+  payoutReference: string,
+) {
+  const result = await generatedCommands.recordReviewCompensationSettlementV1(
+    reviewer,
+    throughLedgerIdInclusive,
+    payoutReference,
+  );
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
 export async function getImportRunStatus(runId: string): Promise<ImportRunStatusResponseV1> {
   const result = await generatedCommands.getImportRunStatus(runId);
   if (result.status === 'error') throw result.error;

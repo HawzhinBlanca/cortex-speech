@@ -5,6 +5,18 @@ import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 /** Commands */
 export const commands = {
 	/**
+	 *  Every ledger payee with exact earned / settled / outstanding totals under the active policy,
+	 *  plus the inclusive ledger boundary a settlement may claim.
+	 */
+	getReviewCompensationOverviewV1: () => typedError<ReviewerCompensationOverviewV1[], CommandErrorV1>(__TAURI_INVOKE("get_review_compensation_overview_v1")),
+	/**
+	 *  Record one immutable external payout for one reviewer, through the exact ledger boundary the
+	 *  overview reported. Idempotent by payout reference (a lost response replays the original
+	 *  allocation); a reused reference with different parameters is a hard error; paid history is
+	 *  never rewritten — a later reversal stays visible as outstanding adjustment.
+	 */
+	recordReviewCompensationSettlementV1: (reviewer: string, throughLedgerIdInclusive: number, payoutReference: string) => typedError<ReviewCompensationSettlementV1, CommandErrorV1>(__TAURI_INVOKE("record_review_compensation_settlement_v1", { reviewer, throughLedgerIdInclusive, payoutReference })),
+	/**
 	 *  Discover only the opaque identity and cardinality of the active focus. The private policy name,
 	 *  individual segment ids and owner data-dir path never cross IPC.
 	 */
@@ -1407,6 +1419,20 @@ export type RendererSettingsV1 = {
 	jury_t1_threshold: number,
 };
 
+/**
+ *  Immutable receipt for one recorded external payout (canon: contiguous ledger ranges, replayable
+ *  by reference, never rewritten).
+ */
+export type ReviewCompensationSettlementV1 = {
+	settlementId: string,
+	policyVersion: string,
+	reviewer: string,
+	fromLedgerIdExclusive: number,
+	throughLedgerIdInclusive: number,
+	allocatedMicroIqd: string,
+	payoutReference: string,
+};
+
 export type ReviewDecisionV1 = "accept" | "edit" | "reject";
 
 export type ReviewDraftV1 = {
@@ -1445,6 +1471,27 @@ export type ReviewTimingStats = {
 	medianSeconds: number | null,
 	// Number of consecutive-decision deltas that fell within a session and fed the median.
 	samples: number,
+};
+
+/**
+ *  One ledger payee's exact money picture for the owner's desktop. Every micro-IQD total crosses
+ *  as a DECIMAL STRING, the same law as the phone accounting API: a lifetime balance must never be
+ *  rounded by JavaScript's float Number on its way to the person who settles it.
+ */
+export type ReviewerCompensationOverviewV1 = {
+	reviewer: string,
+	policyVersion: string,
+	earnedMicroIqd: string,
+	settledMicroIqd: string,
+	outstandingMicroIqd: string,
+	correctedAudioMs: number,
+	legacyEventsPendingReconciliation: number,
+	/**
+	 *  Inclusive ledger boundary AS OF THIS READ. A settlement request must carry this exact value
+	 *  back, so credits landing after the owner read the screen stay outstanding instead of being
+	 *  silently swept into a payout that never covered them.
+	 */
+	maxLedgerId: number,
 };
 
 /**

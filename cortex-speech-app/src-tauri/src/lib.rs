@@ -719,6 +719,11 @@ impl AppState {
         crate::stores::JobStore::new(self.db.clone())
     }
 
+    /// Reviewer-compensation overview and immutable-settlement boundary (owner desktop only).
+    pub(crate) fn compensation_store(&self) -> crate::stores::CompensationStore {
+        crate::stores::CompensationStore::new(self.db.clone())
+    }
+
     /// Durable batch admission, execution and recovery boundary.  The returned store can create a
     /// lease that keeps restore exclusion alive across long-running inference.
     pub(crate) fn batch_store(&self) -> crate::stores::BatchStore {
@@ -1562,6 +1567,8 @@ pub fn run() {
             commands::app_health,
             commands::take_last_crash,
             commands::app_git_sha,
+            commands::get_review_compensation_overview_v1,
+            commands::record_review_compensation_settlement_v1,
             commands::open_audio_file,
             commands::import_directory,
             commands::get_import_run_status,

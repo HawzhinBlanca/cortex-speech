@@ -1069,6 +1069,17 @@ export const ckb = {
   'settings.couchRevoke': 'هەڵوەشاندنەوە',
   'settings.couchThroughput':
     'پێداچوونەوەکراو لەم کتێبخانەیەدا (پارچە · ناوەندی چرکە بۆ هەر پارچەیەک)',
+  // Reviewer-pay card (2026-08-30). New Sorani, NOT natively reviewed — on the owner's read list.
+  'settings.payTitle': 'پارەی پێداچوونەوەران',
+  'settings.payOutstanding': 'ماوە',
+  'settings.payEarned': 'بەدەستهێنراو',
+  'settings.paySettled': 'دراوە',
+  'settings.payReference': 'ژمارەی پارەدان (وەسڵ، ناردن…)',
+  'settings.payRecord': 'تۆمارکردنی پارەدان',
+  'settings.payRecorded': 'پارەدان تۆمارکرا: {amount} دینار بۆ {reviewer}',
+  'settings.payFailed': 'تۆمارکردنی پارەدان سەرکەوتوو نەبوو — هیچ تۆمار نەکرا',
+  'settings.payLoadFailed': 'باڵانسی پێداچوونەوەران بار نەکرا',
+  'settings.payNone': 'هێشتا هیچ پێداچوونەوەرێک پارەی بەدەست نەهێناوە.',
   'settings.couchSpotChecks': 'پشکنینی نمونەیی (تێبینیکراو / دراو · هەڵە بەراورد بە وەڵامی زانراو)',
   'settings.couchSpotChecksHint':
     'هەندێک پارچە لە ڕیزی هەر پێداچوونەوەرێکدا پێشتر وەڵامی پشتڕاستکراویان هەیە و بە ڕەشنووسی هەڵەوە پیشان دەدرێن. ئەو کەسەی گوێ دەگرێت ڕاستیان دەکاتەوە. ژمارەی یەکەمی نزم واتە لەوانەیە بەبێ گوێگرتن پەسەند بکات.',

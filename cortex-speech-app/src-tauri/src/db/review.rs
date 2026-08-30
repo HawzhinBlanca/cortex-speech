@@ -1925,6 +1925,26 @@ impl Database {
         })
     }
 
+    /// Every reviewer identity the ledger has ever credited: one row per NOCASE-folded identity
+    /// (the money law — `Sara` and `sara` are one payee), carrying its newest spelling and that
+    /// identity's current inclusive ledger boundary. The boundary is returned so a settlement can
+    /// be recorded against the exact range the owner SAW, never a range that silently grew between
+    /// the read and the click. SQLite's bare-column-with-MAX rule makes `reviewer` come from the
+    /// MAX(id) row, i.e. the most recent spelling.
+    pub fn review_compensation_reviewers(&self) -> AppResult<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT reviewer, MAX(id) FROM review_compensation_ledger
+             GROUP BY reviewer COLLATE NOCASE
+             ORDER BY reviewer COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        let mut reviewers = Vec::new();
+        for row in rows {
+            reviewers.push(row?);
+        }
+        Ok(reviewers)
+    }
+
     pub fn reviewer_throughput(&self) -> AppResult<Vec<ReviewerThroughput>> {
         // Grouped by the CASE-FOLDED name, and ordered the same way, like every money and limit path.
         // Keyed on the raw string, "Sara" and "sara" became two reviewers with half the clips each

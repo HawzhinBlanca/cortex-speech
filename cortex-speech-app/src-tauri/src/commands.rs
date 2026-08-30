@@ -68,6 +68,8 @@ mod jury;
 pub use jury::*;
 mod segments_read;
 pub use segments_read::*;
+mod compensation;
+pub use compensation::*;
 mod segments_write;
 pub use segments_write::*;
 mod agentic;

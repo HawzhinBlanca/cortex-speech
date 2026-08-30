@@ -4,6 +4,7 @@
   import * as api from './commands';
   import { t } from './i18n';
   import { isTauriRuntime } from './runtime';
+  import ReviewerPayPanel from './ReviewerPayPanel.svelte';
   import SettingsAiTab from './SettingsAiTab.svelte';
   import SettingsAsrTab from './SettingsAsrTab.svelte';
   import SettingsAudioTab from './SettingsAudioTab.svelte';
@@ -382,6 +383,10 @@
               </div>
             {/if}
           </div>
+
+          <!-- Reviewer pay: exact ledger balances and the canon-mandated immutable payout record.
+               Money and activity are separate facts; this card is the money one. -->
+          <ReviewerPayPanel {tauriAvailable} />
         {:else if activeTab === 'asr'}
           <SettingsAsrTab bind:settings={localSettings} />
         {:else if activeTab === 'audio'}

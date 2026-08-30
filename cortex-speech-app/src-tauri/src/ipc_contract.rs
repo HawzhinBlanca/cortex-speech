@@ -1683,6 +1683,8 @@ impl From<crate::session::SessionState> for SessionStateV1 {
 pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
     tauri_specta::Builder::<tauri::Wry>::new()
         .commands(tauri_specta::collect_commands![
+            crate::commands::get_review_compensation_overview_v1,
+            crate::commands::record_review_compensation_settlement_v1,
             crate::commands::get_active_voice_focus_v1,
             crate::commands::get_review_page_v1,
             crate::commands::commit_review_v1,

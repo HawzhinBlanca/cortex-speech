@@ -608,6 +608,39 @@ pub(crate) fn public_export_error(operation: ExportOperationV1, private_detail: 
     }
 }
 
+/// One ledger payee's exact money picture for the owner's desktop. Every micro-IQD total crosses
+/// as a DECIMAL STRING, the same law as the phone accounting API: a lifetime balance must never be
+/// rounded by JavaScript's float Number on its way to the person who settles it.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewerCompensationOverviewV1 {
+    pub reviewer: String,
+    pub policy_version: String,
+    pub earned_micro_iqd: String,
+    pub settled_micro_iqd: String,
+    pub outstanding_micro_iqd: String,
+    pub corrected_audio_ms: i64,
+    pub legacy_events_pending_reconciliation: u32,
+    /// Inclusive ledger boundary AS OF THIS READ. A settlement request must carry this exact value
+    /// back, so credits landing after the owner read the screen stay outstanding instead of being
+    /// silently swept into a payout that never covered them.
+    pub max_ledger_id: i64,
+}
+
+/// Immutable receipt for one recorded external payout (canon: contiguous ledger ranges, replayable
+/// by reference, never rewritten).
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewCompensationSettlementV1 {
+    pub settlement_id: String,
+    pub policy_version: String,
+    pub reviewer: String,
+    pub from_ledger_id_exclusive: i64,
+    pub through_ledger_id_inclusive: i64,
+    pub allocated_micro_iqd: String,
+    pub payout_reference: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
