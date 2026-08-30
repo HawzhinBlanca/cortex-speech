@@ -188,6 +188,27 @@ fn the_shared_export_filter_drops_rejected_placeholder_and_technical_unusable_ro
     );
 }
 
+#[test]
+fn a_pre_pool_corpus_still_exports_unscoped() {
+    // Both new guards -- pool scope and the consensus gate -- must be INERT when no pool is
+    // registered, or they would silently empty every pre-pool export instead of protecting a
+    // curated one. The scoped and consensus-gated behaviour is proven against a genuinely
+    // ACTIVATED pool in
+    // `review_pool::tests::only_a_clip_two_different_reviewers_decided_may_be_exported`; it cannot
+    // be proven here, because `load` correctly refuses a hand-built registry whose membership
+    // digest it did not compute.
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+
+    let mut good = sample_segment("no-pool-good");
+    good.audio_path = "/keep.wav".into();
+    db.insert_legacy_segment_fixture(&good).unwrap();
+
+    let kept = exclude_unexportable_segments(&db, vec![good]).unwrap();
+    let ids: Vec<&str> = kept.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, vec!["no-pool-good"], "with no pool registered an export must not be scoped away: {ids:?}");
+}
+
 fn insert_machine_silver_segment_with_hf_coverage(
     db: &Database,
     wav_path: &std::path::Path,

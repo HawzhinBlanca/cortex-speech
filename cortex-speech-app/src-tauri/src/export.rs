@@ -491,8 +491,43 @@ fn exclude_unexportable_segments_with_holdout_policy(
     segments: Vec<SpeechSegment>,
     exclude_holdouts: bool,
 ) -> AppResult<Vec<SpeechSegment>> {
+    // A registered review pool IS the authority on what may ship, and it is enforced HERE for the
+    // same reason as the withdrawal and human-rejected rules below: every export path already routes
+    // through this function, and a rule enforced per-caller is a rule the sixth caller misses.
+    //
+    // `export_dataset`, the HuggingFace training export and the production bundle all start from
+    // `db.get_segments(None)` — EVERY row in the library, curated or not. Measured on the live
+    // library on 2026-08-29, an export taken without this guard shipped 43,722 rows of which 23,405
+    // (54%, 54.8 h) were outside the pool, and ~22,700 of those carried a machine transcript with no
+    // human ever having heard the clip. The curated 43.8 h would have been the minority of its own
+    // dataset. `None` = no pool registered (the pre-pool corpus), which leaves scope exactly as it
+    // was before this guard existed.
+    let pool_scope = crate::review_pool::exportable_segment_ids(db).map_err(AppError::Validation)?;
+    // OWNER CANON 2026-08-29: "a sentence is decided by any two DIFFERENT reviewers". Membership
+    // says a clip is IN the corpus; it does not say anyone decided it. Without this second scope an
+    // export ships one reviewer's unconfirmed opinion as training truth -- measured on 2026-08-29,
+    // the fine-tune pack emitted 410 clips carrying exactly one review each, while the pool itself
+    // reported resolved=0. Two quality bars were in play and the weaker one was the one that
+    // shipped. Only a clip two distinct reviewers agreed on (or one the owner adjudicated) may
+    // leave. `NeedsThird` and `OwnerConflict` are unresolved disagreements and are held back.
+    let consensus = match pool_scope {
+        Some(_) => Some(crate::review_pool::consensus_resolved_segment_ids(db).map_err(AppError::Validation)?),
+        None => None,
+    };
     let mut kept = Vec::with_capacity(segments.len());
+    let mut in_pool = 0usize;
+    let mut undecided = 0usize;
     for seg in segments {
+        if pool_scope.as_ref().is_some_and(|scope| !scope.contains(&seg.id)) {
+            tracing::info!(segment_id = %seg.id, "export: dropping segment outside the active review pool");
+            continue;
+        }
+        in_pool += 1;
+        if consensus.as_ref().is_some_and(|resolved| !resolved.contains(&seg.id)) {
+            undecided += 1;
+            tracing::info!(segment_id = %seg.id, "export: dropping segment no two reviewers have decided");
+            continue;
+        }
         if db.rights_for_segment(&seg.id)?.is_revoked() {
             tracing::info!(segment_id = %seg.id, "export: dropping segment with withdrawn consent");
             continue;
@@ -525,6 +560,18 @@ fn exclude_unexportable_segments_with_holdout_policy(
             continue;
         }
         kept.push(seg);
+    }
+    // An export that silently returns nothing reads as a broken button, not as a rule doing its job.
+    // When consensus is the ONLY reason the result is empty, say so with the count, so the operator
+    // learns "no clip has two reviewers yet" instead of filing a bug against the exporter. Guarded on
+    // `undecided > 0` and `in_pool > 0` so a genuinely empty library still exports empty as before.
+    if kept.is_empty() && undecided > 0 && in_pool > 0 {
+        return Err(AppError::Validation(format!(
+            "nothing is exportable yet: {undecided} of {in_pool} clips in the review pool are still \
+             waiting for a decision, and none has been decided. OWNER CANON: a sentence ships only \
+             once any two DIFFERENT reviewers have agreed on it. Get second opinions onto reviewed \
+             clips and export again."
+        )));
     }
     let segments = kept;
     if !exclude_holdouts {

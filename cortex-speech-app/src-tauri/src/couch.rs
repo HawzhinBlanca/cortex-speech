@@ -1611,7 +1611,7 @@ mod tests {
     }
 
     #[test]
-    fn flexible_pool_is_voice_named_coverage_first_and_preserves_the_first_review() {
+    fn flexible_pool_is_voice_named_decision_first_and_preserves_the_first_review() {
         let tmp = tempfile::tempdir().unwrap();
         let (db, db_path) = test_db(tmp.path());
         let champion_id = "omniasr-7b-pool-test";
@@ -1673,13 +1673,19 @@ mod tests {
         assert_eq!(code, 200, "pool queue failed: {}", String::from_utf8_lossy(&body));
         let queue: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(queue["reviewPool"], true);
-        assert_eq!(queue["items"][0]["id"], "pool-unreviewed", "zero-coverage clips must be offered first");
-        assert_eq!(queue["items"][0]["speakerId"], "Halwest");
-        assert_eq!(queue["items"][1]["id"], "pool-reviewed");
-        assert_eq!(queue["items"][1]["speakerId"], "Lamo");
-        assert_eq!(queue["items"][1]["text"], "champion reviewed draft", "later reviews stay blind to Rubar's answer");
+        // OWNER CANON 2026-08-29: a sentence is decided by any two DIFFERENT reviewers, so the clip
+        // NEAREST a decision is offered first. "pool-reviewed" already holds Rubar's opinion and one
+        // more judgement retires it; "pool-unreviewed" needs two. This assertion was the reverse
+        // ("zero-coverage clips must be offered first") until the canon landed -- breadth-first
+        // maximised clips touched and left 416 live clips holding one review with none decided.
+        assert_eq!(queue["items"][0]["id"], "pool-reviewed", "the clip nearest a decision comes first");
+        assert_eq!(queue["items"][0]["speakerId"], "Lamo");
+        assert_eq!(queue["items"][1]["id"], "pool-unreviewed");
+        assert_eq!(queue["items"][1]["speakerId"], "Halwest");
+        // Unchanged and load-bearing: ordering must never leak the first reviewer's answer.
+        assert_eq!(queue["items"][0]["text"], "champion reviewed draft", "later reviews stay blind to Rubar's answer");
 
-        let row_version = queue["items"][1]["rowVersion"].as_str().unwrap();
+        let row_version = queue["items"][0]["rowVersion"].as_str().unwrap();
         let pool_operation_id = "30000000-0000-4000-8000-000000000002";
         let decision = serde_json::json!({
             "operationId": pool_operation_id,

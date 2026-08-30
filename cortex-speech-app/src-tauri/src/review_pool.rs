@@ -1064,6 +1064,75 @@ fn require_live_member_identity(db: &Database, pool: &ReviewPool) -> Result<(), 
     Ok(())
 }
 
+/// Segment ids the ACTIVE pool would ship: members MINUS duplicate exclusions.
+///
+/// `None` means no pool is registered, which is the pre-pool corpus case and leaves every export
+/// scoped exactly as it was before this existed.
+///
+/// Deliberately lighter than `load`. `load` additionally re-proves champion identity and REFUSES
+/// when the registered champion has drifted from the live one — correct for serving a review queue,
+/// wrong for deciding export scope: an export must not begin failing because a model pointer moved,
+/// and it must never fall back to "no scope" (i.e. the whole library) for that reason. Scope is a
+/// membership question, so this asks only the membership tables, with the same duplicate-exclusion
+/// clause `pending_segment_ids` serves from — so what ships and what is reviewed cannot disagree.
+pub fn exportable_segment_ids(db: &Database) -> Result<Option<HashSet<String>>, String> {
+    if crate::migrations::get_current_version(db).map_err(|error| error.to_string())? < REVIEW_POOL_BASE_SCHEMA_VERSION
+    {
+        return Ok(None);
+    }
+    let pool_id: Option<String> = db
+        .connection()
+        .query_row("SELECT pool_id FROM review_pool_registry WHERE singleton_key = 1", [], |row| row.get(0))
+        .optional()
+        .map_err(|error| format!("review pool registry cannot be read: {error}"))?;
+    let Some(pool_id) = pool_id else {
+        return Ok(None);
+    };
+    let mut statement = db
+        .connection()
+        .prepare(
+            "SELECT member.segment_id
+               FROM review_pool_members member
+              WHERE member.pool_id = ?1
+                AND NOT EXISTS (
+                    SELECT 1 FROM review_pool_duplicate_exclusions exclusion
+                     WHERE exclusion.pool_id = member.pool_id AND exclusion.segment_id = member.segment_id
+                )",
+        )
+        .map_err(|error| format!("review pool export scope cannot be prepared: {error}"))?;
+    let rows = statement
+        .query_map([&pool_id], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("review pool export scope cannot be read: {error}"))?;
+    let mut ids = HashSet::new();
+    for row in rows {
+        ids.insert(row.map_err(|error| format!("review pool export scope row is unreadable: {error}"))?);
+    }
+    Ok(Some(ids))
+}
+
+/// The segments CONSENSUS has decided: owner canon 2026-08-29 — "a sentence is decided by any two
+/// DIFFERENT reviewers".
+///
+/// Returns only clips whose derived resolution is `Resolved` (two or more distinct reviewers agreed
+/// on the same outcome) or `ownerResolved` (an owner adjudication over that exact evidence). A clip
+/// with one opinion is `Pending`, two disagreeing opinions are `NeedsThird`, and three-way
+/// disagreement is `OwnerConflict` — none of those may ship, because none of them is a decision
+/// under the canon.
+///
+/// This deliberately delegates to `segment_resolutions`, which is the same authority the review
+/// queue and the certification report read, so what SHIPS and what the pool CALLS decided can never
+/// drift apart. It therefore also inherits `load`'s identity proof and FAILS CLOSED: if the pool
+/// cannot be proven, this errors and the export refuses rather than shipping unverified rows. That
+/// is the opposite of `exportable_segment_ids`, whose failure mode had to avoid widening scope;
+/// here refusing is correct, because an unprovable corpus is not a publishable one.
+pub fn consensus_resolved_segment_ids(db: &Database) -> Result<HashSet<String>, String> {
+    Ok(segment_resolutions(db, None)?
+        .into_iter()
+        .filter(|row| matches!(row.status.as_str(), "resolved" | "ownerResolved"))
+        .map(|row| row.segment_id)
+        .collect())
+}
+
 pub fn pending_segment_ids(
     db: &Database,
     pool: &ReviewPool,
@@ -1119,7 +1188,27 @@ pub fn pending_segment_ids(
         {
             continue;
         }
-        pending.push((coverage.map_or(0, |coverage| coverage.judged.len()), created_at, segment_id));
+        // OWNER CANON 2026-08-29: a sentence is DECIDED by any two different reviewers. Serve first
+        // the clips that are one opinion away from being decided.
+        //
+        // This used to sort by judged-count ASCENDING, which served a clip nobody had reviewed
+        // BEFORE a clip already holding one opinion — so reviewers fanned out across new audio and
+        // almost never met on the same clip. Measured on 2026-08-29: 416 clips holding exactly one
+        // review, and ZERO resolved. Breadth-first maximises clips touched; the canon asks for
+        // clips DECIDED, and a clip with one opinion is worth strictly more than a fresh one
+        // because a single further judgement can retire it.
+        //
+        // 1 judgement -> needs one more to agree.        2 -> a disagreeing pair awaiting a third.
+        // 0 -> untouched, still valuable but furthest from a decision. 3+ -> owner conflict, which
+        // no ordinary reviewer can settle, so it sinks to the bottom rather than blocking the queue.
+        let judged = coverage.map_or(0, |coverage| coverage.judged.len());
+        let distance_to_decision: usize = match judged {
+            1 => 0,
+            2 => 1,
+            0 => 2,
+            _ => 3,
+        };
+        pending.push((distance_to_decision, created_at, segment_id));
     }
     pending.sort_unstable();
     Ok(pending.into_iter().map(|(_, _, segment_id)| segment_id).collect())
@@ -2481,7 +2570,42 @@ mod tests {
     }
 
     #[test]
-    fn pool_orders_least_covered_and_keeps_second_review_append_only() {
+    fn only_a_clip_two_different_reviewers_decided_may_be_exported() {
+        // OWNER CANON 2026-08-29: "a sentence is decided by any two DIFFERENT reviewers."
+        // `one_clip_pool` leaves the clip holding exactly ONE opinion (canonical, by Rubar), which
+        // is the state 416 live clips were in on the day this was written while the pool reported
+        // resolved=0 -- and the fine-tune export happily emitted 410 of them. One opinion is not a
+        // decision, and must not ship.
+        let (_dir, db, pool) = one_clip_pool("دەقی چامپیۆن");
+
+        let one_opinion = consensus_resolved_segment_ids(&db).unwrap();
+        assert!(
+            one_opinion.is_empty(),
+            "a single reviewer's opinion is not a decision and must not be exportable: {one_opinion:?}"
+        );
+        let segment = db.get_segment_by_id("clip").unwrap().unwrap();
+        // An empty pack reads as a broken export button. When consensus is the only reason nothing
+        // survives, the export must REFUSE and name the count, so the operator learns the rule
+        // instead of filing a bug against the exporter.
+        let refusal = crate::export::exclude_unexportable_segments(&db, vec![segment.clone()])
+            .expect_err("the export root must refuse loudly, not return an empty pack");
+        let refusal = refusal.to_string();
+        for needle in ["1 of 1", "waiting for a decision", "two DIFFERENT reviewers"] {
+            assert!(refusal.contains(needle), "refusal must explain itself; missing {needle:?} in: {refusal}");
+        }
+
+        // A SECOND, DIFFERENT reviewer agreeing is what makes it a decision.
+        decide(&db, &pool, "Alle", "دەقی چامپیۆن", "60000000-0000-4000-8000-0000000000a1", 2_000);
+
+        let resolved = consensus_resolved_segment_ids(&db).unwrap();
+        assert!(resolved.contains("clip"), "two different reviewers agreeing decides the sentence: {resolved:?}");
+        let kept = crate::export::exclude_unexportable_segments(&db, vec![segment]).unwrap();
+        let ids: Vec<&str> = kept.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["clip"], "a decided sentence must ship: {ids:?}");
+    }
+
+    #[test]
+    fn pool_serves_the_clips_nearest_a_decision_and_keeps_second_review_append_only() {
         let dir = tempfile::tempdir().unwrap();
         let first_audio = dir.path().join("first.wav");
         let second_audio = dir.path().join("second.wav");
@@ -2524,7 +2648,12 @@ mod tests {
         );
 
         assert_eq!(pending_segment_ids(&db, &pool, "Rubar", None).unwrap(), vec!["second"]);
-        assert_eq!(pending_segment_ids(&db, &pool, "Alle", None).unwrap(), vec!["second", "first"]);
+        // OWNER CANON 2026-08-29: a sentence is decided by any two DIFFERENT reviewers, so the
+        // queue serves whatever is NEAREST a decision. "first" already holds one opinion and one
+        // more judgement can retire it; "second" is untouched and needs two. This assertion was
+        // the reverse until the canon landed -- breadth-first maximised clips TOUCHED while
+        // leaving 416 clips holding one review and zero decided.
+        assert_eq!(pending_segment_ids(&db, &pool, "Alle", None).unwrap(), vec!["first", "second"]);
 
         let (_, revision) = db.get_segment_by_id_with_revision("first").unwrap().unwrap();
         let operation_payload_hash = "a".repeat(64);
@@ -2636,17 +2765,9 @@ mod tests {
         let reversal_operation = "123e4567-e89b-42d3-a456-426614174062";
 
         assert_eq!(
-            reverse_decision_addressed(
-                &db,
-                &pool,
-                latest,
-                "Alle",
-                latest_operation,
-                reversal_operation,
-                30,
-            )
-            .unwrap()
-            .as_deref(),
+            reverse_decision_addressed(&db, &pool, latest, "Alle", latest_operation, reversal_operation, 30,)
+                .unwrap()
+                .as_deref(),
             Some("b")
         );
         assert_eq!(
@@ -2658,17 +2779,9 @@ mod tests {
         // Model commit -> lost HTTP response -> app restart -> retry. No in-memory token exists; the
         // exact request coordinates alone must replay the same durable reversal.
         assert_eq!(
-            reverse_decision_addressed(
-                &db,
-                &pool,
-                latest,
-                "alle",
-                latest_operation,
-                reversal_operation,
-                40,
-            )
-            .unwrap()
-            .as_deref(),
+            reverse_decision_addressed(&db, &pool, latest, "alle", latest_operation, reversal_operation, 40,)
+                .unwrap()
+                .as_deref(),
             Some("b")
         );
         assert_eq!(
@@ -2677,15 +2790,16 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert!(db
-            .connection()
-            .query_row::<i64, _, _>(
-                "SELECT COUNT(*) FROM effective_review_pool_decisions_v62 WHERE id=?1",
-                [older],
-                |row| row.get(0),
-            )
-            .unwrap()
-            == 1);
+        assert!(
+            db.connection()
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM effective_review_pool_decisions_v62 WHERE id=?1",
+                    [older],
+                    |row| row.get(0),
+                )
+                .unwrap()
+                == 1
+        );
         assert!(reverse_decision_addressed(
             &db,
             &pool,

@@ -2054,7 +2054,7 @@ mod tests {
 
     #[test]
     fn a_follower_shares_the_leaders_flight_and_never_runs_its_own_probe() {
-        let _serial = PROBE_REGISTRY_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _probe_test = lock_technical_probe_tests();
         let started = Arc::new(std::sync::Barrier::new(2));
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
 
@@ -2081,7 +2081,7 @@ mod tests {
         std::thread::spawn(move || {
             // Hold the leader's slot as BRIEFLY as the test allows. The probe registry is a
             // process-global with only TECHNICAL_PROBE_MAX_CONCURRENCY slots, and tests in other
-            // modules (which cannot take PROBE_REGISTRY_SERIAL) probe through it too -- measured
+            // modules (which cannot take lock_technical_probe_tests) probe through it too -- measured
             // 2026-08-29, a full-suite run refused
             // commands::segments_write::…::healthy_audio_direct_invocation with AUDIO_PROBE_BUSY
             // while slots were occupied here. The follower attaches to an already-registered
@@ -2111,7 +2111,7 @@ mod tests {
 
     #[test]
     fn a_panicking_probe_is_contained_as_inconclusive_and_frees_its_slot() {
-        let _serial = PROBE_REGISTRY_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _probe_test = lock_technical_probe_tests();
         // A decoder crash must neither poison the registry nor invent a verdict: Inconclusive is
         // the honest "the probe itself failed", and the slot must come back for the next claim.
         let evidence = probe_technical_audio_failure_single_flight_with(
