@@ -12153,3 +12153,30 @@ Product commit `f0417be9b70ad00c28cb5193cf65865da03a1582` is ready for the ledge
 Honest status before the iteration-9 remeasurement: the product chunk is green, but no new coverage
 delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
 and P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 10: exhaustive review-flag identity fields
+
+Iteration 9's exact serialized measurement at ledger commit
+`ff985aa640b178ed9a966c4a4fbd5f2097d8496d` completed 1,822 library tests with 0 failures and 8
+ignores, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell smoke 1/1,
+user-data 2/2, and all Criterion targets. The certifying wrapper exited red solely because the
+locked coverage thresholds remain unmet. Overall branch coverage moved 59.75% to 59.83%; restore
+moved 62.88% to 63.55%, reducing uncovered restore branches from 559 to 549. The active effects
+function fell from 160 to 150 uncovered branches. P1 remains red, P2 green, and P0 unknown because
+the production heartbeat is absent.
+
+The next LLVM-ranked cluster contained seven unproved fields in the review-flag immutable
+revision/operation identity clause. The new table-driven regression starts every case from a genuine
+flag written through the production API, proves that clean state validates, then independently
+corrupts the effect id, operation UUID, segment id, flag revision, rationale presence, rationale
+canonical form, or prior-escalation flag. Every mutation is proven to apply and must produce the exact
+flag-identity refusal. The reversal-operation arm was deliberately excluded because the exact artifact
+already showed it covered.
+
+The focused proof passed 1/1 and the complete restore-effects suite passed 24/24. Installed stable
+rustfmt passed; installed stable Clippy passed all targets/features with `-D warnings`. Product commit
+`918ac6b6fb2e92c9a392db434cf57ecb51831f89` is ready for the ledger commit and exact push.
+
+Honest status before the iteration-10 remeasurement: the product chunk is green, but no new coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
