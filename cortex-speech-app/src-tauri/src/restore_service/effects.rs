@@ -2194,6 +2194,112 @@ mod tests {
     }
 
     #[test]
+    fn first_post_v60_decision_must_start_from_the_exact_legacy_reviewed_state() {
+        // Build the authority in the only honest order: create reviewed human truth on schema 59,
+        // migrate it into the immutable v60 snapshot, then record one new phone decision through
+        // the production writer. The validator must accept that complete chain before any sabotage.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        paid_segment(&db, "legacy-decision-baseline");
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments
+                        SET review_revision = 5,
+                            verified = 1,
+                            annotated_transcript = 'legacy truth',
+                            verdict = 'human_edit',
+                            verdict_transcript = 'legacy truth',
+                            human_decision = 'edit',
+                            corrected_at = '2026-08-29 00:00:00',
+                            reviewed_by = 'Legacy Reviewer',
+                            escalated = 0,
+                            is_gold = 0,
+                            rationale = NULL
+                      WHERE id = 'legacy-decision-baseline'",
+                    [],
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        validate_review_effect_semantics(&db).expect("the exact migrated terminal state must remain restorable");
+
+        let revision = db.segment_review_revision("legacy-decision-baseline").unwrap().unwrap();
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "legacy-decision-baseline",
+            "accept",
+            Some("legacy truth"),
+            "Reviewer",
+            revision,
+            &canonical_operation(462),
+            &crate::db::review_operation_payload_hash("legacy-decision-baseline", "accept", "legacy truth", "Reviewer"),
+        )
+        .unwrap()
+        .unwrap();
+        validate_review_effect_semantics(&db).expect("a real first post-v60 decision must bind to its legacy origin");
+
+        db.connection().execute("DROP TRIGGER human_decision_effect_events_immutable_update", []).unwrap();
+        let corruptions = [
+            (
+                "verified flag",
+                "UPDATE human_decision_effect_events SET prior_verified = 0",
+                "UPDATE human_decision_effect_events SET prior_verified = 1",
+            ),
+            (
+                "annotated transcript",
+                "UPDATE human_decision_effect_events SET prior_annotated_transcript = 'forged annotation'",
+                "UPDATE human_decision_effect_events SET prior_annotated_transcript = 'legacy truth'",
+            ),
+            (
+                "verdict",
+                "UPDATE human_decision_effect_events SET prior_verdict = 'human_accept'",
+                "UPDATE human_decision_effect_events SET prior_verdict = 'human_edit'",
+            ),
+            (
+                "verdict transcript",
+                "UPDATE human_decision_effect_events SET prior_verdict_transcript = 'forged verdict text'",
+                "UPDATE human_decision_effect_events SET prior_verdict_transcript = 'legacy truth'",
+            ),
+            (
+                "escalation flag",
+                "UPDATE human_decision_effect_events SET prior_escalated = 1",
+                "UPDATE human_decision_effect_events SET prior_escalated = 0",
+            ),
+            (
+                "human decision",
+                "UPDATE human_decision_effect_events SET prior_human_decision = 'accept'",
+                "UPDATE human_decision_effect_events SET prior_human_decision = 'edit'",
+            ),
+            (
+                "correction timestamp",
+                "UPDATE human_decision_effect_events SET prior_corrected_at = '2026-08-29 00:00:01'",
+                "UPDATE human_decision_effect_events SET prior_corrected_at = '2026-08-29 00:00:00'",
+            ),
+            (
+                "reviewer",
+                "UPDATE human_decision_effect_events SET prior_reviewed_by = 'Other Reviewer'",
+                "UPDATE human_decision_effect_events SET prior_reviewed_by = 'Legacy Reviewer'",
+            ),
+        ];
+        for (label, sabotage, restore) in corruptions {
+            assert_eq!(
+                db.connection().execute(sabotage, []).unwrap(),
+                1,
+                "{label}: the corruption must apply, or the refusal proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("does not start from its immutable pre-v60 reviewed state"),
+                "{label}: expected the exact legacy-baseline refusal, got: {error}"
+            );
+            assert_eq!(db.connection().execute(restore, []).unwrap(), 1, "{label}: reset must restore the fixture");
+            validate_review_effect_semantics(&db).expect("each reset must recover the exact valid chain");
+        }
+    }
+
+    #[test]
     fn a_forged_effect_on_a_non_decision_event_is_refused() {
         // A skip is not a decision: it pays nothing and must leave no human-decision effect. Forging
         // one would invent paid, reviewed truth for a clip nobody judged — so the trigger is dropped
