@@ -11982,3 +11982,23 @@ scheduled task, release pointer, model, GPU setting, or production artifact was 
 
 Honest status before the iteration-2 remeasurement: P0 remains unknown because no current health
 heartbeat exists; P1 remains red and materially below its locked bars; P2 remains green.
+
+## 2026-08-30 — Reliability iteration 3: exact legacy correction-memory boundary
+
+The current pinned scoreboard still ranked
+`restore_service::effects::validate_review_effect_semantics` first. The next exercised refusal gap
+was the schema-v60 correction-memory boundary: only rows that existed before migration may carry
+`legacy_seed = 1`; every post-v60 row starts at zero and requires immutable effect-bound capture
+lineage.
+
+One two-sided regression now constructs the exact grandfathered row and proves it remains
+restorable, then applies `legacy_seed = 2` with restored-file guards disabled and proves the
+validator returns the specific invalid-legacy-boundary refusal. Focused result:
+`test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 1807 filtered out`. Strict
+all-target/all-feature Clippy with `-D warnings` and rustfmt both exited 0. Commit
+`0cd9c52b734775f047069a4c0d3281d4dfed3a44` was pushed and independently matched on
+`origin/public/clean-release`.
+
+Honest status before the iteration-3 remeasurement: the product chunk is green and pushed, but no
+coverage improvement is claimed until the pinned all-target run finishes. P0 remains unknown; P1
+remains red; P2 remains green. Production and scheduled tasks were untouched.
