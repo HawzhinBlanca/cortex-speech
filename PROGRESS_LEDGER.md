@@ -12041,3 +12041,44 @@ linker OOM that was diagnosed twice by inference before the error was read.
 
 Honest status: **the tests and the restore fix stand on their own; PR #72's thresholds remain far
 out of reach by this method — roughly 1,780 more covered branches across five domains.**
+
+---
+
+## 2026-08-30 — Branch reconciliation: no ship line re-introduces a fixed defect
+
+The three diverged lines (this integration branch, `deploy/link-health`, `public/clean-release`)
+each lacked safety fixes the others carried, so every possible deploy re-shipped a known bug. This
+branch (`codex/10-10-reconcile-20260830`, cut from checkpoint `a1d552d3`) now holds the union:
+
+- **Restore validators** (cherry-picked from `public/clean-release`): `22e2ddeb` + `c7e3dc97`
+  (phone-Undo refusal + the two undo-reversal test arms), `64091792` + `e32b5a3a` (typed desktop
+  review contract + identity-boundary pin). Without these, one desktop review or one phone Undo
+  made every later backup unrestorable. `stores/review_write.rs` test serialization adapted to this
+  tree's `lock_technical_probe_tests()`.
+- **Export boundary** (ported from `deploy/link-health` `c1dae8b8` + `dfd150ae` into this tree's
+  `exclude_unexportable_segments_with_holdout_policy` root): pool scope + the owner's
+  two-different-reviewers consensus gate, the loud empty-pack refusal, decision-first queue
+  ordering, and `529d…`-class tests — without it a generic export here shipped all 32,322 rows
+  including 3,333 dedup-excluded duplicates. Canon text restored via cherry-pick `528d859e`
+  (`1adc7c7e` here). Gates: `test_consensus_review_canon.py` (15 pins),
+  `test_rust_tests_are_registered.py` (170 files; the stacked-`#[test]` defect `967d5c16` fixed on
+  deploy is not reproduced here).
+- **Single-coin pay display** (`8ce1dea3`, owner instruction 2026-08-28) ported to this tree's
+  `couch.html`; the diverged phone `undo` string is registered as its own reviewed-pending key
+  since the desktop's undo became the atomic last-action undo (`fb16b2e8`).
+- **Ops hygiene**: probe + robustness_measure take `$PSScriptRoot` paths;
+  `test_reviewer_link_ops_policy.py` (11 pins incl. no-second-reviver) passes against this tree's
+  newer watchdog, which is deliberately kept over deploy's. Deploy's `4a2ecd03` (7-day cookies) is
+  deliberately NOT ported — 24h is the reviewed harder posture.
+- **Hygiene**: seven ipc_contract redaction fixtures de-profiled (`Z:\private-vault\…`);
+  `test_windows_repo_hygiene.py` green with unchanged redaction assertions.
+
+Measured on this tree: full Rust lib suite **1994 passed / 0 failed / 8 ignored** (1234 s, under a
+concurrent coverage run from another worktree); `ipc_contract::` 21/21 on the final fixtures;
+canon pins 12/12; couch i18n 28 strings green.
+
+Honest status: **12 of 140 policy scripts were red at the checkpoint this branch was cut from; the
+ledger-staleness one is settled by this entry, and the remaining 11 (frontend/store boundary pins,
+model-claim attestation, review-pilot certification) pre-date the reconciliation — proven by
+running all 11 against pristine `a1d552d3` in a clean worktree, all exit 1 there — and are being
+addressed next on this branch.**
