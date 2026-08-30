@@ -500,7 +500,23 @@ fn public_precommit_playback_binding_error(_error: &str) -> CommandErrorV1 {
 }
 
 fn public_draft_error(error: &str, action: &str) -> CommandErrorV1 {
-    if error.contains("E_STALE_REVIEW_DRAFT") {
+    if error.contains("E_STALE_REVIEW_DRAFT_WRITE") {
+        CommandErrorV1::new(
+            "DRAFT_WRITE_SUPERSEDED",
+            "A newer draft action replaced this one. Retry the current edit.",
+            true,
+        )
+        .suggested(SuggestedActionV1::Retry)
+    } else if error.to_ascii_lowercase().contains("restore generation changed")
+        || error.to_ascii_lowercase().contains("database restore is in progress")
+    {
+        CommandErrorV1::new(
+            "DRAFT_WRITE_GENERATION_CHANGED",
+            "The workspace was restored while this draft action was pending. Reload the clip and retry.",
+            true,
+        )
+        .suggested(SuggestedActionV1::ReloadClip)
+    } else if error.contains("E_STALE_REVIEW_DRAFT") {
         CommandErrorV1::new(
             "STALE_DRAFT_REVISION",
             "The clip changed while this draft was being saved. Reload it before continuing.",
@@ -524,6 +540,28 @@ fn public_draft_error(error: &str, action: &str) -> CommandErrorV1 {
         };
         CommandErrorV1::new("REVIEW_DRAFT_FAILED", message, false).suggested(SuggestedActionV1::OpenHealth)
     }
+}
+
+/// Reserve the exact next draft mutation before starting a possibly slow native write.
+#[tauri::command]
+#[specta::specta]
+pub fn reserve_review_draft_write_v1(
+    state: State<'_, AppState>,
+    segment_id: String,
+    operation_id: String,
+) -> Result<(), CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("reserve_review_draft_write_v1").map_err(|_| {
+        CommandErrorV1::new("RATE_LIMITED", "Too many draft actions. Retry in a moment.", true)
+            .suggested(SuggestedActionV1::Retry)
+    })?;
+    validate::validate_identifier(&segment_id)
+        .map_err(|_| CommandErrorV1::new("INVALID_SEGMENT_ID", "The clip identity is invalid.", false))?;
+    validate::validate_identifier(&operation_id)
+        .map_err(|_| CommandErrorV1::new("INVALID_OPERATION_ID", "The draft operation identity is invalid.", false))?;
+    state
+        .review_drafts()
+        .reserve_write(&segment_id, &operation_id)
+        .map_err(|error| public_draft_error(&error.to_string(), "reserved"))
 }
 
 fn review_draft_v1(record: crate::stores::ReviewDraftRecord) -> ReviewDraftV1 {
@@ -565,6 +603,7 @@ pub fn save_review_draft_v1(
     segment_id: String,
     base_revision: i64,
     text: String,
+    operation_id: String,
 ) -> Result<ReviewDraftV1, CommandErrorV1> {
     STRICT_RATE_LIMITER.check("save_review_draft_v1").map_err(|_| {
         CommandErrorV1::new("RATE_LIMITED", "Too many draft saves. Retry in a moment.", true)
@@ -572,6 +611,8 @@ pub fn save_review_draft_v1(
     })?;
     validate::validate_identifier(&segment_id)
         .map_err(|_| CommandErrorV1::new("INVALID_SEGMENT_ID", "The clip identity is invalid.", false))?;
+    validate::validate_identifier(&operation_id)
+        .map_err(|_| CommandErrorV1::new("INVALID_OPERATION_ID", "The draft operation identity is invalid.", false))?;
     if base_revision < 0 {
         return Err(CommandErrorV1::new("INVALID_REVIEW_REVISION", "The clip revision must be non-negative.", false));
     }
@@ -579,7 +620,7 @@ pub fn save_review_draft_v1(
         .map_err(|_| CommandErrorV1::new("INVALID_REVIEW_DRAFT", "The draft is invalid or too long.", false))?;
     state
         .review_drafts()
-        .save(&segment_id, base_revision, &text)
+        .save(&segment_id, base_revision, &text, &operation_id)
         .map(review_draft_v1)
         .map_err(|error| public_draft_error(&error.to_string(), "saved"))
 }
@@ -592,6 +633,7 @@ pub fn delete_review_draft_v1(
     state: State<'_, AppState>,
     segment_id: String,
     base_revision: i64,
+    operation_id: String,
 ) -> Result<bool, CommandErrorV1> {
     STRICT_RATE_LIMITER.check("delete_review_draft_v1").map_err(|_| {
         CommandErrorV1::new("RATE_LIMITED", "Too many draft deletes. Retry in a moment.", true)
@@ -599,12 +641,14 @@ pub fn delete_review_draft_v1(
     })?;
     validate::validate_identifier(&segment_id)
         .map_err(|_| CommandErrorV1::new("INVALID_SEGMENT_ID", "The clip identity is invalid.", false))?;
+    validate::validate_identifier(&operation_id)
+        .map_err(|_| CommandErrorV1::new("INVALID_OPERATION_ID", "The draft operation identity is invalid.", false))?;
     if base_revision < 0 {
         return Err(CommandErrorV1::new("INVALID_REVIEW_REVISION", "The clip revision must be non-negative.", false));
     }
     state
         .review_drafts()
-        .delete_if_revision(&segment_id, base_revision)
+        .delete_if_revision(&segment_id, base_revision, &operation_id)
         .map_err(|error| public_draft_error(&error.to_string(), "deleted"))
 }
 

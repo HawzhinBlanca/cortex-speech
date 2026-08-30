@@ -185,6 +185,9 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     if (cmd === 'get_review_draft_v1') {
       return demoReviewDrafts.get(String(args?.segmentId ?? '')) ?? null;
     }
+    if (cmd === 'reserve_review_draft_write_v1') {
+      return null;
+    }
     if (cmd === 'save_review_draft_v1') {
       const segmentId = String(args?.segmentId ?? '');
       const baseRevision = Number(args?.baseRevision);

@@ -324,12 +324,17 @@ def test_long_prework_publishers_hold_full_operation_mutation_guards() -> None:
     ):
         body = _fn_body(commands, signature, span=7500)
         worker = body.find("run_blocking(move ||")
-        mutation = body.find("let _mutation = begin_mutation()")
+        mutation = body.find("database.begin_mutation()")
         mutation_end = body.find(";", mutation)
+        writer = body.find("database.lock_after_mutation(&mutation)", mutation)
         publish = body.find(final_publish)
         propagated = mutation != -1 and mutation_end != -1 and "?" in body[mutation:mutation_end]
-        if -1 in (worker, mutation, mutation_end, publish) or not propagated or not (worker < mutation < publish):
-            raise AssertionError(f"{signature} must own mutation admission inside its detachable worker through publish")
+        if -1 in (worker, mutation, mutation_end, writer, publish) or not propagated or not (
+            worker < mutation < writer < publish
+        ):
+            raise AssertionError(
+                f"{signature} must own exact-runtime mutation admission inside its detachable worker through publish"
+            )
 
     integration = _read("integration_runner.rs")
     body = _fn_body(integration, "pub fn run(", span=3500)
@@ -337,6 +342,8 @@ def test_long_prework_publishers_hold_full_operation_mutation_guards() -> None:
     first_import = body.find("pipeline.import_directory(")
     if mutation == -1 or first_import == -1 or mutation >= first_import:
         raise AssertionError("registered integration/audiobook lifecycle must fence its complete write lifetime")
+    if "lock_after_mutation(&mutation)" not in body:
+        raise AssertionError("integration lifecycle must not re-enter the ordinary admission lock after mutation")
 
 
 def test_external_writers_share_the_desktop_instance_lock() -> None:

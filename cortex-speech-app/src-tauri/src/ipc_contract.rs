@@ -653,6 +653,7 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             crate::commands::cancel_desktop_playback_session_v1,
             crate::commands::finalize_desktop_playback_session_v1,
             crate::commands::get_review_draft_v1,
+            crate::commands::reserve_review_draft_write_v1,
             crate::commands::save_review_draft_v1,
             crate::commands::delete_review_draft_v1,
             crate::commands::get_settings_v1,

@@ -684,7 +684,9 @@ describe('revision-bound desktop review drafts', () => {
     };
     invokeMock
       .mockResolvedValueOnce(draft)
+      .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(draft)
+      .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(true);
 
     await expect(getReviewDraftV1(draft.segmentId)).resolves.toEqual(draft);
@@ -693,13 +695,38 @@ describe('revision-bound desktop review drafts', () => {
     ).resolves.toEqual(draft);
     await expect(deleteReviewDraftV1(draft.segmentId, draft.baseRevision)).resolves.toBe(true);
 
+    const saveOperationId = (invokeMock.mock.calls[1][1] as { operationId: string }).operationId;
+    const deleteOperationId = (invokeMock.mock.calls[3][1] as { operationId: string }).operationId;
+    expect(saveOperationId).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(deleteOperationId).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(deleteOperationId).not.toBe(saveOperationId);
     expect(invokeMock.mock.calls).toEqual([
       ['get_review_draft_v1', { segmentId: draft.segmentId }],
       [
-        'save_review_draft_v1',
-        { segmentId: draft.segmentId, baseRevision: draft.baseRevision, text: draft.text },
+        'reserve_review_draft_write_v1',
+        { segmentId: draft.segmentId, operationId: saveOperationId },
       ],
-      ['delete_review_draft_v1', { segmentId: draft.segmentId, baseRevision: draft.baseRevision }],
+      [
+        'save_review_draft_v1',
+        {
+          segmentId: draft.segmentId,
+          baseRevision: draft.baseRevision,
+          text: draft.text,
+          operationId: saveOperationId,
+        },
+      ],
+      [
+        'reserve_review_draft_write_v1',
+        { segmentId: draft.segmentId, operationId: deleteOperationId },
+      ],
+      [
+        'delete_review_draft_v1',
+        {
+          segmentId: draft.segmentId,
+          baseRevision: draft.baseRevision,
+          operationId: deleteOperationId,
+        },
+      ],
     ]);
   });
 
@@ -712,10 +739,18 @@ describe('revision-bound desktop review drafts', () => {
       suggestedAction: 'reloadClip',
       operationId: null,
     };
-    invokeMock.mockRejectedValueOnce(refusal);
+    invokeMock.mockResolvedValueOnce(null).mockRejectedValueOnce(refusal);
 
     await expect(saveReviewDraftV1('segment-draft', 9, 'text')).rejects.toBe(refusal);
-    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    const operationId = (invokeMock.mock.calls[0][1] as { operationId: string }).operationId;
+    expect(invokeMock.mock.calls).toEqual([
+      ['reserve_review_draft_write_v1', { segmentId: 'segment-draft', operationId }],
+      [
+        'save_review_draft_v1',
+        { segmentId: 'segment-draft', baseRevision: 9, text: 'text', operationId },
+      ],
+    ]);
   });
 });
 

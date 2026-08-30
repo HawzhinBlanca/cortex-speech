@@ -56,16 +56,18 @@ export const commands = {
 	text: string,
 	updatedAt: string,
 } | null, CommandErrorV1>(__TAURI_INVOKE("get_review_draft_v1", { segmentId })),
+	// Reserve the exact next draft mutation before starting a possibly slow native write.
+	reserveReviewDraftWriteV1: (segmentId: string, operationId: string) => typedError<null, CommandErrorV1>(__TAURI_INVOKE("reserve_review_draft_write_v1", { segmentId, operationId })),
 	/**
 	 *  Durably replace one clip's desktop draft. The server owns the timestamp; the renderer supplies
 	 *  the exact review revision so a later decision cannot erase a draft for a newer clip state.
 	 */
-	saveReviewDraftV1: (segmentId: string, baseRevision: number, text: string) => typedError<ReviewDraftV1, CommandErrorV1>(__TAURI_INVOKE("save_review_draft_v1", { segmentId, baseRevision, text })),
+	saveReviewDraftV1: (segmentId: string, baseRevision: number, text: string, operationId: string) => typedError<ReviewDraftV1, CommandErrorV1>(__TAURI_INVOKE("save_review_draft_v1", { segmentId, baseRevision, text, operationId })),
 	/**
 	 *  Delete only a draft bound to the supplied review revision. A stale renderer cannot erase work
 	 *  saved against a newer server state.
 	 */
-	deleteReviewDraftV1: (segmentId: string, baseRevision: number) => typedError<boolean, CommandErrorV1>(__TAURI_INVOKE("delete_review_draft_v1", { segmentId, baseRevision })),
+	deleteReviewDraftV1: (segmentId: string, baseRevision: number, operationId: string) => typedError<boolean, CommandErrorV1>(__TAURI_INVOKE("delete_review_draft_v1", { segmentId, baseRevision, operationId })),
 	/**
 	 *  Read one authoritative settings snapshot and its opaque compare-and-swap revision atomically.
 	 *  API-key values and private app-owned paths are absent from the generated renderer contract.

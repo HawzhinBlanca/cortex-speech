@@ -408,7 +408,16 @@ export async function saveReviewDraftV1(
   baseRevision: number,
   text: string,
 ): Promise<ReviewDraftV1> {
-  const result = await generatedCommands.saveReviewDraftV1(segmentId, baseRevision, text);
+  const operationId = crypto.randomUUID();
+  const reservation = await withReviewOperationTimeout(
+    generatedCommands.reserveReviewDraftWriteV1(segmentId, operationId),
+    'E_REVIEW_DRAFT_RESERVE_TIMEOUT',
+  );
+  if (reservation.status === 'error') throw reservation.error;
+  const result = await withReviewOperationTimeout(
+    generatedCommands.saveReviewDraftV1(segmentId, baseRevision, text, operationId),
+    'E_REVIEW_DRAFT_SAVE_TIMEOUT',
+  );
   if (result.status === 'error') throw result.error;
   return result.data;
 }
@@ -418,7 +427,16 @@ export async function deleteReviewDraftV1(
   segmentId: string,
   baseRevision: number,
 ): Promise<boolean> {
-  const result = await generatedCommands.deleteReviewDraftV1(segmentId, baseRevision);
+  const operationId = crypto.randomUUID();
+  const reservation = await withReviewOperationTimeout(
+    generatedCommands.reserveReviewDraftWriteV1(segmentId, operationId),
+    'E_REVIEW_DRAFT_RESERVE_TIMEOUT',
+  );
+  if (reservation.status === 'error') throw reservation.error;
+  const result = await withReviewOperationTimeout(
+    generatedCommands.deleteReviewDraftV1(segmentId, baseRevision, operationId),
+    'E_REVIEW_DRAFT_DELETE_TIMEOUT',
+  );
   if (result.status === 'error') throw result.error;
   return result.data;
 }

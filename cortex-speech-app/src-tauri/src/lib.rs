@@ -1065,6 +1065,7 @@ pub fn run() {
             commands::commit_review_v1,
             commands::mark_segment_unusable_v1,
             commands::get_review_draft_v1,
+            commands::reserve_review_draft_write_v1,
             commands::save_review_draft_v1,
             commands::delete_review_draft_v1,
             commands::undo_human_decision,

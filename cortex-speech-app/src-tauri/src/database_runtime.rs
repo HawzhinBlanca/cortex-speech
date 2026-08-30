@@ -6,6 +6,7 @@
 
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
+use std::collections::HashMap;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::{Arc, Condvar, LazyLock, LockResult, Mutex, MutexGuard};
@@ -20,6 +21,13 @@ pub(crate) struct DatabaseRuntime {
     database_path: Arc<str>,
     reads: Arc<ReadConnectionPool>,
     admission: Arc<RestoreAdmission>,
+    review_draft_writes: Arc<Mutex<HashMap<String, ReviewDraftWriteReservation>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewDraftWriteReservation {
+    operation_id: String,
+    restore_generation: RestoreGeneration,
 }
 
 impl DatabaseRuntime {
@@ -44,7 +52,50 @@ impl DatabaseRuntime {
             database_path,
             reads: Arc::new(ReadConnectionPool::new(max_reads, read_wait)),
             admission,
+            review_draft_writes: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub(crate) fn reserve_review_draft_write(&self, segment_id: &str, operation_id: &str) -> AppResult<()> {
+        let mut reservations = self.review_draft_writes.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned review-draft reservation lock");
+            poisoned.into_inner()
+        });
+        let restore_generation = self.admission.capture_generation().map_err(AppError::Other)?;
+        reservations.insert(
+            segment_id.to_string(),
+            ReviewDraftWriteReservation { operation_id: operation_id.to_string(), restore_generation },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn with_reserved_review_draft_write<T>(
+        &self,
+        segment_id: &str,
+        operation_id: &str,
+        operation: impl FnOnce(&MutationGuard<'_>) -> AppResult<T>,
+    ) -> AppResult<T> {
+        let reservations = self.review_draft_writes.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned review-draft reservation lock");
+            poisoned.into_inner()
+        });
+        let Some(reservation) = reservations.get(segment_id) else {
+            return Err(AppError::Validation("E_STALE_REVIEW_DRAFT_WRITE".into()));
+        };
+        if reservation.operation_id != operation_id {
+            return Err(AppError::Validation("E_STALE_REVIEW_DRAFT_WRITE".into()));
+        }
+        let mutation =
+            self.admission.begin_mutation_at_generation(reservation.restore_generation).map_err(AppError::Other)?;
+        let result = operation(&mutation);
+        drop(mutation);
+        drop(reservations);
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn review_draft_write_is_active_for_test(&self) -> bool {
+        self.review_draft_writes.try_lock().is_err()
     }
 
     /// The sole ordinary serialized-write connection entry point.
@@ -239,6 +290,9 @@ impl RestoreAdmission {
 
     fn reserve(&self, recovery_required: bool) -> Result<RestoreReservation<'_>, String> {
         let mut admission = self.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let next_generation = admission.generation.checked_add(1).ok_or_else(|| {
+            "Database restore generation is exhausted; restart before attempting another restore.".to_string()
+        })?;
         match admission.phase {
             RestorePhase::Idle => {
                 self.pending
@@ -263,7 +317,7 @@ impl RestoreAdmission {
                 return Err("A database restore is already in progress — wait for it to finish.".to_string());
             }
         }
-        admission.generation = admission.generation.wrapping_add(1);
+        admission.generation = next_generation;
         let generation = admission.generation;
         while admission.captures_active > 0 {
             admission = self.complete.wait(admission).unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -303,6 +357,31 @@ impl RestoreAdmission {
         Ok(MutationGuard { admission: self })
     }
 
+    fn capture_generation(&self) -> Result<RestoreGeneration, String> {
+        let admission = self.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if admission.phase != RestorePhase::Idle || self.is_pending() {
+            return Err(RESTORE_IN_PROGRESS_MSG.to_string());
+        }
+        Ok(RestoreGeneration {
+            admission_identity: std::ptr::from_ref(self) as usize,
+            generation: admission.generation,
+        })
+    }
+
+    fn begin_mutation_at_generation(&self, expected: RestoreGeneration) -> Result<MutationGuard<'_>, String> {
+        let mut admission = self.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if expected.admission_identity != std::ptr::from_ref(self) as usize
+            || expected.generation != admission.generation
+        {
+            return Err("Database restore generation changed while a draft write was pending; retry.".to_string());
+        }
+        if admission.phase != RestorePhase::Idle || self.is_pending() {
+            return Err(RESTORE_IN_PROGRESS_MSG.to_string());
+        }
+        admission.mutations_active = admission.mutations_active.saturating_add(1);
+        Ok(MutationGuard { admission: self })
+    }
+
     pub(crate) fn lock<'a, T>(&self, mutex: &'a Mutex<T>) -> LockResult<MutexGuard<'a, T>> {
         let mut admission = self.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         while self.is_pending() {
@@ -316,6 +395,12 @@ impl RestoreAdmission {
 
 pub(crate) static RESTORE_ADMISSION: LazyLock<Arc<RestoreAdmission>> =
     LazyLock::new(|| Arc::new(RestoreAdmission::new()));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestoreGeneration {
+    admission_identity: usize,
+    generation: u64,
+}
 
 pub(crate) fn begin_mutation() -> Result<MutationGuard<'static>, String> {
     RESTORE_ADMISSION.begin_mutation()
@@ -439,6 +524,66 @@ impl Drop for RestoreReservation<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pre_restore_review_draft_reservation_cannot_mutate_the_restored_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("draft-generation.db");
+        let database = Database::open(path.to_str().unwrap()).unwrap();
+        database.initialize().unwrap();
+        database
+            .connection()
+            .execute(
+                "INSERT INTO speech_segments (id, audio_path, raw_transcript) VALUES ('clip', 'clip.wav', 'draft')",
+                [],
+            )
+            .unwrap();
+        let admission = Arc::new(RestoreAdmission::new());
+        let runtime = DatabaseRuntime::with_admission(database, 1, Duration::from_secs(1), Arc::clone(&admission));
+        let store = crate::stores::ReviewDraftStore::new(runtime);
+        store.reserve_write("clip", "before-restore").unwrap();
+
+        let restore = admission.try_reserve().expect("reserve a newer restore generation");
+        let error = store
+            .save("clip", 0, "must not land", "before-restore")
+            .expect_err("pre-restore draft authority must be refused");
+        assert!(error.to_string().contains("restore generation changed"), "{error}");
+        drop(restore);
+
+        assert!(store.get("clip").unwrap().is_none(), "the newer database generation must remain unchanged");
+    }
+
+    #[test]
+    fn stale_restore_generation_cannot_enter_mutation_after_restore_aba() {
+        let admission = RestoreAdmission::new();
+        let stale = admission.capture_generation().expect("capture pre-restore generation");
+
+        let restore = admission.try_reserve().expect("reserve restore");
+        restore.arm_named_restore().expect("arm restore");
+        restore.commit_named_restore().expect("commit restore generation");
+        drop(restore);
+
+        let error = admission
+            .begin_mutation_at_generation(stale)
+            .err()
+            .expect("a pre-restore generation must never authorize a post-restore mutation");
+        assert!(error.contains("generation changed"), "{error}");
+
+        let current = admission.capture_generation().expect("capture current generation");
+        let mutation = admission.begin_mutation_at_generation(current).expect("current generation may mutate");
+        drop(mutation);
+    }
+
+    #[test]
+    fn restore_generation_never_wraps_back_to_stale_authority() {
+        let admission = RestoreAdmission::new();
+        admission.admission.lock().unwrap().generation = u64::MAX;
+
+        let error = admission.try_reserve().err().expect("generation exhaustion must fail closed");
+        assert!(error.contains("generation is exhausted"), "{error}");
+        assert!(!admission.is_pending());
+        assert_eq!(admission.admission.lock().unwrap().phase, RestorePhase::Idle);
+    }
 
     fn file_runtime(max_reads: usize, wait: Duration) -> (tempfile::TempDir, DatabaseRuntime) {
         let directory = tempfile::tempdir().unwrap();
