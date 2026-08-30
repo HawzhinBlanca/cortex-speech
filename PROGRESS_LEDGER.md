@@ -12189,3 +12189,30 @@ authority, startup recovery surfacing, and the deploy/alarm machinery of steps 2
 
 Honest status: **serving and verified. The old release dirs (5444151a, c1dae8b8) remain on disk
 as rollback fallbacks. Deployed at night with no reviewer mid-session (last decision 13 h prior).**
+
+---
+
+## 2026-08-31 — The money loop is closed, and it serves
+
+Readiness step 5, shipped as release `647b11bdbe7f-b0bad9cdc507-74003a8ebdd6-876715ee80e9-363def17e69f`
+(commit `647b11bd`, same-schema v69 handover; preflight clone PASS, READY with all six reviewer
+queues proven, serving-path verified independently after READY plus a rollback watch).
+
+1. **Settlements have a caller** (`36c0dd82`): CompensationStore + two generated IPC commands +
+   the Reviewer Pay card in Settings (general tab, under Couch Review). The owner sees exact
+   earned/settled/due per payee (micro-IQD as decimal strings end to end — never a float) and
+   records a payout with a durable reference; the settlement claims the EXACT ledger boundary the
+   screen showed, replays idempotently on a lost response, and retires the outstanding balance.
+   Proven in-store: credit → overview → settle → replay-returns-original → outstanding=0.
+2. **The blinded second pass fails closed** (`647b11bd`): the routing branch now answers
+   503 PAY_POLICY_REQUIRED in production — before this, activating a second pass meant evidenced
+   work minting zero pay with every request answering 200. Third pin added to
+   test_pool_pay_fence_scope_policy.py with a tripwire for the day a real pay contract lands.
+
+Measured: cargo lib 1995/0/8, policy suite 141/141, typecheck/lint/build+budget green.
+Known-red, pre-existing, tracked separately: 3 AppRuntimeGuard vitest tests (browser-mode mount
+fixtures drifted at the WIP checkpoint; reproduce on pristine 0b73c06f; task chip raised).
+
+Owner-gated remainder of the money domain: pricing the flexible pool and the second pass — both
+need a literal `change canon:`; the fences hold until then. Legacy pre-policy events
+(6 for one reviewer) stay outside totals until separately reconciled, as canon requires.
