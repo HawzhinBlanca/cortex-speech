@@ -12118,3 +12118,40 @@ through the repaired wrapper: PASS, RTO 2.829 s.
 Honest status: **armed on-machine and testable end to end; the two off-machine legs wait on the
 owner placing his own URLs in `alert-webhook.url` / `healthcheck.url`, and unattended RECOVERY
 (vs detection) still waits on the boot-posture decision.**
+
+---
+
+## 2026-08-30 — Deploy machinery: the recovery arm can no longer fight its own deploy
+
+Readiness step 3, closing the three adversarially-confirmed P1/P2s in the release machinery
+(`release_private_production.py` + `cortex-release-recovery.ps1`; repo copies — the next deploy
+ships them).
+
+1. **Handover mutex** (`release-handover.lock`, handle-based on both platforms so a dead holder
+   releases it instantly and power loss can never strand it): deploy() holds it for its whole run;
+   recover() try-acquires and DEFERS while it is held. This ends the confirmed race where the
+   arm's T+2-minute fire ran a full rollback concurrently with any deploy slower than two minutes
+   (phases are budgeted up to 600 s each; the 2026-08-30 deploy escaped by ~50 s).
+2. **Ordering**: the recovery arm is registered after the journal exists but BEFORE the
+   maintenance marker is written — the old order left a seconds-wide hard-kill window with
+   reviewers 503-blocked, no recovery task, and the watchdog keeping the 503-serving app alive
+   forever.
+3. **A failing recovery is loud and keeps trying**: every failed attempt writes
+   `logs\release-recovery-failure.json` (cleared on success), the arm's repetition window is 24 h
+   instead of 2, and the alarm forwarder gained two CRITICAL checks — `recovery-failing`
+   (breadcrumb present) and `handover-stranded` (maintenance marker older than 15 min, the state
+   watchdog AND all four probe gates provably cannot see).
+
+Also armed the step-2 webhook leg for real: `<data>\alert-webhook.url` now holds a
+cryptographically random private ntfy topic, proven end to end (injected CRITICAL posted, its
+[RESOLVED] posted). The dead-man (`healthcheck.url`) still waits on the owner's healthchecks.io
+account — account creation is his alone.
+
+Measured: `test_private_production_release.py` 31/31 (recover() exercised through the new lock),
+`test_alarm_forwarder_policy.py` 6/6, both new forwarder checks fault-injected in an ISOLATED
+fake data dir (never the live one — a real marker would 503 real reviewers) and both fired;
+real-environment forwarder run back to exit 0; full policy suite 141/141, exit from the runner.
+
+Honest status: **the machinery fixes are code-verified and test-covered but have not yet run a
+REAL handover; the next deploy from this branch is their first live exercise. The release-dir
+copies of the old scripts still carry the old behavior until then.**

@@ -41,6 +41,15 @@ LEGACY_WATCHDOG_TASK = "CortexWatchdog"
 WATCHDOG_TASK = "CortexPrivateProductionWatchdog"
 RESTORE_TASK = "CortexDailyRestoreDrill"
 RECOVERY_TASK = "CortexReleaseRecovery"
+# Handle-based (auto-released on process death, so power loss can never leave it stale) mutex
+# between a live deploy and the scheduled recovery arm. Before this existed the arm's first fire at
+# T+2min ran recover() CONCURRENTLY with any deploy slower than two minutes — rolling back a
+# healthy in-flight handover mid-migration (2026-08-30 audit; that day's deploy escaped by ~50s).
+HANDOVER_LOCK_FILE = "release-handover.lock"
+# Written on every failed recovery attempt and cleared on success, so the alarm forwarder can page
+# the owner when the arm is failing — previously a persistently failing recovery burned its whole
+# repetition window in silence and left every couch route 503 forever.
+RECOVERY_FAILURE_FILE = "release-recovery-failure.json"
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA64 = re.compile(r"^[0-9a-f]{64}$")
 BINARY_SHA_MARKER = re.compile(rb"CORTEX_BUILD_SHA:([0-9a-f]{40}|unknown)(?![0-9a-f])")
@@ -258,6 +267,73 @@ def exclusive_instance_lock(data_dir: Path):
             handle.close()
         # Keep the stable inode. Unlinking after unlock creates a race where a new owner can lock
         # this inode just before it is removed and a third process then locks a replacement inode.
+
+
+def try_acquire_handover_lock(data_dir: Path):
+    """Exclusive handover mutex, or None if a live deploy/recovery process already holds it.
+
+    Handle-based on both platforms: the OS releases it the instant the holder dies, so a power
+    loss mid-deploy can never strand a stale lock that blocks recovery (the failure class that
+    existence-based lockfiles carry). Windows uses share-mode-0 CreateFileW; POSIX uses flock.
+    """
+    lock_path = data_dir / HANDOVER_LOCK_FILE
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        handle = kernel32.CreateFileW(
+            ctypes.c_wchar_p(str(lock_path)),
+            ctypes.c_uint32(0x80000000 | 0x40000000),  # GENERIC_READ | GENERIC_WRITE
+            ctypes.c_uint32(0),  # no sharing: the second opener fails while the first lives
+            None,
+            ctypes.c_uint32(4),  # OPEN_ALWAYS
+            ctypes.c_uint32(0x80),  # FILE_ATTRIBUTE_NORMAL
+            None,
+        )
+        if handle == ctypes.c_void_p(-1).value:
+            return None
+        return ("nt", kernel32, handle)
+    import fcntl
+
+    posix_handle = lock_path.open("a+b")
+    try:
+        fcntl.flock(posix_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        posix_handle.close()
+        return None
+    return ("posix", fcntl, posix_handle)
+
+
+def release_handover_lock(lock) -> None:
+    if lock is None:
+        return
+    kind, module, handle = lock
+    if kind == "nt":
+        module.CloseHandle(ctypes.c_void_p(handle))
+        return
+    try:
+        module.flock(handle.fileno(), module.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def record_recovery_failure(data_dir: Path, error: BaseException) -> None:
+    """Best-effort breadcrumb for the alarm forwarder; never masks the real recovery error."""
+    try:
+        log_dir = data_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        atomic_json(
+            log_dir / RECOVERY_FAILURE_FILE,
+            {"failedAtUtc": utc_now(), "error": str(error)[:2000]},
+        )
+    except BaseException:
+        pass
+
+
+def clear_recovery_failure(data_dir: Path) -> None:
+    try:
+        (data_dir / "logs" / RECOVERY_FAILURE_FILE).unlink(missing_ok=True)
+    except BaseException:
+        pass
 
 
 def is_within(child: Path, parent: Path) -> bool:
@@ -1200,7 +1276,30 @@ def recover(data_dir: Path, release_root: Path) -> bool:
     journal_path = data_dir / JOURNAL_FILE
     if not journal_path.is_file():
         unregister_task(RECOVERY_TASK)
+        clear_recovery_failure(data_dir)
         return True
+    # A live deploy (or another recovery) holds the handover lock for its whole duration. Deferring
+    # here is what stops the scheduled arm's T+2min fire from rolling back a healthy in-flight
+    # handover; the arm simply tries again in five minutes, and a dead holder releases the
+    # handle-based lock instantly.
+    lock = try_acquire_handover_lock(data_dir)
+    if lock is None:
+        print("RELEASE RECOVERY: deferred — a live deploy or recovery process holds the handover lock")
+        return True
+    try:
+        result = _recover_under_lock(data_dir, release_root, journal_path)
+        clear_recovery_failure(data_dir)
+        return result
+    except BaseException as error:
+        # The breadcrumb the alarm forwarder pages on: a failing recovery arm previously burned its
+        # whole repetition window in silence, leaving every couch route 503 with no app running.
+        record_recovery_failure(data_dir, error)
+        raise
+    finally:
+        release_handover_lock(lock)
+
+
+def _recover_under_lock(data_dir: Path, release_root: Path, journal_path: Path) -> bool:
     journal, candidate, previous = validate_release_journal(journal_path, release_root)
     source_schema = int(journal["sourceSchema"])
     baseline = int(journal["baselinePoolDecisionId"])
@@ -1331,6 +1430,12 @@ def deploy(args: argparse.Namespace) -> int:
         raise ReleaseError(f"live database is missing: {db}")
     if (data_dir / JOURNAL_FILE).exists():
         raise ReleaseError("a prior release handover is unfinished; run the recover command first")
+    # Held for the whole deploy. The scheduled recovery arm defers while this process lives, and
+    # the OS releases the handle the instant this process dies — so a crash hands recovery over
+    # immediately, while a slow-but-healthy deploy can never be rolled back mid-flight again.
+    handover_lock = try_acquire_handover_lock(data_dir)
+    if handover_lock is None:
+        raise ReleaseError("another deploy or recovery process holds the handover lock")
     source_schema = database_schema(db)
     if source_schema not in (SUPPORTED_MIGRATION_SOURCES | {EXPECTED_SCHEMA}):
         raise ReleaseError(
@@ -1382,11 +1487,17 @@ def deploy(args: argparse.Namespace) -> int:
         "targetDatabaseSha256": None,
     }
     atomic_json(data_dir / JOURNAL_FILE, journal)
+    # The recovery arm is registered AFTER the journal exists but BEFORE the maintenance marker is
+    # written. The old order (marker first, arm second) left a seconds-wide hard-kill window (power
+    # loss during Register-ScheduledTask) in which reviewers were 503-blocked by the marker while
+    # NO recovery task existed and the still-enabled watchdog faithfully kept the 503-serving old
+    # app alive forever. This order closes it: every possible fire of the arm sees the journal, and
+    # any fire while this process lives defers on the handover lock it holds.
+    recovery = Path(str(manifest["directory"])) / "scripts" / "ops" / "cortex-release-recovery.ps1"
+    powershell_file(recovery, "-Register")
     write_maintenance(data_dir, str(manifest["releaseId"]))
     journal["phase"] = "maintenance"
     atomic_json(data_dir / JOURNAL_FILE, journal)
-    recovery = Path(str(manifest["directory"])) / "scripts" / "ops" / "cortex-release-recovery.ps1"
-    powershell_file(recovery, "-Register")
     task_change(LEGACY_WATCHDOG_TASK, False)
     task_change(WATCHDOG_TASK, False, allow_missing=True)
 
@@ -1455,6 +1566,8 @@ def deploy(args: argparse.Namespace) -> int:
         certify_live(data_dir, manifest)
         (data_dir / JOURNAL_FILE).unlink(missing_ok=True)
         unregister_task(RECOVERY_TASK)
+        clear_recovery_failure(data_dir)
+        release_handover_lock(handover_lock)
         print(
             f"PRIVATE_PRODUCTION_RELEASE=READY release={manifest['releaseId']} schema={EXPECTED_SCHEMA} "
             f"reviewers={','.join(queues)} reviewReady={certification['gates']['reviewReady']}"
@@ -1462,6 +1575,8 @@ def deploy(args: argparse.Namespace) -> int:
         return 0
     except BaseException as error:
         print(f"RELEASE HANDOVER FAILED: {error}", file=sys.stderr)
+        # The inline recover needs the lock this process still holds; hand it over first.
+        release_handover_lock(handover_lock)
         try:
             recover(data_dir, release_root)
         except BaseException as recovery_error:

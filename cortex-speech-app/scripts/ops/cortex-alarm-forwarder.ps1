@@ -198,7 +198,31 @@ try {
     }
 } catch { Add-Finding 'disk-c-low' 'WARN' "C: free space unreadable: $($_.Exception.Message)" }
 
-# 8) Champion 7B server: reviewers are unaffected (they judge existing drafts), but every drafting
+# 8) Deploy machinery: a stranded handover is the worst quiet failure this box has -- the
+#    maintenance marker 503-blocks EVERY couch route while the watchdog counts the 503-serving app
+#    as alive and all four probe gates stay green (2026-08-30 audit, adversarially confirmed).
+#    A healthy handover completes in ~2 min; a marker older than 15 min is stuck, not in flight.
+try {
+    $maintenance = Join-Path $dataDir 'private-production-maintenance.json'
+    if (Test-Path $maintenance) {
+        $mAge = [int]((Get-Date).ToUniversalTime() - (Get-Item $maintenance).LastWriteTimeUtc).TotalMinutes
+        if ($mAge -gt 15) {
+            Add-Finding 'handover-stranded' 'CRITICAL' "release maintenance marker is ${mAge} min old -- reviewers are write-blocked (503) by a handover that is not completing"
+        }
+    }
+} catch { Add-Finding 'handover-stranded' 'WARN' "maintenance marker unreadable: $($_.Exception.Message)" }
+
+#    The recovery arm leaves this breadcrumb on every failed attempt and clears it on success; its
+#    old failure mode was burning the whole repetition window in silence and then stopping forever.
+try {
+    $recoveryFailure = Join-Path $logDir 'release-recovery-failure.json'
+    if (Test-Path $recoveryFailure) {
+        $failure = Get-Content $recoveryFailure -Raw -ErrorAction Stop | ConvertFrom-Json
+        Add-Finding 'recovery-failing' 'CRITICAL' "release recovery is FAILING (last attempt $($failure.failedAtUtc)): $($failure.error)"
+    }
+} catch { Add-Finding 'recovery-failing' 'CRITICAL' "release recovery failure breadcrumb unreadable: $($_.Exception.Message)" }
+
+# 9) Champion 7B server: reviewers are unaffected (they judge existing drafts), but every drafting
 #    batch hard-stops by canon while it is down, and after a reboot only a human restarts it.
 try {
     $appUp = $null -ne (Get-Process -Name 'cortex-speech-app' -ErrorAction SilentlyContinue)

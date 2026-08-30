@@ -52,6 +52,10 @@ def test_every_detector_is_wired() -> None:
         ("snapshots-offsite", "backup_second_dir"),
         ("disk-c-low", "Get-PSDrive -Name C"),
         ("champion-down", "8799"),
+        # A stranded handover 503-blocks every reviewer while watchdog AND probe both stay green
+        # (adversarially confirmed 2026-08-30) -- only this check sees it.
+        ("handover-stranded", "private-production-maintenance.json"),
+        ("recovery-failing", "release-recovery-failure.json"),
     ):
         _pin(src, f"'{check_id}'", f"detector {check_id} must stay wired")
         _pin(src, anchor, f"detector {check_id} must read its real source")
