@@ -12180,3 +12180,31 @@ rustfmt passed; installed stable Clippy passed all targets/features with `-D war
 Honest status before the iteration-10 remeasurement: the product chunk is green, but no new coverage
 delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
 and P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 11: exhaustive post-v60 memory baseline fields
+
+Iteration 10's exact serialized measurement at ledger commit
+`863d9448f906cf6fe8c567c2bc6e0cf425c20a74` completed 1,823 library tests with 0 failures and 8
+ignores, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell smoke 1/1,
+user-data 2/2, and all Criterion targets. The certifying wrapper exited red solely because the
+locked coverage thresholds remain unmet. Overall branch coverage moved 59.83% to 59.87%; restore
+moved 63.55% to 64.01%, reducing uncovered restore branches from 549 to 542. The active effects
+function fell from 150 to 143 uncovered branches. P1 remains red, P2 green, and P0 unknown because
+the production heartbeat is absent.
+
+The next LLVM-ranked cluster contained twelve unproved fields in the post-v60 correction-memory
+zero-baseline capture boundary. The new table-driven regression starts each case from a real edit
+through the production decision writer, proves its generated memory and contribution validate, then
+independently corrupts the memory UUID, wrong/human token presence, slot presence, token distinction,
+confidence finiteness, exact baseline confidence, confirmation/override baseline, fired-at baseline,
+capture presence, or capture origin. Every mutation is proven to apply and must produce the exact
+zero-baseline capture-identity refusal. The hit-count arm was deliberately excluded because the exact
+artifact already showed it covered.
+
+The focused proof passed 1/1 and the complete restore-effects suite passed 25/25. Installed stable
+rustfmt passed; installed stable Clippy passed all targets/features with `-D warnings`. Product commit
+`b8efd92efe12eb632debac1e2aa6236ea1867f12` is ready for the ledger commit and exact push.
+
+Honest status before the iteration-11 remeasurement: the product chunk is green, but no new coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
