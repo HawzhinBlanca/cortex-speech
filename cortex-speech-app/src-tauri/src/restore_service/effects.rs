@@ -2358,6 +2358,92 @@ mod tests {
     }
 
     #[test]
+    fn every_uncovered_unsnapshotted_human_prior_field_is_refused() {
+        // Accept is intentional: unlike an edit it writes no correction/example/memory evidence,
+        // so changing the immutable prior snapshot cannot be intercepted by an earlier learning
+        // provenance guard. Every fixture begins with a real phone decision or flag, validates,
+        // then changes exactly one prior-truth field under the restored-file threat model.
+        let decision_corruptions = [
+            (
+                "prior annotated transcript",
+                "UPDATE human_decision_effect_events SET prior_annotated_transcript = 'forged prior annotation'",
+            ),
+            ("prior human decision", "UPDATE human_decision_effect_events SET prior_human_decision = 'edit'"),
+            ("prior reviewer", "UPDATE human_decision_effect_events SET prior_reviewed_by = 'Forged Reviewer'"),
+            (
+                "prior correction timestamp",
+                "UPDATE human_decision_effect_events SET prior_corrected_at = '2026-08-31 00:00:00'",
+            ),
+            ("prior human verdict", "UPDATE human_decision_effect_events SET prior_verdict = 'human_edit'"),
+        ];
+
+        for (index, (label, sabotage)) in decision_corruptions.into_iter().enumerate() {
+            let db = seeded_db("unsnapshotted-decision-prior");
+            let revision = db.segment_review_revision("unsnapshotted-decision-prior").unwrap().unwrap();
+            db.record_phone_human_decision_by_at_revision_with_operation(
+                "unsnapshotted-decision-prior",
+                "accept",
+                Some("machine draft"),
+                "Reviewer",
+                revision,
+                &canonical_operation(480 + index as u64),
+                &crate::db::review_operation_payload_hash(
+                    "unsnapshotted-decision-prior",
+                    "accept",
+                    "machine draft",
+                    "Reviewer",
+                ),
+            )
+            .unwrap()
+            .unwrap();
+            validate_review_effect_semantics(&db).expect("the genuine accept decision must validate first");
+
+            db.connection().execute("DROP TRIGGER human_decision_effect_events_immutable_update", []).unwrap();
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
+            assert_eq!(
+                db.connection().execute(sabotage, []).unwrap(),
+                1,
+                "{label}: the corruption must apply, or this case proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("starts from unsnapshotted human review truth"),
+                "{label}: expected the exact unsnapshotted-prior refusal, got: {error}"
+            );
+        }
+
+        for (index, (label, sabotage)) in [
+            ("prior flag escalation", "UPDATE review_flag_effect_events SET prior_escalated = 1"),
+            ("prior flag human verdict", "UPDATE review_flag_effect_events SET prior_verdict = 'human_edit'"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let db = seeded_db("unsnapshotted-flag-prior");
+            db.record_review_flag(
+                "unsnapshotted-flag-prior",
+                "genuine concern",
+                &canonical_operation(490 + index as u64),
+            )
+            .unwrap();
+            validate_review_effect_semantics(&db).expect("the genuine review flag must validate first");
+
+            db.connection().execute("DROP TRIGGER review_flag_effect_events_immutable_update", []).unwrap();
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
+            assert_eq!(
+                db.connection().execute(sabotage, []).unwrap(),
+                1,
+                "{label}: the corruption must apply, or this case proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("starts from unsnapshotted human review truth"),
+                "{label}: expected the exact unsnapshotted-prior refusal, got: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn every_legacy_terminal_field_must_match_its_immutable_snapshot() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
