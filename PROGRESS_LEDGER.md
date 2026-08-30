@@ -12019,3 +12019,29 @@ Strict all-target/all-feature Clippy with `-D warnings` and rustfmt both exited 
 
 Honest status before the iteration-4 remeasurement: no coverage delta is claimed yet. P0 remains
 unknown; P1 remains red; P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 5: exact correction-memory override outcome
+
+Iteration 4's exact clean-SHA measurement at ledger commit `3de0ec770835d4ac75912182f03092d96d37f51c`
+passed 1,817 library tests with 0 failures and 8 ignores, reliability 23/23, soak 1/1, Tauri
+integration 1/1, shell smoke 1/1, user-data 2/2, and all Criterion targets. Overall branch coverage
+moved 59.34% to 59.43%; restore moved 59.39% to 60.03%, reducing uncovered restore branches from
+610 to 602. P1 therefore remains red, P2 remains green, and P0 remains unknown because no current
+production heartbeat exists.
+
+The scoreboard kept `restore_service::effects::validate_review_effect_semantics` first. The next
+uncovered semantic arm was `MemoryOutcome::Override`. A two-sided regression now constructs an exact
+grandfathered memory which would rewrite an accepted transcript away from the human answer. Its
+override contribution is first admitted by the real schema and accepted by the restore validator;
+the same immutable evidence is then relabelled as a confirmation with restored-file guards disabled,
+and the validator must return the exact outcome-rederivation refusal.
+
+Focused result: `test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 1807 filtered out`.
+Installed stable rustfmt passed its exact check, and installed stable Clippy passed all targets and
+all features with `-D warnings`; the pinned measurement nightly lacks both optional components but
+continues to own test and coverage execution. Commit `4fdb416e` was pushed and independently matched
+on `origin/public/clean-release`.
+
+Honest status before the iteration-5 remeasurement: the product chunk is green and pushed, but no
+new coverage delta is claimed until the exact pinned all-target run finishes. Production and
+scheduled tasks were untouched.
