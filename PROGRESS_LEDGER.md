@@ -12239,3 +12239,30 @@ rustfmt passed; installed stable Clippy passed all targets/features with `-D war
 Honest status before the iteration-12 remeasurement: the product chunk is green, but no new coverage
 delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
 and P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 13: exhaustive review-event provenance fields
+
+Iteration 12's exact serialized measurement at ledger commit
+`cfca7041370863db54262244ee16a01226665203` completed 1,825 library tests with 0 failures and 8
+ignores, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell smoke 1/1,
+user-data 2/2, and all Criterion targets. The certifying wrapper exited red solely because the
+locked coverage thresholds remain unmet. Overall branch coverage moved 59.96% to 60.06%; restore
+moved 64.81% to 65.54%, reducing uncovered restore branches from 530 to 519. The active effects
+function fell from 131 to 120 uncovered branches. P1 remains red, P2 green, and P0 unknown because
+the production heartbeat is absent.
+
+The next reachable LLVM cluster contained ten unproved post-v60 review-event provenance fields. The
+new regression starts every case from a real phone decision and independently corrupts source,
+action, requested action, payload-hash shape, payload-hash equality, requested-text canonicality,
+served-text canonicality, served revision, request classification, or build-SHA alphabet. Every
+mutation is proven to apply and must produce the exact Couch/build/playback provenance refusal. The
+requested-text case recomputes a matching payload hash for the deliberately untrimmed text so the
+text-canonicality guard, rather than the earlier digest comparison, owns the failure.
+
+The focused proof passed 1/1 and the complete restore-effects suite passed 27/27. Installed stable
+rustfmt passed; installed stable Clippy passed all targets/features with `-D warnings`. Product commit
+`dbde48ea46d9a468a07331d458c8e89f906c09f7` is ready for the ledger commit and exact push.
+
+Honest status before the iteration-13 remeasurement: the product chunk is green, but no new coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
