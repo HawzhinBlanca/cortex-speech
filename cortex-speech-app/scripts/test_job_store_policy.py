@@ -30,14 +30,16 @@ def test_store_owns_bounded_reads_and_serialized_discard_without_ui_dependencies
     for required in (
         "struct JobStore",
         "runtime: DatabaseRuntime",
-        "begin_mutation().map_err(AppError::Other)?",
+        # Repointed 2026-08-30: writes now begin a restore-generation-gated mutation and take the
+        # lock through it (`lock_after_mutation(op, &mutation)`), replacing bare `self.lock("op")`.
+        "self.runtime.begin_mutation().map_err(AppError::Other)",
         "self.runtime.open_read()?.find_interrupted_import_job()",
-        'self.lock("discard_interrupted_import").discard_import_job(job_id)',
-        'self.lock("begin_import").begin_import_job(directory, total_files)',
-        'self.lock("handoff_import_for_resume").handoff_import_job_for_resume(prior_job_id)',
-        'self.lock("continue_import").continue_import_job(job_id, directory, total_files)',
-        'self.lock("mark_import_file_done").mark_import_file_done(job_id, path)',
-        'self.lock("complete_import").complete_import_job(job_id)',
+        'self.lock_after_mutation("discard_interrupted_import", &mutation).discard_import_job(job_id)',
+        'self.lock_after_mutation("begin_import", &mutation).begin_import_job(directory, total_files)',
+        'self.lock_after_mutation("handoff_import_for_resume", &mutation).handoff_import_job_for_resume(prior_job_id)',
+        'self.lock_after_mutation("continue_import", &mutation).continue_import_job(job_id, directory, total_files)',
+        'self.lock_after_mutation("mark_import_file_done", &mutation).mark_import_file_done(job_id, path)',
+        'self.lock_after_mutation("complete_import", &mutation).complete_import_job(job_id)',
         "self.runtime.open_read()?.list_recent_jobs(limit)",
         'self.run_tracked(job_id, "export_dataset", "EXPORT_FAILED"',
         'self.run_tracked(job_id, "export_huggingface_dataset", "HF_EXPORT_FAILED"',

@@ -48,7 +48,9 @@ def test_full_height_boxes_do_not_centre_their_overflow() -> None:
 def test_the_empty_state_uses_the_scroll_safe_centring() -> None:
     # The positive half: the two boxes that were actually measured clipped must still carry the fix,
     # so this policy cannot be satisfied by deleting the centring altogether.
-    for relative_path in ("src/lib/EmptyState.svelte", "src/Workstation.svelte"):
+    # Repointed 2026-08-30: the workstation's segments-empty-state markup was extracted from
+    # Workstation.svelte into WorkstationLibraryPanel.svelte with its safe_center intact.
+    for relative_path in ("src/lib/EmptyState.svelte", "src/lib/WorkstationLibraryPanel.svelte"):
         source = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
         if SCROLL_SAFE_CENTRE not in source:
             raise AssertionError(

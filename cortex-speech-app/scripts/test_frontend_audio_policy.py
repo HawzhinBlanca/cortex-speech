@@ -6,7 +6,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_audio_player_playback_failures_are_visible() -> None:
-    audio_player = (REPO_ROOT / "src/lib/AudioPlayer.svelte").read_text(encoding="utf-8")
+    # Repointed 2026-08-30: the failure-reporting logic was extracted from AudioPlayer.svelte into
+    # audioPlayerController.ts (the component keeps `audioError` as its $bindable visible state and
+    # hands the controller a setter). Same invariant — every playback failure lands in visible,
+    # decision-blocking state AND raises a notification — pinned where the code now lives.
+    audio_player = (REPO_ROOT / "src/lib/AudioPlayer.svelte").read_text(encoding="utf-8") + (
+        REPO_ROOT / "src/lib/audioPlayerController.ts"
+    ).read_text(encoding="utf-8")
     forbidden = [
         "audioEl.play().catch(() => {});",
         "notifications.error(message, { detail: String(cause) });",
@@ -19,15 +25,18 @@ def test_audio_player_playback_failures_are_visible() -> None:
 
     required = [
         "import { notifications } from './stores/notificationStore';",
-        "function reportPlaybackFailure(message: string, cause: unknown, binding: AudioAttemptBinding)",
+        "private reportPlaybackFailure(",
         # `audioError` is the $bindable prop the decision guards read (2026-08-17): a failure is not
-        # just shown, it also blocks Accept/Reject on audio nobody could hear. The pin follows the
-        # rename — the requirement is unchanged, every failure still lands in visible state.
-        "audioError = message;",
+        # just shown, it also blocks Accept/Reject on audio nobody could hear. The controller writes
+        # it through the component-supplied setter; the requirement is unchanged, every failure
+        # still lands in visible state.
+        "audioError = $bindable<string | null>(null)",
+        "setAudioError: (value) => (audioError = value)",
+        "this.output.setAudioError(message);",
         "notifications.error(message, { cause });",
-        "attemptPlay($t('audio.playbackFailed'));",
-        "attemptPlay($t('audio.loopFailed'));",
-        "audioError = $t('audio.loadFailed');",
+        "this.attemptPlay(this.output.translate('audio.playbackFailed'));",
+        "this.attemptPlay(this.output.translate('audio.loopFailed'));",
+        "this.output.setAudioError(this.output.translate('audio.loadFailed'));",
     ]
     missing = [pattern for pattern in required if pattern not in audio_player]
     if missing:
@@ -62,13 +71,18 @@ def test_audio_player_loop_failure_has_unit_coverage() -> None:
 
 
 def test_audio_state_machine_is_clip_attempt_bound_and_stress_tested() -> None:
-    audio_player = (REPO_ROOT / "src/lib/AudioPlayer.svelte").read_text(encoding="utf-8")
+    # Repointed 2026-08-30 with the controller extraction: the attempt-bound transitions live in
+    # audioPlayerController.ts now (`this.transition(...)` / `isCurrentAudioAttempt(this.audioMachine,
+    # binding)`), with the same machine and the same stress-test contract.
+    audio_player = (REPO_ROOT / "src/lib/AudioPlayer.svelte").read_text(encoding="utf-8") + (
+        REPO_ROOT / "src/lib/audioPlayerController.ts"
+    ).read_text(encoding="utf-8")
     machine = (REPO_ROOT / "src/lib/audioMachine.ts").read_text(encoding="utf-8")
     tests = (REPO_ROOT / "tests/lib/audioMachine.test.ts").read_text(encoding="utf-8")
     player_pins = [
-        "isCurrentAudioAttempt(audioMachine, binding)",
-        "transitionAudio({ type: 'select', clipId, sourceId })",
-        "transitionAudio({ type: 'failed', binding, errorCode: 'AUDIO_DECODE_FAILED' })",
+        "isCurrentAudioAttempt(this.audioMachine, binding)",
+        "this.transition({ type: 'select', clipId, sourceId })",
+        "this.transition({ type: 'failed', binding, errorCode: 'AUDIO_DECODE_FAILED' })",
         "activePlayBinding",
         "mediaLoadBinding",
     ]

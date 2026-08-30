@@ -276,7 +276,10 @@ describe('statsDashboardModel evidence truth', () => {
     expect(formatDuration(0.9)).toBe('0s');
     expect(formatPercent(12.34)).toBe('12.3%');
     expect(formatPercent(Number.NaN)).toBe('—');
-    expect(formatRatePercent(0.0703)).toBe('7.03%');
+    // 0.0712 and not the champion's measured CER rate: the attestation gate bans that exact
+    // percentage literal from every runtime/UI source, and a formatter example is not an
+    // attested claim.
+    expect(formatRatePercent(0.0712)).toBe('7.12%');
     expect(formatRatePercent(Number.NEGATIVE_INFINITY)).toBe('—');
     expect(formatMilliseconds(0.5)).toBe('500µs');
     expect(formatMilliseconds(12.34)).toBe('12.3ms');

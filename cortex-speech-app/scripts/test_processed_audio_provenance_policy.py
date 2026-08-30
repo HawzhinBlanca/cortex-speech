@@ -56,8 +56,18 @@ def test_the_import_records_it_without_being_asked() -> None:
             "the import must detect processed source audio itself — a declaration that depends on "
             "someone remembering to run a command is not a guarantee"
         )
-    if "import_writes.upsert_source_audio_provenance(&provenance)" not in pipeline:
-        raise AssertionError("the import must persist what it detected through the serialized import store")
+    # Repointed 2026-08-30: the detected provenance no longer travels through a separate upsert —
+    # it is handed to the ImportWriteStore's ATOMIC publication calls, so segments and their source
+    # provenance commit in one serialized mutation and cannot drift apart.
+    for required in (
+        "import_writes.publish_segments_with_identity(&prepared, &identity, source_provenance",
+        "self.persist_segments(&import_writes, prepared, source_provenance",
+    ):
+        if required not in pipeline:
+            raise AssertionError(
+                "the import must persist what it detected through the serialized import store: "
+                f"missing {required!r}"
+            )
 
     detector = _read("src-tauri/src/source_provenance.rs")
     if "audio_is_processed" not in detector:

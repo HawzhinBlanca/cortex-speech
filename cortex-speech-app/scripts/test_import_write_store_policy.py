@@ -35,24 +35,31 @@ def test_store_owns_import_publication_rollback_and_revision_guarded_alignment()
     for forbidden in ("tauri", "crate::commands", "crate::http"):
         if forbidden in store:
             raise AssertionError(f"ImportWriteStore crossed a forbidden layer: {forbidden}")
+    # Pins repointed 2026-08-30: the store's boundary got STRONGER — every write now begins a
+    # restore-generation-gated mutation (`begin_mutation()`) and takes the DB lock THROUGH that
+    # guard (`lock_after_mutation(op, &mutation)`), so the old `self.lock("op")` strings describe
+    # code that no longer exists. Same operations, same single-writer property, stricter ordering.
     for required in (
         "struct ImportWriteStore",
         "runtime: DatabaseRuntime",
-        "begin_mutation().map_err(AppError::Other)?",
-        'self.lock("publish_import_segments").insert_segments_with_provenance_batch(segments, provenance)',
-        'self.lock("publish_import_segments_with_identity")',
+        "self.runtime.begin_mutation().map_err(AppError::Other)",
+        "self.runtime.lock_after_mutation(mutation)",
+        'self.lock_after_mutation("publish_import_segments", &mutation)',
+        ".insert_segments_with_provenance_batch(segments, provenance)",
+        'self.lock_after_mutation("publish_import_segments_with_identity", &mutation)',
         ".insert_segments_with_audio_identity_and_provenance_batch(segments, identity, provenance)",
-        'self.lock("publish_champion_import_segments")',
+        'self.lock_after_mutation("publish_champion_import_segments", &mutation)',
         ".insert_champion_segments_with_provenance_batch(",
         "deployment_sha256,",
-        'self.lock("rollback_import_segments").delete_segments_batch(segment_ids)',
-        'self.lock("update_import_alignment").update_segment_alignment_if_unchanged(',
-        'self.lock("upsert_import_source_transcript").upsert_source_transcript(record)',
-        'self.lock("upsert_import_source_provenance").upsert_source_audio_provenance(record)',
-        'self.lock("record_import_loop0_shadow").record_loop0_shadow(segment_id, memory_fired)',
-        'self.lock("update_machine_speaker").update_speaker_id(segment_id, Some(speaker_id))',
-        'self.lock("insert_import_hypothesis").insert_hypothesis(hypothesis)',
-        'self.lock("commit_import_champion_transcript").commit_champion_transcript_if_unreviewed(',
+        'self.lock_after_mutation("rollback_import_segments", &mutation).delete_segments_batch(segment_ids)',
+        'self.lock_after_mutation("update_import_alignment", &mutation).update_segment_alignment_if_unchanged(',
+        'self.lock_after_mutation("upsert_import_source_transcript", &mutation).upsert_source_transcript(record)',
+        'self.lock_after_mutation("upsert_import_source_provenance", &mutation).upsert_source_audio_provenance(record)',
+        'self.lock_after_mutation("record_import_loop0_shadow", &mutation).record_loop0_shadow(segment_id, memory_fired)',
+        'self.lock_after_mutation("update_machine_speaker", &mutation).update_speaker_id(segment_id, Some(speaker_id))',
+        'self.lock_after_mutation("insert_import_hypothesis", &mutation).insert_hypothesis(hypothesis)',
+        'self.lock_after_mutation("commit_import_champion_transcript", &mutation)',
+        ".commit_champion_transcript_if_unreviewed(",
     ):
         if required not in store:
             raise AssertionError(f"ImportWriteStore lost required authority: {required}")

@@ -175,11 +175,23 @@ def test_inbox_undo_bails_while_a_decision_is_in_flight() -> None:
     catch does a second history.slice(0,-1), dropping a PREVIOUS segment's entry. The four persisting
     actions all guard isSubmitting; undo must too."""
     body = _function_body(_read("src/lib/reviewInboxDecisions.svelte.ts"), "async function undo(")
-    if "if (state.submitting || deps.draft.state.editing) return;" not in body:
+    # Repointed 2026-08-30 for the atomic addressed-undo rework: the guard got STRONGER and more
+    # precise. `submitting` still always bails; `editing` now bails only when the undo target is a
+    # decision (the only case where a draft edit and clearHumanDecision can race the same id); and
+    # two new truth-write guards refuse while a durable truth write is in flight or its outcome is
+    # ambiguous — which is exactly the race this pin exists to prevent, now proven at the durable
+    # layer rather than inferred from UI state alone.
+    required_guards = (
+        "state.submitting ||",
+        "durableUndo.state.target?.kind === 'decision' && deps.draft.state.editing",
+        "durableUndo.state.truthWriteAmbiguous",
+        "durableUndo.state.truthWriteInFlight",
+    )
+    missing = [guard for guard in required_guards if guard not in body]
+    if missing:
         raise AssertionError(
-            "undo() has no submitting/editing guard — a Backspace during an in-flight decision "
-            "races clearHumanDecision against the record still in flight and can corrupt the history stack. "
-            "Add the guard at the top of undo(), matching the four persisting actions."
+            "undo() lost its in-flight guards — a Backspace during an in-flight decision races "
+            f"clearHumanDecision against the record still in flight; missing: {missing}"
         )
 
 

@@ -31,7 +31,10 @@ def test_store_is_backend_only_and_serialized() -> None:
     for required in (
         "struct PlaybackObservation",
         "struct PlaybackWriteStore",
-        "self.runtime.lock()",
+        # Repointed 2026-08-30: the write now begins a restore-generation-gated mutation and takes
+        # the lock through it, replacing the bare `self.runtime.lock()` this pin used to name.
+        "self.runtime.begin_mutation().map_err(AppError::Other)?",
+        "self.runtime.lock_after_mutation(&mutation)",
         "database.record_playback_observation",
     ):
         if required not in store:

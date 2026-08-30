@@ -41,7 +41,10 @@ def flexible_report() -> dict[str, object]:
         "readOnly": True,
         "generatedAtEpochSecs": 1_700_000_000,
         "appGitSha": "b" * 40,
-        "databaseSchemaVersion": 65,
+        # Derived from the release contract, never a second hand-written number: the gate refuses
+        # any schema other than release_private_production.EXPECTED_SCHEMA, and this fixture went
+        # stale (65) the day the contract moved to 69.
+        "databaseSchemaVersion": gate.EXPECTED_SCHEMA,
         "pool": {
             "poolId": "123e4567-e89b-42d3-a456-426614174000",
             "focusSegmentCount": 2,
