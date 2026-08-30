@@ -2358,6 +2358,109 @@ mod tests {
     }
 
     #[test]
+    fn every_legacy_terminal_field_must_match_its_immutable_snapshot() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        paid_segment(&db, "legacy-terminal-fields");
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments
+                        SET review_revision = 5,
+                            verified = 1,
+                            annotated_transcript = 'legacy truth',
+                            verdict = 'human_edit',
+                            verdict_transcript = 'legacy truth',
+                            human_decision = 'edit',
+                            corrected_at = '2026-08-29 00:00:00',
+                            reviewed_by = 'Legacy Reviewer',
+                            escalated = 0,
+                            is_gold = 0,
+                            rationale = NULL
+                      WHERE id = 'legacy-terminal-fields'",
+                    [],
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        validate_review_effect_semantics(&db).expect("the exact migrated legacy terminal state must validate first");
+
+        let corruptions = [
+            (
+                "review revision",
+                "UPDATE speech_segments SET review_revision = 4 WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET review_revision = 5 WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "human decision",
+                "UPDATE speech_segments SET human_decision = 'accept' WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET human_decision = 'edit' WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "verdict",
+                "UPDATE speech_segments SET verdict = 'human_accept' WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET verdict = 'human_edit' WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "verdict transcript",
+                "UPDATE speech_segments SET verdict_transcript = 'forged truth' WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET verdict_transcript = 'legacy truth' WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "annotated transcript",
+                "UPDATE speech_segments SET annotated_transcript = 'forged truth' WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET annotated_transcript = 'legacy truth' WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "verified flag",
+                "UPDATE speech_segments SET verified = 0 WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET verified = 1 WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "reviewer",
+                "UPDATE speech_segments SET reviewed_by = 'Other Reviewer' WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET reviewed_by = 'Legacy Reviewer' WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "correction timestamp",
+                "UPDATE speech_segments SET corrected_at = '2026-08-29 00:00:01' WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET corrected_at = '2026-08-29 00:00:00' WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "escalation flag",
+                "UPDATE speech_segments SET escalated = 1 WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET escalated = 0 WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "gold flag",
+                "UPDATE speech_segments SET is_gold = 1 WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET is_gold = 0 WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "rationale",
+                "UPDATE speech_segments SET rationale = 'forged rationale' WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET rationale = NULL WHERE id = 'legacy-terminal-fields'",
+            ),
+        ];
+        for (label, sabotage, restore) in corruptions {
+            assert_eq!(
+                db.connection().execute(sabotage, []).unwrap(),
+                1,
+                "{label}: the corruption must apply, or the refusal proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("disagrees with its immutable pre-v60 terminal state"),
+                "{label}: expected the exact legacy-terminal refusal, got: {error}"
+            );
+            assert_eq!(db.connection().execute(restore, []).unwrap(), 1, "{label}: reset must restore the fixture");
+            validate_review_effect_semantics(&db).expect("each reset must recover the exact migrated terminal state");
+        }
+    }
+
+    #[test]
     fn reversed_decisions_and_flags_require_their_exact_terminal_snapshots() {
         let decision_db = seeded_db("decision-reversal-terminal");
         decided_then_undone(&decision_db, "decision-reversal-terminal", 463, 464);
