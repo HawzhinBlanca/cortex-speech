@@ -1086,7 +1086,19 @@ pub(super) fn authorize_audio(
                         err_reply(503, "independent review authorization is temporarily unavailable")
                     })?
                 }
-                _ => !seg.verified,
+                _ => match active_pool_policy(db, state).map_err(|error| err_reply(503, &error))?.as_ref() {
+                    // OWNER CANON 2026-08-29: the pool queue serves clips NEAREST a decision first,
+                    // so the FIRST clip in every reviewer's queue usually already carries one review
+                    // — `verified=true` BY DESIGN, not a revocation. Refusing verified work here
+                    // 403'd every pool reviewer's playback/start the night the decision-first
+                    // ordering shipped (2026-08-30: player stuck at 00:00/00:00, then the honest
+                    // mustListen refusal on save; reproduced end to end with a real credential).
+                    // Membership in the immutable active pool is the authority; blindness is
+                    // untouched — the queue serves the raw champion draft and audio bytes never
+                    // carry the first reviewer's answer.
+                    Some(pool) => pool.contains(id),
+                    None => !seg.verified,
+                },
             };
             campaign_eligible
                 && !raw.is_empty()

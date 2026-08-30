@@ -1685,6 +1685,22 @@ mod tests {
         // Unchanged and load-bearing: ordering must never leak the first reviewer's answer.
         assert_eq!(queue["items"][0]["text"], "champion reviewed draft", "later reviews stay blind to Rubar's answer");
 
+        // REGRESSION (2026-08-30 live incident): the decision-first ordering serves an
+        // already-reviewed clip FIRST, so `verified=true` is the NORMAL state of every pool
+        // reviewer's clip 1 — and playback/start must authorize it. The eligibility check used to
+        // refuse verified work outright, which 403'd the player's arming call on exactly this
+        // fixture shape: the phone showed 00:00/00:00 forever and every save died on mustListen.
+        // This is the arming call the page performs before it will set the <audio> src at all.
+        let attempt = start_policy4_attempt(
+            &db,
+            &state,
+            "pool-reviewed",
+            "Alle",
+            "test-session-binding-pool",
+            "40000000-0000-4000-8000-0000000000aa",
+        );
+        assert_eq!(attempt["segmentId"], "pool-reviewed", "playback authority must bind the served pool clip");
+
         let row_version = queue["items"][0]["rowVersion"].as_str().unwrap();
         let pool_operation_id = "30000000-0000-4000-8000-000000000002";
         let decision = serde_json::json!({
