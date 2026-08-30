@@ -2112,6 +2112,88 @@ mod tests {
     }
 
     #[test]
+    fn correction_memory_override_outcome_is_rederived_from_the_exact_human_decision() {
+        // A memory that rewrites "machine draft" to "corrected draft" makes an accepted
+        // "machine draft" farther from the human answer, so its only honest outcome is Override.
+        // First prove that exact restored shape remains valid, then relabel only the outcome as a
+        // confirmation and require the semantic validator (not a CHECK constraint) to refuse it.
+        let db = seeded_db("override-outcome");
+        let revision = db.segment_review_revision("override-outcome").unwrap().unwrap();
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "override-outcome",
+            "accept",
+            Some("machine draft"),
+            "Reviewer",
+            revision,
+            &canonical_operation(461),
+            &crate::db::review_operation_payload_hash("override-outcome", "accept", "machine draft", "Reviewer"),
+        )
+        .unwrap()
+        .unwrap();
+        let effect_id: i64 = db
+            .connection()
+            .query_row("SELECT MAX(id) FROM human_decision_effect_events", [], |row| row.get(0))
+            .unwrap();
+        let memory = crate::corrections::extract_substitution_memories("machine draft", "corrected draft")
+            .into_iter()
+            .next()
+            .expect("the fixture must yield one exact substitution memory");
+        let memory_id = "00000000-0000-4000-8000-000000000903";
+
+        db.connection().execute("DROP TRIGGER correction_memory_v60_seed_validate_insert", []).unwrap();
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "INSERT INTO correction_memory
+                        (id, wrong_token, human_token, slot_key, phonetic_key, legacy_seed)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                    rusqlite::params![
+                        memory_id,
+                        memory.wrong_token,
+                        memory.human_token,
+                        memory.slot_key,
+                        memory.phonetic_key,
+                    ],
+                )
+                .unwrap(),
+            1,
+            "the fixture must contain one exact migrated memory"
+        );
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "INSERT INTO correction_memory_contributions
+                        (effect_event_id, memory_id, capture_delta, confirm_delta, override_delta, fired_at)
+                     VALUES (?1, ?2, 0, 0, 1, '2026-08-30 00:00:00')",
+                    rusqlite::params![effect_id, memory_id],
+                )
+                .unwrap(),
+            1,
+            "the exact override evidence must pass the schema guard"
+        );
+        validate_review_effect_semantics(&db).expect("a correctly classified override must remain restorable");
+
+        db.connection().execute("DROP TRIGGER correction_memory_contributions_immutable_update", []).unwrap();
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "UPDATE correction_memory_contributions
+                        SET confirm_delta = 1, override_delta = 0
+                      WHERE effect_event_id = ?1 AND memory_id = ?2",
+                    rusqlite::params![effect_id, memory_id],
+                )
+                .unwrap(),
+            1,
+            "the outcome relabeling must apply, or the refusal proves nothing"
+        );
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(
+            error.contains("is not re-derived from the served/decision text"),
+            "a forged confirmation for a proven override must be refused: {error}"
+        );
+    }
+
+    #[test]
     fn a_forged_effect_on_a_non_decision_event_is_refused() {
         // A skip is not a decision: it pays nothing and must leave no human-decision effect. Forging
         // one would invent paid, reviewed truth for a clip nobody judged — so the trigger is dropped
