@@ -12002,3 +12002,20 @@ all-target/all-feature Clippy with `-D warnings` and rustfmt both exited 0. Comm
 Honest status before the iteration-3 remeasurement: the product chunk is green and pushed, but no
 coverage improvement is claimed until the pinned all-target run finishes. P0 remains unknown; P1
 remains red; P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 4: correction-memory contribution admission
+
+The same top-ranked restore validator next exposed its correction-memory contribution admission
+cluster. One table-driven regression inserts eight guarded restored-file corruptions: missing effect,
+missing memory, an out-of-range capture delta, a zero contribution, simultaneous confirm/override,
+capture on an accept decision, confirm without `fired_at`, and blank `fired_at`. Every case first
+proves its corrupt row was inserted, then requires either the exact missing-effect refusal or the
+exact action/evidence-identity refusal.
+
+Focused result: `test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 1807 filtered out`.
+Strict all-target/all-feature Clippy with `-D warnings` and rustfmt both exited 0. Commit
+`69d9b9b7b07a2be9f49839c5e8fdcf1caf9e8786` was pushed and independently matched on
+`origin/public/clean-release`.
+
+Honest status before the iteration-4 remeasurement: no coverage delta is claimed yet. P0 remains
+unknown; P1 remains red; P2 remains green. Production and scheduled tasks were untouched.
