@@ -1981,7 +1981,8 @@ mod tests {
 
         // Every clause of the binding check refuses on its own: progress written for any OTHER
         // campaign, count, digest, or event boundary must never be accepted by this one.
-        let breaks: Vec<(&str, Box<dyn Fn(&mut CampaignProgress)>)> = vec![
+        type ProgressMutation = Box<dyn Fn(&mut CampaignProgress)>;
+        let breaks: Vec<(&str, ProgressMutation)> = vec![
             ("schema_version", Box::new(|p| p.schema_version = 2)),
             ("campaign_id", Box::new(|p| p.campaign_id = "323e4567-e89b-42d3-a456-426614174222".into())),
             ("first_reviewer", Box::new(|p| p.first_reviewer = "Aram".into())),
@@ -2053,7 +2054,8 @@ mod tests {
     fn policy_validation_refuses_every_malformed_field() {
         // Each variant breaks ONE validate() clause. The error text is asserted so a test can never
         // pass because a DIFFERENT clause fired first.
-        let cases: Vec<(Box<dyn Fn(&mut SequentialReviewCampaign)>, &str)> = vec![
+        type CampaignMutation = Box<dyn Fn(&mut SequentialReviewCampaign)>;
+        let cases: Vec<(CampaignMutation, &str)> = vec![
             (Box::new(|p| p.schema_version = 2), "schema_version must be 1"),
             (Box::new(|p| p.campaign_id = "nope".into()), "must be a canonical UUID"),
             (Box::new(|p| p.campaign_id = p.campaign_id.to_uppercase()), "lowercase hyphenated"),
