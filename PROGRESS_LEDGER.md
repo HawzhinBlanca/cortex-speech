@@ -12407,3 +12407,32 @@ ledger commit and exact push.
 Honest status before the iteration-17 remeasurement: the product chunk is green, but no coverage
 delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
 and P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-31 — Reliability iteration 18: remaining prior and contribution boundaries
+
+Iteration 17's exact serialized measurement at pushed ledger commit
+`1714162741f52ccdaddaf3fad6e939e72154f46f` completed 1,830 library tests with 0 failures and 8
+ignores plus a green importer, E2E, reliability, soak, Tauri, shell, user-data, and Criterion matrix.
+Artifact `ab6d9771e9234c4a8cefbe238b322639` (SHA-256
+`f1e1c0432e50fa6a0256d199b9e08b18cbb5dcd1244e58fd603ec147cd76b591`) moved overall branches
+60.35% to 60.41%, restore 67.86% to 68.39% (484 to 476 uncovered), and active effects 85 to 77.
+The wrapper remained red solely at locked thresholds. P1 remains red, P2 green, and P0 unknown.
+
+The first iteration-18 draft attempted five legacy-origin arms. Its focused run correctly failed
+because the production flag writer refuses a flag on a segment that already owns a human decision;
+the three apparent legacy-first-flag branches are therefore not honest production-writer targets.
+Those cases were removed instead of inserting forged flags or weakening the writer.
+
+The corrected five-branch chunk proves the two reachable legacy-decision origin fields and the three
+remaining correction-memory contribution fields. A migrated schema-59 reviewed segment receives a
+genuine post-v60 accept; the revision case moves event, effect, and pay-ledger revisions together so
+legacy revision ownership—not earlier linkage—owns the refusal, while the rationale case moves both
+effect rationale fields together. Contribution proof adds out-of-range confirm and override values,
+plus a genuine production reject effect with a forged contribution, proving contributions remain
+accept/edit-only.
+
+All three focused tests passed, the complete restore-effects suite passed 33/33, stable rustfmt
+passed, and strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`b161796d0ea25e90525413b643d20c869757fc3a` is ready for the ledger commit and exact push. No
+coverage delta is claimed before exact clean-SHA measurement. Production and scheduled tasks were
+untouched.
