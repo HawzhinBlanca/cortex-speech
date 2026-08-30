@@ -12208,3 +12208,34 @@ rustfmt passed; installed stable Clippy passed all targets/features with `-D war
 Honest status before the iteration-11 remeasurement: the product chunk is green, but no new coverage
 delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
 and P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 12: exhaustive immutable legacy terminal fields
+
+Iteration 11's exact serialized measurement at ledger commit
+`cb778605494cfe09e7233ded3e8a043e1dcba26d` completed 1,824 library tests with 0 failures and 8
+ignores, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell smoke 1/1,
+user-data 2/2, and all Criterion targets. The certifying wrapper exited red solely because the
+locked coverage thresholds remain unmet. Overall branch coverage moved 59.87% to 59.96%; restore
+moved 64.01% to 64.81%, reducing uncovered restore branches from 542 to 530. The active effects
+function fell from 143 to 131 uncovered branches. P1 remains red, P2 green, and P0 unknown because
+the production heartbeat is absent.
+
+The numerically largest remaining thirteen-branch cluster was rejected as a false next target: its
+later phone-effect equality checks cannot be reached in a failing state because the earlier
+post-v60 event query already requires the exact same source, reviewer, event, effect, ledger, action,
+and revision linkage. No guard was weakened and no fixture was manufactured to game coverage.
+
+The next reachable cluster was the immutable pre-v60 terminal snapshot. The new regression creates a
+reviewed schema-59 segment, migrates it through the real schema-60 snapshot, proves the exact state
+validates, then independently corrupts and resets all eleven compared fields: review revision, human
+decision, verdict, verdict transcript, annotated transcript, verified flag, reviewer, correction
+timestamp, escalation, gold flag, and rationale. Every mutation must produce the exact immutable
+legacy-terminal refusal, and every reset is revalidated.
+
+The focused proof passed 1/1 and the complete restore-effects suite passed 26/26. Installed stable
+rustfmt passed; installed stable Clippy passed all targets/features with `-D warnings`. Product commit
+`34ff3bce243ae6a047e0cf3a3d59d23f1a97e5df` is ready for the ledger commit and exact push.
+
+Honest status before the iteration-12 remeasurement: the product chunk is green, but no new coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
