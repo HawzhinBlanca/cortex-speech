@@ -1976,6 +1976,45 @@ mod tests {
     }
 
     #[test]
+    fn legacy_correction_memory_requires_the_exact_grandfathered_seed() {
+        // Schema v60 marks only memory that already existed at migration time with legacy_seed=1;
+        // every new memory starts at 0 and must carry effect-bound capture lineage. Reproduce the
+        // legitimate migrated shape first, then corrupt the restored bytes beyond either boundary.
+        let db = seeded_db("legacy-memory-clip");
+        db.connection().execute("DROP TRIGGER correction_memory_v60_seed_validate_insert", []).unwrap();
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "INSERT INTO correction_memory
+                        (id, wrong_token, human_token, slot_key, phonetic_key, legacy_seed)
+                     VALUES ('00000000-0000-4000-8000-000000000901',
+                             'legacy-wrong', 'legacy-fix', 'legacy|slot', 'legacy', 1)",
+                    [],
+                )
+                .unwrap(),
+            1,
+            "the fixture must contain one genuine migrated memory"
+        );
+        validate_review_effect_semantics(&db).expect("an exact grandfathered legacy memory must remain restorable");
+
+        db.connection().execute("DROP TRIGGER correction_memory_v60_baseline_immutable_update", []).unwrap();
+        db.connection().execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "UPDATE correction_memory SET legacy_seed = 2
+                      WHERE id = '00000000-0000-4000-8000-000000000901'",
+                    [],
+                )
+                .unwrap(),
+            1,
+            "the corruption must apply, or the refusal proves nothing"
+        );
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("has an invalid legacy boundary"), "unexpected refusal: {error}");
+    }
+
+    #[test]
     fn a_forged_effect_on_a_non_decision_event_is_refused() {
         // A skip is not a decision: it pays nothing and must leave no human-decision effect. Forging
         // one would invent paid, reviewed truth for a clip nobody judged — so the trigger is dropped
