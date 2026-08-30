@@ -2091,6 +2091,26 @@ mod tests {
                 "violates its action/evidence identity",
             ),
             ("out-of-range capture", false, false, 2, 0, 0, None, "violates its action/evidence identity"),
+            (
+                "out-of-range confirmation",
+                false,
+                false,
+                0,
+                2,
+                0,
+                Some("2026-08-30 00:00:00"),
+                "violates its action/evidence identity",
+            ),
+            (
+                "out-of-range override",
+                false,
+                false,
+                0,
+                0,
+                2,
+                Some("2026-08-30 00:00:00"),
+                "violates its action/evidence identity",
+            ),
             ("zero contribution", false, false, 0, 0, 0, None, "violates its action/evidence identity"),
             (
                 "simultaneous confirm and override",
@@ -2167,6 +2187,55 @@ mod tests {
             let error = validate_review_effect_semantics(&db).unwrap_err();
             assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
         }
+    }
+
+    #[test]
+    fn a_reject_effect_cannot_own_a_memory_contribution() {
+        let db = seeded_db("reject-contribution");
+        let revision = db.segment_review_revision("reject-contribution").unwrap().unwrap();
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "reject-contribution",
+            "reject",
+            None,
+            "Reviewer",
+            revision,
+            &canonical_operation(520),
+            &crate::db::review_operation_payload_hash("reject-contribution", "reject", "", "Reviewer"),
+        )
+        .unwrap()
+        .unwrap();
+        let effect_id: i64 = db
+            .connection()
+            .query_row("SELECT MAX(id) FROM human_decision_effect_events", [], |row| row.get(0))
+            .unwrap();
+        db.connection().execute("DROP TRIGGER correction_memory_v60_seed_validate_insert", []).unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO correction_memory
+                    (id, wrong_token, human_token, slot_key, phonetic_key, legacy_seed)
+                 VALUES ('00000000-0000-4000-8000-000000000904',
+                         'known-wrong', 'known-fix', 'known|slot', 'known', 1)",
+                [],
+            )
+            .unwrap();
+        validate_review_effect_semantics(&db).expect("the genuine reject and legacy memory must validate first");
+
+        db.connection().execute("DROP TRIGGER correction_memory_contributions_effect_validate_insert", []).unwrap();
+        db.connection().execute_batch("PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;").unwrap();
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "INSERT INTO correction_memory_contributions
+                        (effect_event_id, memory_id, capture_delta, confirm_delta, override_delta, fired_at)
+                     VALUES (?1, '00000000-0000-4000-8000-000000000904', 0, 1, 0,
+                             '2026-08-30 00:00:00')",
+                    [effect_id],
+                )
+                .unwrap(),
+            1
+        );
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("violates its action/evidence identity"), "unexpected refusal: {error}");
     }
 
     #[test]
@@ -2439,6 +2508,93 @@ mod tests {
             assert!(
                 error.contains("starts from unsnapshotted human review truth"),
                 "{label}: expected the exact unsnapshotted-prior refusal, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_reachable_legacy_decision_origin_field_is_refused() {
+        let migrated_reviewed_db = |id: &str| {
+            let db = Database::open(":memory:").unwrap();
+            db.initialize().unwrap();
+            assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+            paid_segment(&db, id);
+            assert_eq!(
+                db.connection()
+                    .execute(
+                        "UPDATE speech_segments
+                            SET review_revision = 5,
+                                verified = 1,
+                                annotated_transcript = 'legacy truth',
+                                verdict = 'human_edit',
+                                verdict_transcript = 'legacy truth',
+                                human_decision = 'edit',
+                                corrected_at = '2026-08-29 00:00:00',
+                                reviewed_by = 'Legacy Reviewer',
+                                rationale = 'legacy rationale'
+                          WHERE id = ?1",
+                        [id],
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+            validate_review_effect_semantics(&db).expect("the exact migrated reviewed state must validate");
+            db
+        };
+
+        for (index, (label, sabotage)) in [
+            (
+                "decision predates the legacy revision",
+                "UPDATE review_events SET served_revision = 4;
+                 UPDATE review_compensation_ledger SET decision_revision = 5 WHERE review_event_id IS NOT NULL;
+                 UPDATE human_decision_effect_events SET prior_revision = 4, decision_revision = 5",
+            ),
+            (
+                "decision prior rationale differs from legacy",
+                "UPDATE human_decision_effect_events
+                    SET prior_rationale = 'forged rationale', decision_rationale = 'forged rationale'",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let db = migrated_reviewed_db("legacy-origin-decision");
+            let revision = db.segment_review_revision("legacy-origin-decision").unwrap().unwrap();
+            db.record_phone_human_decision_by_at_revision_with_operation(
+                "legacy-origin-decision",
+                "accept",
+                Some("legacy truth"),
+                "Reviewer",
+                revision,
+                &canonical_operation(500 + index as u64),
+                &crate::db::review_operation_payload_hash(
+                    "legacy-origin-decision",
+                    "accept",
+                    "legacy truth",
+                    "Reviewer",
+                ),
+            )
+            .unwrap()
+            .unwrap();
+            validate_review_effect_semantics(&db).expect("the genuine post-migration decision must validate first");
+
+            for trigger in [
+                "human_decision_effect_events_immutable_update",
+                "review_compensation_ledger_immutable_update",
+                "review_compensation_ledger_append_only_update",
+                "review_events_v60_post_cutoff_immutable_update",
+                "review_events_v60_provenance_immutable_update",
+                "review_event_operation_immutable_update",
+            ] {
+                db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).unwrap();
+            }
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
+            db.connection().execute_batch(sabotage).unwrap();
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("does not start from its immutable pre-v60 reviewed state"),
+                "{label}: expected the exact immutable-origin refusal, got: {error}"
             );
         }
     }
