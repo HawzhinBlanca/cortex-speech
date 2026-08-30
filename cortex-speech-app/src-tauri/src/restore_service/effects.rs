@@ -3084,7 +3084,8 @@ mod tests {
             ),
             (
                 "noncanonical audio hash",
-                "UPDATE corrections SET audio_content_hash = 'not-an-audio-hash' WHERE effect_event_id IS NOT NULL",
+                "UPDATE speech_segments SET audio_content_hash = 'not-an-audio-hash' WHERE id = 'correction-fields';
+                 UPDATE corrections SET audio_content_hash = 'not-an-audio-hash' WHERE effect_event_id IS NOT NULL",
                 "violates edit/audio/reviewer identity",
             ),
             (
@@ -3157,6 +3158,8 @@ mod tests {
                 "review_events_v60_post_cutoff_immutable_update",
                 "review_events_v60_provenance_immutable_update",
                 "review_event_operation_immutable_update",
+                "speech_segments_v60_paid_identity_immutable_update",
+                "speech_segments_v67_policy4_paid_identity_immutable_update",
             ] {
                 db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).unwrap();
             }
