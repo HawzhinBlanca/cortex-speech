@@ -52,14 +52,18 @@ UNREVIEWED_SORANI = {
     # one reads well: reviewers are paid per hour of audio reviewed, so this is the number they will
     # check against their own count.
     "audioDone",
-    # Reviewer compensation accounting. These labels intentionally distinguish lifetime earned,
-    # externally paid, still due, legacy reconciliation, and an unavailable ledger. New Sorani,
-    # NOT natively reviewed — owner read required before claiming language perfection.
-    "earned",
-    "paid",
-    "outstanding",
-    "earlierPayPending",
-    "accountingUnavailable",
+    # Phone decision undo. Until the desktop's undo became the ATOMIC last-action undo (fb16b2e8),
+    # this was the desktop's own `review.undoLast` string and carried its native review; the two
+    # features then genuinely diverged (desktop = whole-command history undo, phone = one decision),
+    # so the page keeps the short decision-undo phrasing under its own key rather than tracking a
+    # desktop string that now describes a different feature.
+    "undo",
+    # Reviewer compensation accounting: REMOVED 2026-08-28 on owner instruction. The phone showed
+    # lifetime earned, externally paid, still due, and a reconciliation warning; reviewers now see a
+    # single quiet coin count and nothing else, so the money cannot distract them mid-task. That
+    # badge is a bare grouped integer with no words, so it needs no string and no Sorani review —
+    # which is why five keys left this list rather than moving elsewhere in it. The amounts remain
+    # fully recorded in the compensation ledger and the API still sends them; only the screen changed.
     # Dialect routing (owner instruction 2026-08-16): shown to a reviewer restricted to a dialect
     # that currently has no clips. New Sorani, NOT natively reviewed — on the owner's read list.
     "noDialectWork",

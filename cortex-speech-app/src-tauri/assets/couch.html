@@ -45,11 +45,6 @@
   "en": {
     "progress": "Clip {n} of {total}",
     "audioDone": "{t} of audio done",
-    "earned": "Earned: {amount}",
-    "paid": "Paid: {amount}",
-    "outstanding": "Due: {amount}",
-    "earlierPayPending": "Earlier reviews pending payment reconciliation: {n}",
-    "accountingUnavailable": "Payment accounting unavailable",
     "accept": "Looks good",
     "bad": "Reject",
     "save": "Save & next",
@@ -80,11 +75,6 @@
   "ckb": {
     "progress": "پارچەی {n} لە {total}",
     "audioDone": "{t} دەنگ تەواو بووە",
-    "earned": "بەدەستهێنراوە: {amount}",
-    "paid": "دراوە: {amount}",
-    "outstanding": "ماوە بۆ پارەدان: {amount}",
-    "earlierPayPending": "پێداچوونەوەکانی پێشوو چاوەڕێی یەکلایی‌کردنەوەی پارەدانن: {n}",
-    "accountingUnavailable": "ژمێریاری پارەدان بەردەست نییە",
     "accept": "دروستە",
     "bad": "ڕەتکردنەوە",
     "save": "پاشەکەوت و دواتر",
@@ -115,15 +105,10 @@
   "source": {
     "progress": "review.progress",
     "audioDone": null,
-    "earned": null,
-    "paid": null,
-    "outstanding": null,
-    "earlierPayPending": null,
-    "accountingUnavailable": null,
     "accept": "review.acceptAsIs",
     "bad": "inbox.reject",
     "save": "review.saveNext",
-    "undo": "review.undoLast",
+    "undo": null,
     "saved": "saved",
     "markedBad": "inbox.reject",
     "undone": "review.undone",
@@ -507,18 +492,16 @@
     if (m < 60) return `${m}m ${s % 60}s`;
     return `${Math.floor(m / 60)}h ${m % 60}m`;
   }
-  // Exact integer formatting: the API deliberately sends micro-IQD as a decimal string so a large
-  // lifetime balance cannot be rounded by JavaScript's floating-point Number type.
-  function fmtMicroIqd(value) {
+  // Whole coins only. The API sends micro-IQD as a decimal string so a large balance cannot be
+  // rounded by JavaScript's Number type; BigInt keeps that exactness while dropping the fraction,
+  // the currency name, and every label. A bare grouped integer needs no translation, which is why
+  // this badge has no i18n key at all.
+  function fmtCoins(value) {
     try {
       const amount = BigInt(value);
-      const negative = amount < 0n;
-      const absolute = negative ? -amount : amount;
-      const whole = absolute / 1000000n;
-      const fraction = (absolute % 1000000n).toString().padStart(6, '0').replace(/0+$/, '');
-      const grouped = whole.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-      return `${negative ? '-' : ''}${grouped}${fraction ? `.${fraction}` : ''} IQD`;
-    } catch { return '—'; }
+      const whole = (amount < 0n ? -amount : amount) / 1000000n;
+      return `${amount < 0n ? '-' : ''}${whole.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',')}`;
+    } catch { return ''; }
   }
   function applyAccounting(payload) {
     if (!payload || payload.accountingAvailable == null) return; // compatible with an older server
@@ -574,22 +557,15 @@
     const audio = reviewedMs != null && reviewedMs > 0 ? ` · ${t('audioDone', { t: fmtDuration(reviewedMs) })}` : '';
     const corrected = correctedMs != null && correctedMs > 0 ? ` · ✍ ${fmtDuration(correctedMs)}` : '';
     $('progress').textContent = (doneThisSession ? `${pos} · ✓${doneThisSession}` : pos) + audio + corrected;
-    // Lifetime earned, externally settled, and still due are different facts. Label all three so a
-    // completed payout can never leave the lifetime total looking like the amount still owed.
     const accounting = $('accounting');
-    if (accountingAvailable === false) {
-      accounting.textContent = `💰 ${t('accountingUnavailable')}`;
-      accounting.classList.add('pending');
-      accounting.hidden = false;
-    } else if (earnedMicroIqd != null && settledMicroIqd != null && outstandingMicroIqd != null) {
-      const balances = [
-        t('earned', { amount: fmtMicroIqd(earnedMicroIqd) }),
-        t('paid', { amount: fmtMicroIqd(settledMicroIqd) }),
-        t('outstanding', { amount: fmtMicroIqd(outstandingMicroIqd) }),
-      ].join(' · ');
-      const legacy = legacyPayPending > 0 ? ` · ⚠ ${t('earlierPayPending', { n: legacyPayPending })}` : '';
-      accounting.textContent = `💰 ${balances}${legacy}`;
-      accounting.classList.toggle('pending', legacyPayPending > 0);
+    // Owner instruction 2026-08-28: a single quiet coin count, nothing else. The lifetime EARNED
+    // total is the one figure that only ever grows, so it reads like a score rather than a
+    // statement. Settled/outstanding/legacy-reconciliation remain fully recorded server-side and in
+    // the compensation ledger — they are simply not this screen's job. When the ledger is
+    // unavailable the badge hides instead of showing an error the reviewer cannot act on.
+    if (earnedMicroIqd != null) {
+      accounting.textContent = `\u{1FA99} ${fmtCoins(earnedMicroIqd)}`;
+      accounting.classList.remove('pending');
       accounting.hidden = false;
     } else {
       accounting.textContent = '';
