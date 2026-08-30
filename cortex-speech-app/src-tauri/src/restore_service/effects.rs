@@ -1932,6 +1932,50 @@ mod tests {
     }
 
     #[test]
+    fn every_noncanonical_review_effect_frontier_field_is_refused() {
+        for (label, mutation) in [
+            ("wrong singleton key", "UPDATE review_effect_state SET singleton_key = 2"),
+            ("negative review-event frontier", "UPDATE review_effect_state SET effective_after_review_event_id = -1"),
+            ("negative compensation-ledger frontier", "UPDATE review_effect_state SET effective_after_ledger_id = -1"),
+            ("blank creation time", "UPDATE review_effect_state SET created_at = '   '"),
+        ] {
+            let db = seeded_db("frontier-field-clip");
+            db.connection().execute("DROP TRIGGER review_effect_state_immutable_update", []).unwrap();
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
+            assert_eq!(db.connection().execute(mutation, []).unwrap(), 1, "{label}: corruption must apply");
+
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("one canonical schema-v60 frontier row"),
+                "{label}: validator must reject the corrupted frontier, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_effect_frontiers_cannot_claim_history_that_does_not_exist() {
+        for (label, mutation, expected) in [
+            (
+                "review-event frontier",
+                "UPDATE review_effect_state SET effective_after_review_event_id = 1",
+                "frontiers (1, 0) exceed retained history (0, 0)",
+            ),
+            (
+                "compensation-ledger frontier",
+                "UPDATE review_effect_state SET effective_after_ledger_id = 1",
+                "frontiers (0, 1) exceed retained history (0, 0)",
+            ),
+        ] {
+            let db = seeded_db("frontier-history-clip");
+            db.connection().execute("DROP TRIGGER review_effect_state_immutable_update", []).unwrap();
+            assert_eq!(db.connection().execute(mutation, []).unwrap(), 1, "{label}: corruption must apply");
+
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(error.contains(expected), "{label}: unexpected refusal: {error}");
+        }
+    }
+
+    #[test]
     fn a_forged_effect_on_a_non_decision_event_is_refused() {
         // A skip is not a decision: it pays nothing and must leave no human-decision effect. Forging
         // one would invent paid, reviewed truth for a clip nobody judged — so the trigger is dropped
@@ -2434,7 +2478,8 @@ mod tests {
         // The other half: teaching the validator the v1 contract must not let anything through.
         // Each case is a row claiming contract 1 whose digest does not answer for its own contents.
         let authority = "11111111-2222-4333-8444-555555555555";
-        let cases: [(&str, fn(&str, i64, &str) -> String); 3] = [
+        type DesktopPayloadForgery = fn(&str, i64, &str) -> String;
+        let cases: [(&str, DesktopPayloadForgery); 3] = [
             // The retired legacy digest, which is precisely what the buggy validator expected.
             ("legacy digest on a v1 row", |id, _rev, _auth| {
                 crate::db::desktop_decision_payload_hash(id, "edit", Some("desktop corrected"), Some(1_700_000_000_000))
