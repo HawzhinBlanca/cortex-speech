@@ -86,6 +86,11 @@ pub(super) fn save_tls_identity(
 
 pub(super) fn load_tls_identity(data_dir: &Path, required_names: &[String]) -> Result<Option<TlsIdentity>, String> {
     let path = data_dir.join(TLS_IDENTITY_FILE);
+    // Every other consumer of `atomic_file::replace_file` recovers first; this reader skipping it
+    // meant a crash between the two renames left the good identity orphaned at `.replace-bak-*`
+    // and a NEW certificate was silently minted — every phone's stored trust invalidated by a
+    // power cut (2026-08-30 audit).
+    let _ = crate::atomic_file::recover_interrupted_replace(&path);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -509,6 +514,12 @@ pub(super) fn load_session(data_dir: &Path, db_path: &str) -> Option<RememberedS
             return None;
         }
     }
+    // The session file is rewritten on every claim and every >=15-minute cookie renewal, so with
+    // active reviewers the crash window between `replace_file`'s two renames is hit many times a
+    // day. Un-recovered, that crash leaves the file MISSING, resume() returns None, and every
+    // phone answers "link expired" — the nine-day-lockout class re-entering by a new door
+    // (2026-08-30 audit; every sibling consumer already recovers first).
+    let _ = crate::atomic_file::recover_interrupted_replace(&session_path(data_dir));
     let raw = std::fs::read_to_string(session_path(data_dir)).ok()?;
     let saved: SavedSession = serde_json::from_str(&raw).ok()?;
     if saved.db_path != db_path {
@@ -1353,20 +1364,36 @@ pub(super) fn spawn_server_loop(
                 // not disclosed until `request.respond` below. Revalidate the cookie and hold the
                 // read side through that synchronous send; otherwise Revoke could return in the gap
                 // and an old handler could transmit already-materialized biometric audio afterward.
-                let response_path = request.url().split('?').next().unwrap_or("").to_string();
-                let delivery_requires_auth = response_path.starts_with("/api/")
-                    && response_path != "/api/claim"
-                    && response_path != "/api/claim/probe";
-                let delivery_token = delivery_requires_auth.then(|| token_from_request(&request)).flatten();
-                let (mut response, mut set_cookie) = handle_request(&mut request, &db, &state);
-                let delivery_authorization =
-                    delivery_token.as_deref().and_then(|token| live_session_guard(token, None, &state));
-                if delivery_requires_auth && delivery_authorization.is_none() {
-                    response = err_reply(401, "unauthorized");
-                    set_cookie = None;
+                // catch_unwind, like the snapshot loop and every import worker: a panic inside ONE
+                // request must cost that request, never this accept thread. Threads are minted once
+                // at Start (one per reviewer) and nothing revives a dead one — before this guard,
+                // each escaped panic silently retired a thread while the port stayed bound and
+                // `couch_review_status` still said running (2026-08-30 audit). State is a Mutex
+                // whose lock helpers already heal poisoning, so AssertUnwindSafe is honest here.
+                let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let response_path = request.url().split('?').next().unwrap_or("").to_string();
+                    let delivery_requires_auth = response_path.starts_with("/api/")
+                        && response_path != "/api/claim"
+                        && response_path != "/api/claim/probe";
+                    let delivery_token = delivery_requires_auth.then(|| token_from_request(&request)).flatten();
+                    let (mut response, mut set_cookie) = handle_request(&mut request, &db, &state);
+                    let delivery_authorization =
+                        delivery_token.as_deref().and_then(|token| live_session_guard(token, None, &state));
+                    if delivery_requires_auth && delivery_authorization.is_none() {
+                        response = err_reply(401, "unauthorized");
+                        set_cookie = None;
+                    }
+                    let _ = respond_with_cookie(request, response, set_cookie);
+                    // Explicit: the delivery guard must outlive the synchronous send above, and
+                    // nothing after it — the ordering this drop documents is unchanged inside the
+                    // unwind boundary.
+                    drop(delivery_authorization);
+                }));
+                if handled.is_err() {
+                    tracing::error!(
+                        "Couch Review request handler PANICKED; the request was dropped and this accept thread continues"
+                    );
                 }
-                let _ = respond_with_cookie(request, response, set_cookie);
-                drop(delivery_authorization);
             }
         })
         .map_err(|e| format!("Couch Review server thread failed to spawn: {e}"))

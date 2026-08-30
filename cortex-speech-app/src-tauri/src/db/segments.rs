@@ -1069,6 +1069,12 @@ impl Database {
                         fields.join(", ")
                     )));
                 }
+                // The one persist path that could still blank a good champion draft (2026-08-30
+                // audit): a JSON exported before ASR ran carries raw_transcript "" for every
+                // segment, and the UPDATE below would overwrite each matching unreviewed draft
+                // with it in one savepoint, reported as "updated". Same shared-boundary guard as
+                // every other ASR persist; atomically, before any row moves.
+                refuse_blank_asr_persist(&segment.id, &segment.raw_transcript)?;
             }
         }
         let mut updated = 0;
@@ -1388,6 +1394,10 @@ impl Database {
         crate::validation::input::validate_identifier(&champion.model_id).map_err(AppError::Validation)?;
         crate::validation::input::validate_text(&champion.transcript, 100_000, "Champion transcript")
             .map_err(AppError::Validation)?;
+        // The documented third-recurrence vector of the blank-overwrite class: every production
+        // caller guards at ITS call site today, which is exactly the placement that regressed
+        // twice before. The shared boundary refuses so the next caller cannot reintroduce it.
+        refuse_blank_asr_persist(&champion.segment_id, &champion.transcript)?;
         if let Some(sha) = expected_deployment_sha256 {
             if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
                 return Err(AppError::Validation(
