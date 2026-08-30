@@ -12216,3 +12216,36 @@ fixtures drifted at the WIP checkpoint; reproduce on pristine 0b73c06f; task chi
 Owner-gated remainder of the money domain: pricing the flexible pool and the second pass — both
 need a literal `change canon:`; the fences hold until then. Legacy pre-policy events
 (6 for one reviewer) stay outside totals until separately reconciled, as canon requires.
+
+---
+
+## 2026-08-31 — LIVE INCIDENT fixed and shipped, plus the step-6 data-loss guards
+
+**The incident (2026-08-30 ~23:45):** a reviewer's phone player sat at 00:00/00:00 and every save
+died on the honest `mustListen` refusal. Reproduced END TO END with the reviewer's real vault
+credential in one shot: `/api/queue` 200 served clip 1 (7158da8b, 5.9 s, Lamo, verified=true),
+then `/api/playback/start` answered **403 "audio is no longer assigned"** — and the page arms the
+`<audio>` src only after that call succeeds. Root cause: `authorize_audio`'s work-eligibility arm
+was `!seg.verified`, written for the legacy flow — but the owner's decision-first consensus
+ordering serves the clip NEAREST a decision first, so clip 1 of every pool queue already carries
+one review BY DESIGN. First real phone contact with that combination was tonight. Fix
+(`23b54e84`): pool membership is the authority in pool mode; blindness untouched. Regression
+pinned inside the flexible_pool test (playback/start on the served, already-reviewed clip); the
+live incident + the credentialed repro are the fail-before proof.
+
+**Step 6 guards** (`e27910a0`): merge_dataset_json refuses blank raw_transcript atomically before
+any row moves (the last blank-overwrite vector); commit_champion_transcript_inner carries the
+shared blank guard (the documented third-recurrence vector); couch_session.json and the TLS
+identity recover interrupted atomic replaces before reading (the crash windows that orphaned every
+link / silently re-minted the certificate); the couch accept loop catch_unwinds each request (a
+panicking handler used to retire its thread forever while status said running).
+
+Shipped as release `e27910a04c26-b85e0208df2c-…` (same-schema v69; preflight clone PASS; READY,
+six queues proven). Verified at the serving path THROUGH THE REAL FUNNEL with the reviewer's real
+credential: claim 200 → queue 200 (same clip) → playback/start 200 with a bound contract-4
+authority → audio `Range: bytes=0-1` → **206** → full body 200 (190,124 bytes). Probe green,
+forwarder green, rollback watch clean. Suites: Rust 1995/0/8, policy 141/141.
+
+Note: the diagnostic claimed one extra session for the reviewer (indistinguishable from them
+reopening their link; expires on the 24 h TTL). The earlier "awapc01" DNS failure during diagnosis
+was a truncated-screenshot typo — the funnel is and was `hawapc01.tail721a13.ts.net`.
