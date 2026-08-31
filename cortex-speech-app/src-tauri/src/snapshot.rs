@@ -538,6 +538,9 @@ pub(crate) fn take_pinned_snapshot_at(
     keep_pinned: usize,
     ts: u64,
 ) -> AppResult<PathBuf> {
+    if !is_valid_pinned_label(label) {
+        return Err(AppError::Other(format!("invalid pinned snapshot label {label:?}")));
+    }
     let pinned_root = data_dir.join("snapshots").join(PINNED_DIR);
     // Build in a STAGING dir (the '.' prefix keeps it out of every `{label}_` scan), then promote by
     // rename — a failed backup must never leave a partial dir that counts as a real pin, and a
@@ -590,12 +593,18 @@ pub(crate) fn take_pinned_snapshot_at(
     }
     // Bound same-label accumulation (newest keep_pinned survive) so repeated upgrades/restores
     // can't grow without limit; different labels never evict each other.
+    let expected_prefix = format!("{label}_");
     let mut same_label: Vec<PathBuf> = fs::read_dir(&pinned_root)
         .map_err(AppError::Io)?
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
-            p.is_dir() && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&format!("{label}_")))
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix(&expected_prefix))
+                    .and_then(parse_fixed_timestamp)
+                    .is_some()
         })
         .collect();
     same_label.sort();
@@ -1556,13 +1565,16 @@ fn parse_fixed_timestamp(value: &str) -> Option<u64> {
     (value.len() == 10 && value.bytes().all(|byte| byte.is_ascii_digit())).then(|| value.parse().ok()).flatten()
 }
 
-fn parse_pinned_name(value: &str) -> Option<u64> {
-    let (label, timestamp) = value.rsplit_once('_')?;
-    let valid_label = !label.is_empty()
+fn is_valid_pinned_label(label: &str) -> bool {
+    !label.is_empty()
         && label.len() <= 64
         && label.bytes().next().is_some_and(|byte| byte.is_ascii_alphanumeric())
-        && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
-    valid_label.then(|| parse_fixed_timestamp(timestamp)).flatten()
+        && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn parse_pinned_name(value: &str) -> Option<u64> {
+    let (label, timestamp) = value.rsplit_once('_')?;
+    is_valid_pinned_label(label).then(|| parse_fixed_timestamp(timestamp)).flatten()
 }
 
 /// Resolve the opaque selector returned by `list_snapshots` without ever accepting an arbitrary
@@ -2567,13 +2579,44 @@ mod tests {
             take_snapshot_at(&db, data_dir, 1, ts).unwrap().expect("non-empty db snapshots");
         }
         assert!(pinned.join(DB_FILE).is_file(), "pinned snapshot must never be rotated out");
+
+        let pinned_root = data_dir.join("snapshots").join(PINNED_DIR);
+        let snapshot_shaped_file = pinned_root.join("prerestore_0000000000");
+        let malformed_same_label_dir = pinned_root.join("prerestore_not-a-timestamp");
+        let overlapping_label_dir = pinned_root.join("prerestore_extra_0000000000");
+        std::fs::write(&snapshot_shaped_file, b"not a pinned snapshot directory").unwrap();
+        std::fs::create_dir_all(&malformed_same_label_dir).unwrap();
+        std::fs::create_dir_all(&overlapping_label_dir).unwrap();
+
         // Same-label pinning is capped at keep_pinned (here 1): a second one evicts the first.
-        let second = take_pinned_snapshot(&db, data_dir, "prerestore", 1).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1100)); // distinct now_secs() timestamp
-        let third = take_pinned_snapshot(&db, data_dir, "prerestore", 1).unwrap();
+        let second = take_pinned_snapshot_at(&db, data_dir, "prerestore", 1, 1000).unwrap();
+        let third = take_pinned_snapshot_at(&db, data_dir, "prerestore", 1, 2000).unwrap();
         assert!(third.join(DB_FILE).is_file());
         assert!(!second.exists(), "same-label pinned snapshots are capped at keep_pinned");
         assert!(pinned.join(DB_FILE).is_file(), "different labels never evict each other");
+        assert!(snapshot_shaped_file.is_file(), "a same-label regular file is outside pruning authority");
+        assert!(malformed_same_label_dir.is_dir(), "a malformed same-label directory is outside pruning authority");
+        assert!(overlapping_label_dir.is_dir(), "an overlapping label is not the requested exact label");
+    }
+
+    #[test]
+    fn pinned_snapshot_labels_fail_before_filesystem_mutation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let mut invalid = vec![
+            "".to_string(),
+            "-leading-punctuation".to_string(),
+            "../escape".to_string(),
+            "nested/path".to_string(),
+            "nested\\path".to_string(),
+        ];
+        invalid.push("x".repeat(65));
+
+        for label in invalid {
+            let error = take_pinned_snapshot_at(&db, tmp.path(), &label, 1, 1000).unwrap_err().to_string();
+            assert!(error.contains("invalid pinned snapshot label"), "unexpected error for {label:?}: {error}");
+        }
+        assert!(!tmp.path().join("snapshots").exists(), "invalid labels must not create a snapshots tree");
     }
 
     #[test]
