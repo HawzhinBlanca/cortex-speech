@@ -46,6 +46,9 @@ const MIN_CLIP_MS: i64 = 2000;
 
 type Row = (String, String, i64, Option<String>);
 
+/// One embedded clip: `(id, audio_path, duration_ms, embedding)`.
+type Embedded = (String, String, i64, Vec<f32>);
+
 fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
     if a.is_empty() || a.len() != b.len() {
         return None;
@@ -70,6 +73,52 @@ fn shuffle<T>(v: &mut [T], mut seed: u64) {
         let j = (seed >> 33) as usize % (i + 1);
         v.swap(i, j);
     }
+}
+
+/// Greedy online clustering with running centroids — deterministic, and k stays small because
+/// rows are ordered by file and each file has few speakers. Returns `(centroids, counts, assign)`.
+fn greedy_cluster(embedded: &[Embedded], threshold: f32) -> (Vec<Vec<f32>>, Vec<usize>, Vec<usize>) {
+    let mut centroids: Vec<Vec<f32>> = Vec::new();
+    let mut counts: Vec<usize> = Vec::new();
+    let mut assign: Vec<usize> = Vec::with_capacity(embedded.len());
+    for (_, _, _, vec) in embedded {
+        let best = centroids
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| cosine(c, vec).map(|s| (i, s)))
+            .max_by(|a, b| a.1.total_cmp(&b.1));
+        match best {
+            Some((i, sim)) if sim >= threshold => {
+                let n = counts[i] as f32;
+                for (c, v) in centroids[i].iter_mut().zip(vec) {
+                    *c = (*c * n + v) / (n + 1.0);
+                }
+                counts[i] += 1;
+                assign.push(i);
+            }
+            _ => {
+                centroids.push(vec.clone());
+                counts.push(1);
+                assign.push(centroids.len() - 1);
+            }
+        }
+    }
+    (centroids, counts, assign)
+}
+
+/// Rank by DISTINCT FILES present, then by total audio: `(cluster, files, audio_ms, clips)`.
+fn rank_clusters(embedded: &[Embedded], assign: &[usize]) -> Vec<(usize, usize, i64, usize)> {
+    let mut per_cluster: HashMap<usize, (HashSet<&str>, i64, usize)> = HashMap::new();
+    for ((_, path, dur, _), &c) in embedded.iter().zip(assign) {
+        let e = per_cluster.entry(c).or_insert_with(|| (HashSet::new(), 0, 0));
+        e.0.insert(path.as_str());
+        e.1 += dur;
+        e.2 += 1;
+    }
+    let mut ranked: Vec<(usize, usize, i64, usize)> =
+        per_cluster.iter().map(|(&c, (f, ms, n))| (c, f.len(), *ms, *n)).collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+    ranked
 }
 
 fn main() -> Result<(), String> {
@@ -126,7 +175,7 @@ fn main() -> Result<(), String> {
 
     // One decode per source file (the speaker probe's lesson: per-clip decode died on the full library).
     let mut cached: Option<(String, u32, Vec<i16>)> = None;
-    let mut embedded: Vec<(String, String, i64, Vec<f32>)> = Vec::new();
+    let mut embedded: Vec<Embedded> = Vec::new();
     // Kept so the blind sample can be cut from the SAME PCM that was embedded — what the owner
     // hears is exactly what the model judged, with no second decode pass.
     let mut pcm_by_id: HashMap<String, (u32, Vec<i16>)> = HashMap::new();
@@ -170,45 +219,8 @@ fn main() -> Result<(), String> {
         return Err("nothing embedded — CAM++ returned empty vectors for every clip".into());
     }
 
-    // Greedy online clustering with running centroids — deterministic, and k stays small because
-    // rows are ordered by file and each file has few speakers.
-    let mut centroids: Vec<Vec<f32>> = Vec::new();
-    let mut counts: Vec<usize> = Vec::new();
-    let mut assign: Vec<usize> = Vec::with_capacity(embedded.len());
-    for (_, _, _, vec) in &embedded {
-        let best = centroids
-            .iter()
-            .enumerate()
-            .filter_map(|(i, c)| cosine(c, vec).map(|s| (i, s)))
-            .max_by(|a, b| a.1.total_cmp(&b.1));
-        match best {
-            Some((i, sim)) if sim >= threshold => {
-                let n = counts[i] as f32;
-                for (c, v) in centroids[i].iter_mut().zip(vec) {
-                    *c = (*c * n + v) / (n + 1.0);
-                }
-                counts[i] += 1;
-                assign.push(i);
-            }
-            _ => {
-                centroids.push(vec.clone());
-                counts.push(1);
-                assign.push(centroids.len() - 1);
-            }
-        }
-    }
-
-    // Rank by DISTINCT FILES present, then by total audio.
-    let mut per_cluster: HashMap<usize, (HashSet<&str>, i64, usize)> = HashMap::new();
-    for ((_, path, dur, _), &c) in embedded.iter().zip(&assign) {
-        let e = per_cluster.entry(c).or_insert_with(|| (HashSet::new(), 0, 0));
-        e.0.insert(path.as_str());
-        e.1 += dur;
-        e.2 += 1;
-    }
-    let mut ranked: Vec<(usize, usize, i64, usize)> =
-        per_cluster.iter().map(|(&c, (f, ms, n))| (c, f.len(), *ms, *n)).collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+    let (_, _, assign) = greedy_cluster(&embedded, threshold);
+    let ranked = rank_clusters(&embedded, &assign);
 
     println!("clusters  : {}   (top 10 by files-present, then audio)", ranked.len());
     println!("  cluster  files  audio_h   clips");
@@ -396,4 +408,106 @@ fn main() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clip(id: &str, path: &str, dur: i64, vec: &[f32]) -> Embedded {
+        (id.to_string(), path.to_string(), dur, vec.to_vec())
+    }
+
+    #[test]
+    fn cosine_is_exact_on_aligned_and_orthogonal_vectors() {
+        assert_eq!(cosine(&[1.0, 0.0], &[1.0, 0.0]), Some(1.0));
+        assert_eq!(cosine(&[1.0, 0.0], &[0.0, 1.0]), Some(0.0));
+        assert_eq!(cosine(&[1.0, 0.0], &[-1.0, 0.0]), Some(-1.0));
+    }
+
+    #[test]
+    fn cosine_refuses_empty_mismatched_and_zero_norm_pairs() {
+        assert_eq!(cosine(&[], &[]), None);
+        assert_eq!(cosine(&[1.0], &[1.0, 0.0]), None); // length mismatch
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), None); // zero norm
+    }
+
+    #[test]
+    fn arg_reads_the_value_after_its_flag_and_nothing_else() {
+        let args: Vec<String> = ["--threshold", "0.7", "--sample"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(arg(&args, "--threshold"), Some("0.7".to_string()));
+        assert_eq!(arg(&args, "--sample"), None); // flag present, value missing
+        assert_eq!(arg(&args, "--data-dir"), None);
+    }
+
+    #[test]
+    fn shuffle_is_deterministic_and_loses_nothing() {
+        let base: Vec<u32> = (0..32).collect();
+        let mut a = base.clone();
+        let mut b = base.clone();
+        shuffle(&mut a, 20_260_819);
+        shuffle(&mut b, 20_260_819);
+        assert_eq!(a, b, "the same seed must reproduce the same blind sample");
+        let mut sorted = a.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, base, "a shuffle rearranges, never drops or duplicates");
+        assert_ne!(a, base, "32 elements leave no realistic chance of the identity permutation");
+        let mut c = base.clone();
+        shuffle(&mut c, 20_260_820);
+        assert_ne!(c, a, "different seeds must draw different samples");
+        shuffle(&mut Vec::<u32>::new(), 7); // zero- and one-element slices must not panic
+        shuffle(&mut [1u32], 7);
+    }
+
+    #[test]
+    fn greedy_cluster_joins_at_the_threshold_and_updates_the_running_centroid() {
+        // A permissive threshold: everything joins one cluster and the centroid is the running mean.
+        let rows = vec![
+            clip("a", "ep1.wav", 3_000, &[1.0, 0.0]),
+            clip("b", "ep1.wav", 3_000, &[0.0, 1.0]),
+            clip("c", "ep2.wav", 3_000, &[0.5, 0.5]),
+        ];
+        let (centroids, counts, assign) = greedy_cluster(&rows, -1.0);
+        assert_eq!(assign, vec![0, 0, 0]);
+        assert_eq!(counts, vec![3]);
+        assert_eq!(centroids, vec![vec![0.5, 0.5]]);
+
+        // `>=`, not `>`: a similarity exactly at the threshold still joins.
+        let rows = vec![clip("a", "ep1.wav", 3_000, &[1.0, 0.0]), clip("b", "ep1.wav", 3_000, &[1.0, 0.0])];
+        let (_, counts, assign) = greedy_cluster(&rows, 1.0);
+        assert_eq!((counts, assign), (vec![2], vec![0, 0]));
+    }
+
+    #[test]
+    fn greedy_cluster_separates_voices_below_the_threshold() {
+        let rows = vec![
+            clip("a", "ep1.wav", 3_000, &[1.0, 0.0]),
+            clip("b", "ep1.wav", 3_000, &[0.0, 1.0]),
+            clip("c", "ep1.wav", 3_000, &[1.0, 0.0]),
+        ];
+        let (centroids, counts, assign) = greedy_cluster(&rows, 0.5);
+        assert_eq!(centroids.len(), 2);
+        assert_eq!(counts, vec![2, 1]);
+        assert_eq!(assign, vec![0, 1, 0], "the third clip rejoins the first voice, not the nearest-in-time one");
+        assert_eq!(greedy_cluster(&[], 0.5), (Vec::new(), Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn rank_clusters_puts_presence_across_files_above_raw_volume() {
+        // Cluster 1 out-talks everyone inside one episode; clusters 0 and 2 appear in two episodes.
+        // The host is the one in every file, so both outrank it — and between equal spreads, more
+        // audio wins.
+        let rows = vec![
+            clip("a", "ep1.wav", 1_000, &[1.0]),
+            clip("b", "ep2.wav", 1_000, &[1.0]),
+            clip("c", "ep1.wav", 10_000, &[1.0]),
+            clip("d", "ep1.wav", 10_000, &[1.0]),
+            clip("e", "ep1.wav", 10_000, &[1.0]),
+            clip("f", "ep1.wav", 5_000, &[1.0]),
+            clip("g", "ep3.wav", 5_000, &[1.0]),
+        ];
+        let assign = vec![0, 0, 1, 1, 1, 2, 2];
+        let ranked = rank_clusters(&rows, &assign);
+        assert_eq!(ranked, vec![(2, 2, 10_000, 2), (0, 2, 2_000, 2), (1, 1, 30_000, 3)]);
+    }
 }

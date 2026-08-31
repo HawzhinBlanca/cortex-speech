@@ -74,7 +74,10 @@ fn require_campaign_schema(schema_version: i64, command: &str) -> Result<(), Str
 }
 
 fn run() -> Result<serde_json::Value, String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    run_with(std::env::args().skip(1).collect())
+}
+
+fn run_with(args: Vec<String>) -> Result<serde_json::Value, String> {
     let command = args.first().map(String::as_str).ok_or_else(|| {
         "usage: campaign_admin <activate-second-pass|adjudicate|certify|export> --db <path> ...".to_string()
     })?;
@@ -255,5 +258,197 @@ fn main() -> std::process::ExitCode {
             eprintln!("campaign_admin: {error}");
             std::process::ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|item| item.to_string()).collect()
+    }
+
+    /// Real file-backed database carrying the full production migration history.
+    fn fresh_db(dir: &Path) -> PathBuf {
+        let path = dir.join("cortex-speech.db");
+        let db = Database::open(path.to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        path
+    }
+
+    // ── Argument validation ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_flags_accepts_only_known_flag_value_pairs() {
+        let allowed = ["--db", "--focus"];
+        assert!(validate_flags(&args(&["certify", "--db", "a.db", "--focus", "f.json"]), &allowed).is_ok());
+        assert!(validate_flags(&args(&["certify"]), &allowed).is_ok(), "flags are optional at this layer");
+        assert!(validate_flags(&args(&["certify", "--output", "x"]), &allowed)
+            .unwrap_err()
+            .contains("unknown argument for certify: --output"));
+        assert!(validate_flags(&args(&["certify", "stray"]), &allowed)
+            .unwrap_err()
+            .contains("unknown argument for certify: stray"));
+        assert_eq!(
+            validate_flags(&args(&["certify", "--db", "a.db", "--db", "b.db"]), &allowed).unwrap_err(),
+            "duplicate argument: --db"
+        );
+        assert_eq!(validate_flags(&args(&["certify", "--db"]), &allowed).unwrap_err(), "missing value after --db");
+        assert_eq!(
+            validate_flags(&args(&["certify", "--db", "--focus"]), &allowed).unwrap_err(),
+            "missing value after --db",
+            "a --flag can never be consumed as a value"
+        );
+    }
+
+    #[test]
+    fn value_after_and_optional_value_after_extract_or_refuse() {
+        let supplied = args(&["certify", "--db", "a.db"]);
+        assert_eq!(value_after(&supplied, "--db").unwrap(), "a.db");
+        assert_eq!(value_after(&supplied, "--focus").unwrap_err(), "missing --focus");
+        assert_eq!(value_after(&args(&["certify", "--db"]), "--db").unwrap_err(), "missing value after --db");
+        assert_eq!(optional_value_after(&supplied, "--focus").unwrap(), None);
+        assert_eq!(optional_value_after(&supplied, "--db").unwrap(), Some("a.db".to_string()));
+        assert_eq!(
+            optional_value_after(&args(&["certify", "--focus"]), "--focus").unwrap_err(),
+            "missing value after --focus"
+        );
+    }
+
+    #[test]
+    fn read_json_labels_missing_and_malformed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.json");
+        let error = read_json::<FocusFile>(&missing, "voice focus").map(|focus| focus.segment_ids).unwrap_err();
+        assert!(error.contains("cannot read voice focus"), "{error}");
+        let malformed = dir.path().join("bad.json");
+        std::fs::write(&malformed, b"{not json").unwrap();
+        let error = read_json::<FocusFile>(&malformed, "voice focus").map(|focus| focus.segment_ids).unwrap_err();
+        assert!(error.contains("invalid voice focus"), "{error}");
+        std::fs::write(&malformed, br#"{"segment_ids": ["a", "b"]}"#).unwrap();
+        assert_eq!(read_json::<FocusFile>(&malformed, "voice focus").unwrap().segment_ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn require_campaign_schema_refuses_premigration_databases() {
+        let error = require_campaign_schema(MIN_CAMPAIGN_SCHEMA_VERSION - 1, "adjudicate").unwrap_err();
+        assert!(error.contains("adjudicate requires schema 61 or newer, found schema 60"), "{error}");
+        assert!(require_campaign_schema(MIN_CAMPAIGN_SCHEMA_VERSION, "adjudicate").is_ok());
+    }
+
+    #[test]
+    fn open_database_validates_migration_history_in_both_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_db(dir.path());
+        let (_db, schema_version) = open_database(&path, false).unwrap();
+        assert!(schema_version >= MIN_CAMPAIGN_SCHEMA_VERSION, "found schema {schema_version}");
+        let (_snapshot, snapshot_version) = open_database(&path, true).unwrap();
+        assert_eq!(snapshot_version, schema_version);
+    }
+
+    // ── The real command ladder, end to end, against a real database ─────────────────────────────
+
+    #[test]
+    fn run_with_refuses_unknown_commands_and_arguments_before_touching_any_database() {
+        assert!(run_with(Vec::new()).unwrap_err().starts_with("usage: campaign_admin"));
+        assert_eq!(run_with(args(&["demolish"])).unwrap_err(), "unknown campaign_admin command: demolish");
+        assert!(run_with(args(&["certify", "--voice", "Kawa"]))
+            .unwrap_err()
+            .contains("unknown argument for certify: --voice"));
+        let error = run_with(args(&["certify", "--db", "Z:/no/such/cortex-speech.db"])).unwrap_err();
+        assert!(error.contains("database does not exist"), "{error}");
+    }
+
+    #[test]
+    fn activate_second_pass_validates_its_inputs_then_hits_the_real_campaign_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = fresh_db(dir.path());
+        let db_arg = db_path.to_str().unwrap();
+        let focus_path = dir.path().join("focus.json");
+
+        let error = run_with(args(&[
+            "activate-second-pass",
+            "--db",
+            db_arg,
+            "--focus",
+            focus_path.to_str().unwrap(),
+            "--expected-max-review-event-id",
+            "ten",
+        ]))
+        .unwrap_err();
+        assert_eq!(error, "--expected-max-review-event-id must be a non-negative integer");
+
+        let error = run_with(args(&[
+            "activate-second-pass",
+            "--db",
+            db_arg,
+            "--focus",
+            focus_path.to_str().unwrap(),
+            "--expected-max-review-event-id",
+            "-3",
+        ]))
+        .unwrap_err();
+        assert_eq!(error, "--expected-max-review-event-id must be non-negative");
+
+        std::fs::write(&focus_path, br#"{"segment_ids": ["seg-1", "seg-1"]}"#).unwrap();
+        let error = run_with(args(&[
+            "activate-second-pass",
+            "--db",
+            db_arg,
+            "--focus",
+            focus_path.to_str().unwrap(),
+            "--expected-max-review-event-id",
+            "0",
+        ]))
+        .unwrap_err();
+        assert_eq!(error, "voice focus contains duplicate segment ids");
+
+        // A clean focus reaches the real activation API, which fails closed without a campaign.
+        std::fs::write(&focus_path, br#"{"segment_ids": ["seg-1", "seg-2"]}"#).unwrap();
+        let error = run_with(args(&[
+            "activate-second-pass",
+            "--db",
+            db_arg,
+            "--focus",
+            focus_path.to_str().unwrap(),
+            "--expected-max-review-event-id",
+            "0",
+        ]))
+        .unwrap_err();
+        assert_eq!(error, "no sequential review campaign is active");
+    }
+
+    #[test]
+    fn adjudicate_parses_the_manual_file_then_hits_the_real_campaign_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = fresh_db(dir.path());
+        let db_arg = db_path.to_str().unwrap();
+
+        let manual_path = dir.path().join("manual.json");
+        std::fs::write(&manual_path, b"[{").unwrap();
+        let error =
+            run_with(args(&["adjudicate", "--db", db_arg, "--manual", manual_path.to_str().unwrap()])).unwrap_err();
+        assert!(error.contains("invalid manual adjudication file"), "{error}");
+
+        // Without --manual the command still fails closed: no campaign exists to adjudicate.
+        let error = run_with(args(&["adjudicate", "--db", db_arg])).unwrap_err();
+        assert_eq!(error, "no sequential review campaign is active");
+    }
+
+    #[test]
+    fn certify_and_export_fail_closed_on_a_healthy_database_without_a_campaign() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = fresh_db(dir.path());
+        let db_arg = db_path.to_str().unwrap();
+
+        let error = run_with(args(&["certify", "--db", db_arg])).unwrap_err();
+        assert_eq!(error, "no sequential campaign exists");
+
+        let output_dir = dir.path().join("out");
+        let error =
+            run_with(args(&["export", "--db", db_arg, "--output", output_dir.to_str().unwrap(), "--voice", "Kawa"]))
+                .unwrap_err();
+        assert!(error.contains("no completed sequential campaign"), "{error}");
     }
 }

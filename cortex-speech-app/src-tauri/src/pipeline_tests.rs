@@ -1916,3 +1916,174 @@ fn wsl7b_identity_validation_refuses_impostors() {
     missing_component["componentSha256"] = serde_json::json!({"base": sha});
     assert!(wsl7b_validate_identity(&missing_component).is_err(), "a partial component identity is no identity");
 }
+
+// ---- Wave-3 coverage: pipeline.rs root helpers, gating, error taxonomy ----
+
+#[test]
+fn resume_path_key_is_separator_and_case_insensitive() {
+    assert_eq!(super::resume_path_key("D:/Audio/File.WAV"), r"d:\audio\file.wav");
+    assert_eq!(super::resume_path_key(r"d:\audio\file.wav"), r"d:\audio\file.wav");
+    assert_eq!(
+        super::resume_path_key("D:/Audio/File.WAV"),
+        super::resume_path_key(r"D:\AUDIO\FILE.wav"),
+        "the same recording journaled under either separator/case must collide on one resume key"
+    );
+}
+
+#[test]
+fn transcription_config_digests_are_hex_stable_protocol_and_settings_bound() {
+    let (pipeline, _dir) = test_pipeline_with_settings(AppSettings::default());
+    let champion = pipeline.champion_transcription_config_sha256().unwrap();
+    let batch = pipeline.batch_transcription_config_sha256().unwrap();
+    assert_eq!(champion.len(), 64);
+    assert!(champion.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')), "digest must be lowercase hex");
+    assert_eq!(
+        champion,
+        pipeline.champion_transcription_config_sha256().unwrap(),
+        "the config identity must be deterministic for one unchanged pipeline"
+    );
+    assert_ne!(champion, batch, "a one-clip commit and the durable batch contract must never share a digest");
+
+    let (changed, _dir2) = test_pipeline_with_settings(AppSettings { vad_threshold: 0.9, ..AppSettings::default() });
+    assert_ne!(
+        changed.champion_transcription_config_sha256().unwrap(),
+        champion,
+        "a result-affecting setting change must change the stored config identity"
+    );
+}
+
+#[test]
+fn settings_snapshot_and_db_path_expose_the_exact_construction_values() {
+    let settings = AppSettings { vad_threshold: 0.66, ..AppSettings::default() };
+    let (pipeline, dir) = test_pipeline_with_settings(settings);
+    assert_eq!(pipeline.settings_snapshot().vad_threshold, 0.66);
+    assert_eq!(pipeline.db_path(), dir.path().join("db.sqlite").to_string_lossy().as_ref());
+}
+
+#[test]
+fn warmup_asr_skips_the_local_onnx_pool_when_the_champion_is_selected() {
+    // WSL7B selected: warm-up must return Ok without requiring (or loading) any local ONNX model —
+    // the champion runs out of process, and demanding local weights here would fail every clean
+    // champion-only install at startup.
+    let (pipeline, _dir) =
+        test_pipeline_with_settings(AppSettings { asr_model_size: AsrModelSize::WSL7B, ..AppSettings::default() });
+    assert_eq!(pipeline.warmup_asr(), Ok(()), "champion mode must not touch the local ONNX pool");
+}
+
+#[test]
+fn rediarize_refuses_when_disabled_and_noops_when_no_target_rows_exist() {
+    let (off, _off_dir) =
+        test_pipeline_with_settings(AppSettings { enable_diarization: false, ..AppSettings::default() });
+    let err = off.rediarize_segments(&["seg-1".to_string()]).expect_err("disabled setting must refuse");
+    assert!(err.to_string().contains("disabled"), "the refusal must name the setting, got: {err}");
+
+    let (on, _on_dir) = test_pipeline_with_settings(AppSettings { enable_diarization: true, ..AppSettings::default() });
+    on.open_db().unwrap().initialize().unwrap();
+    assert_eq!(
+        on.rediarize_segments(&["missing-a".to_string(), "missing-b".to_string()]).unwrap(),
+        0,
+        "unknown ids must resolve to zero updates without touching audio or ONNX"
+    );
+}
+
+#[test]
+fn batch_champion_draft_refusals_carry_their_exact_machine_codes() {
+    let (pipeline, _dir) = test_pipeline_with_settings(AppSettings::default());
+    let good = super::TranscriptionDraft {
+        raw_text: "دەقی ڕاست".into(),
+        final_text: "دەقی ڕاست".into(),
+        confidence: None,
+        confidence_source: None,
+        model_version_id: Some("champion-v1".into()),
+        deployment_sha256: Some("b".repeat(64)),
+        cloud_call: false,
+    };
+
+    let blank_final = super::TranscriptionDraft { final_text: "  ".into(), ..good.clone() };
+    let err = pipeline.prepare_batch_champion_draft(blank_final).expect_err("a blank final draft must refuse");
+    assert!(err.to_string().contains("E_BATCH_EMPTY_REFINED_DRAFT"), "wrong code: {err}");
+
+    let no_model = super::TranscriptionDraft { model_version_id: None, ..good.clone() };
+    let err = pipeline.prepare_batch_champion_draft(no_model).expect_err("an identity-free draft must refuse");
+    assert!(err.to_string().contains("E_BATCH_MODEL_IDENTITY_MISSING"), "wrong code: {err}");
+
+    let blank_raw = super::TranscriptionDraft { raw_text: String::new(), ..good.clone() };
+    let err = pipeline.prepare_batch_champion_draft(blank_raw).expect_err("an empty champion draft must refuse");
+    assert!(err.to_string().contains("E_BATCH_EMPTY_CHAMPION_DRAFT"), "wrong code: {err}");
+
+    // The one-clip bound commit routes through the SAME chokepoint, so its taxonomy cannot drift.
+    let prepared = pipeline.prepare_bound_champion_draft(good).expect("a complete draft passes");
+    assert_eq!(prepared.model_version_id, "champion-v1");
+}
+
+#[test]
+fn cloud_refinement_is_off_by_default_and_downgrades_without_explicit_opt_in() {
+    // Consent defaults OFF: selecting the cloud (Gemini) mode with UNTOUCHED default consent must
+    // build no refiner even with a provider key on disk. The downgrade — not an error — is the
+    // contract (settings.effective_llm_mode() Gemini -> None), so the default path stays offline.
+    let defaults = AppSettings::default();
+    assert!(!defaults.cloud_llm_opt_in, "cloud LLM consent must default off");
+    assert!(!defaults.jury_cloud_opt_in, "cloud jury consent must default off");
+
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings {
+        llm_mode: crate::settings::LlmMode::Gemini,
+        ..AppSettings::default()
+    });
+    std::fs::write(dir.path().join("secrets.env"), "OPENROUTER_API_KEY=test-or-key\n").unwrap();
+    assert!(
+        pipeline.build_refiner().expect("API-key store should load").is_none(),
+        "default (no opt-in) consent must downgrade the cloud refiner to none, even with a key present"
+    );
+    assert!(
+        !pipeline.llm_refinement_permitted(),
+        "no refinement stage may run under default consent when only a cloud mode is selected"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn wsl_child_kill_and_reap_leaves_no_zombie_and_tolerates_a_dead_child() {
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "ping", "-n", "30", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn long-running child");
+    super::kill_and_reap_wsl_child(&mut child, "test child");
+    assert!(
+        child.try_wait().expect("child status must be readable").is_some(),
+        "kill+reap must leave a fully reaped child, not a zombie"
+    );
+    // A second call on the already-dead child logs and returns — it must never panic, or a
+    // cancel racing a natural exit would take down the import worker.
+    super::kill_and_reap_wsl_child(&mut child, "already-dead test child");
+}
+
+#[test]
+fn wsl_pipe_reader_join_returns_bytes_and_swallows_a_panicked_reader() {
+    let ok = std::thread::spawn(|| vec![b'7', b'b']);
+    assert_eq!(super::join_wsl_pipe_reader(ok, "stdout"), vec![b'7', b'b']);
+
+    let panicked = std::thread::spawn(|| -> Vec<u8> { panic!("reader died") });
+    assert_eq!(
+        super::join_wsl_pipe_reader(panicked, "stderr"),
+        Vec::<u8>::new(),
+        "a panicked pipe reader must degrade to empty output, not poison the whole 7B call"
+    );
+}
+
+#[test]
+fn the_7b_gate_refuses_a_cancelled_caller_queued_behind_a_full_gate() {
+    use std::sync::atomic::AtomicBool;
+    let gate = super::Wsl7bGate::new();
+    let live = AtomicBool::new(false);
+    let cancelled = AtomicBool::new(true);
+
+    let held = gate.acquire_with_limit(Some(&live), 1).expect("the first caller takes the only permit");
+    assert!(
+        gate.acquire_with_limit(Some(&cancelled), 1).is_none(),
+        "a Cancel pressed while QUEUED must return without ever taking a permit"
+    );
+    drop(held);
+    assert!(gate.acquire_with_limit(Some(&live), 1).is_some(), "the queued refusal must not have leaked a permit");
+}

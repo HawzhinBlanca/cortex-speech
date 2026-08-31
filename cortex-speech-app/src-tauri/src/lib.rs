@@ -3100,4 +3100,222 @@ mod tests {
         assert_eq!(live_settings.vad_threshold, settings.vad_threshold);
         assert_eq!(live_settings.max_segment_duration_ms, settings.max_segment_duration_ms);
     }
+
+    // ---- Wave-3 coverage: AppState accessors, run trackers, session plumbing ----
+
+    #[test]
+    fn batch_run_outcome_panicked_marks_every_item_abandoned() {
+        // A worker panic must read as a hard stop: nothing succeeded, everything abandoned, and the
+        // stable machine code names the cause. Never a quiet "completed".
+        let outcome = BatchRunOutcome::panicked(5);
+        assert_eq!(outcome.disposition, BatchRunDisposition::Panicked);
+        assert_eq!(outcome.total, 5);
+        assert_eq!(outcome.abandoned, 5);
+        assert_eq!((outcome.succeeded, outcome.failed, outcome.skipped), (0, 0, 0));
+        assert!(!outcome.cancelled);
+        assert_eq!(outcome.error_code.as_deref(), Some("BATCH_WORKER_PANICKED"));
+    }
+
+    #[test]
+    fn dedup_ready_state_admits_import_and_the_unavailable_error_displays_the_stable_message() {
+        assert!(DedupReadiness::Ready { rehydrated_recordings: 7 }.require_import_ready().is_ok());
+        assert_eq!(DedupIndexUnavailable.to_string(), DEDUP_INDEX_UNAVAILABLE_MESSAGE);
+        assert!(
+            DEDUP_INDEX_UNAVAILABLE_MESSAGE.starts_with(DEDUP_INDEX_UNAVAILABLE_CODE),
+            "callers classify on the leading machine code, so it must stay the message prefix"
+        );
+    }
+
+    #[test]
+    fn review_cursor_and_session_save_persist_durable_view_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+
+        state.persist_review_cursor("seg-cursor-9");
+        let saved = state.lock_session().load().expect("cursor save is durable");
+        assert_eq!(saved.selected_segment_id.as_deref(), Some("seg-cursor-9"));
+
+        state.lock_session().set_view_state("گەڕان".into(), "oldest".into(), Some(false));
+        state.session_save();
+        let saved = state.lock_session().load().expect("session_save is durable");
+        assert_eq!(saved.search_query, "گەڕان");
+        assert_eq!(saved.sort_order, "oldest");
+        assert_eq!(saved.filter_verified, Some(false));
+        assert_eq!(saved.selected_segment_id.as_deref(), Some("seg-cursor-9"), "a later full save keeps the cursor");
+
+        // last_save starts at 0, so the first auto_save is past its interval and must also persist.
+        state.lock_session().set_view_state("دووەم".into(), "newest".into(), None);
+        state.session_auto_save();
+        let saved = state.lock_session().load().expect("auto save is durable");
+        assert_eq!(saved.search_query, "دووەم");
+    }
+
+    #[test]
+    fn history_and_db_handles_reach_the_live_state_authorities() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        assert!(
+            Arc::ptr_eq(&state.history_arc_for_restore(), &state.history),
+            "restore publication must clear the SAME history the commands mutate, not a copy"
+        );
+        let handle = state.db_arc();
+        let db = handle.lock().expect("restore-gated handle reaches the database");
+        assert_eq!(db.integrity_check().unwrap(), "ok");
+    }
+
+    #[test]
+    fn settings_write_gate_recovers_poisoned_lock_and_releases() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.settings_write.lock().expect("lock settings write gate");
+            panic!("poison settings write gate");
+        }));
+
+        {
+            let _gate = state.lock_settings_write();
+            assert!(
+                matches!(state.settings_write.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+                "the recovered gate is genuinely held"
+            );
+        }
+        // The std poison flag survives recovery by design (a bare try_lock keeps answering
+        // Poisoned even when free); what must reopen is acquirability through the recovering
+        // accessor every production caller uses.
+        let _reacquired = state.lock_settings_write();
+    }
+
+    #[test]
+    fn abort_import_start_refuses_a_different_run_and_keeps_the_live_worker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        let live = uuid::Uuid::from_u128(0x7001).to_string();
+        let stranger = uuid::Uuid::from_u128(0x7002).to_string();
+
+        state.try_start_import_for_run(&live).expect("admit live import");
+        state.abort_import_start(&stranger);
+        assert_eq!(*state.lock_import_state(), ImportState::Running, "a wrong-run abort must not free the gate");
+        assert_eq!(state.import_run_admission(&live), ImportRunAdmission::Running);
+        assert_eq!(
+            state.import_run_admission(&stranger),
+            ImportRunAdmission::Unknown,
+            "a refused abort must not fabricate terminal truth for an unadmitted identity"
+        );
+        state.finish_import();
+        assert_eq!(state.import_run_admission(&live), ImportRunAdmission::Settled);
+    }
+
+    #[test]
+    fn import_rejection_memory_is_exact_and_never_downgrades_a_settled_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        let settled = uuid::Uuid::from_u128(0x7003).to_string();
+        let refused = uuid::Uuid::from_u128(0x7004).to_string();
+
+        state.try_start_import_for_run(&settled).expect("admit run");
+        state.finish_import();
+        state.remember_import_rejection(&settled);
+        assert_eq!(
+            state.import_run_admission(&settled),
+            ImportRunAdmission::Settled,
+            "a late rejection writer must not rewrite settled admission truth"
+        );
+
+        state.remember_import_rejection(&refused);
+        assert_eq!(state.import_run_admission(&refused), ImportRunAdmission::Rejected);
+    }
+
+    #[test]
+    fn batch_rejection_memory_blocks_identity_replay_and_never_downgrades_settlement() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        let refused = uuid::Uuid::from_u128(0x7005).to_string();
+        let settled = uuid::Uuid::from_u128(0x7006).to_string();
+
+        state.remember_batch_rejection(&refused, BatchOperation::Normalize);
+        assert_eq!(
+            state.batch_run_admission(&refused),
+            (BatchRunAdmission::Rejected, Some(BatchOperation::Normalize), None)
+        );
+        assert_eq!(
+            state.try_start_batch_for_run(&refused, BatchOperation::Normalize, 1).err().as_deref(),
+            Some("Batch operation identity already used"),
+            "a rejected identity must not be replayable into a live worker"
+        );
+
+        state.try_start_batch_for_run(&settled, BatchOperation::Transcribe, 1).expect("admit batch");
+        assert!(state.finish_batch_for_run(&settled, BatchOperation::Transcribe));
+        state.remember_batch_rejection(&settled, BatchOperation::Transcribe);
+        assert_eq!(
+            state.batch_run_admission(&settled).0,
+            BatchRunAdmission::Settled,
+            "a late rejection writer must not rewrite settled batch truth"
+        );
+    }
+
+    #[test]
+    fn mark_batch_durable_admitted_is_exact_and_one_way() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        let live = uuid::Uuid::from_u128(0x7007).to_string();
+        let stranger = uuid::Uuid::from_u128(0x7008).to_string();
+
+        assert!(!state.mark_batch_durable_admitted(&live, BatchOperation::Normalize), "no active run: refuse");
+        state.try_start_batch_for_run(&live, BatchOperation::Normalize, 2).expect("admit batch");
+        assert!(
+            !state.mark_batch_durable_admitted(&stranger, BatchOperation::Normalize),
+            "a different identity must not flip the live run's phase"
+        );
+        assert!(
+            !state.mark_batch_durable_admitted(&live, BatchOperation::Transcribe),
+            "a wrong-kind writer must not flip the live run's phase"
+        );
+        assert!(state.mark_batch_durable_admitted(&live, BatchOperation::Normalize));
+        assert!(
+            !state.mark_batch_durable_admitted(&live, BatchOperation::Normalize),
+            "the Starting->Durable transition is one-way and single-shot"
+        );
+        assert!(state.finish_batch_for_run(&live, BatchOperation::Normalize));
+    }
+
+    #[test]
+    fn record_batch_outcome_refuses_untracked_and_mismatched_runs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        let live = uuid::Uuid::from_u128(0x7009).to_string();
+        let stranger = uuid::Uuid::from_u128(0x700a).to_string();
+        let outcome = BatchRunOutcome {
+            disposition: BatchRunDisposition::Completed,
+            total: 2,
+            succeeded: 2,
+            failed: 0,
+            skipped: 0,
+            abandoned: 0,
+            cancelled: false,
+            error_code: None,
+        };
+
+        assert!(
+            !state.record_batch_outcome(&stranger, BatchOperation::Transcribe, outcome.clone()),
+            "an untracked run has no outcome slot"
+        );
+        state.try_start_batch_for_run(&live, BatchOperation::Transcribe, 2).expect("admit batch");
+        assert!(
+            !state.record_batch_outcome(
+                &live,
+                BatchOperation::Transcribe,
+                BatchRunOutcome { total: 3, ..outcome.clone() }
+            ),
+            "a mismatched total is a different run's result and must be refused"
+        );
+        assert!(
+            !state.record_batch_outcome(&live, BatchOperation::Normalize, outcome.clone()),
+            "a wrong-kind result must be refused"
+        );
+        assert!(state.record_batch_outcome(&live, BatchOperation::Transcribe, outcome.clone()));
+        assert!(state.finish_batch_for_run(&live, BatchOperation::Transcribe));
+        let (_, _, retained) = state.batch_run_admission(&live);
+        assert_eq!(retained, Some(outcome), "only the exact-match outcome survives to settlement");
+    }
 }

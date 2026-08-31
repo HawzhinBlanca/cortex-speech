@@ -2009,6 +2009,219 @@ mod tests {
         assert_eq!(resolve_root_in(models.path(), bundled.path(), "missing.onnx"), models.path().to_path_buf());
     }
 
+    /// Write then confirm visibility — the module's settle pattern for the Windows write-then-read
+    /// timing artifact (exists()/metadata() can briefly lag fs::write under AV/temp load).
+    fn write_file_settled(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+        for _ in 0..500 {
+            if path.metadata().map(|m| m.len() == bytes.len() as u64).unwrap_or(false) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("file not visible after write: {}", path.display());
+    }
+
+    #[test]
+    fn sha256_helpers_match_known_vectors() {
+        assert_eq!(hex_lower(&[0x00, 0xff, 0x0a]), "00ff0a");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let empty = tmp.path().join("empty.bin");
+        File::create(&empty).expect("empty file");
+        assert_eq!(
+            compute_file_sha256(&empty).expect("hash empty file"),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "SHA-256 of zero bytes is a fixed public vector"
+        );
+        assert!(compute_file_sha256(&tmp.path().join("absent.bin")).expect_err("no file").contains("Open for hash"));
+    }
+
+    #[test]
+    fn verify_sha256_download_gate_removes_the_file_only_on_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("candidate.downloading");
+
+        // An empty pin refuses AND removes: an unverifiable artifact must not stay on disk.
+        write_file_settled(&path, b"model bytes");
+        let err = verify_sha256(&path, "").expect_err("unpinned download");
+        assert!(err.contains("Missing pinned SHA256"), "{err}");
+        assert!(!path.exists(), "the unverifiable temp must be deleted");
+
+        // A mismatched pin refuses AND removes, naming both digests.
+        write_file_settled(&path, b"model bytes");
+        let wrong = "0".repeat(64);
+        let err = verify_sha256(&path, &wrong).expect_err("mismatched download");
+        assert!(err.contains("SHA256 mismatch"), "{err}");
+        assert!(!path.exists(), "the mismatched temp must be deleted");
+
+        // A matching pin accepts and leaves the file in place for promotion.
+        write_file_settled(&path, b"model bytes");
+        let actual = compute_file_sha256(&path).expect("hash");
+        verify_sha256(&path, &actual).expect("matching pin");
+        assert!(path.exists(), "a verified download must be retained");
+    }
+
+    #[test]
+    fn dedupe_paths_keeps_first_occurrence_order() {
+        let a = PathBuf::from("a");
+        let b = PathBuf::from("b");
+        assert_eq!(dedupe_paths(vec![a.clone(), b.clone(), a.clone()]), vec![a, b]);
+        assert!(dedupe_paths(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn bundled_selector_falls_back_to_first_candidate_or_manifest_models() {
+        // No candidates at all: the compiled-in manifest models dir is the last resort.
+        assert_eq!(select_bundled_models_dir(Vec::new()), Path::new(env!("CARGO_MANIFEST_DIR")).join("models"));
+
+        // Candidates exist but none holds a runtime ASR pair: the FIRST keeps priority.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        assert_eq!(select_bundled_models_dir(vec![first.clone(), second]), first);
+    }
+
+    #[test]
+    fn resolve_models_dir_prefers_a_user_dir_with_a_complete_pair() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let user_dir = tmp.path().join("user-models");
+        create_minimal_300m_model_pair(&user_dir);
+        assert_eq!(resolve_models_dir(&user_dir), user_dir);
+    }
+
+    #[test]
+    fn resolve_root_for_serves_user_and_bundled_files_from_one_manager() {
+        // The per-file design proof at the ModelManager surface: with ONE manager, a file that exists
+        // only in the user dir and a sibling that exists only bundled must BOTH resolve — a user
+        // download must never orphan a bundled-only model (round-26), and vice versa.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let user_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&user_dir).expect("user models dir");
+        let manager = ModelManager::new(user_dir.clone());
+
+        // A file only the user dir holds (no bundled candidate ships this name).
+        write_file_settled(&user_dir.join("user-only-probe.onnx"), b"user copy");
+        assert_eq!(manager.resolve_root_for("user-only-probe.onnx"), user_dir, "the user copy must win");
+
+        // A sibling only the bundled tree holds (the repo fixture ships Silero VAD).
+        let vad_root = manager.resolve_root_for("silero_vad_v4.onnx");
+        assert_ne!(vad_root, user_dir, "a partial user dir must not capture the bundled VAD");
+        assert!(vad_root.join("silero_vad_v4.onnx").exists(), "the bundled VAD must resolve, not orphan");
+
+        // Absent everywhere: the WRITABLE user dir (the download target / not-found error path).
+        assert_eq!(manager.resolve_root_for("absent-everywhere.onnx"), user_dir);
+    }
+
+    #[test]
+    fn resolve_model_file_reaches_the_bundled_vad_with_no_user_dir_registered() {
+        // The test process never calls init_user_models_dir, so this exercises the bundled-only leg
+        // of per-file resolution (the same call path production takes before startup registration).
+        let vad = resolve_model_file("silero_vad_v4.onnx");
+        assert!(vad.exists(), "bundled VAD must resolve per-file: {}", vad.display());
+        assert!(vad.ends_with("silero_vad_v4.onnx"), "{}", vad.display());
+    }
+
+    #[test]
+    fn extraction_tmp_path_stays_beside_the_destination_and_is_marked() {
+        let dest = Path::new("models").join(OMNIASR_CTC_300M_DIR).join("model.int8.onnx");
+        let tmp = extraction_tmp_path(&dest);
+        assert_eq!(tmp.parent(), dest.parent(), "the temp must live beside its dest (same filesystem rename)");
+        let name = tmp.file_name().expect("temp name").to_string_lossy().into_owned();
+        assert!(name.starts_with("model.int8.onnx.extracting-"), "{name}");
+    }
+
+    #[test]
+    fn download_supported_follows_the_pin_class_per_model() {
+        // The 300M archive hash was never recorded (archives are deleted after extraction), so its
+        // panel download stays OFF; the 1B archive was downloaded and pinned, so its explicit offline
+        // download is ON. Consistent with routed_archive_download_refuses_unpinned_archive_before_side_effects.
+        let m300 = MODELS.iter().find(|m| m.filename == OMNIASR_CTC_300M_MODEL).expect("300M entry");
+        assert!(!model_download_supported(m300), "an unpinned archive must not be auto-downloadable");
+        let t300 = MODELS.iter().find(|m| m.filename == OMNIASR_CTC_300M_TOKENS).expect("300M tokens entry");
+        assert!(!model_download_supported(t300), "tokens ride the same archive pin");
+
+        let m1b = MODELS.iter().find(|m| m.filename == OMNIASR_CTC_1B_MODEL).expect("1B entry");
+        assert!(model_download_supported(m1b), "the 1B archive is pinned and downloadable");
+
+        let vad = MODELS.iter().find(|m| m.filename == "silero_vad_v4.onnx").expect("VAD entry");
+        assert!(model_download_supported(vad), "a direct URL with a pin is downloadable");
+    }
+
+    #[test]
+    fn wsl7b_has_no_panel_download_and_causes_no_side_effects() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        let manager = ModelManager::new(models_dir.clone());
+        let progress_calls = Cell::new(0);
+
+        let err = manager
+            .download_omniasr(AsrModelSize::WSL7B, |_| progress_calls.set(progress_calls.get() + 1))
+            .expect_err("the champion is not a panel download");
+        assert!(err.contains("WSL"), "{err}");
+        assert_eq!(progress_calls.get(), 0, "the refusal must not emit progress");
+        assert!(!models_dir.exists(), "the refusal must not create model directories");
+    }
+
+    #[test]
+    fn present_support_models_short_circuit_their_downloads() {
+        // Size-aware early return: a file already at/above its floor reports complete with NO network
+        // call (a regression here would hit the network and fail loudly — nothing serves these URLs
+        // in a unit-test run).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        let manager = ModelManager::new(models_dir.clone());
+
+        std::fs::create_dir_all(models_dir.join(CAMPP_DIR)).expect("campp dir");
+        File::create(models_dir.join(CAMPP_MODEL)).expect("campp file").set_len(10_000_000).expect("campp size");
+        let last_progress = Cell::new(0.0_f32);
+        manager.download_campp(|p| last_progress.set(p)).expect("present CAM++ completes offline");
+        assert!((last_progress.get() - 1.0).abs() < f32::EPSILON, "got {}", last_progress.get());
+
+        std::fs::create_dir_all(models_dir.join(DENOISER_DIR)).expect("denoiser dir");
+        File::create(models_dir.join(DENOISER_MODEL)).expect("denoiser file").set_len(400_000).expect("denoiser size");
+        last_progress.set(0.0);
+        manager.download_denoiser(|p| last_progress.set(p)).expect("present denoiser completes offline");
+        assert!((last_progress.get() - 1.0).abs() < f32::EPSILON, "got {}", last_progress.get());
+    }
+
+    #[test]
+    fn download_model_without_a_url_fails_closed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        let manager = ModelManager::new(models_dir.clone());
+        // Field-shorthand on purpose: the provenance policy textually scans ModelInfo blocks for
+        // `url: "..."` manifest entries; these synthetic TEST values must not read as one.
+        let url = "";
+        let sha256 = "";
+        let no_url = ModelInfo {
+            name: "Synthetic Manual Install",
+            filename: "synthetic/manual.onnx",
+            url,
+            sha256,
+            min_size_bytes: 1,
+            version: "0",
+        };
+        let err = manager.download_model(&no_url, |_| {}).expect_err("no URL means manual install");
+        assert!(err.contains("No download URL configured"), "{err}");
+        assert!(!models_dir.exists(), "the refusal must not create model directories");
+    }
+
+    #[test]
+    fn model_path_prepares_its_parent_and_root_candidates_are_deduped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = ModelManager::new(tmp.path().join("models"));
+        let path = manager.model_path(CAMPP_MODEL);
+        assert_eq!(path, tmp.path().join("models").join(CAMPP_MODEL));
+        assert!(path.parent().expect("parent").is_dir(), "model_path must prepare the download target dir");
+
+        let roots = model_root_candidates();
+        assert!(roots.contains(&Path::new(env!("CARGO_MANIFEST_DIR")).join("models")));
+        for (index, root) in roots.iter().enumerate() {
+            assert!(!roots[..index].contains(root), "candidates must be deduped: {root:?}");
+        }
+    }
+
     fn create_minimal_300m_model_pair(model_dir: &Path) {
         std::fs::create_dir_all(model_dir.join(OMNIASR_CTC_300M_DIR)).expect("model dir");
         File::create(model_dir.join(OMNIASR_CTC_300M_MODEL))

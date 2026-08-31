@@ -1725,6 +1725,262 @@ mod tests {
         assert!(!engine.is_available());
     }
 
+    #[test]
+    fn provider_and_autotune_stay_within_documented_bounds() {
+        assert_eq!(detect_optimal_provider(false), "cpu", "gpu disabled must always mean cpu");
+
+        let tuned_1b = auto_tune_config(AsrLoadConfig {
+            model_size: AsrModelSize::CTC1B,
+            enable_gpu: false,
+            num_threads: 99,
+            language: "ckb".to_string(),
+        });
+        assert!((2..=8).contains(&tuned_1b.num_threads), "1B threads out of clamp: {}", tuned_1b.num_threads);
+        assert_eq!(tuned_1b.model_size, AsrModelSize::CTC1B, "tuning must not touch the engine selection");
+        assert!(!tuned_1b.enable_gpu, "tuning must not touch the GPU choice");
+        assert_eq!(tuned_1b.language, "ckb", "tuning must not touch the language");
+
+        let tuned_300m = auto_tune_config(AsrLoadConfig {
+            model_size: AsrModelSize::CTC300M,
+            enable_gpu: true,
+            num_threads: 99,
+            language: "ckb".to_string(),
+        });
+        assert!((1..=4).contains(&tuned_300m.num_threads), "300M threads out of clamp: {}", tuned_300m.num_threads);
+    }
+
+    #[test]
+    fn omniasr_paths_follow_the_size_directory_layout() {
+        let base = Path::new("m");
+        for (size, dir) in [
+            (AsrModelSize::CTC300M, "omniasr-ctc-300m"),
+            (AsrModelSize::CTC1B, "omniasr-ctc-1b"),
+            (AsrModelSize::WSL7B, "omniasr-wsl-7b"),
+        ] {
+            let (model, tokens) = omniasr_model_paths(base, &size);
+            assert_eq!(model, base.join(dir).join("model.int8.onnx"));
+            assert_eq!(tokens, base.join(dir).join("tokens.txt"));
+        }
+    }
+
+    #[test]
+    fn wsl7b_presence_is_exists_only_while_ctc_requires_min_sizes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // The champion marker dir has no local min-size contract: presence is exists-only. Its real
+        // identity is the WSL deploymentSha256 handshake, and loading files from here is refused
+        // anyway (unpinned_files_under_the_champions_provenance_id_are_refused_not_loaded).
+        let (m7, t7) = omniasr_model_paths(tmp.path(), &AsrModelSize::WSL7B);
+        write_sized_file(&m7, 0);
+        write_sized_file(&t7, 0);
+        assert!(omniasr_model_present(tmp.path(), &AsrModelSize::WSL7B));
+
+        // A zero-byte CTC pair is NOT present: a truncated download must never read as installed.
+        let (m3, t3) = omniasr_model_paths(tmp.path(), &AsrModelSize::CTC300M);
+        write_sized_file(&m3, 0);
+        write_sized_file(&t3, 0);
+        assert!(!omniasr_model_present(tmp.path(), &AsrModelSize::CTC300M));
+
+        // Model at its floor but tokens below theirs -> still absent (the pair is atomic).
+        write_sized_file(&m3, CTC_300M_MIN_MODEL_BYTES);
+        write_sized_file(&t3, CTC_MIN_TOKEN_BYTES - 1);
+        assert!(!omniasr_model_present(tmp.path(), &AsrModelSize::CTC300M));
+    }
+
+    #[test]
+    fn verify_model_dir_errors_name_the_missing_piece() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let absent = tmp.path().join("never-created");
+        assert!(verify_model_dir(&absent).expect_err("absent dir").contains("not found"));
+
+        let file = tmp.path().join("a-file");
+        std::fs::write(&file, b"x").expect("file");
+        assert!(verify_model_dir(&file).expect_err("file is not a dir").contains("Not a directory"));
+
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).expect("empty dir");
+        let err = verify_model_dir(&empty).expect_err("no model pair");
+        assert!(err.contains("OmniASR CTC 300M"), "error must name the required pair: {err}");
+
+        let (model, tokens) = omniasr_model_paths(&empty, &AsrModelSize::CTC300M);
+        write_sized_file(&model, CTC_300M_MIN_MODEL_BYTES);
+        write_sized_file(&tokens, CTC_MIN_TOKEN_BYTES);
+        assert!(verify_model_dir(&empty).is_ok());
+    }
+
+    #[test]
+    fn confidence_source_labels_are_stable_for_db_and_wire() {
+        // Downstream calibration (conformal certificate, IRT consensus, autonomy dial) keys on these
+        // strings; the DB label and the serde wire label must stay identical.
+        assert_eq!(ConfidenceSource::RealPosterior.as_db_value(), "real_posterior");
+        assert_eq!(ConfidenceSource::Heuristic.as_db_value(), "heuristic");
+        assert_eq!(serde_json::to_string(&ConfidenceSource::Heuristic).unwrap(), "\"heuristic\"");
+        assert_eq!(serde_json::to_string(&ConfidenceSource::RealPosterior).unwrap(), "\"real_posterior\"");
+        assert_eq!(ConfidenceSource::default(), ConfidenceSource::Heuristic);
+    }
+
+    #[test]
+    fn read_bounded_line_strips_terminators_and_fails_closed() {
+        use std::io::Cursor;
+
+        let mut two = Cursor::new(&b"hello\nworld"[..]);
+        assert_eq!(read_bounded_line(&mut two, 64).unwrap(), Some("hello".to_string()));
+        let err = read_bounded_line(&mut two, 64).expect_err("EOF mid-line is a truncated protocol");
+        assert!(err.contains("middle of a line"), "{err}");
+
+        let mut crlf = Cursor::new(&b"line\r\n"[..]);
+        assert_eq!(read_bounded_line(&mut crlf, 64).unwrap(), Some("line".to_string()));
+
+        let mut empty = Cursor::new(&b""[..]);
+        assert_eq!(read_bounded_line(&mut empty, 64).unwrap(), None);
+
+        let mut oversized = Cursor::new(vec![b'a'; 100]);
+        let err = read_bounded_line(&mut oversized, 16).expect_err("a malformed peer must not grow memory");
+        assert!(err.contains("exceeds 16 bytes"), "{err}");
+
+        let mut invalid = Cursor::new(&[0xff, 0xfe, b'\n'][..]);
+        let err = read_bounded_line(&mut invalid, 64).expect_err("non-UTF-8 protocol line");
+        assert!(err.contains("not UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn worker_protocol_wire_format_is_stable() {
+        let ready = serde_json::to_string(&WorkerResponse::Ready { ok: true, error: None }).unwrap();
+        assert!(ready.contains("\"kind\":\"ready\""), "{ready}");
+
+        let transcript = serde_json::to_string(&WorkerResponse::Transcript {
+            request_id: 7,
+            ok: true,
+            text: "سڵاو".to_string(),
+            confidence: Some(0.9),
+            confidence_source: ConfidenceSource::Heuristic,
+            error: None,
+        })
+        .unwrap();
+        assert!(transcript.contains("\"kind\":\"transcript\""), "{transcript}");
+        assert!(transcript.contains("\"confidence_source\":\"heuristic\""), "{transcript}");
+        match serde_json::from_str::<WorkerResponse>(&transcript).unwrap() {
+            WorkerResponse::Transcript { request_id, ok, text, .. } => {
+                assert_eq!((request_id, ok, text.as_str()), (7, true, "سڵاو"));
+            }
+            other => panic!("round-trip changed the variant: {other:?}"),
+        }
+
+        let startup = serde_json::to_string(&WorkerStartup::Native {
+            model_dir: PathBuf::from("m"),
+            config: AsrLoadConfig::default(),
+        })
+        .unwrap();
+        assert!(startup.contains("\"kind\":\"native\""), "{startup}");
+        match serde_json::from_str::<WorkerStartup>(&startup).unwrap() {
+            WorkerStartup::Native { model_dir, config } => {
+                assert_eq!(model_dir, PathBuf::from("m"));
+                assert_eq!(config, AsrLoadConfig::default());
+            }
+            other => panic!("round-trip changed the variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_executable_resolves_to_a_real_absolute_file() {
+        // Under the test harness (target/{profile}/deps) this exercises the deps-redirect branch;
+        // either the real app binary beside the profile dir or the current exe itself comes back.
+        let exe = worker_executable().expect("worker executable");
+        assert!(exe.is_absolute(), "{}", exe.display());
+        assert!(exe.is_file(), "{}", exe.display());
+        // The test harness was not launched in a special role, so the role dispatcher must decline.
+        assert!(run_special_process_mode().is_none());
+    }
+
+    #[test]
+    fn supervisor_rejects_oversized_or_non_finite_audio_before_any_process() {
+        let mut supervisor = AsrWorkerSupervisor {
+            executable: PathBuf::from("never-spawned"),
+            startup: WorkerStartup::CrashOnceThenEcho { marker: PathBuf::from("unused-marker") },
+            process: None,
+            next_request_id: 1,
+            consecutive_failures: 0,
+            retry_after: None,
+            circuit_open_until: None,
+        };
+
+        let oversized = vec![0.0_f32; WORKER_MAX_SAMPLES + 1];
+        let err = supervisor.transcribe(&oversized, SAMPLE_RATE).expect_err("over the 10-minute limit");
+        assert!(err.contains("10 minutes"), "{err}");
+
+        let err = supervisor.transcribe(&[0.0, f32::NAN], SAMPLE_RATE).expect_err("NaN audio");
+        assert!(err.contains("non-finite"), "{err}");
+
+        assert_eq!(supervisor.consecutive_failures, 0, "input guards must not charge the crash breaker");
+        assert!(supervisor.process.is_none(), "input guards must never spawn a worker");
+    }
+
+    #[test]
+    fn supervisor_spawn_failure_arms_backoff_then_the_circuit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut supervisor = AsrWorkerSupervisor {
+            executable: tmp.path().join("no-such-worker-binary.exe"),
+            startup: WorkerStartup::CrashOnceThenEcho { marker: tmp.path().join("marker") },
+            process: None,
+            next_request_id: 1,
+            consecutive_failures: 0,
+            retry_after: None,
+            circuit_open_until: None,
+        };
+
+        let err = supervisor.transcribe(&[0.0_f32; 160], SAMPLE_RATE).expect_err("unspawnable worker");
+        assert!(err.contains("start isolated ASR worker"), "{err}");
+        assert_eq!(supervisor.consecutive_failures, 1, "a spawn failure must charge the breaker");
+        assert!(supervisor.retry_after.is_some(), "the first failure arms the restart backoff");
+        assert!(supervisor.circuit_open_until.is_none(), "one failure must not open the circuit");
+
+        // Deterministic backoff refusal (no timing dependence on the real 250 ms window).
+        supervisor.retry_after = Some(Instant::now() + Duration::from_secs(60));
+        let err = supervisor.transcribe(&[0.0_f32; 160], SAMPLE_RATE).expect_err("backoff window");
+        assert!(err.contains("backoff is active"), "{err}");
+
+        // Reaching the failure threshold opens the circuit, which then refuses with its own message.
+        supervisor.retry_after = None;
+        supervisor.consecutive_failures = WORKER_CIRCUIT_FAILURES - 1;
+        supervisor.record_failure();
+        assert!(supervisor.circuit_open_until.is_some(), "the threshold failure must open the circuit");
+        assert!(supervisor.retry_after.is_none(), "the open circuit replaces per-attempt backoff");
+        let err = supervisor.transcribe(&[0.0_f32; 160], SAMPLE_RATE).expect_err("open circuit");
+        assert!(err.contains("circuit is open"), "{err}");
+    }
+
+    #[test]
+    fn switching_the_model_dir_resets_cached_pool_services() {
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let pool = AsrPool::new();
+        let config = AsrLoadConfig::default();
+
+        assert!(pool.ensure_loaded(dir_a.path(), &config));
+        assert!(!pool.is_available(dir_a.path(), &config));
+
+        // A different dir must drop every cached service and re-attempt against the new root.
+        assert!(pool.ensure_loaded(dir_b.path(), &config), "a dir switch must re-attempt the load");
+        assert!(!pool.is_available(dir_b.path(), &config));
+    }
+
+    #[test]
+    fn bundled_repo_fixture_passes_the_model_startup_checks() {
+        // The repository bundles Silero VAD + the 300M pair (asserted by models.rs's
+        // bundled_runtime_models_count_as_available_when_user_dir_is_empty); the startup checks must
+        // accept that fixture rather than red a clean checkout.
+        assert!(check_models().is_ok(), "{:?}", check_models());
+        let warnings = check_model_integrity();
+        assert!(
+            !warnings.iter().any(|w| w.contains("silero_vad_v4")),
+            "bundled VAD must pass its integrity floor: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("omniasr-ctc-300m")),
+            "bundled 300M pair must pass its integrity floors: {warnings:?}"
+        );
+    }
+
     fn write_sized_file(path: &Path, size_bytes: u64) {
         std::fs::create_dir_all(path.parent().expect("parent dir")).expect("create parent dir");
         let file = std::fs::File::create(path).expect("create model fixture");

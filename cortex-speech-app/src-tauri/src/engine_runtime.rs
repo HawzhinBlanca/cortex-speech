@@ -1557,4 +1557,148 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn read_bounded_pipe_retains_within_limit_and_flags_excess() {
+        let signal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let under = read_bounded_pipe(&b"abc"[..], 10, std::sync::Arc::clone(&signal)).expect("bounded read");
+        assert_eq!(under.retained, b"abc");
+        assert!(!under.exceeded);
+        assert!(!signal.load(std::sync::atomic::Ordering::SeqCst));
+
+        let flood = vec![b'x'; 100];
+        let over = read_bounded_pipe(&flood[..], 10, std::sync::Arc::clone(&signal)).expect("bounded read");
+        assert_eq!(over.retained.len(), 10, "retention must stop at the limit");
+        assert!(over.exceeded, "the overflow must be reported in-band");
+        assert!(signal.load(std::sync::atomic::Ordering::SeqCst), "the overflow must also trip the kill signal");
+    }
+
+    #[test]
+    fn champion_health_match_requires_every_identity_axis() {
+        let expected = crate::registry::DeploymentIdentity {
+            model_version_id: "candidate-1".into(),
+            deployment_sha256: "a".repeat(64),
+        };
+        let loaded = parse_health_marker(&health_json("candidate-1", &"a".repeat(64))).unwrap();
+        assert!(loaded.matches(&expected), "the untouched reply must match");
+
+        let mut wrong_schema = loaded.clone();
+        wrong_schema.schema = 2;
+        assert!(!wrong_schema.matches(&expected), "an unknown schema is not ready");
+
+        let mut loading = loaded.clone();
+        loading.status = "loading".into();
+        assert!(!loading.matches(&expected), "a still-loading server is not ready");
+
+        let mut wrong_protocol = loaded.clone();
+        wrong_protocol.protocol = "some-other-protocol".into();
+        assert!(!wrong_protocol.matches(&expected), "a foreign protocol on the port is not the champion");
+
+        let mut wrong_protocol_version = loaded.clone();
+        wrong_protocol_version.protocol_version += 1;
+        assert!(!wrong_protocol_version.matches(&expected), "a protocol version bump is not this build's champion");
+
+        let mut wrong_family = loaded.clone();
+        wrong_family.family = "some-other-family".into();
+        assert!(!wrong_family.matches(&expected), "an open port from another family is never the champion");
+
+        let mut wrong_language = loaded.clone();
+        wrong_language.language = "en".into();
+        assert!(!wrong_language.matches(&expected), "the champion serves ckb_Arab, nothing else");
+    }
+
+    #[test]
+    fn health_parser_rejects_non_canonical_or_foreign_identity_fields() {
+        // Uppercase hex is not the canonical form the registry stores — refuse, never normalize.
+        let err = parse_health_marker(&health_json("candidate-1", &"A".repeat(64))).unwrap_err();
+        assert!(err.contains("canonical SHA-256"), "{err}");
+        let err = parse_health_marker(&health_json("candidate-1", &"a".repeat(63))).unwrap_err();
+        assert!(err.contains("canonical SHA-256"), "{err}");
+
+        // The model id passes through the app-wide identifier boundary (no path metacharacters).
+        let err = parse_health_marker(&health_json("cand/../1", &"a".repeat(64))).unwrap_err();
+        assert!(err.contains("model identity is invalid"), "{err}");
+
+        let valid = health_json("candidate-1", &"a".repeat(64));
+        let empty_worker = valid.replace("\"worker\":\"gpu0\"", "\"worker\":\"  \"");
+        let err = parse_health_marker(&empty_worker).unwrap_err();
+        assert!(err.contains("worker/provenance"), "{err}");
+
+        let foreign_provenance = valid.replace("\"provenanceKind\":\"flywheel\"", "\"provenanceKind\":\"handmade\"");
+        let err = parse_health_marker(&foreign_provenance).unwrap_err();
+        assert!(err.contains("worker/provenance"), "{err}");
+
+        // deny_unknown_fields: a reply with extra keys is not this protocol.
+        let extra_field = valid.replace("\"worker\":\"gpu0\"", "\"worker\":\"gpu0\",\"extra\":1");
+        let err = parse_health_marker(&extra_field).unwrap_err();
+        assert!(err.contains("invalid"), "{err}");
+    }
+
+    #[test]
+    fn server_script_is_found_beside_the_start_script_and_in_resources() {
+        // CORTEX_7B_START_SCRIPT points at a sibling launcher: the server script beside it wins.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scripts = tmp.path().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(scripts.join("cortex_7b_server.py"), b"# champion server").unwrap();
+        let start = scripts.join("start_7b.cmd").to_string_lossy().into_owned();
+        let found = resolve_server_script(None, Some(start), None, None)
+            .expect("the script beside the start script must be found");
+        assert!(found.ends_with("cortex_7b_server.py"), "{found}");
+        assert!(std::path::Path::new(&found).is_file(), "{found}");
+
+        // A bundled install: nothing beside the exe, but the resource dir carries scripts/.
+        let bundle = tempfile::TempDir::new().unwrap();
+        let resources = bundle.path().join("resources");
+        std::fs::create_dir_all(resources.join("scripts")).unwrap();
+        std::fs::write(resources.join("scripts").join("cortex_7b_server.py"), b"# champion server").unwrap();
+        let empty_exe_dir = bundle.path().join("exe");
+        std::fs::create_dir_all(&empty_exe_dir).unwrap();
+        let found = resolve_server_script(None, None, Some(&empty_exe_dir), Some(&resources))
+            .expect("the resource-dir fallback must find the bundled script");
+        assert!(found.ends_with("cortex_7b_server.py"), "{found}");
+    }
+
+    #[test]
+    fn an_active_promotion_reads_as_a_temporary_operational_block() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        SHUTTING_DOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+        PROMOTION_RECOVERY_BLOCKED.store(false, std::sync::atomic::Ordering::SeqCst);
+        PROMOTION_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(champion_operational_block_reason().is_none());
+        let lease = acquire_promotion_lease().expect("the lease is free");
+        let reason = champion_operational_block_reason().expect("an active promotion must block readiness");
+        assert!(reason.contains("in progress"), "{reason}");
+        drop(lease);
+        assert!(champion_operational_block_reason().is_none(), "dropping the lease must unblock readiness");
+    }
+
+    #[test]
+    fn contained_command_zero_output_or_memory_limits_fail_before_spawn() {
+        let mut zero_stdout = contained_spec(Duration::from_secs(1));
+        zero_stdout.max_stdout_bytes = 0;
+        let error = run_contained_command(Command::new("this-binary-must-never-be-resolved"), zero_stdout)
+            .expect_err("a zero stdout limit is invalid");
+        assert!(matches!(error, ContainedCommandError::InvalidConfiguration(_)));
+
+        let mut zero_memory = contained_spec(Duration::from_secs(1));
+        zero_memory.process_memory_limit_bytes = Some(0);
+        let error = run_contained_command(Command::new("this-binary-must-never-be-resolved"), zero_memory)
+            .expect_err("a zero-byte memory ceiling is invalid");
+        assert!(matches!(error, ContainedCommandError::InvalidConfiguration(_)));
+    }
+
+    #[test]
+    fn contained_command_unresolvable_binary_is_a_spawn_error() {
+        let command = Command::new("this-binary-must-never-be-resolved");
+        let error = run_contained_command(command, contained_spec(Duration::from_secs(1)))
+            .expect_err("an unresolvable binary cannot start");
+        match error {
+            ContainedCommandError::Spawn(message) => {
+                assert!(message.contains("could not spawn contained process"), "{message}");
+            }
+            other => panic!("expected a spawn failure, got {other:?}"),
+        }
+    }
 }

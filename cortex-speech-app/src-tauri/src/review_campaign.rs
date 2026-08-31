@@ -1589,8 +1589,17 @@ mod tests {
     }
 
     fn seeded_first_pass(count: usize) -> (Database, HashSet<String>, SequentialReviewCampaign, tempfile::TempDir) {
+        seeded_first_pass_with_decisions(count, count)
+    }
+
+    /// Same fixture, but only the first `decided` clips (in sorted order) carry Rubar's effective
+    /// phone decision — the honest way to build a genuinely incomplete first pass.
+    fn seeded_first_pass_with_decisions(
+        count: usize,
+        decided: usize,
+    ) -> (Database, HashSet<String>, SequentialReviewCampaign, tempfile::TempDir) {
         let temp = tempfile::tempdir().unwrap();
-        let db = Database::open(":memory:").unwrap();
+        let db = Database::open(temp.path().join("campaign.db").to_str().unwrap()).unwrap();
         db.initialize().unwrap();
         let ids: HashSet<String> = (0..count).map(|index| format!("campaign-segment-{index:02}")).collect();
         let focus = focus_evidence(&ids).unwrap();
@@ -1655,20 +1664,22 @@ mod tests {
                     rusqlite::params![id, content_hash],
                 )
                 .unwrap();
-            let operation_id = format!("00000000-0000-4000-8000-{:012x}", index + 1);
-            let payload_hash = crate::db::review_operation_payload_hash(id, "accept", &raw, "Rubar");
-            let served_revision = db.segment_review_revision(id).unwrap().unwrap();
-            db.record_phone_human_decision_by_at_revision_with_operation(
-                id,
-                "accept",
-                Some(&raw),
-                "Rubar",
-                served_revision,
-                &operation_id,
-                &payload_hash,
-            )
-            .unwrap()
-            .unwrap();
+            if index < decided {
+                let operation_id = format!("00000000-0000-4000-8000-{:012x}", index + 1);
+                let payload_hash = crate::db::review_operation_payload_hash(id, "accept", &raw, "Rubar");
+                let served_revision = db.segment_review_revision(id).unwrap().unwrap();
+                db.record_phone_human_decision_by_at_revision_with_operation(
+                    id,
+                    "accept",
+                    Some(&raw),
+                    "Rubar",
+                    served_revision,
+                    &operation_id,
+                    &payload_hash,
+                )
+                .unwrap()
+                .unwrap();
+            }
         }
         (db, ids, policy, temp)
     }
@@ -2206,5 +2217,527 @@ mod tests {
         assert!(output.join("manifest.json").is_file());
         assert!(output.join("SHA256SUMS").is_file());
         assert!(output.join("_COMPLETE.json").is_file());
+    }
+
+    /// Record one effective Alle decision through the production writer, mirroring the couch
+    /// caller's exact requested_action/requested_transcript shapes ("bad" + "" for a reject).
+    fn record_alle(
+        db: &Database,
+        policy: &SequentialReviewCampaign,
+        segment_id: &str,
+        action: &str,
+        text: Option<&str>,
+        requested_action: &str,
+        operation_suffix: u32,
+    ) -> i64 {
+        let segment = db.get_segment_by_id(segment_id).unwrap().unwrap();
+        let raw = segment.raw_transcript.clone();
+        let content_hash = db.segment_audio_content_hash(segment_id).unwrap().unwrap();
+        let source_span = db.segment_source_span(segment_id).unwrap().unwrap();
+        let served_revision = db.segment_review_revision(segment_id).unwrap().unwrap();
+        let requested_transcript = text.unwrap_or("");
+        let operation_id = format!("40000000-0000-4000-8000-{operation_suffix:012x}");
+        let payload_hash =
+            crate::db::review_operation_payload_hash(segment_id, requested_action, requested_transcript, "Alle");
+        let input = IndependentDecisionInput {
+            segment_id,
+            reviewer: "Alle",
+            action,
+            submitted_transcript: text,
+            served_transcript: &raw,
+            served_revision,
+            audio_content_hash: Some(&content_hash),
+            playback_authority_session_id: None,
+            source_start_ms: Some(source_span.0),
+            source_end_ms: Some(source_span.1),
+            duration_ms: 1_000,
+            requested_action,
+            requested_transcript,
+            operation_id: &operation_id,
+            operation_payload_hash: &payload_hash,
+            created_at_ms: 9_000 + operation_suffix as i64,
+        };
+        record_independent_decision(db, policy, &input).unwrap().unwrap()
+    }
+
+    #[test]
+    fn policy_validation_refuses_every_malformed_field() {
+        fn expect_invalid(mutate: impl FnOnce(&mut SequentialReviewCampaign), needle: &str) {
+            let mut policy = valid_policy();
+            mutate(&mut policy);
+            let error = parse(&serde_json::to_string(&policy).unwrap()).unwrap_err();
+            assert!(error.contains(needle), "expected {needle:?} in {error}");
+        }
+        expect_invalid(|policy| policy.schema_version = 2, "schema_version must be 1");
+        expect_invalid(|policy| policy.campaign_id = "not-a-uuid".into(), "must be a canonical UUID");
+        expect_invalid(
+            |policy| policy.campaign_id = "123E4567-E89B-42D3-A456-426614174000".into(),
+            "lowercase hyphenated UUID",
+        );
+        expect_invalid(|policy| policy.mode = "flexible_pool".into(), "mode/status is unsupported");
+        expect_invalid(|policy| policy.status = "second_pass_active".into(), "mode/status is unsupported");
+        expect_invalid(|policy| policy.reviewer = "   ".into(), "invalid reviewer");
+        expect_invalid(|policy| policy.reviewer = "Ru\tbar".into(), "invalid reviewer");
+        expect_invalid(|policy| policy.reviewer = "R".repeat(MAX_REVIEWER_NAME + 1), "invalid reviewer");
+        expect_invalid(|policy| policy.reviewer = "Sara".into(), "authorized only for Rubar");
+        expect_invalid(|policy| policy.after_review_event_id = -1, "invalid event boundary or focus size");
+        expect_invalid(|policy| policy.activated_at_review_event_id = 100, "invalid event boundary or focus size");
+        expect_invalid(|policy| policy.focus_segment_count = 0, "invalid event boundary or focus size");
+        expect_invalid(|policy| policy.focus_sha256 = "a".repeat(63), "lowercase SHA-256");
+        expect_invalid(|policy| policy.focus_sha256 = "A".repeat(64), "lowercase SHA-256");
+        expect_invalid(|policy| policy.focus_sha256 = "g".repeat(64), "lowercase SHA-256");
+    }
+
+    #[test]
+    fn focus_evidence_refuses_empty_and_newline_bearing_ids() {
+        for bad in ["", "seg\nnewline", "seg\rreturn"] {
+            let ids = HashSet::from([bad.to_string()]);
+            let error = focus_evidence(&ids).unwrap_err();
+            assert!(error.contains("empty or newline-bearing"), "{error}");
+        }
+    }
+
+    #[test]
+    fn reversal_operation_id_is_deterministic_domain_separated_and_rfc9562_shaped() {
+        let forward = "123e4567-e89b-42d3-a456-426614174000";
+        let derived = independent_reversal_operation_id(forward).unwrap();
+        assert_eq!(derived, independent_reversal_operation_id(forward).unwrap());
+        assert_ne!(derived, forward, "a reversal must never reuse the forward identity");
+        assert_ne!(derived, independent_reversal_operation_id("123e4567-e89b-42d3-a456-426614174001").unwrap());
+        let parsed = uuid::Uuid::parse_str(&derived).unwrap();
+        assert_eq!(parsed.hyphenated().to_string(), derived);
+        let chars: Vec<char> = derived.chars().collect();
+        assert_eq!(chars[14], '5', "version nibble must be 5 in {derived}");
+        assert!(matches!(chars[19], '8' | '9' | 'a' | 'b'), "variant nibble is wrong in {derived}");
+        assert!(independent_reversal_operation_id("not-a-uuid").is_err());
+        assert!(independent_reversal_operation_id("123E4567-E89B-42D3-A456-426614174000").is_err());
+    }
+
+    #[test]
+    fn orphan_progress_without_base_policy_is_refused_and_fails_export_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("orphan.db").to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        db.connection()
+            .execute("INSERT INTO settings(key,value) VALUES(?1,'{}')", [SEQUENTIAL_CAMPAIGN_PROGRESS_SETTINGS_KEY])
+            .unwrap();
+        let error = load(&db).unwrap_err();
+        assert!(error.contains("without its base campaign policy"), "{error}");
+        let production = require_finalized_production_export(&db, "production export").unwrap_err().to_string();
+        assert!(production.contains("campaign authority failed"), "{production}");
+        let generic = require_export_unblocked(&db, "generic export").unwrap_err().to_string();
+        assert!(generic.contains("cannot be proven"), "{generic}");
+
+        let empty = Database::open(dir.path().join("empty.db").to_str().unwrap()).unwrap();
+        empty.initialize().unwrap();
+        let missing = require_finalized_production_export(&empty, "production export").unwrap_err().to_string();
+        assert!(missing.contains("no completed sequential campaign"), "{missing}");
+    }
+
+    #[test]
+    fn second_pass_activation_refuses_wrong_focus_bad_boundaries_and_incomplete_first_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = Database::open(dir.path().join("bare.db").to_str().unwrap()).unwrap();
+        bare.initialize().unwrap();
+        let none = activate_second_pass(&bare, &HashSet::from(["clip-x".to_string()]), 0).unwrap_err();
+        assert!(none.contains("no sequential review campaign is active"), "{none}");
+
+        let (db, ids, policy, _temp) = seeded_first_pass_with_decisions(2, 1);
+        let status = first_pass_status_for_focus(&db, &policy, &ids).unwrap();
+        assert_eq!(status.focus_segment_count, 2);
+        assert_eq!(status.completed_segment_count, 1);
+        assert_eq!(status.pending_segment_count, 1);
+        assert_eq!(status.max_review_event_id, db.max_review_event_id().unwrap());
+
+        let mut wrong_focus = ids.clone();
+        wrong_focus.insert("smuggled-extra-clip".into());
+        let wrong = activate_second_pass(&db, &wrong_focus, db.max_review_event_id().unwrap()).unwrap_err();
+        assert!(wrong.contains("does not match the immutable first-pass policy"), "{wrong}");
+
+        let early = activate_second_pass(&db, &ids, -1).unwrap_err();
+        assert!(early.contains("predates campaign activation"), "{early}");
+
+        let maximum = db.max_review_event_id().unwrap();
+        let stale = activate_second_pass(&db, &ids, maximum + 7).unwrap_err();
+        assert!(stale.contains("compare-and-swap failed"), "{stale}");
+
+        let incomplete = activate_second_pass(&db, &ids, maximum).unwrap_err();
+        assert!(incomplete.contains("first pass is not complete: 1/2"), "{incomplete}");
+        // The refused IMMEDIATE transaction must leave zero campaign authority behind.
+        let reloaded = load(&db).unwrap().unwrap();
+        assert!(reloaded.progress.is_none());
+        assert_eq!(reloaded.phase(), CampaignPhase::FirstPassActive);
+    }
+
+    #[test]
+    fn independent_review_surfaces_refuse_while_the_first_pass_is_active() {
+        let (db, ids, _, _temp) = seeded_first_pass(1);
+        let policy = load(&db).unwrap().unwrap();
+        assert_eq!(policy.phase(), CampaignPhase::FirstPassActive);
+        assert!(!policy.is_blinded_second_pass());
+        assert!(!policy.is_completed());
+        let id = ids.iter().next().unwrap();
+
+        let queue = independent_pending_segment_ids(&db, &policy).unwrap_err();
+        assert!(queue.contains("only during second_pass_active"), "{queue}");
+        assert!(!independent_segment_pending(&db, &policy, id).unwrap());
+
+        let junk_hash = "a".repeat(64);
+        let input = IndependentDecisionInput {
+            segment_id: id,
+            reviewer: "Alle",
+            action: "accept",
+            submitted_transcript: Some("champion raw 0"),
+            served_transcript: "champion raw 0",
+            served_revision: 1,
+            audio_content_hash: None,
+            playback_authority_session_id: None,
+            source_start_ms: None,
+            source_end_ms: None,
+            duration_ms: 1_000,
+            requested_action: "accept",
+            requested_transcript: "champion raw 0",
+            operation_id: "20000000-0000-4000-8000-000000000201",
+            operation_payload_hash: junk_hash.as_str(),
+            created_at_ms: 1,
+        };
+        let decision = record_independent_decision(&db, &policy, &input).unwrap_err();
+        assert!(decision.contains("outside the active Alle second pass"), "{decision}");
+        let reversal = reverse_independent_decision(&db, &policy, 1, "Alle", "20000000-0000-4000-8000-000000000202", 1)
+            .unwrap_err();
+        assert!(reversal.contains("outside the active Alle second pass"), "{reversal}");
+        let adjudicate = adjudicate_and_advance(&db, &[]).unwrap_err();
+        assert!(adjudicate.contains("not ready for second-pass adjudication"), "{adjudicate}");
+        let production = require_finalized_production_export(&db, "production export").unwrap_err().to_string();
+        assert!(production.contains("is first_pass_active"), "{production}");
+    }
+
+    #[test]
+    fn independent_decision_refuses_invalid_evidence_and_reports_stale_serves_as_none() {
+        let (db, ids, _, _temp) = seeded_first_pass(1);
+        activate_second_pass(&db, &ids, db.max_review_event_id().unwrap()).unwrap();
+        let policy = load(&db).unwrap().unwrap();
+        let id = ids.iter().next().unwrap();
+        let segment = db.get_segment_by_id(id).unwrap().unwrap();
+        let raw = segment.raw_transcript.clone();
+        let content_hash = db.segment_audio_content_hash(id).unwrap().unwrap();
+        let source_span = db.segment_source_span(id).unwrap().unwrap();
+        let served_revision = db.segment_review_revision(id).unwrap().unwrap();
+        let accept_hash = crate::db::review_operation_payload_hash(id, "accept", &raw, "Alle");
+        let base = IndependentDecisionInput {
+            segment_id: id,
+            reviewer: "Alle",
+            action: "accept",
+            submitted_transcript: Some(&raw),
+            served_transcript: &raw,
+            served_revision,
+            audio_content_hash: Some(&content_hash),
+            playback_authority_session_id: None,
+            source_start_ms: Some(source_span.0),
+            source_end_ms: Some(source_span.1),
+            duration_ms: 1_000,
+            requested_action: "accept",
+            requested_transcript: &raw,
+            operation_id: "20000000-0000-4000-8000-000000000301",
+            operation_payload_hash: &accept_hash,
+            created_at_ms: 5_000,
+        };
+        let expect_refused = |input: IndependentDecisionInput<'_>, needle: &str| {
+            let error = record_independent_decision(&db, &policy, &input).unwrap_err();
+            assert!(error.contains(needle), "expected {needle:?} in {error}");
+        };
+        let mut wrong_reviewer = base.clone();
+        wrong_reviewer.reviewer = "Sara";
+        expect_refused(wrong_reviewer, "outside the active Alle second pass");
+        let mut bad_operation = base.clone();
+        bad_operation.operation_id = "not-a-uuid";
+        expect_refused(bad_operation, "must be a canonical UUID");
+        let mut bad_hash = base.clone();
+        bad_hash.operation_payload_hash = "Z";
+        expect_refused(bad_hash, "invalid operation or timing evidence");
+        let mut bad_created = base.clone();
+        bad_created.created_at_ms = 0;
+        expect_refused(bad_created, "invalid operation or timing evidence");
+        let mut bad_revision = base.clone();
+        bad_revision.served_revision = -1;
+        expect_refused(bad_revision, "invalid operation or timing evidence");
+        let mut bad_duration = base.clone();
+        bad_duration.duration_ms = -1;
+        expect_refused(bad_duration, "invalid operation or timing evidence");
+        let mut accept_without_text = base.clone();
+        accept_without_text.submitted_transcript = None;
+        expect_refused(accept_without_text, "action/transcript is invalid");
+        let mut reject_with_text = base.clone();
+        reject_with_text.action = "reject";
+        expect_refused(reject_with_text, "action/transcript is invalid");
+        let mut unknown_action = base.clone();
+        unknown_action.action = "approve";
+        expect_refused(unknown_action, "action/transcript is invalid");
+        let foreign_hash = crate::db::review_operation_payload_hash(id, "accept", &raw, "Sara");
+        let mut smuggled_identity = base.clone();
+        smuggled_identity.operation_payload_hash = &foreign_hash;
+        expect_refused(smuggled_identity, "does not match the campaign's canonical reviewer identity");
+        let skip_hash = crate::db::review_operation_payload_hash(id, "skip", "", "Alle");
+        let mut armed_skip = base.clone();
+        armed_skip.action = "skip";
+        armed_skip.submitted_transcript = None;
+        armed_skip.requested_action = "skip";
+        armed_skip.requested_transcript = "";
+        armed_skip.operation_payload_hash = &skip_hash;
+        armed_skip.playback_authority_session_id = Some("fixture-authority");
+        expect_refused(armed_skip, "skip must not consume a playback authority");
+
+        // A well-formed decision against a stale served revision is a no-op, not an error.
+        let mut stale = base.clone();
+        stale.served_revision = served_revision + 1;
+        assert_eq!(record_independent_decision(&db, &policy, &stale).unwrap(), None);
+        assert!(independent_segment_pending(&db, &policy, id).unwrap());
+
+        // The real skip commits, stores no audio evidence, and is visible through the receipts.
+        let mut skip = base.clone();
+        skip.action = "skip";
+        skip.submitted_transcript = None;
+        skip.requested_action = "skip";
+        skip.requested_transcript = "";
+        skip.operation_payload_hash = &skip_hash;
+        let decision_id = record_independent_decision(&db, &policy, &skip).unwrap().unwrap();
+        let stored: (String, Option<String>) = db
+            .connection()
+            .query_row(
+                "SELECT reviewer, audio_content_hash FROM independent_review_decisions WHERE id=?1",
+                [decision_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("Alle".to_string(), None));
+        let receipt = independent_operation(&db, base.operation_id).unwrap().unwrap();
+        assert_eq!(
+            (receipt.decision_id, receipt.segment_id.as_str(), receipt.reviewer.as_str()),
+            (decision_id, id.as_str(), "Alle")
+        );
+        assert_eq!(receipt.operation_payload_hash, skip_hash);
+        assert_eq!(independent_operation(&db, "20000000-0000-4000-8000-000000000999").unwrap(), None);
+        let latest = latest_independent_decision(&db, &policy.campaign_id, "alle").unwrap().unwrap();
+        assert_eq!(latest, (decision_id, id.clone(), base.operation_id.to_string()));
+        assert_eq!(latest_independent_decision(&db, &policy.campaign_id, "Sara").unwrap(), None);
+        reverse_independent_decision(&db, &policy, decision_id, "Alle", "20000000-0000-4000-8000-000000000302", 6_000)
+            .unwrap();
+        assert_eq!(latest_independent_decision(&db, &policy.campaign_id, "Alle").unwrap(), None);
+        assert!(independent_segment_pending(&db, &policy, id).unwrap());
+    }
+
+    #[test]
+    fn independent_reversal_refuses_identity_swaps_and_missing_targets() {
+        let (db, ids, _, _temp) = seeded_first_pass(1);
+        activate_second_pass(&db, &ids, db.max_review_event_id().unwrap()).unwrap();
+        let policy = load(&db).unwrap().unwrap();
+        let id = ids.iter().next().unwrap();
+        let raw = db.get_segment_by_id(id).unwrap().unwrap().raw_transcript;
+        let decision_id = record_alle(&db, &policy, id, "accept", Some(&raw), "accept", 0x401);
+        let wrong_reviewer = reverse_independent_decision(
+            &db,
+            &policy,
+            decision_id,
+            "Sara",
+            "20000000-0000-4000-8000-000000000402",
+            7_000,
+        )
+        .unwrap_err();
+        assert!(wrong_reviewer.contains("outside the active Alle second pass"), "{wrong_reviewer}");
+        reverse_independent_decision(&db, &policy, decision_id, "Alle", "20000000-0000-4000-8000-000000000402", 7_100)
+            .unwrap();
+        let second_identity = reverse_independent_decision(
+            &db,
+            &policy,
+            decision_id,
+            "Alle",
+            "20000000-0000-4000-8000-000000000403",
+            7_200,
+        )
+        .unwrap_err();
+        assert!(second_identity.contains("already has another reversal identity"), "{second_identity}");
+        let missing =
+            reverse_independent_decision(&db, &policy, 9_999, "Alle", "20000000-0000-4000-8000-000000000404", 7_300)
+                .unwrap_err();
+        assert!(missing.contains("target is missing or outside this campaign"), "{missing}");
+    }
+
+    #[test]
+    fn conflicts_advance_to_adjudication_and_seal_only_by_explicit_manual_resolution() {
+        let (db, ids, _, _temp) = seeded_first_pass(3);
+        activate_second_pass(&db, &ids, db.max_review_event_id().unwrap()).unwrap();
+        let policy = load(&db).unwrap().unwrap();
+        let mut sorted: Vec<String> = ids.iter().cloned().collect();
+        sorted.sort();
+        let agreed_raw = db.get_segment_by_id(&sorted[0]).unwrap().unwrap().raw_transcript;
+        record_alle(&db, &policy, &sorted[0], "accept", Some(&agreed_raw), "accept", 0x501);
+        record_alle(&db, &policy, &sorted[1], "reject", None, "bad", 0x502);
+        record_alle(&db, &policy, &sorted[2], "edit", Some("second reviewer heard something else"), "edit", 0x503);
+
+        let adjudicating = adjudicate_and_advance(&db, &[]).unwrap();
+        assert_eq!(adjudicating.phase, CampaignPhase::AdjudicationActive);
+        assert_eq!(adjudicating.independent_decision_count, 3);
+        assert_eq!(adjudicating.adjudication_count, 1);
+        assert_eq!(adjudicating.conflicts_remaining, 2);
+
+        let adjudication_policy = load(&db).unwrap().unwrap();
+        assert_eq!(adjudication_policy.phase(), CampaignPhase::AdjudicationActive);
+        assert_eq!(adjudication_policy.authorized_reviewer(), None);
+        assert!(!adjudication_policy.is_blinded_second_pass());
+        assert!(independent_pending_segment_ids(&db, &adjudication_policy).is_err());
+
+        let unresolved = adjudicate_and_advance(&db, &[]).unwrap_err();
+        assert!(unresolved.contains("2 campaign conflicts still require explicit manual adjudication"), "{unresolved}");
+
+        let manual = |segment_id: &str, action: &str, text: Option<&str>, adjudicator: &str| ManualAdjudication {
+            segment_id: segment_id.to_string(),
+            final_action: action.to_string(),
+            final_transcript: text.map(str::to_string),
+            adjudicator: adjudicator.to_string(),
+        };
+        for (bad, needle) in [
+            (vec![manual(&sorted[1], "reject", None, "system:sneaky")], "reserved system identity"),
+            (vec![manual("", "reject", None, "Hemn")], "reserved system identity"),
+            (
+                vec![manual(&sorted[1], "reject", None, "Hemn"), manual(&sorted[1], "reject", None, "Nechir")],
+                "reserved system identity",
+            ),
+            (vec![manual(&sorted[1], "retain", None, "Hemn")], "action/transcript is invalid"),
+            (vec![manual(&sorted[1], "reject", Some("residual text"), "Hemn")], "action/transcript is invalid"),
+            (vec![manual(&sorted[1], "keep", Some("residual text"), "Hemn")], "action/transcript is invalid"),
+            (vec![manual(&sorted[0], "reject", None, "Hemn")], "already sealed or outside the campaign"),
+            (vec![manual("ghost-clip", "reject", None, "Hemn")], "already sealed or outside the campaign"),
+        ] {
+            let error = adjudicate_and_advance(&db, &bad).unwrap_err();
+            assert!(error.contains(needle), "expected {needle:?} in {error}");
+        }
+
+        let completed = adjudicate_and_advance(
+            &db,
+            &[
+                manual(&sorted[1], "reject", None, "Hemn"),
+                manual(&sorted[2], "retain", Some("second reviewer heard something else"), "Nechir"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(completed.phase, CampaignPhase::Completed);
+        assert_eq!(completed.adjudication_count, 3);
+        assert_eq!(completed.conflicts_remaining, 0);
+        let final_policy = require_finalized_production_export(&db, "production export").unwrap();
+        assert!(final_policy.is_completed());
+        assert_eq!(final_policy.authorized_reviewer(), None);
+        assert!(!independent_segment_pending(&db, &final_policy, &sorted[0]).unwrap());
+    }
+
+    #[test]
+    fn completion_validators_refuse_mismatched_policies_and_missing_second_pass_work() {
+        let (db, ids, _, _temp) = seeded_first_pass(1);
+        activate_second_pass(&db, &ids, db.max_review_event_id().unwrap()).unwrap();
+        let policy = load(&db).unwrap().unwrap();
+        verify_registered_focus(&db, &policy).unwrap();
+        let mut foreign_focus = policy.clone();
+        foreign_focus.focus_sha256 = "b".repeat(64);
+        let digest = verify_registered_focus(&db, &foreign_focus).unwrap_err();
+        assert!(digest.contains("registered campaign focus changed"), "{digest}");
+        let mut wider = policy.clone();
+        wider.focus_segment_count = 2;
+        let first_pass = verify_first_pass_complete(&db, &wider).unwrap_err();
+        assert!(first_pass.contains("first pass is incomplete or inconsistent"), "{first_pass}");
+        let second_pass = verify_independent_pass_complete(&db, &policy).unwrap_err();
+        assert!(second_pass.contains("independent pass is incomplete: 0/1"), "{second_pass}");
+        let completion = verify_campaign_completion(&db, &policy).unwrap_err();
+        assert!(completion.contains("independent pass is incomplete"), "{completion}");
+        let status = first_pass_status_for_focus(&db, &policy, &ids).unwrap_err();
+        assert!(status.contains("only before second-pass activation"), "{status}");
+        let again = activate_second_pass(&db, &ids, db.max_review_event_id().unwrap()).unwrap_err();
+        assert!(again.contains("not at the first-pass transition boundary"), "{again}");
+    }
+
+    #[test]
+    fn validate_focus_requires_the_exact_durable_focus_file() {
+        let ids: HashSet<String> = ["clip-a", "clip-b"].iter().map(|id| id.to_string()).collect();
+        let focus = focus_evidence(&ids).unwrap();
+        let mut policy = valid_policy();
+        policy.focus_segment_count = focus.segment_count;
+        policy.focus_sha256 = focus.sha256;
+        let data_dir = tempfile::tempdir().unwrap();
+        let missing = validate_focus(data_dir.path(), &policy).unwrap_err();
+        assert!(missing.contains("voice_focus.json is required"), "{missing}");
+        std::fs::write(data_dir.path().join("voice_focus.json"), "{broken").unwrap();
+        let broken = validate_focus(data_dir.path(), &policy).unwrap_err();
+        assert!(broken.contains("not valid JSON"), "{broken}");
+        std::fs::write(
+            data_dir.path().join("voice_focus.json"),
+            serde_json::json!({"name": "Lamo", "segment_ids": ["clip-a"]}).to_string(),
+        )
+        .unwrap();
+        let narrowed = validate_focus(data_dir.path(), &policy).unwrap_err();
+        assert!(narrowed.contains("sequential review focus changed"), "{narrowed}");
+        std::fs::write(
+            data_dir.path().join("voice_focus.json"),
+            serde_json::json!({"name": "Lamo", "segment_ids": ["clip-a", "clip-b"]}).to_string(),
+        )
+        .unwrap();
+        let evidence = validate_focus(data_dir.path(), &policy).unwrap();
+        assert_eq!(evidence.segment_count, policy.focus_segment_count);
+        assert_eq!(evidence.sha256, policy.focus_sha256);
+    }
+
+    #[test]
+    fn tampered_progress_or_policy_rows_cannot_survive_reload() {
+        fn write_setting(db: &Database, key: &str, value: &str) {
+            db.connection().execute("UPDATE settings SET value=?2 WHERE key=?1", [key, value]).unwrap();
+        }
+        fn read_setting(db: &Database, key: &str) -> String {
+            db.connection().query_row("SELECT value FROM settings WHERE key=?1", [key], |row| row.get(0)).unwrap()
+        }
+        let (db, ids, _, _temp) = seeded_first_pass(1);
+        activate_second_pass(&db, &ids, db.max_review_event_id().unwrap()).unwrap();
+        let original_progress = read_setting(&db, SEQUENTIAL_CAMPAIGN_PROGRESS_SETTINGS_KEY);
+        let original_policy = read_setting(&db, SEQUENTIAL_CAMPAIGN_SETTINGS_KEY);
+        let expect_tamper = |mutate: fn(&mut serde_json::Value), needle: &str| {
+            let mut value: serde_json::Value = serde_json::from_str(&original_progress).unwrap();
+            mutate(&mut value);
+            write_setting(&db, SEQUENTIAL_CAMPAIGN_PROGRESS_SETTINGS_KEY, &value.to_string());
+            let error = load(&db).unwrap_err();
+            assert!(error.contains(needle), "expected {needle:?} in {error}");
+        };
+        expect_tamper(|value| value["phase"] = "first_pass_active".into(), "immutable base policy");
+        expect_tamper(|value| value["independent_decision_count"] = 1.into(), "premature completion counts");
+        expect_tamper(
+            |value| value["campaign_id"] = "123e4567-e89b-42d3-a456-426614174999".into(),
+            "does not match the bound campaign",
+        );
+        expect_tamper(|value| value["max_review_event_id"] = (-1).into(), "does not match the bound campaign");
+        expect_tamper(
+            |value| value["transition_id"] = "123e4567-e89b-42d3-a456-426614174888".into(),
+            "disagrees with its immutable transition",
+        );
+        expect_tamper(|value| value["smuggled"] = true.into(), "progress is invalid");
+        write_setting(&db, SEQUENTIAL_CAMPAIGN_PROGRESS_SETTINGS_KEY, &original_progress);
+        assert_eq!(load(&db).unwrap().unwrap().phase(), CampaignPhase::SecondPassActive);
+
+        // The immutable registry row also pins the mutable base-policy settings row.
+        let mut policy_value: serde_json::Value = serde_json::from_str(&original_policy).unwrap();
+        policy_value["activated_at_review_event_id"] = 1.into();
+        write_setting(&db, SEQUENTIAL_CAMPAIGN_SETTINGS_KEY, &policy_value.to_string());
+        let drifted = load(&db).unwrap_err();
+        assert!(drifted.contains("registry does not exactly match the base policy"), "{drifted}");
+        write_setting(&db, SEQUENTIAL_CAMPAIGN_SETTINGS_KEY, &original_policy);
+        assert_eq!(load(&db).unwrap().unwrap().phase(), CampaignPhase::SecondPassActive);
+    }
+
+    #[test]
+    fn exact_independent_consensus_requires_matching_verdicts_and_learning_equivalent_text() {
+        assert_eq!(exact_independent_consensus("reject", None, "reject", None), Some(("reject".to_string(), None)));
+        assert_eq!(
+            exact_independent_consensus("accept", Some("same heard text"), "edit", Some("same heard text")),
+            Some(("retain".to_string(), Some("same heard text".to_string())))
+        );
+        assert_eq!(exact_independent_consensus("accept", Some("first text"), "accept", Some("second text")), None);
+        assert_eq!(exact_independent_consensus("accept", Some("text"), "reject", None), None);
+        assert_eq!(exact_independent_consensus("reject", None, "accept", Some("text")), None);
+        assert_eq!(exact_independent_consensus("accept", None, "accept", Some("text")), None);
+        assert_eq!(exact_independent_consensus("skip", Some("text"), "accept", Some("text")), None);
     }
 }
