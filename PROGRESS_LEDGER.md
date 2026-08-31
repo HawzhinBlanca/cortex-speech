@@ -12537,3 +12537,35 @@ The target supplied all eight net branch gains; unrelated run variance was audio
 5,010 lines, 8,821 regions, and 1,194 functions; critical branch deficits are review 157, payment
 147, playback 119, restore 288, and IPC 486. Production, live data, scheduled tasks, release
 pointers, credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 22: snapshot manifest identity and inventory integrity
+
+The next reachable snapshot cluster was the restore manifest's identity, exact-inventory, and
+content-binding contract. One private-contract regression proves missing and future schemas,
+schema-1 unknown fields and policy-schema drift, empty schema-1 identity, empty schema-2 identity
+and source directory, case-colliding declarations, unlisted and missing files, malformed lowercase
+SHA-256 values, size and digest mismatches, an unexpected directory, and removal of the mandatory
+database from both disk and the declared inventory. It first proves the generated schema-1
+manifest, constructs and proves a database-evidence-bound schema-2 manifest, and finally restores
+the canonical database and manifest and proves them again. The typed manifest schema cannot differ
+from the schema probe, and a second exact-name duplicate arm is shadowed by the preceding
+case-folded duplicate guard; neither is falsely claimed as independently reachable.
+
+The focused proof passed 1/1, the complete snapshot suite passed 33/33, stable rustfmt passed, and
+strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`61623cfee510e43ae6e61d60373f1ad73fb58e93` then received an exact pinned all-target measurement:
+1,836 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `dfac15b44b3b43f8ab1497755533cc1c` (SHA-256
+`49d5a5bf721ebacf05818430e417ee4049a0acdfa0ec6c26fae7453f01a35578`) proves snapshot branches
+moved 264/392 to 279/400 and restore moved 1,068/1,506 to 1,083/1,514, reducing uncovered restore
+branches from 438 to 431. Overall coverage is branches 7,793/12,819 (60.79%), lines
+76,318/95,637 (79.80%), regions 135,655/169,875 (79.86%), and functions 6,501/9,614 (67.62%).
+The target supplied all 15 snapshot branch gains; unrelated run variance added one covered branch
+each in `atomic_file.rs` and `jury/learning.rs`. Remaining minimum deficits are 2,463 overall
+branches, 4,974 lines, 8,739 regions, and 1,191 functions; critical branch deficits are review 157,
+payment 147, playback 119, restore 280, and IPC 486. Production, live data, scheduled tasks, release
+pointers, credentials, and GPU/model configuration were untouched.
