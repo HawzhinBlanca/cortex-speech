@@ -12724,3 +12724,38 @@ branch each from `audio.rs` and `jury/learning.rs`. Remaining minimum deficits a
 branches, 4,951 lines, 8,696 regions, and 1,188 functions; critical branch deficits are review 157,
 payment 147, playback 119, restore 265, and IPC 486. Production, live data, scheduled tasks, release
 pointers, credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 28: active-pilot archival and namespace authority
+
+The next reachable snapshot cluster was the private active-pilot authority validator. Two adversarial
+regressions now distinguish schema-58 archival capture validation from production restore admission;
+reject a mutated one-reviewer policy and a baseline ahead of review history; reject a conflicting
+same-digest/different-baseline namespace, unauthorized reviewer, invalid segment identity, invalid
+completion action, missing spot result, and duplicate completion event; and accept one coherent
+grant/event/result chain. The archival assertion is deliberately narrow: the production restore
+contract still fails closed for policy-bearing pre-v59 artifacts, as independently enforced by the
+restore verifier and external drill.
+
+The first focused fixture run passed 1/2 because deleting a policy trigger correctly failed the
+earlier exact-schema guard before the intended namespace conflict. The corrected cross-baseline
+fixture then passed the schema guard but the second run passed 1/2 because its forged requested action
+correctly failed the database provenance trigger. Keeping requested action canonical while corrupting
+only the historical event action produced the intended final proof: focused 2/2, complete snapshot
+namespace 43/43, stable rustfmt, and strict stable Clippy across all targets/features with
+`-D warnings`. Product commit `bf206406f595c937ff28dde303e7d1d626f9339e` then received an exact
+pinned all-target measurement: 1,842 library tests passed with 0 failures and 8 ignores, importer
+14/14, ASR containment 1/1, audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1,
+Tauri integration 1/1, shell smoke 1/1, user-data 2/2, and every Criterion target green. The
+certifying wrapper exited 1 solely because coverage thresholds remain unmet.
+
+Artifact `46ae563878fd426a85ba618c1e1fee59` (SHA-256
+`3e3d98079041854e79803de7464cd6e601bab578a7410493e3a4356b9a7f40b9`) proves snapshot branches
+moved 299/406 to 311/410 and restore moved 1,103/1,520 to 1,115/1,524, reducing uncovered snapshot
+branches from 107 to 99 and uncovered restore branches from 417 to 409. Overall coverage is branches
+7,824/12,829 (60.99%), lines 76,602/95,895 (79.88%), regions 136,224/170,411 (79.94%), and
+functions 6,520/9,630 (67.71%). The target supplied twelve covered branches while the two new
+regressions introduced four measured branches. Unrelated run variance restored one covered branch
+in `audio.rs` and added one in `normalizer.rs`. Remaining minimum deficits are 2,440 overall
+branches, 4,909 lines, 8,626 regions, and 1,184 functions; critical branch deficits are review 157,
+payment 147, playback 119, restore 257, and IPC 486. Production, live data, scheduled tasks, release
+pointers, credentials, and GPU/model configuration were untouched.
