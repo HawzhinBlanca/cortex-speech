@@ -12477,3 +12477,33 @@ opposite direction. Remaining minimum deficits are 2,488 overall branches, 5,038
 regions, and 1,200 functions; critical branch deficits are review 157, payment 147, playback 119,
 restore 305, and IPC 486. Production, live data, scheduled tasks, release pointers, credentials,
 and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 20: exhaustive champion-pointer restore contract
+
+The next reachable snapshot cluster was the required `champion.json` restore-state boundary. One
+private-contract regression supplies malformed JSON, a non-object root, an extra root field, each
+independently missing required root key, the wrong schema, a non-object champions map, a whitespace-
+only family, a non-object family entry, the wrong family field set, and a non-string field. It also
+proves an exact schema-2 champion entry with the five required string fields. Every failure case
+asserts the stable production-owned refusal; the parser-detail suffix is intentionally asserted only
+by its application prefix.
+
+The focused proof passed 1/1, the complete snapshot suite passed 31/31, stable rustfmt passed, and
+strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`e27e3033539cdf3446f85dae568bf7d78be0b45d` then received an exact pinned all-target measurement:
+1,834 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `c920994d0a1f4510b1c201540b215fe1` (SHA-256
+`94340383048eb020e54e6d942fea4eab88e78d878539134b2a3b084fed5750bc`) proves snapshot branches
+moved 247/392 to 256/392 and restore moved 1,051/1,506 to 1,060/1,506, reducing uncovered restore
+branches from 455 to 446. Overall coverage is branches 7,768/12,811 (60.64%), lines
+76,159/95,498 (79.75%), regions 135,278/169,534 (79.79%), and functions 6,491/9,607 (67.57%).
+The target supplied nine restore branches; unrelated run variance removed one covered branch and
+line each from `atomic_file.rs` and `couch/lifecycle.rs`, while `normalizer.rs` gained one covered
+line. Remaining minimum deficits are 2,481 overall branches, 5,015 lines, 8,826 regions, and 1,195
+functions; critical branch deficits are review 157, payment 147, playback 119, restore 296, and IPC
+486. Production, live data, scheduled tasks, release pointers, credentials, and GPU/model
+configuration were untouched.
