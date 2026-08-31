@@ -2803,6 +2803,38 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_listing_ignores_non_authoritative_entries_and_reports_missing_database_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(list_snapshots(tmp.path()).is_empty(), "an absent snapshots root is an empty listing");
+
+        let root = tmp.path().join("snapshots");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("snapshot_0000000009"), b"not a directory").unwrap();
+        std::fs::create_dir(root.join("unrelated")).unwrap();
+        std::fs::create_dir(root.join("snapshot_bad")).unwrap();
+        std::fs::create_dir(root.join("snapshot_0000000002")).unwrap();
+
+        let pinned = root.join(PINNED_DIR);
+        std::fs::create_dir(&pinned).unwrap();
+        std::fs::write(pinned.join("safe_0000000009"), b"not a directory").unwrap();
+        for invalid in ["missing-separator", "_0000000008", "safe_bad"] {
+            std::fs::create_dir(pinned.join(invalid)).unwrap();
+        }
+        std::fs::create_dir(pinned.join("safe_0000000003")).unwrap();
+
+        let listed = list_snapshots(tmp.path());
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].name, "pinned/safe_0000000003");
+        assert_eq!(listed[0].timestamp, 3);
+        assert_eq!(listed[1].name, "snapshot_0000000002");
+        assert_eq!(listed[1].timestamp, 2);
+        for snapshot in listed {
+            assert_eq!(snapshot.db_size_bytes, 0, "a missing database has no invented byte size");
+            assert_eq!(snapshot.segment_count, None, "a missing database has no invented segment count");
+        }
+    }
+
+    #[test]
     fn list_snapshots_reports_newest_first_with_counts() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = seeded_db();
