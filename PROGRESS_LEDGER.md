@@ -12925,3 +12925,46 @@ Remaining minimum deficits at this replay are 2,432 overall branches, 4,860 line
 1,179 functions, 157 review branches, 147 payment, 119 playback, 249 restore, and 486 IPC. P1
 remains red, P2 remains green, and P0 remains unknown. Production, live data, scheduled tasks,
 release pointers, credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 34: consent identity floor and deterministic probe tests
+
+The consent-revocation restore floor now has direct production-path regression proof for its
+fail-closed legacy identity boundary. A withdrawn recording with no content hash is refused when its
+legacy path is whitespace-only or contains an embedded NUL, because neither value is a safe durable
+identity. A canonical withdrawn content hash that is completely absent from the restore target is
+also refused as one forgotten identity and zero resurrected identities. Production restore behavior
+is unchanged; product commit `51a4ad8922c953eec65a5958efd0a2137ddae2b4` adds only this proof.
+
+The focused consent proof passed 1/1, the consent-revocation-floor cluster passed 2/2, the broader
+restore cluster passed 82/82, stable rustfmt passed, and strict stable Clippy passed all
+targets/features with `-D warnings`. The first exact replay, run
+`417f867f9c5d44c4923b67952f117de2`, honestly published `FAILED` / `FAIL` / exit 1 with no artifact:
+one existing command regression received the process-global registry's `AUDIO_PROBE_BUSY` refusal
+instead of reaching its intended injected database failure. This was a test-isolation defect, not a
+consent-floor failure or a coverage-threshold result.
+
+Corrective commit `f3c9dc5a758f422c2d36d2c7375716cfb5a1705d` gives every test that drives or
+intentionally occupies the technical-audio probe registry one shared test-only serialization guard,
+including callers in separate modules. Production's strict two-probe concurrency cap is unchanged.
+The formerly failing proof passed 1/1, the complete command cluster passed 23/23, the review-write
+cluster passed 12/12, stable rustfmt passed, and strict stable Clippy again passed all
+targets/features with `-D warnings`.
+
+The corrected exact one-worker replay at `f3c9dc5a758f422c2d36d2c7375716cfb5a1705d` passed
+1,846 library tests with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1, audio
+integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell smoke
+1/1, user-data 2/2, and every Criterion target. It exited 1 solely at the locked coverage
+thresholds, without timeout or retry. Run `16e3fd016a4040be958b78ca9d74b188` produced LLVM artifact
+SHA-256 `4ecce69fd397bdda16034ce18abbe315b332180a3a017605e5484b550d795282`; its canonical latest
+pointer and event-journal SHA-256
+`130c617e1b89376295adfd1661bc5b61b31f6c21455fb9ba28442c9e3dddd140` were accepted by the
+production failure-pointer validator.
+
+The target `restore_service/authority.rs` improved from 23/34 to 27/34 branches
+(67.65% to 79.41%), 281/314 to 284/314 lines, and 387/448 to 389/448 regions. Overall coverage is
+7,845/12,841 branches (61.09%), 76,825/96,078 lines (79.96%), 136,655/170,783 regions (80.02%),
+and 6,531/9,632 functions (67.81%). Restore is 1,134/1,532 branches (74.02%). Remaining minimum
+deficits are 2,428 overall branches, 4,842 lines, 8,511 regions, 1,175 functions, 157 review
+branches, 147 payment, 119 playback, 245 restore, and 487 IPC. P1 remains red, P2 remains green,
+and P0 remains unknown. Production, live data, scheduled tasks, release pointers, credentials, and
+GPU/model configuration were untouched.
