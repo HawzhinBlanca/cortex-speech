@@ -3359,8 +3359,16 @@ RUST_COVERAGE_PHASE_DIRNAME = "rust-coverage-prerequisite"
 RUST_COVERAGE_ARTIFACT_NAME = "rust-coverage.llvm.json"
 RUST_COVERAGE_MANIFEST_NAME = "rust-coverage-manifest.json"
 RUST_COVERAGE_TOOLCHAIN_CONTRACT = APP / "scripts" / "rust_coverage_toolchain.json"
-RUST_COVERAGE_INNER_TIMEOUT_SECONDS = 7_200
-RUST_COVERAGE_SUPERVISOR_TIMEOUT_SECONDS = 7_500
+# 2026-08-31: 7,200 s was calibrated to the release workstation (64 cores, ~45-75 min cold). The
+# CI coverage job on a 4-core hosted runner was killed mid-build at exactly this budget (measured:
+# started 14:53:24Z, FAILED 16:53:27Z, no measurement produced), so the merge chain could never
+# green there at ANY coverage percentage. Sized to the workflow policy's 180-minute job cap (which
+# refuses ceilings that hide hangs): 170 min inner + supervisor margin under a 180-min job with
+# ~5 min of runner setup. Timeouts bound failure, not success — fast hardware never waits on this.
+# Lives in the coverage phase registry only: a change re-binds coverage manifests (re-earned by
+# the next measure), never the gate/evidence hashes behind fault campaigns or timeout baselines.
+RUST_COVERAGE_INNER_TIMEOUT_SECONDS = 10_200
+RUST_COVERAGE_SUPERVISOR_TIMEOUT_SECONDS = 10_500
 RUST_COVERAGE_FRESH_SECONDS = 8 * 60 * 60
 TIMEOUT_CALIBRATION_FRESH_SECONDS = 72 * 60 * 60
 VERIFIER_FAULT_CAMPAIGN_FRESH_SECONDS = 72 * 60 * 60

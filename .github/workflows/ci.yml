@@ -45,7 +45,7 @@ jobs:
   rust-coverage-prerequisite:
     name: Rust Coverage Prerequisite
     runs-on: windows-latest
-    timeout-minutes: 150
+    timeout-minutes: 180
     defaults:
       run:
         working-directory: cortex-speech-app
