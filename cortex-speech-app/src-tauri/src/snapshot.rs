@@ -2068,6 +2068,133 @@ mod tests {
     }
 
     #[test]
+    fn active_pilot_snapshot_authority_distinguishes_archival_schema_and_invalid_policy_shapes() {
+        let archival = seeded_db();
+        crate::migrations::rollback(&archival, 9).unwrap();
+        assert_eq!(crate::migrations::get_current_version(&archival).unwrap(), 58);
+        validate_active_pilot_snapshot_authority(archival.connection(), None, None, &pilot_policy())
+            .expect("pre-v59 capture validation is archival only; restore admission rejects it separately");
+
+        let invalid_roster = seeded_db();
+        let mut one_reviewer = pilot_policy();
+        one_reviewer.reviewers.pop();
+        let roster_error =
+            validate_active_pilot_snapshot_authority(invalid_roster.connection(), None, None, &one_reviewer)
+                .unwrap_err();
+        assert!(roster_error.contains("exactly two distinct reviewers"), "{roster_error}");
+
+        let ahead = seeded_db();
+        let mut ahead_policy = pilot_policy();
+        ahead_policy.after_review_event_id = 1;
+        let baseline_error =
+            validate_active_pilot_snapshot_authority(ahead.connection(), None, None, &ahead_policy).unwrap_err();
+        assert!(baseline_error.contains("baseline 1") && baseline_error.contains("maximum 0"), "{baseline_error}");
+    }
+
+    #[test]
+    fn active_pilot_snapshot_authority_rejects_namespace_and_completion_drift() {
+        fn insert_grant(db: &Database, policy: &crate::review_pilot::ReviewPilotPolicy, reviewer: &str, segment: &str) {
+            db.connection()
+                .execute(
+                    "INSERT INTO review_pilot_hidden_keys
+                        (policy_sha256, after_review_event_id, reviewer, segment_id)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![policy.policy_sha256().unwrap(), policy.after_review_event_id, reviewer, segment],
+                )
+                .unwrap();
+        }
+
+        fn insert_completion(db: &Database, segment: &str, reviewer: &str, action: &str) {
+            db.connection()
+                .execute(
+                    "INSERT INTO review_events
+                        (segment_id, reviewer, action, source, timestamp_ms, operation_id,
+                         operation_payload_hash, requested_action, requested_transcript,
+                         served_transcript, served_revision, app_git_sha, playback_guard_version)
+                     VALUES (?1, ?2, ?3, 'couch_spot_check', 1, ?4,
+                             ?5, 'accept', '', 'ڕەفەرێنس', 0, ?6, 'content-hash-raw-counter-v3')",
+                    rusqlite::params![
+                        segment,
+                        reviewer,
+                        action,
+                        uuid::Uuid::new_v4().to_string(),
+                        "a".repeat(64),
+                        crate::GIT_SHA
+                    ],
+                )
+                .unwrap();
+        }
+
+        fn insert_result(db: &Database, segment: &str, reviewer: &str, action: &str) {
+            db.connection()
+                .execute(
+                    "INSERT INTO spot_checks
+                        (segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer)
+                     VALUES (?1, ?2, ?3, 'ڕەفەرێنس', 'ڕەفەرێنس', 1, 0.0)",
+                    rusqlite::params![segment, reviewer, action],
+                )
+                .unwrap();
+        }
+
+        let conflict = seeded_db();
+        let policy = pilot_policy();
+        conflict
+            .connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, 1, 'Chiman', 'conflict')",
+                [policy.policy_sha256().unwrap()],
+            )
+            .unwrap();
+        let conflict_error =
+            validate_active_pilot_snapshot_authority(conflict.connection(), None, None, &policy).unwrap_err();
+        assert!(conflict_error.contains("disagree with the active policy SHA/baseline"), "{conflict_error}");
+
+        let unauthorized = seeded_db();
+        insert_grant(&unauthorized, &policy, "Sara", "unauthorized");
+        let reviewer_error =
+            validate_active_pilot_snapshot_authority(unauthorized.connection(), None, None, &policy).unwrap_err();
+        assert!(reviewer_error.contains("unauthorized reviewer"), "{reviewer_error}");
+
+        let invalid_segment = seeded_db();
+        insert_grant(&invalid_segment, &policy, "Chiman", "invalid/segment");
+        let segment_error =
+            validate_active_pilot_snapshot_authority(invalid_segment.connection(), None, None, &policy).unwrap_err();
+        assert!(segment_error.contains("invalid segment"), "{segment_error}");
+
+        let invalid_action = seeded_db();
+        insert_grant(&invalid_action, &policy, "Chiman", "invalid-action");
+        insert_completion(&invalid_action, "invalid-action", "Chiman", "bogus");
+        let action_error =
+            validate_active_pilot_snapshot_authority(invalid_action.connection(), None, None, &policy).unwrap_err();
+        assert!(action_error.contains("invalid action"), "{action_error}");
+
+        let missing_result = seeded_db();
+        insert_grant(&missing_result, &policy, "Chiman", "missing-result");
+        insert_completion(&missing_result, "missing-result", "Chiman", "accept");
+        let result_error =
+            validate_active_pilot_snapshot_authority(missing_result.connection(), None, None, &policy).unwrap_err();
+        assert!(result_error.contains("result mismatch"), "{result_error}");
+
+        let duplicate_completion = seeded_db();
+        insert_grant(&duplicate_completion, &policy, "Chiman", "duplicate-completion");
+        insert_result(&duplicate_completion, "duplicate-completion", "Chiman", "accept");
+        insert_completion(&duplicate_completion, "duplicate-completion", "Chiman", "accept");
+        insert_completion(&duplicate_completion, "duplicate-completion", "Chiman", "accept");
+        let duplicate_error =
+            validate_active_pilot_snapshot_authority(duplicate_completion.connection(), None, None, &policy)
+                .unwrap_err();
+        assert!(duplicate_error.contains("multiple completion events"), "{duplicate_error}");
+
+        let coherent = seeded_db();
+        insert_grant(&coherent, &policy, "Chiman", "coherent");
+        insert_result(&coherent, "coherent", "Chiman", "accept");
+        insert_completion(&coherent, "coherent", "Chiman", "accept");
+        validate_active_pilot_snapshot_authority(coherent.connection(), None, None, &policy).unwrap();
+    }
+
+    #[test]
     fn active_pilot_pre_migration_snapshot_accepts_exact_v59_and_rejects_drift() {
         let db = seeded_db();
         assert_eq!(
