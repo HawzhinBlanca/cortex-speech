@@ -2998,13 +2998,67 @@ mod offsite_state_tests {
         assert!(verify_snapshot_manifest_for_restore(&snap).unwrap_err().contains("invalid JSON"));
     }
 
-    /// The point of the manifest: an incomplete tree is DETECTABLE rather than merely present.
+    /// The external drill mirror must report every omitted representation while accepting either
+    /// legal live/absence form. The production restore verifier separately rejects both-at-once.
     #[test]
-    fn a_snapshot_missing_required_state_is_reported_as_missing() {
-        let manifest = serde_json::json!({"schema": 1, "files": [{"path": "cortex-speech.db"}]});
-        let missing = manifest_missing_required(&manifest);
-        assert!(missing.contains(&"settings.json".to_string()), "{missing:?}");
-        assert!(missing.contains(&"champion.json".to_string()), "{missing:?}");
+    fn manifest_required_state_mirror_covers_every_live_absent_and_omitted_representation() {
+        let missing_for = |paths: &[&str]| {
+            let files = paths.iter().map(|path| serde_json::json!({"path": path})).collect::<Vec<_>>();
+            manifest_missing_required(&serde_json::json!({"schema": 1, "files": files}))
+        };
+        let expected_required = std::iter::once(DB_FILE)
+            .chain(OPTIONAL_SNAPSHOT_STATE.iter().map(|state| state.live_file))
+            .chain(std::iter::once(crate::review_pilot::REVIEW_PILOT_FILE))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        for malformed in [
+            serde_json::Value::Null,
+            serde_json::json!({"files": "not-an-array"}),
+            serde_json::json!({"files": [{}, {"path": 7}]}),
+        ] {
+            assert_eq!(manifest_missing_required(&malformed), expected_required);
+        }
+
+        let complete_live = std::iter::once(DB_FILE)
+            .chain(OPTIONAL_SNAPSHOT_STATE.iter().map(|state| state.live_file))
+            .chain(std::iter::once(crate::review_pilot::REVIEW_PILOT_FILE))
+            .collect::<Vec<_>>();
+        assert!(missing_for(&complete_live).is_empty());
+
+        assert_eq!(missing_for(&complete_live[1..]), [DB_FILE.to_string()]);
+        for state in OPTIONAL_SNAPSHOT_STATE {
+            let absent = complete_live
+                .iter()
+                .map(|path| if *path == state.live_file { state.absent_file } else { *path })
+                .collect::<Vec<_>>();
+            assert!(
+                missing_for(&absent).is_empty(),
+                "{} absence must satisfy required-state presence",
+                state.live_file
+            );
+
+            let omitted = complete_live.iter().copied().filter(|path| *path != state.live_file).collect::<Vec<_>>();
+            assert_eq!(missing_for(&omitted), [state.live_file.to_string()]);
+        }
+
+        let pilot_absent = complete_live
+            .iter()
+            .map(|path| {
+                if *path == crate::review_pilot::REVIEW_PILOT_FILE {
+                    crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE
+                } else {
+                    *path
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(missing_for(&pilot_absent).is_empty());
+        let pilot_omitted = complete_live
+            .iter()
+            .copied()
+            .filter(|path| *path != crate::review_pilot::REVIEW_PILOT_FILE)
+            .collect::<Vec<_>>();
+        assert_eq!(missing_for(&pilot_omitted), [crate::review_pilot::REVIEW_PILOT_FILE.to_string()]);
     }
 
     /// The local snapshot path is unchanged by the fix: destination and primary are one directory.
