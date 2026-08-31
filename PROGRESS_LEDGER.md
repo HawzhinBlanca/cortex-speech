@@ -12304,3 +12304,30 @@ Changed together, per the pin-inversion rule: `couch.rs` MAX_REVIEWERS 8→10 (a
 at the constant), `docs/OWNER_CANON.md` capacity line, `scripts/test_owner_canon_pins.py` pin.
 Measured: canon pins 12/12 hold; `cargo test --lib couch::` 153/0 (the cap test derives from the
 constant — 10 accepted, 11 refused). Deploys with the wave-2 test expansion commit beneath it.
+
+---
+
+## 2026-08-31 — SHIPPED 5a2179c3 and the 10-reviewer roster is live, verified end to end
+
+Release `5a2179c33b23-0e0b63293e0f-2779e3da8109-876715ee80e9-363def17e69f` (same-schema v69
+handover; clone preflight PASS 16990/16990 audio, rights exact; READY with all six pre-change
+queues proven; pointer AND running process verified on the new release). It carries the canon
+capacity change and the wave-2 test expansion.
+
+The roster change itself ran on the real release app over the repo's documented CDP drive
+(watchdog disabled for a 3-minute maintenance window, then re-enabled — the policy suite's one
+red was that gate correctly noticing, 140/141 otherwise): Stop → 10 names → Start. Verified at
+the serving path, with real credentials, before handover to the owner:
+
+- check_reviewer_links_live --funnel: ALL 10 AUTHENTICATE (Alle, Guest, Hawzhin, Iftikhar, Lamo,
+  Pavel, Roza, Rubar, Sabat, Sewa).
+- Full phone path as Iftikhar (brand-new token): claim 200 → queue 200 (clip 7158da8b, 5.9 s) →
+  playback/start 200 (contract 4, receipt minted) → audio 206 + full 200 = 190,124 bytes.
+- Probe exit 0: links 10/10, queues 10/10 with clips (154,737 reviewer-eligible pending),
+  continuity baseline re-accepted for 10, vault snapshotted couch_session.20260831T091723Z.
+- Alarm forwarder + watchdog + health probe + restore drill all Ready afterwards.
+
+Links were emitted from the durable session (DPAPI-unprotected locally, never logged) and handed
+to the owner for distribution. Iftikhar and Guest are dialect-unrestricted until the owner lists
+them in reviewer_dialects.json (hot-reloaded, no restart). The 7B champion stays down (GPUs held
+by another workload) — drafting only; review serving is unaffected.
