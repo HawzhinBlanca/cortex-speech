@@ -2212,23 +2212,38 @@ mod tests {
     }
 
     #[test]
-    fn active_pilot_snapshot_requires_live_session_keys_to_be_durable() {
+    fn active_pilot_snapshot_rejects_live_session_identity_and_cache_drift() {
         let profile = tempfile::TempDir::new().unwrap();
         let db_path = profile.path().join(DB_FILE);
         let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
         db.initialize().unwrap();
         let policy = pilot_policy();
-        std::fs::write(
-            profile.path().join("couch_session.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "db_path": &db_path,
-                "reviewers": {"token-h": "Chiman", "token-p": "Karwan"},
-                "pilot_spot_checks": [["hidden-session", "Chiman"]],
-                "pilot_policy": &policy,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        let session_path = profile.path().join("couch_session.json");
+        let policy_value = serde_json::to_value(&policy).unwrap();
+        let reviewers = serde_json::json!({"token-h": "Chiman", "token-p": "Karwan"});
+        let write_session = |recorded_db_path: &Path,
+                             session_reviewers: serde_json::Value,
+                             checks: serde_json::Value,
+                             session_policy: serde_json::Value| {
+            std::fs::write(
+                &session_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "db_path": recorded_db_path,
+                    "reviewers": session_reviewers,
+                    "pilot_spot_checks": checks,
+                    "pilot_policy": session_policy,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+
+        write_session(
+            &db_path,
+            reviewers.clone(),
+            serde_json::json!([["hidden-session", "Chiman"]]),
+            policy_value.clone(),
+        );
         let error =
             validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
                 .unwrap_err();
@@ -2242,6 +2257,104 @@ mod tests {
                 [policy.policy_sha256().unwrap()],
             )
             .unwrap();
+
+        let other_db_path = profile.path().join("other.db");
+        std::fs::write(&other_db_path, b"not used as a database").unwrap();
+        write_session(&other_db_path, reviewers.clone(), serde_json::json!([]), policy_value.clone());
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("different database"), "{error}");
+
+        let missing_db_path = profile.path().join("missing.db");
+        write_session(&missing_db_path, reviewers.clone(), serde_json::json!([]), policy_value.clone());
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("session database path is unavailable"), "{error}");
+
+        write_session(&db_path, reviewers.clone(), serde_json::json!([]), policy_value.clone());
+        let unavailable_expected = profile.path().join("unavailable-expected.db");
+        let error = validate_active_pilot_snapshot_authority(
+            db.connection(),
+            Some(profile.path()),
+            Some(&unavailable_expected),
+            &policy,
+        )
+        .unwrap_err();
+        assert!(error.contains("snapshot database path is unavailable"), "{error}");
+
+        write_session(&db_path, reviewers.clone(), serde_json::json!([]), serde_json::Value::Null);
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("not bound to the active pilot policy"), "{error}");
+
+        let mut different_policy = policy.clone();
+        different_policy.after_review_event_id = 1;
+        write_session(
+            &db_path,
+            reviewers.clone(),
+            serde_json::json!([]),
+            serde_json::to_value(different_policy).unwrap(),
+        );
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("different pilot policy"), "{error}");
+
+        write_session(&db_path, serde_json::json!({"token-h": "Chiman"}), serde_json::json!([]), policy_value.clone());
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("reviewer roster does not match"), "{error}");
+
+        write_session(&db_path, reviewers.clone(), serde_json::json!([["../invalid", "Chiman"]]), policy_value.clone());
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("hidden key is invalid"), "{error}");
+
+        write_session(
+            &db_path,
+            reviewers.clone(),
+            serde_json::json!([["hidden-session", "Mallory"]]),
+            policy_value.clone(),
+        );
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("snapshot session hidden cache contains unauthorized reviewer"), "{error}");
+
+        write_session(
+            &db_path,
+            reviewers.clone(),
+            serde_json::json!([["hidden-session", "Chiman"], ["hidden-session", " chiman "],]),
+            policy_value.clone(),
+        );
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("duplicates hidden key"), "{error}");
+
+        std::fs::write(&session_path, b"not json").unwrap();
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("couch_session.json is invalid"), "{error}");
+
+        std::fs::remove_file(&session_path).unwrap();
+        std::fs::create_dir(&session_path).unwrap();
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("snapshot session cannot be read"), "{error}");
+
+        std::fs::remove_dir(&session_path).unwrap();
+        validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+            .unwrap();
+
+        write_session(&db_path, reviewers, serde_json::json!([["hidden-session", "Chiman"]]), policy_value);
         validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
             .unwrap();
     }
