@@ -1064,13 +1064,15 @@ mod tests {
 
         // The champion already voted for this segment: no duplicate vote, no server call.
         register_test_champion(&db, "champ-aux");
-        db.insert_hypothesis(&SegmentHypothesis {
-            segment_id: "aux-seg".into(),
-            model_id: "champ-aux".into(),
-            transcript: "دەنگدانی ئامادە".into(),
-            confidence: None,
-        })
-        .unwrap();
+        let hypothesis_writer = &db;
+        hypothesis_writer
+            .insert_hypothesis(&SegmentHypothesis {
+                segment_id: "aux-seg".into(),
+                model_id: "champ-aux".into(),
+                transcript: "دەنگدانی ئامادە".into(),
+                confidence: None,
+            })
+            .unwrap();
         pipeline.populate_wsl_hypothesis_if_configured(&db, &import_writes, "aux-seg").unwrap();
         let votes = db.get_hypotheses_for_segment("aux-seg").unwrap();
         assert_eq!(votes.len(), 1, "an existing champion vote must not be duplicated");

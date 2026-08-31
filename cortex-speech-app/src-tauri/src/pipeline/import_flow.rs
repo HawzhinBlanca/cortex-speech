@@ -2165,7 +2165,8 @@ mod tests {
         let import_dir = dir.path().join("no_champion_resume");
         std::fs::create_dir_all(&import_dir).unwrap();
         std::fs::write(import_dir.join("never-decoded.wav"), b"not-real-audio").unwrap();
-        let crashed = db.begin_import_job(&import_dir.to_string_lossy(), 1).unwrap();
+        let journal_writer = &db;
+        let crashed = journal_writer.begin_import_job(&import_dir.to_string_lossy(), 1).unwrap();
         let successor = db.handoff_import_job_for_resume(&crashed).unwrap();
 
         let done = std::collections::HashSet::new();
@@ -2203,7 +2204,8 @@ mod tests {
             })
             .unwrap();
         }
-        let crashed = db.begin_import_job(&dir_str, 1).unwrap();
+        let journal_writer = &db;
+        let crashed = journal_writer.begin_import_job(&dir_str, 1).unwrap();
         let successor = db.handoff_import_job_for_resume(&crashed).unwrap();
 
         let done = std::collections::HashSet::new();
@@ -2423,7 +2425,8 @@ mod tests {
         // even though their machine draft came from the local CTC engine, not the champion.
         db.record_human_decision(&original_ids[0], "edit", Some("دەقی مرۆڤی ڕاستەقینە"), None).unwrap();
         register_test_champion(&db, "champ-resume-adopt");
-        let crashed = db.begin_import_job(&import_dir.to_string_lossy(), 1).unwrap();
+        let journal_writer = &db;
+        let crashed = journal_writer.begin_import_job(&import_dir.to_string_lossy(), 1).unwrap();
         let successor = db.handoff_import_job_for_resume(&crashed).unwrap();
 
         let done: std::collections::HashSet<String> = std::iter::once(wav_str.clone()).collect();
@@ -2469,7 +2472,8 @@ mod tests {
         // No human decision and the draft's model is the local CTC engine, not the registered
         // champion: the stage is replaceable and resume must discard + redo it.
         register_test_champion(&db, "champ-resume-rollback");
-        let crashed = db.begin_import_job(&import_dir.to_string_lossy(), 1).unwrap();
+        let journal_writer = &db;
+        let crashed = journal_writer.begin_import_job(&import_dir.to_string_lossy(), 1).unwrap();
         let successor = db.handoff_import_job_for_resume(&crashed).unwrap();
 
         let done: std::collections::HashSet<String> = std::iter::once(wav_str.clone()).collect();
@@ -2511,7 +2515,8 @@ mod tests {
             ..SpeechSegment::default()
         })
         .unwrap();
-        db.set_audio_identity(&wav_str, &canonical_identity(&wav)).unwrap();
+        let identity_writer = &db;
+        identity_writer.set_audio_identity(&wav_str, &canonical_identity(&wav)).unwrap();
 
         // Machine-authored rows with no registry champion available: ambiguity hard-stops.
         let error = pipeline.process_single_file(&wav, &db).unwrap_err().to_string();

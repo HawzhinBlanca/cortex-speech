@@ -5875,7 +5875,7 @@ mod state_command_harness_tests {
             assert!(name == "gemini" || name == "openrouter", "unexpected provider name {name:?}");
         }
 
-        *app.state::<AppState>().data_dir.lock().unwrap() = None;
+        *app.state::<AppState>().lock_data_dir() = None;
         let refused = get_configured_providers(app.state()).expect_err("no data dir must refuse");
         assert_eq!(refused.code, "API_KEY_STORE_UNAVAILABLE");
         assert!(!refused.retryable);

@@ -1071,7 +1071,7 @@ mod tests {
         // Point the data dir at a plain FILE so settings.json can never be created beneath it.
         let dead_end = tmp.path().join("not-a-directory");
         std::fs::write(&dead_end, b"occupied").unwrap();
-        *state.data_dir.lock().unwrap() = Some(dead_end);
+        *state.lock_data_dir() = Some(dead_end);
 
         let withdrawal = AppSettings { cloud_llm_opt_in: false, ..AppSettings::default() };
         let error = persist_settings_change(&state, &withdrawal, true).expect_err("save into a file path must fail");
