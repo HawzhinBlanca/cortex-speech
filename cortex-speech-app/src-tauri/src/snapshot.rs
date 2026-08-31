@@ -1907,6 +1907,127 @@ mod tests {
     }
 
     #[test]
+    fn manifest_contract_rejects_identity_inventory_and_digest_drift() {
+        fn row_mut<'a>(manifest: &'a mut serde_json::Value, name: &str) -> &'a mut serde_json::Value {
+            manifest["files"].as_array_mut().unwrap().iter_mut().find(|row| row["path"] == name).unwrap()
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let snap = take_snapshot_at(&db, tmp.path(), 10, 1000).unwrap().unwrap();
+        let manifest_path = snap.join(MANIFEST_FILE);
+        let canonical: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert!(verify_snapshot_manifest_for_restore(&snap).unwrap());
+        let verify = |manifest: &serde_json::Value| {
+            std::fs::write(&manifest_path, serde_json::to_vec_pretty(manifest).unwrap()).unwrap();
+            verify_snapshot_manifest_for_restore(&snap)
+        };
+
+        assert_eq!(
+            verify(&serde_json::json!({"files": []})),
+            Err("snapshot manifest schema must be exactly integer 1 or 2".to_string()),
+        );
+        let mut future_schema = canonical.clone();
+        future_schema["schema"] = serde_json::json!(3);
+        assert_eq!(verify(&future_schema), Err("snapshot manifest schema must be exactly integer 1 or 2".to_string()),);
+        let mut unknown_field = canonical.clone();
+        unknown_field["unexpected"] = serde_json::json!(true);
+        let error = verify(&unknown_field).unwrap_err();
+        assert!(error.starts_with("snapshot schema-1 manifest contract is invalid:"), "{error}");
+
+        let mut policy_schema = canonical.clone();
+        policy_schema["reviewPilotPolicyStateSchema"] = serde_json::json!(2);
+        assert_eq!(
+            verify(&policy_schema),
+            Err("snapshot schema-1 manifest policy-state schema must be exactly 1".to_string()),
+        );
+        let mut empty_app_sha = canonical.clone();
+        empty_app_sha["appGitSha"] = serde_json::json!("");
+        assert_eq!(verify(&empty_app_sha), Err("snapshot manifest appGitSha must be non-empty".to_string()),);
+
+        let evidence = inspect_schema2_database_evidence(&snap.join(DB_FILE)).unwrap();
+        let schema2 = serde_json::json!({
+            "schema": 2,
+            "createdAtEpochSecs": 1000,
+            "appGitSha": crate::GIT_SHA,
+            "sourceDataDir": "C:/disposable/source",
+            "databaseEvidence": evidence,
+            "files": canonical["files"].clone(),
+        });
+        assert_eq!(verify(&schema2), Ok(true));
+        let mut schema2_empty_sha = schema2.clone();
+        schema2_empty_sha["appGitSha"] = serde_json::json!("");
+        assert_eq!(
+            verify(&schema2_empty_sha),
+            Err("snapshot schema-2 manifest identity fields are invalid".to_string()),
+        );
+        let mut schema2_empty_source = schema2;
+        schema2_empty_source["sourceDataDir"] = serde_json::json!("");
+        assert_eq!(
+            verify(&schema2_empty_source),
+            Err("snapshot schema-2 manifest identity fields are invalid".to_string()),
+        );
+
+        let mut collision = canonical.clone();
+        let mut collided_row = row_mut(&mut collision, DB_FILE).clone();
+        collided_row["path"] = serde_json::json!(DB_FILE.to_ascii_uppercase());
+        collision["files"].as_array_mut().unwrap().push(collided_row);
+        assert_eq!(verify(&collision), Err("snapshot manifest contains a duplicate/case-colliding file".to_string()),);
+
+        let mut unlisted = canonical.clone();
+        unlisted["files"].as_array_mut().unwrap().retain(|row| row["path"] != "champion.json");
+        let error = verify(&unlisted).unwrap_err();
+        assert!(error.contains("inventory is not exact") && error.contains("unlisted=[\"champion.json\"]"), "{error}");
+
+        let mut missing = canonical.clone();
+        missing["files"].as_array_mut().unwrap().push(serde_json::json!({
+            "path": "missing.json",
+            "sizeBytes": 0,
+            "sha256": "0".repeat(64),
+        }));
+        let error = verify(&missing).unwrap_err();
+        assert!(error.contains("inventory is not exact") && error.contains("missing=[\"missing.json\"]"), "{error}");
+
+        let mut short_sha = canonical.clone();
+        row_mut(&mut short_sha, DB_FILE)["sha256"] = serde_json::json!("0");
+        assert_eq!(
+            verify(&short_sha),
+            Err(format!("snapshot manifest SHA-256 for '{DB_FILE}' must be 64 lowercase hex digits")),
+        );
+        let mut uppercase_sha = canonical.clone();
+        row_mut(&mut uppercase_sha, DB_FILE)["sha256"] = serde_json::json!("A".repeat(64));
+        assert_eq!(
+            verify(&uppercase_sha),
+            Err(format!("snapshot manifest SHA-256 for '{DB_FILE}' must be 64 lowercase hex digits")),
+        );
+        let mut wrong_size = canonical.clone();
+        let size = row_mut(&mut wrong_size, DB_FILE)["sizeBytes"].as_u64().unwrap();
+        row_mut(&mut wrong_size, DB_FILE)["sizeBytes"] = serde_json::json!(size + 1);
+        let error = verify(&wrong_size).unwrap_err();
+        assert!(error.contains(&format!("snapshot manifest size mismatch for '{DB_FILE}'")), "{error}");
+        let mut wrong_hash = canonical.clone();
+        row_mut(&mut wrong_hash, DB_FILE)["sha256"] = serde_json::json!("0".repeat(64));
+        assert_eq!(verify(&wrong_hash), Err(format!("snapshot manifest SHA-256 mismatch for '{DB_FILE}'")),);
+
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&canonical).unwrap()).unwrap();
+        let unexpected_dir = snap.join("unexpected-dir");
+        std::fs::create_dir(&unexpected_dir).unwrap();
+        assert_eq!(
+            verify_snapshot_manifest_for_restore(&snap),
+            Err("snapshot file 'unexpected-dir' must be a regular, non-symlink file".to_string()),
+        );
+        std::fs::remove_dir(&unexpected_dir).unwrap();
+
+        let saved_db = tmp.path().join("saved-snapshot.db");
+        std::fs::rename(snap.join(DB_FILE), &saved_db).unwrap();
+        let mut without_db = canonical.clone();
+        without_db["files"].as_array_mut().unwrap().retain(|row| row["path"] != DB_FILE);
+        assert_eq!(verify(&without_db), Err(format!("snapshot manifest is incomplete: missing required '{DB_FILE}'")),);
+        std::fs::rename(saved_db, snap.join(DB_FILE)).unwrap();
+        assert_eq!(verify(&canonical), Ok(true));
+    }
+
+    #[test]
     fn active_pilot_snapshot_requires_exact_current_schema_and_completed_event_grants() {
         let db = seeded_db();
         let policy = pilot_policy();
