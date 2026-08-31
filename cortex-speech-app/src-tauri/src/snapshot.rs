@@ -2356,6 +2356,34 @@ mod tests {
     }
 
     #[test]
+    fn prune_only_rotates_valid_snapshot_directories() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("snapshots");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // An existing but empty root is a valid steady state, not an error or an invented snapshot.
+        prune_snapshots(&root, 1).unwrap();
+
+        let snapshot_shaped_file = root.join("snapshot_0000000150");
+        let unrelated_dir = root.join("notes");
+        let malformed_snapshot_dir = root.join("snapshot_not-a-timestamp");
+        let old_snapshot = root.join("snapshot_0000000100");
+        let newest_snapshot = root.join("snapshot_0000000200");
+        std::fs::write(&snapshot_shaped_file, b"not a snapshot directory").unwrap();
+        for path in [&unrelated_dir, &malformed_snapshot_dir, &old_snapshot, &newest_snapshot] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+
+        prune_snapshots(&root, 1).unwrap();
+
+        assert!(snapshot_shaped_file.is_file(), "a snapshot-shaped regular file is outside rotation authority");
+        assert!(unrelated_dir.is_dir(), "an unrelated directory is outside rotation authority");
+        assert!(malformed_snapshot_dir.is_dir(), "a malformed snapshot directory is outside rotation authority");
+        assert!(!old_snapshot.exists(), "the older valid rotating snapshot is pruned");
+        assert!(newest_snapshot.is_dir(), "the newest valid rotating snapshot is retained");
+    }
+
+    #[test]
     fn prune_refuses_while_an_unacknowledged_quarantine_exists() {
         // #4.5 part 1: the empty-DB guard only holds until the user re-imports (segment_count > 0). Once
         // they do, a non-empty DB snapshots + prunes again — and would rotate out the pre-quarantine
