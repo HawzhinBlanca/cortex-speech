@@ -12793,3 +12793,34 @@ removed one in `couch/lifecycle.rs`, added two in `couch/queue_audio.rs`, and re
 4,882 lines, 8,575 regions, and 1,179 functions; critical branch deficits are review 157, payment
 147, playback 119, restore 252, and IPC 486. Production, live data, scheduled tasks, release
 pointers, credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 30: stale restore-capability refusal
+
+The next deterministic snapshot branch was the pre-restore pin's capability-lifetime boundary. One
+isolated regression creates a private restore admission, reserves and durably arms it, completes the
+restore transaction, and proves that the still-held but no-longer-active capability is rejected before
+the snapshots directory can be created. This distinguishes possession of an old reservation object
+from current ownership of the exact restore generation; production snapshot and restore behavior is
+unchanged.
+
+The focused proof passed 1/1, the complete snapshot namespace passed 44/44, stable rustfmt passed, and
+strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`0dbc7e582fae47672dbb31fb0e70c68b810b8524` then received an exact pinned all-target measurement:
+1,843 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `3ab631989c0d4e4f90672d01de2e4443` (SHA-256
+`a1477b258aa4009a9e5aa3ad75c527077bd513049220736210ff382268f38a8e`) proves snapshot branches
+moved 316/410 to 317/410 and restore moved 1,120/1,524 to 1,121/1,524, reducing uncovered snapshot
+branches from 94 to 93 and uncovered restore branches from 404 to 403. Overall coverage is branches
+7,830/12,829 (61.03%), lines 76,731/96,005 (79.92%), regions 136,499/170,649 (79.99%), and
+functions 6,527/9,632 (67.76%). The target supplied one covered snapshot branch with no new snapshot
+branch denominator. Unrelated run variance added one covered branch in `couch/lifecycle.rs`, removed
+two in `couch/queue_audio.rs`, added one in `jury/learning.rs`, and removed one in `normalizer.rs`,
+for a net loss of one that exactly offset the target gain in the overall branch count. Remaining
+minimum deficits are 2,434 overall branches, 4,874 lines, 8,553 regions, and 1,179 functions;
+critical branch deficits are review 157, payment 147, playback 119, restore 251, and IPC 486.
+Production, live data, scheduled tasks, release pointers, credentials, and GPU/model configuration
+were untouched.
