@@ -12250,3 +12250,43 @@ Note: the diagnostic claimed one extra session for the reviewer (indistinguishab
 reopening their link; expires on the 24 h TTL). The earlier DNS failure during diagnosis was a
 truncated-screenshot typo in the funnel hostname (the screenshot's URL bar had cut its first
 character); the funnel itself was healthy throughout.
+
+---
+
+## 2026-08-31 — Certification is real: the machinery works, and it said no
+
+Readiness step 7's machine half, run to its honest terminus at `9009d7de`.
+
+**Built and proven:**
+- Durable certification root (`%LOCALAPPDATA%\CortexSpeech\verify10`, CORTEX_VERIFY10_ROOT
+  override) — proof history can no longer be erased by a temp clean. A verifier crash bug fixed
+  where fail-closed was intended (undefined helper on the incomplete-campaign path).
+- **`owner-review-product` profile**: owner-product's 48 gates PLUS all seven reviewer-serving
+  gates (55) — the first profile whose green would certify what this machine actually does.
+  Supervisor suite 67/67; the fuzz-smoke timeout collision documented loudly instead of silently
+  re-budgeted (calibration + an owner 6h-cap call must resize it).
+- **Verifier fault campaigns: 3/3 consecutive PASS**, hash-bound at the final commit — that
+  evidence class has its raw authority.
+- The first real coverage phase CAUGHT A REAL LATENT RED: tests/quality_gates.rs pinned migration
+  versions [68..60], stale since v69; every --all-targets run failed while --lib stayed green.
+  Fixed derived-from-catalog; the full --all-targets suite is green for the first time on this
+  line (soak, reliability, proptests, integrations).
+
+**The honest wall, measured by the real instrument:** the branch-instrumented coverage phase ran
+end to end (~22 min) and FAILED on its own threshold — **regions 154,656/194,359 = 79.57% vs the
+85% contract**. The phase is correct; the code does not yet meet the bar (independently matching
+the 2026-08-28 measurement of 79.23%). Because the coverage phase is a hard prerequisite, NO
+proof manifest — not even a RED one — can exist until it passes. Fail-closed, exactly as
+designed; no shortcut exists that does not weaken a gate.
+
+**What certification still needs, in order:** (1) raise backend region coverage +5.43 points
+(≈10,500 regions — the audit's "largest single body of work"), after which the first real
+manifest lands with an honest RED enumerating the rest; (2) the five owner-campaign producers
+(deployment-reboot needs only an assembler + a cold reboot; schema-restore's building blocks
+exist; concurrency needs measurement infra); (3) owner-gated evidence — 30 field sessions on 30
+distinct UTC dates (≥30 days BY DESIGN) and the reboot campaign. Full green is a month away at
+minimum, by construction, and that is the bar working as written.
+
+Also tonight: the 7B champion could not restart — both GPUs hold only ~18.7 GB free because
+another resident workload owns ~5 GB each; deliberately NOT evicted without the owner. Drafting
+stays halted (canon hard-stop) until the owner frees VRAM and reruns start_7b_server.ps1.
