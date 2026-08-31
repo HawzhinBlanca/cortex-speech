@@ -836,3 +836,303 @@ pub(crate) fn validate_review_compensation_semantics(db: &crate::db::Database) -
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::validate_review_compensation_semantics;
+    use crate::db::Database;
+
+    fn canonical_operation(index: u64) -> String {
+        format!("00000000-0000-4000-8000-{index:012x}")
+    }
+
+    /// A segment carrying the canonical pay evidence: content hash, fingerprint, source span.
+    fn paid_segment(db: &Database, id: &str) {
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: id.to_string(),
+            audio_path: format!("{id}.wav"),
+            raw_transcript: "machine draft".to_string(),
+            duration_ms: 1_000,
+            confidence: Some(0.99),
+            ..crate::db::SpeechSegment::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_content_hash = ?2,
+                        audio_fingerprint = ?3,
+                        alignment_json = '{\"source_start_ms\":0,\"source_end_ms\":1000}',
+                        duration_ms = 1000
+                  WHERE id = ?1",
+                rusqlite::params![id, "a".repeat(64), 424_242_i64],
+            )
+            .unwrap();
+    }
+
+    fn seeded_db(id: &str) -> Database {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        paid_segment(&db, id);
+        db
+    }
+
+    /// Mint the policy-3 listening evidence the paid decision below must be able to prove.
+    fn listened(db: &Database, id: &str) {
+        db.record_playback_receipt(&crate::db::PlaybackReceipt {
+            segment_id: id.to_string(),
+            segment_revision: 0,
+            audio_content_hash: "a".repeat(64),
+            reviewer: Some("Reviewer".to_string()),
+            session_id: None,
+            started_at_ms: 1,
+            played_ms: 1_000,
+            clip_duration_ms: 1_000,
+            source_start_ms: None,
+            source_end_ms: None,
+        })
+        .unwrap();
+    }
+
+    /// A real paid phone edit through the production API.
+    fn decided(db: &Database, id: &str, index: u64) {
+        let revision = db.segment_review_revision(id).unwrap().unwrap();
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            id,
+            "edit",
+            Some("corrected text"),
+            "Reviewer",
+            revision,
+            &canonical_operation(index),
+            &crate::db::review_operation_payload_hash(id, "edit", "corrected text", "Reviewer"),
+        )
+        .unwrap()
+        .unwrap();
+    }
+
+    fn paid_fixture(id: &str, index: u64) -> Database {
+        let db = seeded_db(id);
+        listened(&db, id);
+        decided(&db, id, index);
+        validate_review_compensation_semantics(&db)
+            .expect("a genuine paid decision with listening evidence must validate first");
+        db
+    }
+
+    /// Restored files can carry rows written with the guards disabled — drop them first.
+    fn unlock(db: &Database, table: &str) {
+        let names = db
+            .connection()
+            .prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=?1")
+            .unwrap()
+            .query_map([table], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for name in names {
+            db.connection().execute(&format!("DROP TRIGGER \"{name}\""), []).unwrap();
+        }
+        db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+    }
+
+    #[test]
+    fn a_fresh_database_and_a_genuine_paid_decision_both_validate() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        validate_review_compensation_semantics(&db).expect("a pristine database is a valid pay target");
+        paid_fixture("paid-clip", 100);
+    }
+
+    #[test]
+    fn the_compensation_policy_row_must_be_the_exact_binary_constants() {
+        let deleted = paid_fixture("policy-clip", 110);
+        unlock(&deleted, "review_compensation_policies");
+        deleted.connection().execute("DELETE FROM review_compensation_policies", []).unwrap();
+        let error = validate_review_compensation_semantics(&deleted).unwrap_err();
+        assert!(error.contains("must contain only the exact"), "{error}");
+
+        let drifted = paid_fixture("policy-clip", 111);
+        unlock(&drifted, "review_compensation_policies");
+        drifted.connection().execute("UPDATE review_compensation_policies SET edit_basis_points = 9999", []).unwrap();
+        let error = validate_review_compensation_semantics(&drifted).unwrap_err();
+        assert!(error.contains("constants differ from this binary"), "{error}");
+
+        let out_of_range = paid_fixture("policy-clip", 112);
+        unlock(&out_of_range, "review_compensation_policies");
+        out_of_range
+            .connection()
+            .execute("UPDATE review_compensation_policies SET effective_after_event_id = 99", [])
+            .unwrap();
+        let error = validate_review_compensation_semantics(&out_of_range).unwrap_err();
+        assert!(error.contains("outside review history"), "{error}");
+    }
+
+    #[test]
+    fn post_cutoff_event_evidence_refusals() {
+        let cases: [(&str, &str, &str); 4] = [
+            (
+                "pay action contradicts the request classification",
+                "UPDATE review_events SET compensation_action='accept'",
+                "invalid action/pay semantics",
+            ),
+            ("no durable duration", "UPDATE review_events SET duration_ms=NULL", "no valid durable duration"),
+            (
+                "non-canonical payload hash",
+                "UPDATE review_events SET operation_payload_hash='xyz'",
+                "lacks a canonical payload hash",
+            ),
+            (
+                "unauthorized event source",
+                "UPDATE review_events SET source='desktop'",
+                "not a valid production Couch action",
+            ),
+        ];
+        for (label, sabotage, expected) in cases {
+            let db = paid_fixture("event-clip", 120);
+            unlock(&db, "review_events");
+            assert_eq!(db.connection().execute(sabotage, []).unwrap(), 1, "{label}");
+            let error = validate_review_compensation_semantics(&db).unwrap_err();
+            assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
+        }
+
+        // Every paid event must carry a canonical lowercase operation UUID. (A same-value duplicate
+        // cannot be forged in place: the schema's UNIQUE index on review_events.operation_id is
+        // undroppable table authority, so the non-canonical arm is the reachable half.)
+        let db = paid_fixture("event-clip", 121);
+        unlock(&db, "review_events");
+        db.connection().execute("UPDATE review_events SET operation_id='not-a-uuid'", []).unwrap();
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("unique canonical lowercase UUID"), "{error}");
+    }
+
+    #[test]
+    fn ledger_identity_and_arithmetic_refusals() {
+        let cases: [(&str, &str, &str); 5] = [
+            (
+                "delta drifts from the re-derived entitlement",
+                "UPDATE review_compensation_ledger SET delta_micro_iqd=delta_micro_iqd+1",
+                "math is invalid",
+            ),
+            (
+                "rate drifts from the action's basis points",
+                "UPDATE review_compensation_ledger SET rate_basis_points=5",
+                "math is invalid",
+            ),
+            (
+                "work identity kind is not the canonical audio identity",
+                "UPDATE review_compensation_ledger SET canonical_identity_kind='legacy'",
+                "disagrees with canonical segment/work identity",
+            ),
+            (
+                "blank reviewer identity",
+                "UPDATE review_compensation_ledger SET reviewer=''",
+                "invalid or duplicate durable identity",
+            ),
+            (
+                "entry key repoints to another event",
+                "UPDATE review_compensation_ledger SET entry_key='review-event:999'",
+                "disagrees with review event",
+            ),
+        ];
+        for (label, sabotage, expected) in cases {
+            let db = paid_fixture("ledger-clip", 130);
+            unlock(&db, "review_compensation_ledger");
+            assert_eq!(db.connection().execute(sabotage, []).unwrap(), 1, "{label}");
+            let error = validate_review_compensation_semantics(&db).unwrap_err();
+            assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
+        }
+
+        // Deleting the listening evidence behind a paid event is refused: pay without proof of
+        // playback is exactly the forgery the policy-3/4 binding exists to stop.
+        let db = paid_fixture("ledger-clip", 131);
+        unlock(&db, "playback_receipts");
+        assert!(db.connection().execute("DELETE FROM playback_receipts", []).unwrap() >= 1);
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("no exact consumed policy-3/4 playback authority"), "{error}");
+    }
+
+    #[test]
+    fn settlements_must_cover_exact_contiguous_ledger_ranges() {
+        let db = paid_fixture("settle-clip", 140);
+        let (maximum_id, amount): (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT COALESCE(MAX(id),0), COALESCE(SUM(delta_micro_iqd),0) FROM review_compensation_ledger",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(maximum_id >= 1, "the paid decision must have minted a ledger entry");
+        unlock(&db, "review_compensation_settlements");
+        let insert = |settlement_id: &str, from: i64, through: i64, amount: i64, reference: &str| {
+            db.connection()
+                .execute(
+                    "INSERT INTO review_compensation_settlements
+                        (settlement_id, policy_version, reviewer, from_ledger_id_exclusive,
+                         through_ledger_id_inclusive, allocated_micro_iqd, payout_reference)
+                     VALUES (?1, ?2, 'Reviewer', ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        settlement_id,
+                        crate::db::REVIEW_PAY_POLICY_VERSION,
+                        from,
+                        through,
+                        amount,
+                        reference
+                    ],
+                )
+                .unwrap();
+        };
+
+        // The exact contiguous range with the exact immutable amount validates.
+        insert("10000000-0000-4000-8000-000000000001", 0, maximum_id, amount, "payout-1");
+        validate_review_compensation_semantics(&db).unwrap();
+
+        // A range reaching beyond retained ledger history is refused.
+        insert("10000000-0000-4000-8000-000000000002", maximum_id, maximum_id + 5, 0, "payout-2");
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("non-contiguous or invalid ledger range"), "{error}");
+        db.connection()
+            .execute("DELETE FROM review_compensation_settlements WHERE payout_reference='payout-2'", [])
+            .unwrap();
+
+        // An amount differing from the immutable range is refused.
+        let mismatched = paid_fixture("settle-clip-2", 141);
+        unlock(&mismatched, "review_compensation_settlements");
+        mismatched
+            .connection()
+            .execute(
+                "INSERT INTO review_compensation_settlements
+                    (settlement_id, policy_version, reviewer, from_ledger_id_exclusive,
+                     through_ledger_id_inclusive, allocated_micro_iqd, payout_reference)
+                 VALUES ('10000000-0000-4000-8000-000000000003', ?1, 'Reviewer', 0, 1, 42, 'payout-3')",
+                [crate::db::REVIEW_PAY_POLICY_VERSION],
+            )
+            .unwrap();
+        let error = validate_review_compensation_semantics(&mismatched).unwrap_err();
+        assert!(error.contains("amount differs from its immutable ledger range"), "{error}");
+
+        // A blank payout reference can never anchor real money movement.
+        let blank = paid_fixture("settle-clip-3", 142);
+        unlock(&blank, "review_compensation_settlements");
+        let (blank_max, blank_amount): (i64, i64) = blank
+            .connection()
+            .query_row(
+                "SELECT COALESCE(MAX(id),0), COALESCE(SUM(delta_micro_iqd),0) FROM review_compensation_ledger",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        blank
+            .connection()
+            .execute(
+                "INSERT INTO review_compensation_settlements
+                    (settlement_id, policy_version, reviewer, from_ledger_id_exclusive,
+                     through_ledger_id_inclusive, allocated_micro_iqd, payout_reference)
+                 VALUES ('10000000-0000-4000-8000-000000000004', ?1, 'Reviewer', 0, ?2, ?3, '   ')",
+                rusqlite::params![crate::db::REVIEW_PAY_POLICY_VERSION, blank_max, blank_amount],
+            )
+            .unwrap();
+        let error = validate_review_compensation_semantics(&blank).unwrap_err();
+        assert!(error.contains("empty or duplicate payout reference"), "{error}");
+    }
+}

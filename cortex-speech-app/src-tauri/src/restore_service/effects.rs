@@ -2526,4 +2526,81 @@ mod tests {
         let error = validate_review_effect_semantics(&db).unwrap_err();
         assert!(error.contains("outside the exact anonymous desktop operation boundary"), "{error}");
     }
+
+    /// Drop every trigger on `table` — the restored-file threat model, same as `unlock_effects`.
+    fn unlock_table(db: &Database, table: &str) {
+        let names = db
+            .connection()
+            .prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=?1")
+            .unwrap()
+            .query_map([table], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for name in names {
+            db.connection().execute(&format!("DROP TRIGGER \"{name}\""), []).unwrap();
+        }
+        db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+    }
+
+    #[test]
+    fn a_genuine_review_flag_validates_and_its_forgeries_are_refused() {
+        // The baseline first: a real flag written by the production API is a valid restore target.
+        let db = seeded_db("flag-clip");
+        let revision = db.segment_review_revision("flag-clip").unwrap().unwrap();
+        db.record_review_flag("flag-clip", revision, "needs another listen", &canonical_operation(470)).unwrap();
+        validate_review_effect_semantics(&db).expect("a genuine flag is a valid restore target");
+
+        // Each corruption breaks exactly one immutable flag invariant.
+        let corruptions: [(&str, &str); 3] = [
+            ("blank rationale", "UPDATE review_flag_effect_events SET flag_rationale='   '"),
+            ("revision skips ahead", "UPDATE review_flag_effect_events SET flag_revision=prior_revision+2"),
+            ("forged operation id", "UPDATE review_flag_effect_events SET operation_id='not-a-uuid'"),
+        ];
+        for (label, sabotage) in corruptions {
+            let db = seeded_db("flag-clip");
+            let revision = db.segment_review_revision("flag-clip").unwrap().unwrap();
+            db.record_review_flag("flag-clip", revision, "needs another listen", &canonical_operation(471)).unwrap();
+            validate_review_effect_semantics(&db).unwrap();
+            unlock_table(&db, "review_flag_effect_events");
+            assert_eq!(db.connection().execute(sabotage, []).unwrap(), 1, "{label}");
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(error.contains("violates its immutable revision/operation identity"), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_flag_reusing_another_review_operation_identity_is_refused() {
+        // Operation ids are the cross-table identity spine; a flag stealing a review event's
+        // operation could later launder that event's evidence as its own.
+        let db = seeded_db("flag-collision");
+        couch_event(&db, "flag-collision", "skip", 480);
+        let revision = db.segment_review_revision("flag-collision").unwrap().unwrap();
+        db.record_review_flag("flag-collision", revision, "needs another listen", &canonical_operation(481)).unwrap();
+        validate_review_effect_semantics(&db).expect("distinct operations must validate first");
+
+        unlock_table(&db, "review_flag_effect_events");
+        db.connection()
+            .execute(
+                "UPDATE review_flag_effect_events
+                    SET operation_id=(SELECT operation_id FROM review_events ORDER BY id LIMIT 1)",
+                [],
+            )
+            .unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("reuses another review operation identity"), "{error}");
+    }
+
+    #[test]
+    fn a_frontier_beyond_retained_history_is_refused() {
+        // A frontier pointing past the retained journals would classify EVERY real row as pre-v60
+        // legacy and exempt it from the post-v60 evidence checks — the cheapest possible laundering.
+        let db = seeded_db("frontier-clip");
+        unlock_table(&db, "review_effect_state");
+        db.connection()
+            .execute("UPDATE review_effect_state SET effective_after_review_event_id=7 WHERE singleton_key=1", [])
+            .unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("exceed retained history"), "{error}");
+    }
 }

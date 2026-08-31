@@ -773,3 +773,311 @@ impl ProcessingPipeline {
         run_wsl_segment_transcript_direct(audio_path, alignment_json, cancel)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Coverage for the pre-flight refusal, source-binding and gating arms that run without a live
+    //! champion server: unbound-source refusals, snapshot/identity validation, engine-selection
+    //! refusals, cloud-routing predicates and the auxiliary-hypothesis guards. Anything that would
+    //! contact the WSL 7B socket is exercised only up to its refusal/early-return boundary.
+
+    use super::*;
+    use crate::cache::TranscriptCache;
+    use crate::db::{Database, SegmentHypothesis, SpeechSegment};
+    use crate::fingerprint::AudioFingerprint;
+    use crate::models::ModelManager;
+    use crate::normalizer::SoraniNormalizer;
+    use crate::settings::{AppSettings, AsrModelSize, LlmMode};
+
+    fn test_pipeline(settings: AppSettings) -> (ProcessingPipeline, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("db.sqlite").to_string_lossy().to_string();
+        let pipeline = ProcessingPipeline::new(
+            db_path,
+            Arc::new(SoraniNormalizer::new()),
+            Arc::new(TranscriptCache::new(16)),
+            Arc::new(AudioFingerprint::new()),
+            Arc::new(settings),
+            Arc::new(ModelManager::new(dir.path().join("models"))),
+        );
+        (pipeline, dir)
+    }
+
+    fn write_sine_wav(path: &Path, samples: usize) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for i in 0..samples {
+            let t = i as f64 / 16_000.0;
+            writer.write_sample((8_000.0 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    fn register_test_champion(db: &Database, id: &str) {
+        crate::registry::register_candidate(
+            db,
+            &crate::registry::NewModelVersion {
+                id: id.into(),
+                family: "omniasr-7b".into(),
+                model_card_name: Some("test/champion".into()),
+                checkpoint_sha256: "a".repeat(64),
+                checkpoint_path: "C:/models/test-champion.json".into(),
+                source: "cortex-finetuned".into(),
+                license: "test-only".into(),
+            },
+        )
+        .unwrap();
+        crate::registry::set_champion_for_test(db, id).unwrap();
+    }
+
+    #[test]
+    fn transcribe_with_a_segment_id_requires_bound_source_authority() {
+        let (pipeline, _dir) = test_pipeline(AppSettings::default());
+        let error = pipeline
+            .transcribe(Some("existing-segment"), "C:/anywhere/audio.wav", None, None)
+            .expect_err("an existing-segment id must be refused on the unbound path")
+            .to_string();
+        assert!(error.contains("E_TRANSCRIPTION_SOURCE_UNBOUND"), "unexpected refusal: {error}");
+    }
+
+    #[test]
+    fn binding_refuses_missing_span_drifted_and_unverified_segments() {
+        let (pipeline, _dir) = test_pipeline(AppSettings::default());
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+
+        let error = pipeline.bind_existing_transcription_source("ghost", None, None).unwrap_err().to_string();
+        assert!(error.contains("no longer exists"), "a vanished segment must fail closed: {error}");
+
+        let stored_alignment = r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":1}"#;
+        db.insert_segment(&SpeechSegment {
+            id: "span-seg".into(),
+            audio_path: "C:/recordings/span.wav".into(),
+            raw_transcript: "دەقی نێوخۆیی".into(),
+            duration_ms: 1_000,
+            alignment_json: Some(stored_alignment.into()),
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+
+        // A caller-supplied span that no longer matches the database copy is stale UI state.
+        let drifted = r#"{"source_start_ms":100,"source_end_ms":900,"chunk_index":0,"chunk_count":1}"#;
+        let error =
+            pipeline.bind_existing_transcription_source("span-seg", None, Some(drifted)).unwrap_err().to_string();
+        assert!(
+            error.contains("E_TRANSCRIPTION_SOURCE_CHANGED") && error.contains("source span changed"),
+            "unexpected span-drift refusal: {error}"
+        );
+
+        // A matching span but no canonical decoded-PCM identity: unverifiable, so unusable.
+        let error = pipeline
+            .bind_existing_transcription_source("span-seg", None, Some(stored_alignment))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("E_TRANSCRIPTION_SOURCE_UNVERIFIED") && error.contains("no canonical decoded-PCM identity"),
+            "unexpected unverified refusal: {error}"
+        );
+
+        // A present-but-malformed identity is repaired, never trusted.
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET audio_content_hash = 'definitely-not-canonical' WHERE id = 'span-seg'",
+                [],
+            )
+            .unwrap();
+        let error = pipeline.bind_existing_transcription_source("span-seg", None, None).unwrap_err().to_string();
+        assert!(
+            error.contains("E_TRANSCRIPTION_SOURCE_UNVERIFIED") && error.contains("malformed decoded-PCM identity"),
+            "unexpected malformed-identity refusal: {error}"
+        );
+    }
+
+    #[test]
+    fn draft_refuses_missing_and_empty_audio_before_any_engine_choice() {
+        let (pipeline, dir) = test_pipeline(AppSettings::default());
+
+        let missing = dir.path().join("does-not-exist.wav");
+        assert!(
+            pipeline.transcribe(None, missing.to_str().unwrap(), None, None).is_err(),
+            "a missing source file must fail before any engine work"
+        );
+
+        // A zero-sample WAV is refused with an empty-audio classification. Whether the duration
+        // probe ("Empty audio file") or the decoder ("Empty audio buffer") trips first depends on
+        // how the container reports frame counts; both are the same loud stop, never a blank draft.
+        let empty = dir.path().join("empty.wav");
+        write_sine_wav(&empty, 0);
+        let error = pipeline.transcribe(None, empty.to_str().unwrap(), None, None).unwrap_err().to_string();
+        assert!(error.contains("Empty audio"), "unexpected empty-audio refusal: {error}");
+    }
+
+    #[test]
+    fn wsl_primary_draft_requires_exactly_one_imported_segment() {
+        // Champion-primary transcription is DB-bound: with no imported segment there is nothing the
+        // draft could be attributed to, and with an ambiguous path the caller must disambiguate.
+        // Both refusals happen before any socket or subprocess is touched.
+        let (pipeline, dir) =
+            test_pipeline(AppSettings { asr_model_size: AsrModelSize::WSL7B, ..AppSettings::default() });
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        let wav = dir.path().join("unimported.wav");
+        write_sine_wav(&wav, 16_000);
+        let wav_str = wav.to_string_lossy().to_string();
+
+        let error = pipeline.transcribe(None, &wav_str, None, None).unwrap_err().to_string();
+        assert!(
+            error.contains("Segment not found in database"),
+            "an unimported file must be refused with the import hint: {error}"
+        );
+
+        for id in ["shared-1", "shared-2"] {
+            db.insert_segment(&SpeechSegment {
+                id: id.into(),
+                audio_path: wav_str.clone(),
+                raw_transcript: "دەقی هاوبەش".into(),
+                duration_ms: 1_000,
+                ..SpeechSegment::default()
+            })
+            .unwrap();
+        }
+        let error = pipeline.transcribe(None, &wav_str, None, None).unwrap_err().to_string();
+        assert!(
+            error.contains("segments share this audio file"),
+            "an ambiguous audio path must demand an explicit segment id: {error}"
+        );
+    }
+
+    #[test]
+    fn finetuned_chunk_transcription_of_empty_pcm_is_empty_without_touching_the_model() {
+        let result = ProcessingPipeline::transcribe_chunk_finetuned(
+            Path::new("C:/definitely/absent/model.onnx"),
+            Path::new("C:/definitely/absent/vocab.json"),
+            &[],
+        )
+        .expect("zero samples short-circuit before any model file is opened");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn gold_eval_local_refuses_engines_it_cannot_label_honestly() {
+        let (pipeline, _dir) = test_pipeline(AppSettings::default());
+        for dishonest in ["omniasr-wsl-7b", "finetuned-mms-ckb", "made-up-engine"] {
+            let error = pipeline.run_gold_eval_local(dishonest).unwrap_err().to_string();
+            assert!(
+                error.contains("can only run the local CTC engines"),
+                "'{dishonest}' must be refused, never mislabeled: {error}"
+            );
+            assert!(error.contains(dishonest), "the refusal must echo the rejected id: {error}");
+        }
+    }
+
+    #[test]
+    fn local_llm_mode_cloud_routing_depends_on_endpoint_locality_and_consent() {
+        // Loopback endpoint: genuinely local, no consent needed, refiner built as configured.
+        let (local, _dir_a) = test_pipeline(AppSettings {
+            llm_mode: LlmMode::Local,
+            llm_endpoint: "http://127.0.0.1:11434".into(),
+            ..AppSettings::default()
+        });
+        assert!(!local.llm_refinement_uses_cloud());
+        assert!(local.llm_refinement_permitted());
+        let refiner = local.build_refiner().unwrap().expect("a local refiner must be constructed");
+        assert!(refiner.endpoint.contains("127.0.0.1"), "unexpected endpoint: {}", refiner.endpoint);
+
+        // "Local" mode pointed at a remote host without cloud consent is effectively cloud and is
+        // downgraded to no refinement at all — text must not leave the machine.
+        let (remote_unconsented, _dir_b) = test_pipeline(AppSettings {
+            llm_mode: LlmMode::Local,
+            llm_endpoint: "https://llm.example.com/v1".into(),
+            cloud_llm_opt_in: false,
+            ..AppSettings::default()
+        });
+        assert!(!remote_unconsented.llm_refinement_permitted());
+        assert!(remote_unconsented.build_refiner().unwrap().is_none(), "no refiner without cloud consent");
+
+        // The same remote endpoint WITH consent is a cloud call and is permitted as one.
+        let (remote_consented, _dir_c) = test_pipeline(AppSettings {
+            llm_mode: LlmMode::Local,
+            llm_endpoint: "https://llm.example.com/v1".into(),
+            cloud_llm_opt_in: true,
+            ..AppSettings::default()
+        });
+        assert!(remote_consented.llm_refinement_uses_cloud());
+        assert!(remote_consented.llm_refinement_permitted());
+        let refiner = remote_consented.build_refiner().unwrap().expect("a consented remote refiner is built");
+        assert!(refiner.endpoint.contains("llm.example.com"), "unexpected endpoint: {}", refiner.endpoint);
+    }
+
+    #[test]
+    fn hypothesis_population_is_gated_off_in_champion_mode() {
+        // Champion supremacy: even a legacy multi_engine_hypotheses=true settings file must not
+        // let auxiliary engines run or write evidence when WSL7B is selected.
+        let (pipeline, _dir) = test_pipeline(AppSettings {
+            asr_model_size: AsrModelSize::WSL7B,
+            multi_engine_hypotheses: true,
+            ..AppSettings::default()
+        });
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&SpeechSegment {
+            id: "champion-gated".into(),
+            audio_path: "C:/recordings/champion-gated.wav".into(),
+            raw_transcript: "دەقی پاڵەوان".into(),
+            duration_ms: 1_000,
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+
+        pipeline.populate_hypotheses(&db, "champion-gated", &[0.0f32; 1_600]).unwrap();
+
+        assert!(
+            db.get_hypotheses_for_segment("champion-gated").unwrap().is_empty(),
+            "champion mode must not mint auxiliary hypothesis evidence"
+        );
+    }
+
+    #[test]
+    fn wsl_auxiliary_hypothesis_skips_gracefully_without_champion_or_segment() {
+        let (pipeline, _dir) =
+            test_pipeline(AppSettings { asr_model_size: AsrModelSize::CTC300M, ..AppSettings::default() });
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        let import_writes = pipeline.import_write_store(db.path()).unwrap();
+        db.insert_segment(&SpeechSegment {
+            id: "aux-seg".into(),
+            audio_path: "C:/recordings/aux-seg.wav".into(),
+            raw_transcript: "دەقی یاریدەدەر".into(),
+            duration_ms: 1_000,
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+
+        // No registry champion identity: the auxiliary pass logs and skips, never guesses.
+        pipeline.populate_wsl_hypothesis_if_configured(&db, &import_writes, "aux-seg").unwrap();
+        assert!(db.get_hypotheses_for_segment("aux-seg").unwrap().is_empty());
+
+        // The champion already voted for this segment: no duplicate vote, no server call.
+        register_test_champion(&db, "champ-aux");
+        db.insert_hypothesis(&SegmentHypothesis {
+            segment_id: "aux-seg".into(),
+            model_id: "champ-aux".into(),
+            transcript: "دەنگدانی ئامادە".into(),
+            confidence: None,
+        })
+        .unwrap();
+        pipeline.populate_wsl_hypothesis_if_configured(&db, &import_writes, "aux-seg").unwrap();
+        let votes = db.get_hypotheses_for_segment("aux-seg").unwrap();
+        assert_eq!(votes.len(), 1, "an existing champion vote must not be duplicated");
+        assert_eq!(votes[0].transcript, "دەنگدانی ئامادە");
+
+        // A row that vanished between selection and the auxiliary pass is a clean no-op.
+        pipeline.populate_wsl_hypothesis_if_configured(&db, &import_writes, "aux-ghost").unwrap();
+        assert!(db.get_hypotheses_for_segment("aux-ghost").unwrap().is_empty());
+    }
+}

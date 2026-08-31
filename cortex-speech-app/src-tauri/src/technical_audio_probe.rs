@@ -583,4 +583,291 @@ mod tests {
         assert_eq!(evidence, TechnicalAudioFailureEvidence::inconclusive());
         assert!(!technical_audio_failure_evidence_is_current(Path::new("unused"), &evidence));
     }
+
+    // Windows on this workstation occasionally lets a metadata/read probe race a just-finished
+    // write (repo-documented flake). Wait for a stable observed length before probing or hashing.
+    fn settle_written_file(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = None;
+        loop {
+            let length = std::fs::metadata(path).ok().map(|metadata| metadata.len());
+            if length.is_some() && length == last {
+                return;
+            }
+            assert!(Instant::now() < deadline, "written test file never settled: {}", path.display());
+            last = length;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn write_probe_wav(path: &Path, seed: i16, samples: usize) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for index in 0..samples {
+            writer.write_sample(seed.wrapping_add((index % 251) as i16)).unwrap();
+        }
+        writer.finalize().unwrap();
+        settle_written_file(path);
+    }
+
+    fn evidence(observation: TechnicalAudioProbeObservation, hash: Option<&str>) -> TechnicalAudioFailureEvidence {
+        TechnicalAudioFailureEvidence { observation, source_blake3: hash.map(str::to_string) }
+    }
+
+    // The lease intentionally has no Debug impl, so unwrap_err/expect_err cannot be used on it.
+    fn lease_error(path: &Path, evidence: &TechnicalAudioFailureEvidence, deadline: Instant, context: &str) -> String {
+        match acquire_technical_audio_source_lease(path, evidence, deadline) {
+            Err(error) => error,
+            Ok(_) => panic!("{context}"),
+        }
+    }
+
+    #[test]
+    fn observation_codes_are_stable_wire_identifiers() {
+        assert_eq!(TechnicalAudioProbeObservation::DecodeFailed.code(), "decodeFailed");
+        assert_eq!(TechnicalAudioProbeObservation::MissingFile.code(), "missingFile");
+        assert_eq!(TechnicalAudioProbeObservation::PermissionDenied.code(), "permissionDenied");
+        assert_eq!(TechnicalAudioProbeObservation::CorruptContainer.code(), "corruptContainer");
+        assert_eq!(TechnicalAudioProbeObservation::Healthy.code(), "healthy");
+        assert_eq!(TechnicalAudioProbeObservation::Inconclusive.code(), "inconclusive");
+    }
+
+    #[test]
+    fn evidence_is_canonical_only_for_the_exact_observation_hash_pairs() {
+        use TechnicalAudioProbeObservation as Observation;
+        let valid = "a".repeat(64);
+        // Reproduced byte-level failures REQUIRE a canonical lowercase 64-hex source binding.
+        assert!(evidence(Observation::DecodeFailed, Some(&valid)).is_canonical());
+        assert!(evidence(Observation::CorruptContainer, Some(&valid)).is_canonical());
+        assert!(!evidence(Observation::DecodeFailed, None).is_canonical());
+        assert!(!evidence(Observation::DecodeFailed, Some(&"a".repeat(63))).is_canonical());
+        assert!(!evidence(Observation::DecodeFailed, Some(&"A".repeat(64))).is_canonical());
+        assert!(!evidence(Observation::DecodeFailed, Some(&"g".repeat(64))).is_canonical());
+        // Every other observation must carry NO hash: those conditions have no reproduced bytes.
+        assert!(evidence(Observation::MissingFile, None).is_canonical());
+        assert!(!evidence(Observation::MissingFile, Some(&valid)).is_canonical());
+        assert!(evidence(Observation::PermissionDenied, None).is_canonical());
+        assert!(!evidence(Observation::PermissionDenied, Some(&valid)).is_canonical());
+        assert!(evidence(Observation::Healthy, None).is_canonical());
+        assert!(!evidence(Observation::Healthy, Some(&valid)).is_canonical());
+        assert!(evidence(Observation::Inconclusive, None).is_canonical());
+        assert!(!evidence(Observation::Inconclusive, Some(&valid)).is_canonical());
+    }
+
+    #[test]
+    fn local_probe_reports_healthy_audio_without_binding_source_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let audio = directory.path().join("healthy.wav");
+        write_probe_wav(&audio, 400, 16_000);
+        let evidence = probe_technical_audio_failure(&audio, Instant::now() + Duration::from_secs(10));
+        assert_eq!(evidence.observation, TechnicalAudioProbeObservation::Healthy);
+        assert!(evidence.source_blake3.is_none(), "healthy audio must never carry a failure binding");
+        assert!(
+            !technical_audio_failure_evidence_is_current(&audio, &evidence),
+            "healthy evidence can never be current failure authority"
+        );
+    }
+
+    #[test]
+    fn local_probe_binds_a_corrupt_container_to_its_exact_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let audio = directory.path().join("corrupt.wav");
+        let bytes = b"definitely not an audio container".to_vec();
+        std::fs::write(&audio, &bytes).unwrap();
+        settle_written_file(&audio);
+
+        let evidence = probe_technical_audio_failure(&audio, Instant::now() + Duration::from_secs(10));
+        assert_eq!(evidence.observation, TechnicalAudioProbeObservation::CorruptContainer);
+        assert_eq!(
+            evidence.source_blake3.as_deref(),
+            Some(blake3::hash(&bytes).to_hex().to_string().as_str()),
+            "the failure must bind the exact source bytes that were reproduced"
+        );
+        assert!(technical_audio_failure_evidence_is_current(&audio, &evidence));
+
+        // Any byte drift after the probe invalidates the evidence.
+        use std::io::Write as _;
+        std::fs::OpenOptions::new().append(true).open(&audio).unwrap().write_all(b"!").unwrap();
+        settle_written_file(&audio);
+        assert!(!technical_audio_failure_evidence_is_current(&audio, &evidence));
+    }
+
+    #[test]
+    fn missing_file_evidence_is_current_only_while_the_path_stays_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        let audio = directory.path().join("absent.wav");
+        let missing = evidence(TechnicalAudioProbeObservation::MissingFile, None);
+        assert!(technical_audio_failure_evidence_is_current(&audio, &missing));
+        std::fs::write(&audio, b"now present").unwrap();
+        settle_written_file(&audio);
+        assert!(!technical_audio_failure_evidence_is_current(&audio, &missing));
+    }
+
+    #[test]
+    fn an_expired_deadline_is_always_inconclusive_never_a_verdict() {
+        let directory = tempfile::tempdir().unwrap();
+        let audio = directory.path().join("deadline.wav");
+        write_probe_wav(&audio, 123, 1_600);
+        let already_past = Instant::now();
+        let evidence = probe_technical_audio_failure(&audio, already_past);
+        assert_eq!(evidence, TechnicalAudioFailureEvidence::inconclusive());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_source_reports_permission_denied_without_a_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let unreadable = directory.path().join("dir-as-source.wav");
+        std::fs::create_dir(&unreadable).unwrap();
+        let evidence = probe_technical_audio_failure(&unreadable, Instant::now() + Duration::from_secs(10));
+        assert_eq!(evidence.observation, TechnicalAudioProbeObservation::PermissionDenied);
+        assert!(evidence.source_blake3.is_none());
+        assert!(technical_audio_failure_evidence_is_current(&unreadable, &evidence));
+        let error = lease_error(
+            &unreadable,
+            &evidence,
+            Instant::now() + Duration::from_secs(5),
+            "an unreadable source has no bytes to seal",
+        );
+        assert_eq!(
+            error,
+            "permission-denied technical-audio evidence cannot acquire the required readable source lease"
+        );
+    }
+
+    #[test]
+    fn blake3_prefilter_honors_content_and_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("hashed.bin");
+        std::fs::write(&file, b"exact bytes to hash").unwrap();
+        settle_written_file(&file);
+        assert_eq!(
+            blake3_file_before(&file, Instant::now() + Duration::from_secs(5)).unwrap().as_deref(),
+            Some(blake3::hash(b"exact bytes to hash").to_hex().to_string().as_str())
+        );
+        assert_eq!(
+            blake3_file_before(&file, Instant::now()).unwrap(),
+            None,
+            "an expired deadline must abandon hashing rather than return a partial identity"
+        );
+        assert!(
+            blake3_file_before(&directory.path().join("missing.bin"), Instant::now() + Duration::from_secs(5)).is_err()
+        );
+    }
+
+    #[test]
+    fn source_lease_refuses_every_non_reproducible_observation() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let path = Path::new("unused-lease-target");
+        let cases = [
+            (evidence(TechnicalAudioProbeObservation::DecodeFailed, None), "technical-audio evidence is not canonical"),
+            (
+                evidence(TechnicalAudioProbeObservation::MissingFile, None),
+                "missing-file technical-audio evidence cannot acquire an immutable source lease",
+            ),
+            (
+                evidence(TechnicalAudioProbeObservation::PermissionDenied, None),
+                "permission-denied technical-audio evidence cannot acquire the required readable source lease",
+            ),
+            (
+                evidence(TechnicalAudioProbeObservation::Healthy, None),
+                "non-failure technical-audio evidence cannot authorize a source lease",
+            ),
+            (
+                evidence(TechnicalAudioProbeObservation::Inconclusive, None),
+                "non-failure technical-audio evidence cannot authorize a source lease",
+            ),
+        ];
+        for (evidence, expected) in cases {
+            let error = lease_error(path, &evidence, deadline, "a non-leasable observation must be refused");
+            assert_eq!(error, expected, "{:?}", evidence.observation);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_source_lease_seals_failed_bytes_and_detects_drift() {
+        let directory = tempfile::tempdir().unwrap();
+        let audio = directory.path().join("truncated.wav");
+        write_probe_wav(&audio, 777, 16_000);
+        let full_length = std::fs::metadata(&audio).unwrap().len();
+        std::fs::OpenOptions::new().write(true).open(&audio).unwrap().set_len(full_length - 1).unwrap();
+        settle_written_file(&audio);
+
+        let evidence = probe_technical_audio_failure(&audio, Instant::now() + Duration::from_secs(10));
+        assert_eq!(evidence.observation, TechnicalAudioProbeObservation::DecodeFailed);
+
+        let lease = acquire_technical_audio_source_lease(&audio, &evidence, Instant::now() + Duration::from_secs(10))
+            .expect("matching failed bytes must be sealable");
+        assert!(
+            std::fs::OpenOptions::new().write(true).open(&audio).is_err(),
+            "no writer may be admitted while the failure lease is live"
+        );
+        assert!(std::fs::remove_file(&audio).is_err(), "the leased source may not be deleted");
+        drop(lease);
+        assert!(
+            std::fs::OpenOptions::new().write(true).open(&audio).is_ok(),
+            "releasing the lease restores ordinary owner access"
+        );
+
+        // Evidence hashed from DIFFERENT bytes must be refused at acquisition.
+        let drifted = TechnicalAudioFailureEvidence {
+            observation: TechnicalAudioProbeObservation::DecodeFailed,
+            source_blake3: Some("0".repeat(64)),
+        };
+        let drift_error = lease_error(
+            &audio,
+            &drifted,
+            Instant::now() + Duration::from_secs(10),
+            "a hash from other bytes must never seal this source",
+        );
+        assert_eq!(drift_error, "technical-audio source changed before its immutable lease was acquired");
+
+        // An already-expired deadline must refuse rather than trust a partial hash.
+        let expired_error = lease_error(
+            &audio,
+            &evidence,
+            Instant::now(),
+            "an expired deadline cannot produce sealed-source authority",
+        );
+        assert_eq!(expired_error, "technical-audio sealed-source hash exceeded its deadline");
+
+        // A vanished path cannot be sealed at all.
+        let gone = directory.path().join("gone.wav");
+        let gone_error = lease_error(
+            &gone,
+            &evidence,
+            Instant::now() + Duration::from_secs(5),
+            "a missing path has no object to lease",
+        );
+        assert!(gone_error.starts_with("technical-audio source could not be sealed read-only:"), "{gone_error}");
+    }
+
+    #[test]
+    fn ok_probe_results_pass_through_fail_closed_conversion() {
+        let authoritative = evidence(TechnicalAudioProbeObservation::CorruptContainer, Some(&"b".repeat(64)));
+        assert_eq!(fail_closed_probe_result(Ok(authoritative.clone())), authoritative);
+    }
+
+    #[test]
+    fn worker_round_trip_binds_corrupt_evidence_and_stays_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let audio = directory.path().join("worker-corrupt.wav");
+        let bytes = b"worker-visible corrupt container".to_vec();
+        std::fs::write(&audio, &bytes).unwrap();
+        settle_written_file(&audio);
+
+        let request = serde_json::to_vec(&ProbeRequestV1 { schema: PROTOCOL_SCHEMA, path: audio }).unwrap();
+        let mut output = Vec::new();
+        run_worker(request.as_slice(), &mut output).unwrap();
+        assert!(output.len() <= WORKER_OUTPUT_LIMIT_BYTES);
+        let evidence = parse_worker_response(&output).unwrap();
+        assert_eq!(evidence.observation, TechnicalAudioProbeObservation::CorruptContainer);
+        assert_eq!(evidence.source_blake3.as_deref(), Some(blake3::hash(&bytes).to_hex().to_string().as_str()));
+    }
 }

@@ -1994,3 +1994,632 @@ impl ProcessingPipeline {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Coverage for the import admission/journal, resume-authority, adoption, publication and
+    //! halt arms that run without the live WSL-7B champion. Model-free determinism: the per-chunk
+    //! transcript cache is seeded so the local CTC engine is never loaded, and every fixture is a
+    //! real WAV written with hound.
+
+    use super::*;
+    use crate::cache::TranscriptCache;
+    use crate::fingerprint::AudioFingerprint;
+    use crate::models::ModelManager;
+    use crate::settings::{AppSettings, AsrModelSize};
+    use std::cell::RefCell;
+
+    fn test_pipeline(settings: AppSettings) -> (ProcessingPipeline, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("db.sqlite").to_string_lossy().to_string();
+        let pipeline = ProcessingPipeline::new(
+            db_path,
+            Arc::new(SoraniNormalizer::new()),
+            Arc::new(TranscriptCache::new(16)),
+            Arc::new(AudioFingerprint::new()),
+            Arc::new(settings),
+            Arc::new(ModelManager::new(dir.path().join("models"))),
+        );
+        (pipeline, dir)
+    }
+
+    /// Local CTC settings whose 1 s fixtures stay on the deterministic non-streaming path: the
+    /// whole buffer is one chunk (no VAD), diarization/denoise construct no ONNX service, and the
+    /// lowered minimum keeps the 1 s chunk from being absorbed away.
+    fn local_import_settings() -> AppSettings {
+        AppSettings {
+            asr_model_size: AsrModelSize::CTC300M,
+            enable_diarization: false,
+            enable_denoising: false,
+            min_segment_duration_ms: 500,
+            ..AppSettings::default()
+        }
+    }
+
+    fn write_sine_wav(path: &Path, samples: usize) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for i in 0..samples {
+            let t = i as f64 / 16_000.0;
+            writer.write_sample((8_000.0 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    fn write_silent_wav(path: &Path, samples: usize) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for _ in 0..samples {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    /// Seed the per-chunk transcript cache for the exact `chunk_0_1000` suffix a 1 s / 16 kHz
+    /// whole-buffer import computes, so the import takes the cache-replay arm instead of loading
+    /// a real CTC model (which exists on the owner's machine and would make output text
+    /// machine-dependent).
+    fn seed_chunk_cache(pipeline: &ProcessingPipeline, wav: &Path, text: &str) {
+        pipeline.cache.set_chunk(
+            wav,
+            Some("chunk_0_1000"),
+            crate::cache::CacheEntry {
+                audio_hash: String::new(),
+                raw_transcript: text.to_string(),
+                normalized_transcript: None,
+                created_at: chrono::Utc::now(),
+                model_id: "omniasr-ctc-300m".to_string(),
+            },
+        );
+    }
+
+    fn register_test_champion(db: &Database, id: &str) {
+        crate::registry::register_candidate(
+            db,
+            &crate::registry::NewModelVersion {
+                id: id.into(),
+                family: "omniasr-7b".into(),
+                model_card_name: Some("test/champion".into()),
+                checkpoint_sha256: "a".repeat(64),
+                checkpoint_path: "C:/models/test-champion.json".into(),
+                source: "cortex-finetuned".into(),
+                license: "test-only".into(),
+            },
+        )
+        .unwrap();
+        crate::registry::set_champion_for_test(db, id).unwrap();
+    }
+
+    fn canonical_identity(path: &Path) -> crate::fingerprint::AudioIdentity {
+        let mut identity = crate::fingerprint::StreamingIdentity::new();
+        audio::decode_pcm_windows(path, audio::DECODE_WINDOW_MS, |window| {
+            identity.push(&window.pcm, window.sample_rate);
+            Ok(())
+        })
+        .unwrap();
+        identity.finish()
+    }
+
+    fn journal_status(db: &Database) -> Option<String> {
+        db.connection().query_row("SELECT status FROM import_jobs LIMIT 1", [], |row| row.get(0)).ok()
+    }
+
+    #[test]
+    fn fresh_empty_directory_import_is_a_successful_noop_without_a_journal() {
+        let (pipeline, dir) = test_pipeline(AppSettings::default());
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        let import_dir = dir.path().join("empty_import");
+        std::fs::create_dir_all(&import_dir).unwrap();
+
+        let events = RefCell::new(Vec::new());
+        pipeline.import_directory(&import_dir, None, |event| events.borrow_mut().push(event)).unwrap();
+
+        let events = events.into_inner();
+        assert!(matches!(events.first(), Some(PipelineEvent::Started { total: 0 })));
+        assert!(
+            events.iter().any(|event| matches!(event, PipelineEvent::Completed { total: 0, succeeded: 0, failed: 0 })),
+            "an empty fresh selection completes as a no-op"
+        );
+        let jobs: i64 = db.connection().query_row("SELECT COUNT(*) FROM import_jobs", [], |r| r.get(0)).unwrap();
+        assert_eq!(jobs, 0, "an empty FRESH import is not an import generation and must mint no journal");
+        assert!(!pipeline.import_status().running);
+    }
+
+    #[test]
+    fn claimed_resume_journal_without_resume_authority_is_refused() {
+        let (pipeline, dir) = test_pipeline(AppSettings::default());
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        let import_dir = dir.path().join("no_authority");
+        std::fs::create_dir_all(&import_dir).unwrap();
+        std::fs::write(import_dir.join("never-decoded.wav"), b"not-real-audio").unwrap();
+
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let error = pipeline
+            .import_directory_with_agent_run_id(&import_dir, None, None, None, Some(&job_id), |_| {})
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("requires resume authority"), "unexpected admission error: {error}");
+        assert_eq!(db.segment_count().unwrap(), 0);
+        let jobs: i64 = db.connection().query_row("SELECT COUNT(*) FROM import_jobs", [], |r| r.get(0)).unwrap();
+        assert_eq!(jobs, 0, "the refusal happens before any journal admission");
+    }
+
+    #[test]
+    fn resume_halts_before_decode_when_no_champion_identity_exists() {
+        let (pipeline, dir) = test_pipeline(AppSettings::default());
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        let import_dir = dir.path().join("no_champion_resume");
+        std::fs::create_dir_all(&import_dir).unwrap();
+        std::fs::write(import_dir.join("never-decoded.wav"), b"not-real-audio").unwrap();
+        let crashed = db.begin_import_job(&import_dir.to_string_lossy(), 1).unwrap();
+        let successor = db.handoff_import_job_for_resume(&crashed).unwrap();
+
+        let done = std::collections::HashSet::new();
+        let error = pipeline
+            .import_directory_with_agent_run_id(&import_dir, None, None, Some(&done), Some(&successor), |_| {})
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("Resume cannot establish the current OmniASR-7B champion"),
+            "resume must refuse to adopt anything without champion authority: {error}"
+        );
+        assert_eq!(db.segment_count().unwrap(), 0, "no row may be adopted or created");
+        let retained = db.find_interrupted_import_job().unwrap().expect("the successor journal must survive");
+        assert_eq!(retained.id, successor);
+    }
+
+    #[test]
+    fn resume_refuses_ambiguous_stored_path_spellings_for_one_logical_file() {
+        let (pipeline, dir) = test_pipeline(AppSettings::default());
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        register_test_champion(&db, "champ-spellings");
+        let import_dir = dir.path().join("spellings");
+        std::fs::create_dir_all(&import_dir).unwrap();
+        std::fs::write(import_dir.join("ambiguous.wav"), b"not-real-audio").unwrap();
+        let dir_str = import_dir.to_string_lossy().to_string();
+        for (id, name) in [("spelling-a", "ambiguous.wav"), ("spelling-b", "AMBIGUOUS.WAV")] {
+            db.insert_segment(&SpeechSegment {
+                id: id.into(),
+                audio_path: format!("{dir_str}\\{name}"),
+                raw_transcript: "دەقی جیاواز".into(),
+                duration_ms: 1_000,
+                ..SpeechSegment::default()
+            })
+            .unwrap();
+        }
+        let crashed = db.begin_import_job(&dir_str, 1).unwrap();
+        let successor = db.handoff_import_job_for_resume(&crashed).unwrap();
+
+        let done = std::collections::HashSet::new();
+        let error = pipeline
+            .import_directory_with_agent_run_id(&import_dir, None, None, Some(&done), Some(&successor), |_| {})
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("multiple stored path spellings"),
+            "resume must refuse to choose between duplicate-spelling authority: {error}"
+        );
+        assert_eq!(db.segment_count().unwrap(), 2, "the refusal must not roll back either spelling's rows");
+    }
+
+    #[test]
+    fn directory_import_publishes_identity_provenance_journal_and_report_end_to_end() {
+        let (pipeline, dir) = test_pipeline(local_import_settings());
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        let import_dir = dir.path().join("cleaned_tree");
+        std::fs::create_dir_all(&import_dir).unwrap();
+        std::fs::write(
+            import_dir.join("manifest.json"),
+            r#"{"cleaning": {"audio_is_processed": true, "separator_model": "test-separator.ckpt"}}"#,
+        )
+        .unwrap();
+        let wav = import_dir.join("speech.wav");
+        write_sine_wav(&wav, 16_000);
+        seed_chunk_cache(&pipeline, &wav, "دەقی تاقیکردنەوەی هاوردە");
+
+        let events = RefCell::new(Vec::new());
+        pipeline.import_directory(&import_dir, None, |event| events.borrow_mut().push(event)).unwrap();
+
+        let events = events.into_inner();
+        assert!(matches!(events.first(), Some(PipelineEvent::Started { total: 1 })));
+        assert!(
+            events.iter().any(|event| matches!(event, PipelineEvent::Completed { total: 1, succeeded: 1, failed: 0 })),
+            "the one-file import must complete with zero failures"
+        );
+        assert!(!pipeline.import_status().running);
+
+        // Serving-path checks: the durable rows, not what the writer intended.
+        let wav_str = wav.to_string_lossy().to_string();
+        let ids = db.segment_ids_for_audio_path(&wav_str).unwrap();
+        assert_eq!(ids.len(), 1, "one 1 s whole-buffer chunk publishes exactly one row");
+        let row = db.get_segment_by_id(&ids[0]).unwrap().unwrap();
+        assert_eq!(row.raw_transcript, "دەقی تاقیکردنەوەی هاوردە");
+        assert_eq!(row.model_version_id.as_deref(), Some("omniasr-ctc-300m"));
+        assert_eq!(row.confidence_source.as_deref(), Some("cache_replay"));
+        assert_eq!(row.vad_backend.as_deref(), Some("none"), "a short whole-buffer file runs no VAD");
+        assert_eq!(row.denoised, Some(false));
+        assert_eq!(row.diarized, Some(false));
+        let meta = chunking::SegmentSourceMeta::from_alignment_json(row.alignment_json.as_deref().unwrap())
+            .expect("import must stamp source offsets");
+        assert_eq!((meta.source_start_ms, meta.source_end_ms), (0, 1_000));
+        assert_eq!((meta.chunk_index, meta.chunk_count), (0, 1));
+        let hash = db.segment_audio_content_hash(&ids[0]).unwrap().expect("cross-session identity must be durable");
+        assert!(crate::db::is_canonical_audio_content_hash(&hash), "stored identity must be canonical: {hash}");
+        assert_eq!(hash, canonical_identity(&wav).content, "stored identity must be the canonical decoded PCM");
+
+        // Provenance wiring: the cleaner's manifest claim travels with the rows.
+        let provenance = db.source_audio_provenance(&wav_str).unwrap().expect("manifest claim must be recorded");
+        assert!(provenance.processing.contains("test-separator.ckpt"), "{}", provenance.processing);
+        assert!(!provenance.timeline_preserved);
+
+        // Journal + auditable report: completion is durable evidence.
+        assert_eq!(journal_status(&db).as_deref(), Some("completed"));
+        let journaled: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM import_job_files", [], |r| r.get(0)).unwrap();
+        assert_eq!(journaled, 1);
+        assert!(db.find_interrupted_import_job().unwrap().is_none());
+        let (reports, report_status): (i64, String) = db
+            .connection()
+            .query_row("SELECT COUNT(*), MAX(status) FROM agent_import_reports", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((reports, report_status.as_str()), (1, "completed"));
+    }
+
+    #[test]
+    fn duplicate_recording_content_halts_the_import_after_the_first_file() {
+        let (pipeline, dir) = test_pipeline(local_import_settings());
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        let import_dir = dir.path().join("duplicates");
+        std::fs::create_dir_all(&import_dir).unwrap();
+        let first = import_dir.join("a.wav");
+        let second = import_dir.join("b.wav");
+        write_sine_wav(&first, 16_000);
+        write_sine_wav(&second, 16_000);
+        seed_chunk_cache(&pipeline, &first, "دەقی یەکەم");
+
+        let error = pipeline.import_directory(&import_dir, None, |_| {}).unwrap_err().to_string();
+
+        assert!(error.contains("import HALTED at"), "halt-on-first-failure must name the failing file: {error}");
+        assert!(error.contains("1 file(s) completed before it"), "the halt reports real progress: {error}");
+        assert!(error.contains("Duplicate audio content"), "the cause must be preserved: {error}");
+        assert_eq!(db.segment_count().unwrap(), 1, "exactly the first file's row is durable");
+        assert_eq!(journal_status(&db).as_deref(), Some("running"), "a halted import stays resumable");
+        let journaled: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM import_job_files", [], |r| r.get(0)).unwrap();
+        assert_eq!(journaled, 1, "only the completed file is journaled done");
+        assert!(!pipeline.import_status().running, "the RAII guard clears the visible import state on halt");
+    }
+
+    #[test]
+    fn unreadable_audio_halts_the_directory_import_and_keeps_the_journal_running() {
+        let (pipeline, dir) = test_pipeline(local_import_settings());
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        let import_dir = dir.path().join("bad_audio");
+        std::fs::create_dir_all(&import_dir).unwrap();
+        std::fs::write(import_dir.join("bad.wav"), b"not-real-audio").unwrap();
+
+        let events = RefCell::new(Vec::new());
+        let error = pipeline
+            .import_directory(&import_dir, None, |event| events.borrow_mut().push(event))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("import HALTED at bad.wav"), "unexpected halt message: {error}");
+        assert!(error.contains("0 file(s) completed before it"), "{error}");
+        assert!(
+            events
+                .into_inner()
+                .iter()
+                .any(|event| matches!(event, PipelineEvent::Error { file, .. } if file == "bad.wav")),
+            "the failing file must be surfaced as an error event"
+        );
+        assert_eq!(db.segment_count().unwrap(), 0);
+        assert!(db.find_interrupted_import_job().unwrap().is_some(), "the journal stays resumable after the halt");
+    }
+
+    #[test]
+    fn journal_write_failure_after_publication_halts_and_keeps_the_durable_rows() {
+        let (pipeline, dir) = test_pipeline(local_import_settings());
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        let import_dir = dir.path().join("journal_write_fault");
+        std::fs::create_dir_all(&import_dir).unwrap();
+        let wav = import_dir.join("speech.wav");
+        write_sine_wav(&wav, 16_000);
+        seed_chunk_cache(&pipeline, &wav, "دەقی ژورناڵ");
+        db.connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_mark_file_done
+                 BEFORE INSERT ON import_job_files
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected journal write failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = pipeline.import_directory(&import_dir, None, |_| {}).unwrap_err().to_string();
+
+        assert!(
+            error.contains("Could not durably journal completed file"),
+            "the journal write failure must be the terminal cause: {error}"
+        );
+        // This is exactly the resume-gap window: segment rows are already durable, the journal is
+        // not. The resume authority check (not the journal) is what prevents duplication later.
+        assert_eq!(db.segment_count().unwrap(), 1, "publication happened before journaling and must survive");
+        assert_eq!(journal_status(&db).as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn completion_stamp_failure_leaves_the_running_journal_visible() {
+        let (pipeline, dir) = test_pipeline(local_import_settings());
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        let import_dir = dir.path().join("completion_fault");
+        std::fs::create_dir_all(&import_dir).unwrap();
+        let wav = import_dir.join("speech.wav");
+        write_sine_wav(&wav, 16_000);
+        seed_chunk_cache(&pipeline, &wav, "دەقی کۆتایی");
+        db.connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_complete_import
+                 BEFORE UPDATE ON import_jobs
+                 WHEN NEW.status = 'completed'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected completion stamp failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = pipeline.import_directory(&import_dir, None, |_| {}).unwrap_err().to_string();
+
+        assert!(
+            error.contains("Could not durably complete the import recovery journal"),
+            "terminal stamping is durable evidence, not decoration: {error}"
+        );
+        assert_eq!(db.segment_count().unwrap(), 1, "the published rows stay durable");
+        assert_eq!(
+            journal_status(&db).as_deref(),
+            Some("running"),
+            "recovery must never mistake this import for clean"
+        );
+        assert!(!pipeline.import_status().running);
+    }
+
+    #[test]
+    fn resume_adopts_human_authoritative_rows_without_duplicating_them() {
+        let (pipeline, dir) = test_pipeline(local_import_settings());
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        let import_dir = dir.path().join("resume_adopt");
+        std::fs::create_dir_all(&import_dir).unwrap();
+        let wav = import_dir.join("speech.wav");
+        write_sine_wav(&wav, 16_000);
+        seed_chunk_cache(&pipeline, &wav, "دەقی سەرەتایی");
+        pipeline.import_directory(&import_dir, None, |_| {}).unwrap();
+        let wav_str = wav.to_string_lossy().to_string();
+        let original_ids = db.segment_ids_for_audio_path(&wav_str).unwrap();
+        assert_eq!(original_ids.len(), 1);
+        // Durable human truth outranks machine provenance, so the resumed rows prove authority
+        // even though their machine draft came from the local CTC engine, not the champion.
+        db.record_human_decision(&original_ids[0], "edit", Some("دەقی مرۆڤی ڕاستەقینە"), None).unwrap();
+        register_test_champion(&db, "champ-resume-adopt");
+        let crashed = db.begin_import_job(&import_dir.to_string_lossy(), 1).unwrap();
+        let successor = db.handoff_import_job_for_resume(&crashed).unwrap();
+
+        let done: std::collections::HashSet<String> = std::iter::once(wav_str.clone()).collect();
+        let events = RefCell::new(Vec::new());
+        pipeline
+            .import_directory_with_agent_run_id(&import_dir, None, None, Some(&done), Some(&successor), |event| {
+                events.borrow_mut().push(event)
+            })
+            .unwrap();
+
+        assert_eq!(
+            db.segment_ids_for_audio_path(&wav_str).unwrap(),
+            original_ids,
+            "resume must adopt the exact durable rows, never mint replacements"
+        );
+        assert_eq!(db.segment_count().unwrap(), 1);
+        assert!(
+            events.into_inner().iter().any(|event| matches!(
+                event,
+                PipelineEvent::Progress { status, .. } if status.contains("Already imported")
+            )),
+            "the resumed file must be reported as adopted, not reprocessed"
+        );
+        assert!(db.find_interrupted_import_job().unwrap().is_none(), "the successor journal completes cleanly");
+        let unchanged = db.get_segment_by_id(&original_ids[0]).unwrap().unwrap();
+        assert_eq!(unchanged.human_decision.as_deref(), Some("edit"), "adoption is non-destructive");
+    }
+
+    #[test]
+    fn resume_rolls_back_non_authoritative_rows_and_reimports_the_file() {
+        let (pipeline, dir) = test_pipeline(local_import_settings());
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        let import_dir = dir.path().join("resume_rollback");
+        std::fs::create_dir_all(&import_dir).unwrap();
+        let wav = import_dir.join("speech.wav");
+        write_sine_wav(&wav, 16_000);
+        seed_chunk_cache(&pipeline, &wav, "دەقی پێش-تێکدان");
+        pipeline.import_directory(&import_dir, None, |_| {}).unwrap();
+        let wav_str = wav.to_string_lossy().to_string();
+        let stale_ids = db.segment_ids_for_audio_path(&wav_str).unwrap();
+        assert_eq!(stale_ids.len(), 1);
+        // No human decision and the draft's model is the local CTC engine, not the registered
+        // champion: the stage is replaceable and resume must discard + redo it.
+        register_test_champion(&db, "champ-resume-rollback");
+        let crashed = db.begin_import_job(&import_dir.to_string_lossy(), 1).unwrap();
+        let successor = db.handoff_import_job_for_resume(&crashed).unwrap();
+
+        let done: std::collections::HashSet<String> = std::iter::once(wav_str.clone()).collect();
+        pipeline
+            .import_directory_with_agent_run_id(&import_dir, None, None, Some(&done), Some(&successor), |_| {})
+            .unwrap();
+
+        let replacement_ids = db.segment_ids_for_audio_path(&wav_str).unwrap();
+        assert_eq!(replacement_ids.len(), 1, "the file is re-imported exactly once");
+        assert_ne!(replacement_ids, stale_ids, "the replaceable stage must be rolled back, not adopted");
+        assert!(db.get_segment_by_id(&stale_ids[0]).unwrap().is_none(), "the stale row must be gone");
+        assert_eq!(db.segment_count().unwrap(), 1, "rollback plus re-import never duplicates");
+        assert!(db.find_interrupted_import_job().unwrap().is_none());
+    }
+
+    #[test]
+    fn retry_adoption_requires_champion_or_human_authority_and_never_deletes() {
+        let (pipeline, dir) = test_pipeline(local_import_settings());
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        let wav = dir.path().join("adopt.wav");
+        write_sine_wav(&wav, 16_000);
+        let wav_str = wav.to_string_lossy().to_string();
+        db.insert_segment(&SpeechSegment {
+            id: "adopt-1".into(),
+            audio_path: wav_str.clone(),
+            raw_transcript: "دەقی مەکینەیی".into(),
+            model_version_id: Some("someone-else".into()),
+            duration_ms: 1_000,
+            alignment_json: Some(
+                chunking::SegmentSourceMeta {
+                    source_start_ms: 0,
+                    source_end_ms: 1_000,
+                    chunk_index: 0,
+                    chunk_count: 1,
+                }
+                .to_alignment_json(),
+            ),
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+        db.set_audio_identity(&wav_str, &canonical_identity(&wav)).unwrap();
+
+        // Machine-authored rows with no registry champion available: ambiguity hard-stops.
+        let error = pipeline.process_single_file(&wav, &db).unwrap_err().to_string();
+        assert!(error.contains("champion authority could not be established"), "unexpected error: {error}");
+        assert_eq!(db.segment_count().unwrap(), 1, "the hard stop must not modify existing data");
+
+        // A registered champion that does not own the stored draft: refuse to duplicate or delete.
+        register_test_champion(&db, "champ-adopt");
+        let error = pipeline.process_single_file(&wav, &db).unwrap_err().to_string();
+        assert!(error.contains("use interrupted-import recovery"), "unexpected error: {error}");
+        assert_eq!(db.get_segment_by_id("adopt-1").unwrap().unwrap().raw_transcript, "دەقی مەکینەیی");
+
+        // The exact champion's own non-placeholder draft is full authority: adopt the same row.
+        db.connection()
+            .execute("UPDATE speech_segments SET model_version_id = 'champ-adopt' WHERE id = 'adopt-1'", [])
+            .unwrap();
+        let adopted = pipeline.process_single_file(&wav, &db).unwrap();
+        assert_eq!(adopted.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["adopt-1"]);
+        assert_eq!(db.segment_count().unwrap(), 1, "adoption mints no new rows");
+    }
+
+    #[test]
+    fn silent_audio_produces_no_speech_chunks_and_publishes_nothing() {
+        let (pipeline, dir) = test_pipeline(local_import_settings());
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        let wav = dir.path().join("silence.wav");
+        write_silent_wav(&wav, 16_000);
+
+        let error = pipeline.process_single_file(&wav, &db).unwrap_err().to_string();
+
+        assert!(error.contains("No speech chunks produced"), "unexpected error: {error}");
+        assert_eq!(db.segment_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn streaming_import_of_long_silent_audio_reports_no_speech_chunks() {
+        // 31 s forces should_stream_decode (duration > 2 × max_segment) onto the windowed path;
+        // digital silence yields zero retained chunks under both the Silero and the energy VAD.
+        let (pipeline, dir) = test_pipeline(AppSettings {
+            asr_model_size: AsrModelSize::CTC300M,
+            enable_diarization: false,
+            enable_denoising: false,
+            ..AppSettings::default()
+        });
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        let wav = dir.path().join("long-silence.wav");
+        write_silent_wav(&wav, 31 * 16_000);
+
+        let error = pipeline.process_single_file(&wav, &db).unwrap_err().to_string();
+
+        assert!(error.contains("No speech chunks produced"), "unexpected error: {error}");
+        assert_eq!(db.segment_count().unwrap(), 0, "the streaming path must publish nothing for silence");
+    }
+
+    #[test]
+    fn pending_placeholder_and_empty_drafts_are_never_usable_champion_attempts() {
+        // attempt_champion's usable-draft gate (the "[Pending" marker semantics): a draft that is
+        // empty or still carries the placeholder must classify as Empty — reachable-but-wordless —
+        // never as Drafted (which would publish the placeholder as champion output).
+        let (pipeline, dir) = test_pipeline(local_import_settings());
+        let wav = dir.path().join("attempt.wav");
+        write_sine_wav(&wav, 16_000);
+
+        pipeline.cache.set(
+            &wav,
+            crate::cache::CacheEntry {
+                audio_hash: String::new(),
+                raw_transcript: "[Pending WSL 7B ASR]".into(),
+                normalized_transcript: None,
+                created_at: chrono::Utc::now(),
+                model_id: "omniasr-ctc-300m".into(),
+            },
+        );
+        let outcome = pipeline.attempt_champion("seg-pending", wav.to_str().unwrap(), None, None);
+        match outcome {
+            ChampionAttempt::Empty(reason) => {
+                assert_eq!(reason, "7B returned an empty transcript");
+            }
+            ChampionAttempt::Drafted(draft) => {
+                panic!("a pending placeholder must never become a usable draft: {:?}", draft.raw_text)
+            }
+            ChampionAttempt::Infra(reason) => panic!("a placeholder draft is not an infra failure: {reason}"),
+        }
+
+        // The same path with a real transcript is a usable draft — proving the gate discriminates
+        // on content, not on the transport.
+        pipeline.cache.set(
+            &wav,
+            crate::cache::CacheEntry {
+                audio_hash: String::new(),
+                raw_transcript: "دەقی بەکارهێنراو".into(),
+                normalized_transcript: None,
+                created_at: chrono::Utc::now(),
+                model_id: "omniasr-ctc-300m".into(),
+            },
+        );
+        match pipeline.attempt_champion("seg-usable", wav.to_str().unwrap(), None, None) {
+            ChampionAttempt::Drafted(draft) => assert_eq!(draft.raw_text, "دەقی بەکارهێنراو"),
+            other => panic!(
+                "a real draft must be usable, got {}",
+                match other {
+                    ChampionAttempt::Empty(reason) => format!("Empty({reason})"),
+                    ChampionAttempt::Infra(reason) => format!("Infra({reason})"),
+                    ChampionAttempt::Drafted(_) => unreachable!(),
+                }
+            ),
+        }
+    }
+}

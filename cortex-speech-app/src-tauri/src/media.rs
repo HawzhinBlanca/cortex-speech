@@ -2454,4 +2454,469 @@ mod tests {
             assert!(Path::new(&recovered.path).is_file());
         }
     }
+
+    // Windows on this workstation occasionally lets a metadata/read probe race a just-finished
+    // write (repo-documented flake). Wait for a stable observed length before hashing.
+    fn settle_written_file(path: &Path) {
+        let deadline = Instant::now() + StdDuration::from_secs(5);
+        let mut last = None;
+        loop {
+            let length = std::fs::metadata(path).ok().map(|metadata| metadata.len());
+            if length.is_some() && length == last {
+                return;
+            }
+            assert!(Instant::now() < deadline, "written test file never settled: {}", path.display());
+            last = length;
+            std::thread::sleep(StdDuration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn single_byte_range_parser_rejects_every_malformed_form() {
+        assert_eq!(parse_single_byte_range("bytes=0-0", 0), None, "a zero-length body has no satisfiable range");
+        assert_eq!(parse_single_byte_range("0-5", 10), None, "the bytes= unit prefix is mandatory");
+        assert_eq!(parse_single_byte_range("bytes=1-2,4-5", 10), None, "multipart ranges are refused");
+        assert_eq!(parse_single_byte_range("bytes=-0", 10), None, "a zero-byte suffix is meaningless");
+        assert_eq!(parse_single_byte_range("bytes=a-b", 10), None, "non-numeric bounds are refused");
+        assert_eq!(parse_single_byte_range("bytes=5-2", 10), None, "an inverted range is refused");
+        assert_eq!(parse_single_byte_range("bytes=", 10), None, "an empty specifier is refused");
+        assert_eq!(parse_single_byte_range(" bytes=0-1 ", 10), Some((0, 1)), "surrounding whitespace is tolerated");
+        assert_eq!(parse_single_byte_range("bytes=2-999", 10), Some((2, 9)), "an oversized end clamps to the body");
+        assert_eq!(parse_single_byte_range("bytes=-100", 10), Some((0, 9)), "an oversized suffix clamps to the body");
+    }
+
+    #[test]
+    fn media_content_type_maps_every_supported_container() {
+        for (name, expected) in [
+            ("clip.wav", "audio/wav"),
+            ("clip.WAVE", "audio/wav"),
+            ("clip.mp3", "audio/mpeg"),
+            ("clip.flac", "audio/flac"),
+            ("clip.ogg", "audio/ogg"),
+            ("clip.oga", "audio/ogg"),
+            ("clip.m4a", "audio/mp4"),
+            ("clip.mp4", "audio/mp4"),
+            ("clip.webm", "audio/webm"),
+            ("clip.aac", "audio/aac"),
+            ("clip.opus", "application/octet-stream"),
+            ("clip", "application/octet-stream"),
+        ] {
+            assert_eq!(media_content_type(Path::new(name)), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn protocol_grant_id_extraction_rejects_query_host_and_path_shapes() {
+        let id = "2f2d9b66-8566-4d1c-8c14-e18d006b776f";
+        let request = |uri: String| Request::builder().method(Method::GET).uri(uri).body(Vec::new()).unwrap();
+        assert_eq!(protocol_request_grant_id(&request(format!("http://cortex-media.localhost/{id}"))), Some(id));
+        assert_eq!(protocol_request_grant_id(&request(format!("http://localhost/{id}"))), Some(id));
+        assert_eq!(
+            protocol_request_grant_id(&request(format!("http://cortex-media.localhost/{id}?x=1"))),
+            None,
+            "queries are refused before any registry lookup"
+        );
+        assert_eq!(
+            protocol_request_grant_id(&request(format!("http://evil.localhost/{id}"))),
+            None,
+            "only the two protocol hosts are ever served"
+        );
+        assert_eq!(
+            protocol_request_grant_id(&request(format!("http://cortex-media.localhost/{id}/extra"))),
+            None,
+            "a nested path never names a grant"
+        );
+        assert_eq!(protocol_request_grant_id(&request("http://cortex-media.localhost/".to_string())), None);
+        assert_eq!(
+            protocol_request_grant_id(&request(format!("http://cortex-media.localhost/{}", id.to_uppercase()))),
+            None,
+            "grant ids are canonical lowercase only"
+        );
+    }
+
+    #[test]
+    fn grant_url_requires_a_canonical_lowercase_v4_uuid() {
+        assert!(media_grant_url("00000000-0000-0000-0000-000000000000").is_err(), "the nil UUID is not a grant");
+        assert!(media_grant_url("2F2D9B66-8566-4D1C-8C14-E18D006B776F").is_err(), "uppercase forms are refused");
+        let url = media_grant_url("2f2d9b66-8566-4d1c-8c14-e18d006b776f").unwrap();
+        assert!(url.contains(MEDIA_PROTOCOL_SCHEME), "{url}");
+    }
+
+    #[test]
+    fn refresh_and_binding_fail_closed_when_the_cached_artifact_disappears() {
+        let tmp = TempDir::new().unwrap();
+        let audio = tmp.path().join("refresh.wav");
+        std::fs::write(&audio, b"refresh audio").unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&segment(&audio)).unwrap();
+        let mut registry = MediaRegistry::default();
+        let grant = registry.register(&db, tmp.path(), &audio.to_string_lossy()).unwrap();
+
+        registry.refresh_grant(&grant.id).expect("a live grant with an existing artifact refreshes");
+        assert_eq!(
+            registry.refresh_grant("2f2d9b66-8566-4d1c-8c14-e18d006b776f").unwrap_err(),
+            "Media grant is missing or expired"
+        );
+
+        // Simulate an externally vanished cache image without fighting the Windows delete lease.
+        registry.grants.get_mut(&grant.id).unwrap().cached_path = tmp.path().join("vanished.wav");
+        assert_eq!(registry.refresh_grant(&grant.id).unwrap_err(), "Cached media file is missing");
+        assert_eq!(registry.playback_binding(&grant.id).unwrap_err(), "Cached media file is missing");
+    }
+
+    #[test]
+    fn expired_grant_is_retired_and_its_artifact_deleted_on_next_touch() {
+        let tmp = TempDir::new().unwrap();
+        let audio = tmp.path().join("expiring.wav");
+        std::fs::write(&audio, b"expiring audio").unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&segment(&audio)).unwrap();
+        let mut registry = MediaRegistry::default();
+        let grant = registry.register(&db, tmp.path(), &audio.to_string_lossy()).unwrap();
+        assert!(Path::new(&grant.path).exists());
+
+        registry.grants.get_mut(&grant.id).unwrap().expires_at = Utc::now() - Duration::minutes(1);
+        assert_eq!(registry.refresh_grant(&grant.id).unwrap_err(), "Media grant is missing or expired");
+        let retired = registry.take_retired_artifacts();
+        assert_eq!(retired.len(), 1, "the expired grant must be queued exactly once for off-lock deletion");
+        assert_eq!(retired[0].cached_path, PathBuf::from(&grant.path));
+        cleanup_retired_media_artifacts(retired, "expired test grant");
+        assert!(!Path::new(&grant.path).exists(), "cleanup must delete the retired artifact");
+        assert!(registry.take_retired_artifacts().is_empty(), "the retirement queue drains exactly once");
+    }
+
+    #[test]
+    fn verified_and_unverified_grants_for_one_source_never_alias() {
+        let tmp = TempDir::new().unwrap();
+        let audio = tmp.path().join("dual-authority.wav");
+        write_test_wav(&audio, 611);
+        settle_written_file(&audio);
+        let expected = crate::export_bundle::current_canonical_pcm_blake3(&audio).unwrap();
+        let canonical = std::fs::canonicalize(&audio).unwrap();
+
+        let mut registry = MediaRegistry::default();
+        let unverified = registry.grant_source(tmp.path(), canonical.clone()).unwrap();
+        let verified = registry
+            .grant_verified_source(
+                tmp.path(),
+                ValidatedMediaSource { source_path: canonical.clone(), audio_content_hash: expected.clone() },
+            )
+            .unwrap();
+        assert_ne!(unverified.id, verified.id, "membership-only playback must never reuse review authority");
+        assert_eq!(std::fs::read_dir(media_cache_dir(tmp.path())).unwrap().count(), 2);
+
+        let error = registry.playback_binding(&unverified.id).unwrap_err();
+        assert!(error.contains("no verified audio identity"), "{error}");
+        assert_eq!(registry.playback_binding(&verified.id).unwrap().audio_content_hash, expected);
+
+        let reused = registry.grant_source(tmp.path(), canonical).unwrap();
+        assert_eq!(reused.id, unverified.id, "an unverified re-request reuses only the unverified grant");
+    }
+
+    #[test]
+    fn playback_binding_requires_the_retained_immutable_source_lease() {
+        let tmp = TempDir::new().unwrap();
+        let audio = tmp.path().join("leaseless.wav");
+        write_test_wav(&audio, 358);
+        settle_written_file(&audio);
+        let expected = crate::export_bundle::current_canonical_pcm_blake3(&audio).unwrap();
+        let canonical = std::fs::canonicalize(&audio).unwrap();
+        let mut registry = MediaRegistry::default();
+        let grant = registry
+            .grant_verified_source(
+                tmp.path(),
+                ValidatedMediaSource { source_path: canonical, audio_content_hash: expected },
+            )
+            .unwrap();
+
+        registry.grants.get_mut(&grant.id).unwrap()._source_guard = None;
+        let error = registry.playback_binding(&grant.id).unwrap_err();
+        assert!(error.contains("lost its immutable source lease"), "{error}");
+    }
+
+    #[test]
+    fn copy_into_cache_refuses_a_source_length_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("shrunk.wav");
+        std::fs::write(&src, b"original-audio").unwrap();
+        let cache_dir = tmp.path().join("media-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let error = copy_into_cache(&src, &cache_dir.join("clip.wav"), 999, &cache_dir)
+            .expect_err("a length drift between metadata and copy must fail closed");
+        assert_eq!(error, "Copy media into app cache was incomplete: expected 999 bytes, wrote 14");
+    }
+
+    #[test]
+    fn current_source_lease_verification_refuses_missing_and_drifted_sources() {
+        let tmp = TempDir::new().unwrap();
+        let missing = verify_current_source_lease(&tmp.path().join("gone.wav"), &"a".repeat(64))
+            .expect_err("a vanished source has no current lease");
+        assert!(missing.contains("Canonicalize current review source"), "{missing}");
+
+        let audio = tmp.path().join("recovered.wav");
+        write_test_wav(&audio, 942);
+        settle_written_file(&audio);
+        let drift = verify_current_source_lease(&audio, &"f".repeat(64))
+            .expect_err("bytes that no longer hash to the receipt identity must be refused");
+        assert_eq!(drift, "The imported source bytes changed after playback; reload or restore the recording");
+
+        let expected = crate::export_bundle::current_canonical_pcm_blake3(&audio).unwrap();
+        let lease = verify_current_source_lease(&audio, &expected).unwrap();
+        assert_eq!(lease.audio_content_hash, expected);
+        assert_eq!(lease, lease.clone(), "the lease identity is its path and decoded-PCM hash");
+
+        let other = tmp.path().join("other.wav");
+        write_test_wav(&other, -942);
+        settle_written_file(&other);
+        let other_lease =
+            verify_current_source_lease(&other, &crate::export_bundle::current_canonical_pcm_blake3(&other).unwrap())
+                .unwrap();
+        assert_ne!(lease, other_lease, "distinct sources never compare as one verified lease");
+    }
+
+    #[test]
+    fn zero_byte_grant_serves_empty_ok_and_unsatisfiable_range() {
+        let tmp = TempDir::new().unwrap();
+        let audio = tmp.path().join("empty.wav");
+        std::fs::write(&audio, b"").unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&segment(&audio)).unwrap();
+        let mut registry = MediaRegistry::default();
+        let grant = registry.register(&db, tmp.path(), &audio.to_string_lossy()).unwrap();
+        let registry = Arc::new(Mutex::new(registry));
+        let url = media_grant_url(&grant.id).unwrap();
+
+        let plain = Request::builder().method(Method::GET).uri(&url).body(Vec::new()).unwrap();
+        let response = serve_media_protocol_request(&registry, plain);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
+        assert!(response.body().is_empty());
+
+        let ranged = Request::builder()
+            .method(Method::GET)
+            .uri(&url)
+            .header(header::RANGE, "bytes=0-0")
+            .body(Vec::new())
+            .unwrap();
+        let response = serve_media_protocol_request(&registry, ranged);
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes */0");
+
+        let head = Request::builder().method(Method::HEAD).uri(&url).body(Vec::new()).unwrap();
+        let response = serve_media_protocol_request(&registry, head);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
+        assert!(response.body().is_empty());
+    }
+
+    #[test]
+    fn head_with_range_reports_partial_metadata_without_a_body() {
+        let tmp = TempDir::new().unwrap();
+        let audio = tmp.path().join("head-range.wav");
+        std::fs::write(&audio, b"0123456789").unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&segment(&audio)).unwrap();
+        let mut registry = MediaRegistry::default();
+        let grant = registry.register(&db, tmp.path(), &audio.to_string_lossy()).unwrap();
+        let registry = Arc::new(Mutex::new(registry));
+        let url = media_grant_url(&grant.id).unwrap();
+
+        let head = Request::builder()
+            .method(Method::HEAD)
+            .uri(&url)
+            .header(header::RANGE, "bytes=2-5")
+            .body(Vec::new())
+            .unwrap();
+        let response = serve_media_protocol_request(&registry, head);
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 2-5/10");
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "4");
+        assert!(response.body().is_empty(), "HEAD must describe the range without shipping bytes");
+    }
+
+    #[test]
+    fn busy_response_is_a_bounded_empty_503() {
+        let response = media_protocol_busy_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(response.body().is_empty());
+    }
+
+    #[test]
+    fn one_flight_admits_at_most_eight_followers_and_two_distinct_builds() {
+        let coordinator = MediaMaterializationCoordinator::default();
+        let key = MediaMaterializationKey { source_path: PathBuf::from("flight-a"), expected_audio_content_hash: None };
+        let MediaFlightClaim::Leader(leader) = coordinator.claim(key.clone()).unwrap() else {
+            panic!("the first claim of an identity must lead its flight");
+        };
+        let followers: Vec<_> = (0..MAX_MEDIA_FLIGHT_FOLLOWERS)
+            .map(|_| match coordinator.claim(key.clone()).unwrap() {
+                MediaFlightClaim::Follower(flight) => flight,
+                MediaFlightClaim::Leader(_) => panic!("an active flight must never mint a second leader"),
+            })
+            .collect();
+        let overflow = match coordinator.claim(key.clone()) {
+            Err(error) => error,
+            Ok(_) => panic!("the ninth waiter must be refused"),
+        };
+        assert!(overflow.starts_with(MEDIA_MATERIALIZATION_BUSY_CODE), "{overflow}");
+        assert!(overflow.contains("retry queue is full"), "{overflow}");
+
+        let second_key = MediaMaterializationKey {
+            source_path: PathBuf::from("flight-b"),
+            expected_audio_content_hash: Some("b".repeat(64)),
+        };
+        let MediaFlightClaim::Leader(second) = coordinator.claim(second_key.clone()).unwrap() else {
+            panic!("a second distinct identity must lead its own flight");
+        };
+        let third_key =
+            MediaMaterializationKey { source_path: PathBuf::from("flight-c"), expected_audio_content_hash: None };
+        let rejected = match coordinator.claim(third_key) {
+            Err(error) => error,
+            Ok(_) => panic!("a third distinct identity must fail closed"),
+        };
+        assert!(rejected.starts_with(MEDIA_MATERIALIZATION_BUSY_CODE), "{rejected}");
+        assert!(rejected.contains("Two different audio files"), "{rejected}");
+
+        drop(followers);
+        coordinator.finish(&key, &leader);
+        coordinator.finish(&second_key, &second);
+        let MediaFlightClaim::Leader(reclaimed) = coordinator.claim(key.clone()).unwrap() else {
+            panic!("a finished flight must release its identity slot");
+        };
+        coordinator.finish(&key, &reclaimed);
+        assert!(lock_recovering(&coordinator.state, "test coordinator").flights.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn import_seal_rejects_relative_missing_and_directory_sources() {
+        let relative = seal_import_source(Path::new("relative-import.wav"))
+            .expect_err("a relative path cannot seal its directory chain");
+        assert!(relative.contains("must be an absolute Windows path"), "{relative}");
+
+        let tmp = TempDir::new().unwrap();
+        let missing = seal_import_source(&tmp.path().join("never-written.wav"))
+            .expect_err("a missing source cannot be inspected");
+        assert!(missing.contains("Inspect import source before sealing"), "{missing}");
+
+        let directory_source = tmp.path().join("dir-as-source.wav");
+        std::fs::create_dir(&directory_source).unwrap();
+        let directory_error =
+            seal_import_source(&directory_source).expect_err("a directory is never an importable source");
+        assert!(directory_error.contains("Seal review media source for canonical decode"), "{directory_error}");
+    }
+
+    #[test]
+    fn playback_source_validation_requires_membership_and_verified_identity() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        let unimported = tmp.path().join("unimported.wav");
+        std::fs::write(&unimported, b"present but foreign").unwrap();
+        let foreign = MediaRegistry::validate_playback_source(&db, &unimported.to_string_lossy())
+            .expect_err("membership is checked before any identity work");
+        assert_eq!(foreign, "Media playback is limited to files already imported into this dataset");
+
+        let unfingerprinted = tmp.path().join("no-identity.wav");
+        std::fs::write(&unfingerprinted, b"imported without identity").unwrap();
+        db.insert_segment(&segment(&unfingerprinted)).unwrap();
+        let repair = MediaRegistry::validate_playback_source(&db, &unfingerprinted.to_string_lossy())
+            .expect_err("an imported clip with no verified identity must be repaired first");
+        assert!(repair.contains("no verified audio identity"), "{repair}");
+
+        // A canonically stored path resolves through the primary index arm.
+        let canonical_source = tmp.path().join("canonical.wav");
+        write_test_wav(&canonical_source, 321);
+        settle_written_file(&canonical_source);
+        let canonical = validate::validate_file_path(&canonical_source.to_string_lossy()).unwrap();
+        let mut canonical_segment = segment(Path::new(&canonical));
+        canonical_segment.id = "seg-canonical".into();
+        db.insert_segment(&canonical_segment).unwrap();
+        let expected = crate::export_bundle::current_canonical_pcm_blake3(&canonical_source).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+                rusqlite::params!["seg-canonical", expected],
+            )
+            .unwrap();
+        let validated = MediaRegistry::validate_playback_source(&db, &canonical_source.to_string_lossy()).unwrap();
+        assert_eq!(validated.source_path, PathBuf::from(&canonical));
+        assert_eq!(validated.audio_content_hash, expected);
+        assert_eq!(MediaRegistry::ensure_imported(&db, &canonical_source.to_string_lossy()).unwrap(), canonical);
+    }
+
+    #[test]
+    fn canonical_review_materialization_refuses_empty_and_missing_sources() {
+        let tmp = TempDir::new().unwrap();
+        let cache_dir = tmp.path().join("media-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let silent = tmp.path().join("zero-samples.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        hound::WavWriter::create(&silent, spec).unwrap().finalize().unwrap();
+        settle_written_file(&silent);
+        let empty_error = materialize_canonical_review_wav(&silent, &cache_dir.join("zero.wav"), &cache_dir)
+            .expect_err("a source with no samples has no reviewable timeline");
+        assert!(
+            empty_error.contains("no positive decoded duration") || empty_error.contains("Read review media duration"),
+            "{empty_error}"
+        );
+        assert!(!cache_dir.join("zero.wav").exists(), "a refused materialization must create no cache artifact");
+
+        let missing_error = materialize_canonical_review_wav(
+            &tmp.path().join("missing-source.wav"),
+            &cache_dir.join("missing.wav"),
+            &cache_dir,
+        )
+        .expect_err("a missing source cannot be sealed for decode");
+        assert!(missing_error.contains("Seal review media source for canonical decode"), "{missing_error}");
+        assert!(!cache_dir.join("missing.wav").exists());
+    }
+
+    #[test]
+    fn canonical_review_hashing_rejects_non_canonical_missing_and_expired() {
+        let tmp = TempDir::new().unwrap();
+        let stereo = tmp.path().join("stereo.wav");
+        write_stereo_48khz_test_wav(&stereo);
+        settle_written_file(&stereo);
+        assert_eq!(
+            canonical_review_wav_pcm_blake3(&stereo).unwrap_err(),
+            "Sealed review media is not canonical 16 kHz mono signed PCM16 WAV"
+        );
+
+        let missing_error = canonical_review_wav_pcm_blake3(&tmp.path().join("missing.wav"))
+            .expect_err("an absent artifact has no identity");
+        assert!(missing_error.contains("Open sealed canonical review WAV"), "{missing_error}");
+
+        let canonical = tmp.path().join("canonical.wav");
+        write_test_wav(&canonical, 640);
+        settle_written_file(&canonical);
+        assert_eq!(
+            canonical_review_wav_pcm_blake3_before(&canonical, Instant::now()).unwrap_err(),
+            "Canonical review media exceeded its internal deadline before canonical hash"
+        );
+        let hash = canonical_review_wav_pcm_blake3(&canonical).unwrap();
+        assert_eq!(hash.len(), 64, "the identity is a canonical 64-hex digest: {hash}");
+        assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()), "{hash}");
+    }
+
+    #[test]
+    fn startup_prune_ignores_a_missing_cache_directory() {
+        let tmp = TempDir::new().unwrap();
+        let ghost = tmp.path().join("never-created-cache");
+        prune_media_cache_on_startup(&ghost);
+        assert!(!ghost.exists(), "the janitor must not create the directory it could not read");
+    }
 }

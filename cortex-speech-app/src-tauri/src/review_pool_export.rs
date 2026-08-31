@@ -1348,6 +1348,309 @@ mod tests {
         );
     }
 
+    /// One-voice, one-clip pool with rights stamped but NO dedup manifest and NO second opinion,
+    /// so each export precondition can be peeled off one refusal at a time.
+    fn lite_fixture(master_ms: usize, end_ms: i64) -> (tempfile::TempDir, Database, crate::review_pool::ReviewPool) {
+        let directory = tempfile::tempdir().unwrap();
+        let master = directory.path().join("solo-master.wav");
+        write_master(&master, master_ms, 3);
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        crate::registry::register_candidate(
+            &db,
+            &crate::registry::NewModelVersion {
+                id: TEST_CHAMPION.to_string(),
+                family: crate::deployment::OMNIASR_7B_FAMILY.to_string(),
+                model_card_name: Some("pool export lite".to_string()),
+                checkpoint_sha256: "c".repeat(64),
+                checkpoint_path: "/test/export-champion.json".to_string(),
+                source: "cortex-finetuned".to_string(),
+                license: "owner-full-rights".to_string(),
+            },
+        )
+        .unwrap();
+        db.connection().execute("UPDATE model_versions SET status='champion' WHERE id=?1", [TEST_CHAMPION]).unwrap();
+        rollback_fixture_to(&db, 59);
+        db.insert_segment_full(&reviewed_segment("solo", &master, 0, end_ms, false)).unwrap();
+        upgrade_fixture_from(&db, 59);
+        let master_hash = crate::export_bundle::current_canonical_pcm_blake3(&master).unwrap();
+        db.connection()
+            .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='solo'", [master_hash])
+            .unwrap();
+        let pool = review_pool::activate(
+            &db,
+            "123e4567-e89b-42d3-a456-426614174200",
+            &[review_pool::PoolMemberInput { segment_id: "solo".into(), voice_name: "Lamo".into() }],
+        )
+        .unwrap();
+        review_pool::stamp_owner_supplied_pool_rights(&db).unwrap();
+        (directory, db, pool)
+    }
+
+    fn empty_dedup_manifest(pool: &crate::review_pool::ReviewPool) -> String {
+        let mut value = serde_json::json!({
+            "manifestSchema": 1,
+            "algorithm": {
+                "id": "cortex-cross-file-waveform-correlation-v1",
+                "minimumTextCharacters": 25,
+                "offsetToleranceMs": 500,
+                "minimumTextSimilarityPpm": 900_000,
+                "audioDurationToleranceMs": 120,
+                "minimumWaveformCorrelationPpm": 980_000,
+                "comparisonSampleRateHz": 16_000,
+            },
+            "pool": {
+                "poolId": &pool.pool_id,
+                "sourceFocusSegmentCount": pool.focus_segment_count,
+                "sourceFocusSha256": &pool.focus_sha256,
+                "championModelVersionId": &pool.champion_model_version_id,
+                "championDeploymentSha256": &pool.champion_deployment_sha256,
+            },
+            "summary": {
+                "candidateTextGroups": 0,
+                "clearedRepeatedTextGroups": 0,
+                "duplicateFamilies": 0,
+                "excludedMembers": 0,
+                "canonicalMembers": pool.focus_segment_count,
+                "unconfirmedRiskGroups": 0,
+                "reviewedCanonicalMembers": 0,
+            },
+            "families": [],
+            "generatedAtMs": 1,
+        });
+        let digest: String = Sha256::digest(review_pool::canonical_json_bytes(&value).unwrap())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        value.as_object_mut().unwrap().insert("manifestSha256".into(), serde_json::Value::String(digest));
+        String::from_utf8(review_pool::canonical_json_bytes(&value).unwrap()).unwrap()
+    }
+
+    fn resolve_solo(db: &Database, pool: &crate::review_pool::ReviewPool, end_ms: i64) {
+        let (_, revision) = db.get_segment_by_id_with_revision("solo").unwrap().unwrap();
+        let audio_hash: String = db
+            .connection()
+            .query_row("SELECT audio_content_hash FROM speech_segments WHERE id='solo'", [], |row| row.get(0))
+            .unwrap();
+        review_pool::record_decision(
+            db,
+            pool,
+            &review_pool::PoolDecisionInput {
+                segment_id: "solo",
+                reviewer: "Alle",
+                action: "edit",
+                submitted_transcript: Some("دەقی solo"),
+                served_transcript: RAW,
+                served_revision: revision,
+                audio_content_hash: Some(&audio_hash),
+                source_start_ms: Some(0),
+                source_end_ms: Some(end_ms),
+                duration_ms: end_ms,
+                requested_action: "edit",
+                requested_transcript: "دەقی solo",
+                operation_id: "123e4567-e89b-42d3-a456-426614174201",
+                operation_payload_hash: &"9".repeat(64),
+                created_at_ms: 5,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    }
+
+    fn export_error(db: &Database, output: &Path, voice_name: &str) -> String {
+        export_voice(
+            db,
+            &PoolDatasetOptions { output_dir: output.to_string_lossy().to_string(), voice_name: voice_name.into() },
+        )
+        .unwrap_err()
+        .to_string()
+    }
+
+    #[test]
+    fn export_refuses_missing_pool_dedup_unresolved_voices_and_bad_destinations() {
+        let fresh = Database::open(":memory:").unwrap();
+        fresh.initialize().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let error = export_error(&fresh, &scratch.path().join("no-pool"), "Lamo");
+        assert!(error.contains("review pool is not active"), "unexpected refusal: {error}");
+
+        let (directory, db, pool) = lite_fixture(1_000, 1_000);
+        let error = export_error(&db, &directory.path().join("no-dedup"), "Lamo");
+        assert!(
+            error.contains("review-pool export requires an applied immutable dedup manifest"),
+            "unexpected refusal: {error}"
+        );
+
+        review_pool::apply_dedup_manifest(&db, &empty_dedup_manifest(&pool)).unwrap();
+        let error = export_error(&db, &directory.path().join("blank-voice"), "   ");
+        assert!(error.contains("voice name must be a non-blank printable label"), "unexpected refusal: {error}");
+        let error = export_error(&db, &directory.path().join("control-voice"), "La\u{7}mo");
+        assert!(error.contains("voice name must be a non-blank printable label"), "unexpected refusal: {error}");
+        let error = export_error(&db, &directory.path().join("ghost-voice"), "Ghost");
+        assert!(error.contains("active review pool has no voice named Ghost"), "unexpected refusal: {error}");
+        let error = export_error(&db, &directory.path().join("unresolved"), "Lamo");
+        assert!(
+            error.contains("voice Lamo is not fully resolved"),
+            "one canonical opinion is not a decision and must not export: {error}"
+        );
+
+        resolve_solo(&db, &pool, 1_000);
+        let occupied = directory.path().join("occupied");
+        fs::write(&occupied, b"a file, not a directory").unwrap();
+        let error = export_error(&db, &occupied, "Lamo");
+        assert!(
+            error.contains("export destination already exists and is not a directory"),
+            "unexpected refusal: {error}"
+        );
+
+        let output = directory.path().join("lite-export");
+        let result = export_voice(
+            &db,
+            &PoolDatasetOptions { output_dir: output.to_string_lossy().to_string(), voice_name: "Lamo".to_string() },
+        )
+        .unwrap();
+        assert_eq!(result.retained_segments, 1);
+        assert_eq!(result.rejected_segments, 0);
+        assert_eq!(result.total_duration_ms, 1_000);
+        assert_eq!(
+            review_pool::voice_certificate(&db, "Lamo").unwrap().unwrap().certificate_sha256,
+            result.certificate_sha256
+        );
+    }
+
+    #[test]
+    fn export_refuses_a_span_that_escapes_its_master() {
+        let (directory, db, pool) = lite_fixture(500, 1_000);
+        review_pool::apply_dedup_manifest(&db, &empty_dedup_manifest(&pool)).unwrap();
+        resolve_solo(&db, &pool, 1_000);
+        let output = directory.path().join("escaping-span");
+        let error = export_error(&db, &output, "Lamo");
+        assert!(
+            error.contains("solo: source span is outside its master or disagrees with duration"),
+            "unexpected refusal: {error}"
+        );
+        assert!(!output.exists(), "a refused export must publish nothing");
+    }
+
+    #[test]
+    fn export_audio_helper_contracts_are_exact() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let error = strict_sample_index(-1, TTS_SAMPLE_RATE, "source_start_ms").unwrap_err().to_string();
+        assert!(error.contains("source_start_ms cannot be negative"), "unexpected refusal: {error}");
+        let error = strict_sample_index(1, 22_050, "source_end_ms").unwrap_err().to_string();
+        assert!(error.contains("source_end_ms does not land on an exact sample boundary"), "unexpected: {error}");
+        assert_eq!(strict_sample_index(1_000, TTS_SAMPLE_RATE, "span").unwrap(), 24_000);
+
+        let error = read_master(&directory.path().join("missing.wav")).unwrap_err().to_string();
+        assert!(error.contains("source WAV is missing"), "unexpected refusal: {error}");
+        let wrong_rate = directory.path().join("16k.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: ASR_SAMPLE_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wrong_rate, spec).unwrap();
+        writer.write_sample(1_i16).unwrap();
+        writer.finalize().unwrap();
+        let error = read_master(&wrong_rate).unwrap_err().to_string();
+        assert!(error.contains("TTS source must be mono 24 kHz PCM16 WAV"), "unexpected refusal: {error}");
+        let empty = directory.path().join("empty.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: TTS_SAMPLE_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        hound::WavWriter::create(&empty, spec).unwrap().finalize().unwrap();
+        let error = read_master(&empty).unwrap_err().to_string();
+        assert!(error.contains("source WAV has no samples"), "unexpected refusal: {error}");
+        let error = write_pcm16_wav(&directory.path().join("out.wav"), TTS_SAMPLE_RATE, &[]).unwrap_err().to_string();
+        assert!(error.contains("refusing to write an empty WAV"), "unexpected refusal: {error}");
+
+        let exact = RecordingRights {
+            license: Some(review_pool::OWNER_RIGHTS_LICENSE.to_string()),
+            consent_basis: Some(review_pool::OWNER_RIGHTS_CONSENT.to_string()),
+            permitted_use: Some(review_pool::OWNER_RIGHTS_PERMITTED_USE.to_string()),
+            attribution: Some(review_pool::OWNER_RIGHTS_ATTRIBUTION.to_string()),
+            source: Some(review_pool::OWNER_RIGHTS_SOURCE.to_string()),
+            revoked_at: None,
+        };
+        exact_owner_rights("seg", &exact).unwrap();
+        let mut conflicting = exact.clone();
+        conflicting.license = Some("CC-BY-4.0".to_string());
+        let error = exact_owner_rights("seg", &conflicting).unwrap_err().to_string();
+        assert!(
+            error.contains("seg: exact owner-supplied recording rights are missing, conflicting, or revoked"),
+            "unexpected refusal: {error}"
+        );
+        let mut revoked = exact.clone();
+        revoked.revoked_at = Some("2026-08-24T00:00:00Z".to_string());
+        assert!(exact_owner_rights("seg", &revoked).is_err());
+
+        let expected = directory.path().join("expected");
+        fs::create_dir(&expected).unwrap();
+        let not_a_dir = directory.path().join("published-file");
+        fs::write(&not_a_dir, b"file").unwrap();
+        let error = verify_exact_tree(&expected, &not_a_dir).unwrap_err().to_string();
+        assert!(error.contains("existing export destination is not a directory"), "unexpected refusal: {error}");
+    }
+
+    #[test]
+    fn crash_recovery_refuses_missing_invalid_or_foreign_certificates_and_content_drift() {
+        let (directory, db) = fixture();
+        let crashed = |name: &str| -> PathBuf {
+            let output = directory.path().join(name);
+            arm_publication_crash();
+            let error = export_error(&db, &output, "Lamo");
+            assert!(error.contains("after atomic publication"), "unexpected injected failure: {error}");
+            output
+        };
+
+        let output = crashed("missing-cert");
+        fs::remove_file(output.join("certificate.json")).unwrap();
+        let error = export_error(&db, &output, "Lamo");
+        assert!(
+            error.contains("existing export destination has no readable recovery certificate"),
+            "unexpected refusal: {error}"
+        );
+
+        let output = crashed("invalid-cert");
+        fs::write(output.join("certificate.json"), b"not json").unwrap();
+        let error = export_error(&db, &output, "Lamo");
+        assert!(error.contains("existing export recovery certificate is invalid JSON"), "unexpected refusal: {error}");
+
+        let output = crashed("no-timestamp");
+        fs::write(output.join("certificate.json"), b"{}").unwrap();
+        let error = export_error(&db, &output, "Lamo");
+        assert!(
+            error.contains("existing export recovery certificate has no valid timestamp"),
+            "unexpected refusal: {error}"
+        );
+
+        let output = crashed("foreign-cert");
+        let mut certificate: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(output.join("certificate.json")).unwrap()).unwrap();
+        certificate["voiceName"] = serde_json::json!("Other");
+        fs::write(output.join("certificate.json"), serde_json::to_string(&certificate).unwrap()).unwrap();
+        let error = export_error(&db, &output, "Lamo");
+        assert!(
+            error.contains("existing export recovery certificate does not match current voice authority"),
+            "unexpected refusal: {error}"
+        );
+
+        let output = crashed("drifted-bytes");
+        fs::write(output.join("rights.jsonl"), b"{\"id\":\"forged\"}\n").unwrap();
+        let error = export_error(&db, &output, "Lamo");
+        assert!(error.contains("differs at rights.jsonl"), "unexpected refusal: {error}");
+
+        assert!(
+            review_pool::voice_certificate(&db, "Lamo").unwrap().is_none(),
+            "no refused recovery may certify the voice"
+        );
+    }
+
     #[test]
     fn publication_crash_injection_is_thread_local() {
         let armed = std::thread::spawn(|| {

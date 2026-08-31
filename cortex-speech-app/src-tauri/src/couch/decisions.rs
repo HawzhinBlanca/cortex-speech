@@ -1843,3 +1843,1440 @@ pub(super) fn api_undo_with_body(db: &Database, body: &[u8], reviewer: &str, sta
     )
 }
 // ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // couch.rs's test module owns its fixtures privately, and this campaign may not touch couch.rs,
+    // so the same proven shapes are reproduced here: one thread-local audio directory (parallel tests
+    // must never share a writable WAV path) and a TEMP trigger granting every fixture insert a real
+    // canonical PCM identity without weakening the production schema.
+    thread_local! {
+        static FIXTURE_AUDIO: tempfile::TempDir =
+            tempfile::tempdir().expect("thread-local decisions fixture audio directory");
+    }
+
+    fn write_fixture_wav(path: &std::path::Path, seed: &[u8]) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for n in 0..24_000_usize {
+            let salt = seed.get(n % seed.len().max(1)).copied().unwrap_or(128) as i16 - 128;
+            writer.write_sample(((n % 1000) as i16).wrapping_mul(30).wrapping_add(salt)).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    fn test_db(dir: &std::path::Path) -> (Database, String) {
+        let path = dir.join("decisions-test.db").to_string_lossy().to_string();
+        let db = Database::open(&path).unwrap();
+        db.initialize().unwrap();
+        let template = dir.join("decisions-fixture-template.wav");
+        write_fixture_wav(&template, &[]);
+        let fixture_audio_content_hash =
+            crate::export_bundle::current_canonical_pcm_blake3(&template).expect("fixture template has PCM identity");
+        db.connection()
+            .execute_batch(&format!(
+                "CREATE TEMP TRIGGER fixture_audio_content_hash
+                 AFTER INSERT ON speech_segments
+                 WHEN NEW.audio_content_hash IS NULL
+                 BEGIN
+                     UPDATE speech_segments
+                        SET audio_content_hash = '{fixture_audio_content_hash}',
+                            alignment_json = COALESCE(
+                                alignment_json,
+                                json_object(
+                                    'source_start_ms', 0,
+                                    'source_end_ms', NEW.duration_ms,
+                                    'chunk_index', 0,
+                                    'chunk_count', 1
+                                )
+                            )
+                      WHERE id = NEW.id;
+                 END;"
+            ))
+            .unwrap();
+        (db, path)
+    }
+
+    fn seg(id: &str, raw: &str) -> SpeechSegment {
+        FIXTURE_AUDIO.with(|audio| {
+            let path = audio.path().join(format!("{id}.wav"));
+            write_fixture_wav(&path, id.as_bytes());
+            SpeechSegment {
+                id: id.into(),
+                audio_path: path.to_string_lossy().into_owned(),
+                raw_transcript: raw.into(),
+                duration_ms: 1500,
+                alignment_json: Some(
+                    r#"{"source_start_ms":0,"source_end_ms":1500,"chunk_index":0,"chunk_count":1}"#.into(),
+                ),
+                ..SpeechSegment::default()
+            }
+        })
+    }
+
+    fn state() -> Mutex<CouchState> {
+        Mutex::new(CouchState::default())
+    }
+
+    /// Raw call into the production handler — no fixture auto-filling, so absent/wrong fields stay
+    /// absent/wrong exactly as the refusal ladder must see them.
+    fn decide(db: &Database, st: &Mutex<CouchState>, reviewer: &str, body: &serde_json::Value) -> (u16, String) {
+        let (code, _, body, _) = super::api_decision(db, body.to_string().as_bytes(), reviewer, st);
+        (code, String::from_utf8(body).unwrap())
+    }
+
+    fn undo_raw(db: &Database, st: &Mutex<CouchState>, reviewer: &str, body: &[u8]) -> (u16, String) {
+        let (code, _, body, _) = api_undo_with_body(db, body, reviewer, st);
+        (code, String::from_utf8(body).unwrap())
+    }
+
+    fn row(db: &Database, id: &str) -> SpeechSegment {
+        db.get_segment_by_id(id).unwrap().expect("fixture row exists")
+    }
+
+    fn stamp(db: &Database, id: &str) -> String {
+        db.segment_row_stamp(id).unwrap().expect("fixture row has a revision stamp")
+    }
+
+    fn review_event_count(db: &Database) -> i64 {
+        db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |r| r.get(0)).unwrap()
+    }
+
+    /// A real durable policy-4 receipt for the current row state, bound to the fixed test cookie
+    /// session `super::api_decision` authenticates with.
+    fn policy4_receipt(db: &Database, reviewer: &str, id: &str) -> String {
+        let revision = db.segment_review_revision(id).unwrap().expect("fixture revision");
+        let segment = row(db, id);
+        let audio_content_hash = db.segment_audio_content_hash(id).unwrap().expect("fixture PCM identity");
+        let (source_start_ms, source_end_ms) = db.segment_source_span(id).unwrap().expect("fixture span");
+        let now_ms =
+            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(10_000).max(10_000);
+        let authority = CouchPlaybackAttemptAuthority {
+            playback_receipt_id: uuid::Uuid::new_v4().to_string(),
+            media_grant_id: uuid::Uuid::new_v4().to_string(),
+            client_attempt_id: uuid::Uuid::new_v4().to_string(),
+            session_binding_sha256: couch_session_binding_sha256("couch-test-session"),
+            reviewer: reviewer.to_string(),
+            segment_id: id.to_string(),
+            segment_revision: revision,
+            audio_content_hash,
+            source_path: PathBuf::from(segment.audio_path),
+            clip_duration_ms: segment.duration_ms,
+            source_start_ms,
+            source_end_ms,
+            issued_at_ms: now_ms,
+            expires_at_ms: now_ms + 60_000,
+        };
+        db.finalize_couch_playback_attempt_v1(
+            &authority,
+            &[DesktopPlaybackInterval { start_ms: 0, end_ms: segment.duration_ms }],
+            segment.duration_ms,
+        )
+        .expect("fixture policy-4 playback finalizes")
+        .playback_receipt_id
+    }
+
+    // ── Pure decision-contract units ─────────────────────────────────────────
+
+    #[test]
+    fn placeholder_refusal_covers_the_authority_and_the_bracket_addition() {
+        // The declared authority refuses bare "n/a"/"null" case-insensitively; the bracket test is a
+        // strict addition for future importer markers the authority has not been taught about.
+        // Emptiness is deliberately NOT this authority's job: blank text is refused by the non-blank
+        // guards on every persist path, so ""/"   " pass through here unflagged.
+        for refused in ["n/a", "N/A", "null", "NULL", "[Pending WSL 7B ASR]", "  [anything]  "] {
+            assert!(refuses_verification_as_placeholder(refused), "{refused:?} must never be verifiable");
+        }
+        for blank in ["", "   "] {
+            assert!(!refuses_verification_as_placeholder(blank), "emptiness belongs to the non-blank guards");
+        }
+        for verifiable in ["دەقی ڕاست", "n/a is what he said", "[open bracket only", "close] only"] {
+            assert!(!refuses_verification_as_placeholder(verifiable), "{verifiable:?} is a real transcript");
+        }
+    }
+
+    #[test]
+    fn a_repeat_is_only_the_same_reviewers_identical_stored_outcome() {
+        let mut prev = seg("repeat-s1", "دەقی خاو");
+        prev.reviewed_by = Some("Sara".into());
+        prev.human_decision = Some("reject".into());
+        assert!(is_repeat_of_stored_decision(&prev, "Sara", "reject", None));
+        assert!(is_repeat_of_stored_decision(&prev, "sara", "reject", None), "reviewer identity is case-insensitive");
+        assert!(!is_repeat_of_stored_decision(&prev, "Hemn", "reject", None), "another reviewer is never a repeat");
+        assert!(!is_repeat_of_stored_decision(&prev, "Sara", "accept", Some("دەق")), "a reject is not an accept");
+        assert!(!is_repeat_of_stored_decision(&prev, "Sara", "accept", None), "a verdict repeat needs its text");
+
+        // An accept/edit repeat matches EITHER column holding the human's text — after a complete
+        // submit that is annotated_transcript; after a half-written one only verdict_transcript.
+        let mut complete = seg("repeat-s2", "دەقی خاو");
+        complete.reviewed_by = Some("Sara".into());
+        complete.human_decision = Some("edit".into());
+        complete.annotated_transcript = Some("دەقی ڕاست".into());
+        assert!(is_repeat_of_stored_decision(&complete, "Sara", "accept", Some("دەقی ڕاست")));
+        assert!(!is_repeat_of_stored_decision(&complete, "Sara", "edit", Some("دەقی جیاواز")));
+
+        let mut half_written = seg("repeat-s3", "دەقی خاو");
+        half_written.reviewed_by = Some("Sara".into());
+        half_written.human_decision = Some("accept".into());
+        half_written.verdict_transcript = Some("دەقی ڕاست".into());
+        assert!(is_repeat_of_stored_decision(&half_written, "Sara", "accept", Some("دەقی ڕاست")));
+
+        // NFC comparison: a decomposed phone-IME paste of the same text is the same human act.
+        let mut composed = seg("repeat-s4", "raw");
+        composed.reviewed_by = Some("Sara".into());
+        composed.human_decision = Some("edit".into());
+        composed.annotated_transcript = Some("caf\u{e9}".into());
+        assert!(is_repeat_of_stored_decision(&composed, "Sara", "edit", Some("cafe\u{301}")));
+
+        let mut undecided = seg("repeat-s5", "raw");
+        undecided.reviewed_by = Some("Sara".into());
+        assert!(!is_repeat_of_stored_decision(&undecided, "Sara", "accept", Some("raw")));
+        assert!(!is_repeat_of_stored_decision(&undecided, "Sara", "reject", None));
+    }
+
+    #[test]
+    fn a_roster_respelled_reviewer_still_owns_their_receipt() {
+        // The v1 payload hash preserved the reviewer's exact spelling, so a roster correction must
+        // rederive the digest with the STORED spelling once it proves the same person is asking.
+        let stored_hash = decision_operation_payload_hash("clip-1", "edit", "دەقی ڕاست", "Rubar");
+        assert!(operation_receipt_matches_request(
+            &stored_hash,
+            "clip-1",
+            "Rubar",
+            "clip-1",
+            "edit",
+            "دەقی ڕاست",
+            "rubar"
+        ));
+        assert!(
+            !operation_receipt_matches_request(&stored_hash, "clip-1", "Rubar", "clip-2", "edit", "دەقی ڕاست", "Rubar"),
+            "a different segment is a hard conflict"
+        );
+        assert!(
+            !operation_receipt_matches_request(
+                &stored_hash,
+                "clip-1",
+                "Rubar",
+                "clip-1",
+                "accept",
+                "دەقی ڕاست",
+                "Rubar"
+            ),
+            "changing edit to accept while reusing the UUID is a different client operation"
+        );
+        assert!(
+            !operation_receipt_matches_request(&stored_hash, "clip-1", "Rubar", "clip-1", "edit", "دەقی ڕاست", "Hemn"),
+            "a different person never inherits the receipt"
+        );
+    }
+
+    #[test]
+    fn pool_undo_coordinates_are_all_or_nothing() {
+        assert!(parse_undo_body(b"").unwrap().is_none(), "a bodyless undo is the legacy canonical request");
+        assert!(parse_undo_body(b"{}").unwrap().is_none());
+        let ok = parse_undo_body(
+            br#"{"poolDecisionId":"7","decisionOperationId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","reversalOperationId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}"#,
+        )
+        .unwrap()
+        .expect("complete coordinates parse");
+        assert_eq!(ok.decision_id, 7);
+        assert_eq!(ok.decision_operation_id, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        assert_eq!(ok.reversal_operation_id, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+
+        assert!(parse_undo_body(b"{not json").unwrap_err().starts_with("bad json"));
+        assert_eq!(
+            parse_undo_body(br#"{"poolDecisionId":"7"}"#).unwrap_err(),
+            "pool undo requires poolDecisionId, decisionOperationId, and reversalOperationId together",
+            "partial coordinates are refused rather than guessed"
+        );
+        for bad_id in ["0", "-3", "seven", "1.5"] {
+            let body = format!(
+                r#"{{"poolDecisionId":"{bad_id}","decisionOperationId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","reversalOperationId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}}"#
+            );
+            assert_eq!(
+                parse_undo_body(body.as_bytes()).unwrap_err(),
+                "poolDecisionId must be a positive decimal database identity",
+                "{bad_id:?} is not a database identity"
+            );
+        }
+        assert_eq!(
+            parse_undo_body(
+                br#"{"poolDecisionId":"7","decisionOperationId":"AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA","reversalOperationId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}"#,
+            )
+            .unwrap_err(),
+            "decisionOperationId must be a lowercase hyphenated UUID"
+        );
+        assert_eq!(
+            parse_undo_body(
+                br#"{"poolDecisionId":"7","decisionOperationId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","reversalOperationId":"not-a-uuid"}"#,
+            )
+            .unwrap_err(),
+            "reversalOperationId must be a lowercase hyphenated UUID"
+        );
+        assert_eq!(
+            parse_undo_body(
+                br#"{"poolDecisionId":"7","decisionOperationId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","reversalOperationId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}"#,
+            )
+            .unwrap_err(),
+            "the decision and reversal operation IDs must be distinct"
+        );
+        assert!(
+            parse_undo_body(br#"{"poolDecisionId":"7","surprise":true}"#).unwrap_err().starts_with("bad json"),
+            "unknown fields are refused, never silently dropped"
+        );
+    }
+
+    // ── The canonical decision refusal ladder ────────────────────────────────
+
+    #[test]
+    fn malformed_decision_requests_are_refused_before_any_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        let st = state();
+
+        let (code, body) = {
+            let (code, _, body, _) = super::api_decision(&db, b"{not json", "Sara", &st);
+            (code, String::from_utf8(body).unwrap())
+        };
+        assert_eq!(code, 400);
+        assert!(body.starts_with("bad json"), "unparseable body: {body}");
+
+        let (code, body) =
+            decide(&db, &st, "Sara", &serde_json::json!({"id": "../evil", "action": "accept", "text": "x"}));
+        assert_eq!((code, body.as_str()), (400, "bad id"));
+
+        let huge = "x".repeat(100_001);
+        let (code, body) = decide(&db, &st, "Sara", &serde_json::json!({"id": "s1", "action": "edit", "text": huge}));
+        assert_eq!((code, body.as_str()), (400, "text too large"));
+
+        assert_eq!(review_event_count(&db), 0, "a refused request must write nothing");
+    }
+
+    #[test]
+    fn a_queued_decision_is_never_recorded_under_someone_elses_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەق")).unwrap();
+        let st = state();
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Hemn",
+            &serde_json::json!({
+                "id": "s1",
+                "action": "accept",
+                "text": "دەق",
+                "reviewer": "Sara",
+                "rowVersion": stamp(&db, "s1"),
+            }),
+        );
+        assert_eq!((code, body.as_str()), (409, "this decision was made by Sara, not Hemn"));
+        let after = row(&db, "s1");
+        assert!(!after.verified && after.human_decision.is_none() && after.reviewed_by.is_none());
+        assert_eq!(review_event_count(&db), 0);
+    }
+
+    #[test]
+    fn operation_ids_must_be_canonical_lowercase_uuids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەق")).unwrap();
+        let st = state();
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({"operationId": "not-a-uuid", "id": "s1", "action": "accept", "text": "دەق"}),
+        );
+        assert_eq!((code, body.as_str()), (400, "operationId must be a canonical UUID"));
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({
+                "operationId": "123E4567-E89B-42D3-A456-426614174000",
+                "id": "s1",
+                "action": "accept",
+                "text": "دەق",
+            }),
+        );
+        assert_eq!((code, body.as_str()), (400, "operationId must be a lowercase hyphenated UUID"));
+        assert_eq!(review_event_count(&db), 0);
+    }
+
+    #[test]
+    fn a_decision_for_an_unknown_clip_is_a_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        let st = state();
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa01",
+                "id": "ghost",
+                "action": "accept",
+                "text": "دەق",
+            }),
+        );
+        assert_eq!((code, body.as_str()), (404, "no such segment"));
+    }
+
+    #[test]
+    fn unknown_actions_and_unusable_transcripts_are_refused_without_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەقی خاو")).unwrap();
+        let st = state();
+
+        let (code, body) = decide(&db, &st, "Sara", &serde_json::json!({"id": "s1", "action": "approve", "text": "x"}));
+        assert_eq!((code, body.as_str()), (400, "unknown action 'approve'"));
+
+        let (code, body) = decide(&db, &st, "Sara", &serde_json::json!({"id": "s1", "action": "accept", "text": "  "}));
+        assert_eq!((code, body.as_str()), (400, "empty transcript"));
+
+        for placeholder in ["[Pending WSL 7B ASR]", "n/a"] {
+            let (code, body) =
+                decide(&db, &st, "Sara", &serde_json::json!({"id": "s1", "action": "edit", "text": placeholder}));
+            assert_eq!((code, body.as_str()), (400, "placeholder transcript cannot be verified"), "{placeholder:?}");
+        }
+
+        let after = row(&db, "s1");
+        assert!(!after.verified && after.human_decision.is_none());
+        assert_eq!(review_event_count(&db), 0);
+    }
+
+    #[test]
+    fn legacy_playback_counters_must_be_sane_even_when_they_authorize_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەق")).unwrap();
+        let st = state();
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({"id": "s1", "action": "accept", "text": "دەق", "heardMs": -1}),
+        );
+        assert_eq!((code, body.as_str()), (400, "heardMs must be a non-negative media-time counter"));
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({"id": "s1", "action": "accept", "text": "دەق", "clipDurationMs": -5}),
+        );
+        assert_eq!((code, body.as_str()), (400, "clipDurationMs must not be negative"));
+    }
+
+    #[test]
+    fn a_new_verdict_requires_a_parseable_row_version_and_an_operation_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەق")).unwrap();
+        let st = state();
+
+        let (code, body) =
+            decide(&db, &st, "Sara", &serde_json::json!({"id": "s1", "action": "accept", "text": "دەق"}));
+        assert_eq!((code, body.as_str()), (400, "rowVersion is required — reload this clip before deciding"));
+
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({"id": "s1", "action": "accept", "text": "دەق", "rowVersion": "later"}),
+        );
+        assert_eq!((code, body.as_str()), (400, "rowVersion is invalid — reload this clip before deciding"));
+
+        // With a fresh stamp but no durable client UUID, the write machinery must refuse before ANY
+        // side effect — no lease, no receipt, no audit event.
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({"id": "s1", "action": "accept", "text": "دەق", "rowVersion": stamp(&db, "s1")}),
+        );
+        assert_eq!((code, body.as_str()), (400, "operationId is required — reload this page before deciding"));
+
+        assert_eq!(review_event_count(&db), 0);
+        assert!(lock_state(&st).leases.is_empty(), "a refused verdict must not leave a lease behind");
+        let after = row(&db, "s1");
+        assert!(!after.verified && after.human_decision.is_none());
+    }
+
+    #[test]
+    fn a_pilot_stamp_without_a_live_pilot_is_a_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەق")).unwrap();
+        let st = state();
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({
+                "id": "s1",
+                "action": "accept",
+                "text": "دەق",
+                "rowVersion": stamp(&db, "s1"),
+                "pilotAfterReviewEventId": 7,
+            }),
+        );
+        assert_eq!(
+            (code, body.as_str()),
+            (409, "controlled review pilot is no longer active — reload the queue before deciding")
+        );
+        assert_eq!(review_event_count(&db), 0);
+    }
+
+    #[test]
+    fn write_time_focus_policy_releases_only_this_reviewers_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەق")).unwrap();
+        std::fs::write(
+            tmp.path().join("voice_focus.json"),
+            serde_json::json!({"name": "someone else's voice", "segment_ids": ["other-clip"]}).to_string(),
+        )
+        .unwrap();
+        let st = Mutex::new(CouchState {
+            session_store: Some((tmp.path().to_path_buf(), db_path)),
+            ..CouchState::default()
+        });
+        {
+            let mut guard = lock_state(&st);
+            guard.leases.insert("s1".into(), ("Sara".into(), Instant::now()));
+            guard.served_work.insert(("s1".into(), "Sara".into()));
+        }
+        let body = serde_json::json!({
+            "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa02",
+            "id": "s1",
+            "action": "accept",
+            "text": "دەق",
+            "rowVersion": stamp(&db, "s1"),
+        });
+        let (code, reply) = decide(&db, &st, "Sara", &body);
+        assert_eq!(
+            (code, reply.as_str()),
+            (403, "this clip is outside your current review assignment — reload your queue")
+        );
+        {
+            let mut guard = lock_state(&st);
+            assert!(guard.holder("s1", Instant::now()).is_none(), "the refused reviewer's own lease is released");
+            assert!(!guard.served_work.contains(&("s1".to_string(), "Sara".to_string())));
+        }
+
+        // Somebody ELSE's live lease is never disturbed by Sara's refusal.
+        lock_state(&st).leases.insert("s1".into(), ("Hemn".into(), Instant::now()));
+        lock_state(&st).served_work.insert(("s1".into(), "Sara".into()));
+        let (code, _) = decide(&db, &st, "Sara", &body);
+        assert_eq!(code, 403);
+        assert_eq!(lock_state(&st).holder("s1", Instant::now()), Some("Hemn"));
+        let after = row(&db, "s1");
+        assert!(!after.verified && after.human_decision.is_none(), "an unauthorized write must not land");
+    }
+
+    #[test]
+    fn playback_evidence_arms_refuse_before_the_corpus_is_touched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەق")).unwrap();
+        let st = state();
+        let fresh = stamp(&db, "s1");
+
+        // (a) Positive legacy counters can no longer authorize a verdict.
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa03",
+                "id": "s1",
+                "action": "accept",
+                "text": "دەق",
+                "rowVersion": fresh,
+                "heardMs": 1500,
+            }),
+        );
+        assert_eq!(code, 428, "{body}");
+        assert!(body.contains("legacy playback counters cannot authorize a verdict"), "{body}");
+
+        // (b) No finalized attempt at all.
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa04",
+                "id": "s1",
+                "action": "accept",
+                "text": "دەق",
+                "rowVersion": fresh,
+            }),
+        );
+        assert_eq!(
+            (code, body.as_str()),
+            (428, "E_NO_PLAYBACK_EVIDENCE: finalize this clip's playback attempt before deciding")
+        );
+
+        // (c) A receipt id that names no finalized authority for this reviewer/session/clip/revision.
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa05",
+                "id": "s1",
+                "action": "accept",
+                "text": "دەق",
+                "rowVersion": fresh,
+                "playbackReceiptId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            }),
+        );
+        assert_eq!(
+            (code, body.as_str()),
+            (
+                428,
+                "E_NO_PLAYBACK_EVIDENCE: playback authority does not match this reviewer, session, clip, or revision"
+            )
+        );
+
+        // (d) A clip with no canonical PCM identity cannot mint evidence at all.
+        db.insert_segment(&seg("s2", "دەق")).unwrap();
+        db.connection().execute("UPDATE speech_segments SET audio_content_hash = NULL WHERE id = 's2'", []).unwrap();
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa06",
+                "id": "s2",
+                "action": "accept",
+                "text": "دەق",
+                "rowVersion": stamp(&db, "s2"),
+            }),
+        );
+        assert_eq!(
+            (code, body.as_str()),
+            (503, "playback identity is unavailable — this clip has no canonical server-derived audio content hash")
+        );
+
+        for id in ["s1", "s2"] {
+            let after = row(&db, id);
+            assert!(!after.verified && after.human_decision.is_none(), "{id} must be untouched");
+        }
+        assert_eq!(review_event_count(&db), 0);
+    }
+
+    #[test]
+    fn one_operation_uuid_has_one_meaning_forever() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەقی خاو")).unwrap();
+        let st = state();
+        let operation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa07";
+        let revision = db.segment_review_revision("s1").unwrap().unwrap();
+        let payload_hash = decision_operation_payload_hash("s1", "edit", "دەقی ڕاست", "Sara");
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "s1",
+            "edit",
+            Some("دەقی ڕاست"),
+            "Sara",
+            revision,
+            operation_id,
+            &payload_hash,
+        )
+        .unwrap()
+        .unwrap();
+        let (expected_effect, _) =
+            db.human_decision_effect_for_operation(operation_id).unwrap().expect("planted decision has its effect");
+        let effect_count = || -> i64 {
+            db.connection().query_row("SELECT COUNT(*) FROM human_decision_effect_events", [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(effect_count(), 1);
+
+        // (a) The exact lost-response retry is acknowledged from the durable receipt alone — no
+        // rowVersion needed, no second effect minted, and the undo token is republished.
+        let replay =
+            serde_json::json!({"operationId": operation_id, "id": "s1", "action": "edit", "text": "دەقی ڕاست"});
+        let (code, body) = decide(&db, &st, "Sara", &replay);
+        assert_eq!(code, 200, "{body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["duplicate"], true);
+        assert_eq!(reply["effectEventId"], expected_effect);
+        assert_eq!(effect_count(), 1, "an ACK must not mint a second effect");
+        assert_eq!(lock_state(&st).undo.get("Sara").map(Vec::len), Some(1), "the replay republishes the undo token");
+
+        // (b) A case-only respelled login still owns the receipt.
+        let (code, body) = decide(&db, &st, "sara", &replay);
+        assert_eq!(code, 200, "{body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["duplicate"], true);
+
+        // (c) The same UUID with ANY different contract is a hard conflict, never a fresh write.
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({"operationId": operation_id, "id": "s1", "action": "edit", "text": "دەقی جیاواز"}),
+        );
+        assert_eq!((code, body.as_str()), (409, "operation UUID is already bound to another decision"));
+        assert_eq!(row(&db, "s1").annotated_transcript.as_deref(), Some("دەقی ڕاست"), "the stored truth is untouched");
+        assert_eq!(effect_count(), 1);
+    }
+
+    #[test]
+    fn skip_writes_the_audit_event_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەق")).unwrap();
+        let st = state();
+        {
+            let mut guard = lock_state(&st);
+            guard.leases.insert("s1".into(), ("Sara".into(), Instant::now()));
+            guard.served_work.insert(("s1".into(), "Sara".into()));
+        }
+        // A skip is the sole rowVersion exemption: it writes no verdict to be stale about.
+        let body = serde_json::json!({
+            "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa08",
+            "id": "s1",
+            "action": "skip",
+        });
+        let (code, reply) = decide(&db, &st, "Sara", &body);
+        assert_eq!(code, 200, "{reply}");
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["skipped"], true);
+        assert_eq!(review_event_count(&db), 1, "exactly the one audit event");
+        let after = row(&db, "s1");
+        assert!(
+            !after.verified && after.human_decision.is_none() && after.reviewed_by.is_none(),
+            "a skip writes NOTHING to the corpus row"
+        );
+        {
+            let mut guard = lock_state(&st);
+            assert!(guard.holder("s1", Instant::now()).is_none(), "the skipping reviewer's lease is released");
+            assert!(!guard.served_work.contains(&("s1".to_string(), "Sara".to_string())));
+            assert!(guard.skipped.get("Sara").is_some_and(|ids| ids.contains("s1")));
+        }
+
+        // The lost-response retry of the same skip is a pure ACK with no decision effect.
+        let (code, reply) = decide(&db, &st, "Sara", &body);
+        assert_eq!(code, 200, "{reply}");
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["duplicate"], true);
+        assert_eq!(reply["effectEventId"], serde_json::Value::Null, "a skip has no effect to name");
+        assert_eq!(review_event_count(&db), 1, "the replay must not append a second audit event");
+    }
+
+    #[test]
+    fn an_interrupted_legacy_decision_is_quarantined_on_the_current_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        // A committed decision without finalization can only exist from an older release; plant it
+        // under schema 59 where that state was writable, then upgrade to the current schema.
+        let rollback = crate::migrations::MIGRATIONS.iter().filter(|m| m.version > 59).count();
+        crate::migrations::rollback(&db, rollback).unwrap();
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 59);
+        let mut half_written = seg("s1", "دەقی خاو");
+        half_written.human_decision = Some("reject".into());
+        half_written.verdict = Some("human_reject".into());
+        half_written.reviewed_by = Some("Sara".into());
+        half_written.verified = false;
+        db.insert_segment_full(&half_written).unwrap();
+        crate::migrations::run_migrations(&db).unwrap();
+        let st = state();
+
+        let (code, body) = decide(&db, &st, "Sara", &serde_json::json!({"id": "s1", "action": "bad", "text": ""}));
+        assert_eq!(
+            (code, body.as_str()),
+            (
+                409,
+                "this legacy interrupted decision requires offline repair before review can continue; no corpus state was changed"
+            )
+        );
+        let after = row(&db, "s1");
+        assert_eq!(after.human_decision.as_deref(), Some("reject"));
+        assert!(!after.verified, "the quarantine must not finalize the row");
+        assert_eq!(review_event_count(&db), 0);
+    }
+
+    #[test]
+    fn a_stale_page_cannot_overwrite_another_humans_verdict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەقی خاو")).unwrap();
+        let revision = db.segment_review_revision("s1").unwrap().unwrap();
+        let hash = decision_operation_payload_hash("s1", "edit", "دەقی سارا", "Sara");
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "s1",
+            "edit",
+            Some("دەقی سارا"),
+            "Sara",
+            revision,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa09",
+            &hash,
+        )
+        .unwrap()
+        .unwrap();
+        let st = state();
+        let receipt = policy4_receipt(&db, "Hemn", "s1");
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Hemn",
+            &serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa10",
+                "id": "s1",
+                "action": "accept",
+                "text": "دەقی سارا",
+                "rowVersion": stamp(&db, "s1"),
+                "playbackReceiptId": receipt,
+            }),
+        );
+        assert_eq!((code, body.as_str()), (409, "already reviewed by Sara"));
+        let after = row(&db, "s1");
+        assert_eq!(after.reviewed_by.as_deref(), Some("Sara"), "Sara's verdict survives the late submit");
+        assert_eq!(after.annotated_transcript.as_deref(), Some("دەقی سارا"));
+
+        // The anonymous desktop variant of the same guard.
+        db.insert_segment(&seg("s2", "دەقی خاو")).unwrap();
+        db.finalize_human_review("s2", "edit", Some("دەقی مێز"), None, None).unwrap();
+        let receipt = policy4_receipt(&db, "Hemn", "s2");
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Hemn",
+            &serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa11",
+                "id": "s2",
+                "action": "accept",
+                "text": "دەقی مێز",
+                "rowVersion": stamp(&db, "s2"),
+                "playbackReceiptId": receipt,
+            }),
+        );
+        assert_eq!((code, body.as_str()), (409, "already reviewed at the desktop"));
+    }
+
+    // ── Undo routing ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_bodyless_undo_with_no_history_is_an_honest_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        let st = state();
+        let (code, body) = {
+            let (code, _, body, _) = super::api_undo(&db, "Sara", &st);
+            (code, String::from_utf8(body).unwrap())
+        };
+        assert_eq!((code, body.as_str()), (409, "nothing to undo"));
+    }
+
+    #[test]
+    fn an_addressed_pool_undo_without_an_active_pool_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        let st = state();
+        let body = serde_json::json!({
+            "poolDecisionId": "7",
+            "decisionOperationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "reversalOperationId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        });
+        let (code, reply) = undo_raw(&db, &st, "Sara", body.to_string().as_bytes());
+        assert_eq!((code, reply.as_str()), (409, "the addressed review pool is no longer active"));
+
+        let (code, reply) = undo_raw(&db, &st, "Sara", b"{broken");
+        assert_eq!(code, 400);
+        assert!(reply.starts_with("bad json"), "{reply}");
+    }
+
+    #[test]
+    fn undo_replays_its_durable_truth_and_never_erases_newer_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەقی خاو")).unwrap();
+        let revision = db.segment_review_revision("s1").unwrap().unwrap();
+        let hash = decision_operation_payload_hash("s1", "edit", "دەقی سارا", "Sara");
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "s1",
+            "edit",
+            Some("دەقی سارا"),
+            "Sara",
+            revision,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa12",
+            &hash,
+        )
+        .unwrap()
+        .unwrap();
+
+        // A restarted process has no in-memory stack; the DB fallback must find Sara's decision.
+        let st = state();
+        let (code, body) = {
+            let (code, _, body, _) = super::api_undo(&db, "Sara", &st);
+            (code, String::from_utf8(body).unwrap())
+        };
+        assert_eq!(code, 200, "{body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["id"], "s1");
+        assert_eq!(reply["rowVersion"], stamp(&db, "s1"), "the reply carries the restored revision");
+        let after = row(&db, "s1");
+        assert!(!after.verified && after.human_decision.is_none(), "the decision is reversed");
+        assert_eq!(lock_state(&st).holder("s1", Instant::now()), Some("Sara"), "the clip is re-leased for re-review");
+
+        // A lost-response retry replays the SAME idempotent reversal instead of failing or walking
+        // back an older decision.
+        let (code, body) = {
+            let (code, _, body, _) = super::api_undo(&db, "Sara", &st);
+            (code, String::from_utf8(body).unwrap())
+        };
+        assert_eq!(code, 200, "{body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["id"], "s1");
+        assert!(!row(&db, "s1").verified, "the retry must not re-apply the decision");
+    }
+
+    #[test]
+    fn undo_refuses_to_erase_a_newer_reviewers_verdict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەقی خاو")).unwrap();
+        let revision = db.segment_review_revision("s1").unwrap().unwrap();
+        let sara_hash = decision_operation_payload_hash("s1", "edit", "دەقی سارا", "Sara");
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "s1",
+            "edit",
+            Some("دەقی سارا"),
+            "Sara",
+            revision,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa13",
+            &sara_hash,
+        )
+        .unwrap()
+        .unwrap();
+        // Hemn re-reviews the clip afterwards (his own correction of Sara's verdict).
+        let revision = db.segment_review_revision("s1").unwrap().unwrap();
+        let hemn_hash = decision_operation_payload_hash("s1", "edit", "دەقی هێمن", "Hemn");
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "s1",
+            "edit",
+            Some("دەقی هێمن"),
+            "Hemn",
+            revision,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa14",
+            &hemn_hash,
+        )
+        .unwrap()
+        .unwrap();
+
+        let st = state();
+        let (code, body) = {
+            let (code, _, body, _) = super::api_undo(&db, "Sara", &st);
+            (code, String::from_utf8(body).unwrap())
+        };
+        assert_eq!((code, body.as_str()), (409, "Hemn has reviewed this clip since — undo would erase their work"));
+        let after = row(&db, "s1");
+        assert!(after.verified, "the newer verdict survives");
+        assert_eq!(after.reviewed_by.as_deref(), Some("Hemn"));
+        assert_eq!(after.annotated_transcript.as_deref(), Some("دەقی هێمن"));
+    }
+
+    // ── Spot-check receipt arms (non-pool modes) ─────────────────────────────
+
+    #[test]
+    fn a_graded_check_acknowledges_every_replay_without_touching_the_corpus() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("g1", "دەقی خاو")).unwrap();
+        // The answer key exists exactly as a finalized desktop edit leaves it.
+        db.finalize_human_review("g1", "edit", Some("دەقی ڕاست"), None, None).unwrap();
+        let st = state();
+        lock_state(&st).spot_checks.insert(("g1".to_string(), "Sara".to_string()));
+
+        let before = row(&db, "g1");
+        let before_stamp = stamp(&db, "g1");
+        let receipt = policy4_receipt(&db, "Sara", "g1");
+        let operation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa15";
+        let first = serde_json::json!({
+            "operationId": operation_id,
+            "id": "g1",
+            "action": "edit",
+            "text": "دەقی ڕاست",
+            "rowVersion": before_stamp,
+            "playbackReceiptId": receipt,
+        });
+        let (code, body) = decide(&db, &st, "Sara", &first);
+        assert_eq!(code, 200, "{body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["ok"], true);
+        assert!(reply.get("skipped").is_none() && reply.get("effectEventId").is_none());
+        assert!(db.has_spot_check_result("g1", "Sara").unwrap(), "the score is durably recorded");
+        let events_after_grade = review_event_count(&db);
+        let after = row(&db, "g1");
+        assert_eq!(stamp(&db, "g1"), before_stamp, "grading must never alter the data it grades against");
+        assert_eq!(after.verdict_transcript, before.verdict_transcript);
+        assert_eq!(after.reviewed_by, before.reviewed_by);
+
+        // Replay one: the SAME operation UUID resolves from the immutable receipt (no decision
+        // effect exists for a check, so the ACK carries a null effect id).
+        let (code, body) = decide(&db, &st, "Sara", &first);
+        assert_eq!(code, 200, "{body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["duplicate"], true);
+        assert_eq!(reply["effectEventId"], serde_json::Value::Null);
+
+        // Replay two: a NEW UUID from a rebuilt outbox is acknowledged by the durable check result
+        // itself — before the rowVersion fence, so a pre-policy-4 outbox can still drain.
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa16",
+                "id": "g1",
+                "action": "edit",
+                "text": "دەقی ڕاست",
+            }),
+        );
+        assert_eq!(code, 200, "{body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["ok"], true);
+        assert!(reply.get("duplicate").is_none(), "the ACK is byte-shaped like a normal success");
+        assert_eq!(review_event_count(&db), events_after_grade, "neither replay appends an audit event");
+        assert_eq!(
+            db.connection()
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM spot_checks WHERE segment_id='g1' AND reviewer='Sara'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+            1,
+            "the first answer is immutable"
+        );
+    }
+
+    // ── Flexible-pool arms ───────────────────────────────────────────────────
+
+    fn pool_fixture(dir: &std::path::Path) -> (Database, crate::review_pool::ReviewPool) {
+        let (db, _) = test_db(dir);
+        let champion_id = "omniasr-7b-decisions-test";
+        crate::registry::register_candidate(
+            &db,
+            &crate::registry::NewModelVersion {
+                id: champion_id.into(),
+                family: crate::deployment::OMNIASR_7B_FAMILY.into(),
+                model_card_name: Some("decisions test champion".into()),
+                checkpoint_sha256: "c".repeat(64),
+                checkpoint_path: "/test/decisions-champion.json".into(),
+                source: "cortex-finetuned".into(),
+                license: "owner-full-rights".into(),
+            },
+        )
+        .unwrap();
+        db.connection().execute("UPDATE model_versions SET status='champion' WHERE id=?1", [champion_id]).unwrap();
+        let mut member = seg("in-pool", "دەقی چامپیۆن");
+        member.model_version_id = Some(champion_id.into());
+        let mut outside = seg("outside", "دەقی دەرەوە");
+        outside.model_version_id = Some(champion_id.into());
+        db.insert_segment(&member).unwrap();
+        db.insert_segment(&outside).unwrap();
+        let pool = crate::review_pool::activate(
+            &db,
+            "123e4567-e89b-42d3-a456-426614174777",
+            &[crate::review_pool::PoolMemberInput { segment_id: "in-pool".into(), voice_name: "Lamo".into() }],
+        )
+        .unwrap();
+        (db, pool)
+    }
+
+    fn pool_body(value: serde_json::Value) -> DecisionBody {
+        serde_json::from_value(value).expect("pool decision body parses")
+    }
+
+    fn pool_decide(
+        db: &Database,
+        st: &Mutex<CouchState>,
+        pool: &crate::review_pool::ReviewPool,
+        reviewer: &str,
+        value: serde_json::Value,
+    ) -> (u16, String) {
+        let body = pool_body(value);
+        let (code, _, reply, _) = api_pool_decision(db, &body, reviewer, st, pool);
+        (code, String::from_utf8(reply).unwrap())
+    }
+
+    #[test]
+    fn pool_decisions_walk_the_same_refusal_ladder_before_any_observation_lands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, pool) = pool_fixture(tmp.path());
+        let st = Mutex::new(CouchState { pool_policy: Some(pool.clone()), ..CouchState::default() });
+        let pool_decisions = || -> i64 {
+            db.connection().query_row("SELECT COUNT(*) FROM review_pool_decisions", [], |r| r.get(0)).unwrap()
+        };
+
+        let (code, body) =
+            pool_decide(&db, &st, &pool, "Sara", serde_json::json!({"id": "in-pool", "action": "accept", "text": "x"}));
+        assert_eq!((code, body.as_str()), (400, "operationId is required — reload this page before deciding"));
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({"operationId": "nope", "id": "in-pool", "action": "accept", "text": "x"}),
+        );
+        assert_eq!((code, body.as_str()), (400, "operationId must be a canonical UUID"));
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAA21",
+                "id": "in-pool",
+                "action": "accept",
+                "text": "x",
+            }),
+        );
+        assert_eq!((code, body.as_str()), (400, "operationId must be a lowercase hyphenated UUID"));
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa22",
+                "id": "ghost",
+                "action": "accept",
+                "text": "x",
+            }),
+        );
+        assert_eq!((code, body.as_str()), (404, "no such segment"));
+
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa23",
+                "id": "in-pool",
+                "action": "accept",
+                "text": "x",
+            }),
+        );
+        assert_eq!((code, body.as_str()), (400, "rowVersion is required — reload this clip before deciding"));
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa24",
+                "id": "in-pool",
+                "action": "accept",
+                "text": "x",
+                "rowVersion": "soon",
+            }),
+        );
+        assert_eq!((code, body.as_str()), (400, "rowVersion is invalid — reload this clip before deciding"));
+        let current = stamp(&db, "in-pool");
+        let stale = (current.parse::<i64>().unwrap() + 41).to_string();
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa25",
+                "id": "in-pool",
+                "action": "accept",
+                "text": "x",
+                "rowVersion": stale,
+            }),
+        );
+        assert_eq!((code, body.as_str()), (409, "this clip changed since it was served — reload for the fresh draft"));
+
+        // Fresh revision but never actually served to this reviewer.
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa26",
+                "id": "in-pool",
+                "action": "accept",
+                "text": "x",
+                "rowVersion": current,
+            }),
+        );
+        assert_eq!(
+            (code, body.as_str()),
+            (409, "pool review requires this clip to be served first — reload the queue")
+        );
+
+        {
+            let mut guard = lock_state(&st);
+            guard.served_work.insert(("in-pool".into(), "Sara".into()));
+            guard.served_work.insert(("outside".into(), "Sara".into()));
+        }
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa27",
+                "id": "outside",
+                "action": "accept",
+                "text": "x",
+                "rowVersion": stamp(&db, "outside"),
+            }),
+        );
+        assert_eq!((code, body.as_str()), (403, "this clip is outside the active review pool"));
+        assert!(
+            !lock_state(&st).served_work.contains(&("outside".to_string(), "Sara".to_string())),
+            "the refused assignment is forgotten"
+        );
+
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa28",
+                "id": "in-pool",
+                "action": "promote",
+                "text": "x",
+                "rowVersion": current,
+            }),
+        );
+        assert_eq!((code, body.as_str()), (400, "unknown action 'promote'"));
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa29",
+                "id": "in-pool",
+                "action": "accept",
+                "text": "   ",
+                "rowVersion": current,
+            }),
+        );
+        assert_eq!((code, body.as_str()), (400, "empty transcript"));
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa30",
+                "id": "in-pool",
+                "action": "edit",
+                "text": "n/a",
+                "rowVersion": current,
+            }),
+        );
+        assert_eq!((code, body.as_str()), (400, "placeholder transcript cannot be verified"));
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa31",
+                "id": "in-pool",
+                "action": "accept",
+                "text": "دەقی چامپیۆن",
+                "rowVersion": current,
+                "heardMs": -1,
+            }),
+        );
+        assert_eq!((code, body.as_str()), (400, "playback counters must not be negative"));
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa32",
+                "id": "in-pool",
+                "action": "accept",
+                "text": "دەقی چامپیۆن",
+                "rowVersion": current,
+            }),
+        );
+        assert_eq!((code, body.as_str()), (428, "E_NO_PLAYBACK_EVIDENCE: listen to the clip before deciding"));
+
+        assert_eq!(pool_decisions(), 0, "every refusal above must leave the observation table empty");
+        let untouched = row(&db, "in-pool");
+        assert!(!untouched.verified && untouched.human_decision.is_none(), "the canonical row is never mutated");
+    }
+
+    #[test]
+    fn pool_routing_and_undo_demand_the_exact_durable_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, pool) = pool_fixture(tmp.path());
+        let st = Mutex::new(CouchState { pool_policy: Some(pool.clone()), ..CouchState::default() });
+        lock_state(&st).served_work.insert(("in-pool".into(), "Sara".into()));
+
+        // A pool observation is a SECOND opinion: the recording authority only accepts it for a
+        // canonical row that is already verified with a first-pass human decision (its guarded
+        // INSERT..SELECT matches nothing otherwise). Mint that precondition first, as production
+        // did before the pool was activated over the reviewed library.
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET verified=1, human_decision='edit', reviewed_by='Hemn',
+                        annotated_transcript='دەقی یەکەم' WHERE id='in-pool'",
+                [],
+            )
+            .unwrap();
+
+        // Plant Sara's durable pool observation directly through the recording authority.
+        let planted_op = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa33";
+        let planted_hash = decision_operation_payload_hash("in-pool", "edit", "دەقی سارا", "Sara");
+        let revision = db.segment_review_revision("in-pool").unwrap().unwrap();
+        let content_hash = db.segment_audio_content_hash("in-pool").unwrap().unwrap();
+        let planted_id = crate::review_pool::record_decision(
+            &db,
+            &pool,
+            &crate::review_pool::PoolDecisionInput {
+                segment_id: "in-pool",
+                reviewer: "Sara",
+                action: "edit",
+                submitted_transcript: Some("دەقی سارا"),
+                served_transcript: "دەقی چامپیۆن",
+                served_revision: revision,
+                audio_content_hash: Some(&content_hash),
+                source_start_ms: Some(0),
+                source_end_ms: Some(1500),
+                duration_ms: 1500,
+                requested_action: "edit",
+                requested_transcript: "دەقی سارا",
+                operation_id: planted_op,
+                operation_payload_hash: &planted_hash,
+                created_at_ms: 1_700_000_000_000,
+            },
+        )
+        .unwrap()
+        .expect("pool observation planted");
+
+        // The routed production entry point recognizes the durable pool receipt as a replay.
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({
+                "operationId": planted_op,
+                "id": "in-pool",
+                "action": "edit",
+                "text": "دەقی سارا",
+                "rowVersion": stamp(&db, "in-pool"),
+            }),
+        );
+        assert_eq!(code, 200, "{body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["duplicate"], true);
+        assert_eq!(reply["poolDecisionId"], planted_id);
+
+        // A second judgement by the same reviewer is refused even under a fresh UUID. The first
+        // decide consumed the in-memory serve entry, and the serve gate sits BEFORE the durable
+        // duplicate check — re-seed the serve (a stale second tab still holding the clip) so this
+        // exercises the refusal that outlives process memory.
+        lock_state(&st).served_work.insert(("in-pool".into(), "Sara".into()));
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa34",
+                "id": "in-pool",
+                "action": "accept",
+                "text": "دەقی چامپیۆن",
+                "rowVersion": stamp(&db, "in-pool"),
+                "heardMs": 1500,
+            }),
+        );
+        assert_eq!((code, body.as_str()), (409, "you already reviewed this clip — reload for another one"));
+
+        // An addressed undo under the WRONG reviewer never reverses Sara's observation.
+        let addressed = serde_json::json!({
+            "poolDecisionId": planted_id.to_string(),
+            "decisionOperationId": planted_op,
+            "reversalOperationId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbb35",
+        });
+        let (code, body) = undo_raw(&db, &st, "Hemn", addressed.to_string().as_bytes());
+        assert_eq!(
+            (code, body.as_str()),
+            (409, "pool undo target is stale or does not match this reviewer — reload before retrying")
+        );
+        assert_eq!(
+            db.connection()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM review_pool_reversals", [], |r| r.get(0))
+                .unwrap(),
+            0,
+            "a refused undo appends no reversal"
+        );
+
+        // A bodyless undo holding only an in-memory pool token must go back for the durable target.
+        let token_state = Mutex::new(CouchState { pool_policy: Some(pool.clone()), ..CouchState::default() });
+        remember_pool_undo(&token_state, "Sara", planted_op, "in-pool", planted_id);
+        let (code, body) = undo_raw(&db, &token_state, "Sara", b"");
+        assert_eq!(
+            (code, body.as_str()),
+            (409, "pool undo requires the exact durable target from the decision response")
+        );
+
+        // And with NO tokens at all, durable pool history newer than canonical history is refused
+        // rather than guessed at.
+        let bare_state = Mutex::new(CouchState { pool_policy: Some(pool.clone()), ..CouchState::default() });
+        let (code, body) = undo_raw(&db, &bare_state, "Sara", b"");
+        assert_eq!(
+            (code, body.as_str()),
+            (409, "pool undo requires the exact durable target from the decision response")
+        );
+
+        // An already-canonical clip in pool mode routes through the pool handler, where the pool
+        // boundary still holds: a non-member is refused, not observed.
+        let outside_revision = db.segment_review_revision("outside").unwrap().unwrap();
+        let outside_hash = decision_operation_payload_hash("outside", "edit", "دەقی ڕووبار", "Rubar");
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "outside",
+            "edit",
+            Some("دەقی ڕووبار"),
+            "Rubar",
+            outside_revision,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa36",
+            &outside_hash,
+        )
+        .unwrap()
+        .unwrap();
+        lock_state(&st).served_work.insert(("outside".into(), "Rubar".into()));
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Rubar",
+            &serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa37",
+                "id": "outside",
+                "action": "accept",
+                "text": "دەقی ڕووبار",
+                "rowVersion": stamp(&db, "outside"),
+            }),
+        );
+        assert_eq!((code, body.as_str()), (403, "this clip is outside the active review pool"));
+    }
+}

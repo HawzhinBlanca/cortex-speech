@@ -590,3 +590,295 @@ pub(crate) fn require_active_pilot_policy_binding(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+
+    const POLICY_JSON: &str = r#"{
+      "schema_version": 1,
+      "after_review_event_id": 0,
+      "max_total_corpus_actions": 20,
+      "reviewers": [
+        {"name": "Hawzhin", "max_corpus_actions": 10},
+        {"name": "Pavel", "max_corpus_actions": 10}
+      ]
+    }"#;
+
+    fn policy() -> crate::review_pilot::ReviewPilotPolicy {
+        crate::review_pilot::parse(POLICY_JSON).unwrap()
+    }
+
+    fn fresh_db() -> Database {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db
+    }
+
+    /// Restored files can carry rows written with the guards disabled.
+    fn unlock(db: &Database, table: &str) {
+        let names = db
+            .connection()
+            .prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=?1")
+            .unwrap()
+            .query_map([table], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for name in names {
+            db.connection().execute(&format!("DROP TRIGGER \"{name}\""), []).unwrap();
+        }
+        db.connection().execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
+    }
+
+    fn hidden_key(db: &Database, policy: &crate::review_pilot::ReviewPilotPolicy, reviewer: &str, segment: &str) {
+        db.connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys(policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![policy.policy_sha256().unwrap(), policy.after_review_event_id, reviewer, segment],
+            )
+            .unwrap();
+    }
+
+    fn review_event(db: &Database, segment: &str, reviewer: &str, action: &str, source: &str, index: u64) {
+        db.connection()
+            .execute(
+                "INSERT INTO review_events
+                    (segment_id, reviewer, action, source, timestamp_ms, operation_id,
+                     operation_payload_hash, requested_action, requested_transcript,
+                     served_transcript, served_revision, app_git_sha, playback_guard_version)
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, 'accept', '', 'served', 0, ?7,
+                         'content-hash-raw-counter-v3')",
+                rusqlite::params![
+                    segment,
+                    reviewer,
+                    action,
+                    source,
+                    format!("00000000-0000-4000-8000-{index:012x}"),
+                    "a".repeat(64),
+                    crate::GIT_SHA
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn active_pilot_grant_and_event_authority_refusals() {
+        let policy = policy();
+        validate_active_pilot_semantics(&fresh_db(), &policy, "target snapshot")
+            .expect("a pristine database satisfies the active pilot semantics");
+
+        // A grant outside the exact roster mints paid work for someone the owner never authorized.
+        let outsider = fresh_db();
+        hidden_key(&outsider, &policy, "Zara", "s1");
+        let error = validate_active_pilot_semantics(&outsider, &policy, "target snapshot").unwrap_err();
+        assert!(error.contains("unauthorized reviewer"), "{error}");
+
+        // The same grant under two spellings is one grant, not two. The table's NOCASE primary key
+        // blocks a same-case duplicate, but a whitespace variant written elsewhere with the CHECKs
+        // disabled folds to the same reviewer identity and must be refused by the validator.
+        let duplicated = fresh_db();
+        hidden_key(&duplicated, &policy, "Hawzhin", "s1");
+        unlock(&duplicated, "review_pilot_hidden_keys");
+        hidden_key(&duplicated, &policy, " Hawzhin", "s1");
+        let error = validate_active_pilot_semantics(&duplicated, &policy, "target snapshot").unwrap_err();
+        assert!(error.contains("duplicate grant"), "{error}");
+
+        // A hidden-check event with no durable grant behind it is forged QC.
+        let ungranted = fresh_db();
+        review_event(&ungranted, "s1", "Hawzhin", "accept", "couch_spot_check", 1);
+        let error = validate_active_pilot_semantics(&ungranted, &policy, "target snapshot").unwrap_err();
+        assert!(error.contains("no active durable grant"), "{error}");
+
+        // Post-baseline corpus work by a reviewer outside the roster.
+        let unauthorized = fresh_db();
+        review_event(&unauthorized, "s1", "Zara", "accept", "couch", 2);
+        let error = validate_active_pilot_semantics(&unauthorized, &policy, "target snapshot").unwrap_err();
+        assert!(error.contains("unauthorized reviewer"), "{error}");
+
+        // An action outside the review vocabulary.
+        let invalid_action = fresh_db();
+        unlock(&invalid_action, "review_events");
+        review_event(&invalid_action, "s1", "Hawzhin", "bogus", "couch", 3);
+        let error = validate_active_pilot_semantics(&invalid_action, &policy, "target snapshot").unwrap_err();
+        assert!(error.contains("invalid action"), "{error}");
+
+        // A reserved hidden key may resolve through the corpus path only as the historical skip;
+        // any non-skip corpus finalization of a hidden key is corruption.
+        let finalized = fresh_db();
+        hidden_key(&finalized, &policy, "Hawzhin", "s1");
+        review_event(&finalized, "s1", "Hawzhin", "accept", "couch", 4);
+        let error = validate_active_pilot_semantics(&finalized, &policy, "target snapshot").unwrap_err();
+        assert!(error.contains("non-skip finalized through the corpus path"), "{error}");
+
+        // The historical corpus skip resolves the grant exactly once.
+        let skipped = fresh_db();
+        hidden_key(&skipped, &policy, "Hawzhin", "s1");
+        review_event(&skipped, "s1", "Hawzhin", "skip", "couch", 5);
+        validate_active_pilot_semantics(&skipped, &policy, "target snapshot")
+            .expect("the recognized pre-v59 hidden-skip history must stay valid");
+        review_event(&skipped, "s1", "Hawzhin", "skip", "couch", 6);
+        let error = validate_active_pilot_semantics(&skipped, &policy, "target snapshot").unwrap_err();
+        assert!(error.contains("resolved more than once"), "{error}");
+    }
+
+    #[test]
+    fn pilot_corpus_decisions_must_carry_matching_ledger_and_segment_state() {
+        let policy = policy();
+
+        // A post-baseline corpus decision without its one compensation ledger entry is unpaid work.
+        let unpaid = fresh_db();
+        review_event(&unpaid, "s1", "Hawzhin", "accept", "couch", 10);
+        let error = validate_active_pilot_semantics(&unpaid, &policy, "target snapshot").unwrap_err();
+        assert!(error.contains("lacks one valid compensation ledger entry"), "{error}");
+
+        // A reviewed row attributed to the roster with no campaign event behind it is forged truth.
+        let forged = fresh_db();
+        forged
+            .insert_segment(&crate::db::SpeechSegment {
+                id: "s1".to_string(),
+                audio_path: "s1.wav".to_string(),
+                raw_transcript: "draft".to_string(),
+                duration_ms: 1_000,
+                ..crate::db::SpeechSegment::default()
+            })
+            .unwrap();
+        unlock(&forged, "speech_segments");
+        forged
+            .connection()
+            .execute("UPDATE speech_segments SET reviewed_by='Hawzhin', human_decision='accept' WHERE id='s1'", [])
+            .unwrap();
+        let error = validate_active_pilot_semantics(&forged, &policy, "target snapshot").unwrap_err();
+        assert!(error.contains("no matching active campaign event/ledger"), "{error}");
+    }
+
+    #[test]
+    fn hidden_key_namespace_and_structural_quota_refusals() {
+        let policy = policy();
+
+        // A policy whose baseline outruns retained review history cannot bind anything.
+        let ahead = crate::review_pilot::parse(
+            &POLICY_JSON.replace("\"after_review_event_id\": 0", "\"after_review_event_id\": 1"),
+        )
+        .unwrap();
+        let error = validate_pilot_hidden_namespace(&fresh_db(), &ahead, "target snapshot").unwrap_err();
+        assert!(error.contains("ahead of review history maximum"), "{error}");
+
+        // A grant sharing the policy SHA under a different baseline splits the namespace.
+        let inconsistent = fresh_db();
+        unlock(&inconsistent, "review_pilot_hidden_keys");
+        inconsistent
+            .connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys(policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, 7, 'Hawzhin', 's1')",
+                [policy.policy_sha256().unwrap()],
+            )
+            .unwrap();
+        let error = validate_pilot_hidden_namespace(&inconsistent, &policy, "target snapshot").unwrap_err();
+        assert!(error.contains("inconsistent with its active policy SHA/baseline"), "{error}");
+
+        // Per-reviewer grant ceiling (2) and roster membership are both enforced on restored rows.
+        let over_ceiling = fresh_db();
+        unlock(&over_ceiling, "review_pilot_hidden_keys");
+        for segment in ["s1", "s2", "s3"] {
+            hidden_key(&over_ceiling, &policy, "Hawzhin", segment);
+        }
+        let error = validate_pilot_hidden_namespace(&over_ceiling, &policy, "target snapshot").unwrap_err();
+        assert!(error.contains("per-reviewer grant ceiling"), "{error}");
+
+        let outsider = fresh_db();
+        hidden_key(&outsider, &policy, "Zara", "s1");
+        let error = validate_pilot_hidden_namespace(&outsider, &policy, "target snapshot").unwrap_err();
+        assert!(error.contains("outside its exact policy roster"), "{error}");
+
+        // Structurally, one baseline may never carry two different policy identities.
+        let split = fresh_db();
+        unlock(&split, "review_pilot_hidden_keys");
+        for (sha, segment) in [("b".repeat(64), "s1"), ("c".repeat(64), "s2")] {
+            split
+                .connection()
+                .execute(
+                    "INSERT INTO review_pilot_hidden_keys(policy_sha256, after_review_event_id, reviewer, segment_id)
+                     VALUES (?1, 0, 'Hawzhin', ?2)",
+                    rusqlite::params![sha, segment],
+                )
+                .unwrap();
+        }
+        let error = validate_pilot_hidden_structural_namespaces(&split, "target snapshot").unwrap_err();
+        assert!(error.contains("one-policy-per-baseline"), "{error}");
+    }
+
+    #[test]
+    fn pilot_policy_binding_across_generations() {
+        let floor = fresh_db();
+        let target = fresh_db();
+        let floor_policy = policy();
+
+        // Before any grant or post-baseline activity, the floor policy does not yet bind targets.
+        require_active_pilot_policy_binding(
+            &floor,
+            Some(&floor_policy),
+            &target,
+            &SnapshotPilotPolicyRestore::ExplicitlyAbsent,
+        )
+        .expect("an unused pilot policy must not veto restores");
+        // And a floor with no policy at all binds nothing.
+        require_active_pilot_policy_binding(&floor, None, &target, &SnapshotPilotPolicyRestore::ExplicitlyAbsent)
+            .expect("no floor policy means no binding");
+
+        // The first durable grant arms the binding: a target without the policy is refused...
+        hidden_key(&floor, &floor_policy, "Hawzhin", "s1");
+        let error = require_active_pilot_policy_binding(
+            &floor,
+            Some(&floor_policy),
+            &target,
+            &SnapshotPilotPolicyRestore::ExplicitlyAbsent,
+        )
+        .unwrap_err();
+        assert!(error.contains("does not cryptographically bind"), "{error}");
+
+        // ...a policy outside the pinned certification constants cannot even parse...
+        let uncapped = POLICY_JSON.replace("\"max_total_corpus_actions\": 20", "\"max_total_corpus_actions\": 21");
+        let error = require_active_pilot_policy_binding(
+            &floor,
+            Some(&floor_policy),
+            &target,
+            &SnapshotPilotPolicyRestore::Install(uncapped.into_bytes()),
+        )
+        .unwrap_err();
+        assert!(error.contains("must cap this certification pilot"), "{error}");
+
+        // ...a VALID policy with a different roster identity is refused as a different policy...
+        let other = POLICY_JSON.replace("\"name\": \"Pavel\"", "\"name\": \"Someone\"");
+        let error = require_active_pilot_policy_binding(
+            &floor,
+            Some(&floor_policy),
+            &target,
+            &SnapshotPilotPolicyRestore::Install(other.into_bytes()),
+        )
+        .unwrap_err();
+        assert!(error.contains("policy identity differs"), "{error}");
+
+        // ...non-UTF-8 policy bytes can never be parsed into an identity...
+        let error = require_active_pilot_policy_binding(
+            &floor,
+            Some(&floor_policy),
+            &target,
+            &SnapshotPilotPolicyRestore::Install(vec![0xff, 0xfe]),
+        )
+        .unwrap_err();
+        assert!(error.contains("not UTF-8"), "{error}");
+
+        // ...and the exact same policy passes.
+        require_active_pilot_policy_binding(
+            &floor,
+            Some(&floor_policy),
+            &target,
+            &SnapshotPilotPolicyRestore::Install(POLICY_JSON.as_bytes().to_vec()),
+        )
+        .expect("the exact bound policy must restore");
+    }
+}

@@ -2915,6 +2915,282 @@ mod tests {
         assert!(listed[0].db_size_bytes > 0);
         assert_eq!(listed[1].name, "snapshot_0000000200");
     }
+
+    #[test]
+    fn manifest_names_and_snapshot_selectors_are_strictly_validated() {
+        for name in ["cortex-speech.db", "settings.json", "champion.json.absent", "review_pilot_policy.json"] {
+            safe_manifest_name(name).expect(name);
+        }
+        for name in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "con.json",
+            "prn",
+            "aux.txt",
+            "nul",
+            "com1.wav",
+            "lpt9.db",
+            "trailing ",
+            "trailing.",
+            "ba<d",
+            "ba|d",
+            "ba?d",
+            "ba*d",
+            "ba\"d",
+            "ba:d",
+            "tab\tname",
+            MANIFEST_FILE,
+            "snapshot_manifest.JSON",
+        ] {
+            assert!(safe_manifest_name(name).is_err(), "{name:?} must be refused as a manifest path");
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let snap = take_snapshot_at(&db, tmp.path(), 5, 1000).unwrap().unwrap();
+        assert_eq!(resolve_snapshot_dir(tmp.path(), "snapshot_0000001000").unwrap(), snap);
+        seed_test_required_snapshot_state(tmp.path()).unwrap();
+        let pin = take_pinned_snapshot_at(&db, tmp.path(), "drill", 3, 2000).unwrap();
+        assert_eq!(resolve_snapshot_dir(tmp.path(), "pinned/drill_0000002000").unwrap(), pin);
+
+        for selector in [
+            "",
+            "snapshot_",
+            "snapshot_123",
+            "snapshot_00000010001",
+            "snapshot_00000x1000",
+            "pinned/",
+            "pinned/_0000001000",
+            "pinned/label",
+            "pinned/label_123",
+            "pinned/-lead_0000001000",
+            "pinned/a/b_0000001000",
+            "pinned/a\\b_0000001000",
+            "../snapshots/snapshot_0000001000",
+            "C:/absolute/path",
+        ] {
+            assert!(resolve_snapshot_dir(tmp.path(), selector).is_err(), "{selector:?} must be refused");
+        }
+        let missing = resolve_snapshot_dir(tmp.path(), "snapshot_0000009999").unwrap_err();
+        assert!(missing.contains("unavailable"), "{missing}");
+        // A well-formed selector pointing at a plain FILE is not a snapshot.
+        std::fs::write(tmp.path().join("snapshots").join("snapshot_0000004242"), b"file").unwrap();
+        let not_a_dir = resolve_snapshot_dir(tmp.path(), "snapshot_0000004242").unwrap_err();
+        assert!(not_a_dir.contains("real directory"), "{not_a_dir}");
+    }
+
+    #[test]
+    fn champion_pointer_and_optional_state_validation_fail_closed() {
+        assert!(validate_champion_pointer(br#"{"schema":2,"champions":{}}"#).is_ok());
+        let valid_family = br#"{"schema":2,"champions":{"omniasr-7b":{"modelVersionId":"m","deploymentManifestPath":"p","deploymentSha256":"s","source":"user-finetuned","license":"Apache-2.0"}}}"#;
+        assert!(validate_champion_pointer(valid_family).is_ok());
+        let cases: [(&[u8], &str); 10] = [
+            (b"not json", "invalid JSON"),
+            (br#"[]"#, "must be an object"),
+            (br#"{"schema":2}"#, "exactly schema and champions"),
+            (br#"{"schema":2,"champions":{},"extra":1}"#, "exactly schema and champions"),
+            (br#"{"schema":1,"champions":{}}"#, "must be exactly 2"),
+            (br#"{"schema":2,"champions":[]}"#, "must be an object"),
+            (br#"{"schema":2,"champions":{"":{}}}"#, "empty family name"),
+            (br#"{"schema":2,"champions":{"omniasr-7b":{"modelVersionId":"m"}}}"#, "invalid field set"),
+            (
+                br#"{"schema":2,"champions":{"omniasr-7b":{"modelVersionId":1,"deploymentManifestPath":"p","deploymentSha256":"s","source":"u","license":"l"}}}"#,
+                "must all be strings",
+            ),
+            (br#"{"schema":2,"champions":{"omniasr-7b":"nope"}}"#, "must be an object"),
+        ];
+        for (bytes, expected) in cases {
+            let error = validate_champion_pointer(bytes).unwrap_err();
+            assert!(error.contains(expected), "expected '{expected}', got: {error}");
+        }
+
+        let unknown = validate_present_optional_state("mystery.json", b"{}").unwrap_err();
+        assert!(unknown.contains("unknown optional snapshot state"), "{unknown}");
+        assert!(validate_present_optional_state("reviewer_dialects.json", b"not json").is_err());
+        let non_utf8 = validate_present_optional_state("voice_focus.json", &[0xff, 0xfe]).unwrap_err();
+        assert!(non_utf8.contains("not UTF-8"), "{non_utf8}");
+    }
+
+    #[test]
+    fn optional_state_inspection_is_exact_about_presence_and_absence() {
+        let state = OPTIONAL_SNAPSHOT_STATE
+            .iter()
+            .copied()
+            .find(|state| state.live_file == "champion.json")
+            .expect("champion.json is part of the optional recovery contract");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pointer: &[u8] = br#"{"schema":2,"champions":{}}"#;
+
+        // Both present and absent at once is a contradiction, never a silent preference.
+        std::fs::write(tmp.path().join(state.live_file), pointer).unwrap();
+        std::fs::write(tmp.path().join(state.absent_file), state.absent_bytes).unwrap();
+        let ambiguous = inspect_optional_state_for_restore(tmp.path(), state, true).unwrap_err();
+        assert!(ambiguous.contains("ambiguous"), "{ambiguous}");
+
+        // A valid present copy installs the exact bytes.
+        std::fs::remove_file(tmp.path().join(state.absent_file)).unwrap();
+        assert_eq!(
+            inspect_optional_state_for_restore(tmp.path(), state, true).unwrap(),
+            OptionalSnapshotRestore::Install(pointer.to_vec())
+        );
+
+        // An invalid present copy fails instead of being installed or downgraded to absence.
+        std::fs::write(tmp.path().join(state.live_file), b"{}").unwrap();
+        assert!(inspect_optional_state_for_restore(tmp.path(), state, true).is_err());
+
+        // Explicit absence restores as absence, and a forged marker is refused.
+        std::fs::remove_file(tmp.path().join(state.live_file)).unwrap();
+        std::fs::write(tmp.path().join(state.absent_file), state.absent_bytes).unwrap();
+        assert_eq!(
+            inspect_optional_state_for_restore(tmp.path(), state, true).unwrap(),
+            OptionalSnapshotRestore::ExplicitlyAbsent
+        );
+        std::fs::write(tmp.path().join(state.absent_file), b"forged marker").unwrap();
+        let forged = inspect_optional_state_for_restore(tmp.path(), state, true).unwrap_err();
+        assert!(forged.contains("invalid contents"), "{forged}");
+
+        // Missing entirely: a manifest-bearing tree fails hard, only a legacy tree preserves live state.
+        std::fs::remove_file(tmp.path().join(state.absent_file)).unwrap();
+        let missing = inspect_optional_state_for_restore(tmp.path(), state, true).unwrap_err();
+        assert!(missing.contains("missing both"), "{missing}");
+        assert_eq!(
+            inspect_optional_state_for_restore(tmp.path(), state, false).unwrap(),
+            OptionalSnapshotRestore::PreserveLegacy
+        );
+    }
+
+    #[test]
+    fn verified_snapshot_image_pins_the_exact_promoted_source_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let snap = take_snapshot_at(&db, tmp.path(), 5, 1000).unwrap().unwrap();
+        let settings = snap.join("settings.json");
+        let original = std::fs::read(&settings).unwrap();
+
+        // The exact race the private image exists to close: the promoted source changing between
+        // capture and re-hash is refused, never silently restored.
+        let error = match VerifiedSnapshotImage::capture(&snap, || {
+            std::fs::write(&settings, b"swapped after capture").unwrap();
+        }) {
+            Ok(_) => panic!("a source mutated during capture must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.contains("digest mismatch during restore preflight"), "{error}");
+        std::fs::write(&settings, &original).unwrap();
+
+        let image = VerifiedSnapshotImage::capture(&snap, || {}).unwrap();
+        assert!(image.manifest_verified(), "a manifest-bearing snapshot must capture as verified");
+        assert!(image.database_path().is_file());
+        image.verify_owned_digest().unwrap();
+        // Tampering with the OWNED private copy is also caught before staging.
+        std::fs::write(image.root().join("settings.json"), b"tampered private copy").unwrap();
+        let owned = image.verify_owned_digest().unwrap_err();
+        assert!(owned.contains("digest mismatch before restore staging"), "{owned}");
+        let root = image.root().to_path_buf();
+        drop(image);
+        assert!(!root.exists(), "the private image directory must be removed on drop");
+
+        // Non-directory sources and nested directories inside the tree are refused outright.
+        let file_source = tmp.path().join("not-a-dir");
+        std::fs::write(&file_source, b"x").unwrap();
+        assert!(VerifiedSnapshotImage::capture(&file_source, || {}).is_err());
+        std::fs::create_dir_all(snap.join("nested")).unwrap();
+        let nested = match VerifiedSnapshotImage::capture(&snap, || {}) {
+            Ok(_) => panic!("a snapshot tree with a nested directory must be refused"),
+            Err(error) => error,
+        };
+        assert!(nested.contains("regular"), "{nested}");
+    }
+
+    #[test]
+    fn manifest_schema_and_inventory_drift_are_hard_failures() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let snap = take_snapshot_at(&db, tmp.path(), 5, 1000).unwrap().unwrap();
+        let manifest_path = snap.join(MANIFEST_FILE);
+        let pristine: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let install = |manifest: &serde_json::Value| {
+            std::fs::write(&manifest_path, serde_json::to_vec_pretty(manifest).unwrap()).unwrap();
+        };
+
+        let mutations: [(&dyn Fn(&mut serde_json::Value), &str); 5] = [
+            (&|manifest| manifest["schema"] = serde_json::json!(3), "must be exactly integer 1 or 2"),
+            (&|manifest| manifest["schema"] = serde_json::json!("1"), "must be exactly integer 1 or 2"),
+            (&|manifest| manifest["appGitSha"] = serde_json::json!(""), "appGitSha must be non-empty"),
+            (
+                &|manifest| manifest["reviewPilotPolicyStateSchema"] = serde_json::json!(2),
+                "policy-state schema must be exactly 1",
+            ),
+            (&|manifest| manifest["files"][0]["sha256"] = serde_json::json!("XYZ"), "64 lowercase hex digits"),
+        ];
+        for (mutate, expected) in mutations {
+            let mut manifest = pristine.clone();
+            mutate(&mut manifest);
+            install(&manifest);
+            let error = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+            assert!(error.contains(expected), "expected '{expected}', got: {error}");
+        }
+
+        // A declared row with a traversal path can never be trusted, whatever its hash claims.
+        let mut traversal = pristine.clone();
+        traversal["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"path": "../evil", "sizeBytes": 1, "sha256": "a".repeat(64)}));
+        install(&traversal);
+        let error = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+        assert!(error.contains("unsafe file path"), "{error}");
+
+        // An on-disk file the manifest never declared is an inexact inventory, not a bonus.
+        install(&pristine);
+        std::fs::write(snap.join("extra.bin"), b"unlisted").unwrap();
+        let unlisted = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+        assert!(unlisted.contains("not exact") && unlisted.contains("extra.bin"), "{unlisted}");
+        std::fs::remove_file(snap.join("extra.bin")).unwrap();
+
+        // A manifest whose inventory verifies but omits the DATABASE is not a recovery artifact.
+        let mut without_db = pristine.clone();
+        without_db["files"].as_array_mut().unwrap().retain(|row| row["path"] != DB_FILE);
+        install(&without_db);
+        std::fs::remove_file(snap.join(DB_FILE)).unwrap();
+        let missing_db = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+        assert!(missing_db.contains("missing required") && missing_db.contains(DB_FILE), "{missing_db}");
+    }
+
+    #[test]
+    fn retention_selector_edges_and_panic_health_accounting() {
+        assert!(select_snapshots_to_keep(&[], 5).is_empty(), "no snapshots means nothing to keep");
+        // keep=0 still keeps the newest through the daily tier — the tiers are additive floors.
+        let kept = select_snapshots_to_keep(&[1000, 2000], 0);
+        assert!(kept.contains(&2000), "the newest snapshot is always tier-protected");
+        assert!(!kept.contains(&1000), "a same-day older snapshot has no tier claim at keep=0");
+        // Duplicate timestamps must not panic or drop the shared value.
+        assert!(select_snapshots_to_keep(&[5000, 5000], 1).contains(&5000));
+
+        // A snapshot-loop panic must surface in health accounting (same shared-static contract as
+        // snapshot_health_tracks_success_and_consecutive_failures above).
+        let before = snapshot_health().consecutive_failures;
+        record_snapshot_panic();
+        assert_eq!(snapshot_health().consecutive_failures, before + 1, "a panic counts as a failure");
+    }
+
+    #[test]
+    fn a_directory_squatting_on_a_config_file_fails_the_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        seed_test_required_snapshot_state(tmp.path()).unwrap();
+        std::fs::remove_file(tmp.path().join("champion.json")).unwrap();
+        std::fs::create_dir(tmp.path().join("champion.json")).unwrap();
+        let error = take_snapshot_at_from(&db, tmp.path(), tmp.path(), 5, 1000).unwrap_err().to_string();
+        assert!(error.contains("not a regular file"), "{error}");
+        assert!(
+            !tmp.path().join("snapshots").join("snapshot_0000001000").exists(),
+            "a directory squatting on config state must never be promoted as absence"
+        );
+    }
 }
 
 #[cfg(test)]

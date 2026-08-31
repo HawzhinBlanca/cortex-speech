@@ -189,3 +189,182 @@ pub(crate) fn validate_restore_target_semantics(db: &crate::db::Database) -> Res
         .map_err(|error| format!("database restore refused: flexible review-pool authority is invalid: {error}"))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_playback_receipt_semantics, validate_restore_target_semantics};
+    use crate::db::Database;
+
+    /// A segment carrying the canonical listening identity: content hash, source span, duration.
+    fn seeded_db(id: &str) -> Database {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: id.to_string(),
+            audio_path: format!("{id}.wav"),
+            raw_transcript: "machine draft".to_string(),
+            duration_ms: 1_000,
+            ..crate::db::SpeechSegment::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_content_hash = ?2,
+                        alignment_json = '{\"source_start_ms\":0,\"source_end_ms\":1000}',
+                        duration_ms = 1000
+                  WHERE id = ?1",
+                rusqlite::params![id, "a".repeat(64)],
+            )
+            .unwrap();
+        db
+    }
+
+    /// A genuine policy-3 receipt minted through the production front door.
+    fn listened(db: &Database, id: &str) {
+        db.record_playback_receipt(&crate::db::PlaybackReceipt {
+            segment_id: id.to_string(),
+            segment_revision: 0,
+            audio_content_hash: "a".repeat(64),
+            reviewer: Some("Reviewer".to_string()),
+            session_id: None,
+            started_at_ms: 1,
+            played_ms: 1_000,
+            clip_duration_ms: 1_000,
+            source_start_ms: None,
+            source_end_ms: None,
+        })
+        .unwrap();
+    }
+
+    /// Restored files can carry receipt rows written with the guards disabled.
+    fn unlock(db: &Database, table: &str) {
+        let names = db
+            .connection()
+            .prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=?1")
+            .unwrap()
+            .query_map([table], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for name in names {
+            db.connection().execute(&format!("DROP TRIGGER \"{name}\""), []).unwrap();
+        }
+        db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+    }
+
+    fn listened_fixture(id: &str) -> Database {
+        let db = seeded_db(id);
+        listened(&db, id);
+        validate_playback_receipt_semantics(&db).expect("a genuine policy-3 receipt must validate first");
+        db
+    }
+
+    #[test]
+    fn a_fresh_database_and_a_genuine_receipt_both_validate_and_the_aggregate_pass_agrees() {
+        let db = listened_fixture("clean-clip");
+        // The aggregate restore-target pass shares this verdict end to end.
+        validate_restore_target_semantics(&db)
+            .expect("a genuine listened clip must be a valid aggregate restore target");
+    }
+
+    #[test]
+    fn receipts_violating_the_canonical_writer_invariants_are_refused() {
+        let cases: [(&str, &str); 5] = [
+            ("negative played time", "UPDATE playback_receipts SET played_ms=-1"),
+            ("coverage disagrees with the integer counters", "UPDATE playback_receipts SET played_ms=1"),
+            ("non-positive clip duration", "UPDATE playback_receipts SET clip_duration_ms=0"),
+            ("unknown policy version", "UPDATE playback_receipts SET policy_version=9"),
+            ("blank segment identity", "UPDATE playback_receipts SET segment_id='   '"),
+        ];
+        for (label, sabotage) in cases {
+            let db = listened_fixture("writer-clip");
+            unlock(&db, "playback_receipts");
+            assert_eq!(db.connection().execute(sabotage, []).unwrap(), 1, "{label}");
+            let error = validate_playback_receipt_semantics(&db).unwrap_err();
+            assert!(error.contains("violates the canonical writer invariants"), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn receipt_identity_must_match_its_retained_segment() {
+        let swapped_hash = format!("UPDATE playback_receipts SET audio_fingerprint='{}'", "b".repeat(64));
+        let cases: [(&str, &str, &str); 6] = [
+            (
+                "receipt points at a missing segment",
+                "UPDATE playback_receipts SET segment_id='ghost'",
+                "points to a missing segment",
+            ),
+            (
+                "receipt claims a future segment revision",
+                "UPDATE playback_receipts SET segment_revision=segment_revision+5",
+                "from a future segment revision",
+            ),
+            (
+                "receipt carries a non-canonical audio identity",
+                "UPDATE playback_receipts SET audio_fingerprint='not-a-hash'",
+                "lacks a canonical decoded-PCM BLAKE3 hash",
+            ),
+            (
+                "receipt loses half its source span",
+                "UPDATE playback_receipts SET source_start_ms=NULL",
+                "invalid source span",
+            ),
+            (
+                "receipt span disagrees with its own decoded duration",
+                "UPDATE playback_receipts SET source_end_ms=source_end_ms+500",
+                "source span disagrees with decoded duration",
+            ),
+            (
+                "receipt hash was swapped for a different valid-looking clip",
+                swapped_hash.as_str(),
+                "disagrees with its retained segment identity",
+            ),
+        ];
+        for (label, sabotage, expected) in cases {
+            let db = listened_fixture("identity-clip");
+            unlock(&db, "playback_receipts");
+            assert_eq!(db.connection().execute(sabotage, []).unwrap(), 1, "{label}");
+            let error = validate_playback_receipt_semantics(&db).unwrap_err();
+            assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
+        }
+
+        // The RETAINED segment's own span must also still answer for its decoded duration.
+        let db = listened_fixture("segment-span-clip");
+        unlock(&db, "speech_segments");
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET alignment_json='{\"source_start_ms\":0,\"source_end_ms\":2000}'
+                  WHERE id='segment-span-clip'",
+                [],
+            )
+            .unwrap();
+        let error = validate_playback_receipt_semantics(&db).unwrap_err();
+        assert!(error.contains("segment source span disagrees with decoded duration"), "{error}");
+    }
+
+    #[test]
+    fn historical_policy_receipts_cannot_claim_policy3_source_spans() {
+        // Policy 1 stored the legacy spectral candidate and predates source spans entirely.
+        let policy1 = listened_fixture("policy1-clip");
+        unlock(&policy1, "playback_receipts");
+        policy1.connection().execute("UPDATE playback_receipts SET policy_version=1", []).unwrap();
+        let error = validate_playback_receipt_semantics(&policy1).unwrap_err();
+        assert!(error.contains("legacy policy-1") && error.contains("claims a policy-3 source span"), "{error}");
+        // Without the span claim, the legacy receipt is preserved as audit evidence.
+        policy1
+            .connection()
+            .execute("UPDATE playback_receipts SET source_start_ms=NULL, source_end_ms=NULL", [])
+            .unwrap();
+        validate_playback_receipt_semantics(&policy1)
+            .expect("a span-free legacy policy-1 receipt is historical evidence, not corruption");
+
+        // Policy 2 stored decoded-PCM BLAKE3 but also predates source-span binding.
+        let policy2 = listened_fixture("policy2-clip");
+        unlock(&policy2, "playback_receipts");
+        policy2.connection().execute("UPDATE playback_receipts SET policy_version=2", []).unwrap();
+        let error = validate_playback_receipt_semantics(&policy2).unwrap_err();
+        assert!(error.contains("historical policy-2") && error.contains("claims a policy-3 source span"), "{error}");
+    }
+}

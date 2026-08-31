@@ -507,3 +507,216 @@ pub(crate) fn has_durable_review_activity(db: &crate::db::Database) -> Result<bo
     }
     Ok(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+
+    fn fresh_db() -> Database {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db
+    }
+
+    fn segment(db: &Database, id: &str) {
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: id.to_string(),
+            audio_path: format!("{id}.wav"),
+            raw_transcript: "machine draft".to_string(),
+            duration_ms: 1_000,
+            ..crate::db::SpeechSegment::default()
+        })
+        .unwrap();
+    }
+
+    /// The production review-event writer refuses segments without a canonical PCM hash and source
+    /// span, so event-recording fixtures need the full paid identity.
+    fn paid_segment(db: &Database, id: &str) {
+        segment(db, id);
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_content_hash = ?2,
+                        alignment_json = '{\"source_start_ms\":0,\"source_end_ms\":1000}',
+                        duration_ms = 1000
+                  WHERE id = ?1",
+                rusqlite::params![id, "a".repeat(64)],
+            )
+            .unwrap();
+    }
+
+    /// A restored file may carry rows written with the schema guards disabled — that is the exact
+    /// state these validators exist for, so corruptions drop the guards first.
+    fn unlock(db: &Database, table: &str) {
+        let names = db
+            .connection()
+            .prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=?1")
+            .unwrap()
+            .query_map([table], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for name in names {
+            db.connection().execute(&format!("DROP TRIGGER \"{name}\""), []).unwrap();
+        }
+        db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+    }
+
+    fn couch_skip(db: &Database, id: &str, index: u64) {
+        let operation = format!("00000000-0000-4000-8000-{index:012x}");
+        db.record_review_event_with_operation(
+            id,
+            "Reviewer",
+            "skip",
+            "couch",
+            i64::try_from(index).unwrap(),
+            &operation,
+            &crate::db::review_operation_payload_hash(id, "skip", "", "Reviewer"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn encoded_row_superset_and_equality_enforce_exact_multiset_semantics() {
+        let columns = || vec!["id".to_string(), "value".to_string()];
+        let row = |bytes: &[u8]| bytes.to_vec();
+
+        // Exact match and true superset both pass; the target may only ADD rows.
+        require_encoded_row_superset("t", columns(), vec![row(b"a")], columns(), vec![row(b"a"), row(b"b")]).unwrap();
+        // Multiset semantics: two identical durable rows need two surviving copies, not one.
+        let error =
+            require_encoded_row_superset("t", columns(), vec![row(b"a"), row(b"a")], columns(), vec![row(b"a")])
+                .unwrap_err();
+        assert!(error.contains("drop or modify 1 durable row"), "{error}");
+        // A changed column set is refused before any row-level comparison can mislead.
+        let error = require_encoded_row_superset("t", columns(), vec![], vec!["id".to_string()], vec![]).unwrap_err();
+        assert!(error.contains("columns do not match"), "{error}");
+
+        // Equality additionally forbids pseudo-legacy additions.
+        require_encoded_row_equality("t", columns(), vec![row(b"a")], columns(), vec![row(b"a")]).unwrap();
+        let error =
+            require_encoded_row_equality("t", columns(), vec![row(b"a")], columns(), vec![row(b"a"), row(b"a")])
+                .unwrap_err();
+        assert!(error.contains("pseudo-legacy additions are forbidden"), "{error}");
+        let error =
+            require_encoded_row_equality("t", columns(), vec![], vec!["other".to_string(), "cols".to_string()], vec![])
+                .unwrap_err();
+        assert!(error.contains("columns do not match"), "{error}");
+    }
+
+    #[test]
+    fn dropping_a_durable_review_row_from_the_target_is_refused() {
+        // Two independently initialized databases are NOT one lineage (installation timestamps in
+        // the policy tables differ), so the target must be an actual copy of the floor — exactly
+        // the snapshot/restore relationship this floor exists for.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let floor_path = tmp.path().join("floor.db");
+        let target_path = tmp.path().join("target.db");
+        let floor = Database::open(floor_path.to_string_lossy().as_ref()).unwrap();
+        floor.initialize().unwrap();
+        floor.backup(&target_path).unwrap();
+        let target = Database::open(target_path.to_string_lossy().as_ref()).unwrap();
+        require_durable_review_history_superset(&floor, &target)
+            .expect("a byte-copied generation satisfies its own review-history floor");
+
+        paid_segment(&floor, "clip");
+        couch_skip(&floor, "clip", 1);
+        let error = require_durable_review_history_superset(&floor, &target).unwrap_err();
+        assert!(
+            error.contains("review_events") && error.contains("drop or modify"),
+            "a target missing a durable review event must be refused: {error}"
+        );
+    }
+
+    #[test]
+    fn consent_withdrawal_is_monotonic_across_restore_generations() {
+        let floor = fresh_db();
+        segment(&floor, "withdrawn");
+        unlock(&floor, "speech_segments");
+        floor
+            .connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_content_hash=?2, rights_revoked_at='2026-08-30T00:00:00Z'
+                  WHERE id=?1",
+                rusqlite::params!["withdrawn", "a".repeat(64)],
+            )
+            .unwrap();
+
+        // A target that FORGETS the withdrawn recording would silently re-permit export elsewhere.
+        let empty_target = fresh_db();
+        let error = require_consent_revocation_superset(&floor, &empty_target).unwrap_err();
+        assert!(error.contains("forget 1"), "{error}");
+
+        // A target carrying the same recording UNREVOKED resurrects the withdrawn voice.
+        let resurrected = fresh_db();
+        segment(&resurrected, "withdrawn");
+        unlock(&resurrected, "speech_segments");
+        resurrected
+            .connection()
+            .execute(
+                "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+                rusqlite::params!["withdrawn", "a".repeat(64)],
+            )
+            .unwrap();
+        let error = require_consent_revocation_superset(&floor, &resurrected).unwrap_err();
+        assert!(error.contains("resurrect 1"), "{error}");
+
+        // Preserving the tombstone (any timestamp) satisfies the monotonic floor.
+        resurrected
+            .connection()
+            .execute("UPDATE speech_segments SET rights_revoked_at='2026-08-31T00:00:00Z' WHERE id='withdrawn'", [])
+            .unwrap();
+        require_consent_revocation_superset(&floor, &resurrected).unwrap();
+
+        // A legacy row without a canonical hash falls back to its exact stored path identity...
+        let legacy_floor = fresh_db();
+        segment(&legacy_floor, "legacy");
+        unlock(&legacy_floor, "speech_segments");
+        legacy_floor
+            .connection()
+            .execute("UPDATE speech_segments SET rights_revoked_at='2026-08-30T00:00:00Z' WHERE id='legacy'", [])
+            .unwrap();
+        let legacy_target = fresh_db();
+        segment(&legacy_target, "legacy"); // same legacy.wav path, not revoked
+        let error = require_consent_revocation_superset(&legacy_floor, &legacy_target).unwrap_err();
+        assert!(error.contains("resurrect 1"), "{error}");
+
+        // ...and a blank legacy identity fails closed instead of pretending it was preserved.
+        legacy_floor.connection().execute("UPDATE speech_segments SET audio_path='   ' WHERE id='legacy'", []).unwrap();
+        let error = require_consent_revocation_superset(&legacy_floor, &legacy_target).unwrap_err();
+        assert!(error.contains("no safe durable identity"), "{error}");
+    }
+
+    #[test]
+    fn durable_review_activity_detection_matches_the_bare_restore_gate() {
+        let db = fresh_db();
+        assert!(!has_durable_review_activity(&db).unwrap(), "a pristine database has no review activity");
+        paid_segment(&db, "clip");
+        assert!(!has_durable_review_activity(&db).unwrap(), "an unreviewed clip is not review activity");
+        couch_skip(&db, "clip", 2);
+        assert!(has_durable_review_activity(&db).unwrap(), "any journaled review action arms the gate");
+
+        // The schema-v60 frontier singleton exists in every pristine database; only a NON-EMPTY
+        // frontier is durable activity.
+        let frontier_db = fresh_db();
+        assert!(!has_durable_review_activity(&frontier_db).unwrap());
+        unlock(&frontier_db, "review_effect_state");
+        frontier_db
+            .connection()
+            .execute("UPDATE review_effect_state SET effective_after_review_event_id=5 WHERE singleton_key=1", [])
+            .unwrap();
+        assert!(has_durable_review_activity(&frontier_db).unwrap());
+
+        // Reviewed truth living only on the segment row itself also counts.
+        let reviewed_db = fresh_db();
+        segment(&reviewed_db, "clip");
+        unlock(&reviewed_db, "speech_segments");
+        reviewed_db
+            .connection()
+            .execute("UPDATE speech_segments SET human_decision='accept' WHERE id='clip'", [])
+            .unwrap();
+        assert!(has_durable_review_activity(&reviewed_db).unwrap());
+    }
+}

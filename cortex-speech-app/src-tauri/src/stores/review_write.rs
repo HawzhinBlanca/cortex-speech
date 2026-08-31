@@ -2184,4 +2184,402 @@ mod tests {
         );
         assert!(evidence.source_blake3.is_some(), "the failure must bind the exact truncated bytes");
     }
+
+    // Windows on this workstation occasionally lets a metadata/read probe race a just-finished
+    // write (repo-documented flake). Wait for a stable observed length before probing.
+    fn settle_written_file(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = None;
+        loop {
+            let length = std::fs::metadata(path).ok().map(|metadata| metadata.len());
+            if length.is_some() && length == last {
+                return;
+            }
+            assert!(Instant::now() < deadline, "written test file never settled: {}", path.display());
+            last = length;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn playback_media_grant_lookup_resolves_only_finalized_policy4_receipts() {
+        let (_directory, store, _runtime, _base_revision, receipt_id, _source_lease) = store_with_listened_clip();
+        assert_eq!(
+            store.desktop_playback_media_grant_id(&receipt_id).unwrap().as_deref(),
+            Some("10000000-0000-4000-8000-000000000001"),
+            "a finalized policy-4 receipt resolves to the exact grant that authorized its session"
+        );
+        assert_eq!(
+            store.desktop_playback_media_grant_id("20000000-0000-4000-8000-00000000dead").unwrap(),
+            None,
+            "an unknown receipt identity resolves to no grant"
+        );
+        assert_eq!(
+            store.desktop_playback_media_grant_id("not-a-receipt").unwrap(),
+            None,
+            "a non-UUID never reaches the database query"
+        );
+    }
+
+    #[test]
+    fn cancel_requires_the_exact_pending_receipt_and_attempt_identity() {
+        let fixture = desktop_playback_fixture();
+        let media_grant_id = "30000000-0000-4000-8000-000000000009";
+        let client_attempt_id = "30000000-0000-4000-8000-00000000000a";
+        let session = fixture.begin(media_grant_id, client_attempt_id);
+
+        let mismatch = fixture
+            .store
+            .cancel_desktop_playback_session_v1(&session.playback_receipt_id, "30000000-0000-4000-8000-00000000000b")
+            .expect_err("a different attempt identity must not retire someone else's pending session");
+        assert!(mismatch.to_string().contains("E_PLAYBACK_CANCEL_IDENTITY_MISMATCH"), "{mismatch}");
+        assert!(desktop_playback_session_exists(&fixture.runtime, &session.playback_receipt_id));
+        assert!(
+            !fixture
+                .store
+                .cancel_desktop_playback_session_v1("30000000-0000-4000-8000-00000000000c", client_attempt_id)
+                .unwrap(),
+            "an unknown receipt cancels nothing"
+        );
+
+        assert!(fixture
+            .store
+            .cancel_desktop_playback_session_v1(&session.playback_receipt_id, client_attempt_id)
+            .unwrap());
+        assert!(!desktop_playback_session_exists(&fixture.runtime, &session.playback_receipt_id));
+        assert!(
+            !fixture.store.cancel_desktop_playback_session_v1(&session.playback_receipt_id, client_attempt_id).unwrap(),
+            "a second cancel of the retired session reports nothing to retire"
+        );
+        assert_eq!(desktop_playback_counts(&fixture.runtime), (0, 0, 0));
+    }
+
+    #[test]
+    fn typed_decision_refuses_unknown_segments_and_stale_revisions_exactly() {
+        let (_directory, store, runtime, base_revision, receipt_id, source_lease) = store_with_listened_clip();
+        let ghost = store
+            .commit_typed_decision_with_source_lease(
+                "ghost",
+                0,
+                "accept",
+                None,
+                &receipt_id,
+                "20000000-0000-4000-8000-0000000000a1",
+                Some(source_lease.clone()),
+            )
+            .expect_err("an unknown segment must fail closed");
+        assert_eq!(ghost.to_string(), "the review segment no longer exists");
+        assert!(matches!(ghost, ReviewCommitError::SegmentNotFound));
+
+        let stale = store
+            .commit_typed_decision_with_source_lease(
+                "clip",
+                base_revision + 7,
+                "accept",
+                None,
+                &receipt_id,
+                "20000000-0000-4000-8000-0000000000a2",
+                Some(source_lease),
+            )
+            .expect_err("a stale base revision must fail closed");
+        assert_eq!(stale.to_string(), format!("the review revision is stale; current revision is {base_revision}"));
+        assert!(
+            matches!(stale, ReviewCommitError::StaleRevision { current_revision } if current_revision == base_revision)
+        );
+        assert_eq!(effect_counts(&runtime), (0, 0));
+    }
+
+    #[test]
+    fn typed_decision_recovers_the_source_after_the_grant_dies_and_replays_exactly() {
+        let (_directory, store, runtime, base_revision, receipt_id, source_lease) = store_with_listened_clip();
+        // The in-memory media grant is gone (renderer restart); only the durable receipt remains.
+        drop(source_lease);
+        let operation_id = "20000000-0000-4000-8000-0000000000a3";
+        let first = store
+            .commit_typed_decision("clip", base_revision, "accept", Some("دەق"), &receipt_id, operation_id)
+            .expect("a durable finalized receipt must recover its source identity and commit");
+        assert_eq!(effect_counts(&runtime), (1, 0));
+        {
+            let database = runtime.lock().unwrap();
+            let row = database.get_segment_by_id("clip").unwrap().unwrap();
+            assert_eq!(row.human_decision.as_deref(), Some("accept"));
+        }
+        let replay = store
+            .commit_typed_decision("clip", base_revision, "accept", Some("دەق"), &receipt_id, operation_id)
+            .expect("the exact operation must replay, not re-execute");
+        assert_eq!(replay.effect_event_id, first.effect_event_id);
+        assert_eq!(replay.decided_revision, first.decided_revision);
+        assert_eq!(effect_counts(&runtime), (1, 0));
+    }
+
+    #[test]
+    fn typed_decision_refuses_a_receipt_that_does_not_bind_the_attempt() {
+        let (_directory, store, runtime, base_revision, _receipt_id, source_lease) = store_with_listened_clip();
+        let foreign_receipt = "20000000-0000-4000-8000-0000000000b1";
+
+        let recovery_error = store
+            .commit_typed_decision(
+                "clip",
+                base_revision,
+                "accept",
+                None,
+                foreign_receipt,
+                "20000000-0000-4000-8000-0000000000b2",
+            )
+            .expect_err("recovery must refuse a receipt that never bound this segment");
+        assert!(recovery_error.to_string().contains(PLAYBACK_EVIDENCE_CHANGED), "{recovery_error}");
+        assert!(
+            recovery_error.to_string().contains("no longer resolves to the current segment source"),
+            "{recovery_error}"
+        );
+
+        let bound_error = store
+            .commit_typed_decision_with_source_lease(
+                "clip",
+                base_revision,
+                "accept",
+                None,
+                foreign_receipt,
+                "20000000-0000-4000-8000-0000000000b3",
+                Some(source_lease),
+            )
+            .expect_err("a verified source lease cannot substitute for the exact policy-4 receipt");
+        assert!(bound_error.to_string().contains("E_NO_PLAYBACK_EVIDENCE"), "{bound_error}");
+        assert!(bound_error.to_string().contains(foreign_receipt), "{bound_error}");
+        assert_eq!(effect_counts(&runtime), (0, 0));
+        let database = runtime.lock().unwrap();
+        let row = database.get_segment_by_id("clip").unwrap().unwrap();
+        assert!(row.human_decision.is_none() && !row.verified);
+    }
+
+    #[test]
+    fn require_listened_names_each_missing_precondition_exactly() {
+        let (_directory, _store, runtime) = store_with_clip();
+        let database = runtime.lock().unwrap();
+        database
+            .insert_segment(&SpeechSegment {
+                id: "no-hash".into(),
+                audio_path: "unused-no-hash.wav".into(),
+                raw_transcript: "دەق".into(),
+                duration_ms: 1_000,
+                ..SpeechSegment::default()
+            })
+            .unwrap();
+        let no_hash = require_listened(&database, "no-hash").unwrap_err();
+        assert!(no_hash.to_string().contains("E_NO_AUDIO_CONTENT_HASH"), "{no_hash}");
+
+        database
+            .insert_segment(&SpeechSegment {
+                id: "no-span".into(),
+                audio_path: "unused-no-span.wav".into(),
+                raw_transcript: "دەق".into(),
+                duration_ms: 1_000,
+                ..SpeechSegment::default()
+            })
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+                rusqlite::params!["no-span", "b".repeat(64)],
+            )
+            .unwrap();
+        let no_span = require_listened(&database, "no-span").unwrap_err();
+        assert!(no_span.to_string().contains("E_NO_AUDIO_SOURCE_SPAN"), "{no_span}");
+
+        let unheard = require_listened(&database, "clip").unwrap_err();
+        assert!(unheard.to_string().contains("E_NO_PLAYBACK_EVIDENCE"), "{unheard}");
+    }
+
+    #[test]
+    fn legacy_decision_commits_with_receipt_evidence_and_replays_exactly() {
+        let (_directory, store, runtime) = store_with_clip();
+        {
+            let database = runtime.lock().unwrap();
+            let audio_content_hash = database.segment_audio_content_hash("clip").unwrap().unwrap();
+            let revision = database.segment_review_revision("clip").unwrap().unwrap_or(0);
+            database
+                .record_playback_receipt(&PlaybackReceipt {
+                    segment_id: "clip".into(),
+                    segment_revision: revision,
+                    audio_content_hash,
+                    reviewer: None,
+                    session_id: None,
+                    started_at_ms: 1,
+                    played_ms: 10_000,
+                    clip_duration_ms: 10_000,
+                    source_start_ms: None,
+                    source_end_ms: None,
+                })
+                .unwrap();
+        }
+        let operation_id = "20000000-0000-4000-8000-0000000000c1";
+        let first = store
+            .commit_legacy_decision("clip", "accept", None, Some(1_700_000_000_777), operation_id)
+            .expect("full canonical traversal must satisfy the legacy preflight");
+        let replay =
+            store.commit_legacy_decision("clip", "accept", None, Some(1_700_000_000_777), operation_id).unwrap();
+        assert_eq!(replay.effect_event_id, first.effect_event_id);
+        assert_eq!(effect_counts(&runtime), (1, 0));
+        let database = runtime.lock().unwrap();
+        let row = database.get_segment_by_id("clip").unwrap().unwrap();
+        assert_eq!(row.human_decision.as_deref(), Some("accept"));
+    }
+
+    #[test]
+    fn technical_unusable_refuses_unknown_stale_and_reviewed_segments_before_probing() {
+        let (_directory, store, runtime) = store_with_clip();
+        let ghost = store
+            .mark_technically_unusable("ghost", 0, "decodeFailed", "20000000-0000-4000-8000-0000000000d1")
+            .expect_err("an unknown segment must fail before any probe");
+        assert_eq!(ghost.to_string(), "the review segment no longer exists");
+        assert!(matches!(ghost, TechnicalUnusableCommitError::SegmentNotFound));
+
+        let base_revision = runtime.lock().unwrap().segment_review_revision("clip").unwrap().unwrap();
+        let stale = store
+            .mark_technically_unusable(
+                "clip",
+                base_revision + 3,
+                "decodeFailed",
+                "20000000-0000-4000-8000-0000000000d2",
+            )
+            .expect_err("a stale base revision must fail before any probe");
+        assert!(matches!(
+            stale,
+            TechnicalUnusableCommitError::StaleRevision { current_revision } if current_revision == base_revision
+        ));
+
+        runtime
+            .lock()
+            .unwrap()
+            .connection()
+            .execute("UPDATE speech_segments SET human_decision='accept' WHERE id='clip'", [])
+            .unwrap();
+        let reviewed_revision = runtime.lock().unwrap().segment_review_revision("clip").unwrap().unwrap();
+        let reviewed = store
+            .mark_technically_unusable(
+                "clip",
+                reviewed_revision,
+                "decodeFailed",
+                "20000000-0000-4000-8000-0000000000d3",
+            )
+            .expect_err("existing human transcript truth must never be overwritten by a technical flag");
+        assert_eq!(reviewed.to_string(), "the segment already has human transcript truth");
+        assert!(matches!(reviewed, TechnicalUnusableCommitError::AlreadyHumanReviewed));
+        assert_eq!(effect_counts(&runtime), (0, 0));
+    }
+
+    #[test]
+    fn technical_unusable_reports_the_observed_healthy_verdict_exactly() {
+        let _probe_test = lock_technical_probe_tests();
+        let (directory, store, runtime) = store_with_clip();
+        let source = directory.path().join("clip.wav");
+        write_wav(&source, 16_000, 16_000);
+        settle_written_file(&source);
+        let base_revision = runtime.lock().unwrap().segment_review_revision("clip").unwrap().unwrap();
+        let error = store
+            .mark_technically_unusable("clip", base_revision, "decodeFailed", "20000000-0000-4000-8000-0000000000d4")
+            .expect_err("healthy audio must never mint technical-failure truth");
+        assert_eq!(
+            error.to_string(),
+            "the declared audio failure was not reproduced (declared decodeFailed, observed healthy)"
+        );
+        let TechnicalUnusableCommitError::FailureNotReproduced { declared_reason, observed } = error else {
+            panic!("expected FailureNotReproduced");
+        };
+        assert_eq!(declared_reason, "decodeFailed");
+        assert_eq!(observed, "healthy");
+        assert_eq!(effect_counts(&runtime), (0, 0));
+    }
+
+    #[test]
+    fn technical_unusable_commit_maps_late_stale_and_reviewed_cas_refusals() {
+        let _probe_test = lock_technical_probe_tests();
+        // A generic flag that lands between the probe and the commit must stale the technical CAS.
+        let (directory, store, runtime) = store_with_clip();
+        std::fs::write(directory.path().join("clip.wav"), b"not an audio container").unwrap();
+        settle_written_file(&directory.path().join("clip.wav"));
+        let base_revision = runtime.lock().unwrap().segment_review_revision("clip").unwrap().unwrap();
+        let flag_store = store.clone();
+        let stale = store
+            .mark_technically_unusable_after_probe(
+                "clip",
+                base_revision,
+                "corruptContainer",
+                "20000000-0000-4000-8000-0000000000e1",
+                move || {
+                    flag_store
+                        .record_flag("clip", base_revision, "raced flag", "20000000-0000-4000-8000-0000000000e2")
+                        .unwrap();
+                },
+            )
+            .expect_err("review truth that advanced after the probe must stale the technical commit");
+        assert!(matches!(
+            stale,
+            TechnicalUnusableCommitError::StaleRevision { current_revision } if current_revision == base_revision + 1
+        ));
+        assert_eq!(effect_counts(&runtime), (0, 1), "only the racing generic flag may exist");
+
+        // Human truth that lands at the SAME revision must hit the commit-side reviewed refusal.
+        let (directory, store, runtime) = store_with_clip();
+        std::fs::write(directory.path().join("clip.wav"), b"still not an audio container").unwrap();
+        settle_written_file(&directory.path().join("clip.wav"));
+        let base_revision = runtime.lock().unwrap().segment_review_revision("clip").unwrap().unwrap();
+        let update_runtime = runtime.clone();
+        let reviewed = store
+            .mark_technically_unusable_after_probe(
+                "clip",
+                base_revision,
+                "corruptContainer",
+                "20000000-0000-4000-8000-0000000000e3",
+                move || {
+                    let database = update_runtime.lock().unwrap();
+                    database.connection().execute_batch("DROP TRIGGER speech_segments_review_revision;").unwrap();
+                    database
+                        .connection()
+                        .execute("UPDATE speech_segments SET human_decision='accept' WHERE id='clip'", [])
+                        .unwrap();
+                },
+            )
+            .expect_err("human truth landing after the probe must refuse the technical commit");
+        assert!(matches!(reviewed, TechnicalUnusableCommitError::AlreadyHumanReviewed));
+        assert_eq!(effect_counts(&runtime), (0, 0));
+    }
+
+    #[test]
+    fn desktop_flag_undo_uses_only_the_immutable_effect_identity() {
+        let (_directory, store, runtime) = store_with_clip();
+        let base_revision = runtime.lock().unwrap().segment_review_revision("clip").unwrap().unwrap();
+        let flag = store
+            .record_flag("clip", base_revision, "Needs another listen", "20000000-0000-4000-8000-0000000000f1")
+            .unwrap();
+        let DesktopReviewUndoAvailability::Available(DesktopReviewUndoAuthority::Flag(authority)) =
+            store.desktop_review_undo_availability().unwrap()
+        else {
+            panic!("an active flag must expose typed flag-undo authority");
+        };
+        assert_eq!(authority.effect_event_id, flag.effect_event_id);
+
+        let undo_operation = "20000000-0000-4000-8000-0000000000f2";
+        assert!(matches!(
+            store.undo_latest_desktop_review_flag(&authority, undo_operation).unwrap(),
+            HumanFlagUndoOutcome::Applied { .. }
+        ));
+        assert!(matches!(
+            store.undo_latest_desktop_review_flag(&authority, undo_operation).unwrap(),
+            HumanFlagUndoOutcome::AlreadyApplied
+        ));
+        let database = runtime.lock().unwrap();
+        let (effects, reversals): (i64, i64) = database
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM review_flag_effect_events),
+                    (SELECT COUNT(*) FROM review_flag_effect_reversals)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((effects, reversals), (1, 1));
+    }
 }

@@ -3108,4 +3108,613 @@ mod tests {
         let error = database.validate_batch_job_authority_v1().unwrap_err().to_string();
         assert!(error.contains(BATCH_EVIDENCE_ERROR), "{error}");
     }
+
+    /// Put the connection into the state a RESTORED/CORRUPTED file can arrive in: every trigger on
+    /// the named tables dropped and CHECK constraints ignored. The validators under test exist
+    /// precisely because bytes written elsewhere never ran these guards.
+    fn unlock_tables(database: &Database, tables: &[&str]) {
+        for table in tables {
+            let names = database
+                .connection()
+                .prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=?1")
+                .unwrap()
+                .query_map([table], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            for name in names {
+                database.connection().execute(&format!("DROP TRIGGER \"{name}\""), []).unwrap();
+            }
+        }
+        database.connection().execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
+    }
+
+    #[test]
+    fn admission_argument_validation_fails_closed_before_any_write() {
+        let database = fixture(&["s1"]);
+        let bad_uuid = database.admit_batch_job_v1(
+            "not-a-uuid",
+            BatchJobKindV1::Normalize,
+            &ids(&["s1"]),
+            CONFIG_SHA,
+            &executor(),
+        );
+        assert!(bad_uuid.unwrap_err().to_string().contains("canonical UUID"));
+        let upper_uuid = database.admit_batch_job_v1(
+            "10000000-0000-4000-8000-00000000000A",
+            BatchJobKindV1::Normalize,
+            &ids(&["s1"]),
+            CONFIG_SHA,
+            &executor(),
+        );
+        assert!(upper_uuid.unwrap_err().to_string().contains("lowercase hyphenated"));
+        let bad_config = database.admit_batch_job_v1(
+            "10000000-0000-4000-8000-00000000000a",
+            BatchJobKindV1::Normalize,
+            &ids(&["s1"]),
+            "NOT-A-SHA",
+            &executor(),
+        );
+        assert!(bad_config.unwrap_err().to_string().contains("canonical lowercase SHA-256"));
+        let bad_git = BatchExecutorIdentityV1 { git_sha: "abc".into(), ..executor() };
+        let git_error = database.admit_batch_job_v1(
+            "10000000-0000-4000-8000-00000000000a",
+            BatchJobKindV1::Normalize,
+            &ids(&["s1"]),
+            CONFIG_SHA,
+            &bad_git,
+        );
+        assert!(git_error.unwrap_err().to_string().contains("40 lowercase hexadecimal"));
+        let bad_token = BatchExecutorIdentityV1 { token_sha256: "zz".into(), ..executor() };
+        let token_error = database.admit_batch_job_v1(
+            "10000000-0000-4000-8000-00000000000a",
+            BatchJobKindV1::Normalize,
+            &ids(&["s1"]),
+            CONFIG_SHA,
+            &bad_token,
+        );
+        assert!(token_error.unwrap_err().to_string().contains("canonical lowercase SHA-256"));
+        let zero_generation = BatchExecutorIdentityV1 { attempt_generation: 0, ..executor() };
+        let generation_error = database.admit_batch_job_v1(
+            "10000000-0000-4000-8000-00000000000a",
+            BatchJobKindV1::Normalize,
+            &ids(&["s1"]),
+            CONFIG_SHA,
+            &zero_generation,
+        );
+        assert!(generation_error.unwrap_err().to_string().contains("must be positive"));
+        let empty = database.admit_batch_job_v1(
+            "10000000-0000-4000-8000-00000000000a",
+            BatchJobKindV1::Normalize,
+            &[],
+            CONFIG_SHA,
+            &executor(),
+        );
+        assert!(empty.unwrap_err().to_string().contains("between 1 and"));
+        let blank_id = database.admit_batch_job_v1(
+            "10000000-0000-4000-8000-00000000000a",
+            BatchJobKindV1::Normalize,
+            &ids(&[""]),
+            CONFIG_SHA,
+            &executor(),
+        );
+        assert!(blank_id.is_err(), "a blank segment identifier must be refused");
+
+        // Cursor and status/read argument validation on the read side.
+        assert!(database.get_batch_job_status_v1("not-a-uuid").is_err());
+        let missing_page =
+            database.pending_batch_item_page_v1("10000000-0000-4000-8000-00000000000a", None).unwrap_err().to_string();
+        assert!(missing_page.contains("does not exist"), "{missing_page}");
+        // A negative cursor is refused before the header is even read.
+        let negative = database.pending_batch_item_page_v1("10000000-0000-4000-8000-00000000000a", Some(-1));
+        assert!(negative.unwrap_err().to_string().contains("pending-item cursor"));
+
+        // None of the refusals may have published anything durable.
+        let jobs: i64 = database.connection().query_row("SELECT count(*) FROM jobs", [], |row| row.get(0)).unwrap();
+        assert_eq!(jobs, 0, "argument refusals must never leave a header behind");
+    }
+
+    #[test]
+    fn pre_v68_schema_is_refused_by_every_batch_entry_point() {
+        let database = Database::open(":memory:").unwrap();
+        database.initialize().unwrap();
+        let head = crate::migrations::max_supported_version();
+        let expected: Vec<i64> = (68..=head).rev().collect();
+        assert_eq!(crate::migrations::rollback(&database, expected.len()).unwrap(), expected);
+        assert_eq!(crate::migrations::get_current_version(&database).unwrap(), 67);
+
+        let operation_id = "70000000-0000-4000-8000-000000000001";
+        for error in [
+            database
+                .admit_batch_job_v1(operation_id, BatchJobKindV1::Normalize, &ids(&["s1"]), CONFIG_SHA, &executor())
+                .unwrap_err(),
+            database.get_batch_job_status_v1(operation_id).unwrap_err(),
+            database.pending_batch_item_page_v1(operation_id, None).unwrap_err(),
+            database.active_batch_job_v1().unwrap_err(),
+            database.validate_batch_job_authority_v1().unwrap_err(),
+        ] {
+            let message = error.to_string();
+            assert!(message.contains("requires schema 68"), "{message}");
+        }
+        // The connection-level startup form is deliberately a no-op below v68: those files have no
+        // batch journal to validate, and refusing them would block every legacy restore.
+        validate_batch_job_authority_on(database.connection()).unwrap();
+    }
+
+    #[test]
+    fn forged_header_lifecycle_or_progress_is_refused_at_the_status_reader() {
+        let cases: [(&str, &str); 10] = [
+            ("UPDATE jobs SET total=0", "header progress disagrees"),
+            ("UPDATE jobs SET total=3", "header progress disagrees"),
+            ("UPDATE jobs SET progress=0.75", "header progress disagrees"),
+            ("UPDATE jobs SET completed=1", "header progress disagrees"),
+            ("UPDATE jobs SET state='queued'", "lifecycle residue"),
+            ("UPDATE jobs SET started_at=NULL", "invalid lifecycle fields"),
+            ("UPDATE jobs SET state='succeeded',finished_at='2026-08-30T00:00:00Z'", "contradicts item evidence"),
+            (
+                "UPDATE jobs SET state='failed',finished_at='2026-08-30T00:00:00Z',error_code='X'",
+                "contradicts item evidence",
+            ),
+            (
+                "UPDATE jobs SET state='cancelled',finished_at='2026-08-30T00:00:00Z',error_code='X'",
+                "contradicts item evidence",
+            ),
+            ("UPDATE jobs SET state='bogus'", "unknown batch state"),
+        ];
+        for (sabotage, expected) in cases {
+            let database = fixture(&["s1", "s2"]);
+            let operation_id = "71000000-0000-4000-8000-000000000001";
+            database
+                .admit_batch_job_v1(
+                    operation_id,
+                    BatchJobKindV1::Normalize,
+                    &ids(&["s1", "s2"]),
+                    CONFIG_SHA,
+                    &executor(),
+                )
+                .unwrap();
+            unlock_tables(&database, &["jobs"]);
+            assert_eq!(database.connection().execute(sabotage, []).unwrap(), 1, "{sabotage}");
+            let error = database.get_batch_job_status_v1(operation_id).unwrap_err().to_string();
+            assert!(error.contains(expected), "{sabotage}: expected '{expected}', got: {error}");
+        }
+    }
+
+    #[test]
+    fn forged_payload_authority_is_refused() {
+        // Replace the stored payload with `replacement(stored)` and read the job's status back.
+        let forge = |replacement: &dyn Fn(&str) -> String| -> String {
+            let database = fixture(&["s1"]);
+            let operation_id = "72000000-0000-4000-8000-000000000001";
+            database
+                .admit_batch_job_v1(operation_id, BatchJobKindV1::Normalize, &ids(&["s1"]), CONFIG_SHA, &executor())
+                .unwrap();
+            unlock_tables(&database, &["jobs"]);
+            let stored: String = database
+                .connection()
+                .query_row("SELECT payload_json FROM jobs WHERE id=?1", [operation_id], |row| row.get(0))
+                .unwrap();
+            database
+                .connection()
+                .execute("UPDATE jobs SET payload_json=?2 WHERE id=?1", params![operation_id, replacement(&stored)])
+                .unwrap();
+            database.get_batch_job_status_v1(operation_id).unwrap_err().to_string()
+        };
+        // Re-serializing through the typed struct keeps the canonical field order, so each case
+        // reaches exactly the semantic check it corrupts rather than the canonical-form guard.
+        fn retyped(stored: &str, mutate: impl FnOnce(&mut BatchJobPayloadV1)) -> String {
+            let mut payload: BatchJobPayloadV1 = serde_json::from_str(stored).unwrap();
+            mutate(&mut payload);
+            canonical_json(&payload).unwrap()
+        }
+
+        let undecodable = forge(&|_| "{}".to_string());
+        assert!(undecodable.contains("cannot be decoded"), "{undecodable}");
+        let pretty = forge(&|stored| {
+            let payload: serde_json::Value = serde_json::from_str(stored).unwrap();
+            serde_json::to_string_pretty(&payload).unwrap()
+        });
+        assert!(pretty.contains("not in canonical typed JSON form"), "{pretty}");
+        let wrong_operation = forge(&|stored| {
+            retyped(stored, |payload| payload.operation_id = "99999999-0000-4000-8000-000000000009".into())
+        });
+        assert!(wrong_operation.contains("disagrees with its header"), "{wrong_operation}");
+        let wrong_schema = forge(&|stored| retyped(stored, |payload| payload.schema = 2));
+        assert!(wrong_schema.contains("disagrees with its header"), "{wrong_schema}");
+        let zero_generation = forge(&|stored| retyped(stored, |payload| payload.attempt_generation = 0));
+        assert!(zero_generation.contains("disagrees with its header"), "{zero_generation}");
+        let bad_request_hash = forge(&|stored| retyped(stored, |payload| payload.request_sha256 = "XYZ".into()));
+        assert!(bad_request_hash.contains("canonical lowercase SHA-256"), "{bad_request_hash}");
+        let bad_git_sha = forge(&|stored| retyped(stored, |payload| payload.executor_git_sha = "short".into()));
+        assert!(bad_git_sha.contains("40 lowercase hexadecimal"), "{bad_git_sha}");
+    }
+
+    #[test]
+    fn executor_identity_must_be_wellformed_before_ownership_is_even_compared() {
+        let database = fixture(&["s1"]);
+        let operation_id = "73000000-0000-4000-8000-000000000001";
+        database
+            .admit_batch_job_v1(operation_id, BatchJobKindV1::Normalize, &ids(&["s1"]), CONFIG_SHA, &executor())
+            .unwrap();
+        let bad_git = BatchExecutorIdentityV1 { git_sha: "oops".into(), ..executor() };
+        let git_error = database
+            .commit_batch_normalization_v1(operation_id, 0, "text", "normalizer-v1", &bad_git)
+            .unwrap_err()
+            .to_string();
+        assert!(git_error.contains("40 lowercase hexadecimal"), "{git_error}");
+        let bad_token = BatchExecutorIdentityV1 { token_sha256: "oops".into(), ..executor() };
+        let token_error = database
+            .commit_batch_normalization_v1(operation_id, 0, "text", "normalizer-v1", &bad_token)
+            .unwrap_err()
+            .to_string();
+        assert!(token_error.contains("canonical lowercase SHA-256"), "{token_error}");
+        let zero = BatchExecutorIdentityV1 { attempt_generation: 0, ..executor() };
+        let zero_error = database
+            .commit_batch_normalization_v1(operation_id, 0, "text", "normalizer-v1", &zero)
+            .unwrap_err()
+            .to_string();
+        assert!(zero_error.contains("must be positive"), "{zero_error}");
+        // Malformed identities were refused before comparison — nothing landed, nothing terminalized.
+        let status = database.get_batch_job_status_v1(operation_id).unwrap().unwrap();
+        assert_eq!(status.counts.pending, 1);
+    }
+
+    #[test]
+    fn conflict_skips_cover_missing_segment_changed_source_and_changed_projection() {
+        // BATCH_SEGMENT_MISSING: the segment vanished between admission and commit.
+        let missing_db = fixture(&["gone"]);
+        let missing_id = "74000000-0000-4000-8000-000000000001";
+        missing_db
+            .admit_batch_job_v1(missing_id, BatchJobKindV1::Normalize, &ids(&["gone"]), CONFIG_SHA, &executor())
+            .unwrap();
+        unlock_tables(&missing_db, &["speech_segments"]);
+        missing_db.connection().execute("DELETE FROM speech_segments WHERE id='gone'", []).unwrap();
+        let outcome =
+            missing_db.commit_batch_normalization_v1(missing_id, 0, "text", "normalizer-v1", &executor()).unwrap();
+        assert_eq!(outcome, BatchItemCommitOutcomeV1::Skipped { code: "BATCH_SEGMENT_MISSING".into() });
+
+        // BATCH_SOURCE_CHANGED: the audio identity moved out from under the admitted projection.
+        let moved_db = fixture(&["moved"]);
+        let moved_id = "74000000-0000-4000-8000-000000000002";
+        moved_db
+            .admit_batch_job_v1(moved_id, BatchJobKindV1::Normalize, &ids(&["moved"]), CONFIG_SHA, &executor())
+            .unwrap();
+        moved_db
+            .connection()
+            .execute("UPDATE speech_segments SET audio_path='C:/audio/elsewhere.wav' WHERE id='moved'", [])
+            .unwrap();
+        let outcome =
+            moved_db.commit_batch_normalization_v1(moved_id, 0, "text", "normalizer-v1", &executor()).unwrap();
+        assert_eq!(outcome, BatchItemCommitOutcomeV1::Skipped { code: "BATCH_SOURCE_CHANGED".into() });
+        let untouched: Option<String> = moved_db
+            .connection()
+            .query_row("SELECT normalized_transcript FROM speech_segments WHERE id='moved'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(untouched, None, "a source conflict must never write");
+
+        // BATCH_PROJECTION_CHANGED: same source identity and revision, but the hypothesis authority
+        // grew — the projection hash is the only guard that can see it.
+        let hypo_db = fixture(&["hypo"]);
+        let hypo_id = "74000000-0000-4000-8000-000000000003";
+        hypo_db
+            .admit_batch_job_v1(hypo_id, BatchJobKindV1::Normalize, &ids(&["hypo"]), CONFIG_SHA, &executor())
+            .unwrap();
+        hypo_db
+            .insert_hypothesis(&SegmentHypothesis {
+                segment_id: "hypo".into(),
+                model_id: "late-model".into(),
+                transcript: "late vote".into(),
+                confidence: None,
+            })
+            .unwrap();
+        let revision: i64 = hypo_db
+            .connection()
+            .query_row("SELECT review_revision FROM speech_segments WHERE id='hypo'", [], |row| row.get(0))
+            .unwrap();
+        let base: i64 = hypo_db
+            .connection()
+            .query_row("SELECT base_revision FROM batch_job_items_v1 WHERE job_id=?1", [hypo_id], |row| row.get(0))
+            .unwrap();
+        let outcome = hypo_db.commit_batch_normalization_v1(hypo_id, 0, "text", "normalizer-v1", &executor()).unwrap();
+        if revision == base {
+            assert_eq!(outcome, BatchItemCommitOutcomeV1::Skipped { code: "BATCH_PROJECTION_CHANGED".into() });
+        } else {
+            // If hypothesis writes advance segment authority in this schema, the revision guard is
+            // the one that legitimately fires first; either way the stale write must be refused.
+            assert_eq!(outcome, BatchItemCommitOutcomeV1::Skipped { code: "BATCH_REVISION_CHANGED".into() });
+        }
+    }
+
+    #[test]
+    fn terminal_item_retries_report_already_terminal_and_divergent_retries_are_refused() {
+        let database = fixture(&["s1", "s2"]);
+        let operation_id = "75000000-0000-4000-8000-000000000001";
+        database
+            .admit_batch_job_v1(operation_id, BatchJobKindV1::Normalize, &ids(&["s1", "s2"]), CONFIG_SHA, &executor())
+            .unwrap();
+        database.commit_batch_normalization_v1(operation_id, 0, "one", "normalizer-v1", &executor()).unwrap();
+        // A retry carrying a DIFFERENT payload is not idempotent replay — it is a contradiction.
+        let divergent_text = database
+            .commit_batch_normalization_v1(operation_id, 0, "two", "normalizer-v1", &executor())
+            .unwrap_err()
+            .to_string();
+        assert!(divergent_text.contains("disagrees with the already-applied durable result"), "{divergent_text}");
+        let divergent_version = database
+            .commit_batch_normalization_v1(operation_id, 0, "one", "normalizer-v2", &executor())
+            .unwrap_err()
+            .to_string();
+        assert!(divergent_version.contains("disagrees with the already-applied durable result"), "{divergent_version}");
+
+        // A skipped item replays as AlreadyTerminal with its durable code, whatever the payload.
+        database.connection().execute("UPDATE speech_segments SET verified=1 WHERE id='s2'", []).unwrap();
+        database.commit_batch_normalization_v1(operation_id, 1, "text", "normalizer-v1", &executor()).unwrap();
+        let replay =
+            database.commit_batch_normalization_v1(operation_id, 1, "other", "normalizer-v1", &executor()).unwrap();
+        assert_eq!(
+            replay,
+            BatchItemCommitOutcomeV1::AlreadyTerminal {
+                state: BatchItemStateV1::Skipped,
+                code: Some("BATCH_HUMAN_OWNED".into()),
+            }
+        );
+
+        // The champion path has the same retry contract.
+        let champion_db = fixture(&["c1"]);
+        insert_champion(&champion_db);
+        let champion_id = "75000000-0000-4000-8000-000000000002";
+        champion_db
+            .admit_batch_job_v1(champion_id, BatchJobKindV1::Transcribe, &ids(&["c1"]), CONFIG_SHA, &executor())
+            .unwrap();
+        let draft = BatchChampionDraftV1 {
+            raw_transcript: "champion text".into(),
+            normalized_transcript: None,
+            confidence: Some(0.9),
+            confidence_source: Some("posterior".into()),
+            model_version_id: "champion-v1".into(),
+            deployment_sha256: DEPLOYMENT_SHA.into(),
+            cloud_call: false,
+            normalizer_version: None,
+        };
+        champion_db.commit_batch_champion_draft_v1(champion_id, 0, &draft, &executor()).unwrap();
+        let same = champion_db.commit_batch_champion_draft_v1(champion_id, 0, &draft, &executor()).unwrap();
+        assert!(matches!(same, BatchItemCommitOutcomeV1::AlreadyApplied { .. }));
+        let divergent = BatchChampionDraftV1 { raw_transcript: "different text".into(), ..draft };
+        let error = champion_db
+            .commit_batch_champion_draft_v1(champion_id, 0, &divergent, &executor())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("disagrees with the already-applied durable result"), "{error}");
+    }
+
+    #[test]
+    fn wrong_kind_or_absent_operation_and_ordinal_are_refused() {
+        let database = fixture(&["s1"]);
+        insert_champion(&database);
+        let transcribe_id = "76000000-0000-4000-8000-000000000001";
+        database
+            .admit_batch_job_v1(transcribe_id, BatchJobKindV1::Transcribe, &ids(&["s1"]), CONFIG_SHA, &executor())
+            .unwrap();
+        let kind_error = database
+            .commit_batch_normalization_v1(transcribe_id, 0, "text", "normalizer-v1", &executor())
+            .unwrap_err()
+            .to_string();
+        assert!(kind_error.contains("not a normalize job"), "{kind_error}");
+        let draft = BatchChampionDraftV1 {
+            raw_transcript: "text".into(),
+            normalized_transcript: None,
+            confidence: None,
+            confidence_source: None,
+            model_version_id: "champion-v1".into(),
+            deployment_sha256: DEPLOYMENT_SHA.into(),
+            cloud_call: false,
+            normalizer_version: None,
+        };
+        let absent_operation = database
+            .commit_batch_champion_draft_v1("76000000-0000-4000-8000-00000000ffff", 0, &draft, &executor())
+            .unwrap_err()
+            .to_string();
+        assert!(absent_operation.contains("does not exist"), "{absent_operation}");
+        let absent_ordinal =
+            database.commit_batch_champion_draft_v1(transcribe_id, 5, &draft, &executor()).unwrap_err().to_string();
+        assert!(absent_ordinal.contains("ordinal does not exist"), "{absent_ordinal}");
+
+        let normalize_db = fixture(&["n1"]);
+        let normalize_id = "76000000-0000-4000-8000-000000000002";
+        normalize_db
+            .admit_batch_job_v1(normalize_id, BatchJobKindV1::Normalize, &ids(&["n1"]), CONFIG_SHA, &executor())
+            .unwrap();
+        let champion_error =
+            normalize_db.commit_batch_champion_draft_v1(normalize_id, 0, &draft, &executor()).unwrap_err().to_string();
+        assert!(champion_error.contains("not a transcribe job"), "{champion_error}");
+    }
+
+    #[test]
+    fn champion_draft_field_validation_fails_closed() {
+        let database = fixture(&["s1"]);
+        insert_champion(&database);
+        let operation_id = "77000000-0000-4000-8000-000000000001";
+        database
+            .admit_batch_job_v1(operation_id, BatchJobKindV1::Transcribe, &ids(&["s1"]), CONFIG_SHA, &executor())
+            .unwrap();
+        let valid = BatchChampionDraftV1 {
+            raw_transcript: "real transcript".into(),
+            normalized_transcript: Some("real transcript".into()),
+            confidence: Some(0.5),
+            confidence_source: Some("posterior".into()),
+            model_version_id: "champion-v1".into(),
+            deployment_sha256: DEPLOYMENT_SHA.into(),
+            cloud_call: false,
+            normalizer_version: Some("normalizer-v1".into()),
+        };
+        let cases: Vec<(&str, BatchChampionDraftV1, &str)> = vec![
+            (
+                "blank transcript",
+                BatchChampionDraftV1 { raw_transcript: "   ".into(), ..valid.clone() },
+                "blank ASR transcript",
+            ),
+            (
+                "placeholder transcript",
+                BatchChampionDraftV1 { raw_transcript: "[Pending WSL 7B ASR]".into(), ..valid.clone() },
+                "placeholder",
+            ),
+            (
+                "invalid deployment hash",
+                BatchChampionDraftV1 { deployment_sha256: "nope".into(), ..valid.clone() },
+                "champion deployment hash",
+            ),
+            (
+                "normalized text without a normalizer version",
+                BatchChampionDraftV1 { normalizer_version: None, ..valid.clone() },
+                "both be present or both be absent",
+            ),
+            (
+                "blank normalizer version",
+                BatchChampionDraftV1 { normalizer_version: Some("  ".into()), ..valid.clone() },
+                "normalizer version must not be blank",
+            ),
+            (
+                "blank confidence source",
+                BatchChampionDraftV1 { confidence_source: Some("  ".into()), ..valid.clone() },
+                "confidence source must not be blank",
+            ),
+            (
+                "out-of-range confidence",
+                BatchChampionDraftV1 { confidence: Some(1.5), ..valid.clone() },
+                "between 0 and 1",
+            ),
+            (
+                "non-finite confidence",
+                BatchChampionDraftV1 { confidence: Some(f64::NAN), ..valid.clone() },
+                "between 0 and 1",
+            ),
+        ];
+        for (label, draft, expected) in cases {
+            let error =
+                database.commit_batch_champion_draft_v1(operation_id, 0, &draft, &executor()).unwrap_err().to_string();
+            assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
+        }
+        // Every refusal happened before any durable write.
+        let status = database.get_batch_job_status_v1(operation_id).unwrap().unwrap();
+        assert_eq!(status.counts.pending, 1);
+        let raw: String = database
+            .connection()
+            .query_row("SELECT raw_transcript FROM speech_segments WHERE id='s1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(raw, "raw s1");
+    }
+
+    #[test]
+    fn two_live_batch_headers_are_corruption_not_an_arbitrary_winner() {
+        let database = fixture(&["s1", "s2"]);
+        let first = "78000000-0000-4000-8000-000000000001";
+        database.admit_batch_job_v1(first, BatchJobKindV1::Normalize, &ids(&["s1"]), CONFIG_SHA, &executor()).unwrap();
+        assert_eq!(database.active_batch_job_v1().unwrap().unwrap().operation_id, first);
+
+        // The one-live-batch invariant is enforced for new writes by a partial unique index; a
+        // restored file can nevertheless carry two fully-valid live journals (the index can be
+        // absent from bytes written elsewhere). Drop the guard and admit a second real journal.
+        unlock_tables(&database, &["jobs"]);
+        database.connection().execute("DROP INDEX idx_jobs_one_live_batch_v1", []).unwrap();
+        let second = "78000000-0000-4000-8000-000000000002";
+        database.admit_batch_job_v1(second, BatchJobKindV1::Normalize, &ids(&["s2"]), CONFIG_SHA, &executor()).unwrap();
+        let discovery = database.active_batch_job_v1().unwrap_err().to_string();
+        assert!(discovery.contains("live batch headers exist"), "{discovery}");
+        let deep = database.validate_batch_job_authority_v1().unwrap_err().to_string();
+        assert!(deep.contains("live batch headers exist"), "{deep}");
+    }
+
+    #[test]
+    fn terminal_jobs_serve_an_empty_pending_page() {
+        let database = fixture(&["s1"]);
+        let operation_id = "79000000-0000-4000-8000-000000000001";
+        database
+            .admit_batch_job_v1(operation_id, BatchJobKindV1::Normalize, &ids(&["s1"]), CONFIG_SHA, &executor())
+            .unwrap();
+        assert_eq!(database.pending_batch_item_page_v1(operation_id, None).unwrap().len(), 1);
+        database.commit_batch_normalization_v1(operation_id, 0, "done", "normalizer-v1", &executor()).unwrap();
+        database.finish_batch_job_v1(operation_id, BatchTerminalIntentV1::Succeeded, &executor()).unwrap();
+        assert!(
+            database.pending_batch_item_page_v1(operation_id, None).unwrap().is_empty(),
+            "a terminal job must never serve pending work"
+        );
+        assert!(database.active_batch_job_v1().unwrap().is_none());
+    }
+
+    #[test]
+    fn item_evidence_corruption_is_refused_by_the_deep_validator() {
+        // Each case corrupts exactly one durable evidence invariant on a journal produced entirely
+        // by production APIs, then asserts the deep validator names the violated boundary.
+        type Prepare = fn(&Database, &str);
+        fn admit_only(_database: &Database, _operation_id: &str) {}
+        fn apply_first(database: &Database, operation_id: &str) {
+            database.commit_batch_normalization_v1(operation_id, 0, "done", "normalizer-v1", &executor()).unwrap();
+        }
+        fn skip_first(database: &Database, operation_id: &str) {
+            database.connection().execute("UPDATE speech_segments SET verified=1 WHERE id='s1'", []).unwrap();
+            database.commit_batch_normalization_v1(operation_id, 0, "done", "normalizer-v1", &executor()).unwrap();
+        }
+        let cases: [(&str, Prepare, &str, &str); 8] = [
+            (
+                "pending item with terminal evidence",
+                admit_only,
+                "UPDATE batch_job_items_v1 SET result_code='X'",
+                "carries terminal evidence",
+            ),
+            (
+                "empty before projection",
+                admit_only,
+                "UPDATE batch_job_items_v1 SET before_projection_json=''",
+                "E_BATCH_PROJECTION_LIMIT_EXCEEDED",
+            ),
+            (
+                "tampered before projection bytes",
+                admit_only,
+                "UPDATE batch_job_items_v1 SET before_projection_json=before_projection_json||' '",
+                BATCH_EVIDENCE_ERROR,
+            ),
+            (
+                "shifted base revision",
+                admit_only,
+                "UPDATE batch_job_items_v1 SET base_revision=base_revision+1",
+                "does not match its identity columns",
+            ),
+            (
+                "applied item with a result code",
+                apply_first,
+                "UPDATE batch_job_items_v1 SET result_code='X'",
+                "lacks exact after authority",
+            ),
+            (
+                "applied item missing its after projection",
+                apply_first,
+                "UPDATE batch_job_items_v1 SET after_projection_json=NULL",
+                "partial after authority",
+            ),
+            (
+                "applied item missing its effect revision",
+                apply_first,
+                "UPDATE batch_job_items_v1 SET effect_revision=NULL",
+                BATCH_EVIDENCE_ERROR,
+            ),
+            (
+                "skipped item without a result code",
+                skip_first,
+                "UPDATE batch_job_items_v1 SET result_code=NULL",
+                "malformed evidence",
+            ),
+        ];
+        for (label, prepare, sabotage, expected) in cases {
+            let database = fixture(&["s1"]);
+            let operation_id = "7a000000-0000-4000-8000-000000000001";
+            database
+                .admit_batch_job_v1(operation_id, BatchJobKindV1::Normalize, &ids(&["s1"]), CONFIG_SHA, &executor())
+                .unwrap();
+            prepare(&database, operation_id);
+            database.validate_batch_job_authority_v1().expect("the uncorrupted journal must validate first");
+            unlock_tables(&database, &["batch_job_items_v1"]);
+            assert_eq!(database.connection().execute(sabotage, []).unwrap(), 1, "{label}");
+            let error = database.validate_batch_job_authority_v1().unwrap_err().to_string();
+            assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
+        }
+    }
 }

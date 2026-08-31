@@ -89,6 +89,8 @@ pub mod stats;
 mod stores;
 pub mod technical_audio_probe;
 pub mod telemetry;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod throttle;
 pub mod transcript_export;
 pub mod validation;

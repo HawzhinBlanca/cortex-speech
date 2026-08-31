@@ -5813,3 +5813,393 @@ mod tests {
         assert!(fresh.rationale.as_deref().unwrap_or("").contains("T2 disabled"));
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// State-taking command coverage through the shared MockRuntime harness
+// (`crate::test_support`): every call below goes through a genuine
+// `State<'_, AppState>` exactly as the renderer's IPC dispatch would deliver it.
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod state_command_harness_tests {
+    use super::*;
+    use crate::test_support::managed_app_state;
+
+    #[test]
+    fn get_settings_serves_the_scrubbed_default_snapshot_never_the_session_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        {
+            let state = app.state::<AppState>();
+            let mut live = state.lock_settings();
+            live.llm_api_key = "session-only-secret".to_string();
+        }
+
+        let served = get_settings(app.state()).expect("get_settings");
+
+        assert_eq!(served.llm_api_key, "", "the session secret must never leave through get_settings");
+        assert!(served.llm_api_key_configured, "a present secret must still report as configured");
+        let expected = AppSettings { llm_api_key_configured: true, ..AppSettings::default() }.for_client_response();
+        assert_eq!(
+            serde_json::to_value(&served).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "everything else must be the exact default client snapshot"
+        );
+    }
+
+    #[test]
+    fn get_settings_v1_snapshot_is_stable_and_reports_the_default_privacy_posture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+
+        let first = get_settings_v1(app.state()).expect("first snapshot");
+        let second = get_settings_v1(app.state()).expect("second snapshot");
+
+        assert_eq!(first, second, "an unchanged store must serve an identical snapshot + revision");
+        assert!(!first.settings.cloud_llm_opt_in, "cloud LLM consent defaults OFF");
+        assert!(!first.settings.jury_cloud_opt_in, "jury cloud consent defaults OFF");
+        assert!(!first.settings.llm_api_key_configured);
+        assert!(!first.settings.use_finetuned_asr, "champion supremacy: no finetuned override by default");
+        assert_eq!(first.settings.language, "ckb");
+        assert!(first.settings_revision >= 0, "revision must survive the i64->number TS binding");
+    }
+
+    #[test]
+    fn get_configured_providers_speaks_a_closed_vocabulary_and_refuses_without_a_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+
+        // No secrets.env exists in the temp data dir; ambient env keys may still legitimately
+        // surface, so the exact-content claim here is the closed provider vocabulary.
+        let providers = get_configured_providers(app.state()).expect("providers with a data dir");
+        for name in &providers {
+            assert!(name == "gemini" || name == "openrouter", "unexpected provider name {name:?}");
+        }
+
+        *app.state::<AppState>().data_dir.lock().unwrap() = None;
+        let refused = get_configured_providers(app.state()).expect_err("no data dir must refuse");
+        assert_eq!(refused.code, "API_KEY_STORE_UNAVAILABLE");
+        assert!(!refused.retryable);
+        assert_eq!(refused.suggested_action, Some(crate::ipc_contract::SuggestedActionV1::OpenHealth));
+    }
+
+    #[test]
+    fn list_model_versions_serves_only_the_champion_family_with_exact_public_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        {
+            let state = app.state::<AppState>();
+            let db = state.lock_db();
+            crate::registry::register_candidate(
+                &db,
+                &crate::registry::NewModelVersion {
+                    id: "cand-7b".to_string(),
+                    family: crate::deployment::OMNIASR_7B_FAMILY.to_string(),
+                    model_card_name: Some("owner-card".to_string()),
+                    checkpoint_sha256: "a".repeat(64),
+                    checkpoint_path: "/ckpt/cand-7b".to_string(),
+                    source: "meta-stock".to_string(),
+                    license: "SAIL".to_string(),
+                },
+            )
+            .expect("register 7B candidate");
+            crate::registry::register_candidate(
+                &db,
+                &crate::registry::NewModelVersion {
+                    id: "diag-mms".to_string(),
+                    family: "mms".to_string(),
+                    model_card_name: None,
+                    checkpoint_sha256: "b".repeat(64),
+                    checkpoint_path: "/ckpt/diag-mms".to_string(),
+                    source: "meta-stock".to_string(),
+                    license: "CC-BY-NC".to_string(),
+                },
+            )
+            .expect("register diagnostic-family row");
+        }
+
+        let rows = list_model_versions(app.state()).expect("list_model_versions");
+
+        assert_eq!(
+            rows,
+            vec![ModelVersionSummaryV1 {
+                id: "cand-7b".to_string(),
+                family: crate::deployment::OMNIASR_7B_FAMILY.to_string(),
+                model_card_name: Some("owner-card".to_string()),
+                checkpoint_sha256: "a".repeat(64),
+                source: "meta-stock".to_string(),
+                license: "SAIL".to_string(),
+                status: "candidate".to_string(),
+            }],
+            "diagnostic families must be filtered out and the public row must carry no checkpoint path"
+        );
+    }
+
+    #[test]
+    fn db_info_reports_the_live_library_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+
+        let empty = db_info(app.state()).expect("db_info on a fresh library");
+        assert_eq!(empty["segmentCount"], 0);
+        assert_eq!(empty["journalMode"], "wal");
+        assert_eq!(empty["path"], tmp.path().join("app-state.db").to_string_lossy().as_ref());
+        assert!(empty["sizeBytes"].as_u64().unwrap() > 0, "a migrated database file is never empty");
+
+        app.state::<AppState>()
+            .lock_db()
+            .insert_segment(&crate::db::SpeechSegment {
+                id: "seg-info-1".to_string(),
+                audio_path: "C:/fixtures/seg-info-1.wav".to_string(),
+                raw_transcript: "deng".to_string(),
+                ..Default::default()
+            })
+            .expect("seed segment");
+        let seeded = db_info(app.state()).expect("db_info after insert");
+        assert_eq!(seeded["segmentCount"], 1);
+    }
+
+    #[test]
+    fn get_history_status_v1_reports_honest_empty_stacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+
+        let status = get_history_status_v1(app.state()).expect("history status");
+
+        assert_eq!(
+            status,
+            crate::ipc_contract::HistoryStatusV1 { undo_action: None, redo_action: None },
+            "a fresh session has nothing to undo or redo — no English fallback allowed"
+        );
+    }
+
+    #[test]
+    fn cancel_operation_signals_every_armed_cancellation_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+
+        cancel_operation(app.state()).expect("cancel with nothing armed is still Ok");
+        assert!(!app.state::<AppState>().is_cancelled(), "no token was armed, so nothing may read cancelled");
+
+        let import_token = crate::cancel::CancellationToken::new();
+        let batch_token = crate::cancel::CancellationToken::new();
+        {
+            let state = app.state::<AppState>();
+            *state.import_cancel_token.lock().unwrap() = Some(import_token.clone());
+            *state.batch_cancel_token.lock().unwrap() = Some(batch_token.clone());
+        }
+
+        cancel_operation(app.state()).expect("cancel with armed tokens");
+
+        assert!(import_token.is_cancelled(), "the import slot must be signalled");
+        assert!(batch_token.is_cancelled(), "the batch slot must be signalled");
+        assert!(app.state::<AppState>().is_cancelled());
+    }
+
+    #[test]
+    fn get_jobs_serves_seeded_durable_jobs_newest_first_with_exact_wire_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        {
+            let state = app.state::<AppState>();
+            let db = state.lock_db();
+            db.create_or_get_job("job-a", "import", None, Some(4)).expect("seed job-a");
+            db.create_or_get_job("job-b", "export_dataset", None, None).expect("seed job-b");
+        }
+
+        let jobs = tauri::async_runtime::block_on(get_jobs(app.state())).expect("get_jobs");
+
+        assert_eq!(
+            jobs,
+            vec![
+                JobV1 {
+                    id: "job-b".to_string(),
+                    kind: "export_dataset".to_string(),
+                    state: JobStateV1::Queued,
+                    progress: 0.0,
+                    completed: 0,
+                    total: None,
+                    error_code: None,
+                },
+                JobV1 {
+                    id: "job-a".to_string(),
+                    kind: "import".to_string(),
+                    state: JobStateV1::Queued,
+                    progress: 0.0,
+                    completed: 0,
+                    total: Some(4),
+                    error_code: None,
+                },
+            ],
+            "newest first (created_at DESC, id DESC), exact queued lifecycle fields"
+        );
+    }
+
+    #[test]
+    fn merge_dataset_json_creates_rows_and_refuses_malformed_or_blanking_payloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let incoming = crate::db::SpeechSegment {
+            id: "seg-merge-1".to_string(),
+            audio_path: "C:/fixtures/seg-merge-1.wav".to_string(),
+            raw_transcript: "deng yek du".to_string(),
+            ..Default::default()
+        };
+        let payload = serde_json::to_string(&vec![incoming]).unwrap();
+
+        let merged = tauri::async_runtime::block_on(merge_dataset_json(payload, app.state())).expect("merge new row");
+        assert_eq!(merged, crate::ipc_contract::MergeDatasetResultV1 { created: 1, updated: 0 });
+        let stored = app
+            .state::<AppState>()
+            .lock_db()
+            .get_segment_by_id("seg-merge-1")
+            .expect("read back")
+            .expect("merged row exists");
+        assert_eq!(stored.raw_transcript, "deng yek du");
+
+        let malformed = tauri::async_runtime::block_on(merge_dataset_json("this is not json".to_string(), app.state()))
+            .expect_err("malformed payload must refuse");
+        assert_eq!(malformed.code, "DATASET_MERGE_FAILED");
+        assert!(!malformed.retryable);
+        assert_eq!(malformed.suggested_action, Some(crate::ipc_contract::SuggestedActionV1::OpenHealth));
+
+        // The blank-transcript guard: a pre-ASR export must never blank an existing good draft.
+        let blanking = serde_json::to_string(&vec![crate::db::SpeechSegment {
+            id: "seg-merge-1".to_string(),
+            audio_path: "C:/fixtures/seg-merge-1.wav".to_string(),
+            raw_transcript: "".to_string(),
+            ..Default::default()
+        }])
+        .unwrap();
+        let refused = tauri::async_runtime::block_on(merge_dataset_json(blanking, app.state()))
+            .expect_err("blank transcript must refuse atomically");
+        assert_eq!(refused.code, "DATASET_MERGE_FAILED");
+        let untouched = app.state::<AppState>().lock_db().get_segment_by_id("seg-merge-1").unwrap().unwrap();
+        assert_eq!(untouched.raw_transcript, "deng yek du", "the refusal must leave the good draft intact");
+    }
+
+    #[test]
+    fn get_segment_consensus_refuses_typed_and_serves_empty_provenance_honestly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+
+        let invalid = get_segment_consensus(app.state(), "bad id!".to_string())
+            .expect_err("a non-identifier must refuse before any read");
+        assert_eq!(invalid.code, "INVALID_SEGMENT_ID");
+
+        let missing =
+            get_segment_consensus(app.state(), "seg-missing".to_string()).expect_err("an unknown segment must refuse");
+        assert_eq!(missing.code, "SEGMENT_NOT_FOUND");
+        assert_eq!(missing.suggested_action, Some(crate::ipc_contract::SuggestedActionV1::ReloadClip));
+
+        // A row with NO recorded producing model: consensus must invent no provenance.
+        app.state::<AppState>()
+            .lock_db()
+            .insert_segment(&crate::db::SpeechSegment {
+                id: "seg-unattributed".to_string(),
+                audio_path: "C:/fixtures/seg-unattributed.wav".to_string(),
+                raw_transcript: "deng yek du".to_string(),
+                ..Default::default()
+            })
+            .expect("seed unattributed segment");
+        let empty = get_segment_consensus(app.state(), "seg-unattributed".to_string()).expect("unattributed consensus");
+        assert_eq!(
+            empty,
+            crate::ipc_contract::SegmentConsensusV1 {
+                draft: String::new(),
+                words: Vec::new(),
+                model_count: 0,
+                min_agreement: 0.0,
+                mean_agreement: 0.0,
+                models: Vec::new(),
+            },
+            "no persisted model id means no attributable vote — never invented provenance"
+        );
+    }
+
+    #[test]
+    fn get_segment_consensus_votes_the_champion_draft_when_stored_hypotheses_are_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        app.state::<AppState>()
+            .lock_db()
+            .insert_segment(&crate::db::SpeechSegment {
+                id: "seg-champion".to_string(),
+                audio_path: "C:/fixtures/seg-champion.wav".to_string(),
+                raw_transcript: "deng yek du".to_string(),
+                model_version_id: Some(LEGACY_CHAMPION_MODEL_ID.to_string()),
+                confidence: Some(0.9),
+                ..Default::default()
+            })
+            .expect("seed champion-attributed segment");
+
+        let consensus = get_segment_consensus(app.state(), "seg-champion".to_string()).expect("champion consensus");
+
+        assert_eq!(consensus.draft, "deng yek du");
+        assert_eq!(consensus.models, vec![LEGACY_CHAMPION_MODEL_ID.to_string()]);
+        assert_eq!(consensus.model_count, 1);
+        assert_eq!(consensus.min_agreement, 1.0);
+        assert_eq!(consensus.mean_agreement, 1.0);
+        assert_eq!(consensus.words.len(), 3);
+        for (word, expected_text) in consensus.words.iter().zip(["deng", "yek", "du"]) {
+            assert_eq!(word.text, expected_text);
+            assert_eq!(word.agreement, 1.0, "a single-model vote is unanimous by construction");
+            assert_eq!(word.models_agreeing, 1);
+            assert_eq!(word.total_models, 1);
+            assert!(word.alternatives.is_empty());
+        }
+    }
+
+    #[test]
+    fn clear_escalation_is_a_retired_endpoint_with_exact_refusals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+
+        let invalid =
+            clear_escalation(app.state(), "bad id".to_string()).expect_err("a malformed id must fail validation first");
+        assert_eq!(invalid, "Identifier must be alphanumeric (underscore, hyphen, dot allowed)");
+
+        let retired =
+            clear_escalation(app.state(), "seg-1".to_string()).expect_err("the identity-free path is retired");
+        assert_eq!(
+            retired,
+            "EXACT_FLAG_UNDO_REQUIRED: identity-free escalation clearing is retired; use the immutable flag effect and an operation UUID"
+        );
+    }
+
+    #[test]
+    fn review_team_reports_are_exactly_empty_on_a_fresh_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+
+        assert!(spot_check_report(app.state()).expect("spot_check_report").is_empty());
+        assert!(reviewer_throughput(app.state()).expect("reviewer_throughput").is_empty());
+        assert!(
+            export_agreement_sample(app.state()).expect("export_agreement_sample").is_none(),
+            "nothing double-reviewed yet is an honest None, not an error"
+        );
+        assert!(!tmp.path().join("agreement_sample.tsv").exists(), "an empty sample must not leave a TSV behind");
+        assert!(list_gold_segments(app.state()).expect("list_gold_segments").is_empty());
+        assert!(list_eval_runs(app.state()).expect("list_eval_runs").is_empty());
+    }
+
+    #[test]
+    fn get_few_shot_examples_validates_the_id_and_serves_nothing_from_an_empty_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+
+        let invalid =
+            get_few_shot_examples(app.state(), "../etc".to_string(), 3).expect_err("a path-like id must refuse");
+        assert_eq!(invalid, "Identifier must be alphanumeric (underscore, hyphen, dot allowed)");
+
+        let examples = get_few_shot_examples(app.state(), "seg-none".to_string(), 3).expect("empty example store");
+        assert!(examples.is_empty(), "no human-verified corrections exist, so no exemplars may be served");
+    }
+
+    #[test]
+    fn couch_review_status_reports_the_stopped_server_exactly() {
+        let status = couch_review_status().expect("couch status");
+        assert!(!status.running, "no test starts the couch server; status must say stopped");
+        assert!(status.reviewers.is_empty(), "a stopped server mints no reviewer links");
+        assert_eq!(status.certificate_fingerprint, None);
+    }
+}
