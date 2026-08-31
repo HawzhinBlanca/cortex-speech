@@ -2533,6 +2533,28 @@ mod tests {
     }
 
     #[test]
+    fn non_regular_active_state_fails_the_pinned_snapshot_without_residue() {
+        for (live_file, expected) in [
+            (crate::review_pilot::REVIEW_PILOT_FILE, "could not be read"),
+            (OPTIONAL_SNAPSHOT_STATE[0].live_file, "is not a regular file"),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let db = seeded_db();
+            std::fs::create_dir(tmp.path().join(live_file)).unwrap();
+
+            let error =
+                take_pinned_snapshot_at(&db, tmp.path(), "premigration_v57_to_v58", 3, 1000).unwrap_err().to_string();
+            assert!(error.contains(live_file) && error.contains(expected), "unexpected error for {live_file}: {error}");
+            let pinned = tmp.path().join("snapshots").join(PINNED_DIR);
+            assert!(pinned.is_dir(), "the writer may create only its private pinned root");
+            assert!(
+                std::fs::read_dir(&pinned).unwrap().next().is_none(),
+                "unreadable {live_file} must leave neither a promoted pin nor staging residue"
+            );
+        }
+    }
+
+    #[test]
     fn active_pilot_snapshot_refuses_missing_or_nonexact_focus_before_promotion() {
         const POLICY: &[u8] = br#"{
           "schema_version": 1,
