@@ -12331,3 +12331,34 @@ Links were emitted from the durable session (DPAPI-unprotected locally, never lo
 to the owner for distribution. Iftikhar and Guest are dialect-unrestricted until the owner lists
 them in reviewer_dialects.json (hot-reloaded, no restart). The 7B champion stays down (GPUs held
 by another workload) — drafting only; review serving is unaffected.
+
+---
+
+## 2026-08-31 — LIVE INCIDENT #2 fixed and shipped: the queue served what the pay fence refuses
+
+**Symptom:** reviewers' first day on the 10-link roster — links authenticated, seven reviewers
+connected, ZERO decisions landed anywhere (review_events last: the prior morning; pool decisions:
+none ever). "The link isn't working."
+
+**Root cause (measured, then read in the shipped code):** with the flexible pool active the phone
+queue serves ONLY pool members, decision-first then oldest-first — and the three oldest members at
+every queue's front were already-canonical (verified + human_decision). Saving on such a clip is a
+pool observation, which decisions.rs correctly refuses 503 PAY_POLICY_REQUIRED until an owner pay
+contract prices pool work — and skip routes into the same fence. Served-but-unsavable work at
+position 1 walled all ten reviewers out of a 19,905-clip savable backlog (only 418 of 20,323
+members are fenced). A second contributor: my coverage measure had spawned an instrumented debug
+app instance sharing the live data dir plus a full-CPU build; killed, and no heavy builds run
+during review hours from now on.
+
+**Fix (release `a6de3c17e7ee-373ce78a01a8-a591ada04b3f-876715ee80e9-363def17e69f`):** the queue
+now mirrors the fence exactly — `cfg!(not(test))` skips verified+decided pool members in
+`pending_segment_ids` (tests keep seeing them; they decide via `api_pool_decision`). New pin
+`test_the_queue_never_serves_what_the_fence_refuses` in test_pool_pay_fence_scope_policy.py ties
+mirror and fence so they lift TOGETHER when the owner prices pool work with a literal
+`change canon:`.
+
+**Proof at the serving path:** deploy READY with all TEN queues proven; running exe = pointer =
+a6de3c17; queue clip 1 via the funnel is now be2827bb with verified=0/decision=none (savable, the
+paid canonical path); playback/start 200 + audio 206/full; probe 4/4 (10/10 links, 10 queues with
+clips, continuity intact). Gates: fence-scope policy 4/4 (new pin bites), consensus canon pins
+green, review_pool+couch::queue tests 37/0.
