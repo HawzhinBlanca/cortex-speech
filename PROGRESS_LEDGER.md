@@ -12600,3 +12600,34 @@ each from `atomic_file.rs` and `jury/learning.rs`. Remaining minimum deficits ar
 branches, 4,972 lines, 8,740 regions, and 1,190 functions; critical branch deficits are review 157,
 payment 147, playback 119, restore 275, and IPC 486. Production, live data, scheduled tasks, release
 pointers, credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 24: exhaustive required-state drill mirror
+
+The next reachable snapshot cluster was the Rust mirror of the external restore drill's required-
+state check. The prior two-assertion test was replaced with an exhaustive contract regression that
+proves null, non-array, and pathless/non-string inventories report the full required set; omission
+of the mandatory database is reported independently; every optional settings, champion, reviewer-
+dialects, and voice-focus state is accepted in either live-file or exact absence-marker form and is
+reported when both are omitted; and paid-pilot state is likewise accepted as live policy or absence
+marker and reported when omitted. This mirror answers only whether a representation is missing;
+the production restore verifier's stricter exactly-one rule remains unchanged and separately proven.
+
+The focused proof passed 1/1, the complete snapshot namespace passed 38/38, stable rustfmt passed,
+and strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`80ddde11777e84d35cd6304789b46fe88d914cb3` then received an exact pinned all-target measurement:
+1,837 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `d71c3201f5c046208fc7eb5bc94f3110` (SHA-256
+`37a07289e96e3495cb0a66cdb5876faa51ed88dac71263beb9cce5eb0dd42961`) proves snapshot branches
+moved 284/400 to 291/404 and restore moved 1,088/1,514 to 1,095/1,518, reducing uncovered snapshot
+branches from 116 to 113 and uncovered restore branches from 426 to 423. Overall coverage is
+branches 7,804/12,823 (60.86%), lines 76,391/95,710 (79.82%), regions 135,786/170,012 (79.87%),
+and functions 6,508/9,621 (67.64%). The target supplied seven covered snapshot branches while its
+expanded exhaustive test introduced four measured branches; unrelated run variance added one
+covered branch in `atomic_file.rs`. Remaining minimum deficits are 2,455 overall branches, 4,963
+lines, 8,725 regions, and 1,189 functions; critical branch deficits are review 157, payment 147,
+playback 119, restore 272, and IPC 486. Production, live data, scheduled tasks, release pointers,
+credentials, and GPU/model configuration were untouched.
