@@ -12691,3 +12691,36 @@ no new snapshot branch denominator. Unrelated run variance restored two covered 
 2,450 overall branches, 4,950 lines, 8,689 regions, and 1,189 functions; critical branch deficits
 are review 157, payment 147, playback 119, restore 267, and IPC 486. Production, live data,
 scheduled tasks, release pointers, credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 27: bounded pinned-snapshot deletion authority
+
+The next exact snapshot branch exposed a broader deletion-authority defect. Same-label pinned
+retention previously accepted every directory whose name merely started with `<label>_`, so a
+malformed timestamp or overlapping longer label could enter the deletion set; snapshot construction
+also accepted path-like labels before joining them into staging and final paths. Pinned labels now
+share the restore selector's bounded grammar and fail before the snapshots tree is created. Retention
+admits only real directories whose name is the exact requested label plus a canonical ten-digit
+timestamp. The existing cap regression now deterministically proves a same-label regular file,
+malformed same-label directory, overlapping-label directory, and different-label pin all survive
+while the older of two valid exact-label pins is evicted. It also removes a 1.1-second timing sleep.
+The OS-denied recursive-removal warning remains environment-dependent and explicitly unclaimed.
+
+The corrected focused proof passed 3/3, the complete snapshot namespace passed 41/41, stable rustfmt
+passed, and strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`3d54ef845fd7472c94c3453ed17d6c9f3da52876` then received an exact pinned all-target measurement:
+1,840 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `466a219cf1e64627909e81462ea191b4` (SHA-256
+`572bb604341b193b4be10410ff9e5c39585f234b42817bcf434dc0e0a00a2bbc`) proves snapshot branches
+moved 296/404 to 299/406 and restore moved 1,100/1,518 to 1,103/1,520, reducing uncovered snapshot
+branches from 108 to 107 and uncovered restore branches from 418 to 417. Overall coverage is
+branches 7,810/12,825 (60.90%), lines 76,473/95,792 (79.83%), regions 135,963/170,186 (79.89%),
+and functions 6,512/9,625 (67.66%). The target supplied three covered branches while the stronger
+authority predicate introduced two measured branches. Unrelated run variance removed one covered
+branch each from `audio.rs` and `jury/learning.rs`. Remaining minimum deficits are 2,450 overall
+branches, 4,951 lines, 8,696 regions, and 1,188 functions; critical branch deficits are review 157,
+payment 147, playback 119, restore 265, and IPC 486. Production, live data, scheduled tasks, release
+pointers, credentials, and GPU/model configuration were untouched.
