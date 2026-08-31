@@ -404,9 +404,9 @@ class LockedToolchainTrees:
     """Retain no-write/no-delete handles for every executable/runtime closure entry."""
 
     def __init__(self, roots: list[Path]):
+        self.handles: list[int] = []  # __del__ -> close() must be safe after a platform refusal
         if os.name != "nt":
             raise ProofInputError("toolchain tree locks require Windows")
-        self.handles: list[int] = []
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.CreateFileW.argtypes = [
             ctypes.c_wchar_p,
@@ -470,11 +470,13 @@ class LockedFile:
     """Retain an ordinary file identity while denying writes, deletes, and namespace replacement."""
 
     def __init__(self, path: Path, *, require_single_link: bool = True, acl_authority: bool = False):
+        # __del__ -> close() reads self.handle even when construction was refused; initialize it
+        # before the platform refusal so a POSIX caller gets one typed error, not deallocator noise.
+        self.handle: int | None = None
+        self.protected_dacl_sha256: str | None = None
         if os.name != "nt":
             raise ProofInputError("owner-proof file identity locks require Windows")
         self.path = absolute_lexical(path)
-        self.handle: int | None = None
-        self.protected_dacl_sha256: str | None = None
 
         class FileTime(ctypes.Structure):
             _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
@@ -938,6 +940,7 @@ class NamedMutex:
     """Crash-released per-output ownership; no stale filesystem sentinel survives process death."""
 
     def __init__(self, namespace: str, identity: str):
+        self.handle: int | None = None  # __del__ -> close() must be safe after a platform refusal
         if os.name != "nt":
             raise ProofInputError("owner-proof preparation mutex requires Windows")
         digest = hashlib.sha256(identity.encode("utf-8", errors="strict")).hexdigest()

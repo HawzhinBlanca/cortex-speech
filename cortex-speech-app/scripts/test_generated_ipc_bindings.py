@@ -34,6 +34,12 @@ def _generation_blocker() -> str | None:
     ]
     if missing:
         return f"bundled build resources are absent (gitignored model binaries): {', '.join(sorted(missing))}"
+    # `tauri::generate_context!` hard-fails when the frontend dist is unbuilt — a gitignored build
+    # output, absent from every fresh clone (measured on Linux CI: "frontendDist ../dist doesn't
+    # exist" panics the proc macro before the generator can run).
+    frontend_dist = configuration["build"]["frontendDist"]
+    if not (REPO_ROOT / "src-tauri" / frontend_dist).exists():
+        return f"the frontend dist is not built (gitignored build output): {frontend_dist}"
     return None
 
 

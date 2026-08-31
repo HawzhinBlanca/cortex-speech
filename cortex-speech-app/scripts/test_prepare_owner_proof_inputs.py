@@ -352,7 +352,9 @@ class Fixture:
 
 class OwnerProofInputTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = Path(tempfile.mkdtemp(prefix="cortex-owner-proof-test-"))
+        # resolve(): macOS temp lives under /var -> /private/var; unresolved fixture roots carry a
+        # symlink component and the proof-input no-alias guards (correctly) refuse every path.
+        self.temporary = Path(tempfile.mkdtemp(prefix="cortex-owner-proof-test-")).resolve()
 
     def tearDown(self) -> None:
         for path in sorted(self.temporary.rglob("*"), key=lambda item: len(item.parts), reverse=True):

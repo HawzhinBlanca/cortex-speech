@@ -72,7 +72,9 @@ def fixture() -> tuple[
     Path,
 ]:
     temporary = tempfile.TemporaryDirectory()
-    base = Path(temporary.name)
+    # resolve(): macOS temp is /var/... -> /private/var/...; the staged-manifest guard requires
+    # the canonical alias-free spelling, which is the fixture's job to supply.
+    base = Path(temporary.name).resolve()
     source = base / "source"
     candidate = base / "candidate"
     appdata = base / "appdata"

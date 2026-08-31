@@ -110,7 +110,7 @@ def seed(root: Path, *, schema: int = CURRENT_SCHEMA) -> tuple[Path, dict[str, o
 
 def test_activation_preserves_target_tokens_narrows_every_session_surface_and_backs_up() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, original = seed(root)
         result = activate(
             root,
@@ -144,7 +144,7 @@ def test_activation_preserves_target_tokens_narrows_every_session_surface_and_ba
 
 def test_first_activation_refuses_unnamespaced_legacy_pilot_hidden_keys() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, _ = seed(root)
         session_path = root / SESSION_FILE
         session = json.loads(session_path.read_text(encoding="utf-8"))
@@ -162,7 +162,7 @@ def test_first_activation_refuses_unnamespaced_legacy_pilot_hidden_keys() -> Non
 
 def test_event_id_and_existing_policy_are_compare_and_swap_guards() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, _ = seed(root)
         try:
             activate(root, db_path, expected_max_review_event_id=862, check_runtime=False)
@@ -185,7 +185,7 @@ def test_event_id_and_existing_policy_are_compare_and_swap_guards() -> None:
 
 def test_pristine_roster_replacement_atomically_extends_the_exact_focus() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, credential_session = seed(root)
         credential_path = root / "credential_session.json"
         credential_path.write_text(json.dumps(credential_session), encoding="utf-8")
@@ -238,7 +238,7 @@ def test_pristine_roster_replacement_atomically_extends_the_exact_focus() -> Non
 
 def test_existing_pilot_cannot_reset_its_baseline_after_any_durable_activity() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, _ = seed(root)
         activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
         policy_path = root / POLICY_FILE
@@ -264,7 +264,7 @@ def test_existing_pilot_cannot_reset_its_baseline_after_any_durable_activity() -
 
 def test_schema63_activation_imports_session_and_completed_hidden_keys_into_one_namespace() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, _ = seed(root)
         activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
         policy_path = root / POLICY_FILE
@@ -320,7 +320,7 @@ def test_schema63_activation_rolls_back_when_hidden_history_exceeds_quota_or_sch
         ("missing_trigger", "trigger(s) missing"),
     ):
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             db_path, _ = seed(root)
             activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
             policy_path = root / POLICY_FILE
@@ -360,7 +360,7 @@ def test_schema63_activation_rolls_back_when_hidden_history_exceeds_quota_or_sch
 
 def test_interrupted_activation_leaves_durable_revocation_instead_of_old_unrestricted_resume() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, original = seed(root)
         try:
             activate(
@@ -380,7 +380,7 @@ def test_interrupted_activation_leaves_durable_revocation_instead_of_old_unrestr
 
 def test_schema_56_is_refused_before_any_activation_file_changes() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, original = seed(root, schema=56)
         try:
             activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
@@ -399,7 +399,7 @@ def test_missing_middle_or_description_drift_is_refused_before_file_changes() ->
         ("UPDATE schema_migrations SET description='tampered' WHERE version=31", "descriptionMismatch=[31]"),
     ):
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             db_path, original = seed(root)
             conn = sqlite3.connect(db_path)
             conn.execute(sql)
@@ -418,7 +418,7 @@ def test_missing_middle_or_description_drift_is_refused_before_file_changes() ->
 
 def test_non_restartable_or_duplicate_session_json_is_refused_before_revocation() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, session = seed(root)
         session["sessions"][0]["issued_unix"] = True
         session_path = root / SESSION_FILE
@@ -435,7 +435,7 @@ def test_non_restartable_or_duplicate_session_json_is_refused_before_revocation(
         assert not (root / REVOCATION_FILE).exists()
 
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, session = seed(root)
         session_path = root / SESSION_FILE
         encoded_db = json.dumps(str(db_path))
@@ -458,7 +458,7 @@ def test_non_restartable_or_duplicate_session_json_is_refused_before_revocation(
 
 def test_maintenance_revocation_precedes_schema_56_to_current_work_and_survives_refusal() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, original = seed(root, schema=56)
         result = prepare_maintenance_revocation(root, check_runtime=False)
         assert result["autoResumeBlocked"] is True
@@ -476,7 +476,7 @@ def test_maintenance_revocation_precedes_schema_56_to_current_work_and_survives_
 
 def test_live_cortex_instance_lock_refuses_activation_without_touching_state() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, original = seed(root)
         with acquire_cortex_lock(root):
             try:
@@ -497,7 +497,7 @@ def test_missing_or_wrong_focus_is_refused_before_activation_mutates_state() -> 
         ({"segment_ids": ["focus-a", "focus-b", "focus-wrong"]}, "digest mismatch"),
     ):
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             db_path, original = seed(root)
             focus = root / "voice_focus.json"
             if replacement is None:
@@ -518,7 +518,7 @@ def test_missing_or_wrong_focus_is_refused_before_activation_mutates_state() -> 
 def test_focus_is_rechecked_immediately_before_promotion_and_commit() -> None:
     for drift_on_call, promoted in ((2, False), (3, True)):
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             db_path, _ = seed(root)
             calls = 0
 
@@ -582,7 +582,7 @@ def test_tracked_focus_contract_and_8277_8279_wrong_id_failures_are_exact() -> N
     baseline = [f"segment-{index:05}" for index in range(8_278)]
     contract = contract_for_ids(baseline)
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         focus = root / "voice_focus.json"
 
         def expect_refusal(ids: list[str], expected: str) -> None:

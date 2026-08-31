@@ -116,7 +116,7 @@ def seed(root: Path) -> tuple[Path, Path, dict[str, object]]:
 
 def test_success_is_exact_history_preserving_and_session_byte_preserving() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, source, old_campaign = seed(root)
         session_hash = sha256_file(root / SESSION_FILE)
         result = activate(
@@ -157,7 +157,7 @@ def test_success_is_exact_history_preserving_and_session_byte_preserving() -> No
 
 def test_stale_event_boundary_fails_before_live_mutation() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, source, old_campaign = seed(root)
         before_db = sha256_file(db_path)
         before_focus = (root / "voice_focus.json").read_bytes()
@@ -183,7 +183,7 @@ def test_stale_event_boundary_fails_before_live_mutation() -> None:
 
 def test_interruption_after_database_commit_resumes_without_double_revision() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, source, old_campaign = seed(root)
         kwargs = dict(
             speaker_name="Lamo",
@@ -217,7 +217,7 @@ def test_interruption_after_database_commit_resumes_without_double_revision() ->
 def test_registry_not_the_startup_mirror_decides_which_drafts_are_champion() -> None:
     """A registry with no usable champion refuses; the stale mirror never rescues it."""
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, source, old_campaign = seed(root)
         conn = sqlite3.connect(db_path)
         conn.execute("UPDATE model_versions SET status = 'rolled_back'")

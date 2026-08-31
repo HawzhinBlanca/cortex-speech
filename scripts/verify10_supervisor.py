@@ -204,6 +204,30 @@ def process_creation_time(pid: int) -> str | None:
 
     if pid <= 0:
         return None
+    if sys.platform == "darwin":
+        # No procfs on macOS. BSD ps prints the kernel-issued start time (lstart); a zombie keeps
+        # its ps row until reaped, so reject Z/X states exactly like the /proc branch below.
+        # ponytail: lstart is second-granular — a reused PID started within the same second would
+        # collide; upgrade to sysctl KERN_PROC (microsecond p_starttime) if that ever matters.
+        try:
+            completed = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "stat=,lstart="],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        lines = completed.stdout.strip().splitlines()
+        if completed.returncode != 0 or not lines:
+            return None
+        state, _, started = lines[0].strip().partition(" ")
+        started = started.strip()
+        if not started or state.startswith(("Z", "X")):
+            return None
+        return started
     if os.name != "nt":
         try:
             text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")

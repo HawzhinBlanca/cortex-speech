@@ -940,7 +940,9 @@ def test_watchdog_and_server_pin_the_release_boundary() -> None:
 
 def test_supervision_accepts_exact_schema_v2_pointer_and_rejects_contract_drift() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        base = Path(raw)
+        # resolve(): _private_watchdog_problem resolves watchdogScript (strict) and requires that
+        # canonical spelling inside the scheduled action; macOS temp is aliased (/var -> /private/var).
+        base = Path(raw).resolve()
         source, candidate, data = base / "source", base / "candidate", base / "data"
         localappdata = base / "local"
         releases = localappdata / "CortexSpeech" / "private-production-releases"

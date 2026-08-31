@@ -687,6 +687,9 @@ class Verify10SupervisorTests(unittest.TestCase):
         checkout_digest = self.verify._checkout_state_digest()
 
         with tempfile.TemporaryDirectory() as temporary:
+            # resolve(): evidence validation compares resolved artifact paths against this root;
+            # macOS temp is aliased (/var -> /private/var), so hand it the canonical spelling.
+            temporary = os.fspath(Path(temporary).resolve())
             manifest_path, manifest = self._write_coverage_phase(
                 Path(temporary) / "valid",
                 sha=sha,
@@ -789,6 +792,10 @@ class Verify10SupervisorTests(unittest.TestCase):
             ("branchless", self._llvm_coverage_payload(branch_count=0), "zero denominator"),
         ):
             with tempfile.TemporaryDirectory() as temporary:
+                # resolve(): _rust_coverage_phase_artifacts inventories resolved paths; an aliased
+                # temp root (macOS /var -> /private/var) would fail the inventory before the
+                # threshold refusal under test is ever reached.
+                temporary = os.fspath(Path(temporary).resolve())
                 invalid_path, invalid_manifest = self._write_coverage_phase(
                     Path(temporary) / label,
                     sha=sha,
@@ -1086,7 +1093,7 @@ class Verify10SupervisorTests(unittest.TestCase):
         environment = self.verify._environment_document()
         classes = tuple(self.verify.OWNER_EVIDENCE_CLASS_GATE_IDS)
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             source_root = root / "source"
             gate_roots: dict[str, Path] = {}
             for index, class_id in enumerate(classes, start=1):
@@ -2902,7 +2909,7 @@ class Verify10SupervisorTests(unittest.TestCase):
         environment = self.verify._environment_document()
         now = datetime.now(timezone.utc).replace(microsecond=0)
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             campaign_root = root / "campaigns"
             gate_root = root / "gate"
             gate_root.mkdir()

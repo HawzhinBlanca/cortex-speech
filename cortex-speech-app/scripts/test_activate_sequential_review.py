@@ -70,7 +70,7 @@ def seed(root: Path, *, foreign_reviewer: bool = False) -> tuple[Path, dict[str,
 
 def test_activation_preserves_history_and_token_but_retires_every_pilot_surface() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, original_session = seed(root)
         pilot_hash = sha256_file(root / POLICY_FILE)
         before_conn = sqlite3.connect(db_path)
@@ -122,7 +122,7 @@ def test_activation_preserves_history_and_token_but_retires_every_pilot_surface(
 def test_cas_and_foreign_reviewer_fail_before_any_live_mutation() -> None:
     for foreign_reviewer, expected_error in ((False, "CAS mismatch"), (True, "Rubar-only takeover")):
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             db_path, _ = seed(root, foreign_reviewer=foreign_reviewer)
             pilot_path = root / POLICY_FILE
             session_before = (root / SESSION_FILE).read_bytes()
@@ -150,7 +150,7 @@ def test_cas_and_foreign_reviewer_fail_before_any_live_mutation() -> None:
 
 def test_interruption_between_session_promotion_and_pilot_retirement_resumes_safely() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        root = Path(raw).resolve()
         db_path, _ = seed(root)
         pilot_hash = sha256_file(root / POLICY_FILE)
         focus = focus_evidence(load_voice_focus_ids(root))
