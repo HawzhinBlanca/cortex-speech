@@ -2631,6 +2631,57 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_selectors_accept_only_opaque_grammar_and_real_directories() {
+        assert_eq!(parse_fixed_timestamp("0000000042"), Some(42));
+        for invalid in ["42", "000000004x"] {
+            assert_eq!(parse_fixed_timestamp(invalid), None, "invalid fixed timestamp passed: {invalid:?}");
+        }
+
+        assert_eq!(parse_pinned_name("pre_restore-2_0000000042"), Some(42));
+        assert_eq!(parse_pinned_name(&format!("{}_0000000042", "a".repeat(64))), Some(42));
+        for invalid in
+            ["missing-timestamp", "_0000000042", "-leading_0000000042", "label.with-dot_0000000042", "label_000000004x"]
+        {
+            assert_eq!(parse_pinned_name(invalid), None, "invalid pinned name passed: {invalid:?}");
+        }
+        assert_eq!(parse_pinned_name(&format!("{}_0000000042", "a".repeat(65))), None);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("snapshots");
+        let rotating = root.join("snapshot_0000000001");
+        let pinned = root.join(PINNED_DIR).join("pre_restore-2_0000000002");
+        std::fs::create_dir_all(&rotating).unwrap();
+        std::fs::create_dir_all(&pinned).unwrap();
+        assert_eq!(resolve_snapshot_dir(tmp.path(), "snapshot_0000000001").unwrap(), rotating);
+        assert_eq!(resolve_snapshot_dir(tmp.path(), "pinned/pre_restore-2_0000000002").unwrap(), pinned);
+
+        for selector in ["snapshot_1", "snapshot_000000000x", "../snapshot_0000000001", "pinned"] {
+            assert_eq!(
+                resolve_snapshot_dir(tmp.path(), selector),
+                Err(format!("invalid snapshot selector '{selector}'")),
+            );
+        }
+        for selector in
+            ["pinned/label/child_0000000002", r"pinned/label\child_0000000002", "pinned/label.with-dot_0000000002"]
+        {
+            assert_eq!(
+                resolve_snapshot_dir(tmp.path(), selector),
+                Err(format!("invalid pinned snapshot selector '{selector}'")),
+            );
+        }
+
+        let unavailable = resolve_snapshot_dir(tmp.path(), "snapshot_0000000003").unwrap_err();
+        assert!(unavailable.starts_with("snapshot 'snapshot_0000000003' is unavailable:"), "{unavailable}");
+
+        let file_selector = "snapshot_0000000004";
+        std::fs::write(root.join(file_selector), b"not a directory").unwrap();
+        assert_eq!(
+            resolve_snapshot_dir(tmp.path(), file_selector),
+            Err(format!("snapshot '{file_selector}' must be a real directory, not a link")),
+        );
+    }
+
+    #[test]
     fn list_snapshots_reports_newest_first_with_counts() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = seeded_db();
