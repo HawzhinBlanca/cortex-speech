@@ -104,7 +104,10 @@ const QUEUE_BATCH: usize = 25;
 /// cap drops the OLDEST entries — never the most recent, which is the only one anyone reaches for.
 const UNDO_DEPTH: usize = 20;
 /// Upper bound on named reviewers — each gets a server thread and its own DB connection.
-const MAX_REVIEWERS: usize = 8;
+/// Raised from 8 by the owner ("change canon: raise max reviewers 8 → 10", 2026-08-31) for the
+/// 10-name roster: 8 working reviewers plus the Iftikhar and Guest links, minted once so the
+/// roster never has to change (a roster change remints every distributed link).
+const MAX_REVIEWERS: usize = 10;
 /// One clip in every [`SPOT_CHECK_EVERY`] served is a SPOT CHECK: a clip whose correct answer is
 /// already known, handed over with its raw (wrong) draft (docs/REMOTE_REVIEW_PLAN.md §2.1).
 ///

@@ -127,7 +127,9 @@ def test_the_watchdog_grace_stays_sized_to_the_measured_startup() -> None:
 def test_spot_check_rate_and_reviewer_cap_hold() -> None:
     couch = _read("src-tauri/src/couch.rs")
     assert "SPOT_CHECK_EVERY: usize = 8" in couch, "1-in-8 spot-check rate is an owner trade-off"
-    assert "MAX_REVIEWERS: usize = 8" in couch, "8 named reviewers is the approved capacity"
+    assert "MAX_REVIEWERS: usize = 10" in couch, (
+        "10 named reviewers is the approved capacity (owner 'change canon: raise max reviewers 8 -> 10', 2026-08-31)"
+    )
 
 
 def test_kbhp_is_hawleri_and_the_tree_declares_dialect() -> None:

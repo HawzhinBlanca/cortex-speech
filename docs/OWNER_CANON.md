@@ -66,7 +66,8 @@ if a checkable pin drifts from what is written here.
   same person may never be two of its opinions), never per person, so throughput scales with however
   many reviewers are working. This supersedes the sequential single-reviewer campaign model for
   deciding sentences.
-- Max 8 named reviewers; per-reviewer tokens; Stop revokes durably.
+- Max 10 named reviewers (owner "change canon: raise max reviewers 8 → 10", 2026-08-31 — was 8);
+  per-reviewer tokens; Stop revokes durably.
 - Dialect routing: **KBHP = Hawleri** (all 32 episodes, owner-confirmed). The organized corpus tree
   declares dialect by folder (`Kurdish Corpora\<dialect>\`). Unmapped sources FAIL CLOSED for
   restricted reviewers. WHO may judge WHAT lives in `<data_dir>/reviewer_dialects.json` — names stay

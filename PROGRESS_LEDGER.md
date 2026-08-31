@@ -12290,3 +12290,17 @@ minimum, by construction, and that is the bar working as written.
 Also tonight: the 7B champion could not restart — both GPUs hold only ~18.7 GB free because
 another resident workload owns ~5 GB each; deliberately NOT evicted without the owner. Drafting
 stays halted (canon hard-stop) until the owner frees VRAM and reruns start_7b_server.ps1.
+
+---
+
+## 2026-08-31 — Canon change: reviewer capacity 8 → 10, by the owner's literal authorization
+
+The owner wrote `change canon: raise max reviewers 8 → 10` (chat, 2026-08-31) for today's
+roster: 8 working reviewers (Hawzhin, Sabat, Rubar, Lamo, Sewa, Roza, Pavel, Alle) plus the
+Iftikhar and Guest links — minted ONCE at 10 so the roster never changes again (a roster change
+remints every distributed link; the whole point is links that never move).
+
+Changed together, per the pin-inversion rule: `couch.rs` MAX_REVIEWERS 8→10 (authorization noted
+at the constant), `docs/OWNER_CANON.md` capacity line, `scripts/test_owner_canon_pins.py` pin.
+Measured: canon pins 12/12 hold; `cargo test --lib couch::` 153/0 (the cap test derives from the
+constant — 10 accepted, 11 refused). Deploys with the wave-2 test expansion commit beneath it.
