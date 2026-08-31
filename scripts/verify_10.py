@@ -9169,6 +9169,217 @@ def _validate_latest_rust_coverage_pointer(
     return manifest
 
 
+# ── Coverage attestation: the workstation measures, CI verifies ──────────────────────────────────
+#
+# Owner decision 2026-08-31: GitHub's 4-core hosted Windows runner cannot complete the instrumented
+# coverage phase inside the workflow policy's 180-minute job cap (measured twice: killed mid-build
+# with no measurement at 2 h and at 2 h 50 m), so CI consumes the hash-bound manifest the release
+# workstation produced for the exact PR head instead of re-measuring on hardware the exe never
+# ships from. The trust boundary is explicit: CI re-verifies everything recomputable from git and
+# the committed contracts (sha ancestry, tree digest, attestation-only diff, registry, toolchain
+# identity, freshness, and the floor arithmetic over the embedded per-metric counts) and trusts the
+# workstation's counts themselves, which stay bound to the retained raw LLVM artifact by sha256.
+# The publisher runs the FULL local phase validation (raw artifacts and journal included) before it
+# will write anything, and refuses any serialized output carrying a private local path.
+
+COVERAGE_ATTESTATION_DIR = REPO_ROOT / "coverage-attestation"
+COVERAGE_ATTESTATION_PATH = COVERAGE_ATTESTATION_DIR / "rust-coverage-attestation.json"
+COVERAGE_ATTESTATION_TYPE = "RustCoverageAttestationV1"
+_ATTESTATION_PYTHON_PLACEHOLDER = "<python>"
+# Both raw and JSON-escaped spellings: the hygiene check runs over json.dumps output, where a
+# Windows path's backslashes arrive doubled (caught by the policy gate's escaped-form probe).
+_ATTESTATION_PRIVATE_PATH_MARKERS = (
+    "C:\\Users",
+    "C:\\\\Users",
+    "C:/Users",
+    "/home/",
+    "/Users/",
+)
+
+
+def _normalized_attestation_registry(registry: dict[str, object]) -> dict[str, object]:
+    normalized = json.loads(json.dumps(registry))
+    template = normalized.get("argvTemplate")
+    if isinstance(template, list) and template:
+        template[0] = _ATTESTATION_PYTHON_PLACEHOLDER
+    return normalized
+
+
+def _normalized_attestation_manifest(manifest: dict[str, object]) -> dict[str, object]:
+    normalized = json.loads(json.dumps(manifest))
+    normalized["commandRegistry"] = _normalized_attestation_registry(
+        normalized.get("commandRegistry", {})
+    )
+    host = normalized.get("environment", {}).get("host")
+    if isinstance(host, dict) and "pythonExecutable" in host:
+        host["pythonExecutable"] = _ATTESTATION_PYTHON_PLACEHOLDER
+    return normalized
+
+
+def _assert_attestation_hygiene(serialized: str) -> None:
+    for marker in _ATTESTATION_PRIVATE_PATH_MARKERS:
+        if marker in serialized:
+            raise EvidenceError(
+                f"coverage attestation would embed a private local path (found {marker!r}); refusing to publish"
+            )
+
+
+def publish_coverage_attestation_main() -> int:
+    expected_sha = _full_git_sha()
+    manifest = _validate_latest_rust_coverage_pointer(
+        RUST_COVERAGE_LATEST,
+        expected_sha=expected_sha,
+        expected_checkout_digest=_checkout_state_digest(),
+    )
+    document = {
+        "schema": 1,
+        "type": COVERAGE_ATTESTATION_TYPE,
+        "publishedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "manifest": _normalized_attestation_manifest(manifest),
+    }
+    serialized = json.dumps(document, ensure_ascii=False, sort_keys=True, indent=1) + "\n"
+    _assert_attestation_hygiene(serialized)
+    COVERAGE_ATTESTATION_DIR.mkdir(parents=True, exist_ok=True)
+    COVERAGE_ATTESTATION_PATH.write_text(serialized, encoding="utf-8")
+    print(
+        "RUST COVERAGE ATTESTATION PUBLISHED "
+        f"sha={expected_sha[:12]} expires={manifest['expiresAt']} -> {COVERAGE_ATTESTATION_PATH}"
+    )
+    print(
+        "Commit this file as its own attestation-only commit on top of the measured SHA; "
+        "CI refuses any other diff between the measured SHA and the head it verifies."
+    )
+    return 0
+
+
+def _attestation_metric_passes(metric: dict[str, object]) -> bool:
+    count = metric.get("count")
+    covered = metric.get("covered")
+    required = metric.get("required_percent")
+    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+        return False
+    if not isinstance(covered, int) or isinstance(covered, bool) or not 0 <= covered <= count:
+        return False
+    if not isinstance(required, (int, float)) or isinstance(required, bool):
+        return False
+    return covered * 100 + 1e-9 >= float(required) * count
+
+
+def verify_coverage_attestation_main() -> int:
+    def fail(reason: str) -> int:
+        print(f"RUST COVERAGE ATTESTATION FAILED: {reason}")
+        return 1
+
+    try:
+        if not COVERAGE_ATTESTATION_PATH.is_file():
+            return fail(
+                "no attestation is committed; produce one on the release workstation with "
+                "--rust-coverage-prerequisite then --publish-coverage-attestation"
+            )
+        document = _load_json_without_duplicate_keys(COVERAGE_ATTESTATION_PATH)
+        if not isinstance(document, dict) or set(document) != {
+            "schema",
+            "type",
+            "publishedAt",
+            "manifest",
+        }:
+            return fail("attestation has a non-canonical envelope")
+        if not _is_exact_integer(document.get("schema"), 1) or document.get("type") != COVERAGE_ATTESTATION_TYPE:
+            return fail("attestation type/schema is not the committed contract")
+        manifest = document.get("manifest")
+        if not isinstance(manifest, dict):
+            return fail("attestation manifest is not an object")
+        measured_sha = str(manifest.get("fullGitSha", ""))
+        if not re.fullmatch(r"[0-9a-f]{40}", measured_sha):
+            return fail("attestation is not bound to a full measurement SHA")
+        head_sha = _full_git_sha()
+        if measured_sha != head_sha:
+            ancestry = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", measured_sha, head_sha],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                check=False,
+            )
+            if ancestry.returncode != 0:
+                return fail("measured SHA is not an ancestor of this head")
+            diff = subprocess.run(
+                ["git", "diff", "--name-only", f"{measured_sha}..{head_sha}"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if diff.returncode != 0:
+                return fail("cannot enumerate the diff from the measured SHA")
+            attestation_prefix = COVERAGE_ATTESTATION_DIR.name + "/"
+            offending = [
+                name
+                for name in diff.stdout.splitlines()
+                if name.strip() and not name.startswith(attestation_prefix)
+            ]
+            if offending:
+                return fail(
+                    "commits after the measured SHA touch more than the attestation: "
+                    + ", ".join(sorted(offending)[:5])
+                )
+        if manifest.get("sourceTreeDigest") != _source_tree_digest_for_sha(measured_sha):
+            return fail("attestation tree digest does not match the measured commit")
+        if manifest.get("complete") is not True or not _is_exact_integer(manifest.get("exitCode"), 0):
+            return fail("attested measurement is not one completed clean run")
+        expected_registry = _normalized_attestation_registry(_rust_coverage_command_registry())
+        if manifest.get("commandRegistry") != expected_registry:
+            return fail("attested command registry differs from this checkout's coverage contract")
+        environment = manifest.get("environment")
+        if not isinstance(environment, dict):
+            return fail("attestation environment is malformed")
+        if environment.get("coverageToolchain") != _expected_rust_coverage_toolchain_identity():
+            return fail("attested toolchain identity differs from the committed toolchain contract")
+        started = _parse_utc(manifest.get("startedAt"), "attested startedAt")
+        ended = _parse_utc(manifest.get("endedAt"), "attested endedAt")
+        expires = _parse_utc(manifest.get("expiresAt"), "attested expiresAt")
+        now = datetime.now(timezone.utc)
+        if ended <= started or expires != ended + timedelta(seconds=RUST_COVERAGE_FRESH_SECONDS):
+            return fail("attested duration/freshness authority is invalid")
+        if ended > now + timedelta(minutes=5):
+            return fail("attested completion time is in the future")
+        if not now < expires:
+            return fail("attestation is stale; re-measure on the release workstation")
+        coverage = manifest.get("coverage")
+        if not isinstance(coverage, dict) or coverage.get("passed") is not True:
+            return fail("attested coverage did not pass its thresholds")
+        metrics = coverage.get("metrics")
+        thresholds = expected_registry.get("thresholds")
+        if not isinstance(metrics, dict) or not isinstance(thresholds, dict) or set(metrics) != set(thresholds):
+            return fail("attested metrics do not cover the contract thresholds")
+        for name, metric in metrics.items():
+            if (
+                not isinstance(metric, dict)
+                or metric.get("required_percent") != thresholds[name]
+                or not _attestation_metric_passes(metric)
+            ):
+                return fail(f"attested metric {name} fails recomputed floor arithmetic")
+        domains = coverage.get("criticalDomains")
+        domain_thresholds = expected_registry.get("criticalDomainThresholds")
+        if not isinstance(domains, dict) or not isinstance(domain_thresholds, dict):
+            return fail("attested critical domains are malformed")
+        for domain, entry in domains.items():
+            if not isinstance(entry, dict):
+                return fail(f"attested domain {domain} is malformed")
+            for metric_name, metric in entry.items():
+                if not isinstance(metric, dict) or not _attestation_metric_passes(metric):
+                    return fail(f"attested domain {domain}/{metric_name} fails recomputed floor arithmetic")
+        artifact_sha = coverage.get("artifactSha256")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(artifact_sha or "")):
+            return fail("attestation does not bind a raw LLVM artifact identity")
+    except EvidenceError as error:
+        return fail(str(error))
+    print(
+        "RUST COVERAGE ATTESTATION VERIFIED "
+        f"sha={measured_sha[:12]} expires={manifest['expiresAt']} artifact={str(artifact_sha)[:12]}"
+    )
+    return 0
+
+
 def rust_coverage_prerequisite_main() -> int:
     """Run the slow coverage campaign as one no-retry, self-supervised prerequisite phase."""
 
@@ -12610,6 +12821,22 @@ def main():
         help="run the separately supervised no-retry Rust coverage prerequisite and publish only its immutable completed pointer",
     )
     ap.add_argument(
+        "--publish-coverage-attestation",
+        action="store_true",
+        help=(
+            "fully re-validate the latest completed coverage pointer for the current HEAD and write "
+            "the normalized attestation CI verifies (commit it as its own attestation-only commit)"
+        ),
+    )
+    ap.add_argument(
+        "--verify-coverage-attestation",
+        action="store_true",
+        help=(
+            "CI mode: verify the committed coverage attestation against this head (sha ancestry, "
+            "attestation-only diff, tree digest, registry/toolchain contracts, freshness, floors)"
+        ),
+    )
+    ap.add_argument(
         "--verifier-fault-campaign",
         action="store_true",
         help=(
@@ -12680,6 +12907,12 @@ def main():
         ):
             ap.error("--rust-coverage-prerequisite cannot be combined with another verifier mode")
         return rust_coverage_prerequisite_main()
+    if args.publish_coverage_attestation and args.verify_coverage_attestation:
+        ap.error("--publish-coverage-attestation and --verify-coverage-attestation are exclusive")
+    if args.publish_coverage_attestation:
+        return publish_coverage_attestation_main()
+    if args.verify_coverage_attestation:
+        return verify_coverage_attestation_main()
     if args.proof_manifest is not None and not args.require_certifying_proof:
         ap.error("--proof-manifest requires --require-certifying-proof")
     if args.expected_sha is not None and args.proof_manifest is None:

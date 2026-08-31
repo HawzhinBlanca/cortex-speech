@@ -43,44 +43,24 @@ jobs:
         run: python "${{ github.workspace }}/scripts/verify_10.py" --static
 
   rust-coverage-prerequisite:
+    # Owner decision 2026-08-31: hosted 4-core Windows runners cannot complete the instrumented
+    # coverage phase inside the 180-minute policy cap (measured twice, killed mid-build with no
+    # measurement), so CI verifies the hash-bound attestation the release workstation publishes
+    # for the exact head instead of re-measuring on hardware the exe never ships from. The
+    # verifier recomputes everything git and the committed contracts can prove: sha ancestry with
+    # an attestation-only diff, the measured commit's tree digest, registry/toolchain contract
+    # equality, freshness, and the floor arithmetic over the embedded per-metric counts.
     name: Rust Coverage Prerequisite
     runs-on: windows-latest
-    timeout-minutes: 180
-    defaults:
-      run:
-        working-directory: cortex-speech-app
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: cortex-speech-app/package-lock.json
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.12' }
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Install exact nightly used only for branch coverage
-        run: rustup toolchain install nightly-2026-07-11 --profile minimal --component llvm-tools-preview
-      - name: Cache exact Rust dependency inputs
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            cortex-speech-app/src-tauri/target
-          key: windows-coverage-cargo-${{ hashFiles('cortex-speech-app/src-tauri/Cargo.lock', 'cortex-speech-app/scripts/rust_coverage_toolchain.json') }}
-      - name: Install pinned coverage tool
-        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
-      - name: Provision locked build inputs
-        run: |
-          npm ci
-          npm run fetch-models
-          npm run build
-          cargo fetch --locked --manifest-path src-tauri/Cargo.toml
-      - name: Run separately supervised, no-retry coverage authority
-        run: python "${{ github.workspace }}/scripts/verify_10.py" --rust-coverage-prerequisite
+      - name: Verify the workstation-published coverage attestation for this head
+        run: python "${{ github.workspace }}/scripts/verify_10.py" --verify-coverage-attestation
 
   windows-release-gate:
     name: Windows Release Gate

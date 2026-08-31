@@ -12362,3 +12362,37 @@ a6de3c17; queue clip 1 via the funnel is now be2827bb with verified=0/decision=n
 paid canonical path); playback/start 200 + audio 206/full; probe 4/4 (10/10 links, 10 queues with
 clips, continuity intact). Gates: fence-scope policy 4/4 (new pin bites), consensus canon pins
 green, review_pool+couch::queue tests 37/0.
+
+---
+
+## 2026-08-31 — First CI contact survived, and CI's coverage authority moved to where the exe ships from
+
+The reconciled line's first-ever push (PR #73) put every gate through its first honest
+cross-platform run. Outcomes, each measured:
+
+1. **Linux/macOS smokes green** after two fix rounds: 9 scripts carried Windows-only assumptions
+   (WinDLL, Known-Folder resolution), then macOS exposed the symlinked-TMPDIR alias class and two
+   real portable defects (zombie processes read as live in the supervisor takeover check; JSON
+   depth gating that leaned on interpreter RecursionError). Fixture paths resolved, guards
+   untouched, every fix proven red-to-green under a Linux darwin-analogue harness; Windows runs
+   everything with zero new skips.
+2. **The CI coverage job could never green**: hosted 4-core Windows runners were killed mid-build
+   at 2 h and again at 2 h 50 m (the workflow policy's 180-minute cap) without producing a
+   measurement — a merge chain structurally stuck at any coverage percentage. Owner decision:
+   CI now VERIFIES the workstation's hash-bound coverage attestation for the exact head
+   (`--publish-coverage-attestation` / `--verify-coverage-attestation`): sha ancestry with an
+   attestation-only diff, tree digest, registry/toolchain contract equality, freshness, and
+   recomputed floor arithmetic. Ten fail-closed proofs in test_coverage_attestation_policy.py —
+   which immediately caught a real gap (JSON escaping hid the Windows profile-path marker from
+   the hygiene scan). The workflow-policy pin was inverted deliberately in the same change; the
+   tag-release flow keeps measuring for itself.
+3. **Coverage wave 3 landed**: ~90 tests across the zero-coverage surfaces — both probe bins and
+   both admin bins (30 bin tests, mechanical extracts only), the engine layer
+   (asr/engine_runtime/models incl. the per-file model-resolution proof), the composition roots
+   (pipeline root + lib.rs incl. the consent-downgrade proof), and review_campaign's refusal
+   matrix. Combined gate: lib 2283/0 after one honest correction (std mutex poison flags survive
+   recovery; the test now asserts re-acquirability through the recovering accessor), all five
+   bins green, policy suite 141/141 with the new attestation gate counted.
+
+Reviewers were untouched all evening: 156 decisions today across five reviewers, serving probe
+4/4 green throughout.

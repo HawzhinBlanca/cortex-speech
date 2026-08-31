@@ -358,32 +358,47 @@ def test_rust_quality_authorities_are_split_mandatory_and_fail_closed() -> None:
         "--profile minimal --component llvm-tools-preview"
     )
     prerequisite = 'python "${{ github.workspace }}/scripts/verify_10.py" --rust-coverage-prerequisite'
+    attestation = 'python "${{ github.workspace }}/scripts/verify_10.py" --verify-coverage-attestation'
     architecture = "python scripts/rust_quality_gate.py architecture"
     for name in ["ci.yml", "release.yml"]:
         text = workflow_steps_text(name)
-        if text.count(install) != 1:
-            raise AssertionError(f"{name} must install exactly one pinned cargo-llvm-cov authority")
-        if text.count(install_toolchain) != 1:
-            raise AssertionError(f"{name} must install exactly one date-pinned coverage nightly")
         if "rustup toolchain install nightly " in text or "toolchain: nightly" in text:
             raise AssertionError(f"{name} must never resolve coverage through rolling nightly")
-        assert_contains(
-            text,
-            "cortex-speech-app/scripts/rust_coverage_toolchain.json",
-            f"{name} coverage cache authority",
-        )
-        if text.count(prerequisite) != 1:
-            raise AssertionError(f"{name} must run exactly one supervised Rust coverage prerequisite")
         if text.count(architecture) != 1:
             raise AssertionError(f"{name} must run exactly one independent Rust architecture gate")
-        for required in (
-            "cargo fetch --locked --manifest-path src-tauri/Cargo.toml",
-            "npm run fetch-models",
-            "npm run build",
-        ):
-            assert_contains(text, required, f"{name} coverage provisioning")
         if "coverage-json" in text or "continue-on-error" in text:
             raise AssertionError(f"{name} contains a non-certifying or non-blocking Rust truth path")
+    # Owner decision 2026-08-31: PR CI VERIFIES the workstation-published, hash-bound attestation
+    # (hosted 4-core runners were measured twice failing to fit the instrumented phase inside the
+    # 180-minute job cap, producing no measurement at all — a merge chain that could never green).
+    # The verification itself stays mandatory and fail-closed; only WHERE the measurement runs
+    # moved, to the machine the exe actually ships from.
+    ci_text = workflow_steps_text("ci.yml")
+    if ci_text.count(attestation) != 1:
+        raise AssertionError("ci.yml must verify exactly one workstation coverage attestation")
+    if prerequisite in ci_text or install in ci_text or install_toolchain in ci_text:
+        raise AssertionError(
+            "ci.yml must not re-measure coverage on hosted runners — it verifies the attestation"
+        )
+    # The tag-release flow still measures for itself, with the pinned authorities.
+    release_text = workflow_steps_text("release.yml")
+    if release_text.count(install) != 1:
+        raise AssertionError("release.yml must install exactly one pinned cargo-llvm-cov authority")
+    if release_text.count(install_toolchain) != 1:
+        raise AssertionError("release.yml must install exactly one date-pinned coverage nightly")
+    assert_contains(
+        release_text,
+        "cortex-speech-app/scripts/rust_coverage_toolchain.json",
+        "release.yml coverage cache authority",
+    )
+    if release_text.count(prerequisite) != 1:
+        raise AssertionError("release.yml must run exactly one supervised Rust coverage prerequisite")
+    for required in (
+        "cargo fetch --locked --manifest-path src-tauri/Cargo.toml",
+        "npm run fetch-models",
+        "npm run build",
+    ):
+        assert_contains(release_text, required, "release.yml coverage provisioning")
     assert_contains(release_docs(), install_toolchain, "docs/RELEASE.md coverage nightly")
 
     ci = workflow_steps_text("ci.yml")
@@ -396,13 +411,13 @@ def test_rust_quality_authorities_are_split_mandatory_and_fail_closed() -> None:
         assert_contains(ci, guard, "ci.yml coverage prerequisite consumer")
     prerequisite_job = ci.find("  rust-coverage-prerequisite:")
     windows_job = ci.find("  windows-release-gate:")
-    prerequisite_run = ci.find("--rust-coverage-prerequisite", prerequisite_job)
+    attestation_run = ci.find("--verify-coverage-attestation", prerequisite_job)
     refusal = ci.find("Windows Release Gate refuses", windows_job)
     architecture_run = ci.find(architecture, windows_job)
-    if min(prerequisite_job, windows_job, prerequisite_run, refusal, architecture_run) < 0 or not (
-        prerequisite_job < prerequisite_run < windows_job < refusal < architecture_run
+    if min(prerequisite_job, windows_job, attestation_run, refusal, architecture_run) < 0 or not (
+        prerequisite_job < attestation_run < windows_job < refusal < architecture_run
     ):
-        raise AssertionError("CI must complete coverage before the independently blocking architecture/source gate")
+        raise AssertionError("CI must verify coverage authority before the independently blocking architecture/source gate")
 
     release = workflow_steps_text("release.yml")
     for guard in (
