@@ -12853,3 +12853,38 @@ branch each from `db/history.rs` and `jury/learning.rs`, and added one each in `
 4,866 lines, 8,558 regions, and 1,179 functions; critical branch deficits are review 157, payment
 147, playback 119, restore 250, and IPC 486. Production, live data, scheduled tasks, release pointers,
 credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 32: pinned recovery-state type refusal
+
+The archival pre-migration writer now has direct parity proof with the rotating writer's recovery-state
+object-type boundary. One production-path regression places a directory first at the paid-pilot policy
+path and then at the first generic optional-state path. Both pinned-snapshot cases fail closed instead of
+recording intentional absence, and both remove their private staging directory without promoting a pin.
+Production snapshot and restore behavior is unchanged.
+
+The focused proof passed 1/1 across both object-type cases, the complete snapshot namespace passed
+46/46, stable rustfmt passed, and strict stable Clippy passed all targets/features with `-D warnings`.
+Product commit `2d6a1f61810118374c7b56b0d35f0e6beb25e73d` then received an exact pinned
+all-target measurement: 1,845 library tests passed with 0 failures and 8 ignores, importer 14/14,
+ASR containment 1/1, audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri
+integration 1/1, shell smoke 1/1, user-data 2/2, and every Criterion target green. The certifying
+wrapper exited 1 solely because coverage thresholds remain unmet.
+
+Artifact `c13a7df864084a83a8a91ce87f9a2a04` (SHA-256
+`20fad3bcde3f374c1ea5bd9533515e9b24ba1ee6c8e3905f9894729adcfe34fa`) proves snapshot
+branches moved 322/414 to 326/418 and restore moved 1,126/1,528 to 1,130/1,532. The target
+supplied four covered branches while introducing four measured branches, leaving uncovered snapshot
+branches at 92 and uncovered restore branches at 402; the restore threshold deficit nevertheless
+improved from 250 to 249. Overall coverage is branches 7,836/12,837 (61.04%), lines
+76,773/96,036 (79.94%), regions 136,578/170,719 (80.00%), and functions 6,529/9,634
+(67.77%). Unrelated run variance removed two covered branches from `commands.rs`, one from
+`couch/lifecycle.rs`, and one from `normalizer.rs`, while adding one in `jury/learning.rs`, for a
+net loss of three. Remaining minimum deficits are 2,434 overall branches, 4,858 lines, 8,534
+regions, and 1,179 functions; critical branch deficits are review 157, payment 147, playback 119,
+restore 249, and IPC 488.
+
+A separate verifier-hygiene finding remains: after the terminal threshold failure, the generated
+`latest-rust-coverage-prerequisite.json` pointer still reported `RUNNING` even though the run's event
+stream recorded `phase_end`, exit 1, no timeout, and verdict `FAIL`. No generated pointer was manually
+rewritten; its terminal-state publication needs its own bounded remediation. Production, live data,
+scheduled tasks, release pointers, credentials, and GPU/model configuration were untouched.
