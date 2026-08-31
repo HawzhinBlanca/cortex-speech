@@ -12824,3 +12824,32 @@ minimum deficits are 2,434 overall branches, 4,874 lines, 8,553 regions, and 1,1
 critical branch deficits are review 157, payment 147, playback 119, restore 251, and IPC 486.
 Production, live data, scheduled tasks, release pointers, credentials, and GPU/model configuration
 were untouched.
+
+## 2026-08-31 — Reliability iteration 31: non-file recovery-state refusal
+
+The next deterministic snapshot cluster was source object-type authority. One production-path
+regression places a directory first at the paid-pilot policy path and then at the first generic
+optional-state path. Both cases fail closed instead of becoming intentional absence, and both prove
+the writer removes its private staging tree without promoting any snapshot. Production snapshot and
+restore behavior is unchanged.
+
+The focused proof passed 1/1 across both object-type cases, the complete snapshot namespace passed
+45/45, stable rustfmt passed, and strict stable Clippy passed all targets/features with `-D warnings`.
+Product commit `3b5234586af37dbeb8082bfe377edb2ea9883053` then received an exact pinned all-target measurement:
+1,844 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `7533e5233554425aad315704b7bc4b7b` (SHA-256
+`623e9779b6d53c459cb186f7f0fcccb53cf92c8e32928d02b268b28c447224d3`) proves snapshot branches
+moved 317/410 to 322/414 and restore moved 1,121/1,524 to 1,126/1,528, reducing uncovered snapshot
+branches from 93 to 92 and uncovered restore branches from 403 to 402. Overall coverage is branches
+7,835/12,833 (61.05%), lines 76,751/96,020 (79.93%), regions 136,524/170,684 (79.99%), and
+functions 6,528/9,633 (67.77%). The target supplied five covered snapshot branches while its stronger
+two-case regression introduced four measured branches. Unrelated run variance removed one covered
+branch each from `db/history.rs` and `jury/learning.rs`, and added one each in `normalizer.rs` and
+`review_pilot.rs`, for a net zero change. Remaining minimum deficits are 2,432 overall branches,
+4,866 lines, 8,558 regions, and 1,179 functions; critical branch deficits are review 157, payment
+147, playback 119, restore 250, and IPC 486. Production, live data, scheduled tasks, release pointers,
+credentials, and GPU/model configuration were untouched.
