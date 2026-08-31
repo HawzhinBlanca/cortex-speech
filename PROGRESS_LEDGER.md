@@ -12507,3 +12507,33 @@ line. Remaining minimum deficits are 2,481 overall branches, 5,015 lines, 8,826 
 functions; critical branch deficits are review 157, payment 147, playback 119, restore 296, and IPC
 486. Production, live data, scheduled tasks, release pointers, credentials, and GPU/model
 configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 21: snapshot selector authority boundaries
+
+The next reachable snapshot cluster was the opaque selector grammar and real-directory admission
+boundary. One regression proves fixed timestamps require exactly ten decimal digits; pin labels are
+non-empty, at most 64 bytes, begin alphanumerically, and otherwise contain only alphanumerics,
+underscore, or hyphen. It exercises both valid rotating and pinned directories, rejects short and
+nondigit timestamps, missing/empty/oversized/invalid pin labels, forward- and backslash nesting,
+arbitrary selectors, valid-but-unavailable selectors, and a selector resolving to a file. The
+directory-symlink disjunct remains intentionally unclaimed because creating directory symlinks is
+privilege-dependent on Windows; the production refusal remains intact.
+
+The focused proof passed 1/1, the complete snapshot suite passed 32/32, stable rustfmt passed, and
+strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`251e2aeee78751b8ac6f91c702eb8440134ccfce` then received an exact pinned all-target measurement:
+1,835 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `707a6c1151174d19abafb42f4c8df83d` (SHA-256
+`9fa1158691d609dc9ae59296c7fb5ccc2db84176d9d1c2bd96223b2465b06fc9`) proves snapshot branches
+moved 256/392 to 264/392 and restore moved 1,060/1,506 to 1,068/1,506, reducing uncovered restore
+branches from 446 to 438. Overall coverage is branches 7,776/12,811 (60.70%), lines
+76,194/95,533 (79.76%), regions 135,357/169,621 (79.80%), and functions 6,493/9,608 (67.58%).
+The target supplied all eight net branch gains; unrelated run variance was audio +1, Couch lifecycle
++1, jury learning -1, and normalizer -1. Remaining minimum deficits are 2,473 overall branches,
+5,010 lines, 8,821 regions, and 1,194 functions; critical branch deficits are review 157, payment
+147, playback 119, restore 288, and IPC 486. Production, live data, scheduled tasks, release
+pointers, credentials, and GPU/model configuration were untouched.
