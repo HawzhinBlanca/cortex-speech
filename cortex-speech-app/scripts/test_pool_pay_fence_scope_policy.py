@@ -110,9 +110,32 @@ def test_blinded_second_pass_campaign_is_also_fenced() -> None:
     print("[OK] the blinded second-pass branch carries the pay fence and answers 503")
 
 
+def test_the_queue_never_serves_what_the_fence_refuses() -> None:
+    """The fence alone is not enough: on 2026-08-31 the queue's decision-first ordering put the three
+    OLDEST already-canonical pool clips at every reviewer's position 1, the fence 503'd their saves,
+    and skip routes into the same fence — all ten reviewers were walled out of a 19,905-clip savable
+    backlog on the reviewers' first day. Served work whose save is refused is a contradiction: the
+    queue must mirror the fence, exactly as wide (cfg!(not(test)), so the pool tests that decide via
+    `api_pool_decision` still see these clips served). When an owner pay contract prices pool work,
+    the fence and this mirror must be lifted TOGETHER."""
+    pool = (SRC.parent / "review_pool.rs").read_text(encoding="utf-8")
+    if "PAY-FENCE MIRROR" not in pool:
+        raise AssertionError(
+            "review_pool.rs lost the queue-side pay-fence mirror — already-canonical pool clips will "
+            "be served again while their saves answer 503, walling reviewers at the queue front"
+        )
+    if "if cfg!(not(test)) && already_canonical {" not in pool:
+        raise AssertionError(
+            "the queue mirror must be exactly as wide as the fence: production-only via cfg!(not(test)), "
+            "keyed on the same already-canonical predicate the fence refuses"
+        )
+    print("[OK] the pool queue never serves a clip whose save the pay fence refuses")
+
+
 if __name__ == "__main__":
     test_startup_does_not_refuse_on_a_pool_row()
     test_decision_fence_is_scoped_to_the_unpaid_second_pass()
     test_blinded_second_pass_campaign_is_also_fenced()
+    test_the_queue_never_serves_what_the_fence_refuses()
     print("PASS: pool pay-fence scope policy")
     sys.exit(0)

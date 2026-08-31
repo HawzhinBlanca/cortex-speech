@@ -1154,7 +1154,8 @@ pub fn pending_segment_ids(
     let mut statement = db
         .connection()
         .prepare(
-            "SELECT segment.id, segment.audio_path, COALESCE(segment.created_at, '')
+            "SELECT segment.id, segment.audio_path, COALESCE(segment.created_at, ''),
+                    (segment.verified=1 AND segment.human_decision IS NOT NULL)
                FROM review_pool_members member
                JOIN speech_segments segment ON segment.id=member.segment_id
               WHERE member.pool_id=?1
@@ -1168,13 +1169,25 @@ pub fn pending_segment_ids(
         .map_err(|error| format!("review pool queue cannot be prepared: {error}"))?;
     let rows = statement
         .query_map([&pool.pool_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, bool>(3)?))
         })
         .map_err(|error| format!("review pool queue cannot be read: {error}"))?;
     let mut pending: Vec<(usize, String, String)> = Vec::new();
     for row in rows {
-        let (segment_id, audio_path, created_at) =
+        let (segment_id, audio_path, created_at, already_canonical) =
             row.map_err(|error| format!("review pool row is unreadable: {error}"))?;
+        // PAY-FENCE MIRROR (decisions.rs `already_canonical` → 503 PAY_POLICY_REQUIRED): production
+        // refuses a pool observation on a clip that already carries a canonical human answer, because
+        // `record_decision` never writes `review_compensation_ledger` and evidenced work must never
+        // be taken for free. The queue must therefore never SERVE such a clip — 2026-08-31 the three
+        // oldest fenced clips sat at every queue's front and skip routes into the same fence, walling
+        // all ten reviewers out of a 19,905-clip savable backlog. `cfg!(not(test))` keeps the mirror
+        // exactly as wide as the fence itself (tests decide pool clips via `api_pool_decision`). The
+        // day an owner pay contract prices pool work, lift this mirror WITH the fence — the scope
+        // pin in test_pool_pay_fence_scope_policy.py ties them together.
+        if cfg!(not(test)) && already_canonical {
+            continue;
+        }
         let coverage = reviewers.get(&segment_id);
         if coverage.is_some_and(|coverage| coverage.seen.contains(&reviewer)) {
             continue;
