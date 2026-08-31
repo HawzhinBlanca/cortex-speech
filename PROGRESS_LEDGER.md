@@ -12436,3 +12436,44 @@ passed, and strict stable Clippy passed all targets/features with `-D warnings`.
 `b161796d0ea25e90525413b643d20c869757fc3a` is ready for the ledger commit and exact push. No
 coverage delta is claimed before exact clean-SHA measurement. Production and scheduled tasks were
 untouched.
+
+## 2026-08-31 — Reliability iteration 19: snapshot manifest filename boundaries
+
+Iteration 18's exact serialized measurement at pushed ledger commit
+`f39daf8c4343a9263b893b2d9f1b501271011804` completed 1,832 library tests with 0 failures and 8
+ignores, importer 14/14, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and all Criterion targets. Artifact
+`31a98f84537a4f4089ca25a7952c51d1` (SHA-256
+`3ddd39661a115deacb694e0749daec9ca27286d85ba83afee9fa32af9082735a`) moved overall branch
+coverage to 60.46% and restore to 68.86% (476 to 469 uncovered). The active effects convention
+fell from 77 to 70 uncovered branches. The wrapper remained red solely at locked thresholds. P1
+remains red, P2 green, and P0 unknown because the production heartbeat is absent.
+
+The next highest restore-critical debt was snapshot manifest filename hardening. A new private-
+contract regression proves every reachable unsafe-shape arm: empty/current/parent names,
+case-insensitive manifest self-reference, rooted and nested paths, control and Windows-special
+characters, trailing space or dot, classic reserved devices, and numbered COM/LPT devices. It also
+proves valid boundaries including COM0, LPT0, longer non-device prefixes, ordinary database/config
+files, and a non-self manifest-like name. The explicit separator predicate remains structurally
+unreachable because rooted or multi-component paths are rejected by the preceding component guards;
+the test does not falsely claim it.
+
+The focused proof passed 1/1, the complete snapshot suite passed 30/30, stable rustfmt passed, and
+strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`43cafc8e90e17f5a3fd3d2ae88890e1feadbfa77` then received an exact pinned all-target measurement:
+1,833 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `302c2012afb841f398ae5c7c8dafc4cb` (SHA-256
+`e8d2c0c794bfb3f1669b1dd219f69c348eecb94fab86187f20be4f8b72576729`) proves snapshot branches
+moved 233/392 to 247/392 and restore moved 1,037/1,506 to 1,051/1,506, reducing uncovered restore
+branches from 469 to 455. Overall coverage is branches 7,761/12,811 (60.58%), lines
+76,090/95,444 (79.72%), regions 135,168/169,454 (79.77%), and functions 6,485/9,606 (67.51%).
+The target supplied all 14 restore gains; unrelated run variance added one branch each in
+`atomic_file.rs` and `jury/learning.rs`, while `normalizer.rs` varied by one covered line in the
+opposite direction. Remaining minimum deficits are 2,488 overall branches, 5,038 lines, 8,868
+regions, and 1,200 functions; critical branch deficits are review 157, payment 147, playback 119,
+restore 305, and IPC 486. Production, live data, scheduled tasks, release pointers, credentials,
+and GPU/model configuration were untouched.
