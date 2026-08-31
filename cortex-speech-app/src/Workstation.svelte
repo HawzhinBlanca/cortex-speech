@@ -235,6 +235,7 @@
     loadSettings: data.loadSettings,
     restoreAndApplySession: session.restoreAndApply,
     reconcileImportRecovery: importRecovery.reconcile,
+    resolveImportRecoveryWithoutBackend: () => recovery.resolveImportRecoveryWithoutBackend(),
     flushAutosave: autosave.flush,
     flushAutosaveAsync: autosave.flushAsync,
     clearSessionTimer: session.clearTimer,

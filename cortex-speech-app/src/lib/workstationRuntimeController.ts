@@ -37,6 +37,7 @@ type RuntimeDependencies = {
   loadSettings: () => Promise<void>;
   restoreAndApplySession: () => Promise<void>;
   reconcileImportRecovery: () => Promise<void>;
+  resolveImportRecoveryWithoutBackend: () => void;
   flushAutosave: () => void;
   flushAutosaveAsync: () => Promise<void>;
   clearSessionTimer: () => void;
@@ -106,6 +107,7 @@ export function createWorkstationRuntimeController(dependencies: RuntimeDependen
     if (!available) {
       segments.set([]);
       dependencies.setSegmentsLoading(false);
+      dependencies.resolveImportRecoveryWithoutBackend();
       statusMessage.set(get(t)('ready'));
       return;
     }

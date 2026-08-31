@@ -145,6 +145,8 @@ describe('App desktop runtime guard', () => {
   it('starts in browser mode without invoking Tauri and disables desktop-only actions', async () => {
     render(App);
 
+    // The strangler decomposition moved the file actions into the header overflow menu.
+    await fireEvent.click(await screen.findByTestId('header-overflow-btn'));
     const openButton = await screen.findByRole('button', { name: 'Open audio file' });
 
     await waitFor(() => expect(invokeMock).not.toHaveBeenCalled());
@@ -159,7 +161,12 @@ describe('App desktop runtime guard', () => {
   it('blocks HF training export when the latest dataset promotion stage is blocked', async () => {
     window.__TAURI__ = {};
     invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_segments_page')
+        return Promise.resolve({ items: [segmentFixture()], total: 1, nextCursor: null });
       if (command === 'get_segments') return Promise.resolve([segmentFixture()]);
+      if (command === 'get_interrupted_import') return Promise.resolve(null);
+      if (command === 'get_quarantine_notice')
+        return Promise.resolve({ quarantinedFileCount: 0, snapshotCount: 0 });
       if (command === 'list_agent_import_reports')
         return Promise.resolve([blockedAgentReportFixture()]);
       if (command === 'list_agent_stage_events') return Promise.resolve([]);
@@ -194,6 +201,7 @@ describe('App desktop runtime guard', () => {
 
     render(App);
 
+    await fireEvent.click(await screen.findByTestId('header-overflow-btn'));
     const hfExport = await screen.findByTestId('hf-export-btn');
 
     await waitFor(() =>
@@ -213,6 +221,7 @@ describe('App desktop runtime guard', () => {
   it('opens settings in browser mode without persisting through Tauri', async () => {
     render(App);
 
+    await fireEvent.click(await screen.findByTestId('header-overflow-btn'));
     await fireEvent.click(await screen.findByRole('button', { name: 'Open settings' }));
     expect(await screen.findByTestId('settings-panel')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'AI Models' })).toBeDisabled();

@@ -102,6 +102,13 @@ export function createWorkstationRecoveryController(dependencies: RecoveryDepend
     get importRecoveryAuthority() {
       return importRecoveryAuthority;
     },
+    // Browser mode has no backend and therefore no durable import journal to reconcile — authority
+    // is vacuously known-empty. Without this, the mount early-return left it 'checking' forever and
+    // the recovery region rendered a permanently busy resume banner in a mode that cannot resume.
+    resolveImportRecoveryWithoutBackend() {
+      interruptedImport = null;
+      importRecoveryAuthority = 'known';
+    },
     get importStarting() {
       return importStarting;
     },
