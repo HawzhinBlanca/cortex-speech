@@ -12759,3 +12759,37 @@ in `audio.rs` and added one in `normalizer.rs`. Remaining minimum deficits are 2
 branches, 4,909 lines, 8,626 regions, and 1,184 functions; critical branch deficits are review 157,
 payment 147, playback 119, restore 257, and IPC 486. Production, live data, scheduled tasks, release
 pointers, credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 29: live pilot-session identity and cache authority
+
+The next reachable snapshot cluster was the live `couch_session.json` admission boundary inside the
+private active-pilot authority validator. The existing durable-cache regression now also rejects a
+session bound to a different database, an unavailable recorded or expected database path, an absent
+or different pilot policy, a mismatched reviewer roster, an invalid segment identity, an unauthorized
+reviewer, a duplicate case-insensitive hidden key, malformed JSON, and a session path that is present
+but unreadable. It separately proves that a missing session is legal because the database remains the
+durable authority, and that one exact live session backed by its durable grant is accepted. Production
+snapshot and restore behavior is unchanged.
+
+The first focused run reached the intended unauthorized-reviewer refusal but failed because its
+assertion expected older wording. After matching the current exact error contract, the focused proof
+passed 1/1, the complete snapshot namespace passed 43/43, stable rustfmt passed, and strict stable
+Clippy passed all targets/features with `-D warnings`. Product commit
+`5790c0618615c57232b07cdc940fe5dde23abf76` then received an exact pinned all-target measurement:
+1,842 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `0b74c4e02868488c84ffc670c0faa706` (SHA-256
+`a04bf599c822fc02184d28eecdf5a27b3cb0a717c413a3082df1fe3a3fa76cd1`) proves snapshot branches
+moved 311/410 to 316/410 and restore moved 1,115/1,524 to 1,120/1,524, reducing uncovered snapshot
+branches from 99 to 94 and uncovered restore branches from 409 to 404. Overall coverage is branches
+7,830/12,829 (61.03%), lines 76,711/95,991 (79.91%), regions 136,450/170,617 (79.97%), and
+functions 6,526/9,631 (67.76%). The target supplied five covered snapshot branches with no new
+snapshot branch denominator. Unrelated run variance added one covered branch in `atomic_file.rs`,
+removed one in `couch/lifecycle.rs`, added two in `couch/queue_audio.rs`, and removed one in
+`review_pilot.rs`, for a net gain of one. Remaining minimum deficits are 2,434 overall branches,
+4,882 lines, 8,575 regions, and 1,179 functions; critical branch deficits are review 157, payment
+147, playback 119, restore 252, and IPC 486. Production, live data, scheduled tasks, release
+pointers, credentials, and GPU/model configuration were untouched.
