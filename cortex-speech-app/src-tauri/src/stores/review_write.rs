@@ -70,6 +70,17 @@ struct TechnicalProbeRegistry {
 static TECHNICAL_PROBE_REGISTRY: LazyLock<Mutex<TechnicalProbeRegistry>> =
     LazyLock::new(|| Mutex::new(TechnicalProbeRegistry::default()));
 
+/// The technical-probe registry is process-global, so tests that intentionally occupy it or drive
+/// a real probe must share one test-only boundary. Otherwise Rust's parallel test runner can turn a
+/// test of a later database failure into an unrelated `ProbeBusy` refusal.
+#[cfg(test)]
+static TECHNICAL_PROBE_TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn serialize_technical_audio_probe_test() -> std::sync::MutexGuard<'static, ()> {
+    TECHNICAL_PROBE_TEST_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn lock_probe_registry() -> std::sync::MutexGuard<'static, TechnicalProbeRegistry> {
     TECHNICAL_PROBE_REGISTRY.lock().unwrap_or_else(|poisoned| {
         tracing::warn!("Recovering poisoned technical-audio probe registry");
@@ -1024,19 +1035,9 @@ mod tests {
         assert!(source.is_file());
     }
 
-    /// The technical-probe registry is a process-global static with a hard concurrency cap of
-    /// TECHNICAL_PROBE_MAX_CONCURRENCY, and `cargo test` runs these tests in parallel. Without this
-    /// lock a sibling test can hold a slot while
-    /// `technical_probe_strictly_limits_distinct_blocking_sources` is mid-setup: its second worker is
-    /// then refused with ProbeBusy and returns WITHOUT reaching `started.wait()`, so its 3-party
-    /// Barrier waits forever for a party that will never arrive. A std Barrier has no timeout, so the
-    /// whole suite hangs — which is exactly how the Rust coverage prerequisite burned its full 7200s
-    /// budget on CI while reporting nothing. Same idiom as GLOBAL_SESSION_LOCK in couch.rs.
-    static PROBE_REGISTRY_SERIAL: Mutex<()> = Mutex::new(());
-
     #[test]
     fn technical_probe_strictly_limits_distinct_blocking_sources() {
-        let _serial = PROBE_REGISTRY_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = serialize_technical_audio_probe_test();
         let started = Arc::new(std::sync::Barrier::new(3));
         let release = Arc::new(std::sync::Barrier::new(3));
         let mut workers = Vec::new();
@@ -1082,7 +1083,7 @@ mod tests {
 
     #[test]
     fn a_follower_shares_the_leaders_flight_and_never_runs_its_own_probe() {
-        let _serial = PROBE_REGISTRY_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = serialize_technical_audio_probe_test();
         let started = Arc::new(std::sync::Barrier::new(2));
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
 
@@ -1108,9 +1109,9 @@ mod tests {
         started.wait();
         std::thread::spawn(move || {
             // Hold the leader's slot as BRIEFLY as the test allows. The probe registry is a
-            // process-global with only TECHNICAL_PROBE_MAX_CONCURRENCY slots, and tests in other
-            // modules (which cannot take PROBE_REGISTRY_SERIAL) probe through it too -- measured
-            // 2026-08-29, a full-suite run refused
+            // process-global with only TECHNICAL_PROBE_MAX_CONCURRENCY slots. Every test that
+            // drives it now shares serialize_technical_audio_probe_test; the short hold still keeps
+            // this test quick. Measured 2026-08-29, an earlier full-suite run refused
             // commands::segments_write::…::healthy_audio_direct_invocation with AUDIO_PROBE_BUSY
             // while slots were occupied here. The follower attaches to an already-registered
             // flight by key lookup, so it needs only enough time to reach the call; 120 ms is
@@ -1139,7 +1140,7 @@ mod tests {
 
     #[test]
     fn a_panicking_probe_is_contained_as_inconclusive_and_frees_its_slot() {
-        let _serial = PROBE_REGISTRY_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = serialize_technical_audio_probe_test();
         // A decoder crash must neither poison the registry nor invent a verdict: Inconclusive is
         // the honest "the probe itself failed", and the slot must come back for the next claim.
         let evidence = probe_technical_audio_failure_single_flight_with(
@@ -1156,7 +1157,7 @@ mod tests {
 
     #[test]
     fn concurrent_long_healthy_audio_claims_create_zero_effects() {
-        let _serial = PROBE_REGISTRY_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = serialize_technical_audio_probe_test();
         let (directory, store, runtime) = store_with_clip();
         // Sixteen minutes at 8 kHz is deliberately much larger than a review clip. The probe walks
         // packets without accumulating PCM; same-source callers share at most one active flight.
@@ -1198,7 +1199,7 @@ mod tests {
 
     #[test]
     fn truncated_audio_tail_is_never_accepted_as_clean_eof() {
-        let _serial = PROBE_REGISTRY_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = serialize_technical_audio_probe_test();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("truncated-tail.wav");
         write_wav(&path, 16_000, 16_000);

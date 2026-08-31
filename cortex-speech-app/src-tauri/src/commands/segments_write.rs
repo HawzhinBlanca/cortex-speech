@@ -1132,7 +1132,8 @@ mod tests {
         CommitReviewRequestV1, MarkSegmentUnusableRequestV1, ReviewDecisionV1, TechnicalUnusableReasonV1,
     };
     use crate::stores::{
-        require_listened, ReviewWriteStore, SegmentDeleteError, SegmentMetadataUpdateError, SpeakerRenameError,
+        require_listened, serialize_technical_audio_probe_test, ReviewWriteStore, SegmentDeleteError,
+        SegmentMetadataUpdateError, SpeakerRenameError,
     };
     use sha2::{Digest, Sha256};
 
@@ -1734,6 +1735,7 @@ mod tests {
 
     #[test]
     fn technical_unusable_mark_is_cas_bound_idempotent_non_human_and_export_excluded() {
+        let _probe_serial = serialize_technical_audio_probe_test();
         let tmp = tempfile::tempdir().unwrap();
         let db = db_with_clip(tmp.path(), "technical-unusable");
         std::fs::write(tmp.path().join("technical-unusable.wav"), b"not an audio container").unwrap();
@@ -1898,6 +1900,7 @@ mod tests {
 
     #[test]
     fn technical_unusable_mark_and_draft_clear_are_one_atomic_effect() {
+        let _probe_serial = serialize_technical_audio_probe_test();
         let tmp = tempfile::tempdir().unwrap();
         let db = db_with_clip(tmp.path(), "technical-unusable-atomic");
         std::fs::write(tmp.path().join("technical-unusable-atomic.wav"), b"not an audio container").unwrap();
@@ -1944,6 +1947,7 @@ mod tests {
 
     #[test]
     fn healthy_audio_direct_invocation_is_refused_without_any_mutation() {
+        let _probe_serial = serialize_technical_audio_probe_test();
         let tmp = tempfile::tempdir().unwrap();
         let db = db_with_clip(tmp.path(), "healthy-unusable-refusal");
         write_test_wav(&tmp.path().join("healthy-unusable-refusal.wav"), 16_000);
@@ -1975,6 +1979,7 @@ mod tests {
 
     #[test]
     fn backend_distinguishes_container_failure_from_post_probe_decode_failure() {
+        let _probe_serial = serialize_technical_audio_probe_test();
         let tmp = tempfile::tempdir().unwrap();
 
         let corrupt = db_with_clip(tmp.path(), "corrupt-authority");
