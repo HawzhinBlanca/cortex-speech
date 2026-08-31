@@ -12662,3 +12662,32 @@ minimum deficits are 2,454 overall branches, 4,960 lines, 8,716 regions, and 1,1
 critical branch deficits are review 157, payment 147, playback 119, restore 269, and IPC 488.
 Production, live data, scheduled tasks, release pointers, credentials, and GPU/model configuration
 were untouched.
+
+## 2026-08-31 — Reliability iteration 26: authoritative snapshot-prune inputs
+
+The next reachable snapshot cluster was rotating-prune input discrimination. One private-contract
+regression proves an existing but empty snapshots root is a valid no-op; a snapshot-shaped regular
+file, unrelated directory, and malformed `snapshot_*` directory remain outside rotation authority;
+and, in the same mixed tree, the older valid rotating snapshot is pruned while the newest valid
+snapshot survives. The warning path for an OS-denied recursive removal remains environment-dependent
+and is not forged by weakening production input checks.
+
+The focused proof passed 1/1, the complete snapshot namespace passed 40/40, stable rustfmt passed,
+and strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`0f133bf6a9dbe9e0f9bdc8bf0d21c497eced1337` then received an exact pinned all-target measurement:
+1,839 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `9f92777f00ec44199884632c79ea463b` (SHA-256
+`3630c8ad9b50f9e396d52aa3c915caa99fe31235e49b5936d978c385e7e820fb`) proves snapshot branches
+moved 294/404 to 296/404 and restore moved 1,098/1,518 to 1,100/1,518, reducing uncovered snapshot
+branches from 110 to 108 and uncovered restore branches from 420 to 418. Overall coverage is
+branches 7,809/12,823 (60.90%), lines 76,444/95,757 (79.83%), regions 135,914/170,121 (79.89%),
+and functions 6,510/9,623 (67.65%). The target supplied exactly two covered snapshot branches with
+no new snapshot branch denominator. Unrelated run variance restored two covered branches in
+`commands.rs`, moving IPC branches from 438/1,028 back to 440/1,028. Remaining minimum deficits are
+2,450 overall branches, 4,950 lines, 8,689 regions, and 1,189 functions; critical branch deficits
+are review 157, payment 147, playback 119, restore 267, and IPC 486. Production, live data,
+scheduled tasks, release pointers, credentials, and GPU/model configuration were untouched.
