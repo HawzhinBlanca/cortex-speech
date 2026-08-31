@@ -12382,7 +12382,7 @@ cross-platform run. Outcomes, each measured:
    CI now VERIFIES the workstation's hash-bound coverage attestation for the exact head
    (`--publish-coverage-attestation` / `--verify-coverage-attestation`): sha ancestry with an
    attestation-only diff, tree digest, registry/toolchain contract equality, freshness, and
-   recomputed floor arithmetic. Ten fail-closed proofs in test_coverage_attestation_policy.py —
+   recomputed floor arithmetic. Thirteen fail-closed proofs in test_coverage_attestation_policy.py —
    which immediately caught a real gap (JSON escaping hid the Windows profile-path marker from
    the hygiene scan). The workflow-policy pin was inverted deliberately in the same change; the
    tag-release flow keeps measuring for itself.
@@ -12396,3 +12396,15 @@ cross-platform run. Outcomes, each measured:
 
 Reviewers were untouched all evening: 156 decisions today across five reviewers, serving probe
 4/4 green throughout.
+
+**Attestation audit correction:** the first verifier/test fixture represented critical domains as
+bare metrics even though the real coverage producer emits `{patterns, matchedFiles, metrics,
+passed}`. An empty domain map therefore verified while a genuine manifest would fail. The
+corrected verifier requires the exact manifest, report, domain, metric, and artifact-inventory
+schemas; every configured domain and threshold; recomputed percentages/floors; exact raw-artifact
+identity agreement; a publication timestamp inside the freshness window; and exactly one allowed
+attestation path after the measured SHA. Adversarial proof now includes empty-domain, substituted-
+pattern, and mismatched-artifact refusals. The JSON is deliberately described as a trusted
+owner-published statement, not a cryptographic workstation signature: branch authorization and
+review remain its publisher-authentication boundary until a signing key or trusted self-hosted
+runner is configured.

@@ -1,11 +1,13 @@
-"""The CI coverage attestation must fail closed on every forgeable axis.
+"""The CI coverage attestation must fail closed on every locally verifiable axis.
 
 Owner decision 2026-08-31: hosted CI verifies the workstation's hash-bound coverage manifest
 instead of re-measuring (4-core runners cannot fit the instrumented phase under the workflow
 policy's 180-minute cap). That verifier is now part of the merge chain, so this gate proves the
 refusal matrix with a real scratch git repository: a valid attestation verifies, and every
 tampered axis — envelope, ancestry, non-attestation diffs, tree digest, staleness, floor
-arithmetic — is refused. The publisher's private-path hygiene refusal is pinned too.
+arithmetic — is refused. The publisher's private-path hygiene refusal is pinned too. The
+committed document is not a cryptographic workstation signature; repository authorization and
+review remain the publisher-authentication boundary until a signing key or trusted runner exists.
 """
 
 from __future__ import annotations
@@ -86,15 +88,31 @@ class CoverageAttestationTests(unittest.TestCase):
         registry = V10._normalized_attestation_registry(V10._rust_coverage_command_registry())
         thresholds = registry["thresholds"]
         metrics = {
-            name: {"required_percent": required, "count": 1000, "covered": 1000}
+            name: {
+                "required_percent": required,
+                "count": 1000,
+                "covered": 1000,
+                "percent": 100.0,
+            }
             for name, required in thresholds.items()
         }
         domain_thresholds = registry["criticalDomainThresholds"]
         domains = {
-            "review": {
-                name: {"required_percent": required, "count": 100, "covered": 100}
-                for name, required in domain_thresholds.items()
+            domain: {
+                "patterns": patterns,
+                "matchedFiles": [f"src-tauri/src/{domain}.rs"],
+                "metrics": {
+                    name: {
+                        "required_percent": required,
+                        "count": 100,
+                        "covered": 100,
+                        "percent": 100.0,
+                    }
+                    for name, required in domain_thresholds.items()
+                },
+                "passed": True,
             }
+            for domain, patterns in registry["criticalDomainPatterns"].items()
         }
         ended = datetime.now(timezone.utc) - timedelta(minutes=30)
         started = ended - timedelta(minutes=50)
@@ -119,12 +137,19 @@ class CoverageAttestationTests(unittest.TestCase):
                 "coverageToolchain": V10._expected_rust_coverage_toolchain_identity(),
             },
             "coverage": {
+                "schema": 1,
+                "gate": "rust-coverage",
                 "passed": True,
                 "metrics": metrics,
                 "criticalDomains": domains,
                 "artifactSha256": "c" * 64,
+                "failures": [],
             },
-            "artifacts": [],
+            "artifacts": [
+                {"path": V10.RUST_COVERAGE_ARTIFACT_NAME, "sha256": "c" * 64, "bytes": 1},
+                {"path": "events.jsonl", "sha256": "d" * 64, "bytes": 1},
+                {"path": "worker.log", "sha256": "e" * 64, "bytes": 1},
+            ],
         }
         return {
             "schema": 1,
@@ -200,6 +225,26 @@ class CoverageAttestationTests(unittest.TestCase):
         metrics = document["manifest"]["coverage"]["metrics"]
         first = next(iter(metrics))
         metrics[first]["covered"] = 0
+        self._write(document)
+        self.assertEqual(V10.verify_coverage_attestation_main(), 1)
+
+    def test_empty_critical_domains_are_refused(self) -> None:
+        document = self._passing_document()
+        document["manifest"]["coverage"]["criticalDomains"] = {}
+        self._write(document)
+        self.assertEqual(V10.verify_coverage_attestation_main(), 1)
+
+    def test_real_critical_domain_shape_and_exact_thresholds_are_required(self) -> None:
+        document = self._passing_document()
+        domains = document["manifest"]["coverage"]["criticalDomains"]
+        first_domain = next(iter(domains.values()))
+        first_domain["patterns"] = ["substituted.rs"]
+        self._write(document)
+        self.assertEqual(V10.verify_coverage_attestation_main(), 1)
+
+    def test_raw_artifact_identity_must_match_the_coverage_report(self) -> None:
+        document = self._passing_document()
+        document["manifest"]["artifacts"][0]["sha256"] = "f" * 64
         self._write(document)
         self.assertEqual(V10.verify_coverage_attestation_main(), 1)
 

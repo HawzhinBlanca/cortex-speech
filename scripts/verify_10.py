@@ -9253,16 +9253,29 @@ def publish_coverage_attestation_main() -> int:
 
 
 def _attestation_metric_passes(metric: dict[str, object]) -> bool:
+    if set(metric) != {"count", "covered", "percent", "required_percent"}:
+        return False
     count = metric.get("count")
     covered = metric.get("covered")
+    percent = metric.get("percent")
     required = metric.get("required_percent")
     if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
         return False
     if not isinstance(covered, int) or isinstance(covered, bool) or not 0 <= covered <= count:
         return False
-    if not isinstance(required, (int, float)) or isinstance(required, bool):
+    if (
+        not isinstance(percent, (int, float))
+        or isinstance(percent, bool)
+        or not math.isfinite(float(percent))
+        or not isinstance(required, (int, float))
+        or isinstance(required, bool)
+        or not math.isfinite(float(required))
+    ):
         return False
-    return covered * 100 + 1e-9 >= float(required) * count
+    recomputed = covered * 100.0 / count
+    return math.isclose(float(percent), recomputed, rel_tol=0.0, abs_tol=1e-9) and (
+        covered * 100 + 1e-9 >= float(required) * count
+    )
 
 
 def verify_coverage_attestation_main() -> int:
@@ -9287,8 +9300,34 @@ def verify_coverage_attestation_main() -> int:
         if not _is_exact_integer(document.get("schema"), 1) or document.get("type") != COVERAGE_ATTESTATION_TYPE:
             return fail("attestation type/schema is not the committed contract")
         manifest = document.get("manifest")
-        if not isinstance(manifest, dict):
-            return fail("attestation manifest is not an object")
+        expected_manifest_fields = {
+            "schema",
+            "type",
+            "complete",
+            "runToken",
+            "fullGitSha",
+            "sourceTreeDigest",
+            "checkoutStateDigest",
+            "startedAt",
+            "endedAt",
+            "expiresAt",
+            "exitCode",
+            "attemptCount",
+            "commandRegistry",
+            "environment",
+            "coverage",
+            "artifacts",
+        }
+        if not isinstance(manifest, dict) or set(manifest) != expected_manifest_fields:
+            return fail("attestation manifest has a non-canonical envelope")
+        if (
+            not _is_exact_integer(manifest.get("schema"), 1)
+            or manifest.get("type") != "RustCoveragePrerequisiteV1"
+            or not re.fullmatch(r"[0-9a-f]{32}", str(manifest.get("runToken", "")))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get("checkoutStateDigest", "")))
+            or not _is_exact_integer(manifest.get("attemptCount"), 1)
+        ):
+            return fail("attestation manifest has an invalid run identity")
         measured_sha = str(manifest.get("fullGitSha", ""))
         if not re.fullmatch(r"[0-9a-f]{40}", measured_sha):
             return fail("attestation is not bound to a full measurement SHA")
@@ -9311,11 +9350,11 @@ def verify_coverage_attestation_main() -> int:
             )
             if diff.returncode != 0:
                 return fail("cannot enumerate the diff from the measured SHA")
-            attestation_prefix = COVERAGE_ATTESTATION_DIR.name + "/"
+            attestation_path = COVERAGE_ATTESTATION_PATH.relative_to(REPO_ROOT).as_posix()
             offending = [
                 name
                 for name in diff.stdout.splitlines()
-                if name.strip() and not name.startswith(attestation_prefix)
+                if name.strip() and name != attestation_path
             ]
             if offending:
                 return fail(
@@ -9337,15 +9376,26 @@ def verify_coverage_attestation_main() -> int:
         started = _parse_utc(manifest.get("startedAt"), "attested startedAt")
         ended = _parse_utc(manifest.get("endedAt"), "attested endedAt")
         expires = _parse_utc(manifest.get("expiresAt"), "attested expiresAt")
+        published = _parse_utc(document.get("publishedAt"), "attestation publishedAt")
         now = datetime.now(timezone.utc)
         if ended <= started or expires != ended + timedelta(seconds=RUST_COVERAGE_FRESH_SECONDS):
             return fail("attested duration/freshness authority is invalid")
         if ended > now + timedelta(minutes=5):
             return fail("attested completion time is in the future")
+        if not ended <= published < expires or published > now + timedelta(minutes=5):
+            return fail("attestation publication time is outside the measured freshness window")
         if not now < expires:
             return fail("attestation is stale; re-measure on the release workstation")
         coverage = manifest.get("coverage")
-        if not isinstance(coverage, dict) or coverage.get("passed") is not True:
+        if (
+            not isinstance(coverage, dict)
+            or set(coverage)
+            != {"schema", "gate", "passed", "artifactSha256", "metrics", "criticalDomains", "failures"}
+            or not _is_exact_integer(coverage.get("schema"), 1)
+            or coverage.get("gate") != "rust-coverage"
+            or coverage.get("passed") is not True
+            or coverage.get("failures") != []
+        ):
             return fail("attested coverage did not pass its thresholds")
         metrics = coverage.get("metrics")
         thresholds = expected_registry.get("thresholds")
@@ -9360,17 +9410,66 @@ def verify_coverage_attestation_main() -> int:
                 return fail(f"attested metric {name} fails recomputed floor arithmetic")
         domains = coverage.get("criticalDomains")
         domain_thresholds = expected_registry.get("criticalDomainThresholds")
-        if not isinstance(domains, dict) or not isinstance(domain_thresholds, dict):
-            return fail("attested critical domains are malformed")
-        for domain, entry in domains.items():
-            if not isinstance(entry, dict):
-                return fail(f"attested domain {domain} is malformed")
-            for metric_name, metric in entry.items():
-                if not isinstance(metric, dict) or not _attestation_metric_passes(metric):
+        domain_patterns = expected_registry.get("criticalDomainPatterns")
+        if (
+            not isinstance(domains, dict)
+            or not isinstance(domain_thresholds, dict)
+            or not isinstance(domain_patterns, dict)
+            or set(domains) != set(domain_patterns)
+        ):
+            return fail("attested critical domains are incomplete or substituted")
+        for domain, expected_patterns in domain_patterns.items():
+            entry = domains.get(domain)
+            if (
+                not isinstance(entry, dict)
+                or set(entry) != {"patterns", "matchedFiles", "metrics", "passed"}
+                or entry.get("passed") is not True
+                or entry.get("patterns") != expected_patterns
+                or not isinstance(entry.get("matchedFiles"), list)
+                or not entry["matchedFiles"]
+                or not all(isinstance(path, str) and path for path in entry["matchedFiles"])
+            ):
+                return fail(f"attested domain {domain} is incomplete or substituted")
+            domain_metrics = entry.get("metrics")
+            if not isinstance(domain_metrics, dict) or set(domain_metrics) != set(domain_thresholds):
+                return fail(f"attested domain {domain} has incomplete metrics")
+            for metric_name, required in domain_thresholds.items():
+                metric = domain_metrics.get(metric_name)
+                if (
+                    not isinstance(metric, dict)
+                    or metric.get("required_percent") != required
+                    or not _attestation_metric_passes(metric)
+                ):
                     return fail(f"attested domain {domain}/{metric_name} fails recomputed floor arithmetic")
         artifact_sha = coverage.get("artifactSha256")
         if not re.fullmatch(r"[0-9a-f]{64}", str(artifact_sha or "")):
             return fail("attestation does not bind a raw LLVM artifact identity")
+        artifacts = manifest.get("artifacts")
+        if not isinstance(artifacts, list):
+            return fail("attestation artifact inventory is malformed")
+        artifact_by_path: dict[str, dict[str, object]] = {}
+        for artifact in artifacts:
+            if not isinstance(artifact, dict) or set(artifact) != {"path", "sha256", "bytes"}:
+                return fail("attestation artifact inventory is malformed")
+            path = artifact.get("path")
+            size = artifact.get("bytes")
+            if (
+                not isinstance(path, str)
+                or not path
+                or Path(path).is_absolute()
+                or ".." in Path(path).parts
+                or path in artifact_by_path
+                or not re.fullmatch(r"[0-9a-f]{64}", str(artifact.get("sha256", "")))
+                or not isinstance(size, int)
+                or isinstance(size, bool)
+                or size < 0
+            ):
+                return fail("attestation artifact inventory is malformed")
+            artifact_by_path[path] = artifact
+        if {RUST_COVERAGE_ARTIFACT_NAME, "events.jsonl", "worker.log"} - set(artifact_by_path):
+            return fail("attestation omits a required phase artifact identity")
+        if artifact_by_path[RUST_COVERAGE_ARTIFACT_NAME]["sha256"] != artifact_sha:
+            return fail("attestation coverage report disagrees with its raw artifact identity")
     except EvidenceError as error:
         return fail(str(error))
     print(
