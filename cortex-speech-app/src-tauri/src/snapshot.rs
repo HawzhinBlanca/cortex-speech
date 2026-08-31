@@ -2860,6 +2860,23 @@ mod tests {
     }
 
     #[test]
+    fn pre_restore_pin_rejects_a_completed_reservation_before_filesystem_mutation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let admission = crate::database_runtime::RestoreAdmission::new();
+        let reservation = admission.try_reserve().unwrap();
+        reservation.arm_named_restore().unwrap();
+        reservation.commit_named_restore().unwrap();
+        assert!(!reservation.is_active(), "a completed restore capability must be stale");
+
+        let error = take_pinned_snapshot_during_restore(&reservation, &db, tmp.path(), "prerestore", 3)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires an active exclusive restore reservation"), "{error}");
+        assert!(!tmp.path().join("snapshots").exists(), "a stale capability must fail before filesystem mutation");
+    }
+
+    #[test]
     fn pending_migrations_cannot_run_until_the_exact_pre_upgrade_database_is_pinned() {
         let profile = tempfile::TempDir::new().unwrap();
         seed_test_required_snapshot_state(profile.path()).unwrap();
