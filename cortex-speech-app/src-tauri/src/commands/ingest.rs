@@ -2011,4 +2011,257 @@ mod typed_normalization_ipc_tests {
         assert!(!wire.contains("secret"));
         assert!(!wire.contains("token"));
     }
+
+    #[test]
+    fn normalization_text_within_the_character_budget_is_accepted() {
+        // The limit is measured in CHARACTERS, not bytes: multi-byte Sorani must keep the full
+        // advertised budget (validate_text documents the byte-counting regression this fixed).
+        validate_normalization_text("سڵاو ئەمە دەقێکی ئاسایی کوردییە").expect("valid Sorani text is accepted");
+        validate_normalization_text(&"ک".repeat(100_000)).expect("exactly the budget is accepted");
+    }
+}
+
+#[cfg(test)]
+mod typed_ingest_refusal_and_identity_tests {
+    use super::*;
+
+    #[test]
+    fn import_run_admission_maps_exactly_onto_the_public_wire_enum() {
+        // The renderer reconciles a lost import response purely from this mapping; a swapped arm
+        // would make it clear a still-running command or retry a settled one.
+        assert_eq!(ImportRunStatusV1::from(crate::ImportRunAdmission::Running), ImportRunStatusV1::Running);
+        assert_eq!(ImportRunStatusV1::from(crate::ImportRunAdmission::Settled), ImportRunStatusV1::Settled);
+        assert_eq!(ImportRunStatusV1::from(crate::ImportRunAdmission::Rejected), ImportRunStatusV1::Rejected);
+        assert_eq!(ImportRunStatusV1::from(crate::ImportRunAdmission::Unknown), ImportRunStatusV1::Unknown);
+    }
+
+    #[test]
+    fn import_run_identity_requires_exact_canonical_uuid_text() {
+        let canonical = "00000000-0000-4000-8000-000000000001";
+        assert_eq!(canonical_import_run_id(canonical), Ok(canonical.to_string()));
+        // Parseable-but-non-canonical spellings are refused, not normalized: admission state is
+        // keyed by exact text, so an alternate spelling would fork one run into two identities.
+        assert!(canonical_import_run_id("{00000000-0000-4000-8000-000000000001}").is_err());
+        assert!(canonical_import_run_id("00000000-0000-4000-8000-00000000000A").is_err());
+        assert!(canonical_import_run_id("run-1").is_err());
+    }
+
+    #[test]
+    fn import_refusal_helpers_pin_owner_actionable_codes() {
+        let busy = import_rate_limited_error();
+        assert_eq!(busy.code, "RATE_LIMITED");
+        assert!(busy.retryable);
+        assert_eq!(busy.suggested_action, Some(SuggestedActionV1::Retry));
+
+        // Dedup-unavailable is a hard stop toward Health, never a blind retry: retrying without
+        // duplicate protection is exactly the import this refusal exists to prevent.
+        let not_ready = import_not_ready_error();
+        assert_eq!(not_ready.code, crate::DEDUP_INDEX_UNAVAILABLE_CODE);
+        assert!(!not_ready.retryable);
+        assert_eq!(not_ready.suggested_action, Some(SuggestedActionV1::OpenHealth));
+
+        let invalid_run = invalid_import_run_id_error();
+        assert_eq!(invalid_run.code, "INVALID_IMPORT_RUN_ID");
+        assert!(!invalid_run.retryable);
+
+        let invalid_batch = invalid_batch_operation_id_error();
+        assert_eq!(invalid_batch.code, "INVALID_BATCH_OPERATION_ID");
+        assert!(!invalid_batch.retryable);
+
+        let missing = no_interrupted_import_error();
+        assert_eq!(missing.code, "NO_INTERRUPTED_IMPORT");
+        assert!(!missing.retryable);
+    }
+
+    #[test]
+    fn public_import_item_label_is_basename_only_for_both_separator_styles() {
+        // Journals can hold Windows paths inspected under another host, so both slash styles must
+        // reduce to a basename — the directory part is private filesystem history.
+        assert_eq!(public_import_item_label(r"D:\private\Wareen\clip one.wav"), "clip one.wav");
+        assert_eq!(public_import_item_label("/home/wareen/audio/clip.flac"), "clip.flac");
+        // Control and bidi-formatting characters are display attacks, never useful UI.
+        assert_eq!(public_import_item_label("evil\u{202e}gnp.wav"), "evilgnp.wav");
+        assert_eq!(public_import_item_label("bad\u{0007}name.wav"), "badname.wav");
+        // A separator-only "path" has no basename; the empty fallback comes back verbatim.
+        assert_eq!(public_import_item_label("///"), "");
+    }
+
+    #[test]
+    fn public_event_run_id_admits_only_parseable_uuid_text() {
+        assert_eq!(public_event_run_id(None), "");
+        assert_eq!(public_event_run_id(Some("not-a-uuid")), "");
+        let canonical = "00000000-0000-4000-8000-000000000001";
+        assert_eq!(public_event_run_id(Some(canonical)), canonical);
+        // Unlike command admission, event correlation NORMALIZES any parseable spelling to
+        // canonical text so the renderer can match run ids by simple equality.
+        assert_eq!(public_event_run_id(Some("{00000000-0000-4000-8000-000000000001}")), canonical);
+    }
+
+    #[test]
+    fn probe_result_send_survives_a_dropped_receiver() {
+        // Live receiver: the probe result arrives intact.
+        let (tx, rx) = std::sync::mpsc::channel();
+        send_audio_duration_probe_result(tx, Ok(1234));
+        assert_eq!(rx.recv().expect("probe result must arrive").expect("probe result is Ok"), 1234);
+
+        // Timed-out caller: the receiver is gone. The worker must swallow the send failure — a
+        // panic here would unwind the probe worker thread instead of merely logging a warning.
+        let (tx, rx) = std::sync::mpsc::channel::<crate::error::AppResult<i64>>();
+        drop(rx);
+        send_audio_duration_probe_result(tx, Ok(1));
+    }
+
+    #[test]
+    fn import_cancel_wait_returns_immediately_for_a_pre_cancelled_token() {
+        let token = crate::CancellationToken::new();
+        token.cancel();
+        // A regression here hangs this test forever (the loop never observes cancellation) —
+        // that hang IS the failure signal for the picker's cancel arm.
+        tauri::async_runtime::block_on(wait_for_import_cancel(token.clone()));
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn import_cancel_wait_observes_a_cancellation_raised_mid_poll() {
+        let token = crate::CancellationToken::new();
+        let canceller = token.clone();
+        let handle = std::thread::spawn(move || {
+            // Give the waiter time to enter its poll sleep so the sleeping loop arm — not the
+            // fast pre-cancelled path — is the one that observes the flag.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            canceller.cancel();
+        });
+        tauri::async_runtime::block_on(wait_for_import_cancel(token.clone()));
+        handle.join().expect("canceller thread");
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn app_git_sha_exposes_the_baked_build_identity() {
+        let sha = app_git_sha().expect("git sha command is infallible");
+        assert_eq!(sha, crate::GIT_SHA);
+        // The About panel and e2e harness compare against this value; a blank identity would make
+        // "which build is running" unanswerable (see the silent-rollback incident).
+        assert!(!sha.trim().is_empty(), "build identity must never be blank");
+    }
+}
+
+#[cfg(test)]
+mod typed_batch_halt_classification_tests {
+    use super::*;
+
+    #[test]
+    fn batch_halt_codes_classify_every_failure_family() {
+        use crate::error::{AppError, AudioError};
+        let tag = crate::pipeline::ASR_7B_UNAVAILABLE_TAG;
+        // Decode-shaped audio failures route the owner to the clip, not to a champion retry.
+        for audio in [
+            AudioError::UnsupportedCodec("wma".into()),
+            AudioError::Decode("truncated frame".into()),
+            AudioError::Resample("rate mismatch".into()),
+            AudioError::NoTracks(std::path::PathBuf::from("clip.mp4")),
+            AudioError::EmptyBuffer,
+        ] {
+            assert_eq!(batch_halt_code_for_error(&AppError::Audio(audio)), BatchHaltCode::AudioDecodeFailed);
+        }
+        assert_eq!(
+            batch_halt_code_for_error(&AppError::Validation("E_TRANSCRIPTION_SOURCE_CHANGED: clip edited".into())),
+            BatchHaltCode::TranscriptionSourceChanged
+        );
+        // Both identity clauses mean silent substitution — the exact failure the champion-supremacy
+        // rule exists to hard-stop — and must never soften into a retryable "unavailable".
+        assert_eq!(
+            batch_halt_code_for_error(&AppError::Validation(format!(
+                "{tag}: loaded model does not match registry champion"
+            ))),
+            BatchHaltCode::ChampionIdentityMismatch
+        );
+        assert_eq!(
+            batch_halt_code_for_error(&AppError::Validation(format!("{tag}: transcription reply identity a/b"))),
+            BatchHaltCode::ChampionIdentityMismatch
+        );
+        // The plain tag (no identity clause) is availability, not substitution.
+        assert_eq!(
+            batch_halt_code_for_error(&AppError::Validation(format!("{tag}: connection refused"))),
+            BatchHaltCode::ChampionUnavailable
+        );
+        // Primary recognizer failures must never masquerade as refinement failures — the wrong
+        // label sends the owner toward the wrong recovery path.
+        assert_eq!(
+            batch_halt_code_for_error(&AppError::Asr("engine fault".into())),
+            BatchHaltCode::BatchTranscriptionFailed
+        );
+        assert_eq!(
+            batch_halt_code_for_error(&AppError::Onnx("ort fault".into())),
+            BatchHaltCode::BatchTranscriptionFailed
+        );
+        assert_eq!(
+            batch_halt_code_for_error(&AppError::ModelNotFound {
+                path: std::path::PathBuf::from("model.onnx"),
+                reason: "missing".into()
+            }),
+            BatchHaltCode::BatchTranscriptionFailed
+        );
+        // A validation message with neither guard prefix falls through to the generic family.
+        assert_eq!(
+            batch_halt_code_for_error(&AppError::Validation("unrelated refusal".into())),
+            BatchHaltCode::BatchTranscriptionFailed
+        );
+    }
+
+    #[test]
+    fn batch_halt_errors_carry_actionable_wire_contracts() {
+        let cases = [
+            (BatchHaltCode::ChampionUnavailable, "CHAMPION_UNAVAILABLE", true, SuggestedActionV1::OpenHealth),
+            (
+                BatchHaltCode::ChampionIdentityMismatch,
+                "CHAMPION_IDENTITY_MISMATCH",
+                false,
+                SuggestedActionV1::OpenModels,
+            ),
+            (
+                BatchHaltCode::TranscriptionSourceChanged,
+                "TRANSCRIPTION_SOURCE_CHANGED",
+                false,
+                SuggestedActionV1::ReloadClip,
+            ),
+            (BatchHaltCode::AudioDecodeFailed, "AUDIO_DECODE_FAILED", false, SuggestedActionV1::ReloadClip),
+            (BatchHaltCode::BatchRefinementFailed, "BATCH_REFINEMENT_FAILED", true, SuggestedActionV1::Retry),
+            (BatchHaltCode::BatchTranscriptionFailed, "BATCH_TRANSCRIPTION_FAILED", true, SuggestedActionV1::Retry),
+        ];
+        for (halt, code, retryable, suggested) in cases {
+            let error = batch_halt_error(halt);
+            assert_eq!(error.code, code);
+            assert_eq!(error.retryable, retryable, "halt {code}");
+            assert_eq!(error.suggested_action, Some(suggested), "halt {code}");
+        }
+        // The durable journal's terminal failure code is fed from the same table, so a rename in
+        // one place cannot silently fork the wire contract from the journal evidence.
+        let decode = crate::error::AppError::Audio(crate::error::AudioError::EmptyBuffer);
+        assert_eq!(durable_transcription_failure_code(&decode), "AUDIO_DECODE_FAILED");
+        let asr = crate::error::AppError::Asr("engine crashed".into());
+        assert_eq!(durable_transcription_failure_code(&asr), "BATCH_TRANSCRIPTION_FAILED");
+    }
+
+    #[test]
+    fn batch_admission_refusals_classify_and_scrub_private_details() {
+        let cases = [
+            ("prep aborted: BATCH_ADMISSION_CANCELLED", "BATCH_START_CANCELLED", true),
+            (RESTORE_IN_PROGRESS_MSG, "RESTORE_IN_PROGRESS", true),
+            ("restore generation changed during admission", "RESTORE_GENERATION_CHANGED", true),
+            ("batch already in progress", "BATCH_ALREADY_RUNNING", true),
+            ("one_live_batch constraint violated", "BATCH_ALREADY_RUNNING", true),
+            ("segment seg-42 does not exist", "BATCH_SEGMENT_MISSING", false),
+            (r"disk I/O error at D:\private\Wareen\cortex.db", "BATCH_ADMISSION_FAILED", false),
+        ];
+        for (private, code, retryable) in cases {
+            let error = batch_transcribe_admission_error(private);
+            assert_eq!(error.code, code, "detail: {private}");
+            assert_eq!(error.retryable, retryable, "detail: {private}");
+            // Raw admission details can carry paths and row identities; the wire error never may.
+            let wire = serde_json::to_string(&error).expect("serialize admission refusal");
+            assert!(!wire.contains("Wareen"), "detail: {private}");
+            assert!(!wire.contains("seg-42"), "detail: {private}");
+        }
+    }
 }

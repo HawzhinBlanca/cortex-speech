@@ -1339,3 +1339,198 @@ pub async fn compute_signal_anomaly_scores(
         )
     })
 }
+
+#[cfg(test)]
+mod system_ops_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn deployment_request_validation_gates_every_field_individually() {
+        // A fully well-formed request must be admitted — the refusals below prove each gate, this
+        // proves none of them over-reject.
+        let good_sha = "0123abcd".repeat(8); // 64 chars, digits + lowercase a-f only
+        validate_deployment_request("C:/models/deployment/manifest.json", &good_sha, "omniasr-7b_v2.0", "Apache-2.0")
+            .expect("well-formed deployment request must pass validation");
+
+        let field_of = |result: Result<(), crate::ipc_contract::CommandErrorV1>| {
+            let error = result.expect_err("request must be refused");
+            let wire = serde_json::to_value(error).expect("serialize refusal");
+            assert_eq!(wire["code"], "INVALID_MODEL_IMPORT");
+            wire["details"]["field"].as_str().expect("refusal names its field").to_string()
+        };
+
+        // SHA gate: wrong length, uppercase hex, and non-hex are all refused (lowercase-only law).
+        let short_sha = "0123abcd".repeat(7);
+        assert_eq!(
+            field_of(validate_deployment_request("C:/m.json", &short_sha, "m", "MIT")),
+            "expectedDeploymentSha256"
+        );
+        assert_eq!(
+            field_of(validate_deployment_request("C:/m.json", &"A".repeat(64), "m", "MIT")),
+            "expectedDeploymentSha256"
+        );
+        assert_eq!(
+            field_of(validate_deployment_request("C:/m.json", &"g".repeat(64), "m", "MIT")),
+            "expectedDeploymentSha256"
+        );
+
+        // Manifest path gate: empty after trim, control characters, and the 4096 length cap.
+        assert_eq!(field_of(validate_deployment_request("   ", &good_sha, "m", "MIT")), "manifestPath");
+        assert_eq!(field_of(validate_deployment_request("mani\nfest.json", &good_sha, "m", "MIT")), "manifestPath");
+        assert_eq!(field_of(validate_deployment_request(&"x".repeat(4097), &good_sha, "m", "MIT")), "manifestPath");
+
+        // Identifier gates fire before the SHA/path checks and name their own fields.
+        assert_eq!(field_of(validate_deployment_request("C:/m.json", &good_sha, "", "MIT")), "expectedModelId");
+        assert_eq!(field_of(validate_deployment_request("C:/m.json", &good_sha, "m", "not a license")), "license");
+    }
+
+    #[test]
+    fn model_identifier_validation_accepts_repo_ids_and_refuses_path_shapes() {
+        validate_model_identifier("omniasr-7b_v2.0", "id").expect("repo-style id must pass");
+        for hostile in ["", "../evil", "a/b", "id with spaces"] {
+            let error = validate_model_identifier(hostile, "id").expect_err("hostile id must be refused");
+            assert_eq!(error.code, "INVALID_MODEL_IMPORT");
+        }
+    }
+
+    #[test]
+    fn rate_limited_errors_are_retryable_with_a_retry_suggestion() {
+        for error in [model_registry_rate_limited_error(), history_rate_limited_error()] {
+            let wire = serde_json::to_value(error).expect("serialize rate-limit error");
+            assert_eq!(wire["code"], "RATE_LIMITED");
+            assert_eq!(wire["retryable"], true);
+            assert_eq!(wire["suggestedAction"], "retry");
+        }
+    }
+
+    #[test]
+    fn public_history_error_maps_locked_to_busy_and_redo_to_redo_failed() {
+        // The sibling test covers "database is busy" and the undo arm; these are the other two arms.
+        let locked = public_history_error("undo", "database is locked (5)");
+        assert_eq!(locked.code, "DATABASE_BUSY");
+        assert!(locked.retryable);
+
+        let redo = public_history_error("redo", "constraint violation");
+        let wire = serde_json::to_value(redo).expect("serialize redo failure");
+        assert_eq!(wire["code"], "REDO_FAILED");
+        assert_eq!(wire["retryable"], false);
+        assert_eq!(wire["suggestedAction"], "openHealth");
+        assert!(!wire.to_string().contains("constraint"), "backend detail must not reach the renderer");
+    }
+
+    #[test]
+    fn engine_status_wire_shape_is_camel_case() {
+        let status = EngineStatusV1 {
+            ready: false,
+            port: 8791,
+            identity_matches: false,
+            expected_model_version_id: Some("champion-1".into()),
+            expected_deployment_sha256: Some("e".repeat(64)),
+            loaded_model_version_id: None,
+            loaded_deployment_sha256: None,
+            reason: Some("identity mismatch".into()),
+        };
+        let wire = serde_json::to_value(status).expect("serialize engine status");
+        assert_eq!(wire["identityMatches"], false);
+        assert_eq!(wire["expectedModelVersionId"], "champion-1");
+        assert!(wire.get("identity_matches").is_none());
+        assert!(wire.get("expected_model_version_id").is_none());
+    }
+
+    #[test]
+    fn segment_chunk_offset_ms_reads_the_alignment_offset_or_zero() {
+        let segment = |alignment_json: Option<String>| crate::db::SpeechSegment {
+            id: "seg".into(),
+            audio_path: "source.wav".into(),
+            alignment_json,
+            ..crate::db::SpeechSegment::default()
+        };
+        // No metadata, unparseable metadata, and metadata missing source_start_ms all order as 0.
+        assert_eq!(segment_chunk_offset_ms(&segment(None)), 0);
+        assert_eq!(segment_chunk_offset_ms(&segment(Some("not json".into()))), 0);
+        assert_eq!(segment_chunk_offset_ms(&segment(Some(r#"{"words":[]}"#.into()))), 0);
+        let meta = crate::chunking::SegmentSourceMeta {
+            source_start_ms: 1234,
+            source_end_ms: 5678,
+            chunk_index: 1,
+            chunk_count: 4,
+        };
+        assert_eq!(segment_chunk_offset_ms(&segment(Some(meta.to_alignment_json()))), 1234);
+    }
+
+    #[test]
+    fn history_status_reflects_real_undo_and_redo_stacks() {
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let history = crate::history::HistoryManager::new(16);
+
+        let empty = history_status(&history);
+        assert_eq!(empty.undo_action, None);
+        assert_eq!(empty.redo_action, None);
+        // Wire contract: the snapshot serializes camelCase for the renderer.
+        let wire = serde_json::to_value(&empty).expect("serialize history status");
+        assert!(wire.get("undoAction").is_some());
+        assert!(wire.get("redo_action").is_none());
+
+        let original = crate::db::SpeechSegment {
+            id: "hs-1".into(),
+            audio_path: "hs-1.wav".into(),
+            raw_transcript: "machine before".into(),
+            duration_ms: 1_000,
+            ..crate::db::SpeechSegment::default()
+        };
+        db.insert_segment(&original).unwrap();
+        let updated = crate::db::SpeechSegment { raw_transcript: "machine after".into(), ..original.clone() };
+        db.insert_segment(&updated).unwrap();
+        history.push(crate::history::Command::UpdateSegment {
+            segment_id: updated.id.clone(),
+            previous: Box::new(original),
+            current: Box::new(updated),
+        });
+
+        let recorded = history_status(&history);
+        assert_eq!(recorded.undo_action, Some(crate::ipc_contract::HistoryActionV1::UpdateSegment));
+        assert_eq!(recorded.redo_action, None);
+
+        // A real undo against the real row moves the entry to the redo stack and restores the text.
+        history.undo(&db).unwrap().expect("one recorded action to undo");
+        assert_eq!(db.get_segment_by_id("hs-1").unwrap().unwrap().raw_transcript, "machine before");
+        let undone = history_status(&history);
+        assert_eq!(undone.undo_action, None);
+        assert_eq!(undone.redo_action, Some(crate::ipc_contract::HistoryActionV1::UpdateSegment));
+    }
+
+    #[test]
+    fn cancel_wsl_refinement_only_arms_cancel_while_running_and_guard_clears_flags() {
+        // One test owns both process-global flags end to end; nothing else in the suite touches them,
+        // so the arms stay deterministic without cross-test coordination.
+        WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+        WSL_REFINE_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // Idle arm: a cancel with no batch running must NOT arm the flag (it would abort the NEXT run).
+        cancel_wsl_refinement().unwrap();
+        assert!(!WSL_REFINE_CANCEL.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Running arm: with a batch in flight the cancel arms the flag the loop polls.
+        WSL_REFINE_RUNNING.store(true, std::sync::atomic::Ordering::SeqCst);
+        cancel_wsl_refinement().unwrap();
+        assert!(WSL_REFINE_CANCEL.load(std::sync::atomic::Ordering::SeqCst));
+
+        // The RAII guard resets both flags on drop — the panic-safe exit path of the batch worker.
+        drop(WslRefineRunningGuard);
+        assert!(!WSL_REFINE_RUNNING.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!WSL_REFINE_CANCEL.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn get_inference_stats_serves_the_typed_snapshot_without_state() {
+        // This command takes no State, so the full path is testable; a fresh rate-limiter key admits
+        // the first call.
+        let stats = get_inference_stats().expect("first stats call is not rate limited");
+        let wire = serde_json::to_value(stats).expect("serialize inference stats");
+        assert!(wire.get("vad").is_some());
+        assert!(wire.get("asr").is_some());
+        assert!(wire["model_load_ms"].as_f64().is_some());
+        assert!(wire["vad"]["p50_ms"].as_f64().is_some());
+    }
+}

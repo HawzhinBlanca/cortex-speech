@@ -824,4 +824,264 @@ mod tests {
             "set_api_key must NOT write API keys in plaintext via save_key(&data_dir, ...)"
         );
     }
+
+    #[test]
+    fn json_patch_value_covers_every_type_arm_and_refuses_lossy_coercions() {
+        use serde_json::json;
+        // Matching types patch through exactly.
+        assert_eq!(json_patch_value(&json!("old"), &SettingValueV1::String("new".to_string())).unwrap(), json!("new"));
+        assert_eq!(json_patch_value(&json!(true), &SettingValueV1::Boolean(false)).unwrap(), json!(false));
+        assert_eq!(json_patch_value(&json!(4_u64), &SettingValueV1::Number(7.0)).unwrap(), json!(7));
+        assert_eq!(json_patch_value(&json!(-4), &SettingValueV1::Number(-2.0)).unwrap(), json!(-2));
+        assert_eq!(json_patch_value(&json!(0.5), &SettingValueV1::Number(0.25)).unwrap(), json!(0.25));
+        // Lossy or malformed numbers fail closed instead of rounding.
+        for (current, changed, code) in [
+            (json!(3_u64), SettingValueV1::Number(-1.0), "INVALID_SETTINGS_VALUE"),
+            (json!(3_u64), SettingValueV1::Number(2.5), "INVALID_SETTINGS_VALUE"),
+            (json!(-3), SettingValueV1::Number(1.5), "INVALID_SETTINGS_VALUE"),
+            (json!(0.5), SettingValueV1::Number(f64::NAN), "INVALID_SETTINGS_VALUE"),
+            (json!(0.5), SettingValueV1::Number(f64::INFINITY), "INVALID_SETTINGS_VALUE"),
+            (json!(true), SettingValueV1::Number(1.0), "INVALID_SETTINGS_VALUE_TYPE"),
+            (json!("text"), SettingValueV1::Boolean(true), "INVALID_SETTINGS_VALUE_TYPE"),
+            (json!(7_u64), SettingValueV1::String("7".to_string()), "INVALID_SETTINGS_VALUE_TYPE"),
+        ] {
+            let error = json_patch_value(&current, &changed).expect_err("lossy patch value must be refused");
+            assert_eq!(error.code, code, "current {current}");
+            assert!(!error.retryable);
+        }
+    }
+
+    #[test]
+    fn oversized_unknown_and_invalid_patches_fail_closed_with_stable_codes() {
+        let current = AppSettings::default();
+        let revision = settings_revision(&current).unwrap();
+
+        fn refused(result: Result<EvaluatedSettingsChange, CommandErrorV1>) -> CommandErrorV1 {
+            match result {
+                Err(error) => error,
+                Ok(_) => panic!("a hostile patch must be refused"),
+            }
+        }
+
+        let mut too_many = BTreeMap::new();
+        for index in 0..=MAX_SETTINGS_PATCH_FIELDS {
+            too_many.insert(format!("field_{index}"), SettingValueV1::Boolean(true));
+        }
+        let oversized = SettingsPatchV1 { expected_settings_revision: revision, changed_fields: too_many };
+        assert_eq!(refused(evaluate_patch(&current, &oversized)).code, "SETTINGS_PATCH_TOO_LARGE");
+
+        let unknown = patch(revision, "not_a_settings_field", SettingValueV1::Boolean(true));
+        assert_eq!(refused(evaluate_patch(&current, &unknown)).code, "SETTINGS_FIELD_NOT_PATCHABLE");
+
+        // Patchable field, hostile value: refused by validate() AFTER type checks, BEFORE any effect.
+        let endpoint = format!("https://{}", "a".repeat(3000));
+        let hostile = patch(revision, "llm_endpoint", SettingValueV1::String(endpoint));
+        assert_eq!(refused(evaluate_patch(&current, &hostile)).code, "INVALID_SETTINGS_PATCH");
+    }
+
+    #[test]
+    fn a_patch_carries_the_session_secret_and_applies_every_requested_field() {
+        let current = AppSettings {
+            llm_api_key: "session-only-secret".to_string(),
+            llm_api_key_configured: true,
+            ..AppSettings::default()
+        };
+        let request = SettingsPatchV1 {
+            expected_settings_revision: settings_revision(&current).unwrap(),
+            changed_fields: BTreeMap::from([
+                ("autoplay_segments".to_string(), SettingValueV1::Boolean(true)),
+                ("num_asr_threads".to_string(), SettingValueV1::Number(2.0)),
+                ("vad_threshold".to_string(), SettingValueV1::Number(0.25)),
+            ]),
+        };
+        let next = applied(evaluate_patch(&current, &request).expect("multi-field patch applies"));
+        assert!(next.autoplay_segments);
+        assert_eq!(next.num_asr_threads, 2);
+        assert_eq!(next.vad_threshold, 0.25);
+        assert_eq!(next.llm_api_key, "session-only-secret", "a patch must not drop the in-session secret");
+        assert!(next.llm_api_key_configured);
+    }
+
+    #[test]
+    fn a_noop_patch_at_the_current_revision_is_already_applied_not_a_second_write() {
+        let current = AppSettings::default();
+        let request = patch(settings_revision(&current).unwrap(), "autoplay_segments", SettingValueV1::Boolean(false));
+        assert!(matches!(
+            evaluate_patch(&current, &request).expect("no-op patch"),
+            EvaluatedSettingsChange::AlreadyApplied(_)
+        ));
+    }
+
+    #[test]
+    fn stale_settings_refusal_reports_both_revisions_as_typed_details() {
+        use crate::ipc_contract::CommandErrorDetailV1;
+        let error = stale_settings_error(11, 22);
+        assert_eq!(error.code, "STALE_SETTINGS_REVISION");
+        assert!(!error.retryable, "a blind same-payload retry would still clobber the newer writer");
+        assert_eq!(error.details.get("expectedSettingsRevision"), Some(&CommandErrorDetailV1::Number(11.0)));
+        assert_eq!(error.details.get("currentSettingsRevision"), Some(&CommandErrorDetailV1::Number(22.0)));
+    }
+
+    #[test]
+    fn jury_consent_changes_only_its_own_flag_and_withdrawals_evaluate_correctly() {
+        let base = AppSettings::default();
+        let jury_grant = SetCloudConsentRequestV1 {
+            expected_settings_revision: settings_revision(&base).unwrap(),
+            consent: CloudConsentKindV1::Jury,
+            granted: true,
+        };
+        let granted = applied(evaluate_consent(&base, &jury_grant).expect("jury grant applies"));
+        assert!(granted.jury_cloud_opt_in);
+        assert!(!granted.cloud_llm_opt_in, "the jury grant must not leak into the LLM consent");
+
+        // Withdrawing a consent that is already off is the durable truth — no second effect.
+        let llm_noop_withdrawal = SetCloudConsentRequestV1 {
+            expected_settings_revision: settings_revision(&granted).unwrap(),
+            consent: CloudConsentKindV1::Llm,
+            granted: false,
+        };
+        assert!(matches!(
+            evaluate_consent(&granted, &llm_noop_withdrawal).expect("no-op withdrawal"),
+            EvaluatedSettingsChange::AlreadyApplied(_)
+        ));
+
+        let jury_withdrawal = SetCloudConsentRequestV1 {
+            expected_settings_revision: settings_revision(&granted).unwrap(),
+            consent: CloudConsentKindV1::Jury,
+            granted: false,
+        };
+        let withdrawn = applied(evaluate_consent(&granted, &jury_withdrawal).expect("jury withdrawal applies"));
+        assert!(!withdrawn.jury_cloud_opt_in);
+    }
+
+    #[test]
+    fn settings_result_binds_the_replay_flag_revision_and_renderer_snapshot_together() {
+        let current = AppSettings::default();
+        let result = settings_result(&current, true).expect("settings result");
+        assert!(result.already_applied);
+        assert_eq!(result.settings_revision, settings_revision(&current).unwrap());
+        assert_eq!(result.settings, renderer_settings(&current).unwrap());
+        // The opaque revision must survive the generated TypeScript i64->number binding exactly.
+        assert!(result.settings_revision >= 0);
+        assert!(result.settings_revision <= (SETTINGS_REVISION_MASK as i64));
+    }
+
+    #[test]
+    fn error_constructors_and_key_validation_cover_their_accept_arms() {
+        assert_eq!(public_settings_error("X", "m", true).suggested_action, Some(SuggestedActionV1::Retry));
+        assert_eq!(public_settings_error("X", "m", false).suggested_action, None);
+        assert_eq!(public_api_key_error("Y", "m", true).suggested_action, Some(SuggestedActionV1::Retry));
+        assert_eq!(public_api_key_error("Y", "m", false).suggested_action, Some(SuggestedActionV1::OpenHealth));
+
+        assert!(validate_public_api_key("sk-ABC_123").is_ok());
+        assert!(validate_public_api_key("  padded-key\n").is_ok(), "outer whitespace is trimmed, not refused");
+        assert!(validate_public_api_key("").is_ok(), "an empty key is the documented clear-key request");
+        assert!(validate_public_api_key("two words").is_err(), "interior whitespace is malformed");
+        assert!(validate_public_api_key("tab\there").is_err());
+    }
+
+    /// Mirror of lib.rs's private `test_app_state`: the smallest real AppState the persistence
+    /// path needs — a file-backed database in a throwaway dir, default settings, live pipeline.
+    fn test_state(data_dir: std::path::PathBuf) -> AppState {
+        use std::sync::{Arc, Mutex};
+        let normalizer = Arc::new(crate::normalizer::SoraniNormalizer::new());
+        let cache = Arc::new(crate::cache::TranscriptCache::new(10));
+        let fingerprint = Arc::new(crate::fingerprint::AudioFingerprint::new());
+        let settings = AppSettings::default();
+        let model_manager = crate::models::ModelManager::new(data_dir.join("models"));
+        let pipeline = crate::pipeline::ProcessingPipeline::new(
+            ":memory:".to_string(),
+            Arc::clone(&normalizer),
+            Arc::clone(&cache),
+            Arc::clone(&fingerprint),
+            Arc::new(settings.clone()),
+            Arc::new(crate::models::ModelManager::new(data_dir.join("models"))),
+        );
+        let db = crate::db::Database::open(data_dir.join("app-state.db").to_string_lossy().as_ref()).unwrap();
+        db.initialize().unwrap();
+        AppState {
+            db: crate::database_runtime::DatabaseRuntime::new(db),
+            pipeline: Mutex::new(pipeline),
+            normalizer,
+            cache,
+            fingerprint,
+            dedup_readiness: crate::DedupReadiness::Ready { rehydrated_recordings: 0 },
+            history: Arc::new(Mutex::new(crate::history::HistoryManager::new(10))),
+            session: Mutex::new(crate::session::SessionManager::new(data_dir.join("session"))),
+            settings: Mutex::new(settings),
+            settings_write: Mutex::new(()),
+            data_dir: Mutex::new(Some(data_dir)),
+            model_manager: Mutex::new(model_manager),
+            file_picker_cancel_token: Mutex::new(None),
+            import_cancel_token: Mutex::new(None),
+            batch_cancel_token: Mutex::new(None),
+            import_state: Mutex::new(crate::ImportState::Idle),
+            import_run_tracker: Mutex::new(crate::ImportRunTracker::default()),
+            batch_state: Mutex::new(crate::BatchState::Idle),
+            batch_run_tracker: Mutex::new(crate::BatchRunTracker::default()),
+            media_registry: Arc::new(Mutex::new(crate::media::MediaRegistry::default())),
+            media_materializer: Arc::new(crate::media::MediaMaterializationCoordinator::default()),
+        }
+    }
+
+    #[test]
+    fn persist_publishes_scrubbed_disk_state_while_memory_keeps_the_session_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path().to_path_buf());
+        let next = AppSettings {
+            autoplay_segments: true,
+            llm_api_key: "session-only-secret".to_string(),
+            llm_api_key_configured: true,
+            ..AppSettings::default()
+        };
+
+        persist_settings_change(&state, &next, false).expect("persist settings");
+
+        let saved = std::fs::read_to_string(tmp.path().join("settings.json")).expect("settings.json written");
+        assert!(!saved.contains("session-only-secret"), "llm_api_key must never persist to disk");
+        let disk: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(disk["llm_api_key"], "");
+        assert_eq!(disk["llm_api_key_configured"], true);
+        assert_eq!(disk["autoplay_segments"], true);
+
+        let live = state.lock_settings().clone();
+        assert!(live.autoplay_segments, "the change must publish to the in-memory store after the save");
+        assert_eq!(live.llm_api_key, "session-only-secret", "the secret stays in-session only");
+    }
+
+    #[test]
+    fn persist_refuses_blocked_write_authority_before_any_side_effect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path().to_path_buf());
+        let blocked = AppSettings { settings_write_blocked: true, autoplay_segments: true, ..AppSettings::default() };
+
+        let error = persist_settings_change(&state, &blocked, false).expect_err("blocked authority must refuse");
+
+        assert_eq!(error.code, SETTINGS_WRITE_BLOCKED_CODE);
+        assert_eq!(error.suggested_action, Some(SuggestedActionV1::OpenHealth));
+        assert!(!tmp.path().join("settings.json").exists(), "a refusal must not leave a settings file behind");
+        assert!(!state.lock_settings().autoplay_segments, "a refusal must not publish to memory");
+    }
+
+    #[test]
+    fn a_failed_save_surfaces_and_never_publishes_even_for_a_withdrawal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path().to_path_buf());
+        state.lock_settings().cloud_llm_opt_in = true;
+        // Point the data dir at a plain FILE so settings.json can never be created beneath it.
+        let dead_end = tmp.path().join("not-a-directory");
+        std::fs::write(&dead_end, b"occupied").unwrap();
+        *state.data_dir.lock().unwrap() = Some(dead_end);
+
+        let withdrawal = AppSettings { cloud_llm_opt_in: false, ..AppSettings::default() };
+        let error = persist_settings_change(&state, &withdrawal, true).expect_err("save into a file path must fail");
+
+        assert_eq!(error.code, "SETTINGS_PERSIST_FAILED");
+        assert!(error.retryable);
+        assert_eq!(error.suggested_action, Some(SuggestedActionV1::Retry));
+        // The documented one-directional divergence: memory (and disk) stay at the OLD opted-in
+        // value so the UI can only ever over-report cloud consent, while the pipeline stop already
+        // ran before the save (pinned by the source-order test above and pipeline unit tests).
+        assert!(state.lock_settings().cloud_llm_opt_in, "a failed save must not publish the new settings");
+    }
 }

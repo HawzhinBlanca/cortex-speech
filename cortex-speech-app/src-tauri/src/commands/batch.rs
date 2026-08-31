@@ -525,3 +525,112 @@ mod normalizer_cache_tests {
         assert_eq!(normalize_cached("poison-recovery-key".to_string(), || "stale".to_string()), "recovered");
     }
 }
+
+#[cfg(test)]
+mod admission_contract_tests {
+    use super::*;
+
+    #[test]
+    fn speaker_assignment_store_errors_map_to_the_exact_public_contract() {
+        let invalid = public_speaker_assignment_error(SpeakerAssignmentError::Invalid);
+        assert_eq!(invalid.code, "INVALID_SPEAKER_ASSIGNMENT");
+        assert!(!invalid.retryable);
+        assert_eq!(invalid.suggested_action, None);
+
+        let stale = public_speaker_assignment_error(SpeakerAssignmentError::Stale);
+        assert_eq!(stale.code, "STALE_SEGMENT_SELECTION");
+        assert!(!stale.retryable);
+        assert_eq!(stale.suggested_action, Some(SuggestedActionV1::ReloadClip));
+
+        let busy = public_speaker_assignment_error(SpeakerAssignmentError::Busy);
+        assert_eq!(busy.code, "DATABASE_BUSY");
+        assert!(busy.retryable, "a busy workspace is transient and must invite a retry");
+        assert_eq!(busy.suggested_action, Some(SuggestedActionV1::Retry));
+
+        let application = public_speaker_assignment_error(SpeakerAssignmentError::Application);
+        assert_eq!(application.code, "SPEAKER_ASSIGNMENT_FAILED");
+        assert!(!application.retryable);
+        assert_eq!(application.suggested_action, Some(SuggestedActionV1::OpenHealth));
+    }
+
+    #[test]
+    fn normalization_admission_failures_classify_to_actionable_public_codes() {
+        let cases: [(&str, &str, bool, Option<SuggestedActionV1>); 7] = [
+            ("BATCH_ADMISSION_CANCELLED: stop pressed", "BATCH_START_CANCELLED", true, Some(SuggestedActionV1::Retry)),
+            (
+                crate::database_runtime::RESTORE_IN_PROGRESS_MSG,
+                "RESTORE_IN_PROGRESS",
+                true,
+                Some(SuggestedActionV1::Retry),
+            ),
+            (
+                "restore generation changed during admission",
+                "RESTORE_GENERATION_CHANGED",
+                true,
+                Some(SuggestedActionV1::Retry),
+            ),
+            ("a normalize batch is already in progress", "BATCH_ALREADY_RUNNING", true, Some(SuggestedActionV1::Retry)),
+            (
+                "UNIQUE constraint failed: index 'one_live_batch'",
+                "BATCH_ALREADY_RUNNING",
+                true,
+                Some(SuggestedActionV1::Retry),
+            ),
+            ("segment 'seg-9' does not exist", "BATCH_SEGMENT_MISSING", false, Some(SuggestedActionV1::ReloadClip)),
+            ("disk I/O error", "BATCH_ADMISSION_FAILED", false, Some(SuggestedActionV1::OpenHealth)),
+        ];
+        for (raw, code, retryable, suggested) in cases {
+            let error = batch_normalize_start_error(raw);
+            assert_eq!(error.code, code, "raw admission error: {raw}");
+            assert_eq!(error.retryable, retryable, "raw admission error: {raw}");
+            assert_eq!(error.suggested_action, suggested, "raw admission error: {raw}");
+        }
+    }
+
+    #[test]
+    fn cancellation_outranks_every_other_admission_classification() {
+        // A cancelled admission can surface journal detail that ALSO matches later patterns. The
+        // owner pressed Stop, so the public error must say cancelled — never missing-segment.
+        let error = batch_normalize_start_error("BATCH_ADMISSION_CANCELLED: row does not exist, already in progress");
+        assert_eq!(error.code, "BATCH_START_CANCELLED");
+        assert!(error.retryable);
+    }
+
+    fn test_config(verbalize_numbers: bool) -> BatchNormalizationConfigV1 {
+        BatchNormalizationConfigV1 {
+            schema: 1,
+            protocol: "durable-batch-normalize-v1",
+            build_git_sha: "test-sha",
+            normalize_numbers: true,
+            verbalize_numbers,
+            normalize_hamza: true,
+            remove_diacritics: false,
+            normalizer_version: "v-test",
+        }
+    }
+
+    #[test]
+    fn normalization_config_identity_is_deterministic_and_knob_sensitive() {
+        let first = canonical_batch_config_sha256(&test_config(false)).expect("config serializes");
+        let second = canonical_batch_config_sha256(&test_config(false)).expect("config serializes");
+        let flipped = canonical_batch_config_sha256(&test_config(true)).expect("config serializes");
+        assert_eq!(first, second, "identical normalization configs must share one durable identity");
+        assert_ne!(first, flipped, "flipping a normalization knob must change the durable config identity");
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "sha must be lowercase hex");
+    }
+
+    #[test]
+    fn normalization_config_wire_shape_is_the_pinned_sha_preimage() {
+        // canonical_batch_config_sha256 hashes these exact serialized bytes into the durable batch
+        // journal. A silent field rename or reorder would orphan every journaled config_sha256, so
+        // the preimage is pinned byte-for-byte.
+        let json = serde_json::to_string(&test_config(false)).expect("config serializes");
+        assert_eq!(
+            json,
+            "{\"schema\":1,\"protocol\":\"durable-batch-normalize-v1\",\"buildGitSha\":\"test-sha\",\
+             \"normalizeNumbers\":true,\"verbalizeNumbers\":false,\"normalizeHamza\":true,\
+             \"removeDiacritics\":false,\"normalizerVersion\":\"v-test\"}"
+        );
+    }
+}

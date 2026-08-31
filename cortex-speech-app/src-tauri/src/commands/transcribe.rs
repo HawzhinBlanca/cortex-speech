@@ -470,4 +470,151 @@ mod tests {
         segment.annotated_transcript = Some("human draft".into());
         assert_eq!(prospective_champion_review_text(&segment, "new champion raw"), "human draft");
     }
+
+    #[test]
+    fn whitespace_only_human_draft_never_becomes_the_alignment_baseline() {
+        let segment = SpeechSegment {
+            raw_transcript: "old raw".into(),
+            annotated_transcript: Some("   \n".into()),
+            ..SpeechSegment::default()
+        };
+        assert_eq!(prospective_champion_review_text(&segment, "new champion raw"), "new champion raw");
+    }
+
+    #[test]
+    fn alignment_without_a_segment_id_passes_caller_inputs_through() {
+        let (audio, text, alignment, revision) = canonical_alignment_inputs(
+            "C:\\audio\\adhoc.wav".to_string(),
+            "ad hoc words".to_string(),
+            Some(r#"{"words":[]}"#.to_string()),
+            None,
+            None,
+        )
+        .expect("id-less alignment stays a caller-scoped operation");
+        assert_eq!(audio, "C:\\audio\\adhoc.wav");
+        assert_eq!(text, "ad hoc words");
+        assert_eq!(alignment.as_deref(), Some(r#"{"words":[]}"#));
+        assert_eq!(revision, None, "no segment id means no revision authority to enforce");
+    }
+
+    #[test]
+    fn alignment_rejects_a_vanished_segment_id() {
+        let error = canonical_alignment_inputs(
+            "C:\\audio\\gone.wav".to_string(),
+            "any words".to_string(),
+            None,
+            None,
+            Some("seg-gone"),
+        )
+        .expect_err("a deleted segment must not silently align as an ad-hoc file");
+        assert!(error.contains("no longer exists"), "unexpected error: {error}");
+        assert!(error.contains("seg-gone"), "refusal must name the segment: {error}");
+    }
+
+    #[test]
+    fn alignment_rejects_a_segment_with_no_authoritative_transcript() {
+        let stored = SpeechSegment {
+            id: "seg-blank".to_string(),
+            audio_path: "C:\\audio\\blank.wav".to_string(),
+            raw_transcript: "   ".to_string(),
+            ..SpeechSegment::default()
+        };
+        let error = canonical_alignment_inputs(
+            stored.audio_path.clone(),
+            "   ".to_string(),
+            None,
+            Some((stored, 1)),
+            Some("seg-blank"),
+        )
+        .expect_err("a blank authority must never acquire durable word timings");
+        assert!(error.contains("no authoritative transcript"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn word_timings_refuse_a_whole_file_segment_without_a_positive_duration() {
+        let segment = SpeechSegment {
+            id: "no-duration".into(),
+            audio_path: "C:\\audio\\short.wav".into(),
+            duration_ms: 0,
+            alignment_json: None,
+            ..SpeechSegment::default()
+        };
+        let error = merge_bound_transcription_words(
+            &segment,
+            &[WordTimestamp { word: "x".into(), start: 0.0, end: 0.2, confidence: 0.5 }],
+        )
+        .expect_err("offset-less word timings would clobber chunk identity");
+        assert!(error.contains("no positive stored duration"), "unexpected error: {error}");
+        assert!(error.contains("no-duration"), "refusal must name the segment: {error}");
+    }
+
+    #[test]
+    fn word_timings_merge_into_the_stored_chunk_identity_when_present() {
+        let stored_json = r#"{"source_start_ms":12000,"source_end_ms":13000,"chunk_index":2,"chunk_count":4}"#;
+        let segment = SpeechSegment {
+            id: "chunked".into(),
+            audio_path: "C:\\audio\\book.wav".into(),
+            duration_ms: 1_000,
+            alignment_json: Some(stored_json.to_string()),
+            ..SpeechSegment::default()
+        };
+        let merged = merge_bound_transcription_words(
+            &segment,
+            &[WordTimestamp { word: "wusha".into(), start: 0.2, end: 0.6, confidence: 0.8 }],
+        )
+        .expect("stored chunk identity is the merge base");
+        let meta =
+            crate::chunking::SegmentSourceMeta::from_alignment_json(&merged).expect("chunk identity survives merging");
+        assert_eq!(meta.source_start_ms, 12_000);
+        assert_eq!(meta.source_end_ms, 13_000);
+        assert_eq!(meta.chunk_index, 2);
+        assert_eq!(meta.chunk_count, 4);
+        let words = crate::chunking::word_timestamps_from_alignment(&merged).expect("fresh words persisted");
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].word, "wusha");
+    }
+
+    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread().build().expect("build test runtime").block_on(future)
+    }
+
+    #[test]
+    fn check_audio_fails_closed_on_a_missing_file() {
+        let missing = std::env::temp_dir().join("cortex-check-audio-definitely-missing.wav");
+        let error = block_on(super::check_audio(missing.to_string_lossy().into_owned()))
+            .expect_err("a nonexistent path must never report audio info");
+        assert!(error.contains("Invalid path"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn check_audio_reports_the_real_identity_of_a_wav() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let wav = dir.path().join("probe.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav, spec).expect("create wav");
+        for n in 0..800u32 {
+            // A ramp, not silence: a wrong byte offset shows up as a wrong value downstream.
+            writer.write_sample(((n % 320) as i16).wrapping_mul(90)).expect("write sample");
+        }
+        writer.finalize().expect("finalize wav");
+        // Settle loop: write-then-immediately-read flakes on this Windows box (memory:
+        // windows-fs-test-write-then-read-flaky).
+        for _ in 0..50 {
+            if std::fs::metadata(&wav).map(|m| m.len() > 44).unwrap_or(false) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let info = block_on(super::check_audio(wav.to_string_lossy().into_owned())).expect("valid wav reports info");
+        assert_eq!(info["sample_rate"], 16_000);
+        assert_eq!(info["channels"], 1);
+        assert_eq!(info["format"], "wav");
+        // 800 mono frames at 16 kHz are exactly 50 ms.
+        assert_eq!(info["duration_ms"], 50);
+    }
 }

@@ -654,6 +654,151 @@ fn inventory(db: &Database, specs: &[VoiceSpec]) -> Result<(Vec<VoiceInventory>,
     Ok((reports, members))
 }
 
+/// Everything `certify` prints and enforces, computed without touching the process boundary so the
+/// gate verdicts are testable against fixture databases. `main` only prints the report and applies
+/// the `--require-*` flags to the two readiness booleans returned here.
+#[derive(Debug)]
+struct CertificationOutcome {
+    report: serde_json::Value,
+    review_ready: bool,
+    final_dataset_ready: bool,
+}
+
+fn certification_outcome(
+    db: &Database,
+    data_dir: &Path,
+    schema_version: i64,
+    full_integrity_requested: bool,
+) -> Result<CertificationOutcome, Box<dyn std::error::Error>> {
+    let pool = review_pool::load(db)?.ok_or("review pool is not active")?;
+    let coverage = review_pool::coverage_by_voice(db)?;
+    let resolutions = review_pool::segment_resolutions(db, None)?;
+    let resolution_authority = resolution_authority_totals(&resolutions);
+    let resolution_summary = review_pool::resolution_summary(db)?;
+    let dedup = review_pool::dedup_status(db)?;
+    let rights = review_pool::rights_coverage(db)?;
+    let audio = audio_coverage(db)?;
+    let quick_check = sqlite_check(db, "quick_check")?;
+    let full_integrity = if full_integrity_requested { Some(sqlite_check(db, "integrity_check")?) } else { None };
+    let foreign_key_violations: i64 =
+        db.connection().query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| row.get(0))?;
+    let database_healthy = quick_check == ["ok"]
+        && full_integrity.as_ref().map_or(true, |rows| rows.as_slice() == ["ok"])
+        && foreign_key_violations == 0;
+    let now = current_epoch_secs()?;
+    let local_snapshot = latest_snapshot(&data_dir.join("snapshots"), now);
+    let offsite_root = configured_offsite_snapshots(data_dir);
+    let offsite_snapshot = offsite_root
+        .as_deref()
+        .map(|root| latest_snapshot(root, now))
+        .unwrap_or_else(|| serde_json::json!({"configured": false, "fresh": false}));
+    let local_fresh = local_snapshot.get("fresh").and_then(serde_json::Value::as_bool) == Some(true);
+    let offsite_fresh = offsite_snapshot.get("fresh").and_then(serde_json::Value::as_bool) == Some(true);
+    let free_disk_bytes = cortex_speech_app_lib::health::free_disk_bytes_for(data_dir);
+    let disk_healthy = free_disk_bytes.is_some_and(|bytes| bytes >= 20 * 1024 * 1024 * 1024);
+    let audio_healthy = audio.get("allAvailable").and_then(serde_json::Value::as_bool) == Some(true);
+    let dedup_healthy = dedup.applied
+        && dedup.unconfirmed_risk_count == 0
+        && dedup.source_segment_count == dedup.canonical_segment_count.saturating_add(dedup.excluded_segment_count);
+    let review_ready =
+        database_healthy && audio_healthy && local_fresh && offsite_fresh && disk_healthy && dedup_healthy;
+    let all_resolved = resolution_summary.resolved_clips == resolution_summary.total_clips
+        && resolution_summary.needs_first_or_second_review == 0
+        && resolution_summary.needs_third_review == 0
+        && resolution_summary.owner_conflicts == 0;
+    let mut voice_outcomes: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for voice in &coverage {
+        let voice_rows: Vec<_> = resolutions.iter().filter(|row| row.voice_name == voice.voice_name).collect();
+        let retained = voice_rows.iter().filter(|row| row.final_action.as_deref() == Some("retain")).count();
+        let rejected = voice_rows.iter().filter(|row| row.final_action.as_deref() == Some("reject")).count();
+        let authority = resolution_authority_totals(voice_rows.iter().copied());
+        let certificate = review_pool::voice_certificate(db, &voice.voice_name)?;
+        voice_outcomes.insert(
+            voice.voice_name.clone(),
+            serde_json::json!({
+                "total": voice_rows.len(),
+                "retained": retained,
+                "rejected": rejected,
+                "unresolved": voice_rows.len().saturating_sub(retained + rejected),
+                "consensusAgreements": authority.consensus_agreements,
+                "ownerAdjudications": authority.owner_adjudications,
+                "unresolvedConflicts": authority.unresolved_conflicts,
+                "certificate": certificate,
+            }),
+        );
+    }
+    let every_voice_certified =
+        voice_outcomes.values().all(|row| row.get("certificate").is_some_and(|value| !value.is_null()));
+    let final_dataset_ready = review_ready && all_resolved && rights.all_exact && every_voice_certified;
+    let last_decision_at_ms: Option<i64> = db.connection().query_row(
+        "SELECT MAX(created_at_ms) FROM (
+             SELECT decision.created_at_ms
+               FROM effective_review_pool_decisions_v62 decision
+             UNION ALL
+             SELECT decision.created_at_ms
+               FROM effective_independent_review_decisions_v61 decision
+               JOIN review_pool_members member ON member.segment_id=decision.segment_id
+             UNION ALL
+             SELECT event.timestamp_ms
+               FROM review_events event
+               JOIN review_pool_members member ON member.segment_id=event.segment_id
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let report = serde_json::json!({
+        "reportSchema": CERTIFICATION_REPORT_SCHEMA,
+        "readOnly": true,
+        "generatedAtEpochSecs": now,
+        "appGitSha": cortex_speech_app_lib::GIT_SHA,
+        "databaseSchemaVersion": schema_version,
+        "pool": {
+            "poolId": pool.pool_id,
+            "focusSegmentCount": pool.focus_segment_count,
+            "focusSha256": pool.focus_sha256,
+            "reviewSegmentCount": pool.review_segment_count,
+            "excludedDuplicateCount": pool.excluded_duplicate_count,
+            "duplicateFamilyCount": pool.duplicate_family_count,
+            "dedupManifestSha256": pool.dedup_manifest_sha256,
+            "championModelVersionId": pool.champion_model_version_id,
+            "championDeploymentSha256": pool.champion_deployment_sha256,
+        },
+        "resolutionSummary": resolution_summary,
+        "dedup": dedup,
+        "resolutionAuthority": resolution_authority,
+        "coverageByVoice": coverage,
+        "voiceOutcomes": voice_outcomes,
+        "reviewerVoiceTotals": reviewer_voice_totals(db)?,
+        "lastDecisionAtMs": last_decision_at_ms,
+        "rights": rights,
+        "audio": audio,
+        "database": {
+            "quickCheck": quick_check,
+            "fullIntegrityCheck": full_integrity,
+            "foreignKeyViolations": foreign_key_violations,
+            "healthy": database_healthy,
+        },
+        "disk": {
+            "freeBytes": free_disk_bytes,
+            "minimumFreeBytes": 20_u64 * 1024 * 1024 * 1024,
+            "healthy": disk_healthy,
+        },
+        "snapshots": {
+            "local": local_snapshot,
+            "offsite": offsite_snapshot,
+        },
+        "gates": {
+            "reviewReady": review_ready,
+            "duplicateExclusionsBound": dedup_healthy,
+            "allClipsResolved": all_resolved,
+            "rightsComplete": rights.all_exact,
+            "everyVoiceCertified": every_voice_certified,
+            "finalDatasetReady": final_dataset_ready,
+        },
+    });
+    Ok(CertificationOutcome { report, review_ready, final_dataset_ready })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).ok_or_else(|| usage().to_string())?;
@@ -761,145 +906,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
         "certify" => {
-            let pool = review_pool::load(&db)?.ok_or("review pool is not active")?;
-            let coverage = review_pool::coverage_by_voice(&db)?;
-            let resolutions = review_pool::segment_resolutions(&db, None)?;
-            let resolution_authority = resolution_authority_totals(&resolutions);
-            let resolution_summary = review_pool::resolution_summary(&db)?;
-            let dedup = review_pool::dedup_status(&db)?;
-            let rights = review_pool::rights_coverage(&db)?;
-            let audio = audio_coverage(&db)?;
-            let quick_check = sqlite_check(&db, "quick_check")?;
-            let full_integrity = if args.iter().any(|arg| arg == "--full-integrity") {
-                Some(sqlite_check(&db, "integrity_check")?)
-            } else {
-                None
-            };
-            let foreign_key_violations: i64 =
-                db.connection().query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| row.get(0))?;
-            let database_healthy = quick_check == ["ok"]
-                && full_integrity.as_ref().map_or(true, |rows| rows.as_slice() == ["ok"])
-                && foreign_key_violations == 0;
             let data_dir = db_path
                 .parent()
                 .ok_or_else(|| format!("database has no parent data directory: {}", db_path.display()))?;
-            let now = current_epoch_secs()?;
-            let local_snapshot = latest_snapshot(&data_dir.join("snapshots"), now);
-            let offsite_root = configured_offsite_snapshots(data_dir);
-            let offsite_snapshot = offsite_root
-                .as_deref()
-                .map(|root| latest_snapshot(root, now))
-                .unwrap_or_else(|| serde_json::json!({"configured": false, "fresh": false}));
-            let local_fresh = local_snapshot.get("fresh").and_then(serde_json::Value::as_bool) == Some(true);
-            let offsite_fresh = offsite_snapshot.get("fresh").and_then(serde_json::Value::as_bool) == Some(true);
-            let free_disk_bytes = cortex_speech_app_lib::health::free_disk_bytes_for(data_dir);
-            let disk_healthy = free_disk_bytes.is_some_and(|bytes| bytes >= 20 * 1024 * 1024 * 1024);
-            let audio_healthy = audio.get("allAvailable").and_then(serde_json::Value::as_bool) == Some(true);
-            let dedup_healthy = dedup.applied
-                && dedup.unconfirmed_risk_count == 0
-                && dedup.source_segment_count
-                    == dedup.canonical_segment_count.saturating_add(dedup.excluded_segment_count);
-            let review_ready =
-                database_healthy && audio_healthy && local_fresh && offsite_fresh && disk_healthy && dedup_healthy;
-            let all_resolved = resolution_summary.resolved_clips == resolution_summary.total_clips
-                && resolution_summary.needs_first_or_second_review == 0
-                && resolution_summary.needs_third_review == 0
-                && resolution_summary.owner_conflicts == 0;
-            let mut voice_outcomes: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-            for voice in &coverage {
-                let voice_rows: Vec<_> = resolutions.iter().filter(|row| row.voice_name == voice.voice_name).collect();
-                let retained = voice_rows.iter().filter(|row| row.final_action.as_deref() == Some("retain")).count();
-                let rejected = voice_rows.iter().filter(|row| row.final_action.as_deref() == Some("reject")).count();
-                let authority = resolution_authority_totals(voice_rows.iter().copied());
-                let certificate = review_pool::voice_certificate(&db, &voice.voice_name)?;
-                voice_outcomes.insert(
-                    voice.voice_name.clone(),
-                    serde_json::json!({
-                        "total": voice_rows.len(),
-                        "retained": retained,
-                        "rejected": rejected,
-                        "unresolved": voice_rows.len().saturating_sub(retained + rejected),
-                        "consensusAgreements": authority.consensus_agreements,
-                        "ownerAdjudications": authority.owner_adjudications,
-                        "unresolvedConflicts": authority.unresolved_conflicts,
-                        "certificate": certificate,
-                    }),
-                );
-            }
-            let every_voice_certified =
-                voice_outcomes.values().all(|row| row.get("certificate").is_some_and(|value| !value.is_null()));
-            let final_dataset_ready = review_ready && all_resolved && rights.all_exact && every_voice_certified;
-            let last_decision_at_ms: Option<i64> = db.connection().query_row(
-                "SELECT MAX(created_at_ms) FROM (
-                     SELECT decision.created_at_ms
-                       FROM effective_review_pool_decisions_v62 decision
-                     UNION ALL
-                     SELECT decision.created_at_ms
-                       FROM effective_independent_review_decisions_v61 decision
-                       JOIN review_pool_members member ON member.segment_id=decision.segment_id
-                     UNION ALL
-                     SELECT event.timestamp_ms
-                       FROM review_events event
-                       JOIN review_pool_members member ON member.segment_id=event.segment_id
-                 )",
-                [],
-                |row| row.get(0),
-            )?;
-            let report = serde_json::json!({
-                "reportSchema": CERTIFICATION_REPORT_SCHEMA,
-                "readOnly": true,
-                "generatedAtEpochSecs": now,
-                "appGitSha": cortex_speech_app_lib::GIT_SHA,
-                "databaseSchemaVersion": schema_version,
-                "pool": {
-                    "poolId": pool.pool_id,
-                    "focusSegmentCount": pool.focus_segment_count,
-                    "focusSha256": pool.focus_sha256,
-                    "reviewSegmentCount": pool.review_segment_count,
-                    "excludedDuplicateCount": pool.excluded_duplicate_count,
-                    "duplicateFamilyCount": pool.duplicate_family_count,
-                    "dedupManifestSha256": pool.dedup_manifest_sha256,
-                    "championModelVersionId": pool.champion_model_version_id,
-                    "championDeploymentSha256": pool.champion_deployment_sha256,
-                },
-                "resolutionSummary": resolution_summary,
-                "dedup": dedup,
-                "resolutionAuthority": resolution_authority,
-                "coverageByVoice": coverage,
-                "voiceOutcomes": voice_outcomes,
-                "reviewerVoiceTotals": reviewer_voice_totals(&db)?,
-                "lastDecisionAtMs": last_decision_at_ms,
-                "rights": rights,
-                "audio": audio,
-                "database": {
-                    "quickCheck": quick_check,
-                    "fullIntegrityCheck": full_integrity,
-                    "foreignKeyViolations": foreign_key_violations,
-                    "healthy": database_healthy,
-                },
-                "disk": {
-                    "freeBytes": free_disk_bytes,
-                    "minimumFreeBytes": 20_u64 * 1024 * 1024 * 1024,
-                    "healthy": disk_healthy,
-                },
-                "snapshots": {
-                    "local": local_snapshot,
-                    "offsite": offsite_snapshot,
-                },
-                "gates": {
-                    "reviewReady": review_ready,
-                    "duplicateExclusionsBound": dedup_healthy,
-                    "allClipsResolved": all_resolved,
-                    "rightsComplete": rights.all_exact,
-                    "everyVoiceCertified": every_voice_certified,
-                    "finalDatasetReady": final_dataset_ready,
-                },
-            });
-            println!("{}", serde_json::to_string_pretty(&report)?);
-            if args.iter().any(|arg| arg == "--require-review-ready") && !review_ready {
+            let outcome =
+                certification_outcome(&db, data_dir, schema_version, args.iter().any(|arg| arg == "--full-integrity"))?;
+            println!("{}", serde_json::to_string_pretty(&outcome.report)?);
+            if args.iter().any(|arg| arg == "--require-review-ready") && !outcome.review_ready {
                 return Err("review-readiness certification failed".into());
             }
-            if args.iter().any(|arg| arg == "--require-final-ready") && !final_dataset_ready {
+            if args.iter().any(|arg| arg == "--require-final-ready") && !outcome.final_dataset_ready {
                 return Err("final-dataset certification failed".into());
             }
         }
@@ -1244,5 +1260,683 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert!(submission_idempotency_authority(&db).unwrap());
+    }
+
+    // ── File-backed fixtures (same idiom as the review_pool test fixtures) ────────────────────────
+
+    const TEST_CHAMPION: &str = "omniasr-7b-test-champion";
+
+    fn seed_champion(db: &Database) {
+        cortex_speech_app_lib::registry::register_candidate(
+            db,
+            &cortex_speech_app_lib::registry::NewModelVersion {
+                id: TEST_CHAMPION.to_string(),
+                family: cortex_speech_app_lib::deployment::OMNIASR_7B_FAMILY.to_string(),
+                model_card_name: Some("test champion".to_string()),
+                checkpoint_sha256: "c".repeat(64),
+                checkpoint_path: "/test/champion.json".to_string(),
+                source: "cortex-finetuned".to_string(),
+                license: "owner-full-rights".to_string(),
+            },
+        )
+        .unwrap();
+        db.connection().execute("UPDATE model_versions SET status='champion' WHERE id=?1", [TEST_CHAMPION]).unwrap();
+    }
+
+    /// Decision columns can only be written below the verbatim-law schema, so fixture rows are
+    /// inserted at 59 and migrated forward — exactly how the review_pool fixtures do it.
+    fn insert_rows_at_v59(db: &Database, rows: &[cortex_speech_app_lib::db::SpeechSegment]) {
+        let rolled_back: Vec<i64> = cortex_speech_app_lib::migrations::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 59)
+            .rev()
+            .map(|migration| migration.version)
+            .collect();
+        assert_eq!(cortex_speech_app_lib::migrations::rollback(db, rolled_back.len()).unwrap(), rolled_back);
+        for row in rows {
+            db.insert_segment_full(row).unwrap();
+        }
+        let reapplied: Vec<i64> = rolled_back.iter().rev().copied().collect();
+        assert_eq!(cortex_speech_app_lib::migrations::run_migrations(db).unwrap(), reapplied);
+    }
+
+    fn fixture_segment(
+        id: &str,
+        audio_path: &Path,
+        reviewed_by: Option<&str>,
+    ) -> cortex_speech_app_lib::db::SpeechSegment {
+        cortex_speech_app_lib::db::SpeechSegment {
+            id: id.to_string(),
+            audio_path: audio_path.to_string_lossy().to_string(),
+            raw_transcript: "دەقی چامپیۆن".to_string(),
+            annotated_transcript: reviewed_by.map(|_| "دەقی دروست".to_string()),
+            verdict: reviewed_by.map(|_| "human_edit".to_string()),
+            verdict_transcript: reviewed_by.map(|_| "دەقی دروست".to_string()),
+            human_decision: reviewed_by.map(|_| "edit".to_string()),
+            reviewed_by: reviewed_by.map(str::to_string),
+            verified: reviewed_by.is_some(),
+            duration_ms: 1_000,
+            model_version_id: Some(TEST_CHAMPION.to_string()),
+            alignment_json: Some(r#"{"source_start_ms":0,"source_end_ms":1000}"#.to_string()),
+            ..cortex_speech_app_lib::db::SpeechSegment::default()
+        }
+    }
+
+    fn clip_hash(index: usize) -> String {
+        format!("{:064x}", index + 1)
+    }
+
+    const FIXTURE_POOL_ID: &str = "123e4567-e89b-42d3-a456-426614174060";
+
+    /// A live, activated pool in `data_dir`: one WAV + one library row per clip, every identity
+    /// column certify reads populated the way the app populates it.
+    fn pool_fixture(data_dir: &Path, clips: &[(&str, bool)]) -> (Database, review_pool::ReviewPool) {
+        let db = Database::open(&data_dir.join("cortex-speech.db").to_string_lossy()).unwrap();
+        db.initialize().unwrap();
+        seed_champion(&db);
+        let rows: Vec<_> = clips
+            .iter()
+            .map(|(id, reviewed)| {
+                let audio = data_dir.join(format!("{id}.wav"));
+                std::fs::write(&audio, b"wav").unwrap();
+                fixture_segment(id, &audio, reviewed.then_some("ReviewerA"))
+            })
+            .collect();
+        insert_rows_at_v59(&db, &rows);
+        for (index, (id, _)) in clips.iter().enumerate() {
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments SET audio_content_hash=?1 WHERE id=?2",
+                    rusqlite::params![clip_hash(index), id],
+                )
+                .unwrap();
+        }
+        let members: Vec<PoolMemberInput> = clips
+            .iter()
+            .map(|(id, _)| PoolMemberInput { segment_id: id.to_string(), voice_name: "Lamo".to_string() })
+            .collect();
+        let pool = review_pool::activate(&db, FIXTURE_POOL_ID, &members).unwrap();
+        (db, pool)
+    }
+
+    fn pool_decision(
+        db: &Database,
+        pool: &review_pool::ReviewPool,
+        segment_id: &str,
+        hash: &str,
+        reviewer: &str,
+        action: &str,
+        text: Option<&str>,
+        at: i64,
+    ) -> i64 {
+        let (_, revision) = db.get_segment_by_id_with_revision(segment_id).unwrap().unwrap();
+        let skip = action == "skip";
+        review_pool::record_decision(
+            db,
+            pool,
+            &review_pool::PoolDecisionInput {
+                segment_id,
+                reviewer,
+                action,
+                submitted_transcript: text,
+                served_transcript: "دەقی چامپیۆن",
+                served_revision: revision,
+                audio_content_hash: (!skip).then_some(hash),
+                source_start_ms: (!skip).then_some(0),
+                source_end_ms: (!skip).then_some(1_000),
+                duration_ms: 1_000,
+                requested_action: action,
+                requested_transcript: text.unwrap_or(""),
+                operation_id: &uuid::Uuid::new_v4().hyphenated().to_string(),
+                operation_payload_hash: &"b".repeat(64),
+                created_at_ms: at,
+            },
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    /// A trivial (no-duplicate) dedup manifest bound directly to the frozen pool authority, the rows
+    /// `dedup_status` reads. The validate-insert trigger holds it to the registry's frozen counts.
+    fn bind_trivial_dedup_manifest(db: &Database, pool: &review_pool::ReviewPool) {
+        let manifest_sha256 = "d".repeat(64);
+        let manifest_json = serde_json::json!({
+            "manifestSchema": 1,
+            "manifestSha256": manifest_sha256,
+            "pool": {
+                "poolId": pool.pool_id,
+                "sourceFocusSegmentCount": pool.focus_segment_count,
+                "sourceFocusSha256": pool.focus_sha256,
+            },
+            "algorithm": { "id": "cortex-cross-file-waveform-correlation-v1" },
+            "summary": {
+                "duplicateFamilies": 0,
+                "excludedMembers": 0,
+                "canonicalMembers": pool.focus_segment_count,
+                "unconfirmedRiskGroups": 0,
+            },
+        })
+        .to_string();
+        db.connection()
+            .execute(
+                "INSERT INTO review_pool_dedup_manifests
+                 (pool_id, source_focus_segment_count, source_focus_sha256, algorithm_id, family_count,
+                  excluded_count, canonical_count, unconfirmed_risk_count, manifest_json, manifest_sha256,
+                  app_git_sha, created_at_ms)
+                 VALUES (?1, ?2, ?3, 'cortex-cross-file-waveform-correlation-v1', 0, 0, ?2, 0, ?4, ?5, ?6, 1)",
+                rusqlite::params![
+                    pool.pool_id,
+                    pool.focus_segment_count as i64,
+                    pool.focus_sha256,
+                    manifest_json,
+                    manifest_sha256,
+                    "0".repeat(40),
+                ],
+            )
+            .unwrap();
+    }
+
+    // ── Argument helpers ──────────────────────────────────────────────────────────────────────────
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn flag_parsers_distinguish_a_missing_flag_from_a_missing_value() {
+        let parsed = args(&["--db", "x.db", "--flag"]);
+        assert_eq!(value_after(&parsed, "--db").unwrap(), "x.db");
+        assert_eq!(value_after(&parsed, "--missing").unwrap_err(), "missing --missing");
+        assert_eq!(value_after(&parsed, "--flag").unwrap_err(), "missing value after --flag");
+        assert_eq!(optional_value_after(&parsed, "--db").unwrap(), Some("x.db".to_string()));
+        assert_eq!(optional_value_after(&parsed, "--missing").unwrap(), None);
+        assert_eq!(optional_value_after(&parsed, "--flag").unwrap_err(), "missing value after --flag");
+    }
+
+    #[test]
+    fn repeated_values_collects_in_order_and_refuses_a_trailing_flag() {
+        let parsed = args(&["--dialect", "Hawleri", "--other", "x", "--dialect", "Slemani"]);
+        assert_eq!(repeated_values(&parsed, "--dialect").unwrap(), ["Hawleri", "Slemani"]);
+        assert!(repeated_values(&parsed, "--absent").unwrap().is_empty());
+        assert_eq!(repeated_values(&args(&["--dialect"]), "--dialect").unwrap_err(), "missing value after --dialect");
+    }
+
+    #[test]
+    fn usage_documents_every_dispatched_command() {
+        for command in DETACHED_READ_COMMANDS.iter().chain(DIRECT_READ_COMMANDS).chain(WRITE_COMMANDS) {
+            assert!(usage().contains(&format!("pool_admin {command} ")), "{command} is missing from usage");
+        }
+    }
+
+    #[test]
+    fn clock_helpers_report_the_present_epoch() {
+        assert!(unix_time_ms().unwrap() > 1_700_000_000_000);
+        assert!(current_epoch_secs().unwrap() > 1_700_000_000);
+    }
+
+    #[test]
+    fn normalized_path_lowercases_forward_slashes_and_trims_trailing_separators() {
+        assert_eq!(normalized_path(Path::new(r"D:\Voices\KAWA\wavs\")), "d:/voices/kawa/wavs");
+        assert_eq!(
+            normalized_path(Path::new("D:/Voices/kawa/wavs")),
+            normalized_path(Path::new(r"d:\voices\KAWA\wavs"))
+        );
+    }
+
+    #[test]
+    fn collect_wavs_recurses_and_accepts_only_wav_files_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        for name in ["a.wav", "B.WAV", "nested/c.wav"] {
+            std::fs::write(dir.path().join(name), b"wav").unwrap();
+        }
+        for name in ["notes.txt", "d.mp3", "wav"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let mut expected =
+            vec![dir.path().join("a.wav"), dir.path().join("B.WAV"), dir.path().join("nested").join("c.wav")];
+        expected.sort_unstable();
+        assert_eq!(collect_wavs(dir.path()).unwrap(), expected);
+        assert!(collect_wavs(&dir.path().join("no-such-dir")).unwrap_err().contains("cannot read prepared directory"));
+    }
+
+    #[test]
+    fn voice_specs_parses_names_and_refuses_malformed_or_duplicate_specs() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let specs = voice_specs(&[
+            "--voice".to_string(),
+            format!(" Kawa ={}", first.path().display()),
+            "--noise".to_string(),
+            "--voice".to_string(),
+            format!("Lamo={}", second.path().display()),
+        ])
+        .unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "Kawa");
+        assert_eq!(specs[1].name, "Lamo");
+
+        assert!(voice_specs(&args(&["plain"])).unwrap_err().contains("at least one --voice"));
+        assert_eq!(voice_specs(&args(&["--voice"])).unwrap_err(), "missing value after --voice");
+        assert!(voice_specs(&args(&["--voice", "KawaNoEquals"])).unwrap_err().contains("must be Name=directory"));
+        assert!(voice_specs(&["--voice".to_string(), format!("={}", first.path().display())])
+            .unwrap_err()
+            .contains("empty name or missing directory"));
+        assert!(voice_specs(&args(&["--voice", "Kawa=Z:/definitely/not/a/dir"]))
+            .unwrap_err()
+            .contains("empty name or missing directory"));
+        assert!(voice_specs(&[
+            "--voice".to_string(),
+            format!("Kawa={}", first.path().display()),
+            "--voice".to_string(),
+            format!("Lamo={}", first.path().display()),
+        ])
+        .unwrap_err()
+        .contains("specified more than once"));
+    }
+
+    // ── Snapshot and settings readers ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn latest_snapshot_reports_an_absent_root_as_never_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = latest_snapshot(&dir.path().join("snapshots"), 1_800_000_000);
+        assert_eq!(report["createdAtEpochSecs"], serde_json::Value::Null);
+        assert_eq!(report["verified"], serde_json::json!(false));
+        assert_eq!(report["fresh"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn latest_snapshot_picks_the_newest_complete_candidate_but_never_trusts_a_bad_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("snapshots");
+        let complete = |path: &Path| {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("cortex-speech.db"), b"db").unwrap();
+            std::fs::write(path.join("SNAPSHOT_MANIFEST.json"), b"not json").unwrap();
+        };
+        complete(&root.join("snapshot_1700000000"));
+        complete(&root.join("snapshot_123")); // malformed epoch: never a candidate
+        complete(&root.join("pinned").join("premigration_v62_to_v63_1800000000"));
+        std::fs::create_dir_all(root.join("snapshot_1900000000")).unwrap(); // newer but incomplete
+        let report = latest_snapshot(&root, 1_800_000_600);
+        assert_eq!(report["createdAtEpochSecs"], serde_json::json!(1_800_000_000_u64));
+        assert_eq!(report["ageSecs"], serde_json::json!(600));
+        assert!(report["path"].as_str().unwrap().contains("premigration_v62_to_v63_1800000000"));
+        // Recent enough, but its manifest fails verification — a bad manifest can never be fresh.
+        assert_eq!(report["verified"], serde_json::json!(false));
+        assert_eq!(report["fresh"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn a_real_snapshot_taken_now_is_verified_and_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("cortex-speech.db").to_string_lossy()).unwrap();
+        db.initialize().unwrap();
+        let taken = cortex_speech_app_lib::snapshot::take_snapshot(&db, dir.path(), 3)
+            .unwrap()
+            .expect("first-run snapshot must be taken");
+        let report = latest_snapshot(&dir.path().join("snapshots"), current_epoch_secs().unwrap());
+        assert_eq!(report["path"].as_str().unwrap(), taken.to_string_lossy());
+        assert_eq!(report["verified"], serde_json::json!(true), "{report}");
+        assert_eq!(report["fresh"], serde_json::json!(true), "{report}");
+    }
+
+    #[test]
+    fn configured_offsite_snapshots_requires_a_nonblank_configured_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(configured_offsite_snapshots(dir.path()), None, "no settings.json");
+        let settings = dir.path().join("settings.json");
+        std::fs::write(&settings, b"{not json").unwrap();
+        assert_eq!(configured_offsite_snapshots(dir.path()), None, "invalid JSON");
+        std::fs::write(&settings, br#"{"other": 1}"#).unwrap();
+        assert_eq!(configured_offsite_snapshots(dir.path()), None, "key absent");
+        std::fs::write(&settings, br#"{"backup_second_dir": "   "}"#).unwrap();
+        assert_eq!(configured_offsite_snapshots(dir.path()), None, "blank value");
+        std::fs::write(&settings, br#"{"backup_second_dir": "E:/backup root"}"#).unwrap();
+        assert_eq!(configured_offsite_snapshots(dir.path()), Some(PathBuf::from("E:/backup root").join("snapshots")));
+    }
+
+    // ── Database probes ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sqlite_check_surfaces_pragma_rows_and_refuses_malformed_pragmas() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(sqlite_check(&db, "quick_check").unwrap(), ["ok"]);
+        assert!(sqlite_check(&db, "quick_check(").unwrap_err().contains("cannot start"));
+    }
+
+    #[test]
+    fn submission_idempotency_authority_reports_a_dropped_collision_trigger() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert!(submission_idempotency_authority(&db).unwrap());
+        db.connection().execute_batch("DROP TRIGGER review_pool_decision_validate_insert;").unwrap();
+        assert!(!submission_idempotency_authority(&db).unwrap());
+    }
+
+    #[test]
+    fn submission_idempotency_authority_requires_the_unique_operation_id_index() {
+        let db = Database::open(":memory:").unwrap();
+        db.connection()
+            .execute_batch(
+                "CREATE TABLE review_pool_decisions (
+                     id INTEGER PRIMARY KEY, pool_id TEXT, segment_id TEXT, reviewer TEXT,
+                     operation_id TEXT, operation_payload_hash TEXT
+                 );",
+            )
+            .unwrap();
+        assert!(!submission_idempotency_authority(&db).unwrap());
+    }
+
+    // ── Pool-backed helpers ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn commit_benchmark_clip_loads_only_verified_human_decided_pool_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _pool) = pool_fixture(dir.path(), &[("a", true), ("b", false)]);
+        let clip = commit_benchmark_clip(&db, "a").unwrap();
+        assert_eq!(clip.segment_id, "a");
+        assert_eq!(clip.raw_transcript, "دەقی چامپیۆن");
+        assert_eq!(clip.audio_content_hash, clip_hash(0));
+        assert_eq!((clip.source_start_ms, clip.source_end_ms, clip.duration_ms), (0, 1_000, 1_000));
+        assert!(commit_benchmark_clip(&db, "b").unwrap_err().contains("cannot be loaded"), "unreviewed clip");
+        assert!(commit_benchmark_clip(&db, "missing").unwrap_err().contains("cannot be loaded"));
+    }
+
+    #[test]
+    fn commit_benchmark_worker_times_each_commit_and_reverses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cortex-speech.db");
+        let (db, pool) = pool_fixture(dir.path(), &[("clip", true)]);
+        let clip = commit_benchmark_clip(&db, "clip").unwrap();
+        let samples = commit_benchmark_worker(db, pool, clip, "CommitBenchA".to_string(), 3).unwrap();
+        assert_eq!(samples.len(), 3);
+        assert!(samples.iter().all(|sample| sample.is_finite() && *sample >= 0.0));
+        let reopened = Database::open(&db_path.to_string_lossy()).unwrap();
+        let count = |sql: &str| -> i64 { reopened.connection().query_row(sql, [], |row| row.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM review_pool_decisions"), 3);
+        assert_eq!(count("SELECT COUNT(*) FROM review_pool_reversals"), 3);
+        assert_eq!(count("SELECT COUNT(*) FROM effective_review_pool_decisions_v62"), 0, "every commit reversed");
+    }
+
+    #[test]
+    fn audio_coverage_counts_missing_recordings_by_voice() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _pool) = pool_fixture(dir.path(), &[("a", true), ("b", false)]);
+        let all_present = audio_coverage(&db).unwrap();
+        assert_eq!(all_present["recordings"], serde_json::json!(2));
+        assert_eq!(all_present["clips"], serde_json::json!(2));
+        assert_eq!(all_present["missingRecordings"], serde_json::json!(0));
+        assert_eq!(all_present["allAvailable"], serde_json::json!(true));
+        std::fs::remove_file(dir.path().join("b.wav")).unwrap();
+        let one_missing = audio_coverage(&db).unwrap();
+        assert_eq!(one_missing["missingRecordings"], serde_json::json!(1));
+        assert_eq!(one_missing["missingClips"], serde_json::json!(1));
+        assert_eq!(one_missing["missingClipsByVoice"], serde_json::json!({"Lamo": 1}));
+        assert_eq!(one_missing["allAvailable"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn audio_coverage_never_calls_an_empty_pool_available() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let report = audio_coverage(&db).unwrap();
+        assert_eq!(report["recordings"], serde_json::json!(0));
+        assert_eq!(report["allAvailable"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn reviewer_voice_totals_counts_desktop_pool_and_skip_evidence_per_voice() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, pool) = pool_fixture(dir.path(), &[("clip", true)]);
+        let hash = clip_hash(0);
+        pool_decision(&db, &pool, "clip", &hash, "ReviewerC", "skip", None, 4_000_000);
+        pool_decision(&db, &pool, "clip", &hash, "ReviewerB", "edit", Some("دەقی دروست"), 5_000_000);
+        let rows = reviewer_voice_totals(&db).unwrap();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        for (row, key, judgments, skips) in
+            [(&rows[0], "reviewera", 1, 0), (&rows[1], "reviewerb", 1, 0), (&rows[2], "reviewerc", 0, 1)]
+        {
+            assert_eq!(row["voiceName"], serde_json::json!("Lamo"));
+            assert_eq!(row["reviewerKey"], serde_json::json!(key));
+            assert_eq!(row["judgments"], serde_json::json!(judgments), "{key}");
+            assert_eq!(row["skips"], serde_json::json!(skips), "{key}");
+        }
+    }
+
+    // ── Inventory ────────────────────────────────────────────────────────────────────────────────
+
+    fn library_db(rows: Vec<cortex_speech_app_lib::db::SpeechSegment>, hashes: &[(&str, &str)]) -> Database {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        seed_champion(&db);
+        insert_rows_at_v59(&db, &rows);
+        for (id, hash) in hashes {
+            db.connection()
+                .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id=?2", rusqlite::params![hash, id])
+                .unwrap();
+        }
+        db
+    }
+
+    fn library_row(id: &str, wav: &Path, span: Option<(i64, i64)>) -> cortex_speech_app_lib::db::SpeechSegment {
+        let mut row = fixture_segment(id, wav, None);
+        row.alignment_json = span.map(|(start, end)| format!(r#"{{"source_start_ms":{start},"source_end_ms":{end}}}"#));
+        row
+    }
+
+    fn spec(name: &str, directory: &Path) -> VoiceSpec {
+        VoiceSpec { name: name.to_string(), directory: directory.to_path_buf() }
+    }
+
+    fn write_wav(directory: &Path, name: &str) -> PathBuf {
+        let path = directory.join(name);
+        std::fs::write(&path, b"wav").unwrap();
+        path
+    }
+
+    #[test]
+    fn inventory_reports_matched_missing_and_unusable_segments_per_voice() {
+        let dir = tempfile::tempdir().unwrap();
+        let healthy_dir = dir.path().join("healthy");
+        let broken_dir = dir.path().join("broken");
+        std::fs::create_dir_all(&healthy_dir).unwrap();
+        std::fs::create_dir_all(&broken_dir).unwrap();
+        let long_wav = write_wav(&healthy_dir, "long.wav");
+        let matched_wav = write_wav(&broken_dir, "matched.wav");
+        let wrong_model_wav = write_wav(&broken_dir, "wrong-model.wav");
+        let placeholder_wav = write_wav(&broken_dir, "placeholder.wav");
+        let orphan_wav = write_wav(&broken_dir, "orphan.wav");
+        let mut wrong_model = library_row("wrong", &wrong_model_wav, Some((0, 1_000)));
+        wrong_model.model_version_id = None;
+        let mut placeholder = library_row("placeholder", &placeholder_wav, Some((0, 1_000)));
+        placeholder.raw_transcript = "n/a".to_string();
+        let db = library_db(
+            vec![
+                // One long prepared WAV legitimately split into two bounded, contiguous clips.
+                library_row("long-1", &long_wav, Some((0, 1_000))),
+                library_row("long-2", &long_wav, Some((1_000, 2_000))),
+                library_row("matched", &matched_wav, Some((0, 1_000))),
+                wrong_model,
+                placeholder,
+            ],
+            &[("long-1", &clip_hash(0)), ("long-2", &clip_hash(0)), ("matched", &clip_hash(1))],
+        );
+        let (reports, members) = inventory(&db, &[spec("Kawa", &healthy_dir), spec("Lamo", &broken_dir)]).unwrap();
+        assert_eq!(reports.len(), 2);
+
+        let healthy = &reports[0];
+        assert_eq!(healthy.voice_name, "Kawa");
+        assert_eq!((healthy.disk_wavs, healthy.matched_files, healthy.matched_segments), (1, 1, 2));
+        assert_eq!(healthy.usable_7b_segments, 2);
+        assert!(voice_inventory_ready(healthy), "bounded clips of one long WAV are complete");
+
+        let broken = &reports[1];
+        assert_eq!((broken.disk_wavs, broken.matched_files, broken.matched_segments), (4, 3, 3));
+        assert_eq!(broken.usable_7b_segments, 1);
+        assert_eq!(broken.missing_files, [orphan_wav.to_string_lossy().to_string()]);
+        // The migration chain backfills a NULL model id to the pre-registry marker, so the
+        // non-champion row is reported under exactly that provenance.
+        assert_eq!(broken.invalid_segments, ["placeholder:omniasr-7b-test-champion", "wrong:unknown@pre-registry"]);
+        assert!(!voice_inventory_ready(broken));
+
+        let member_ids: Vec<&str> = members.iter().map(|member| member.segment_id.as_str()).collect();
+        assert_eq!(member_ids, ["long-1", "long-2", "matched"], "only usable segments become pool members");
+    }
+
+    #[test]
+    fn inventory_refuses_usable_segments_without_activation_identity_and_empty_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let voice_dir = dir.path().join("kawa");
+        std::fs::create_dir_all(&voice_dir).unwrap();
+        let wav = write_wav(&voice_dir, "clip.wav");
+
+        let no_hash = library_db(vec![library_row("clip", &wav, Some((0, 1_000)))], &[]);
+        assert!(inventory(&no_hash, &[spec("Kawa", &voice_dir)])
+            .unwrap_err()
+            .contains("has no canonical audio-content hash"));
+
+        let no_span = library_db(vec![library_row("clip", &wav, None)], &[("clip", &clip_hash(0))]);
+        assert!(inventory(&no_span, &[spec("Kawa", &voice_dir)]).unwrap_err().contains("has no canonical source span"));
+
+        let empty_dir = dir.path().join("empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        let db = library_db(vec![library_row("clip", &wav, Some((0, 1_000)))], &[("clip", &clip_hash(0))]);
+        assert!(inventory(&db, &[spec("Kawa", &empty_dir)]).unwrap_err().contains("contains no WAV files"));
+    }
+
+    #[test]
+    fn inventory_binds_each_segment_to_one_voice_and_dedups_nested_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let nested = parent.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let wav = write_wav(&nested, "clip.wav");
+        let db = library_db(vec![library_row("clip", &wav, Some((0, 1_000)))], &[("clip", &clip_hash(0))]);
+
+        let conflict = inventory(&db, &[spec("Kawa", &parent), spec("Lamo", &nested)]).unwrap_err();
+        assert!(conflict.contains("appears in both voice Kawa and voice Lamo"), "{conflict}");
+
+        // The same voice under a nested/overlapping prepared directory is one window, not a double.
+        let (reports, members) = inventory(&db, &[spec("Kawa", &parent), spec("KAWA", &nested)]).unwrap();
+        assert!(reports.iter().all(voice_inventory_ready));
+        assert_eq!(members.len(), 1);
+    }
+
+    #[test]
+    fn inventory_refuses_a_span_divergent_double_import_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let voice_dir = dir.path().join("kawa");
+        std::fs::create_dir_all(&voice_dir).unwrap();
+        let first = write_wav(&voice_dir, "gen-a.wav");
+        let second = write_wav(&voice_dir, "gen-b.wav");
+        // Two import generations of ONE recording (same content hash) cut at different spans.
+        let db = library_db(
+            vec![library_row("gen-a", &first, Some((0, 5_000))), library_row("gen-b", &second, Some((4_000, 9_000)))],
+            &[("gen-a", &clip_hash(0)), ("gen-b", &clip_hash(0))],
+        );
+        let error = inventory(&db, &[spec("Kawa", &voice_dir)]).unwrap_err();
+        assert!(error.contains("segments gen-a and gen-b cover overlapping audio"), "{error}");
+        assert!(error.contains("servable and payable twice"), "{error}");
+    }
+
+    // ── Certification ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn certification_requires_an_active_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let error =
+            certification_outcome(&db, dir.path(), cortex_speech_app_lib::migrations::max_supported_version(), false)
+                .unwrap_err();
+        assert!(error.to_string().contains("review pool is not active"));
+    }
+
+    #[test]
+    fn certification_gates_pass_individually_on_a_fully_reviewed_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, pool) = pool_fixture(dir.path(), &[("clip", true)]);
+        let hash = clip_hash(0);
+        pool_decision(&db, &pool, "clip", &hash, "ReviewerC", "skip", None, 4_000_000);
+        // Second distinct reviewer agrees with the desktop verdict: consensus resolution.
+        pool_decision(&db, &pool, "clip", &hash, "ReviewerB", "edit", Some("دەقی دروست"), 5_000_000);
+        review_pool::stamp_owner_supplied_pool_rights(&db).unwrap();
+        bind_trivial_dedup_manifest(&db, &pool);
+        cortex_speech_app_lib::snapshot::take_snapshot(&db, dir.path(), 3).unwrap().expect("snapshot must be taken");
+
+        let outcome =
+            certification_outcome(&db, dir.path(), cortex_speech_app_lib::migrations::max_supported_version(), true)
+                .unwrap();
+        let report = &outcome.report;
+        assert_eq!(report["reportSchema"], serde_json::json!(3));
+        assert_eq!(report["readOnly"], serde_json::json!(true));
+        assert_eq!(
+            report["databaseSchemaVersion"],
+            serde_json::json!(cortex_speech_app_lib::migrations::max_supported_version())
+        );
+        assert_eq!(report["pool"]["poolId"], serde_json::json!(FIXTURE_POOL_ID));
+        assert_eq!(report["pool"]["focusSegmentCount"], serde_json::json!(1));
+        assert_eq!(report["database"]["quickCheck"], serde_json::json!(["ok"]));
+        assert_eq!(report["database"]["fullIntegrityCheck"], serde_json::json!(["ok"]));
+        assert_eq!(report["database"]["foreignKeyViolations"], serde_json::json!(0));
+        assert_eq!(report["database"]["healthy"], serde_json::json!(true));
+        assert_eq!(report["audio"]["allAvailable"], serde_json::json!(true));
+        assert_eq!(report["dedup"]["applied"], serde_json::json!(true));
+        assert_eq!(report["resolutionSummary"]["totalClips"], serde_json::json!(1));
+        assert_eq!(report["resolutionSummary"]["resolvedClips"], serde_json::json!(1));
+        assert_eq!(report["resolutionAuthority"]["consensusAgreements"], serde_json::json!(1));
+        assert_eq!(report["resolutionAuthority"]["ownerAdjudications"], serde_json::json!(0));
+        assert_eq!(report["voiceOutcomes"]["Lamo"]["total"], serde_json::json!(1));
+        assert_eq!(report["voiceOutcomes"]["Lamo"]["retained"], serde_json::json!(1));
+        assert_eq!(report["voiceOutcomes"]["Lamo"]["unresolved"], serde_json::json!(0));
+        assert_eq!(report["voiceOutcomes"]["Lamo"]["certificate"], serde_json::Value::Null);
+        assert_eq!(report["lastDecisionAtMs"], serde_json::json!(5_000_000));
+        assert_eq!(report["snapshots"]["local"]["fresh"], serde_json::json!(true));
+        assert_eq!(report["snapshots"]["offsite"], serde_json::json!({"configured": false, "fresh": false}));
+        let totals = report["reviewerVoiceTotals"].as_array().unwrap();
+        assert_eq!(totals.len(), 3);
+        assert_eq!(totals[2]["reviewerKey"], serde_json::json!("reviewerc"));
+        assert_eq!(totals[2]["skips"], serde_json::json!(1));
+
+        assert_eq!(report["gates"]["duplicateExclusionsBound"], serde_json::json!(true));
+        assert_eq!(report["gates"]["allClipsResolved"], serde_json::json!(true));
+        assert_eq!(report["gates"]["rightsComplete"], serde_json::json!(true));
+        assert_eq!(report["gates"]["everyVoiceCertified"], serde_json::json!(false), "no export certificate yet");
+        // No offsite snapshot tree is configured, so review-readiness must refuse regardless of
+        // how healthy everything else is.
+        assert_eq!(report["gates"]["reviewReady"], serde_json::json!(false));
+        assert_eq!(report["gates"]["finalDatasetReady"], serde_json::json!(false));
+        assert!(!outcome.review_ready);
+        assert!(!outcome.final_dataset_ready);
+    }
+
+    #[test]
+    fn certification_flags_missing_pool_audio_and_unresolved_clips() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _pool) = pool_fixture(dir.path(), &[("a", true), ("b", false)]);
+        std::fs::remove_file(dir.path().join("b.wav")).unwrap();
+        let outcome =
+            certification_outcome(&db, dir.path(), cortex_speech_app_lib::migrations::max_supported_version(), false)
+                .unwrap();
+        let report = &outcome.report;
+        assert_eq!(report["database"]["healthy"], serde_json::json!(true));
+        assert_eq!(report["database"]["fullIntegrityCheck"], serde_json::Value::Null);
+        assert_eq!(report["audio"]["allAvailable"], serde_json::json!(false));
+        assert_eq!(report["audio"]["missingRecordings"], serde_json::json!(1));
+        assert_eq!(report["audio"]["missingClipsByVoice"], serde_json::json!({"Lamo": 1}));
+        assert_eq!(report["resolutionSummary"]["totalClips"], serde_json::json!(2));
+        assert_eq!(report["resolutionSummary"]["resolvedClips"], serde_json::json!(0));
+        assert_eq!(report["resolutionSummary"]["needsFirstOrSecondReview"], serde_json::json!(2));
+        assert_eq!(report["snapshots"]["local"]["fresh"], serde_json::json!(false));
+        assert_eq!(report["gates"]["duplicateExclusionsBound"], serde_json::json!(false), "no dedup manifest bound");
+        assert_eq!(report["gates"]["allClipsResolved"], serde_json::json!(false));
+        assert_eq!(report["gates"]["rightsComplete"], serde_json::json!(false), "rights never stamped");
+        assert_eq!(report["gates"]["reviewReady"], serde_json::json!(false));
+        assert_eq!(report["gates"]["finalDatasetReady"], serde_json::json!(false));
+        assert!(!outcome.review_ready);
+        assert!(!outcome.final_dataset_ready);
     }
 }

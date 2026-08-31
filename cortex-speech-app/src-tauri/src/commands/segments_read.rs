@@ -722,3 +722,115 @@ pub async fn get_active_learning_queue(
         )
     })
 }
+
+#[cfg(test)]
+mod read_command_surface_tests {
+    use super::*;
+
+    #[test]
+    fn review_read_errors_are_typed_retry_aware_and_scrub_internal_text() {
+        let busy = public_review_read_error("Database Is LOCKED at X:\\private\\owner.db");
+        assert_eq!(busy.code, "DATABASE_BUSY");
+        assert!(busy.retryable);
+        assert_eq!(busy.suggested_action, Some(crate::ipc_contract::SuggestedActionV1::Retry));
+        assert_eq!(public_review_read_error("database is busy").code, "DATABASE_BUSY");
+
+        let failed = public_review_read_error("SQL SELECT annotated_transcript FROM speech_segments");
+        assert_eq!(failed.code, "REVIEW_PAGE_FAILED");
+        assert!(!failed.retryable);
+        assert_eq!(failed.suggested_action, Some(crate::ipc_contract::SuggestedActionV1::OpenHealth));
+        let wire = serde_json::to_string(&failed).expect("serialize public review error");
+        assert!(!wire.contains("SELECT"));
+        assert!(!wire.contains("speech_segments"));
+        assert!(!wire.contains("annotated_transcript"));
+    }
+
+    #[test]
+    fn library_worker_and_rate_limit_refusals_are_retryable_typed_codes() {
+        let limited = library_rate_limited_error();
+        assert_eq!(limited.code, "RATE_LIMITED");
+        assert!(limited.retryable);
+        assert_eq!(limited.suggested_action, Some(crate::ipc_contract::SuggestedActionV1::Retry));
+
+        let worker = library_worker_error();
+        assert_eq!(worker.code, "LIBRARY_READ_FAILED");
+        assert!(worker.retryable);
+        assert_eq!(worker.suggested_action, Some(crate::ipc_contract::SuggestedActionV1::Retry));
+    }
+
+    #[test]
+    fn every_supported_library_sort_is_accepted_and_the_default_is_newest() {
+        assert_eq!(public_library_sort(None).unwrap(), "newest");
+        for sort in [
+            "newest",
+            "oldest",
+            "duration",
+            "verified",
+            "confidence",
+            "activeLearning",
+            "active_learning",
+            "suspectFirst",
+            "suspect_first",
+        ] {
+            assert_eq!(public_library_sort(Some(sort.to_string())).unwrap(), sort);
+        }
+        // An oversize value takes the length-validation arm, not the unknown-word arm.
+        assert_eq!(public_library_sort(Some("n".repeat(65))).unwrap_err().code, "INVALID_LIBRARY_SORT");
+    }
+
+    #[test]
+    fn absent_empty_and_oversized_cursors_take_their_own_validation_arms() {
+        assert!(validate_library_cursor(None).is_ok());
+        assert!(validate_library_cursor(Some("")).is_ok());
+        let oversized = "a".repeat(2049);
+        assert_eq!(validate_library_cursor(Some(&oversized)).unwrap_err().code, "INVALID_LIBRARY_CURSOR");
+    }
+
+    #[test]
+    fn an_unchanged_focus_generation_is_accepted_and_deactivation_is_stale() {
+        assert!(ensure_library_focus_unchanged(None, None).is_ok());
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(crate::voice_focus::VOICE_FOCUS_FILE),
+            br#"{"name":"private label","segment_ids":["segment-a"]}"#,
+        )
+        .unwrap();
+        let before = crate::voice_focus::resolve_binding(Some(dir.path())).unwrap().unwrap();
+        let current = crate::voice_focus::resolve_binding(Some(dir.path())).unwrap().unwrap();
+        assert!(ensure_library_focus_unchanged(Some(&before), Some(&current)).is_ok());
+        // A focus that disappears mid-read must invalidate the page, exactly like a replaced one.
+        assert_eq!(ensure_library_focus_unchanged(Some(&before), None).unwrap_err().code, "STALE_VOICE_FOCUS");
+    }
+
+    #[test]
+    fn audio_duration_probe_measures_real_audio_and_refuses_bad_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("one-second.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav, spec).unwrap();
+        for sample in 0..16_000 {
+            writer.write_sample(((sample % 127) as i16) - 63).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let garbage = dir.path().join("not-audio.wav");
+        std::fs::write(&garbage, b"this is not a RIFF container").unwrap();
+
+        tauri::async_runtime::block_on(async {
+            // 16 000 frames at 16 kHz is exactly one second.
+            assert_eq!(get_audio_duration(wav.to_string_lossy().into_owned()).await.unwrap(), 1_000);
+
+            let missing = get_audio_duration(dir.path().join("missing.wav").to_string_lossy().into_owned()).await;
+            assert!(missing.unwrap_err().contains("Invalid path"));
+
+            // An existing non-audio file passes path validation and must fail in the decode probe.
+            assert!(get_audio_duration(garbage.to_string_lossy().into_owned()).await.is_err());
+        });
+    }
+}

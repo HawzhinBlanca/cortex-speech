@@ -407,4 +407,116 @@ mod tests {
         assert!(!unavailable.retryable);
         assert_eq!(unavailable.suggested_action, Some(SuggestedActionV1::OpenHealth));
     }
+
+    #[test]
+    fn every_recovery_operation_keeps_its_stable_public_fallback_code_and_action() {
+        // The renderer keys retry/health affordances off these exact codes; a rename or a
+        // retryability flip is a silent UI contract break, not a refactor.
+        for (operation, code, retryable) in [
+            (RecoveryOperation::Backup, "BACKUP_FAILED", true),
+            (RecoveryOperation::RestoreBackup, "BACKUP_RESTORE_FAILED", false),
+            (RecoveryOperation::Vacuum, "DATABASE_MAINTENANCE_FAILED", true),
+            (RecoveryOperation::ReadState, "RECOVERY_READ_FAILED", true),
+            (RecoveryOperation::ArchiveQuarantine, "QUARANTINE_ARCHIVE_FAILED", true),
+            (RecoveryOperation::RestoreSnapshot, "SNAPSHOT_RESTORE_FAILED", false),
+        ] {
+            let error = public_recovery_failure(operation, "io error: unspecified backend detail");
+            assert_eq!(error.code, code);
+            assert_eq!(error.retryable, retryable, "retryability for {code}");
+            let expected_action = if retryable { SuggestedActionV1::Retry } else { SuggestedActionV1::OpenHealth };
+            assert_eq!(error.suggested_action, Some(expected_action), "suggested action for {code}");
+        }
+    }
+
+    #[test]
+    fn conflict_classification_is_case_insensitive_and_wins_over_the_operation_fallback() {
+        // Backend detail strings are not stable in casing; classification must normalize.
+        let mixed = public_recovery_failure(RecoveryOperation::Vacuum, "Restore Is Already In Progress for this DB");
+        assert_eq!(mixed.code, "RESTORE_IN_PROGRESS", "conflict detection must beat the vacuum fallback code");
+        assert!(mixed.retryable);
+
+        for busy_detail in ["The Database Is Busy right now", "an ACTIVE DATABASE WRITER holds the connection"] {
+            let busy = public_recovery_failure(RecoveryOperation::RestoreSnapshot, busy_detail);
+            assert_eq!(busy.code, "DATABASE_BUSY", "detail: {busy_detail}");
+            assert!(busy.retryable);
+            assert_eq!(busy.suggested_action, Some(SuggestedActionV1::Retry));
+        }
+
+        let limited = recovery_rate_limited_error();
+        assert_eq!(limited.code, "RATE_LIMITED");
+        assert!(limited.retryable);
+        assert_eq!(limited.suggested_action, Some(SuggestedActionV1::Retry));
+    }
+
+    #[test]
+    fn recovery_dtos_map_service_values_verbatim_and_round_trip_the_camel_case_wire() {
+        let backup: BackupVerificationV1 =
+            crate::backup_service::BackupVerification { integrity_ok: false, segment_count: 7 }.into();
+        assert!(!backup.integrity_ok);
+        assert_eq!(backup.segment_count, 7);
+        let wire = serde_json::to_value(&backup).expect("serialize backup verification");
+        assert_eq!(serde_json::from_value::<BackupVerificationV1>(wire).expect("deserialize"), backup);
+
+        let notice =
+            QuarantineNoticeV1 { quarantined_file_count: 1, snapshot_count: 2, newest_snapshot_segments: None };
+        let wire = serde_json::to_value(&notice).expect("serialize quarantine notice");
+        assert_eq!(wire["newestSnapshotSegments"], serde_json::Value::Null);
+        assert_eq!(serde_json::from_value::<QuarantineNoticeV1>(wire).expect("deserialize"), notice);
+
+        let info: SnapshotInfoV1 = crate::snapshot::SnapshotInfo {
+            name: "snapshot_1700000000".to_string(),
+            timestamp: 1_700_000_000,
+            db_size_bytes: 4096,
+            segment_count: Some(3),
+        }
+        .into();
+        assert_eq!(info.name, "snapshot_1700000000");
+        assert_eq!(info.timestamp, 1_700_000_000);
+        assert_eq!(info.db_size_bytes, 4096);
+        assert_eq!(info.segment_count, Some(3));
+        let wire = serde_json::to_value(&info).expect("serialize snapshot info");
+        assert_eq!(wire["dbSizeBytes"], 4096);
+        assert_eq!(serde_json::from_value::<SnapshotInfoV1>(wire).expect("deserialize"), info);
+    }
+
+    #[test]
+    fn listed_snapshot_dtos_are_opaque_selectors_that_resolve_back_to_their_directory() {
+        // Real tempdir fixture: one rotating snapshot with a real SQLite library, one pinned
+        // snapshot without a database file (the size-0 / unknown-count arm of the mapping).
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let data_dir = tmp.path();
+        let rotating_dir = data_dir.join("snapshots").join("snapshot_1700000000");
+        std::fs::create_dir_all(&rotating_dir).expect("create rotating snapshot dir");
+        {
+            let db = crate::db::Database::open(rotating_dir.join("cortex-speech.db").to_string_lossy().as_ref())
+                .expect("open snapshot database");
+            db.initialize().expect("initialize snapshot database");
+        }
+        let pinned_dir = data_dir.join("snapshots").join("pinned").join("premigration_1700000001");
+        std::fs::create_dir_all(&pinned_dir).expect("create pinned snapshot dir");
+
+        let listed = crate::snapshot::list_snapshots(data_dir);
+        assert_eq!(listed.len(), 2, "fixture must list both snapshot forms");
+        for source in listed {
+            let mapped = SnapshotInfoV1::from(source.clone());
+            assert_eq!(mapped.name, source.name);
+            assert_eq!(mapped.timestamp, source.timestamp);
+            assert_eq!(mapped.db_size_bytes, source.db_size_bytes);
+            assert_eq!(mapped.segment_count, source.segment_count);
+            // The wire name is an opaque selector, never a filesystem path — and exactly what
+            // `restore_db_from_snapshot` accepts back.
+            assert!(!mapped.name.contains('/') || mapped.name.starts_with("pinned/"));
+            assert!(!mapped.name.contains('\\'));
+            let resolved = crate::snapshot::resolve_snapshot_dir(data_dir, &mapped.name)
+                .expect("listed selector must resolve for restore");
+            assert!(resolved.starts_with(data_dir.join("snapshots")));
+        }
+
+        let rotating = crate::snapshot::resolve_snapshot_dir(data_dir, "snapshot_1700000000").expect("rotating");
+        assert_eq!(rotating, rotating_dir);
+        let pinned = crate::snapshot::resolve_snapshot_dir(data_dir, "pinned/premigration_1700000001").expect("pinned");
+        assert_eq!(pinned, pinned_dir);
+        // An arbitrary path is never a valid selector even when the directory exists.
+        assert!(crate::snapshot::resolve_snapshot_dir(data_dir, "snapshots/../snapshots").is_err());
+    }
 }
