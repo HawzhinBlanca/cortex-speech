@@ -420,6 +420,165 @@ class Verify10SupervisorTests(unittest.TestCase):
                     require_current_environment=False,
                 )
 
+    def test_failed_rust_coverage_prerequisite_replaces_running_pointer_with_terminal_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = (
+                self.verify.RUST_COVERAGE_PHASE_ROOT,
+                self.verify.RUST_COVERAGE_LATEST,
+                self.verify.RUST_COVERAGE_LOCK,
+            )
+            try:
+                self.verify.RUST_COVERAGE_PHASE_ROOT = root / "phases"
+                self.verify.RUST_COVERAGE_LATEST = root / "latest-rust-coverage-prerequisite.json"
+                self.verify.RUST_COVERAGE_LOCK = root / "rust-coverage-prerequisite.lease.json"
+                process = mock.Mock(pid=os.getpid())
+                with mock.patch.object(
+                    self.verify,
+                    "spawn_isolated",
+                    return_value=(process, mock.Mock()),
+                ), mock.patch.object(
+                    self.verify,
+                    "wait_isolated",
+                    return_value=(7, False),
+                ):
+                    code = self.verify.rust_coverage_prerequisite_main()
+
+                self.assertEqual(code, 1)
+                pointer = json.loads(self.verify.RUST_COVERAGE_LATEST.read_text(encoding="utf-8"))
+                self.assertEqual(pointer["state"], "FAILED")
+                self.assertEqual(pointer["verdict"], "FAIL")
+                self.assertEqual(pointer["terminalEvent"], "phase_end")
+                self.assertEqual(pointer["exitCode"], 1)
+                self.assertEqual(pointer["childExitCode"], 7)
+                self.assertFalse(pointer["timedOut"])
+                self.assertIsNone(pointer["artifactSha256"])
+                event_journal = (self.verify.RUST_COVERAGE_LATEST.parent / pointer["eventJournal"]).resolve()
+                self.assertEqual(pointer["eventJournalSha256"], self.supervisor.sha256_file(event_journal))
+                terminal = json.loads(event_journal.read_text(encoding="utf-8").splitlines()[-1])
+                self.assertEqual(terminal["event"], "phase_end")
+                self.assertEqual(terminal["runToken"], pointer["runToken"])
+                self.assertEqual(terminal["verdict"], pointer["verdict"])
+                with self.assertRaisesRegex(self.verify.EvidenceError, "ended FAIL with exit 1"):
+                    self.verify._validate_latest_rust_coverage_pointer(
+                        self.verify.RUST_COVERAGE_LATEST,
+                        expected_sha=pointer["fullGitSha"],
+                        expected_checkout_digest=self.verify._checkout_state_digest(),
+                    )
+                event_journal.write_bytes(event_journal.read_bytes() + b"substitution")
+                with self.assertRaisesRegex(self.verify.EvidenceError, "journal is missing or changed"):
+                    self.verify._validate_failed_rust_coverage_pointer(
+                        self.verify.RUST_COVERAGE_LATEST,
+                        expected_sha=pointer["fullGitSha"],
+                        expected_token=pointer["runToken"],
+                    )
+            finally:
+                (
+                    self.verify.RUST_COVERAGE_PHASE_ROOT,
+                    self.verify.RUST_COVERAGE_LATEST,
+                    self.verify.RUST_COVERAGE_LOCK,
+                ) = original
+
+    def test_post_measurement_publication_failure_cannot_leave_running_pointer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = (
+                self.verify.RUST_COVERAGE_PHASE_ROOT,
+                self.verify.RUST_COVERAGE_LATEST,
+                self.verify.RUST_COVERAGE_LOCK,
+            )
+            try:
+                self.verify.RUST_COVERAGE_PHASE_ROOT = root / "phases"
+                self.verify.RUST_COVERAGE_LATEST = root / "latest-rust-coverage-prerequisite.json"
+                self.verify.RUST_COVERAGE_LOCK = root / "rust-coverage-prerequisite.lease.json"
+                process = mock.Mock(pid=os.getpid())
+
+                def spawn_with_artifact(command, **_kwargs):
+                    artifact = Path(command[command.index("--output") + 1])
+                    artifact.write_bytes(b"synthetic coverage")
+                    return process, mock.Mock()
+
+                coverage = {
+                    "passed": True,
+                    "artifactSha256": hashlib.sha256(b"synthetic coverage").hexdigest(),
+                }
+                with mock.patch.object(
+                    self.verify,
+                    "spawn_isolated",
+                    side_effect=spawn_with_artifact,
+                ), mock.patch.object(
+                    self.verify,
+                    "wait_isolated",
+                    return_value=(0, False),
+                ), mock.patch.object(
+                    self.verify,
+                    "_rust_coverage_report",
+                    return_value=coverage,
+                ), mock.patch.object(
+                    self.verify,
+                    "_validate_rust_coverage_phase",
+                    side_effect=self.verify.EvidenceError("injected manifest validation failure"),
+                ):
+                    code = self.verify.rust_coverage_prerequisite_main()
+
+                self.assertEqual(code, 1)
+                pointer = json.loads(self.verify.RUST_COVERAGE_LATEST.read_text(encoding="utf-8"))
+                self.assertEqual(pointer["state"], "FAILED")
+                self.assertEqual(pointer["verdict"], "VERIFIER_FAILURE")
+                self.assertEqual(pointer["terminalEvent"], "publication_failure")
+                self.assertEqual(pointer["exitCode"], 1)
+                self.assertEqual(pointer["artifactSha256"], coverage["artifactSha256"])
+                event_journal = (self.verify.RUST_COVERAGE_LATEST.parent / pointer["eventJournal"]).resolve()
+                events = [json.loads(line) for line in event_journal.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual([event["event"] for event in events[-2:]], ["phase_end", "publication_failure"])
+                self.assertEqual(events[-2]["verdict"], "PASS")
+                self.assertEqual(events[-1]["verdict"], "VERIFIER_FAILURE")
+                artifact = event_journal.parent / self.verify.RUST_COVERAGE_ARTIFACT_NAME
+                artifact.write_bytes(b"substituted coverage")
+                with self.assertRaisesRegex(self.verify.EvidenceError, "LLVM artifact is missing or changed"):
+                    self.verify._validate_failed_rust_coverage_pointer(
+                        self.verify.RUST_COVERAGE_LATEST,
+                        expected_sha=pointer["fullGitSha"],
+                        expected_token=pointer["runToken"],
+                    )
+            finally:
+                (
+                    self.verify.RUST_COVERAGE_PHASE_ROOT,
+                    self.verify.RUST_COVERAGE_LATEST,
+                    self.verify.RUST_COVERAGE_LOCK,
+                ) = original
+
+    def test_coverage_lease_loser_cannot_overwrite_active_run_pointer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = (
+                self.verify.RUST_COVERAGE_PHASE_ROOT,
+                self.verify.RUST_COVERAGE_LATEST,
+                self.verify.RUST_COVERAGE_LOCK,
+            )
+            try:
+                self.verify.RUST_COVERAGE_PHASE_ROOT = root / "phases"
+                self.verify.RUST_COVERAGE_LATEST = root / "latest-rust-coverage-prerequisite.json"
+                self.verify.RUST_COVERAGE_LOCK = root / "rust-coverage-prerequisite.lease.json"
+                sentinel = b'{"state":"RUNNING","runToken":"active-owner"}\n'
+                self.verify.RUST_COVERAGE_LATEST.write_bytes(sentinel)
+
+                with mock.patch.object(
+                    self.verify,
+                    "acquired_lease",
+                    side_effect=self.verify.LeaseError("active owner holds the lease"),
+                ):
+                    code = self.verify.rust_coverage_prerequisite_main()
+
+                self.assertEqual(code, 1)
+                self.assertEqual(self.verify.RUST_COVERAGE_LATEST.read_bytes(), sentinel)
+            finally:
+                (
+                    self.verify.RUST_COVERAGE_PHASE_ROOT,
+                    self.verify.RUST_COVERAGE_LATEST,
+                    self.verify.RUST_COVERAGE_LOCK,
+                ) = original
+
     def test_product_profiles_cannot_omit_core_gates_or_mandatory_evidence_classes(self) -> None:
         owner_gates = {
             gate.id for gate in self.verify.GATES if self.verify.PROFILE_OWNER in gate.profiles
