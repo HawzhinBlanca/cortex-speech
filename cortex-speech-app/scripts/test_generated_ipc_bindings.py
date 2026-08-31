@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -13,9 +15,35 @@ MANIFEST = REPO_ROOT / "src-tauri" / "Cargo.toml"
 TRACKED = REPO_ROOT / "src" / "lib" / "generated" / "ipc.ts"
 
 
+def _generation_blocker() -> str | None:
+    """Name the missing build input, or None when regeneration can actually run.
+
+    `cargo run` here executes Tauri's build script, which hard-fails unless every bundled
+    resource exists — and the model binaries are deliberately gitignored (fetched on the
+    release workstation, absent from any fresh clone or the Linux/macOS CI checkouts).
+    A skip must name that exact precondition; the Windows Release Gate machine has the
+    toolchain and the models, so the drift check still bites where the exe is built.
+    """
+    if shutil.which("cargo") is None:
+        return "the cargo toolchain is not installed"
+    configuration = json.loads((REPO_ROOT / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
+    missing = [
+        resource
+        for resource in configuration["bundle"]["resources"]
+        if not (REPO_ROOT / "src-tauri" / resource).exists()
+    ]
+    if missing:
+        return f"bundled build resources are absent (gitignored model binaries): {', '.join(sorted(missing))}"
+    return None
+
+
 def main() -> None:
     if not TRACKED.is_file():
         raise AssertionError(f"generated IPC contract is missing: {TRACKED}")
+    blocker = _generation_blocker()
+    if blocker is not None:
+        print(f"SKIPPED: IPC binding regeneration cannot run here — {blocker}")
+        return
     with tempfile.TemporaryDirectory(prefix="cortex-ipc-") as temporary:
         generated = Path(temporary) / "ipc.ts"
         completed = subprocess.run(

@@ -27,6 +27,16 @@ import owner_proof_platform as proof_platform
 import owner_proof_transaction as proof_transaction
 
 
+if os.name != "nt":
+    # protected_roots() documents its POSIX branch as the seam that "keeps synthetic policy
+    # tests usable elsewhere": it reads APPDATA/LOCALAPPDATA there, and CI Linux/macOS shells
+    # define neither. Point the live-authority sentinels at paths no fixture can live under so
+    # every protected-root rejection stays a real, lexical comparison. Windows is untouched —
+    # its branch resolves Known Folders and ignores these variables entirely.
+    os.environ.setdefault("APPDATA", "/nonexistent-cortex-live/roaming")
+    os.environ.setdefault("LOCALAPPDATA", "/nonexistent-cortex-live/local")
+
+
 GIT_SHA = "a" * 40
 
 
@@ -720,6 +730,7 @@ proof.prepare_bundle(
             check=False,
         )
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_prepare_is_atomic_path_free_and_hash_preserving(self) -> None:
         fixture = Fixture(self.temporary)
         source_hashes = {role: digest(path) for role, path in fixture.sources().by_role().items()}
@@ -871,6 +882,7 @@ proof.prepare_bundle(
             )
             self.assertEqual(replay, result)
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_attempt_requires_exact_prepare_transaction_path_and_journals(self) -> None:
         path_fixture = Fixture(self.temporary / "attempt-container-path")
         path_bundle, _manifest = self.prepare(path_fixture)
@@ -935,6 +947,7 @@ proof.prepare_bundle(
                 self.assertFalse(final.exists())
                 self.assertFalse(staging.exists())
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_attempt_replay_requires_exact_readonly_initial_manifest(self) -> None:
         fixture = Fixture(self.temporary / "attempt-manifest-exact")
         bundle, _manifest = self.prepare(fixture)
@@ -998,6 +1011,7 @@ proof.prepare_bundle(
                 expected_contract_sha256=fixture.contract_sha256,
             )
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_attempt_replay_requires_both_databases_to_remain_writable(self) -> None:
         fixture = Fixture(self.temporary / "attempt-database-writable")
         bundle, _manifest = self.prepare(fixture)
@@ -1019,6 +1033,7 @@ proof.prepare_bundle(
                     expected_contract_sha256=fixture.contract_sha256,
                 )
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_transaction_plan_missing_entries_and_duplicate_acl_states_fail_typed(self) -> None:
         owner_payload = proof.canonical_json_bytes({"fixture": "owner"})
         duplicate_masks = {
@@ -1067,6 +1082,7 @@ proof.prepare_bundle(
                 mutable_descendant_roots=(proof.VERIFY_ROOT_DIR, f"{proof.BUNDLE_DIR}/{proof.ATTEMPTS_DIR}"),
             )
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_published_transaction_rejects_shape_valid_recovery_authority_drift(self) -> None:
         for mutation_index, mutation in enumerate(("fingerprint", "mask")):
             case = self.temporary / f"pm-{mutation_index}"
@@ -1155,6 +1171,7 @@ proof.prepare_bundle(
         self.assertEqual(payload["bundleRoot"], os.fspath(container / proof.BUNDLE_DIR))
         self.assertEqual(payload["status"], "already-prepared")
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_fresh_attempts_are_writable_distinct_and_never_overwritten(self) -> None:
         fixture = Fixture(self.temporary)
         bundle, _manifest = self.prepare(fixture)
@@ -1196,6 +1213,7 @@ proof.prepare_bundle(
                 expected_contract_sha256=fixture.contract_sha256,
             )
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_traversal_and_non_v4_attempt_tokens_are_refused(self) -> None:
         fixture = Fixture(self.temporary)
         bundle, _manifest = self.prepare(fixture)
@@ -1241,6 +1259,7 @@ proof.prepare_bundle(
         with self.assertRaises(proof.ProofInputError):
             self.prepare(fixture)
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_contract_wrong_media_count_and_extra_bundle_file_are_refused(self) -> None:
         fixture = Fixture(self.temporary)
         contract = json.loads(fixture.contract.read_text(encoding="utf-8"))
@@ -1312,9 +1331,8 @@ proof.prepare_bundle(
                     expected_contract_sha256=fixture.contract_sha256,
                 )
 
+    @unittest.skipUnless(os.name == "nt", "protected roots resolve via SHGetKnownFolderPath only on Windows")
     def test_environment_cannot_redirect_windows_known_folder_authority(self) -> None:
-        if os.name != "nt":
-            return
         before = proof.protected_roots()
         decoy = self.temporary / "decoy"
         with mock.patch.dict(
@@ -1324,9 +1342,8 @@ proof.prepare_bundle(
         ):
             self.assertEqual(proof.protected_roots(), before)
 
+    @unittest.skipUnless(os.name == "nt", "\\\\?\\ verbatim and 8.3 short names are Windows path aliases")
     def test_windows_verbatim_and_short_names_share_one_containment_identity(self) -> None:
-        if os.name != "nt":
-            return
         protected = proof.protected_roots()[0]
         raw = str(protected)
         slash = "\\"
@@ -1410,6 +1427,7 @@ proof.prepare_bundle(
         self.assertEqual(destination.read_bytes(), b"owner")
         self.assertEqual(temporary.read_bytes(), b"new")
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_derived_name_flush_failure_prevents_root_publication(self) -> None:
         fixture = Fixture(self.temporary / "derived-name-fsync")
         output = self.temporary / "derived-name-fsync-bundle"
@@ -1445,6 +1463,7 @@ proof.prepare_bundle(
         self.assertFalse(output.exists())
         self.assertFalse(staging.exists())
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_source_and_published_authority_hardlinks_fail_closed(self) -> None:
         fixture = Fixture(self.temporary / "source-hardlink")
         alias = self.temporary / "source-hardlink-alias.mp4"
@@ -1492,6 +1511,7 @@ proof.prepare_bundle(
                 )
         self.assertFalse(output.exists())
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_attempt_flush_failure_is_retryable_and_never_publishes(self) -> None:
         fixture = Fixture(self.temporary / "attempt-fsync")
         bundle, _manifest = self.prepare(fixture)
@@ -1522,6 +1542,7 @@ proof.prepare_bundle(
         )
         self.assertEqual(result["runToken"], token)
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_post_rename_flush_failure_is_explicit_and_reconcilable(self) -> None:
         fixture = Fixture(self.temporary / "post-rename-fsync")
         output = self.temporary / "post-rename-fsync-bundle"
@@ -1587,6 +1608,10 @@ proof.prepare_bundle(
         )
         self.assertEqual(Path(recovered["attemptDirectory"]), final)
 
+    @unittest.skipUnless(
+        os.name == "nt",
+        "the swap defense under test is the Windows delete-by-handle cleanup; the POSIX branch is rmtree",
+    )
     def test_cleanup_refuses_a_renamed_root_replacement(self) -> None:
         parent = self.temporary / "cleanup-swap"
         parent.mkdir()
@@ -1611,6 +1636,10 @@ proof.prepare_bundle(
         self.assertTrue(displaced.is_dir())
         self.assertEqual((staging / "KEEP.txt").read_text(encoding="utf-8"), "owner")
 
+    @unittest.skipUnless(
+        os.name == "nt",
+        "_delete_owned_tree_windows is the Windows identity-locked deleter (CreateFileW handles)",
+    )
     def test_cleanup_never_deletes_a_child_swapped_after_namespace_check(self) -> None:
         root = self.temporary / "cleanup-child-race"
         root.mkdir()
@@ -1639,6 +1668,7 @@ proof.prepare_bundle(
         self.assertEqual(owned.read_text(encoding="utf-8"), "VICTIM")
         self.assertEqual(parked.read_text(encoding="utf-8"), "OWNED")
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_prepare_holds_staging_identity_across_every_write(self) -> None:
         fixture = Fixture(self.temporary / "staging-write-race")
         output = self.temporary / "staging-write-race-bundle"
@@ -1952,6 +1982,7 @@ proof.prepare_bundle(
             child.stdout.close()
             child.stderr.close()
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_moved_bundle_inside_git_worktree_cannot_validate_or_create_attempt(self) -> None:
         fixture = Fixture(self.temporary / "moved-bundle")
         bundle, _manifest = self.prepare(fixture)
@@ -1989,6 +2020,7 @@ proof.prepare_bundle(
                 campaign="absent",
             )
 
+    @unittest.skipUnless(os.name == "nt", "the release build environment contract requires Windows (%SystemRoot%, MSVC toolchain roots)")
     def test_release_build_environment_drops_wrapper_and_flag_injection(self) -> None:
         injected = {
             "SystemRoot": r"Z:\attacker-root",
@@ -2194,6 +2226,7 @@ proof.prepare_bundle(
                     expected_contract_sha256=fixture.contract_sha256,
                 )
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_manifest_and_authorities_detect_post_publication_drift(self) -> None:
         fixture = Fixture(self.temporary)
         bundle, _manifest = self.prepare(fixture)
@@ -2208,6 +2241,7 @@ proof.prepare_bundle(
                 expected_contract_sha256=fixture.contract_sha256,
             )
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_attempts_entry_is_namespace_sealed_against_replacement(self) -> None:
         fixture = Fixture(self.temporary)
         bundle, _manifest = self.prepare(fixture)
@@ -2242,6 +2276,7 @@ proof.prepare_bundle(
             expected_contract_sha256=fixture.contract_sha256,
         )
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_rehashed_manifest_cannot_reauthorize_a_different_media_authority(self) -> None:
         fixture = Fixture(self.temporary)
         bundle, _manifest = self.prepare(fixture)
@@ -2270,6 +2305,7 @@ proof.prepare_bundle(
                 expected_contract_sha256=fixture.contract_sha256,
             )
 
+    @unittest.skipUnless(os.name == "nt", "the owner-proof publication transaction is Windows-only (NamedMutex, CreateFileW identity locks, protected DACLs)")
     def test_writable_manifest_is_not_valid_proof(self) -> None:
         fixture = Fixture(self.temporary)
         bundle, _manifest = self.prepare(fixture)

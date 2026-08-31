@@ -36,7 +36,7 @@ import sqlite3
 import sys
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable
 
 # The duplicates that existed the day this gate was written, awaiting the owner-gated cleanup.
@@ -102,7 +102,9 @@ def duplicate_groups(rows: list[tuple[str, str, str, str, int]]) -> list[list[tu
             offset = int(json.loads(alignment_json or "{}").get("source_start_ms", -1))
         except (ValueError, TypeError):
             offset = -1
-        parsed.append((seg_id, os.path.basename(path), text, offset))
+        # The library stores Windows drive paths; PureWindowsPath splits both separators, so the
+        # basename is identical on Windows and deterministic when this audit runs on POSIX CI.
+        parsed.append((seg_id, PureWindowsPath(path).name, text, offset))
 
     # Union-find over clip ids, so A-links and B-links merge into one group per real sentence.
     parent: dict[str, str] = {sid: sid for sid, _, _, _ in parsed}

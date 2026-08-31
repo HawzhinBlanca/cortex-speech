@@ -590,7 +590,9 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
         local_free = Function()
         crypt32 = type("Crypt32", (), {"CryptUnprotectData": crypt})()
         kernel32 = type("Kernel32", (), {"LocalFree": local_free})()
-        with mock.patch.object(gate.ctypes, "WinDLL", side_effect=[crypt32, kernel32]):
+        # create=True: POSIX ctypes has no WinDLL attribute; the parser logic under test is
+        # platform-independent once both DLLs are faked, so it must keep running everywhere.
+        with mock.patch.object(gate.ctypes, "WinDLL", side_effect=[crypt32, kernel32], create=True):
             with self.assertRaises(OSError):
                 gate.dpapi_unprotect("dpapi:QQ==")
         self.assertEqual(crypt.calls[0][5], 0x1)

@@ -14,6 +14,7 @@ close, so it is driven against a fabricated-clean database and required to refus
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import os
 import re
@@ -22,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 from _command_policy_util import command_surface
 from _couch_policy_util import couch_surface
@@ -421,21 +423,41 @@ def test_verify_10_keeps_the_current_build_empty_canary_red() -> None:
 
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
-        db_path = tmp / "t.db"
+        # The child never receives CORTEX_DB: the gate's environment allowlist admits only
+        # CORTEX_APP_EXE, and live-authority mode pins APPDATA to the canonical roots. Seed the
+        # database at the canonical location under a synthetic roaming root so the POSIX run
+        # audits exactly this fixture; on Windows the child reads the real live database and the
+        # just-written executable's mtime still makes the current-build window genuinely 0/20.
+        db_path = tmp / "live-roaming" / "cortex-speech" / "cortex-speech.db"
+        db_path.parent.mkdir(parents=True)
         _seed(db_path)
         exe = tmp / "cortex-speech-app.exe"
         exe.write_bytes(b"\x00" + gate.ENFORCE_MARKER + b"\x00")
 
         # Exercise the exact registered command through the aggregator, changing only the isolated
-        # binary path and DB environment. The old event predates the just-written executable, so the
-        # current-build window is genuinely 0/20 without manufacturing or backdating any evidence.
+        # binary path. The old event predates the just-written executable, so the current-build
+        # window is genuinely 0/20 without manufacturing or backdating any evidence.
         isolated_payload = payload.replace("--active-release", f'--exe "{exe}"')
         previous_db = os.environ.get("CORTEX_DB")
         previous_log_dir = verify.LOG_DIR
+        # run_gate builds the child environment against the canonical live data roots, which only
+        # Windows can resolve (SHGetKnownFolderPath — deliberately not overridable by env). On
+        # POSIX, stub that single seam with synthetic roots so the canary-red proof itself — a
+        # plain subprocess over an isolated SQLite file — keeps running; Windows runs unpatched.
+        live_roots = (
+            contextlib.nullcontext()
+            if os.name == "nt"
+            else mock.patch.object(
+                verify,
+                "_canonical_live_data_roots",
+                return_value=(tmp / "live-roaming", tmp / "live-local"),
+            )
+        )
         try:
             os.environ["CORTEX_DB"] = str(db_path)
             verify.LOG_DIR = tmp / "verify-logs"
-            status, _seconds, detail = verify.run_gate(name, kind, isolated_payload, cwd, probe, timeout=30)
+            with live_roots:
+                status, _seconds, detail = verify.run_gate(name, kind, isolated_payload, cwd, probe, timeout=30)
         finally:
             verify.LOG_DIR = previous_log_dir
             if previous_db is None:

@@ -43,6 +43,17 @@ def load_module(name: str, path: Path):
     return module
 
 
+# These tests drive full verifier runs (aggregate_main / _run_authority_document) whose run
+# authority binds the live product through SHGetKnownFolderPath — deliberately without any
+# environment override (that refusal is itself a pinned property). No portable authority exists
+# by design, so they execute only where the Windows Known Folder API does. The Windows Release
+# Gate runs them unskipped.
+_requires_windows_live_authority = unittest.skipUnless(
+    sys.platform == "win32",
+    "full verifier runs bind live product authority via Windows Known Folder resolution (SHGetKnownFolderPath)",
+)
+
+
 class Verify10SupervisorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -3214,6 +3225,7 @@ class Verify10SupervisorTests(unittest.TestCase):
                             expected_environment=environment,
                         )
 
+    @_requires_windows_live_authority
     def test_timeout_calibration_consumes_completed_manifests_and_latest_incomplete_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4445,6 +4457,7 @@ class Verify10SupervisorTests(unittest.TestCase):
                 )
             )
 
+    @_requires_windows_live_authority
     def test_keyboard_interrupt_terminates_worker_and_publishes_no_status(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4498,6 +4511,7 @@ class Verify10SupervisorTests(unittest.TestCase):
             finally:
                 lease.release()
 
+    @_requires_windows_live_authority
     def test_declared_gate_timeout_is_the_exact_parent_hard_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4858,6 +4872,10 @@ class Verify10SupervisorTests(unittest.TestCase):
         self.assertEqual(status, self.verify.FAIL)
         self.assertIn("probe crashed", detail)
 
+    @unittest.skipUnless(
+        os.name == "nt",
+        "injects an NTSTATUS termination through kernel32 OpenProcess/TerminateProcess (ctypes.WinDLL)",
+    )
     def test_abnormal_node_termination_retry_is_noncertifying(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -5021,24 +5039,31 @@ class Verify10SupervisorTests(unittest.TestCase):
                 self.assertIn(
                     {"pid": child.pid, "processCreationTime": creation}, identities
                 )
-                for declared_port in sorted(self.verify.VERIFIER_FAULT_DECLARED_PORTS):
-                    try:
-                        server = ThreadingHTTPServer(
-                            ("127.0.0.1", declared_port), BaseHTTPRequestHandler
+                if os.name == "nt":
+                    for declared_port in sorted(self.verify.VERIFIER_FAULT_DECLARED_PORTS):
+                        try:
+                            server = ThreadingHTTPServer(
+                                ("127.0.0.1", declared_port), BaseHTTPRequestHandler
+                            )
+                            break
+                        except OSError:
+                            continue
+                    self.assertIsNotNone(server)
+                    assert server is not None
+                    listeners = self.verify._declared_port_listeners()
+                    self.assertTrue(
+                        any(
+                            item["port"] == server.server_address[1]
+                            and item["pid"] == os.getpid()
+                            for item in listeners
                         )
-                        break
-                    except OSError:
-                        continue
-                self.assertIsNotNone(server)
-                assert server is not None
-                listeners = self.verify._declared_port_listeners()
-                self.assertTrue(
-                    any(
-                        item["port"] == server.server_address[1]
-                        and item["pid"] == os.getpid()
-                        for item in listeners
                     )
-                )
+                else:
+                    # The port inventory parses Windows `netstat -ano` PID ownership; its
+                    # documented POSIX contract is the empty inventory. Pin that contract —
+                    # this method's name is bound into VERIFIER_FAULT_SCENARIOS, so it must
+                    # keep existing (and keep measuring) on every platform.
+                    self.assertEqual(self.verify._declared_port_listeners(), [])
                 owned = root / "owned.lease.json"
                 contender = root / "contender.lease.json"
                 self.supervisor.atomic_write_json(owned, {"runToken": "ours"})
@@ -5150,6 +5175,7 @@ class Verify10SupervisorTests(unittest.TestCase):
                 )
             self.assertFalse(absent_pointer.exists())
 
+    @_requires_windows_live_authority
     def test_gate_worker_isolated_result_is_hash_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -5189,6 +5215,7 @@ class Verify10SupervisorTests(unittest.TestCase):
                 {"attemptCount": 1, "retryCount": 0, "retryReasons": []},
             )
 
+    @_requires_windows_live_authority
     def test_retry_is_structured_in_worker_result_and_fsynced_journal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -5301,6 +5328,7 @@ class Verify10SupervisorTests(unittest.TestCase):
                 next(event["sequence"] for event in events if event["event"] == "gate_end"),
             )
 
+    @_requires_windows_live_authority
     def test_completed_manifest_is_the_only_status_and_latest_pointer_authority(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -5689,6 +5717,7 @@ class Verify10SupervisorTests(unittest.TestCase):
         self.assertIn("stale-lock takeover occurred", recovered_verdict)
         self.assertIn("fresh no-takeover run", recovered_verdict)
 
+    @_requires_windows_live_authority
     def test_takeover_is_bound_into_manifest_attestation_and_terminal_journal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -5829,6 +5858,7 @@ class Verify10SupervisorTests(unittest.TestCase):
                     self.verify._checkout_state_digest,
                 ) = original
 
+    @_requires_windows_live_authority
     def test_attestation_publication_failure_invalidates_the_run_and_publishes_no_pointer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -23,9 +23,28 @@ def completed(returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess([], returncode, stdout, stderr)
 
 
+class _WindowsCheckout:
+    """A fixed Windows-drive checkout path, usable on any host.
+
+    The assertions below prove the WINDOWS branch of _fuzz_cmd translates the checkout
+    through WSL's /mnt/<drive> mount; on a POSIX host the module-level SRC_TAURI has no
+    drive letter, so the branch under test needs a representative Windows path injected.
+    """
+
+    _raw = "C:\\cx\\cortex-speech-app\\src-tauri"
+
+    def __str__(self):
+        return self._raw
+
+    def resolve(self):
+        return self
+
+
 def test_windows_fuzz_uses_one_ext4_cache_with_quoted_arguments():
     module = load_verify()
-    with mock.patch.object(module.sys, "platform", "win32"):
+    with mock.patch.object(module.sys, "platform", "win32"), mock.patch.object(
+        module, "SRC_TAURI", _WindowsCheckout()
+    ):
         command = module._fuzz_cmd("run normalizer -- -max_total_time=30")
 
     assert command[:4] == ["wsl", "--exec", "bash", "-lc"]

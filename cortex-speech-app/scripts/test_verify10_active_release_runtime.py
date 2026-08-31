@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -500,14 +501,30 @@ def test_every_staged_candidate_artifact_is_reobserved_after_authority_capture()
 def test_staged_runtime_gates_use_bound_executable_without_caller_or_active_pointer() -> None:
     playback = GATE._gate_by_id("playback-enforcement-readiness")
     freshness = GATE._gate_by_id("exe-freshness")
-    with mock.patch.dict(os.environ, {"CORTEX_APP_EXE": r"C:\sealed\cortex-speech-app.exe"}):
-        steps = GATE._effective_gate_steps(
-            playback.id, playback.steps, GATE.AUTHORITY_MODE_STAGED_CANDIDATE
+    # _gate_environment inventories caller overrides against the canonical live data roots,
+    # which resolve only through the Windows Known Folder API (no env override, by design).
+    # The environment-composition assertions below are platform-independent, so on POSIX stub
+    # that single seam with synthetic roots; Windows runs the real resolution unpatched.
+    with tempfile.TemporaryDirectory() as raw:
+        live_roots = (
+            contextlib.nullcontext()
+            if os.name == "nt"
+            else mock.patch.object(
+                GATE,
+                "_canonical_live_data_roots",
+                return_value=(Path(raw) / "live-roaming", Path(raw) / "live-local"),
+            )
         )
-        staged_freshness = GATE._gate_environment(
-            freshness, GATE.AUTHORITY_MODE_STAGED_CANDIDATE
-        )
-        live_freshness = GATE._gate_environment(freshness, GATE.AUTHORITY_MODE_LIVE)
+        with live_roots, mock.patch.dict(
+            os.environ, {"CORTEX_APP_EXE": r"C:\sealed\cortex-speech-app.exe"}
+        ):
+            steps = GATE._effective_gate_steps(
+                playback.id, playback.steps, GATE.AUTHORITY_MODE_STAGED_CANDIDATE
+            )
+            staged_freshness = GATE._gate_environment(
+                freshness, GATE.AUTHORITY_MODE_STAGED_CANDIDATE
+            )
+            live_freshness = GATE._gate_environment(freshness, GATE.AUTHORITY_MODE_LIVE)
     argv = list(steps[0].argv)
     assert "--active-release" not in argv
     assert argv[-2:] == ["--exe", r"C:\sealed\cortex-speech-app.exe"]

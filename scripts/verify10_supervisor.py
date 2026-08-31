@@ -206,8 +206,16 @@ def process_creation_time(pid: int) -> str | None:
         return None
     if os.name != "nt":
         try:
-            fields = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").split()
-            return fields[21]
+            text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+            # Split after the parenthesized comm so an executable name containing spaces cannot
+            # shift the field indexes: the remainder starts at field 3 (state).
+            fields = text.rpartition(")")[2].split()
+            if fields[0] in {"Z", "X", "x"}:
+                # A zombie or dead entry keeps its /proc row (and starttime) until the parent
+                # reaps it, but the process identity is gone. Windows reports the same condition
+                # as "exited" via WaitForSingleObject; treat both sides identically.
+                return None
+            return fields[19]
         except (OSError, IndexError, UnicodeError):
             return None
 

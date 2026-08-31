@@ -14,6 +14,22 @@ from owner_proof_platform import ProofInputError
 
 
 MAX_JSON_BYTES = 2 * 1024 * 1024
+# Proof documents are a few levels deep; 100 is decisively above any real payload. The bound must
+# be explicit: relying on the interpreter's RecursionError leaves the depth ceiling to whichever
+# Python build runs the gate (CPython 3.13+ parses 1000+ levels without raising).
+MAX_JSON_DEPTH = 100
+
+
+def _reject_excessive_depth(value: Any, *, context: str) -> None:
+    pending: list[tuple[Any, int]] = [(value, 1)]
+    while pending:
+        node, depth = pending.pop()
+        if depth > MAX_JSON_DEPTH:
+            raise ProofInputError(f"{context} exceeds the bounded nesting depth")
+        if isinstance(node, dict):
+            pending.extend((child, depth + 1) for child in node.values())
+        elif isinstance(node, list):
+            pending.extend((child, depth + 1) for child in node)
 SOURCE_ROLES = (
     "real-media-mp4",
     "real-media-mov",
@@ -96,9 +112,10 @@ def parse_json_bytes(raw: bytes, *, context: str = "proof JSON") -> Any:
             object_pairs_hook=reject_duplicate_keys,
             parse_constant=_reject_nonfinite_constant,
         )
+        _reject_excessive_depth(value, context=context)
         # Validate that every decoded string/value can cross the canonical UTF-8
-        # boundary. This rejects escaped lone surrogates and excessive recursion
-        # even when canonical byte equality is not required by the caller.
+        # boundary. This rejects escaped lone surrogates even when canonical byte
+        # equality is not required by the caller.
         canonical_json_bytes(value)
         return value
     except ProofInputError:
@@ -121,6 +138,7 @@ def load_json(path: Path, *, canonical: bool = False) -> dict[str, Any]:
 
 
 def canonical_json_bytes(value: Any) -> bytes:
+    _reject_excessive_depth(value, context="canonical JSON value")
     try:
         text = json.dumps(
             value,

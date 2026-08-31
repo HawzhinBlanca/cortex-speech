@@ -871,7 +871,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", type=Path)
     parser.add_argument("--focus", type=Path)
     args = parser.parse_args(argv)
-    data_dir = args.data_dir or _default_data_dir()
+    # Resolve the Windows %APPDATA% default only when a path actually needs it, so explicit
+    # --db/--focus invocations (the policy tests, cross-platform CI) never require APPDATA.
+    data_dir = args.data_dir
+    if data_dir is None and not (args.db and args.focus):
+        data_dir = _default_data_dir()
     db_path = args.db or data_dir / "cortex-speech.db"
     focus_path = args.focus or data_dir / "voice_focus.json"
     result = audit_flexible_deferred(db_path)
