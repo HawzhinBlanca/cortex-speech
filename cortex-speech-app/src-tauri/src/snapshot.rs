@@ -1847,6 +1847,66 @@ mod tests {
     }
 
     #[test]
+    fn champion_pointer_rejects_every_invalid_shape_and_accepts_exact_schema_two() {
+        let parse_error = validate_champion_pointer(b"{").unwrap_err();
+        assert!(parse_error.starts_with("champion.json is invalid JSON:"), "{parse_error}");
+
+        let exact_entry = serde_json::json!({
+            "modelVersionId": "model-v1",
+            "deploymentManifestPath": "models/manifest.json",
+            "deploymentSha256": "a".repeat(64),
+            "source": "owner",
+            "license": "private",
+        });
+        let invalid = [
+            (serde_json::json!([]), "champion.json must be an object"),
+            (
+                serde_json::json!({"schema": 2, "champions": {}, "extra": true}),
+                "champion.json must contain exactly schema and champions",
+            ),
+            (serde_json::json!({"schema": 2, "other": {}}), "champion.json must contain exactly schema and champions"),
+            (
+                serde_json::json!({"champions": {}, "other": {}}),
+                "champion.json must contain exactly schema and champions",
+            ),
+            (serde_json::json!({"schema": 1, "champions": {}}), "champion.json schema must be exactly 2"),
+            (serde_json::json!({"schema": 2, "champions": []}), "champion.json champions must be an object"),
+            (
+                serde_json::json!({"schema": 2, "champions": {" \t": exact_entry.clone()}}),
+                "champion.json contains an empty family name",
+            ),
+            (
+                serde_json::json!({"schema": 2, "champions": {"asr": null}}),
+                "champion.json family 'asr' must be an object",
+            ),
+            (
+                serde_json::json!({"schema": 2, "champions": {"asr": {}}}),
+                "champion.json family 'asr' has an invalid field set",
+            ),
+            (
+                serde_json::json!({
+                    "schema": 2,
+                    "champions": {"asr": {
+                        "modelVersionId": 7,
+                        "deploymentManifestPath": "models/manifest.json",
+                        "deploymentSha256": "a".repeat(64),
+                        "source": "owner",
+                        "license": "private",
+                    }},
+                }),
+                "champion.json family 'asr' fields must all be strings",
+            ),
+        ];
+        for (value, expected) in invalid {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            assert_eq!(validate_champion_pointer(&bytes), Err(expected.to_string()), "unexpected value: {value}");
+        }
+
+        let valid = serde_json::json!({"schema": 2, "champions": {"asr": exact_entry}});
+        assert_eq!(validate_champion_pointer(&serde_json::to_vec(&valid).unwrap()), Ok(()));
+    }
+
+    #[test]
     fn active_pilot_snapshot_requires_exact_current_schema_and_completed_event_grants() {
         let db = seeded_db();
         let policy = pilot_policy();
