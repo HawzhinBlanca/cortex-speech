@@ -2690,6 +2690,37 @@ mod tests {
     }
 
     #[test]
+    fn stale_staging_sweep_removes_only_crash_directories_and_never_invents_snapshot_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("snapshots");
+        sweep_stale_staging_dirs(&root);
+        assert!(!root.exists(), "sweeping a missing root must not create state");
+        assert!(!has_any_snapshot(&root), "a missing root has no snapshot history");
+
+        std::fs::create_dir(&root).unwrap();
+        let stale = root.join(format!("{STAGING_PREFIX}crashed-generation"));
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(stale.join("partial.db"), b"partial").unwrap();
+        let unrelated = root.join(".staging-not-a-generation");
+        std::fs::create_dir(&unrelated).unwrap();
+        let staging_named_file = root.join(format!("{STAGING_PREFIX}ordinary-file"));
+        std::fs::write(&staging_named_file, b"not a directory").unwrap();
+        let final_snapshot = root.join("snapshot_0000000001");
+        std::fs::create_dir(&final_snapshot).unwrap();
+
+        sweep_stale_staging_dirs(&root);
+        assert!(!stale.exists(), "a crash-left staging directory must be removed recursively");
+        assert!(unrelated.is_dir(), "a non-prefix directory must survive the sweep");
+        assert!(staging_named_file.is_file(), "the sweep must never delete a prefix-matching regular file");
+        assert!(final_snapshot.is_dir(), "a promoted snapshot must survive the sweep");
+        assert!(has_any_snapshot(&root), "a final snapshot directory is authoritative history");
+
+        std::fs::remove_dir(&final_snapshot).unwrap();
+        std::fs::write(root.join("snapshot_0000000002"), b"not a directory").unwrap();
+        assert!(!has_any_snapshot(&root), "a snapshot-shaped regular file must not invent history");
+    }
+
+    #[test]
     fn same_second_pinned_snapshots_do_not_overwrite_each_other() {
         // Round-24 hunt #7: <label>_<seconds> collided for two pins in the same wall-clock second —
         // create_dir_all succeeded on the existing dir and db.backup silently OVERWROTE the previous
