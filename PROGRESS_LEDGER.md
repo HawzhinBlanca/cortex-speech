@@ -12888,3 +12888,40 @@ A separate verifier-hygiene finding remains: after the terminal threshold failur
 stream recorded `phase_end`, exit 1, no timeout, and verdict `FAIL`. No generated pointer was manually
 rewritten; its terminal-state publication needs its own bounded remediation. Production, live data,
 scheduled tasks, release pointers, credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 33: terminal coverage-pointer publication
+
+The exact Rust coverage prerequisite no longer leaves its authoritative latest-run pointer stuck at
+`RUNNING` after a terminal nonzero result. Every owned failure path now publishes a canonical
+`FAILED` envelope bound to the immutable event journal and any produced LLVM artifact. A failure
+after measurement but before completion publication records a distinct `publication_failure`, while
+a process that loses the coverage lease cannot overwrite the active owner's pointer. Successful
+`COMPLETED` evidence remains the only consumable prerequisite; a validated `FAILED` pointer reports
+the terminal verdict and requires a rerun.
+
+Three focused supervisor regressions passed 3/3: ordinary child failure replaces `RUNNING`, a
+post-measurement manifest-publication failure cannot strand it, and a lease loser preserves the
+active pointer byte-for-byte. The existing prerequisite anti-forgery/staleness proof also passed 1/1.
+The full verifier-supervisor module passed 33/33, Python compilation passed, workflow policy passed,
+and the execution-discovery guard passed 10 assertions while scanning 130 policy files. The blanket
+policy runner was deliberately not invoked because it would execute the desktop-forbidden 7B launch
+guard; the directly governing policies were run instead.
+
+Product commit `afc965a76f20a739f07bdcba4f0860fa90402db9` then received a real serialized
+post-commit prerequisite replay. It passed 1,845 library tests with 0 failures and 8 ignores, importer
+14/14, ASR containment 1/1, audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1,
+Tauri integration 1/1, shell smoke 1/1, user-data 2/2, and every Criterion target. The child exited
+1 solely at the locked coverage thresholds, without timeout or retry. Run
+`c1888ad79277491f8b621d7c069e260b` produced LLVM artifact SHA-256
+`cf7eb9fb9b04f73912b5b2afb7721b473712122201e4b9fba5f77f2461434a33`; its latest
+pointer finished as `FAILED` / `FAIL` / exit 1 and was accepted by the production failure-pointer
+validator with event-journal SHA-256
+`9e3face64da8bdba18eadfad7c1f71c4e6e6c7f53e0088d2be07410b0e12c3d2`.
+
+No Rust production code changed in this iteration. The replay's nondeterministic coverage variance
+was 7,838/12,837 branches (61.06%), 76,771/96,036 lines (79.94%), 136,568/170,719 regions
+(80.00%), and 6,529/9,634 functions (67.77%); restore remained 1,130/1,532 branches (73.76%).
+Remaining minimum deficits at this replay are 2,432 overall branches, 4,860 lines, 8,544 regions,
+1,179 functions, 157 review branches, 147 payment, 119 playback, 249 restore, and 486 IPC. P1
+remains red, P2 remains green, and P0 remains unknown. Production, live data, scheduled tasks,
+release pointers, credentials, and GPU/model configuration were untouched.
