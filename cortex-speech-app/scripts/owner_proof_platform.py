@@ -34,6 +34,7 @@ _SE_DACL_PROTECTED = 0x1000
 _ACCESS_DENIED_ACE_TYPE = 0x1
 _INHERITED_ACE = 0x10
 _WIN_WORLD_SID = 1
+_FILE_ID_INFO_CLASS = 18
 
 
 class _WindowsFileTime(ctypes.Structure):
@@ -53,6 +54,11 @@ class _WindowsFileInformation(ctypes.Structure):
         ("indexHigh", ctypes.c_uint32),
         ("indexLow", ctypes.c_uint32),
     ]
+
+
+class _WindowsFileIdInformation(ctypes.Structure):
+    # FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS FileIdInfo.
+    _fields_ = [("volume", ctypes.c_uint64), ("file_id", ctypes.c_ubyte * 16)]
 
 
 class _WindowsBasicInformation(ctypes.Structure):
@@ -566,8 +572,12 @@ class LockedFile:
         if self.handle is None:
             raise ProofInputError("proof-input file lock is closed")
         metadata = os.stat(self.path, follow_symlinks=False)
-        if (metadata.st_dev, metadata.st_ino) != self.identity or metadata.st_nlink != self.links:
+        if not self.matches_stat(metadata) or metadata.st_nlink != self.links:
             raise ProofInputError("locked proof-input file identity changed")
+
+    def matches_stat(self, metadata: os.stat_result) -> bool:
+        """Whether an os.stat() result names this locked file, in either Windows identity encoding."""
+        return stat_matches_handle_identity(metadata, self.handle, self.identity)
 
     def close(self) -> None:
         if self.handle is None:
@@ -1439,6 +1449,50 @@ def _windows_information_identity(information: _WindowsFileInformation) -> tuple
     return (information.volume, (information.indexHigh << 32) | information.indexLow)
 
 
+def _windows_handle_file_id_identity(handle: int) -> tuple[int, int] | None:
+    """FILE_ID_INFO identity for an open handle, or None when the volume cannot report one."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFileInformationByHandleEx.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    kernel32.GetFileInformationByHandleEx.restype = ctypes.c_int
+    information = _WindowsFileIdInformation()
+    if not kernel32.GetFileInformationByHandleEx(
+        handle,
+        _FILE_ID_INFO_CLASS,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        return None
+    return (information.volume, int.from_bytes(bytes(information.file_id), "little"))
+
+
+def stat_matches_handle_identity(
+    metadata: os.stat_result,
+    handle: int | None,
+    identity: tuple[int, int],
+) -> bool:
+    """Answer whether os.stat() names the same volume and file as an open handle's identity.
+
+    ``identity`` is ``(dwVolumeSerialNumber, 64-bit file index)`` as GetFileInformationByHandle
+    reports it.  CPython >= 3.12 fills ``st_dev``/``st_ino`` on Windows from FILE_ID_INFO instead
+    -- a 64-bit volume serial and a 128-bit file id -- so on 3.12 the two encodings name the same
+    object with different numbers and a direct tuple comparison refuses every honest file.  Read
+    the second encoding back from the same already-trusted handle and accept either one; nothing
+    that is not the locked file can satisfy either.
+    """
+    observed = (metadata.st_dev, metadata.st_ino)
+    if observed == identity:
+        return True
+    if os.name != "nt" or handle is None:
+        return False
+    extended = _windows_handle_file_id_identity(handle)
+    return extended is not None and observed == extended
+
+
 def _open_exact_windows_handle(
     kernel32: ctypes.WinDLL,
     path: Path,
@@ -1626,6 +1680,46 @@ def _remove_publication_denies(
         raise ProofInputError(f"{context} DACL differs from its exact pre-seal fingerprint")
 
 
+def path_matches_handle_identity(
+    path: Path,
+    *,
+    is_directory: bool,
+    observed: tuple[int, int],
+    identity: tuple[int, int],
+    context: str,
+) -> bool:
+    """Bind an os.lstat identity to a handle-encoded identity for the same path.
+
+    Companion to :func:`stat_matches_handle_identity` for callers that scanned a directory
+    without retaining a handle.  Opens the exact path and requires BOTH encodings to agree:
+    the handle's GetFileInformationByHandle identity must equal ``identity`` and its
+    FILE_ID_INFO identity must equal what the scan observed, so the scan, the handle and the
+    plan are all pinned to one object.
+    """
+    if observed == identity:
+        return True
+    if os.name != "nt":
+        return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle, information = _open_exact_windows_handle(
+        kernel32,
+        absolute_lexical(path),
+        is_directory=is_directory,
+        desired_access=_FILE_READ_ATTRIBUTES,
+        share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+        context=context,
+    )
+    try:
+        if _windows_information_identity(information) != identity:
+            return False
+        extended = _windows_handle_file_id_identity(handle)
+        return extended is not None and observed == extended
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def validate_owned_publication_plan(
     root: Path,
     expected_root_identity: tuple[int, int],
@@ -1803,7 +1897,7 @@ def recover_owned_publication_staging(
                 )
                 metadata_handles[relative] = (handle, information)
                 identity = _windows_information_identity(information)
-                if (metadata.st_dev, metadata.st_ino) != identity or information.links != 1:
+                if not stat_matches_handle_identity(metadata, handle, identity) or information.links != 1:
                     raise ProofInputError("publication recovery metadata identity or link count changed")
                 authority[relative] = (False, identity, 1)
                 continue
@@ -1821,7 +1915,7 @@ def recover_owned_publication_staging(
             identity = _windows_information_identity(information)
             if (
                 identity != entry.identity
-                or (metadata.st_dev, metadata.st_ino) != entry.identity
+                or not stat_matches_handle_identity(metadata, handle, entry.identity)
                 or information.links != entry.link_count
                 or metadata.st_nlink != entry.link_count
             ):

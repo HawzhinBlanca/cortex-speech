@@ -23,6 +23,7 @@ from owner_proof_platform import (
     OwnedDirectoryLock,
     ProofInputError,
     PublicationRecoveryEntry,
+    path_matches_handle_identity,
     recover_owned_publication_staging,
     validate_owned_publication_plan,
 )
@@ -105,7 +106,7 @@ def _journal_bytes(path: Path) -> bytes:
     if not readonly:
         raise ProofInputError("transaction journal must remain read-only")
     with LockedFile(path) as locked:
-        if (metadata.st_dev, metadata.st_ino) != locked.identity or metadata.st_nlink != 1:
+        if not locked.matches_stat(metadata) or metadata.st_nlink != 1:
             raise ProofInputError("transaction journal changed between namespace check and identity lock")
         try:
             payload = path.read_bytes()
@@ -482,8 +483,18 @@ def validate_published_transaction(
             raise ProofInputError("published transaction inventory differs from its exact seal plan")
         file_identities: set[tuple[int, int]] = set()
         for relative, entry in planned.items():
-            _path, is_directory, identity, links = tree[relative]
-            if is_directory != entry.is_directory or identity != entry.identity or links != entry.link_count:
+            entry_path, is_directory, identity, links = tree[relative]
+            if (
+                is_directory != entry.is_directory
+                or links != entry.link_count
+                or not path_matches_handle_identity(
+                    entry_path,
+                    is_directory=is_directory,
+                    observed=identity,
+                    identity=entry.identity,
+                    context=f"published transaction entry {relative}",
+                )
+            ):
                 raise ProofInputError("published transaction entry differs from its exact seal plan")
             if not is_directory:
                 if identity in file_identities:

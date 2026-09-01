@@ -867,19 +867,30 @@ def stop_app(executables: list[Path], *, force_after_seconds: int = 8) -> None:
     env = dict(os.environ, CORTEX_RELEASE_TARGETS="\n".join(sorted(targets)))
     script = r"""
 $targets = @($env:CORTEX_RELEASE_TARGETS -split "`n" | Where-Object { $_ })
-$processes = @(Get-Process -Name cortex-speech-app -ErrorAction SilentlyContinue | Where-Object {
-    $_.Path -and ($targets -contains $_.Path.ToLowerInvariant())
-})
+function Resolve-ImagePath([string]$path) {
+    # Get-Process reports the image path exactly as the process was launched, so an app started
+    # through an 8.3 component (C:\PROGRA~1\..., or a CI runner's C:\Users\RUNNER~1\...) never
+    # string-equals the long path this controller resolved. Left un-normalised the filter matches
+    # nothing, stop_app returns success without stopping anything, and the release goes on to
+    # overwrite files and launch a second instance while the old one still holds the database.
+    # Normalise the kernel path against the filesystem so both sides are the same identity; the
+    # comparison stays an exact whole-path match, so only the named executable is ever touched.
+    $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+    if ($item) { return $item.FullName.ToLowerInvariant() }
+    return $path.ToLowerInvariant()
+}
+function Get-TargetedProcesses {
+    @(Get-Process -Name cortex-speech-app -ErrorAction SilentlyContinue | Where-Object {
+        $_.Path -and ($targets -contains (Resolve-ImagePath $_.Path))
+    })
+}
+$processes = @(Get-TargetedProcesses)
 foreach ($process in $processes) { [void]$process.CloseMainWindow() }
 if ($processes.Count) { Wait-Process -Id $processes.Id -Timeout $env:CORTEX_RELEASE_STOP_TIMEOUT -ErrorAction SilentlyContinue }
-$left = @(Get-Process -Name cortex-speech-app -ErrorAction SilentlyContinue | Where-Object {
-    $_.Path -and ($targets -contains $_.Path.ToLowerInvariant())
-})
+$left = @(Get-TargetedProcesses)
 foreach ($process in $left) { Stop-Process -Id $process.Id -Force }
 if ($left.Count) { Wait-Process -Id $left.Id -Timeout 10 -ErrorAction SilentlyContinue }
-$survivors = @(Get-Process -Name cortex-speech-app -ErrorAction SilentlyContinue | Where-Object {
-    $_.Path -and ($targets -contains $_.Path.ToLowerInvariant())
-})
+$survivors = @(Get-TargetedProcesses)
 if ($survivors.Count) { throw "Cortex app process did not stop after the force deadline" }
 """
     env["CORTEX_RELEASE_STOP_TIMEOUT"] = str(force_after_seconds)

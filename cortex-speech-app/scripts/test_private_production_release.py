@@ -53,6 +53,24 @@ def current_windows_process_image() -> Path:
     return Path(buffer.value)
 
 
+def short_directory_launch_path(path: Path) -> str:
+    """Return ``path`` reached through the 8.3 form of its directory, keeping the executable name.
+
+    This is the identity Windows records for anything started under a shortened directory - a CI
+    runner's ``C:\\Users\\RUNNER~1\\...``, a shortcut through ``C:\\PROGRA~1\\...``. Only the
+    directory is shortened on purpose: the process keeps its real image name, so it is still the
+    same process the stop path claims to find, and the only thing that differs is the path text.
+
+    Volumes with 8.3 name creation disabled hand back the long directory unchanged; the caller's
+    other assertions still hold there, that machine simply cannot stage this launch shape.
+    """
+    buffer = ctypes.create_unicode_buffer(32_768)
+    length = ctypes.windll.kernel32.GetShortPathNameW(str(path.parent), buffer, len(buffer))
+    if length == 0 or length >= len(buffer):
+        raise ctypes.WinError()
+    return str(Path(buffer.value) / path.name)
+
+
 def seed_source(root: Path) -> None:
     scripts = root / "scripts"
     (scripts / "ops").mkdir(parents=True)
@@ -484,24 +502,66 @@ def test_database_content_authority_includes_committed_wal_frames() -> None:
 def test_stop_app_targets_one_exact_executable_and_waits_for_exit() -> None:
     if os.name != "nt":
         return
-    ping = Path(os.environ["WINDIR"]) / "System32" / "ping.exe"
+    ping = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "ping.exe"
+    if not ping.is_file():
+        print(f"SKIP-ENV: {ping} missing (the stand-in process image this test stops)")
+        return
     with tempfile.TemporaryDirectory() as raw:
-        decoy = Path(raw) / "cortex-speech-app.exe"
-        shutil.copy2(ping, decoy)
-        process = subprocess.Popen(
-            [str(decoy), "127.0.0.1", "-t"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+        base = Path(raw)
+        targeted, bystander = (
+            base / "active-release" / "cortex-speech-app.exe",
+            base / "other-release" / "cortex-speech-app.exe",
         )
+        processes: dict[Path, subprocess.Popen[bytes]] = {}
+        for path, launch_as in (
+            # The targeted copy is launched through the 8.3 form of its directory, which is what
+            # Windows then reports as its image path (a CI runner's C:\Users\RUNNER~1\..., a
+            # shortcut through C:\PROGRA~1\...). stop_app is still handed the long path, so an
+            # identity compare that does not normalise both sides matches nothing, stops nothing,
+            # and still reports success.
+            (targeted, short_directory_launch_path),
+            (bystander, str),
+        ):
+            path.parent.mkdir()
+            shutil.copy2(ping, path)
+            # `ping -t` never exits on its own, so nothing below depends on how long the stand-in
+            # runs: the only thing that can end either process is stop_app.
+            processes[path] = subprocess.Popen(
+                [launch_as(path), "127.0.0.1", "-t"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
         try:
-            release.stop_app([decoy], force_after_seconds=1)
-            assert process.wait(timeout=3) is not None
+            release.stop_app([targeted], force_after_seconds=1)
+            # stop_app only returns once it has confirmed the kernel no longer lists the target, so
+            # this reaps an already-dead handle rather than waiting on the stand-in's runtime.
+            try:
+                processes[targeted].wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                raise AssertionError(
+                    "stop_app reported success while the targeted executable was still running"
+                ) from None
+            assert (
+                processes[bystander].poll() is None
+            ), "stop_app stopped a same-named executable living at a different path"
+
+            # Positive control: the bystander is a process stop_app can reach, so surviving above
+            # was the exact-path filter doing its job and not this fixture being unkillable.
+            release.stop_app([bystander], force_after_seconds=1)
+            try:
+                processes[bystander].wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                raise AssertionError(
+                    "stop_app could not stop the bystander even when it was the named target, so "
+                    "its survival above proves nothing about exact targeting"
+                ) from None
         finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait(timeout=3)
+            for process in processes.values():
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=3)
 
 
 def test_restore_preserves_failed_database_and_verifies_snapshot() -> None:

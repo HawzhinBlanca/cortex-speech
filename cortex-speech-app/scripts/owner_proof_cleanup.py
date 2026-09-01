@@ -142,10 +142,10 @@ def delete_owned_tree_windows(api: Any, root: Path, expected_root_identity: tupl
             identity = (information.volume, (information.indexHigh << 32) | information.indexLow)
             if information.attributes & api.FILE_ATTRIBUTE_REPARSE_POINT or is_directory != directory:
                 raise api.ProofInputError("owned cleanup encountered a reparse or type swap")
-            if (metadata.st_dev, metadata.st_ino) != identity:
+            if not api.stat_matches_handle_identity(metadata, int(handle), identity):
                 raise api.ProofInputError("owned cleanup entry changed between namespace check and handle lock")
             path_metadata = os.stat(path, follow_symlinks=False)
-            if (path_metadata.st_dev, path_metadata.st_ino) != identity:
+            if not api.stat_matches_handle_identity(path_metadata, int(handle), identity):
                 raise api.ProofInputError("owned cleanup pathname differs from its retained handle")
             return (int(handle), identity, information, metadata)
         except Exception:
