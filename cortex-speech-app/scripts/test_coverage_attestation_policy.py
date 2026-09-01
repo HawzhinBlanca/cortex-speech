@@ -252,7 +252,7 @@ class CoverageAttestationTests(unittest.TestCase):
         registry = V10._normalized_attestation_registry(V10._rust_coverage_command_registry())
         self.assertEqual(registry["argvTemplate"][0], "<python>")
         with self.assertRaises(V10.EvidenceError):
-            V10._assert_attestation_hygiene(r'{"x": "C:\\Users\\someone\\secret"}')
+            V10._assert_attestation_hygiene(json.dumps({"x": "C:" + "\\Users\\someone\\secret"}))
         with self.assertRaises(V10.EvidenceError):
             V10._assert_attestation_hygiene('{"x": "/home/someone/secret"}')
 
