@@ -3133,7 +3133,8 @@ mod tests {
             std::fs::write(&manifest_path, serde_json::to_vec_pretty(manifest).unwrap()).unwrap();
         };
 
-        let mutations: [(&dyn Fn(&mut serde_json::Value), &str); 5] = [
+        type ManifestMutation<'a> = (&'a dyn Fn(&mut serde_json::Value), &'a str);
+        let mutations: [ManifestMutation; 5] = [
             (&|manifest| manifest["schema"] = serde_json::json!(3), "must be exactly integer 1 or 2"),
             (&|manifest| manifest["schema"] = serde_json::json!("1"), "must be exactly integer 1 or 2"),
             (&|manifest| manifest["appGitSha"] = serde_json::json!(""), "appGitSha must be non-empty"),
@@ -3328,7 +3329,8 @@ mod tests {
         // remain defense-in-depth; the rows below are the ones a real file can carry.
         let policy = pilot_policy();
         let digest = policy.policy_sha256().unwrap();
-        let cases: [(&dyn Fn(&Database), &str); 3] = [
+        type ForgedGrant<'a> = (&'a dyn Fn(&Database), &'a str);
+        let cases: [ForgedGrant; 3] = [
             (&|db| grant(db, &digest, 0, "Nobody", "seg-a"), "unauthorized reviewer"),
             (&|db| grant(db, &digest, 0, "Hawzhin", "bad seg!"), "invalid segment"),
             // Same active policy digest at a foreign baseline: a namespace the policy never armed.

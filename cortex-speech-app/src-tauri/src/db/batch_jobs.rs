@@ -3913,7 +3913,8 @@ mod tests {
         let unowned = SpeechSegment { id: "own-0".into(), ..SpeechSegment::default() };
         assert!(!segment_is_human_owned(&unowned), "a bare machine row is not human-owned");
 
-        let cases: Vec<(&str, Box<dyn Fn(&mut SpeechSegment)>)> = vec![
+        type OwnershipAxis = (&'static str, Box<dyn Fn(&mut SpeechSegment)>);
+        let cases: Vec<OwnershipAxis> = vec![
             ("verified", Box::new(|seg| seg.verified = true)),
             ("is_gold", Box::new(|seg| seg.is_gold = true)),
             // Presence alone is authoritative, including a historical machine-seeded empty string.

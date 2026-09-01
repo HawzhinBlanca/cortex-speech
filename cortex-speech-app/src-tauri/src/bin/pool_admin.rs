@@ -1359,16 +1359,18 @@ mod tests {
         (db, pool)
     }
 
+    /// One reviewer's verdict on a fixture clip: (reviewer, action, submitted transcript).
+    type Verdict<'a> = (&'a str, &'a str, Option<&'a str>);
+
     fn pool_decision(
         db: &Database,
         pool: &review_pool::ReviewPool,
         segment_id: &str,
         hash: &str,
-        reviewer: &str,
-        action: &str,
-        text: Option<&str>,
+        verdict: Verdict<'_>,
         at: i64,
     ) -> i64 {
+        let (reviewer, action, text) = verdict;
         let (_, revision) = db.get_segment_by_id_with_revision(segment_id).unwrap().unwrap();
         let skip = action == "skip";
         review_pool::record_decision(
@@ -1692,8 +1694,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (db, pool) = pool_fixture(dir.path(), &[("clip", true)]);
         let hash = clip_hash(0);
-        pool_decision(&db, &pool, "clip", &hash, "ReviewerC", "skip", None, 4_000_000);
-        pool_decision(&db, &pool, "clip", &hash, "ReviewerB", "edit", Some("دەقی دروست"), 5_000_000);
+        pool_decision(&db, &pool, "clip", &hash, ("ReviewerC", "skip", None), 4_000_000);
+        pool_decision(&db, &pool, "clip", &hash, ("ReviewerB", "edit", Some("دەقی دروست")), 5_000_000);
         let rows = reviewer_voice_totals(&db).unwrap();
         assert_eq!(rows.len(), 3, "{rows:?}");
         for (row, key, judgments, skips) in
@@ -1860,9 +1862,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (db, pool) = pool_fixture(dir.path(), &[("clip", true)]);
         let hash = clip_hash(0);
-        pool_decision(&db, &pool, "clip", &hash, "ReviewerC", "skip", None, 4_000_000);
+        pool_decision(&db, &pool, "clip", &hash, ("ReviewerC", "skip", None), 4_000_000);
         // Second distinct reviewer agrees with the desktop verdict: consensus resolution.
-        pool_decision(&db, &pool, "clip", &hash, "ReviewerB", "edit", Some("دەقی دروست"), 5_000_000);
+        pool_decision(&db, &pool, "clip", &hash, ("ReviewerB", "edit", Some("دەقی دروست")), 5_000_000);
         review_pool::stamp_owner_supplied_pool_rights(&db).unwrap();
         bind_trivial_dedup_manifest(&db, &pool);
         cortex_speech_app_lib::snapshot::take_snapshot(&db, dir.path(), 3).unwrap().expect("snapshot must be taken");

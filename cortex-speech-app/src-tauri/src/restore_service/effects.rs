@@ -2476,7 +2476,8 @@ mod tests {
         // The other half: teaching the validator the v1 contract must not let anything through.
         // Each case is a row claiming contract 1 whose digest does not answer for its own contents.
         let authority = "11111111-2222-4333-8444-555555555555";
-        let cases: [(&str, fn(&str, i64, &str) -> String); 3] = [
+        type ForgedDigest = (&'static str, fn(&str, i64, &str) -> String);
+        let cases: [ForgedDigest; 3] = [
             // The retired legacy digest, which is precisely what the buggy validator expected.
             ("legacy digest on a v1 row", |id, _rev, _auth| {
                 crate::db::desktop_decision_payload_hash(id, "edit", Some("desktop corrected"), Some(1_700_000_000_000))
@@ -2855,15 +2856,17 @@ mod tests {
 
     fn install_legacy_reviewed_row(db: &Database, rowid: i64, id: &str, reviewed: bool) {
         unlock_table(db, "legacy_reviewed_segments_v60");
-        let (verified, revision, decision, verdict, transcript, reviewer, corrected): (
+        // (verified, revision, decision, verdict, transcript, reviewer, corrected)
+        type LegacyReviewedRow = (
             i64,
             i64,
-            Option<&str>,
-            Option<&str>,
-            Option<&str>,
-            Option<&str>,
-            Option<&str>,
-        ) = if reviewed {
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+        );
+        let (verified, revision, decision, verdict, transcript, reviewer, corrected): LegacyReviewedRow = if reviewed {
             (
                 1,
                 3,

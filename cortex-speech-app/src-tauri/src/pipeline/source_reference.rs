@@ -416,8 +416,19 @@ mod tests {
         }
     }
 
+    /// Undoes the read-only bit `create_private_source_reference_snapshot` sets, so a test can tamper
+    /// with or remove the snapshot. Same shape as `remove_private_source_snapshot` above: the lint's
+    /// world-writable hazard is Unix-only, and the Unix branch here sets an explicit owner-only mode,
+    /// so the allow is scoped to the Windows branch that genuinely needs `set_readonly(false)`.
+    #[cfg_attr(windows, allow(clippy::permissions_set_readonly_false))]
     fn make_writable(path: &Path) {
         let mut permissions = std::fs::metadata(path).expect("snapshot metadata").permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o644);
+        }
+        #[cfg(not(unix))]
         permissions.set_readonly(false);
         std::fs::set_permissions(path, permissions).expect("make snapshot writable");
     }
@@ -541,8 +552,7 @@ mod tests {
                 Ok(artifact_for(&source, "model", transcript, &output))
             },
         )
-        .err()
-        .expect("snapshot tampering must fail")
+        .expect_err("snapshot tampering must fail")
         .to_string();
 
         assert!(error.contains("private source-reference snapshot after generation changed bytes"));
@@ -572,8 +582,7 @@ mod tests {
                 Ok(artifact_for(&source, "model", transcript, &output))
             },
         )
-        .err()
-        .expect("source tampering must fail")
+        .expect_err("source tampering must fail")
         .to_string();
 
         assert!(error.contains("Audio source changed while generating whole-file reference transcript"));
@@ -608,8 +617,7 @@ mod tests {
                 Ok(artifact_for(&source, "model", transcript, &output))
             },
         )
-        .err()
-        .expect("cleanup failure must hard-stop")
+        .expect_err("cleanup failure must hard-stop")
         .to_string();
 
         let private_path = swapped_path.borrow().as_ref().expect("swapped private path").to_string_lossy().to_string();

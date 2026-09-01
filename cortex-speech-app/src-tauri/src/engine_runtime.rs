@@ -1566,7 +1566,7 @@ mod tests {
         assert!(!under.exceeded);
         assert!(!signal.load(std::sync::atomic::Ordering::SeqCst));
 
-        let flood = vec![b'x'; 100];
+        let flood = [b'x'; 100];
         let over = read_bounded_pipe(&flood[..], 10, std::sync::Arc::clone(&signal)).expect("bounded read");
         assert_eq!(over.retained.len(), 10, "retention must stop at the limit");
         assert!(over.exceeded, "the overflow must be reported in-band");
