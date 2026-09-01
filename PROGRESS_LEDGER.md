@@ -12430,3 +12430,32 @@ die at the entry probe before events exist, and the schema's own NOCASE PK + quo
 two validator arms unreachable (recorded as defense-in-depth). Final gate: lib 2422/0,
 owner_proof_db 26/0, batch_importer 29/0. The re-measure runs in the next reviewer-idle window;
 the machine stays the reviewers' during work hours after yesterday's PDB-collision lesson.
+
+---
+
+## 2026-09-01 — The backend layering gate was reading test code as production
+
+`test_backend_layering_policy.py` stripped test code by cutting each file at the first
+`#[cfg(test)]\nmod tests {`. Two defects, both measured today.
+
+The module NAME is not fixed: alongside `mod tests` this repo has `state_command_surface_tests`,
+`system_ops_boundary_tests`, `typed_ingest_refusal_and_identity_tests` and more, so those files
+were scanned IN FULL and a test that legitimately opened a database connection read as "the
+command layer regained SQL authority". A wave-5 agent hit exactly that, and — correctly refusing
+to dodge a gate — deleted its own test instead. That is a gate destroying real coverage.
+
+Second, several files interleave test modules with production code, so everything after the first
+match went unscanned. Measured before asserting: the escaped production code is 2
+`#[tauri::command]` items across 2 files and zero top-level `pub fn` — small, because the bulk of
+every truncated tail is exempt test code anyway. An earlier draft of this entry claimed the gate
+was "reading 1850 of commands.rs's 6913 lines" and therefore largely vacuous; that framing was
+wrong and is recorded here because the number, not the impression, is what belongs in a ledger.
+
+`production_prefix` now removes each `#[cfg(test)]` module by brace matching (skipping braces
+inside comments, strings, raw strings and char literals, with the `'a` lifetime case handled
+separately) rather than truncating at the first one. Gate passes; proven non-vacuous by
+construction rather than by assertion — it retains all 13 production commands in `commands.rs`,
+drops all 111 `#[test]` functions, and an injected `.execute(` in production code is caught.
+
+No layering violations were found in the newly-scanned code: the architecture was clean, the gate
+simply was not looking at it.
