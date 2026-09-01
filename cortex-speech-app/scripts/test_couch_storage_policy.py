@@ -33,7 +33,14 @@ def test_outbox_never_flushes_stamped_work_under_an_unknown_identity() -> None:
     )
     idx_me = source.find("me = res.reviewer;")
     assert idx_me != -1, "load() must record who the server says this link belongs to"
-    assert "flushOutbox()" in source[idx_me : idx_me + 1800], (
+    # Bound this by load()'s success path, not by a character count. The window used to be
+    # `idx_me + 1800`, which is a proxy for "in the same block" that decays every time anything is
+    # added between the two — a 13-line explanatory comment pushed the real, still-present call to
+    # 2325 chars and reddened CI on 2026-09-01. The `} catch` that closes the try is the actual
+    # boundary being asserted, and it does not move when someone documents the code.
+    idx_catch = source.find("} catch", idx_me)
+    assert idx_catch != -1, "load()'s success path must stay inside a try/catch"
+    assert "flushOutbox()" in source[idx_me:idx_catch], (
         "once identity is known, load() must re-flush so the held stamped work still lands"
     )
 

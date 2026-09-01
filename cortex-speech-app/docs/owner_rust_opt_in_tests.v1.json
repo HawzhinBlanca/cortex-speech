@@ -43,6 +43,7 @@
     {"source":"cortex-speech-app/src-tauri/tests/real_audio.rs","selector":"test_vad_on_real_kurdish_audio","scope":"owner-product","authority":"owner-real-media-rust"},
     {"source":"cortex-speech-app/src-tauri/tests/real_audio.rs","selector":"transcribe_file_with_finetuned","scope":"model-evidence","authority":"model-evidence"},
     {"source":"cortex-speech-app/src-tauri/tests/refinery_lift.rs","selector":"refinery_lift_diag_score_cer_distribution","scope":"model-evidence","authority":"model-evidence"},
-    {"source":"cortex-speech-app/src-tauri/tests/refinery_lift.rs","selector":"refinery_lift_injected_error_benchmark","scope":"model-evidence","authority":"model-evidence"}
+    {"source":"cortex-speech-app/src-tauri/tests/refinery_lift.rs","selector":"refinery_lift_injected_error_benchmark","scope":"model-evidence","authority":"model-evidence"},
+    {"source":"cortex-speech-app/src-tauri/tests/reviewer_serving_path.rs","selector":"reviewer_serving_path_child","scope":"diagnostic-tool","authority":"non-certifying-test-harness-child"}
   ]
 }
