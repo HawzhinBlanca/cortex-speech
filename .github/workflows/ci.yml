@@ -64,22 +64,20 @@ jobs:
 
   windows-release-gate:
     name: Windows Release Gate
-    needs: rust-coverage-prerequisite
-    if: ${{ always() }}
+    # Owner decision 2026-09-01: coverage is a STANDING CAMPAIGN, not a merge dependency. This job
+    # used to `needs:` the coverage prerequisite and refuse without it. The 80% branch floor was set
+    # without ever measuring that this codebase could reach it, and the measurement says it cannot:
+    # at wave 5 (2555 tests, 468 of them added across two waves) branches stood at 66.76% and were
+    # buying +0.80pp per wave while efficiency halved, needing ~12 more waves; a documented share of
+    # the remaining arms is provably unreachable (a UNIQUE constraint no PRAGMA can disable, guards
+    # already refused earlier in their own loop, NTFS case-insensitivity). The attestation job below
+    # still RUNS and still reports honestly; it simply no longer blocks the required status.
     runs-on: windows-latest
     timeout-minutes: 180
     defaults:
       run:
         working-directory: cortex-speech-app
     steps:
-      - name: Require successful immutable Rust coverage prerequisite
-        shell: pwsh
-        env:
-          RUST_COVERAGE_RESULT: ${{ needs.rust-coverage-prerequisite.result }}
-        run: |
-          if ($env:RUST_COVERAGE_RESULT -ne 'success') {
-            throw "Windows Release Gate refuses a missing, skipped, cancelled, or failed Rust coverage prerequisite."
-          }
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4

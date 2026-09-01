@@ -12522,3 +12522,40 @@ Process: seven agents on one crate was too many. The shared cargo lock and MSVC 
 the linker the bottleneck — one agent needed 22 attempts over ~40 minutes for a clean full run.
 Five would have been faster in wall-clock. Reviewers worked through it at below-normal priority
 (31 decisions today, 25 of them during the storm) with no sign of disruption.
+
+---
+
+## 2026-09-01 — OWNER DECISION: coverage becomes a standing campaign, not a merge dependency
+
+The wave-5 measurement at 20f8d4b8 (2555 tests, 0 failures) closed the question of whether the
+coverage contract was reachable by writing tests. It is not, and the trend is the evidence:
+
+| metric   | wave 4 | wave 5 | required | verdict |
+|----------|--------|--------|----------|---------|
+| regions  | 85.35% | 86.20% | 85       | PASS    |
+| lines    | 85.18% | 86.07% | 85       | PASS    |
+| functions| 74.50% | 76.01% | 80       | ~1.5 waves away |
+| branches | 65.96% | 66.76% | 80       | ~12 waves away, efficiency falling |
+
+Wave 4 spent 174 tests for +2.68pp branches. Wave 5 spent 132 tests for **+0.80pp** — the easy arms
+are gone. Reaching 80% branches means covering 1,998 more arms out of 5,014 remaining: 43% of every
+uncovered branch in the tree. The mass is diffuse (2,225 in crate-root files, 631 in db, 432 in the
+binaries, 422 in commands), so there is no single blockage to clear; the `AppHandle` ceiling
+accounts for only 409 of them. And an unknown share is *provably uncoverable*: agents examining
+three files proved six arms unreachable by construction (a `UNIQUE(segment_id, flag_revision)` no
+PRAGMA can disable, guards already refused earlier in their own loop, NTFS case-insensitivity).
+
+The honest reading is that 80% branch coverage was set without checking this codebase could reach
+it. Owner's call, taken with the numbers above in front of him: **land PR #73 on its three green
+required gates and keep coverage as a standing campaign with no merge dependency.**
+
+`.github/workflows/ci.yml`: `windows-release-gate` no longer `needs:` the coverage prerequisite and
+no longer carries the refusal step. The attestation job still RUNS and still reports honestly —
+decoupled is not deleted. `test_workflow_policy.py` now fails in BOTH directions: it refuses a
+silent re-coupling (which would block every merge again) and refuses a silently deleted coverage
+job (which would turn "standing campaign" into "abandoned"). Proven against injected regressions of
+each kind before commit.
+
+What did NOT change: `release.yml` still measures coverage for itself and still gates the tag-release
+build on it. The regions and lines floors (85) both pass and stay. The functions floor stays at 80
+and remains reachable — roughly 1.5 more waves — and the campaign continues toward it.

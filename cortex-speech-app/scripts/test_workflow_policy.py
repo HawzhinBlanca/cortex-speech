@@ -402,22 +402,36 @@ def test_rust_quality_authorities_are_split_mandatory_and_fail_closed() -> None:
     assert_contains(release_docs(), install_toolchain, "docs/RELEASE.md coverage nightly")
 
     ci = workflow_steps_text("ci.yml")
-    for guard in (
+    # Owner decision 2026-09-01: PR coverage is a standing campaign, NOT a merge dependency. The 80%
+    # branch floor was set without measuring that this codebase could reach it, and the measurement
+    # says it cannot — at wave 5 branches were 66.76%, buying +0.80pp per 132-test wave with
+    # efficiency halving, and a documented share of the remaining arms is provably unreachable. The
+    # attestation job still runs and still reports honestly; it no longer blocks the required status.
+    for recoupled in (
         "needs: rust-coverage-prerequisite",
-        "if: ${{ always() }}",
         "RUST_COVERAGE_RESULT: ${{ needs.rust-coverage-prerequisite.result }}",
         "Windows Release Gate refuses a missing, skipped, cancelled, or failed Rust coverage prerequisite.",
     ):
-        assert_contains(ci, guard, "ci.yml coverage prerequisite consumer")
+        if recoupled in ci:
+            raise AssertionError(
+                "ci.yml re-coupled the Windows Release Gate to the coverage prerequisite. That "
+                "dependency was removed by owner decision 2026-09-01 because the branch floor is "
+                "not reachable by writing tests; re-adding it blocks every merge indefinitely. If "
+                "coverage now passes, change the floor deliberately and update this pin with it."
+            )
+    # The job must still EXIST and still verify — decoupled is not deleted. A silently dropped
+    # coverage job would turn "standing campaign" into "abandoned".
     prerequisite_job = ci.find("  rust-coverage-prerequisite:")
     windows_job = ci.find("  windows-release-gate:")
     attestation_run = ci.find("--verify-coverage-attestation", prerequisite_job)
-    refusal = ci.find("Windows Release Gate refuses", windows_job)
     architecture_run = ci.find(architecture, windows_job)
-    if min(prerequisite_job, windows_job, attestation_run, refusal, architecture_run) < 0 or not (
-        prerequisite_job < attestation_run < windows_job < refusal < architecture_run
+    if min(prerequisite_job, windows_job, attestation_run, architecture_run) < 0 or not (
+        prerequisite_job < attestation_run < windows_job < architecture_run
     ):
-        raise AssertionError("CI must verify coverage authority before the independently blocking architecture/source gate")
+        raise AssertionError(
+            "ci.yml must still run the coverage attestation job, and the Windows gate must still "
+            "run the independently blocking architecture/source gate"
+        )
 
     release = workflow_steps_text("release.yml")
     for guard in (
