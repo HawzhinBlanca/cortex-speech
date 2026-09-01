@@ -402,7 +402,16 @@ def request(
         resp = opener.open(req, timeout=20)
         return resp.status, resp.headers.get("Set-Cookie"), resp.read()
     except urllib.error.HTTPError as e:
-        return e.code, None, e.read()
+        # The STATUS is the answer here; the body is best-effort. A fixture server (or a real
+        # origin) can reset the connection before the error body is read, and losing the body must
+        # not turn a clean "we received a 302" into an unhandled ConnectionResetError that takes
+        # the whole probe down. Measured 2026-09-01 on a macOS runner: Errno 54 while reading a 302
+        # body failed test_probe_redirect_is_not_followed, which had correctly NOT followed it.
+        try:
+            body = e.read()
+        except Exception:  # noqa: BLE001 - an unreadable error body is still a real answer
+            body = b""
+        return e.code, None, body
     except Exception as e:  # noqa: BLE001 - transport failure is a real answer here
         return None, None, str(e).encode()
 
