@@ -1320,15 +1320,26 @@
       // drafts (2026-08-20 hunt): sessionStorage survives navigating from one link to another in
       // the same tab, and a saved draft overrides the served text — reviewer B would be shown, and
       // could save, reviewer A's half-typed correction as their own. Identity change = the drafts
-      // are gone; the banner recount below re-scopes the refused list the same way.
+      // are gone.
       const prevWho = sessionStorage.getItem('cortex.couch.who');
       if (prevWho !== null && prevWho !== me) {
         for (let k = sessionStorage.length - 1; k >= 0; k--) {
           const key = sessionStorage.key(k);
           if (key && key.startsWith('cortex.couch.draft.')) sessionStorage.removeItem(key);
         }
-        renderRefused();
       }
+      // RE-SCOPE THE SHARED BANNER, on identity ARRIVAL and not only on identity CHANGE. `refused` is
+      // localStorage and therefore shared by everyone who opens a link on this phone; `refusedMine()`
+      // keeps each person to their own entries, but it cannot while `me` is still empty — and the
+      // startup `renderRefused()` runs before /api/queue has named anybody, so `!me` matches every
+      // entry and the banner goes up for all of them. The recount used to sit inside the branch
+      // above, which needs a PREVIOUS identity in this tab: a new tab, the installed PWA's first
+      // open, or a fresh profile has `prevWho === null`, so it never ran and the banner stayed up.
+      // Measured: reviewer two opens their own link on a shared phone and is told "1 decision could
+      // not be saved" about work that was reviewer one's — the exact lie the `by` stamp exists to
+      // stop, still reachable through the first load. Unconditional here, and idempotent: with no
+      // entries of your own it takes a stale banner DOWN, which is the same fix pointing the other way.
+      renderRefused();
       sessionStorage.setItem('cortex.couch.who', me);
       // Now that the server has named this reviewer, send the stamped work the pre-identity flush
       // above rightly held back (it must never guess whose cookie it is flushing under). Fire and

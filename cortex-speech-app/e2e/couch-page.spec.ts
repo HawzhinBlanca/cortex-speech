@@ -922,6 +922,52 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#err')).toBeHidden();
   });
 
+  test('a new tab re-scopes shared refusal warnings after the server names its reviewer', async ({
+    page,
+  }) => {
+    // localStorage is per-ORIGIN, so everyone who opens a link on the same phone shares this store —
+    // and an unscoped banner told the next reviewer that work "could not be saved" which was never
+    // theirs (2026-08-20 hunt). `refusedMine()` is the fix; nothing on this line tested it.
+    await page.addInitScript(() => {
+      window.fetch = async (input: RequestInfo | URL) => {
+        if (String(input).includes('/api/queue')) {
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              reviewer: 'Reviewer-Two',
+              items: [],
+              heldByOthers: 0,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#who')).toContainText('Reviewer-Two');
+    await page.evaluate(`
+      localStorage.setItem('cortex.couch.refused', JSON.stringify([
+        { id: 'one-only', by: 'Reviewer-One' }
+      ]));
+      sessionStorage.clear();
+    `);
+
+    // sessionStorage.clear() models a new tab on the same phone: local recovery data is shared, tab
+    // identity is not. The other reviewer's warning must not be attributed to this one — and must not
+    // be discarded either, because it is still the only record that their work did not land.
+    await page.reload();
+    await expect(page.locator('#who')).toContainText('Reviewer-Two');
+    await expect(page.locator('#err')).toBeHidden();
+    const refused = (await page.evaluate(
+      `JSON.parse(localStorage.getItem('cortex.couch.refused') || '[]')`,
+    )) as Array<{ id: string; by: string | null }>;
+    expect(refused).toContainEqual(expect.objectContaining({ id: 'one-only', by: 'Reviewer-One' }));
+  });
+
   test('retracting a refusal must not swallow the link-expired notice', async ({ page }) => {
     // #err is shared, and link-expired is the more urgent message: it needs an action from the reviewer
     // (ask for a new link). Clearing a refusal must never take that banner down with it.
