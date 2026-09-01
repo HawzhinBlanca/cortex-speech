@@ -9127,6 +9127,22 @@ def _validate_latest_rust_coverage_pointer(
     expected_checkout_digest: str,
 ) -> dict[str, object]:
     pointer = _load_json_without_duplicate_keys(pointer_path)
+    if (
+        isinstance(pointer, dict)
+        and _is_exact_integer(pointer.get("schema"), 1)
+        and pointer.get("type") == "RustCoveragePrerequisitePointerV1"
+        and pointer.get("state") == "FAILED"
+        and pointer.get("fullGitSha") == expected_sha
+    ):
+        pointer = _validate_failed_rust_coverage_pointer(
+            pointer_path,
+            expected_sha=expected_sha,
+            expected_token=None,
+        )
+        raise EvidenceError(
+            "latest Rust coverage prerequisite ended "
+            f"{pointer.get('verdict')} with exit {pointer.get('exitCode')}; rerun required"
+        )
     if not isinstance(pointer, dict) or set(pointer) != {
         "schema",
         "type",
@@ -9167,6 +9183,175 @@ def _validate_latest_rust_coverage_pointer(
     if pointer.get("artifactSha256") != manifest["coverage"]["artifactSha256"]:
         raise EvidenceError("latest Rust coverage pointer names another LLVM artifact")
     return manifest
+
+
+def _validate_failed_rust_coverage_pointer(
+    pointer_path: Path,
+    *,
+    expected_sha: str,
+    expected_token: str | None,
+) -> dict[str, object]:
+    pointer = _load_json_without_duplicate_keys(pointer_path)
+    if not isinstance(pointer, dict) or set(pointer) != {
+        "schema",
+        "type",
+        "state",
+        "runToken",
+        "fullGitSha",
+        "verdict",
+        "terminalEvent",
+        "exitCode",
+        "endedAt",
+        "childExitCode",
+        "timedOut",
+        "eventJournal",
+        "eventJournalSha256",
+        "artifactSha256",
+    }:
+        raise EvidenceError("failed Rust coverage pointer has a non-canonical envelope")
+    token = pointer.get("runToken")
+    verdict = pointer.get("verdict")
+    exit_code = pointer.get("exitCode")
+    child_exit_code = pointer.get("childExitCode")
+    timed_out = pointer.get("timedOut")
+    ended_at = pointer.get("endedAt")
+    relative_journal_value = pointer.get("eventJournal")
+    event_digest = pointer.get("eventJournalSha256")
+    artifact_digest = pointer.get("artifactSha256")
+    if (
+        not _is_exact_integer(pointer.get("schema"), 1)
+        or pointer.get("type") != "RustCoveragePrerequisitePointerV1"
+        or pointer.get("state") != "FAILED"
+        or pointer.get("fullGitSha") != expected_sha
+        or not isinstance(token, str)
+        or not token
+        or (expected_token is not None and token != expected_token)
+        or not isinstance(verdict, str)
+        or not verdict
+        or verdict == "PASS"
+        or pointer.get("terminalEvent") not in {"phase_end", "publication_failure"}
+        or not isinstance(exit_code, int)
+        or isinstance(exit_code, bool)
+        or exit_code == 0
+        or (
+            child_exit_code is not None
+            and (not isinstance(child_exit_code, int) or isinstance(child_exit_code, bool))
+        )
+        or (timed_out is not None and not isinstance(timed_out, bool))
+        or not isinstance(ended_at, str)
+        or not isinstance(relative_journal_value, str)
+        or not relative_journal_value
+        or not isinstance(event_digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", event_digest)
+        or (
+            artifact_digest is not None
+            and (
+                not isinstance(artifact_digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", artifact_digest)
+            )
+        )
+    ):
+        raise EvidenceError("failed Rust coverage pointer identity or terminal result is invalid")
+    _parse_utc(ended_at, "failed coverage phase end")
+
+    relative_journal = Path(relative_journal_value)
+    if relative_journal.is_absolute() or ".." in relative_journal.parts:
+        raise EvidenceError("failed Rust coverage pointer event journal is not relative")
+    event_journal = (pointer_path.parent / relative_journal).resolve()
+    try:
+        event_journal.relative_to(RUST_COVERAGE_PHASE_ROOT.resolve())
+    except ValueError as error:
+        raise EvidenceError("failed Rust coverage pointer escapes its immutable root") from error
+    if (
+        event_journal.parent.name != token
+        or event_journal.name != "events.jsonl"
+        or not event_journal.is_file()
+        or _is_link_or_junction(event_journal)
+        or sha256_file(event_journal) != event_digest
+    ):
+        raise EvidenceError("failed Rust coverage pointer event journal is missing or changed")
+    events = _strict_json_lines(event_journal, "failed Rust coverage prerequisite journal")
+    if not events:
+        raise EvidenceError("failed Rust coverage pointer journal is empty")
+    for sequence, event in enumerate(events, start=1):
+        if (
+            not _is_exact_integer(event.get("schema"), 1)
+            or not _is_exact_integer(event.get("sequence"), sequence)
+            or event.get("runToken") != token
+        ):
+            raise EvidenceError("failed Rust coverage pointer journal identity/sequence is invalid")
+    terminal = events[-1]
+    if (
+        terminal.get("event") != pointer.get("terminalEvent")
+        or terminal.get("verdict") != verdict
+        or terminal.get("exitCode") != exit_code
+        or terminal.get("at") != ended_at
+        or terminal.get("childExitCode") != child_exit_code
+        or terminal.get("timedOut") != timed_out
+    ):
+        raise EvidenceError("failed Rust coverage pointer does not match its terminal journal event")
+
+    artifact_path = event_journal.parent / RUST_COVERAGE_ARTIFACT_NAME
+    if artifact_digest is None:
+        if artifact_path.is_file():
+            raise EvidenceError("failed Rust coverage pointer omits an existing LLVM artifact")
+    elif (
+        not artifact_path.is_file()
+        or _is_link_or_junction(artifact_path)
+        or sha256_file(artifact_path) != artifact_digest
+    ):
+        raise EvidenceError("failed Rust coverage pointer LLVM artifact is missing or changed")
+    return pointer
+
+
+def _publish_failed_rust_coverage_pointer(
+    phase_dir: Path,
+    *,
+    run_token: str,
+    full_sha: str,
+    end_record: dict[str, object],
+) -> None:
+    exit_code = end_record.get("exitCode")
+    if (
+        end_record.get("event") not in {"phase_end", "publication_failure"}
+        or end_record.get("runToken") != run_token
+        or not isinstance(exit_code, int)
+        or isinstance(exit_code, bool)
+        or exit_code == 0
+        or not isinstance(end_record.get("verdict"), str)
+        or end_record.get("verdict") == "PASS"
+        or not isinstance(end_record.get("at"), str)
+    ):
+        raise EvidenceError("Rust coverage failure pointer requires one matching terminal event")
+    event_journal = phase_dir / "events.jsonl"
+    if not event_journal.is_file() or _is_link_or_junction(event_journal):
+        raise EvidenceError("Rust coverage failure pointer has no durable event journal")
+    artifact_path = phase_dir / RUST_COVERAGE_ARTIFACT_NAME
+    pointer = {
+        "schema": 1,
+        "type": "RustCoveragePrerequisitePointerV1",
+        "state": "FAILED",
+        "runToken": run_token,
+        "fullGitSha": full_sha,
+        "verdict": end_record["verdict"],
+        "terminalEvent": end_record["event"],
+        "exitCode": exit_code,
+        "endedAt": end_record["at"],
+        "childExitCode": end_record.get("childExitCode"),
+        "timedOut": end_record.get("timedOut"),
+        "eventJournal": os.path.relpath(event_journal, RUST_COVERAGE_LATEST.parent),
+        "eventJournalSha256": sha256_file(event_journal),
+        "artifactSha256": sha256_file(artifact_path) if artifact_path.is_file() else None,
+    }
+    publish_validated_json(
+        RUST_COVERAGE_LATEST,
+        pointer,
+        lambda candidate: _validate_failed_rust_coverage_pointer(
+            candidate,
+            expected_sha=full_sha,
+            expected_token=run_token,
+        ),
+    )
 
 
 # ── Coverage attestation: the workstation measures, CI verifies ──────────────────────────────────
@@ -9496,6 +9681,9 @@ def rust_coverage_prerequisite_main() -> int:
         run_token,
     )
     phase_ended = False
+    failure_record: dict[str, object] | None = None
+    completion_published = False
+    pointer_claimed = False
     try:
         with acquired_lease(lease) as abandoned_token:
             # Starting a new measurement makes an older pointer non-authoritative immediately. A
@@ -9510,6 +9698,7 @@ def rust_coverage_prerequisite_main() -> int:
                     "fullGitSha": full_sha,
                 },
             )
+            pointer_claimed = True
             registry = _rust_coverage_command_registry()
             environment = _rust_coverage_environment_document()
             start_record = journal.append(
@@ -9525,8 +9714,16 @@ def rust_coverage_prerequisite_main() -> int:
                     abandonedRunToken=abandoned_token,
                     reason="stale lease takeover",
                 )
-                journal.append("phase_end", exitCode=2, verdict="INCOMPLETE_STALE_TAKEOVER")
+                failure_record = journal.append(
+                    "phase_end", exitCode=2, verdict="INCOMPLETE_STALE_TAKEOVER"
+                )
                 phase_ended = True
+                _publish_failed_rust_coverage_pointer(
+                    phase_dir,
+                    run_token=run_token,
+                    full_sha=full_sha,
+                    end_record=failure_record,
+                )
                 print("RUST COVERAGE PREREQUISITE INCOMPLETE: stale-lock takeover; rerun cleanly")
                 return 2
             artifact_path = phase_dir / RUST_COVERAGE_ARTIFACT_NAME
@@ -9572,7 +9769,7 @@ def rust_coverage_prerequisite_main() -> int:
                 os.fsync(log.fileno())
             lease.update_gate(None, None)
             if timed_out or return_code != 0:
-                end = journal.append(
+                failure_record = journal.append(
                     "phase_end",
                     exitCode=1,
                     verdict="FAIL",
@@ -9580,7 +9777,16 @@ def rust_coverage_prerequisite_main() -> int:
                     childExitCode=return_code,
                 )
                 phase_ended = True
-                print(f"RUST COVERAGE PREREQUISITE FAILED @ {end['at']}: exit={return_code}")
+                _publish_failed_rust_coverage_pointer(
+                    phase_dir,
+                    run_token=run_token,
+                    full_sha=full_sha,
+                    end_record=failure_record,
+                )
+                print(
+                    "RUST COVERAGE PREREQUISITE FAILED "
+                    f"@ {failure_record['at']}: exit={return_code}"
+                )
                 return 1
             _assert_source_state(full_sha, tree_digest, checkout_digest)
             coverage = _rust_coverage_report(
@@ -9643,18 +9849,48 @@ def rust_coverage_prerequisite_main() -> int:
                     expected_checkout_digest=checkout_digest,
                 ),
             )
+            completion_published = True
             print(f"RUST COVERAGE PREREQUISITE PASS: {manifest_path}")
             return 0
     except KeyboardInterrupt:
-        with contextlib.suppress(EvidenceError):
+        with contextlib.suppress(EvidenceError, OSError):
             if not phase_ended:
-                journal.append("phase_end", exitCode=130, verdict="ABORTED")
+                failure_record = journal.append("phase_end", exitCode=130, verdict="ABORTED")
+                phase_ended = True
+            elif failure_record is None and not completion_published:
+                failure_record = journal.append(
+                    "publication_failure", exitCode=130, verdict="ABORTED"
+                )
+            if failure_record is not None and pointer_claimed:
+                _publish_failed_rust_coverage_pointer(
+                    phase_dir,
+                    run_token=run_token,
+                    full_sha=full_sha,
+                    end_record=failure_record,
+                )
         print("RUST COVERAGE PREREQUISITE ABORTED")
         return 130
     except (EvidenceError, LeaseError, OSError, ValueError, subprocess.SubprocessError) as error:
-        with contextlib.suppress(EvidenceError):
+        with contextlib.suppress(EvidenceError, OSError):
             if not phase_ended:
-                journal.append("phase_end", exitCode=1, verdict="VERIFIER_FAILURE", detail=str(error))
+                failure_record = journal.append(
+                    "phase_end", exitCode=1, verdict="VERIFIER_FAILURE", detail=str(error)
+                )
+                phase_ended = True
+            elif failure_record is None and not completion_published:
+                failure_record = journal.append(
+                    "publication_failure",
+                    exitCode=1,
+                    verdict="VERIFIER_FAILURE",
+                    detail=str(error),
+                )
+            if failure_record is not None and pointer_claimed:
+                _publish_failed_rust_coverage_pointer(
+                    phase_dir,
+                    run_token=run_token,
+                    full_sha=full_sha,
+                    end_record=failure_record,
+                )
         print(f"RUST COVERAGE PREREQUISITE VERIFIER FAILURE: {error}")
         return 1
 
