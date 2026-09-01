@@ -12640,3 +12640,33 @@ the environment where it could bite — and it is recorded as such rather than p
 The reboot also revealed a production gap: the serving app came back on release a6de3c17 and all 10
 reviewer links authenticate, but the OmniASR-7B champion on 8799 did not, because nothing on this
 box supervises it across a reboot.
+
+---
+
+## 2026-09-02 — Three Codex candidates integrated by hand, one with seven semantic conflicts
+
+Codex held a detached line (669b7783, diverged from ours at f38fdfc1) with three fixes worth
+having. Owner instruction: no merge, no rebase, no cherry-pick — read, port by hand, report
+conflicts. Reviewed per canon before landing.
+
+**669b7783 — terminal FAILED coverage pointer.** Clean: the candidate's pre-image was byte-identical
+to our HEAD for both files, every hunk landed at its anchor, registry/gate-hash inputs untouched.
+A failed, aborted, verifier-faulted or lease-lost measure now leaves a validated FAILED pointer
+that every consumer refuses with "rerun required", instead of a RUNNING sentinel that cost two
+takeover passes on 2026-09-01. 70/70 supervisor tests, five dependent policy gates green, and the
+publish path proven to refuse a failed measure. Commit 18b0bf4a.
+
+**0db9fcc6 + 4c443a12 — per-file model resolution for readiness.** Correct by the documented rule
+(resolve_models_dir is all-or-nothing; a partial user directory orphans bundled-only VAD/CAM++/
+denoiser/aligner), and confirmed to touch readiness REPORTING only — nothing near
+should_use_wsl_primary_asr, AsrLoadConfig or engine choice; champion supremacy and owner canon
+pins hold. But it collided with wave 5, which had pinned the OLD behaviour a day earlier. Seven
+conflicts found by reading every wave-5 test against the change, resolved with one rule: per-file
+is correct, so update the pin, keep every intent, delete nothing. models:: stayed at 56 tests,
+asr:: gained one. Notable: the corrected warm-up test now performs a REAL ort load, and `ort` is
+load-dynamic — it needed `init_ort_dylib_path()` exactly as production sets at startup, a hazard
+the candidate did not have to face because its own tests never reached that path.
+
+Honest gap carried forward: this workstation bundles the CTC-300M/1B pair, so the clean-checkout
+arms of the conditional tests were not exercised here; those arms are the candidate's own
+assertions, unmodified, and CI's clean runner is where they get their first real execution.

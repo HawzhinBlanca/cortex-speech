@@ -204,24 +204,29 @@ fn parse_asr_result_json(json_str: &str) -> Result<(String, Option<f64>, Confide
 pub fn check_models() -> Result<(), String> {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let models_dir = project_root.join("models");
+    check_models_in(&models_dir, &AsrModelSize::WSL7B)
+}
+
+/// Startup readiness for the SELECTED engine. The WSL7B champion is an external WSL service, so the
+/// default needs only the VAD that cuts its clips (a standard fetch bundles VAD and omits CTC); a
+/// selected native CTC size still requires its complete model+tokens pair. Reporting only — this
+/// never chooses which engine transcribes.
+fn check_models_in(models_dir: &Path, model_size: &AsrModelSize) -> Result<(), String> {
     let vad_path = models_dir.join("silero_vad_v4.onnx");
 
     if !vad_path.exists() {
         return Err(format!("Required VAD model not found: {}", vad_path.display()));
     }
 
-    let (m300_path, t300_path) = omniasr_model_paths(&models_dir, &AsrModelSize::CTC300M);
-    let (m1b_path, t1b_path) = omniasr_model_paths(&models_dir, &AsrModelSize::CTC1B);
-
-    let has_300m = m300_path.exists() && t300_path.exists();
-    let has_1b = m1b_path.exists() && t1b_path.exists();
-
-    if !has_300m && !has_1b {
-        return Err(format!(
-            "No OmniASR models found (tried 300M at {} and 1B at {})",
-            m300_path.display(),
-            m1b_path.display()
-        ));
+    if !matches!(model_size, AsrModelSize::WSL7B) {
+        let (model_path, tokens_path) = omniasr_model_paths(models_dir, model_size);
+        if !model_path.exists() || !tokens_path.exists() {
+            return Err(format!(
+                "Selected {model_size:?} model is incomplete (model: {}, tokens: {})",
+                model_path.display(),
+                tokens_path.display()
+            ));
+        }
     }
 
     Ok(())
@@ -1965,20 +1970,42 @@ mod tests {
     }
 
     #[test]
-    fn bundled_repo_fixture_passes_the_model_startup_checks() {
-        // The repository bundles Silero VAD + the 300M pair (asserted by models.rs's
-        // bundled_runtime_models_count_as_available_when_user_dir_is_empty); the startup checks must
-        // accept that fixture rather than red a clean checkout.
+    fn bundled_repo_fixture_passes_the_default_wsl7b_startup_checks() {
+        // Previously `bundled_repo_fixture_passes_the_model_startup_checks`, which assumed the repo
+        // bundles the 300M pair. Standard fetch/check/build/release paths bundle VAD + ORT support
+        // but deliberately omit auxiliary CTC weights (fetch_models.py OPTIONAL_ASR_ITEMS), so the
+        // default WSL7B champion must be ready with VAD alone rather than red a clean checkout.
         assert!(check_models().is_ok(), "{:?}", check_models());
         let warnings = check_model_integrity();
         assert!(
             !warnings.iter().any(|w| w.contains("silero_vad_v4")),
             "bundled VAD must pass its integrity floor: {warnings:?}"
         );
-        assert!(
-            !warnings.iter().any(|w| w.contains("omniasr-ctc-300m")),
-            "bundled 300M pair must pass its integrity floors: {warnings:?}"
-        );
+        // Kept from the old test: WHEN the optional 300M pair is bundled (an owner box), it must still
+        // pass its integrity floors — the pair is optional, a corrupt one is not.
+        let models_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
+        if omniasr_model_present(&models_dir, &AsrModelSize::CTC300M) {
+            assert!(
+                !warnings.iter().any(|w| w.contains("omniasr-ctc-300m")),
+                "bundled 300M pair must pass its integrity floors: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_native_ctc_startup_check_requires_its_complete_pair() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("silero_vad_v4.onnx"), b"vad").expect("VAD fixture");
+
+        assert!(check_models_in(tmp.path(), &AsrModelSize::WSL7B).is_ok());
+        let error = check_models_in(tmp.path(), &AsrModelSize::CTC300M).expect_err("missing CTC pair");
+        assert!(error.contains("CTC300M"), "{error}");
+
+        let (model, tokens) = omniasr_model_paths(tmp.path(), &AsrModelSize::CTC300M);
+        std::fs::create_dir_all(model.parent().expect("model parent")).expect("model dir");
+        std::fs::write(&model, b"model").expect("model fixture");
+        std::fs::write(&tokens, b"tokens").expect("tokens fixture");
+        assert!(check_models_in(tmp.path(), &AsrModelSize::CTC300M).is_ok());
     }
 
     fn write_sized_file(path: &Path, size_bytes: u64) {
