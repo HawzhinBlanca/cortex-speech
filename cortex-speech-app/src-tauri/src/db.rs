@@ -1006,6 +1006,7 @@ mod jobs_rights;
 mod playback;
 mod queries_recovery;
 mod review;
+mod review_pilot_keys;
 mod segments;
 
 impl Database {

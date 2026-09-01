@@ -12605,3 +12605,38 @@ must SURVIVE — the old assertion only proved "something with this name died".
 
 The lesson worth keeping: a required check that is skipped is not a passing check. This job showed
 green-adjacent for weeks while 507 of its policy-step appearances were `skipped`.
+
+---
+
+## 2026-09-02 — Two modules brought under the architecture ceiling by pure code motion
+
+The Windows Release Gate's next step after the policy suite — the fail-closed production-module
+architecture gate — had not run in CI since 2026-08-19 either. It refuses any ordinary module at or
+above 2,000 production lines, and its only escape hatch is a hash-bound exception for modules at or
+above the 2,500 HARD ceiling; the band between has no way out but shrinking, by design.
+
+  src-tauri/src/review_pool.rs  2153 -> 1622   (546 lines -> review_pool/authority.rs)
+  src-tauri/src/db/review.rs    2007 -> 1768   (242 lines -> db/review_pilot_keys.rs)
+
+Neither was caused by this branch's work: review_pool.rs crossed 2,000 on 2026-08-24 and
+db/review.rs on 2026-08-30, measured with the gate's own counter at every commit since. The 153-line
+coincidence with wave 5's test additions was exactly that — the production count is identical before
+and after wave 5.
+
+Pure code motion, verified rather than asserted: every one of the 519 and 230 removed non-blank
+lines reappears verbatim in the new module; the only additions are `mod authority;` plus a
+re-export block, and one `mod review_pilot_keys;` line in db.rs. The PAY-FENCE MIRROR block and
+every other grep-pinned region stayed in place — seven pinned policy gates pass, including
+test_pool_pay_fence_scope_policy and test_consensus_review_canon.
+
+Evidence, stated exactly: architecture gate exit 0 (169 modules); layering, fmt, diff-check clean;
+strict clippy exit 0; review_pool:: 41/41; full library 2550 passed / 5 failed. The 5 are all
+couch::tests lease tests that call `Instant::now().checked_sub(LEASE_TTL)`; the workstation rebooted
+at 00:06 and the suite ran with under 16 minutes of uptime, so the monotonic clock had no headroom
+to subtract 15 minutes. couch.rs is untouched by this change, and all 5 pass in isolation once
+uptime exceeds the TTL. That is a latent assumption worth knowing about — a fresh CI VM is exactly
+the environment where it could bite — and it is recorded as such rather than papered over.
+
+The reboot also revealed a production gap: the serving app came back on release a6de3c17 and all 10
+reviewer links authenticate, but the OmniASR-7B champion on 8799 did not, because nothing on this
+box supervises it across a reboot.
