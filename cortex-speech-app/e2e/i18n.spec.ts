@@ -31,7 +31,10 @@ test.describe('i18n and locale switching', () => {
 
     await toggle.click();
 
-    // Now in English, the toggle offers Kurdish (endonym).
+    // Switching locale re-renders the header, which closes the overflow menu that holds the
+    // toggle -- exactly what the sibling test below already does before its own assertion. The
+    // assertion is unchanged: once in English, the toggle must offer Kurdish (endonym).
+    await openHeaderOverflow(page);
     await expect(toggle).toHaveText('کوردی');
   });
 
