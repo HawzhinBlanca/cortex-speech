@@ -57,7 +57,7 @@ def short_directory_launch_path(path: Path) -> str:
     """Return ``path`` reached through the 8.3 form of its directory, keeping the executable name.
 
     This is the identity Windows records for anything started under a shortened directory - a CI
-    runner's ``C:\\Users\\RUNNER~1\\...``, a shortcut through ``C:\\PROGRA~1\\...``. Only the
+    runner's shortened profile directory, a shortcut through ``C:\\PROGRA~1\\...``. Only the
     directory is shortened on purpose: the process keeps its real image name, so it is still the
     same process the stop path claims to find, and the only thing that differs is the path text.
 
@@ -515,7 +515,7 @@ def test_stop_app_targets_one_exact_executable_and_waits_for_exit() -> None:
         processes: dict[Path, subprocess.Popen[bytes]] = {}
         for path, launch_as in (
             # The targeted copy is launched through the 8.3 form of its directory, which is what
-            # Windows then reports as its image path (a CI runner's C:\Users\RUNNER~1\..., a
+            # Windows then reports as its image path (a hosted runner's shortened profile dir, a
             # shortcut through C:\PROGRA~1\...). stop_app is still handed the long path, so an
             # identity compare that does not normalise both sides matches nothing, stops nothing,
             # and still reports success.

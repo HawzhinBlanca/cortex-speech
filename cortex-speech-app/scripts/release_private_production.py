@@ -869,7 +869,7 @@ def stop_app(executables: list[Path], *, force_after_seconds: int = 8) -> None:
 $targets = @($env:CORTEX_RELEASE_TARGETS -split "`n" | Where-Object { $_ })
 function Resolve-ImagePath([string]$path) {
     # Get-Process reports the image path exactly as the process was launched, so an app started
-    # through an 8.3 component (C:\PROGRA~1\..., or a CI runner's C:\Users\RUNNER~1\...) never
+    # through an 8.3 component (C:\PROGRA~1\..., or a hosted runner's shortened profile dir) never
     # string-equals the long path this controller resolved. Left un-normalised the filter matches
     # nothing, stop_app returns success without stopping anything, and the release goes on to
     # overwrite files and launch a second instance while the old one still holds the database.
