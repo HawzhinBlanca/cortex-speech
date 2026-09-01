@@ -1558,4 +1558,274 @@ mod tests {
         let error = validate_review_compensation_semantics(&db).unwrap_err();
         assert!(error.contains("amount differs from its immutable ledger range"), "{error}");
     }
+
+    // ── Wave-5 branch coverage. The unpaid/zero-rate actions, the retained-audio arm, and the
+    // remaining identity edges on the pure helpers.
+
+    #[test]
+    fn entitlement_and_work_identity_helper_edges() {
+        // The last arithmetic arm: an amount that is exact but larger than the money type can hold.
+        // (duration × bps / 2 with both at their extremes — a real overflow, not a rounding one.)
+        let too_large = super::exact_review_entitlement(i64::MAX, 10_000).unwrap_err();
+        assert!(too_large.contains("exceeds the supported integer range"), "{too_large}");
+
+        // A work id whose audio identity is missing its end offset is not a span at all.
+        let truncated = format!("reviewer-work-v1:8:reviewer:audio-segment-v1:{}:0", "a".repeat(64));
+        assert!(!super::canonical_work_id_has_writer_shape(&truncated, "Reviewer", 1_000));
+        assert!(super::canonical_work_audio_identity(&truncated, "Reviewer").is_none());
+
+        let unparsable_end = format!("reviewer-work-v1:8:reviewer:audio-segment-v1:{}:0:end", "a".repeat(64));
+        assert!(super::canonical_work_audio_identity(&unparsable_end, "Reviewer").is_none());
+        let uppercase_hash = format!("reviewer-work-v1:8:reviewer:audio-segment-v1:{}:0:1000", "A".repeat(64));
+        assert!(super::canonical_work_audio_identity(&uppercase_hash, "Reviewer").is_none());
+
+        // A negative current revision is corrupt even when the decision claims the same value, so
+        // the "not current" early return must never swallow it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_paid_db(&dir, "negative-revision");
+        db.connection().execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
+        db.connection()
+            .execute("UPDATE speech_segments SET review_revision=-1 WHERE id='negative-revision'", [])
+            .unwrap();
+        let negative = super::canonical_compensation_work(&db, "negative-revision", "Reviewer", -1).unwrap_err();
+        assert!(negative.contains("regresses its decision revision"), "{negative}");
+    }
+
+    #[test]
+    fn a_skip_is_recorded_as_unpaid_work_that_still_needs_its_exact_ledger_entry() {
+        // Skips are the zero-rate action: they mint a ledger entry that must exist, must be worth
+        // nothing, and must not be asked for playback evidence (nobody is paid to skip).
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_paid_db(&dir, "skip-clip");
+        db.record_review_event_with_operation(
+            "skip-clip",
+            "Reviewer",
+            "skip",
+            "couch",
+            700,
+            &canonical_operation(700),
+            &crate::db::review_operation_payload_hash("skip-clip", "skip", "", "Reviewer"),
+        )
+        .unwrap();
+        validate_review_compensation_semantics(&db).expect("a genuine skip is a valid pay target with no receipt");
+
+        let (action, rate, entitlement, delta, corrected): (String, i64, i64, i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT compensation_action, rate_basis_points, entitlement_micro_iqd,
+                        delta_micro_iqd, corrected_entitlement_ms
+                   FROM review_compensation_ledger ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (action.as_str(), rate, entitlement, delta, corrected),
+            ("skip", crate::db::REVIEW_PAY_SKIP_BPS, 0, 0, 0),
+            "a skip is recorded at the zero rate and moves no money"
+        );
+
+        // Paying anything for a skip is refused by the re-derived arithmetic.
+        unlock(&db, "review_compensation_ledger");
+        assert!(
+            db.connection()
+                .execute(
+                    "UPDATE review_compensation_ledger SET delta_micro_iqd=1 WHERE compensation_action='skip'",
+                    [],
+                )
+                .unwrap()
+                >= 1
+        );
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("math is invalid"), "{error}");
+    }
+
+    #[test]
+    fn a_reject_is_paid_at_the_reject_rate_with_no_corrected_time() {
+        // The reject action pairs a non-zero rate with zero corrected-entitlement time — a distinct
+        // arithmetic arm from the edit fixture every other test here uses.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_paid_db(&dir, "reject-pay");
+        listened(&db, "reject-pay");
+        let revision = db.segment_review_revision("reject-pay").unwrap().unwrap();
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "reject-pay",
+            "reject",
+            None,
+            "Reviewer",
+            revision,
+            &canonical_operation(710),
+            &crate::db::review_operation_payload_hash("reject-pay", "reject", "", "Reviewer"),
+        )
+        .unwrap()
+        .unwrap();
+        validate_review_compensation_semantics(&db).expect("a genuine paid reject must validate");
+
+        let (action, rate, corrected, corrected_delta): (String, i64, i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT compensation_action, rate_basis_points, corrected_entitlement_ms, delta_corrected_ms
+                   FROM review_compensation_ledger ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (action.as_str(), rate, corrected, corrected_delta),
+            ("reject", crate::db::REVIEW_PAY_REJECT_BPS, 0, 0),
+            "a reject pays the reject rate and earns no corrected-transcript time"
+        );
+    }
+
+    #[test]
+    fn paid_work_must_keep_the_retained_audio_it_was_paid_for() {
+        // Policy-3 evidence: pay is bound to a specific clip's BLAKE3 + source span + duration. If
+        // that clip is gone, or its identity has drifted, the ledger row can no longer name what was
+        // reviewed — and an export built from it would attribute paid human work to other audio.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_paid_db(&dir, "vanished-clip");
+        listened(&db, "vanished-clip");
+        decided(&db, "vanished-clip", 720);
+        validate_review_compensation_semantics(&db).unwrap();
+        unlock(&db, "speech_segments");
+        assert_eq!(db.connection().execute("DELETE FROM speech_segments WHERE id='vanished-clip'", []).unwrap(), 1);
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("policy-3 evidence forbids reviewed-segment deletion"), "{error}");
+
+        // A drifted audio hash on a segment that has since moved past the paid revision: the
+        // per-revision work-identity check no longer claims it, so the RETAINED identity arm is the
+        // one that must still refuse.
+        let db = file_paid_db(&dir, "drifted-clip");
+        listened(&db, "drifted-clip");
+        decided(&db, "drifted-clip", 721);
+        validate_review_compensation_semantics(&db).unwrap();
+        unlock(&db, "speech_segments");
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments SET review_revision = review_revision + 1, audio_content_hash = ?1
+                      WHERE id='drifted-clip'",
+                    [&"d".repeat(64)],
+                )
+                .unwrap(),
+            1
+        );
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("disagrees with its retained BLAKE3/source-span/duration identity"), "{error}");
+    }
+
+    #[test]
+    fn every_remaining_event_and_ledger_identity_clause_is_load_bearing() {
+        // Each case breaks exactly one clause of a disjunction whose other arms are already pinned
+        // above, so the message alone would not prove the arm under test ever ran — the corruption
+        // is asserted to apply first, and each case gets a fresh fixture.
+        let event_cases: [(&str, &str, &str); 3] = [
+            (
+                "no compensation action at all",
+                "UPDATE review_events SET compensation_action=NULL",
+                "has no compensation action",
+            ),
+            ("no served revision", "UPDATE review_events SET served_revision=NULL", "invalid served/request evidence"),
+            (
+                "untrimmed request text is not canonical",
+                "UPDATE review_events SET requested_transcript='  corrected text  '",
+                "invalid served/request evidence",
+            ),
+        ];
+        for (label, sabotage, expected) in event_cases {
+            // A fresh directory per case: `file_paid_db` names the file after the segment id, so
+            // reusing one directory would re-open the previous case's already-corrupted database.
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = file_paid_db(&dir, "event-clause");
+            listened(&db, "event-clause");
+            decided(&db, "event-clause", 740);
+            validate_review_compensation_semantics(&db).unwrap();
+            unlock(&db, "review_events");
+            assert_eq!(db.connection().execute(sabotage, []).unwrap(), 1, "{label}");
+            let error = validate_review_compensation_semantics(&db).unwrap_err();
+            assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
+        }
+
+        let ledger_cases: [(&str, &str, &str); 3] = [
+            (
+                "durable entry identity is not a canonical UUID",
+                "UPDATE review_compensation_ledger SET entry_id='not-a-uuid'",
+                "invalid or duplicate durable identity",
+            ),
+            (
+                "work id does not have the writer's shape",
+                "UPDATE review_compensation_ledger SET canonical_work_id='forged-work'",
+                "disagrees with canonical segment/work identity",
+            ),
+            (
+                "non-positive paid duration",
+                "UPDATE review_compensation_ledger SET duration_ms=0",
+                "disagrees with canonical segment/work identity",
+            ),
+        ];
+        for (label, sabotage, expected) in ledger_cases {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = file_paid_db(&dir, "ledger-clause");
+            listened(&db, "ledger-clause");
+            decided(&db, "ledger-clause", 741);
+            validate_review_compensation_semantics(&db).unwrap();
+            unlock(&db, "review_compensation_ledger");
+            assert_eq!(db.connection().execute(sabotage, []).unwrap(), 1, "{label}");
+            let error = validate_review_compensation_semantics(&db).unwrap_err();
+            assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
+        }
+
+        // A settlement whose range covers no ledger id at all can only be a payout for nothing.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_paid_db(&dir, "empty-range");
+        listened(&db, "empty-range");
+        decided(&db, "empty-range", 742);
+        validate_review_compensation_semantics(&db).unwrap();
+        unlock(&db, "review_compensation_settlements");
+        db.connection()
+            .execute(
+                "INSERT INTO review_compensation_settlements
+                    (settlement_id, policy_version, reviewer, from_ledger_id_exclusive,
+                     through_ledger_id_inclusive, allocated_micro_iqd, payout_reference)
+                 VALUES ('30303030-3030-4030-8030-303030303030', ?1, 'Reviewer', 0, 0, 0, 'payout-empty')",
+                [crate::db::REVIEW_PAY_POLICY_VERSION],
+            )
+            .unwrap();
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("non-contiguous or invalid ledger range"), "{error}");
+    }
+
+    #[test]
+    fn undo_and_decision_rows_must_name_the_operation_and_revision_they_settle() {
+        // An undo is addressed by the operation of the event it reverses; re-keying it to some other
+        // operation leaves a clawback that answers for nothing.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = undone_paid_fixture(&dir, "undo-linkage", 730);
+        unlock(&db, "review_compensation_ledger");
+        assert!(
+            db.connection()
+                .execute(
+                    "UPDATE review_compensation_ledger SET entry_key = 'undo:' || ?1
+                      WHERE compensation_action='undo'",
+                    [canonical_operation(731)],
+                )
+                .unwrap()
+                >= 1
+        );
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("invalid operation/event linkage"), "{error}");
+
+        // A paid Couch decision at revision 0 never advanced the segment it claims to have decided.
+        let db = file_paid_db(&dir, "zero-revision");
+        listened(&db, "zero-revision");
+        decided(&db, "zero-revision", 732);
+        validate_review_compensation_semantics(&db).unwrap();
+        unlock(&db, "review_compensation_ledger");
+        assert_eq!(
+            db.connection().execute("UPDATE review_compensation_ledger SET decision_revision=0", []).unwrap(),
+            1
+        );
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("disagrees with review event"), "{error}");
+    }
 }

@@ -1717,6 +1717,177 @@ mod tests {
     }
 
     #[test]
+    fn health_parser_names_the_exact_non_canonical_identity_field() {
+        // The identity loop checks SIX digests; only the deployment one had coverage. A manifest,
+        // base, adapter, adapter-config or tokenizer digest that is not canonical hex must name
+        // itself in the refusal, otherwise an operator cannot tell which half of the deployment the
+        // server actually has.
+        let valid = health_json("candidate-1", &"a".repeat(64));
+        for (filler, label) in
+            [("b", "manifest"), ("c", "base"), ("d", "adapter"), ("e", "adapter config"), ("f", "tokenizer")]
+        {
+            let corrupted = valid.replace(&filler.repeat(64), &"z".repeat(64));
+            assert_ne!(corrupted, valid, "the {label} fixture digest was never substituted");
+            let error = parse_health_marker(&corrupted).unwrap_err();
+            assert!(error.contains(label), "a corrupted {label} digest reported: {error}");
+            assert!(error.contains("canonical SHA-256"), "{error}");
+        }
+    }
+
+    #[test]
+    fn server_script_resolution_walks_every_rung_in_precedence_order() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scripts = tmp.path().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(scripts.join("cortex_7b_server.py"), b"# champion server").unwrap();
+
+        // A whitespace-only override is not an override: resolution must continue to the start-script
+        // sibling instead of returning a path the launcher would immediately fail on.
+        let start = scripts.join("start_7b.cmd").to_string_lossy().into_owned();
+        let found = resolve_server_script(Some("   ".into()), Some(start), None, None)
+            .expect("a blank override must fall through to the start-script sibling");
+        assert!(found.ends_with("cortex_7b_server.py"), "{found}");
+        assert!(std::path::Path::new(&found).is_file(), "{found}");
+
+        // A start script whose own directory has no server script contributes nothing.
+        let bare = tmp.path().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        let lonely_start = bare.join("start_7b.cmd").to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_server_script(None, Some(lonely_start.clone()), None, None),
+            None,
+            "a start script with no sibling server script must not invent one"
+        );
+
+        // …and the next rung still resolves: the bundled layout with the script directly beside the
+        // exe, reached with no repo hops and no environment at all.
+        let beside = tmp.path().join("install");
+        std::fs::create_dir_all(&beside).unwrap();
+        std::fs::write(beside.join("cortex_7b_server.py"), b"# champion server").unwrap();
+        let found = resolve_server_script(None, Some(lonely_start), Some(&beside), None)
+            .expect("the script beside the exe must be found once the start script has nothing");
+        assert!(std::path::Path::new(&found).is_file(), "{found}");
+    }
+
+    #[test]
+    fn resource_dir_fallback_covers_the_root_and_up_bundle_layouts() {
+        // Only `resources/scripts/` had coverage. A bundle that ships the script at the resource
+        // root, or under Tauri's `_up_/scripts/` rewrite, must resolve too — otherwise the champion
+        // can never start from that install even though the file is right there.
+        for relative in ["cortex_7b_server.py", "_up_/scripts/cortex_7b_server.py"] {
+            let bundle = tempfile::TempDir::new().unwrap();
+            let resources = bundle.path().join("resources");
+            let script = resources.join(relative);
+            std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+            std::fs::write(&script, b"# champion server").unwrap();
+            let empty_exe_dir = bundle.path().join("exe");
+            std::fs::create_dir_all(&empty_exe_dir).unwrap();
+
+            let found = resolve_server_script(None, None, Some(&empty_exe_dir), Some(&resources))
+                .unwrap_or_else(|| panic!("the {relative} bundle layout must resolve"));
+            assert!(found.ends_with("cortex_7b_server.py"), "{found}");
+            assert!(std::path::Path::new(&found).is_file(), "{found}");
+        }
+    }
+
+    #[test]
+    fn bounded_pipe_read_surfaces_io_failure_and_stops_exactly_at_the_limit() {
+        struct FailingReader;
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "drained pipe fault"))
+            }
+        }
+
+        let signal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let error = match read_bounded_pipe(FailingReader, 16, std::sync::Arc::clone(&signal)) {
+            Err(error) => error,
+            Ok(result) => {
+                panic!("a pipe fault must surface, not read as {} clean bytes", result.retained.len())
+            }
+        };
+        assert!(error.contains("drained pipe fault"), "{error}");
+        assert!(!signal.load(std::sync::atomic::Ordering::SeqCst), "an I/O fault is not an output overflow");
+
+        // The boundary between a legitimate maximum-size reply and a flood: exactly at the limit is
+        // retained in full and must NOT trip the kill signal.
+        let exact = read_bounded_pipe(&b"0123456789"[..], 10, std::sync::Arc::clone(&signal)).expect("bounded read");
+        assert_eq!(exact.retained, b"0123456789");
+        assert!(!exact.exceeded, "a reply that exactly fills the budget is not over it");
+        assert!(!signal.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn contained_command_rejects_every_remaining_invalid_limit_before_spawn() {
+        let mut zero_stdin = contained_spec(Duration::from_secs(1));
+        zero_stdin.max_stdin_bytes = 0;
+        zero_stdin.stdin_body.clear();
+        let error = run_contained_command(Command::new("this-binary-must-never-be-resolved"), zero_stdin)
+            .expect_err("a zero stdin limit is invalid");
+        assert!(matches!(error, ContainedCommandError::InvalidConfiguration(_)), "{error:?}");
+
+        let mut zero_stderr = contained_spec(Duration::from_secs(1));
+        zero_stderr.max_stderr_bytes = 0;
+        let error = run_contained_command(Command::new("this-binary-must-never-be-resolved"), zero_stderr)
+            .expect_err("a zero stderr limit is invalid");
+        assert!(matches!(error, ContainedCommandError::InvalidConfiguration(_)), "{error:?}");
+
+        // A deadline the monotonic clock cannot represent is a configuration refusal, never an
+        // unbounded run with no deadline at all.
+        let error = run_contained_command(
+            Command::new("this-binary-must-never-be-resolved"),
+            ContainedCommandSpec { timeout: Duration::MAX, ..contained_spec(Duration::from_secs(1)) },
+        )
+        .expect_err("an unrepresentable deadline must refuse before spawn");
+        match error {
+            ContainedCommandError::InvalidConfiguration(message) => {
+                assert!(message.contains("monotonic clock"), "{message}");
+            }
+            other => panic!("expected an invalid-configuration refusal, got {other:?}"),
+        }
+    }
+
+    /// Real-process stderr flood. Kept separate from [`contained_command_fault_helper`] so no
+    /// existing drill role changes; it returns immediately in the ordinary suite.
+    #[test]
+    fn contained_command_stderr_flood_helper() {
+        use std::io::Write;
+        if std::env::var("CORTEX_CONTAINED_STDERR_DRILL").is_err() {
+            return;
+        }
+        let bytes = vec![b'e'; 64 * 1024];
+        loop {
+            std::io::stderr().write_all(&bytes).expect("flood drill stderr");
+            std::io::stderr().flush().expect("flush flood drill stderr");
+        }
+    }
+
+    #[test]
+    fn contained_command_stderr_flood_is_killed_without_unbounded_retention() {
+        // The stdout bound had a real-process drill; the stderr bound did not. Give stdout generous
+        // headroom so the refusal can only come from the stream under test.
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .arg("engine_runtime::tests::contained_command_stderr_flood_helper")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("CORTEX_CONTAINED_STDERR_DRILL", "1");
+        let spec = ContainedCommandSpec { max_stdout_bytes: 64 * 1024, ..contained_spec(Duration::from_secs(5)) };
+
+        let started = std::time::Instant::now();
+        let error = run_contained_command(command, spec).expect_err("a stderr flood must fail closed like stdout");
+        assert_eq!(error, ContainedCommandError::OutputLimitExceeded { stream: "stderr", limit_bytes: 1_024 });
+        assert!(started.elapsed() < Duration::from_secs(3), "the stderr flood was not stopped promptly");
+    }
+
+    #[test]
+    fn contained_command_io_and_spawn_errors_name_their_stage() {
+        assert!(ContainedCommandError::Io("stdin writer panicked".into()).to_string().contains("I/O failed"));
+        assert!(ContainedCommandError::Spawn("no such binary".into()).to_string().contains("could not start"));
+        assert!(ContainedCommandError::AbnormalExit { exit_code: None }.to_string().contains("None"));
+    }
+
+    #[test]
     fn contained_command_errors_render_actionable_messages() {
         assert!(ContainedCommandError::Timeout { timeout_ms: 250 }.to_string().contains("250 ms deadline"));
         assert!(ContainedCommandError::OutputLimitExceeded { stream: "stdout", limit_bytes: 9 }

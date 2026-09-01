@@ -2880,4 +2880,88 @@ mod tests {
         let production = require_finalized_production_export(&db, "production export").unwrap_err().to_string();
         assert!(production.contains("is adjudication_active"), "{production}");
     }
+
+    /// Who may act is derived ENTIRELY from the phase, and the two terminal phases authorize nobody.
+    /// A wrong answer here does not fail loudly — it hands a live reviewer session to the wrong
+    /// person, or keeps the blind second pass open after adjudication has already sealed clips.
+    #[test]
+    fn every_campaign_phase_names_exactly_one_authorized_surface() {
+        fn at(phase: CampaignPhase) -> SequentialReviewCampaign {
+            let base = valid_policy();
+            SequentialReviewCampaign {
+                reviewer: "Rubar".into(),
+                progress: Some(CampaignProgress {
+                    schema_version: 1,
+                    campaign_id: base.campaign_id.clone(),
+                    phase,
+                    transition_id: "123e4567-e89b-42d3-a456-426614174001".into(),
+                    first_reviewer: "Rubar".into(),
+                    second_reviewer: SECOND_PASS_REVIEWER.into(),
+                    focus_segment_count: base.focus_segment_count,
+                    focus_sha256: base.focus_sha256.clone(),
+                    max_review_event_id: 900,
+                    independent_decision_count: 0,
+                    adjudication_count: 0,
+                    conflicts_remaining: 0,
+                }),
+                ..base
+            }
+        }
+
+        // No progress row at all IS the first pass; it must not need one to name its reviewer.
+        let fresh = parse(&serde_json::to_string(&valid_policy()).unwrap()).unwrap();
+        assert_eq!(fresh.phase(), CampaignPhase::FirstPassActive);
+        assert_eq!(fresh.authorized_reviewer(), Some("Rubar"));
+        assert!(!fresh.is_blinded_second_pass() && !fresh.is_completed());
+
+        let first = at(CampaignPhase::FirstPassActive);
+        assert_eq!(first.phase().as_str(), "first_pass_active");
+        assert_eq!(first.authorized_reviewer(), Some("Rubar"));
+        assert!(first.matches_reviewer("  rUbAr  "), "identity is trimmed and case-insensitive");
+        assert!(!first.matches_reviewer(SECOND_PASS_REVIEWER), "the second reviewer cannot act in the first pass");
+        assert!(!first.is_blinded_second_pass() && !first.is_completed());
+
+        let second = at(CampaignPhase::SecondPassActive);
+        assert_eq!(second.phase().as_str(), "second_pass_active");
+        assert_eq!(second.authorized_reviewer(), Some(SECOND_PASS_REVIEWER));
+        assert!(!second.matches_reviewer("Rubar"), "the first reviewer cannot act in the blind second pass");
+        assert!(second.is_blinded_second_pass() && !second.is_completed());
+
+        for terminal in [CampaignPhase::AdjudicationActive, CampaignPhase::Completed] {
+            let policy = at(terminal);
+            assert_eq!(policy.authorized_reviewer(), None, "{} authorizes nobody", terminal.as_str());
+            assert!(!policy.matches_reviewer("Rubar"));
+            assert!(!policy.matches_reviewer(SECOND_PASS_REVIEWER));
+            assert!(!policy.is_blinded_second_pass());
+        }
+        assert_eq!(CampaignPhase::AdjudicationActive.as_str(), "adjudication_active");
+        assert_eq!(CampaignPhase::Completed.as_str(), "completed");
+        assert!(!at(CampaignPhase::AdjudicationActive).is_completed());
+        assert!(at(CampaignPhase::Completed).is_completed());
+        assert_eq!(CampaignPhase::default(), CampaignPhase::FirstPassActive);
+    }
+
+    /// Both independent read surfaces answer "nothing yet" rather than erring on a campaign that has
+    /// no second-pass evidence — an undo or a receipt lookup on a fresh second pass is ordinary.
+    #[test]
+    fn independent_receipt_and_latest_decision_are_empty_before_any_second_pass_work() {
+        let (db, ids, base, _temp) = seeded_first_pass(2);
+        let maximum = db.max_review_event_id().unwrap();
+        activate_second_pass(&db, &ids, maximum).unwrap();
+        let policy = load(&db).unwrap().unwrap();
+        assert!(policy.is_blinded_second_pass());
+
+        assert!(
+            latest_independent_decision(&db, &policy.campaign_id, SECOND_PASS_REVIEWER).unwrap().is_none(),
+            "an untouched second pass has nothing to undo"
+        );
+        assert!(
+            latest_independent_decision(&db, &policy.campaign_id, base.reviewer.as_str()).unwrap().is_none(),
+            "the first reviewer never owns independent evidence"
+        );
+        assert!(
+            independent_operation(&db, "123e4567-e89b-42d3-a456-4266141749ff").unwrap().is_none(),
+            "an unknown operation id is a miss, not an error"
+        );
+    }
 }

@@ -3318,4 +3318,102 @@ mod tests {
         let (_, _, retained) = state.batch_run_admission(&live);
         assert_eq!(retained, Some(outcome), "only the exact-match outcome survives to settlement");
     }
+
+    fn completed_outcome(total: usize) -> BatchRunOutcome {
+        BatchRunOutcome {
+            disposition: BatchRunDisposition::Completed,
+            total,
+            succeeded: total as u32,
+            failed: 0,
+            skipped: 0,
+            abandoned: 0,
+            cancelled: false,
+            error_code: None,
+        }
+    }
+
+    #[test]
+    fn batch_run_adoption_survives_a_lost_terminal_event_until_the_renderer_acknowledges() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        assert!(state.adoptable_batch_run_identity().is_none(), "a fresh process has nothing to adopt");
+        assert!(!state.acknowledge_batch_run_renderer("never-started"), "an unknown identity cannot be acknowledged");
+
+        // A rejected start produced no result, so there is nothing for the renderer to present.
+        let rejected = uuid::Uuid::from_u128(0x9001).to_string();
+        state.try_start_batch_for_run(&rejected, BatchOperation::Transcribe, 1).expect("admit batch");
+        state.abort_batch_start(&rejected, BatchOperation::Transcribe);
+        assert!(state.adoptable_batch_run_identity().is_none(), "a rejected start is never adoptable");
+        assert!(!state.acknowledge_batch_run_renderer(&rejected), "there is no result to acknowledge");
+
+        // A LIVE run is always adoptable — and stays adoptable after acknowledgement, because its
+        // durable header may terminalize between two renderer discovery reads.
+        let live = uuid::Uuid::from_u128(0x9002).to_string();
+        state.try_start_batch_for_run(&live, BatchOperation::Normalize, 3).expect("admit batch");
+        assert_eq!(state.adoptable_batch_run_identity(), Some((live.clone(), BatchOperation::Normalize)));
+        assert!(state.acknowledge_batch_run_renderer(&live));
+        assert_eq!(
+            state.adoptable_batch_run_identity(),
+            Some((live.clone(), BatchOperation::Normalize)),
+            "acknowledgement must not detach a still-running batch"
+        );
+        assert!(state.record_batch_outcome(&live, BatchOperation::Normalize, completed_outcome(3)));
+        assert!(state.finish_batch_for_run(&live, BatchOperation::Normalize));
+        assert!(
+            state.adoptable_batch_run_identity().is_none(),
+            "a settled result the renderer already presented must not be re-adopted"
+        );
+
+        // A settled run whose terminal event was LOST stays adoptable until the renderer says it saw it.
+        let lost = uuid::Uuid::from_u128(0x9003).to_string();
+        state.try_start_batch_for_run(&lost, BatchOperation::Transcribe, 2).expect("admit batch");
+        assert!(state.record_batch_outcome(&lost, BatchOperation::Transcribe, completed_outcome(2)));
+        assert!(state.finish_batch_for_run(&lost, BatchOperation::Transcribe));
+        assert_eq!(
+            state.adoptable_batch_run_identity(),
+            Some((lost.clone(), BatchOperation::Transcribe)),
+            "an unacknowledged settled result is exactly what response-loss reconciliation must find"
+        );
+        assert!(state.acknowledge_batch_run_renderer(&lost));
+        assert!(state.adoptable_batch_run_identity().is_none(), "acknowledgement closes the reconciliation");
+    }
+
+    #[test]
+    fn query_and_write_store_boundaries_bind_to_the_live_database() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+
+        // Every migrated command domain hands out a store bound to the SAME restore-gated runtime.
+        // On an initialized-but-empty library each read is an empty answer, never an error.
+        assert!(state.segment_queries().get_segments(None).expect("segment query store reads").is_empty());
+        assert!(state
+            .segment_queries()
+            .get_segment("no-such-segment")
+            .expect("a missing segment is not an error")
+            .is_none());
+        assert!(state.review_drafts().get("no-such-segment").expect("review draft store reads").is_none());
+        assert!(state.rights_store().list_recordings().expect("rights store reads").is_empty());
+        assert!(state.job_store().find_interrupted_import().expect("job store reads").is_none());
+        assert!(state.job_store().list_recent(5).expect("job history reads").is_empty());
+        assert!(state.compensation_store().overview().expect("compensation store reads").is_empty());
+        assert!(state.batch_store().active().expect("batch store reads").is_none());
+        state.review_writes().capture_restore_generation().expect("review write store reaches restore generation");
+
+        // The deletion boundary carries the AppState history, and a no-op delete records no undo.
+        let before_undo = state.lock_history().can_undo();
+        let (deleted, _mutation) = state.segment_writes().delete_batch(&[]).expect("an empty delete is a no-op");
+        assert_eq!(deleted, 0);
+        assert_eq!(state.lock_history().can_undo(), before_undo, "a no-op delete must not push an undo command");
+    }
+
+    #[test]
+    fn dirs_fallback_anchors_the_data_dir_under_the_home_directory() {
+        // The non-Windows leg of get_app_data_dir. HOME is machine-dependent; the JOIN is not.
+        let linux = dirs_fallback(".local/share");
+        let macos = dirs_fallback("Library/Application Support");
+        assert!(linux.ends_with(".local/share"), "{}", linux.display());
+        assert!(macos.ends_with("Library/Application Support"), "{}", macos.display());
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        assert!(linux.starts_with(&home) && macos.starts_with(&home), "{} / {}", linux.display(), macos.display());
+    }
 }

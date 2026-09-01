@@ -2260,3 +2260,236 @@ fn wsl_result_parser_clamps_and_filters_confidence() {
     let null = over.replace("1.5", "null");
     assert_eq!(super::parse_wsl_segment_result(&null).unwrap().confidence, None, "absent confidence stays absent");
 }
+
+// ---- Wave-4 coverage: the remaining refusal arms of the direct-transport identity contract ----
+
+fn complete_champion_identity_reply() -> serde_json::Value {
+    let sha = "a".repeat(64);
+    serde_json::json!({
+        "protocol": "cortex-omniasr-adapter", "protocolVersion": 1, "family": "omniasr-7b",
+        "modelVersionId": "omniasr-7b-legacy-c348ade8a816", "deploymentSha256": sha,
+        "componentSha256": {"base": sha, "adapter": sha, "adapterConfig": sha, "tokenizer": sha},
+        "language": "ckb_Arab", "manifestSha256": sha,
+        "provenanceKind": "legacy_bootstrap", "worker": "gpu0", "transcript": "دەق"
+    })
+}
+
+#[test]
+fn wsl7b_identity_validation_refuses_every_remaining_incomplete_field() {
+    use super::wsl7b_validate_identity;
+    let good = complete_champion_identity_reply();
+    assert!(wsl7b_validate_identity(&good).is_ok(), "the fixture must be a complete identity");
+
+    // Existing coverage moved protocolVersion only; the protocol NAME is the other half of the pair.
+    let mut foreign_protocol = good.clone();
+    foreign_protocol["protocol"] = serde_json::json!("cortex-whisper-adapter");
+    let error = wsl7b_validate_identity(&foreign_protocol).unwrap_err().to_string();
+    assert!(error.contains("deployment protocol"), "{error}");
+
+    // A blank or absent model id is no identity — never an empty-string model attribution.
+    for model in [serde_json::json!(""), serde_json::json!("   "), serde_json::Value::Null] {
+        let mut blank_model = good.clone();
+        blank_model["modelVersionId"] = model.clone();
+        let error = wsl7b_validate_identity(&blank_model).unwrap_err().to_string();
+        assert!(error.contains("no modelVersionId"), "{model} accepted: {error}");
+    }
+
+    // componentSha256 absent entirely, and present but not an object at all.
+    for components in [serde_json::Value::Null, serde_json::json!("all-four-digests"), serde_json::json!([])] {
+        let mut broken = good.clone();
+        broken["componentSha256"] = components.clone();
+        let error = wsl7b_validate_identity(&broken).unwrap_err().to_string();
+        assert!(error.contains("componentSha256"), "{components} accepted: {error}");
+    }
+
+    // All four component keys present, one of them not a digest: complete-LOOKING is not complete.
+    let mut non_hex_component = good.clone();
+    non_hex_component["componentSha256"]["tokenizer"] = serde_json::json!("Z".repeat(64));
+    let error = wsl7b_validate_identity(&non_hex_component).unwrap_err().to_string();
+    assert!(error.contains("componentSha256"), "{error}");
+
+    // The manifest digest is checked with the same canonical rule as the deployment digest.
+    let mut short_manifest = good.clone();
+    short_manifest["manifestSha256"] = serde_json::json!("a".repeat(63));
+    let error = wsl7b_validate_identity(&short_manifest).unwrap_err().to_string();
+    assert!(error.contains("manifestSha256"), "{error}");
+
+    // A worker that cannot name itself cannot be attributed.
+    for worker in [serde_json::json!("   "), serde_json::json!(""), serde_json::Value::Null] {
+        let mut anonymous = good.clone();
+        anonymous["worker"] = worker.clone();
+        let error = wsl7b_validate_identity(&anonymous).unwrap_err().to_string();
+        assert!(error.contains("worker identity"), "{worker} accepted: {error}");
+    }
+}
+
+#[test]
+fn wsl7b_source_range_refuses_negative_and_zero_width_windows() {
+    use super::wsl7b_source_range;
+    // `end > start` alone is not the contract: a negative start would ask the server for audio
+    // before the beginning of the file and get the wrong clip back.
+    assert!(
+        wsl7b_source_range(Some(r#"{"source_start_ms": -5, "source_end_ms": 1000}"#)).is_err(),
+        "a negative source offset is a clobbered chunk"
+    );
+    // A zero-width window is not a clip.
+    assert!(wsl7b_source_range(Some(r#"{"source_start_ms": 500, "source_end_ms": 500}"#)).is_err());
+    // Offsets that are not integers are not offsets.
+    assert!(wsl7b_source_range(Some(r#"{"source_start_ms": "0", "source_end_ms": 1000}"#)).is_err());
+    assert!(wsl7b_source_range(Some(r#"{"source_start_ms": 0.5, "source_end_ms": 1000}"#)).is_err());
+    // The exact accepted boundary: a zero start with a one-millisecond window.
+    assert_eq!(wsl7b_source_range(Some(r#"{"source_start_ms": 0, "source_end_ms": 1}"#)).unwrap(), Some((0, 1)));
+}
+
+#[test]
+fn wsl_client_resolution_honours_a_configured_path_and_ignores_a_dead_one() {
+    // A POSIX path is already INSIDE WSL, so the app cannot stat it: it is configuration, taken
+    // verbatim (trimmed), never probed.
+    assert_eq!(
+        super::resolve_wsl_7b_client(Some("  /home/ai/cortex_7b_client.py  ".to_string())).as_deref(),
+        Some("/home/ai/cortex_7b_client.py")
+    );
+
+    // A configured Windows path that really exists is accepted as-is.
+    let dir = tempfile::TempDir::new().unwrap();
+    let configured = dir.path().join("cortex_7b_client.py");
+    std::fs::write(&configured, b"# client").unwrap();
+    let configured_text = configured.to_string_lossy().into_owned();
+    assert_eq!(super::resolve_wsl_7b_client(Some(configured_text.clone())).as_deref(), Some(configured_text.as_str()));
+
+    // A stale configured path that no longer exists must NOT be returned. Falling through to the
+    // bundled/repo client is what keeps one bad setting from making the champion unresolvable.
+    let dead = dir.path().join("gone.py").to_string_lossy().into_owned();
+    let resolved = super::resolve_wsl_7b_client(Some(dead.clone()));
+    assert_ne!(resolved.as_deref(), Some(dead.as_str()), "a dead configured path is not a resolution");
+    assert!(resolved.is_some(), "the bundled/repo client remains the fallback");
+}
+
+#[test]
+fn hypothesis_stage_truncates_a_long_blocked_list_with_an_honest_remainder() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let mut segments = Vec::new();
+    for index in 0..7 {
+        let segment = test_segment(&format!("blocked-{index}"));
+        db.insert_segment(&segment).unwrap();
+        insert_hypothesis(&db, &segment.id, "omniasr-wsl-7b", "single model phrase");
+        segments.push(segment);
+    }
+
+    let settings = AppSettings { asr_model_size: AsrModelSize::CTC300M, ..AppSettings::default() };
+    let event = super::multi_model_hypothesis_stage(&db, &settings, "long.wav", &segments);
+
+    match event {
+        super::PipelineEvent::AgentStage { status, detail, current, total, .. } => {
+            assert_eq!(status, "blocked");
+            assert_eq!((current, total), (0, 7));
+            assert!(detail.contains("blocked-0") && detail.contains("blocked-4"), "the preview names five: {detail}");
+            assert!(!detail.contains("blocked-5"), "ids past the preview must be summarised, not listed: {detail}");
+            assert!(detail.contains("and 2 more"), "the remainder must be counted honestly: {detail}");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[test]
+fn resume_authority_reads_the_verdict_fallback_and_refuses_blank_human_text() {
+    use super::resume_segment_has_authoritative_transcript;
+
+    // No `human_decision` value at all, but a stored `verdict` of reject: still complete authority.
+    // Re-importing a rejected row would resurrect audio a human already discarded.
+    let mut segment = SpeechSegment {
+        raw_transcript: "[Pending WSL 7B ASR]".into(),
+        model_version_id: Some("not-the-champion".into()),
+        verdict: Some("HUMAN_REJECT".into()),
+        ..SpeechSegment::default()
+    };
+    assert!(resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
+
+    // A human decision whose captured text is blank or still a placeholder is NOT authority: the
+    // row has a decision but no transcript to adopt.
+    segment.verdict = Some("accept".into());
+    segment.human_decision = Some("edit".into());
+    for text in ["   ", "[Pending WSL 7B ASR]"] {
+        segment.verdict_transcript = Some(text.into());
+        assert!(
+            !resume_segment_has_authoritative_transcript(&segment, "champion-v1"),
+            "a human decision over {text:?} is not adoptable text"
+        );
+    }
+    segment.verdict_transcript = Some("دەقی مرۆڤی پەسەندکراو".into());
+    assert!(resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
+}
+
+#[test]
+fn primary_hypothesis_requires_a_named_model_and_falls_through_to_inference() {
+    use super::{reuse_primary_or_infer, PrimaryHypothesis};
+    use std::cell::Cell;
+
+    // A draft with no model id has no attributable provenance, so it can never be reused as one.
+    let unattributed =
+        SpeechSegment { raw_transcript: "دەقی بێ ناسنامە".into(), ..SpeechSegment::default() };
+    assert!(PrimaryHypothesis::from_segment(&unattributed).is_none(), "an unattributed draft is not a primary");
+
+    // With no primary at all, the caller's inference runs unconditionally.
+    let inferred = Cell::new(0usize);
+    let fresh = reuse_primary_or_infer(None, "omniasr-ctc-300m", || {
+        inferred.set(inferred.get() + 1);
+        Some(Ok::<_, &'static str>(("freshly inferred".to_string(), Some(0.5))))
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(fresh, ("freshly inferred".to_string(), Some(0.5)));
+    assert_eq!(inferred.get(), 1);
+
+    // An inference that declines to run at all stays declined — no fabricated empty hypothesis.
+    assert!(reuse_primary_or_infer(None, "omniasr-ctc-1b", || None::<Result<(String, Option<f64>), &'static str>>)
+        .is_none());
+}
+
+#[test]
+fn loop0_firing_is_best_effort_when_the_memory_view_cannot_be_read() {
+    // Contract: a memory-load failure logs and returns the transcript UNCHANGED. Failing the
+    // transcription here would discard a draft the champion already produced.
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    db.connection().execute("DROP VIEW effective_correction_memory_v60", []).unwrap();
+    assert!(db.load_correction_memories().is_err(), "the fault injection must actually break the load");
+
+    let text = "ئەو ساڵە باش بوو";
+    assert_eq!(super::apply_loop0_firing(true, &db, text), text, "a broken memory view must not lose the draft");
+    // Disabled short-circuits before any load, so the same broken database is irrelevant.
+    assert_eq!(super::apply_loop0_firing(false, &db, text), text);
+}
+
+#[test]
+fn batch_draft_refuses_placeholders_and_a_half_present_identity() {
+    // The remaining refusal arms of the publication chokepoint: a PLACEHOLDER (not merely blank) on
+    // either transcript side, and an identity that names the model but not the exact deployment
+    // bytes. Publishing either would attribute a non-transcript, or an unpinnable one, to the
+    // champion.
+    let (pipeline, _dir) = test_pipeline_with_settings(AppSettings::default());
+    let good = super::TranscriptionDraft {
+        raw_text: "دەقی ڕاست".into(),
+        final_text: "دەقی ڕاست".into(),
+        confidence: None,
+        confidence_source: None,
+        model_version_id: Some("champion-v1".into()),
+        deployment_sha256: Some("b".repeat(64)),
+        cloud_call: false,
+    };
+
+    let placeholder_raw = super::TranscriptionDraft { raw_text: "[Pending WSL 7B ASR]".into(), ..good.clone() };
+    let err = pipeline.prepare_batch_champion_draft(placeholder_raw).expect_err("a placeholder is not a transcript");
+    assert!(err.to_string().contains("E_BATCH_EMPTY_CHAMPION_DRAFT"), "wrong code: {err}");
+
+    let placeholder_final = super::TranscriptionDraft { final_text: "[Pending WSL 7B ASR]".into(), ..good.clone() };
+    let err = pipeline.prepare_batch_champion_draft(placeholder_final).expect_err("a placeholder final must refuse");
+    assert!(err.to_string().contains("E_BATCH_EMPTY_REFINED_DRAFT"), "wrong code: {err}");
+
+    let no_deployment = super::TranscriptionDraft { deployment_sha256: None, ..good };
+    let err = pipeline
+        .prepare_batch_champion_draft(no_deployment)
+        .expect_err("a model id without its deployment digest is half an identity");
+    assert!(err.to_string().contains("deployment identity is absent"), "wrong code: {err}");
+}

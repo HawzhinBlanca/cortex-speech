@@ -2358,4 +2358,258 @@ mod tests {
         assert!(vad_dir.join("silero_vad_v4.onnx").exists(), "{}", vad_dir.display());
         assert_eq!(bundled_dir_containing("no-such-model-anywhere.onnx"), bundled_models_dir());
     }
+
+    /// Create (or truncate) `path` at exactly `len` bytes and confirm the size is visible. Sparse
+    /// `set_len` plus the module's settle loop — the Windows write-then-read metadata lag bites
+    /// `set_len` exactly as it bites `fs::write`.
+    fn create_sized_file_settled(path: &Path, len: u64) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("model parent dir");
+        }
+        File::create(path).expect("create sized file").set_len(len).expect("set length");
+        for _ in 0..500 {
+            if path.metadata().map(|m| m.len() == len).unwrap_or(false) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("sized file not visible after write: {}", path.display());
+    }
+
+    /// A user models dir holding a COMPLETE 300M pair, which wins `resolve_models_dir` outright — so
+    /// every assertion below reads the user dir instead of inheriting whatever the bundled tree holds.
+    fn user_dir_that_wins_resolution(tmp: &Path) -> (PathBuf, ModelManager) {
+        let user_dir = tmp.join("models");
+        create_minimal_300m_model_pair(&user_dir);
+        let manager = ModelManager::new(user_dir.clone());
+        assert_eq!(manager.resolved_dir(), user_dir, "a complete user pair must win resolution");
+        (user_dir, manager)
+    }
+
+    #[test]
+    fn missing_and_optional_model_names_split_required_from_the_rest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_user_dir, manager) = user_dir_that_wins_resolution(tmp.path());
+
+        let missing: Vec<&str> = manager.missing_models().into_iter().map(|model| model.name).collect();
+        assert!(!missing.contains(&"Meta OmniASR CTC 300M (model)"), "an installed pair is not missing: {missing:?}");
+        assert!(!missing.contains(&"Meta OmniASR CTC 300M (tokens)"), "{missing:?}");
+        assert!(missing.contains(&"Silero VAD v4"), "the VAD is absent from this user dir: {missing:?}");
+        assert!(missing.contains(&"Meta OmniASR CTC 1B (model)"), "{missing:?}");
+        assert!(missing.contains(&"CAM++ Speaker Embedding"), "{missing:?}");
+
+        // The optional list is the missing list MINUS the required VAD.
+        let optional = manager.missing_optional_model_names();
+        assert!(!optional.contains(&"Silero VAD v4"), "the VAD is required, never optional: {optional:?}");
+        assert!(optional.contains(&"Meta OmniASR CTC 1B (model)"), "{optional:?}");
+        assert!(optional.contains(&"CAM++ Speaker Embedding"), "{optional:?}");
+        assert!(optional.contains(&"AI Audio Denoiser"), "{optional:?}");
+
+        // Bulk-download candidacy filters the missing set by pin class: the 1B pair rides a pinned
+        // archive and qualifies, the unpinned 300M archive never would.
+        let downloadable: Vec<&str> =
+            manager.downloadable_missing_models().into_iter().map(|model| model.filename).collect();
+        assert!(downloadable.contains(&OMNIASR_CTC_1B_MODEL), "{downloadable:?}");
+        assert!(!downloadable.contains(&OMNIASR_CTC_300M_MODEL), "an installed+unpinned model is never a candidate");
+        assert!(downloadable.iter().all(|filename| *filename != OMNIASR_CTC_300M_TOKENS), "{downloadable:?}");
+
+        // Presence probes read the RAW models_dir, not the resolved one.
+        assert!(manager.omniasr_ctc_300m_present());
+        assert!(!manager.omniasr_ctc_1b_present());
+        assert!(!manager.campp_present(), "campp_present reads the raw user models dir");
+    }
+
+    #[test]
+    fn required_model_names_follow_the_selected_engine_through_the_manager() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_user_dir, manager) = user_dir_that_wins_resolution(tmp.path());
+        assert!(
+            model_file_meets_min_size(&bundled_models_dir(), "silero_vad_v4.onnx", 1_000_000),
+            "repository fixture must ship the bundled Silero VAD"
+        );
+
+        // The VAD resolves PER FILE, so a user dir holding only OmniASR never orphans it — the
+        // champion therefore has no missing requirement at all.
+        assert!(manager.missing_required_model_names().is_empty(), "{:?}", manager.missing_required_model_names());
+        assert!(manager.all_models_present(), "the champion needs only the VAD used to cut its clips");
+        assert!(manager.all_models_present_for(&AsrModelSize::WSL7B));
+
+        assert!(
+            manager.missing_required_model_names_for(&AsrModelSize::CTC300M).is_empty(),
+            "the installed 300M pair satisfies its own engine"
+        );
+        assert!(manager.all_models_present_for(&AsrModelSize::CTC300M));
+
+        // The 1B leg follows the SAME per-file resolution: whether the pair is bundled on this tree
+        // decides the outcome, and the reported name is always the selected engine's own.
+        let missing_1b = manager.missing_required_model_names_for(&AsrModelSize::CTC1B);
+        if omniasr_ctc_1b_present_in(&manager.resolve_root_for(OMNIASR_CTC_1B_MODEL)) {
+            assert!(missing_1b.is_empty(), "a per-file-resolved 1B pair is not a missing requirement: {missing_1b:?}");
+        } else {
+            assert_eq!(missing_1b, vec!["Meta OmniASR CTC 1B model and tokens"]);
+        }
+        assert!(!missing_1b.iter().any(|name| name.contains("300M")), "1B must never report the 300M pair");
+        assert_eq!(manager.all_models_present_for(&AsrModelSize::CTC1B), missing_1b.is_empty());
+    }
+
+    #[test]
+    fn support_model_presence_resolves_per_file_after_a_user_ctc_download() {
+        assert!(
+            model_file_meets_min_size(&bundled_models_dir(), DENOISER_MODEL, 400_000)
+                && model_file_meets_min_size(&bundled_models_dir(), CAMPP_MODEL, 10_000_000),
+            "repository fixture must ship the bundled denoiser and CAM++ support models"
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_user_dir, manager) = user_dir_that_wins_resolution(tmp.path());
+
+        // Round-26: downloading OmniASR into the user dir flips resolved_dir there and USED TO orphan
+        // every bundled-only sibling. Per-file resolution must still find the denoiser.
+        assert!(manager.denoiser_present(), "the bundled denoiser must still resolve after a user CTC download");
+        assert!(
+            manager.missing_production_models().is_empty(),
+            "every shipped support model resolves per file: {:?}",
+            manager.missing_production_models().iter().map(|m| m.filename).collect::<Vec<_>>()
+        );
+        assert!(manager.downloadable_missing_production_models().is_empty());
+
+        let production = manager.production_status();
+        assert_eq!(production.len(), PRODUCTION_RUNTIME_MODEL_FILENAMES.len());
+        for row in &production {
+            assert!(row.downloaded, "{} should resolve from the bundled tree", row.filename);
+            assert!(row.exists);
+            assert_eq!(row.source, ModelArtifactSourceV1::Bundled, "{}", row.filename);
+            assert!(row.size_bytes.unwrap_or(0) >= row.min_size_bytes, "{}", row.filename);
+        }
+    }
+
+    #[test]
+    fn model_availability_is_a_min_size_floor_not_mere_presence() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let campp = MODELS.iter().find(|model| model.filename == CAMPP_MODEL).expect("CAM++ entry");
+
+        assert!(!model_available_in(tmp.path(), campp), "absent -> unavailable");
+        create_sized_file_settled(&tmp.path().join(CAMPP_MODEL), campp.min_size_bytes - 1);
+        assert!(!model_available_in(tmp.path(), campp), "a truncated download must never read as installed");
+        create_sized_file_settled(&tmp.path().join(CAMPP_MODEL), campp.min_size_bytes);
+        assert!(model_available_in(tmp.path(), campp), "exactly the floor counts as available");
+    }
+
+    #[test]
+    fn status_labels_each_row_user_or_missing_from_the_resolved_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (user_dir, manager) = user_dir_that_wins_resolution(tmp.path());
+
+        let status = manager.status();
+        assert_eq!(status.len(), MODELS.len(), "status reports every manifest row");
+        let row = |filename: &str| {
+            status.iter().find(|row| row["filename"] == filename).unwrap_or_else(|| panic!("{filename} row"))
+        };
+
+        let installed = row(OMNIASR_CTC_300M_MODEL);
+        assert_eq!(installed["downloaded"], true);
+        assert_eq!(installed["exists"], true);
+        assert_eq!(installed["size_bytes"], 50_000_000_u64);
+        assert_eq!(installed["source"], "user", "resolved_dir == models_dir -> the user copy");
+        assert_eq!(installed["downloadable"], false, "the 300M archive hash was never pinned");
+        assert_eq!(installed["path"], serde_json::json!(user_dir.join(OMNIASR_CTC_300M_MODEL)));
+
+        let absent = row(CAMPP_MODEL);
+        assert_eq!(absent["downloaded"], false);
+        assert_eq!(absent["exists"], false);
+        assert_eq!(absent["size_bytes"], serde_json::Value::Null);
+        assert_eq!(absent["source"], "missing", "an unavailable row is labelled missing, never user");
+        assert_eq!(absent["downloadable"], true, "CAM++ is pinned with a direct URL");
+    }
+
+    #[test]
+    fn ensure_dir_creates_the_target_and_reports_a_file_collision() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("models").join("nested");
+        ModelManager::new(dir.clone()).ensure_dir().expect("create nested models dir");
+        assert!(dir.is_dir());
+        ModelManager::new(dir.clone()).ensure_dir().expect("an existing directory is not an error");
+
+        let blocked = tmp.path().join("a-file");
+        std::fs::write(&blocked, b"not a dir").expect("seed file");
+        let error = ModelManager::new(blocked).ensure_dir().expect_err("a file in the way must fail");
+        assert!(error.starts_with("Failed to create models directory"), "{error}");
+    }
+
+    #[test]
+    fn load_meta_reports_an_absent_metadata_file_distinctly_from_corrupt_json() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = ModelManager::new(tmp.path().join("models"));
+        // Distinct prefixes matter: "never downloaded anything" must not read as "metadata corrupt".
+        // let-else, not expect_err: ModelMeta does not implement Debug and this test has no business
+        // requiring a production type to derive it just to be asserted about.
+        let Err(error) = manager.load_meta() else {
+            panic!("no metadata file exists yet");
+        };
+        assert!(error.starts_with("Read meta"), "{error}");
+    }
+
+    #[test]
+    fn warmup_is_a_no_op_when_the_resolved_dir_holds_no_vad() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_user_dir, manager) = user_dir_that_wins_resolution(tmp.path());
+        // The resolved dir is the user dir, which has no VAD — warm-up must skip the ONNX load and
+        // still report success rather than turning a cold start into an error.
+        manager.warmup().expect("a missing VAD must not fail warm-up");
+    }
+
+    #[test]
+    fn download_model_routes_support_models_to_their_direct_file_downloaders() {
+        // Routing proof with NO network: each support model is pre-placed at its floor, so the
+        // routed downloader short-circuits. A routing regression would attempt a real fetch and fail.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        let manager = ModelManager::new(models_dir.clone());
+        create_sized_file_settled(&models_dir.join(CAMPP_MODEL), 10_000_000);
+        create_sized_file_settled(&models_dir.join(DENOISER_MODEL), 400_000);
+
+        for filename in [CAMPP_MODEL, DENOISER_MODEL] {
+            let model = MODELS.iter().find(|model| model.filename == filename).expect(filename);
+            let last_progress = Cell::new(0.0_f32);
+            manager.download_model(model, |p| last_progress.set(p)).unwrap_or_else(|e| panic!("{filename}: {e}"));
+            assert!((last_progress.get() - 1.0).abs() < f32::EPSILON, "{filename} got {}", last_progress.get());
+        }
+        assert!(!manager.meta_path().exists(), "a short-circuited routed download writes no metadata");
+    }
+
+    #[test]
+    fn write_reader_to_temp_stays_silent_without_a_content_length_and_creates_nothing_on_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("model.downloading");
+        let calls = Cell::new(0_u32);
+
+        let written = write_reader_to_temp(
+            std::io::Cursor::new(b"abc".to_vec()),
+            &path,
+            0, // no Content-Length header
+            1.0,
+            &|_| calls.set(calls.get() + 1),
+            "read",
+            "write",
+        )
+        .expect("write temp");
+        assert_eq!(written, 3);
+        assert_eq!(calls.get(), 0, "a server without Content-Length must not emit fabricated progress");
+        assert_eq!(std::fs::read(&path).expect("read temp"), b"abc");
+
+        // An uncreatable temp path fails before any byte is read, and leaves nothing behind.
+        let unopenable = tmp.path().join("no-such-dir").join("model.downloading");
+        let error = write_reader_to_temp(
+            std::io::Cursor::new(b"abc".to_vec()),
+            &unopenable,
+            3,
+            1.0,
+            &|_| calls.set(calls.get() + 1),
+            "read",
+            "write",
+        )
+        .expect_err("a missing parent directory must fail closed");
+        assert!(error.starts_with("Create temp file"), "{error}");
+        assert!(!unopenable.exists());
+        assert_eq!(calls.get(), 0, "a failed create must not report progress");
+    }
 }

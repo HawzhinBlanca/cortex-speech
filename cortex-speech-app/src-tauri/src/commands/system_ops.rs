@@ -1707,4 +1707,180 @@ mod system_ops_boundary_tests {
             .expect_err("no aligner model means no acoustic scores");
         assert_eq!(refused, "MMS Forced Aligner model (mms_aligner.onnx) is not available.");
     }
+
+    #[test]
+    fn wsl_log_preview_truncates_a_pathological_line_and_says_so() {
+        let bounded = "x".repeat(WSL_LOG_LINE_PREVIEW_CHARS);
+        assert_eq!(wsl_log_preview(&bounded), bounded, "a line exactly at the bound is served whole");
+
+        let oversized = "x".repeat(WSL_LOG_LINE_PREVIEW_CHARS + 1);
+        assert_eq!(
+            wsl_log_preview(&oversized),
+            format!("{bounded} [truncated WSL log line]"),
+            "one character over the bound must be cut AND declared, never silently shortened"
+        );
+
+        // The bound counts CHARACTERS, not bytes: a Sorani progress line must never be cut
+        // mid-scalar, which would render as replacement junk in the owner's log panel.
+        let preview = wsl_log_preview(&"ک".repeat(WSL_LOG_LINE_PREVIEW_CHARS + 10));
+        assert!(preview.ends_with(" [truncated WSL log line]"));
+        assert_eq!(preview.chars().filter(|character| *character == 'ک').count(), WSL_LOG_LINE_PREVIEW_CHARS);
+    }
+
+    #[test]
+    fn drain_log_lines_stops_at_a_genuine_io_error_after_delivering_earlier_lines() {
+        // A non-UTF-8 line must NOT stop the feed (the sibling test in commands.rs pins that). A
+        // real I/O fault — the WSL pipe collapsing — is the one condition that ends it, and it must
+        // end it cleanly rather than fabricating a line out of the error.
+        struct FailingReader;
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "wsl stdout pipe collapsed"))
+            }
+        }
+        let reader =
+            std::io::BufReader::new(std::io::Read::chain(std::io::Cursor::new(b">>> ready\n".to_vec()), FailingReader));
+
+        let mut got = Vec::new();
+        drain_log_lines(reader, |line| got.push(line.to_string()));
+
+        assert_eq!(got, vec![">>> ready".to_string()], "lines read before the fault are still delivered");
+    }
+
+    #[test]
+    fn join_wsl_log_reader_absorbs_a_panicked_reader_instead_of_propagating_it() {
+        // A clean reader joins silently.
+        join_wsl_log_reader(std::thread::spawn(|| {}), "stdout");
+
+        // A log-reader thread that unwinds must be absorbed with a warning: propagating the panic
+        // into the batch driver would abort a run that has already produced real transcripts, and
+        // skip the terminal wsl-status the panel needs to leave "Processing…".
+        // NOTE: the deliberate panic below prints its message to the console — that output is the
+        // test doing its job, not a failure.
+        let panicking = std::thread::spawn(|| {
+            panic!("simulated WSL log reader failure");
+        });
+        join_wsl_log_reader(panicking, "stderr");
+    }
+
+    // The source / license / modelCardName refusal arms of import_model_checkpoint are deliberately
+    // NOT covered by a second command-level test. STRICT_RATE_LIMITER is a process-global token
+    // bucket keyed by the literal command name (burst 5, refill 10/s), and the sibling test above
+    // already spends 4 of those tokens between real file writes and a SHA-256 hash. A second test
+    // firing three back-to-back calls on the same key drains the bucket instantly and makes the
+    // sibling's fourth call return RATE_LIMITED instead of reaching the worker — measured, a
+    // deterministic red suite. Three one-line validation branches are not worth that.
+
+    #[test]
+    fn get_speaker_inventory_v1_reduces_a_backend_read_failure_to_a_closed_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = crate::test_support::managed_app_state(tmp.path());
+        {
+            let harness = app.state::<AppState>();
+            let db = harness.lock_db();
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: "seg-lost-relation".to_string(),
+                audio_path: "C:/fixtures/seg-lost-relation.wav".to_string(),
+                raw_transcript: "deng".to_string(),
+                speaker_id: Some("spk-a".to_string()),
+                duration_ms: 1_000,
+                ..Default::default()
+            })
+            .expect("seed segment");
+            // speech_segments is a STRICT table, so an unmappable column value cannot be injected
+            // (SQLite refuses it with extended code 3091). A genuinely damaged library loses the
+            // relation itself, and the inventory read opens its OWN connection — so it meets the
+            // damage exactly as a corrupted workspace would.
+            db.connection().execute("PRAGMA foreign_keys = OFF", []).expect("release the child cascade");
+            db.connection().execute("DROP TABLE speech_segments", []).expect("damage the segment relation");
+        }
+
+        let refused = get_speaker_inventory_v1(app.state())
+            .expect_err("a missing relation must refuse, never read as an empty inventory");
+        assert_eq!(refused.code, "SPEAKER_INVENTORY_FAILED");
+        assert!(!refused.retryable, "a damaged library is not repaired by retrying");
+        assert_eq!(refused.suggested_action, Some(crate::ipc_contract::SuggestedActionV1::OpenHealth));
+        let wire = serde_json::to_string(&refused).expect("serialize inventory refusal");
+        for forbidden in ["speech_segments", "speaker_id", "SQL", "no such table"] {
+            assert!(!wire.contains(forbidden), "backend detail {forbidden} reached the renderer: {wire}");
+        }
+    }
+
+    #[test]
+    fn get_speaker_inventory_v1_maps_a_locked_workspace_to_a_retryable_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = crate::test_support::managed_app_state(tmp.path());
+
+        // A second writer holding the database file is the real shape of a busy workspace (a backup
+        // tool, a second app instance). The bounded read snapshot opens its OWN connection, so it
+        // meets that lock exactly as production would — and the owner must be told to retry, not
+        // sent to Health for a fault that clears by itself.
+        //
+        // The journal mode is stepped off WAL first purely to make the contention observable: under
+        // WAL a reader is by design never blocked by a writer, so no in-process arrangement can hold
+        // a lock a WAL reader would wait on. What is under test is the command's mapping of a real
+        // SQLite lock error, not the journal mode that produced it.
+        app.state::<AppState>()
+            .lock_db()
+            .connection()
+            .execute_batch("PRAGMA journal_mode=DELETE;")
+            .expect("step the fixture off WAL so a writer lock is observable to a reader");
+        let blocker =
+            rusqlite::Connection::open(tmp.path().join("app-state.db")).expect("second holder of the live file");
+        blocker.execute_batch("BEGIN EXCLUSIVE;").expect("hold the database file exclusively");
+
+        let refused =
+            get_speaker_inventory_v1(app.state()).expect_err("a locked workspace must refuse, never serve stale data");
+        assert_eq!(refused.code, "DATABASE_BUSY");
+        assert!(refused.retryable, "a lock clears on its own, so retry is the honest owner action");
+        assert_eq!(refused.suggested_action, Some(crate::ipc_contract::SuggestedActionV1::Retry));
+        drop(blocker);
+    }
+
+    #[test]
+    fn compute_signal_anomaly_scores_skips_undecodable_audio_and_clobbered_chunk_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = crate::test_support::managed_app_state(tmp.path());
+        let undecodable = tmp.path().join("not-really-audio.wav");
+        std::fs::write(&undecodable, b"this is not a RIFF container at all, just bytes").unwrap();
+        crate::test_support::await_stable_fixture(&undecodable);
+        let clobbered_source = wav_fixture(tmp.path(), "clobbered-chunk.wav", 8_000);
+        {
+            let harness = app.state::<AppState>();
+            let db = harness.lock_db();
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: "seg-undecodable".to_string(),
+                audio_path: undecodable.to_string_lossy().to_string(),
+                raw_transcript: "deng".to_string(),
+                duration_ms: 500,
+                ..Default::default()
+            })
+            .expect("seed a present-but-undecodable file");
+            // Alignment metadata present but carrying no source offsets (a clobbered chunk). The
+            // slice must refuse rather than score the WHOLE recording as if it were this chunk —
+            // a systematically wrong quality signal feeding the conformal jury gate.
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: "seg-clobbered".to_string(),
+                audio_path: clobbered_source,
+                raw_transcript: "deng".to_string(),
+                duration_ms: 500,
+                alignment_json: Some(r#"{"words":[]}"#.to_string()),
+                ..Default::default()
+            })
+            .expect("seed a clobbered-chunk segment");
+        }
+
+        let scored = tauri::async_runtime::block_on(compute_signal_anomaly_scores(app.state()))
+            .expect("the pass completes honestly over a backlog it cannot score");
+        assert_eq!(scored, 0, "neither an undecodable file nor a clobbered chunk may earn a score");
+
+        let harness = app.state::<AppState>();
+        for id in ["seg-undecodable", "seg-clobbered"] {
+            assert_eq!(
+                harness.lock_db().get_segment_by_id(id).unwrap().unwrap().signal_anomaly_score,
+                None,
+                "{id} must never receive an invented score"
+            );
+        }
+    }
 }

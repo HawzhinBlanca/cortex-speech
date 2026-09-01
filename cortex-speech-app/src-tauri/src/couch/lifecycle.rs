@@ -1398,3 +1398,260 @@ pub(super) fn spawn_server_loop(
         })
         .map_err(|e| format!("Couch Review server thread failed to spawn: {e}"))
 }
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    fn pilot_policy() -> crate::review_pilot::ReviewPilotPolicy {
+        crate::review_pilot::ReviewPilotPolicy {
+            schema_version: crate::review_pilot::REVIEW_PILOT_SCHEMA_VERSION,
+            after_review_event_id: 863,
+            max_total_corpus_actions: crate::review_pilot::REVIEW_PILOT_TOTAL_CORPUS_ACTIONS,
+            reviewers: vec![
+                crate::review_pilot::ReviewPilotReviewer {
+                    name: "Sara".to_string(),
+                    max_corpus_actions: crate::review_pilot::REVIEW_PILOT_CORPUS_ACTIONS_PER_REVIEWER,
+                },
+                crate::review_pilot::ReviewPilotReviewer {
+                    name: "Hemn".to_string(),
+                    max_corpus_actions: crate::review_pilot::REVIEW_PILOT_CORPUS_ACTIONS_PER_REVIEWER,
+                },
+            ],
+        }
+    }
+
+    /// The restore preflight (`recovery.rs`) fails closed on this answer, so every arm of it has to
+    /// be the honest one: a missing generation is unrestricted, a REVOKED one is unrestricted even
+    /// when the credential file survived the Stop, and an unreadable one is an error rather than a
+    /// guess. Nothing else in the tree exercised this function.
+    #[test]
+    fn durable_controlled_pilot_state_reports_every_generation_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let db_path = "C:/library/cortex.db";
+
+        assert!(!durable_controlled_pilot_state(data_dir).unwrap(), "no session file at all is unrestricted");
+
+        let pairing = HashMap::from([("pair-sara".to_string(), "Sara".to_string())]);
+        save_session(data_dir, &pairing, db_path, &HashSet::new(), &HashSet::new(), &HashMap::new(), None).unwrap();
+        assert!(!durable_controlled_pilot_state(data_dir).unwrap(), "a plain session carries no pilot cap");
+
+        let policy = pilot_policy();
+        save_session(data_dir, &pairing, db_path, &HashSet::new(), &HashSet::new(), &HashMap::new(), Some(&policy))
+            .unwrap();
+        assert!(durable_controlled_pilot_state(data_dir).unwrap(), "a bound policy is a controlled pilot");
+
+        // The separate policy file can go missing while the durable generation still holds served
+        // hidden-key evidence; that evidence alone still means the cap was live.
+        let checks = HashSet::from([("hidden-1".to_string(), "Sara".to_string())]);
+        save_session(data_dir, &pairing, db_path, &HashSet::new(), &checks, &HashMap::new(), None).unwrap();
+        assert!(
+            durable_controlled_pilot_state(data_dir).unwrap(),
+            "served pilot hidden keys alone prove the cap was live"
+        );
+
+        std::fs::write(session_path(data_dir), b"{not json").unwrap();
+        let error = durable_controlled_pilot_state(data_dir).unwrap_err();
+        assert!(error.contains("Couch session state is invalid"), "{error}");
+
+        // Stop's marker wins over whatever the stale credential file still says.
+        write_session_revocation(data_dir).unwrap();
+        assert!(
+            !durable_controlled_pilot_state(data_dir).unwrap(),
+            "a revoked generation is unrestricted even with an unreadable session file behind it"
+        );
+    }
+
+    #[test]
+    fn revocation_marker_is_idempotent_and_refuses_a_non_file_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        assert_eq!(session_revocation_path(data_dir).file_name().unwrap(), SESSION_REVOCATION_FILE);
+        assert_eq!(session_path(data_dir).file_name().unwrap(), SESSION_FILE);
+
+        clear_session_revocation(data_dir).unwrap();
+        write_session_revocation(data_dir).unwrap();
+        let first = std::fs::read(session_revocation_path(data_dir)).unwrap();
+        write_session_revocation(data_dir).unwrap();
+        assert_eq!(std::fs::read(session_revocation_path(data_dir)).unwrap(), first, "a second Stop rewrites nothing");
+        clear_session_revocation(data_dir).unwrap();
+        assert!(!session_revocation_path(data_dir).exists());
+        clear_session_revocation(data_dir).unwrap();
+
+        // Something else occupying the marker's name must be an error, never a silent "revoked".
+        std::fs::create_dir(session_revocation_path(data_dir)).unwrap();
+        let error = write_session_revocation(data_dir).unwrap_err();
+        assert!(error.contains("is not a file"), "{error}");
+    }
+
+    #[test]
+    fn durable_link_credentials_prefer_pairing_codes_and_fall_back_to_session_tokens() {
+        // Pre-pairing-code shape: the session tokens ARE the links. Writing an empty map here made
+        // save_session's partial-write refusal pass vacuously and killed every link on restart.
+        let legacy = CouchState {
+            reviewers: HashMap::from([("legacy-token".to_string(), "Sara".to_string())]),
+            ..CouchState::default()
+        };
+        assert_eq!(durable_pairing_codes(&legacy), legacy.reviewers);
+
+        let paired = CouchState {
+            reviewers: HashMap::from([("cookie".to_string(), "Sara".to_string())]),
+            pairing_codes: HashMap::from([("pair-sara".to_string(), "Sara".to_string())]),
+            ..CouchState::default()
+        };
+        assert_eq!(durable_pairing_codes(&paired), paired.pairing_codes);
+    }
+
+    #[test]
+    fn session_snapshot_keeps_only_tokens_that_carry_an_issue_time() {
+        let reviewers =
+            HashMap::from([("dated".to_string(), "Sara".to_string()), ("undated".to_string(), "Hemn".to_string())]);
+        let at = SystemTime::now();
+        let issued = HashMap::from([
+            ("dated".to_string(), at),
+            // An issue time for a token nobody holds must not resurrect a session.
+            ("stranger".to_string(), at),
+        ]);
+        let snapshot = snapshot_sessions_from_maps(&reviewers, &issued);
+        assert_eq!(snapshot.len(), 1, "expiry is only meaningful with an issue time");
+        assert_eq!(snapshot.get("dated").map(|(name, _)| name.as_str()), Some("Sara"));
+    }
+
+    /// Live cookie sessions are all-or-nothing. Silently dropping one leaves memory green while the
+    /// restart forgets that reviewer's working cookie -- the amnesia class this file exists to end.
+    #[test]
+    fn one_unprotectable_cookie_fails_the_whole_generation_but_an_expired_one_is_simply_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let db_path = "C:/library/cortex.db";
+        let pairing = HashMap::from([("pair-sara".to_string(), "Sara".to_string())]);
+        let spot_checks = HashSet::new();
+        let pilot_spot_checks = HashSet::new();
+
+        let sessions: HashMap<String, (String, SystemTime)> = HashMap::from([(
+            "cookie-sara".to_string(),
+            ("Sara".to_string(), SystemTime::now() - Duration::from_secs(60)),
+        )]);
+        let error = save_session_with_cookie_protector(
+            SessionSaveInput {
+                data_dir,
+                reviewers: &pairing,
+                db_path,
+                spot_checks: &spot_checks,
+                pilot_spot_checks: &pilot_spot_checks,
+                sessions: &sessions,
+                pilot_policy: None,
+            },
+            |_| Err("injected".to_string()),
+        )
+        .unwrap_err();
+        assert!(error.contains("could not be protected at rest"), "{error}");
+        assert!(!session_path(data_dir).exists(), "a refused generation writes nothing");
+
+        // The same failing protector is never even reached for an already-expired session.
+        let expired: HashMap<String, (String, SystemTime)> = HashMap::from([(
+            "cookie-expired".to_string(),
+            ("Sara".to_string(), SystemTime::now() - COUCH_SESSION_TTL - Duration::from_secs(60)),
+        )]);
+        save_session_with_cookie_protector(
+            SessionSaveInput {
+                data_dir,
+                reviewers: &pairing,
+                db_path,
+                spot_checks: &spot_checks,
+                pilot_spot_checks: &pilot_spot_checks,
+                sessions: &expired,
+                pilot_policy: None,
+            },
+            |_| Err("injected".to_string()),
+        )
+        .unwrap();
+        let remembered = load_session(data_dir, db_path).expect("the pairing generation is durable");
+        assert!(remembered.sessions.is_empty(), "an expired cookie is not resurrected by a restart");
+        assert_eq!(remembered.pairing.get("pair-sara").map(String::as_str), Some("Sara"));
+    }
+
+    #[test]
+    fn a_remembered_session_without_a_single_link_is_not_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let db_path = "C:/library/cortex.db";
+        save_session(data_dir, &HashMap::new(), db_path, &HashSet::new(), &HashSet::new(), &HashMap::new(), None)
+            .unwrap();
+        assert!(load_session(data_dir, db_path).is_none(), "no links means nothing to resume");
+
+        // A file written by a NEWER build (unknown field) must fail closed rather than half-load.
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(session_path(data_dir)).unwrap()).unwrap();
+        raw["somethingNewer"] = serde_json::json!(true);
+        std::fs::write(session_path(data_dir), raw.to_string()).unwrap();
+        assert!(load_session(data_dir, db_path).is_none(), "an unknown field is refused, not ignored");
+    }
+
+    #[test]
+    fn tls_subject_alt_names_are_sorted_deduped_and_always_reachable_locally() {
+        let names = tls_subject_alt_names();
+        assert!(names.contains(&"localhost".to_string()), "{names:?}");
+        assert!(names.contains(&"127.0.0.1".to_string()), "{names:?}");
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(names, sorted, "rcgen SANs must be stable and duplicate-free");
+    }
+
+    #[test]
+    fn certificate_pem_decoding_refuses_garbage_and_fingerprints_the_der() {
+        let identity = generate_tls_identity(&["localhost".to_string()]).unwrap();
+        let pem = String::from_utf8(identity.certificate_pem.clone()).unwrap();
+        let der = certificate_der_from_pem(&pem).unwrap();
+        assert!(!der.is_empty());
+        let expected: String =
+            Sha256::digest(&der).iter().map(|byte| format!("{byte:02X}")).collect::<Vec<_>>().join(":");
+        assert_eq!(identity.fingerprint, expected);
+        assert_eq!(identity.fingerprint.split(':').count(), 32, "{}", identity.fingerprint);
+
+        let error = certificate_fingerprint("-----BEGIN CERTIFICATE-----\n!!not base64!!\n-----END CERTIFICATE-----\n")
+            .unwrap_err();
+        assert!(error.contains("decode Couch TLS certificate PEM"), "{error}");
+    }
+
+    /// A phone trusts the fingerprint it was shown once. Reusing a stored identity for a DIFFERENT
+    /// set of names would serve a certificate the device cannot validate, so the mismatch arm has to
+    /// mint a fresh one rather than hand back the stale one.
+    #[test]
+    fn a_stored_tls_identity_is_reused_only_for_the_exact_names_it_covers() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let names = vec!["127.0.0.1".to_string(), "localhost".to_string()];
+        assert!(load_tls_identity(data_dir, &names).unwrap().is_none(), "nothing stored yet");
+
+        let identity = generate_tls_identity(&names).unwrap();
+        save_tls_identity(data_dir, &identity, &names).unwrap();
+        let reloaded = load_tls_identity(data_dir, &names).unwrap().expect("the exact names reload");
+        assert_eq!(reloaded.fingerprint, identity.fingerprint);
+        assert_eq!(reloaded.certificate_pem, identity.certificate_pem);
+        assert_eq!(reloaded.private_key_pem, identity.private_key_pem, "DPAPI must round-trip the key");
+
+        let mut wider = names.clone();
+        wider.push("cortex.local".to_string());
+        assert!(
+            load_tls_identity(data_dir, &wider).unwrap().is_none(),
+            "a name the stored certificate does not cover forces a fresh identity"
+        );
+
+        std::fs::write(data_dir.join(TLS_IDENTITY_FILE), b"{not json").unwrap();
+        let Err(error) = load_tls_identity(data_dir, &names) else {
+            panic!("an unparseable stored identity must be an error, never a silent re-mint");
+        };
+        assert!(error.contains("parse Couch TLS identity"), "{error}");
+    }
+
+    /// An env var must never be able to stop the owner's phone link from coming up, so the fallback
+    /// -- not the variable -- is what `start`/`resume` actually depend on.
+    #[test]
+    fn the_configured_port_is_exactly_what_the_environment_parses_to() {
+        assert_eq!(configured_port(), port_from(std::env::var("CORTEX_COUCH_PORT").ok().as_deref()));
+        assert!(configured_port() != 0, "port 0 would make the link unfindable");
+    }
+}

@@ -1986,4 +1986,129 @@ mod tests {
         let file = std::fs::File::create(path).expect("create model fixture");
         file.set_len(size_bytes).expect("set model fixture length");
     }
+
+    /// Wait until `path` reports exactly `len` bytes. Windows metadata can briefly lag a `set_len`
+    /// under AV/temp load, and a fingerprint comparison reads that size directly.
+    fn settle_file_size(path: &Path, len: u64) {
+        for _ in 0..500 {
+            if path.metadata().map(|m| m.len() == len).unwrap_or(false) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("file size {len} not visible for {}", path.display());
+    }
+
+    #[test]
+    fn provider_detection_returns_one_of_the_supported_backends() {
+        // Machine-dependent WHICH backend wins; never machine-dependent that it is a supported one.
+        // (The owner's rig has CUDA; a CI box without nvidia-smi must still land on a real provider.)
+        let provider = get_provider();
+        assert!(
+            ["coreml", "cuda", "directml", "cpu"].contains(&provider.as_str()),
+            "unknown execution provider: {provider}"
+        );
+        assert_eq!(detect_optimal_provider(true), provider, "gpu enabled must defer to the detected backend");
+        assert_eq!(detect_optimal_provider(false), "cpu", "gpu disabled is always cpu, whatever the hardware");
+        #[cfg(target_os = "windows")]
+        assert_ne!(provider, "coreml", "coreml is an Apple-silicon-only backend");
+    }
+
+    #[test]
+    fn model_fingerprint_needs_both_files_and_changes_on_a_redownload() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let (model, tokens) = omniasr_model_paths(dir, &AsrModelSize::CTC300M);
+
+        assert!(model_files_fingerprint(dir, &AsrModelSize::CTC300M).is_none(), "nothing on disk -> no identity");
+        write_sized_file(&model, CTC_300M_MIN_MODEL_BYTES);
+        assert!(
+            model_files_fingerprint(dir, &AsrModelSize::CTC300M).is_none(),
+            "a half-installed pair has no identity: the breaker must keep retrying cheaply"
+        );
+
+        write_sized_file(&tokens, CTC_MIN_TOKEN_BYTES);
+        settle_file_size(&model, CTC_300M_MIN_MODEL_BYTES);
+        settle_file_size(&tokens, CTC_MIN_TOKEN_BYTES);
+        let first = model_files_fingerprint(dir, &AsrModelSize::CTC300M).expect("complete pair has an identity");
+        assert_eq!(model_files_fingerprint(dir, &AsrModelSize::CTC300M), Some(first), "a stable file is stable");
+        assert_eq!(first.0 .0, CTC_300M_MIN_MODEL_BYTES);
+        assert_eq!(first.1 .0, CTC_MIN_TOKEN_BYTES);
+
+        // A re-download changes the size, so the load breaker re-attempts immediately.
+        write_sized_file(&model, CTC_300M_MIN_MODEL_BYTES + 1);
+        settle_file_size(&model, CTC_300M_MIN_MODEL_BYTES + 1);
+        let second = model_files_fingerprint(dir, &AsrModelSize::CTC300M).expect("identity after re-download");
+        assert_ne!(second, first, "a changed model file must produce a different fingerprint");
+        assert!(should_attempt_load(&Some(second), Some(&first), Some(Duration::from_secs(0)), LOAD_RETRY_COOLDOWN));
+
+        // A different engine reads its own directory, so it has no identity here.
+        assert!(model_files_fingerprint(dir, &AsrModelSize::CTC1B).is_none());
+    }
+
+    #[test]
+    fn asr_pool_default_is_an_empty_lazy_pool() {
+        let pool = AsrPool::default();
+        {
+            let state = pool.lock_state();
+            assert!(state.services.is_empty(), "the pool must not load anything before it is asked");
+            assert!(state.loaded_dir.is_none());
+            assert!(state.load_failed.is_empty());
+        }
+        // An absent model degrades to unavailable rather than erroring the caller.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = AsrLoadConfig { enable_gpu: false, ..AsrLoadConfig::default() };
+        assert!(!pool.is_available(tmp.path(), &config));
+        let state = pool.lock_state();
+        assert_eq!(state.loaded_dir.as_deref(), Some(tmp.path()), "the pool remembers the dir it loaded against");
+        assert_eq!(state.services.len(), 1, "one unavailable placeholder is cached for the requested config");
+    }
+
+    #[test]
+    fn malformed_asr_result_json_is_an_error_not_a_fabricated_transcript() {
+        let error = parse_asr_result_json("{not json").expect_err("malformed engine output must fail closed");
+        assert!(error.contains("Failed to parse ASR stream result JSON"), "{error}");
+        // A well-formed object missing the required `text` field is equally refused — never defaulted
+        // to an empty transcript that would then overwrite a good draft downstream.
+        assert!(parse_asr_result_json(r#"{"ys_log_probs":[]}"#).is_err(), "a result without text is not a transcript");
+    }
+
+    #[test]
+    fn restart_backoff_doubles_before_the_circuit_and_an_expired_circuit_reopens_the_gate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut supervisor = AsrWorkerSupervisor {
+            executable: tmp.path().join("no-such-worker-binary.exe"),
+            startup: WorkerStartup::CrashOnceThenEcho { marker: tmp.path().join("marker") },
+            process: None,
+            next_request_id: 1,
+            consecutive_failures: 0,
+            retry_after: None,
+            circuit_open_until: None,
+        };
+
+        let before = Instant::now();
+        supervisor.record_failure();
+        let first = supervisor.retry_after.expect("first failure arms backoff").saturating_duration_since(before);
+        assert!(first >= Duration::from_millis(250), "first backoff was {first:?}");
+        assert!(supervisor.circuit_open_until.is_none());
+
+        let before = Instant::now();
+        supervisor.record_failure();
+        let second = supervisor.retry_after.expect("second failure re-arms backoff").saturating_duration_since(before);
+        assert!(second >= Duration::from_millis(500), "backoff must double, got {second:?}");
+        assert_eq!(supervisor.consecutive_failures, 2);
+
+        supervisor.record_failure();
+        assert_eq!(supervisor.consecutive_failures, WORKER_CIRCUIT_FAILURES);
+        assert!(supervisor.circuit_open_until.is_some(), "the threshold failure opens the circuit");
+
+        // An EXPIRED circuit must not latch the engine off forever: the gate reopens and the next
+        // attempt reaches the spawn (which fails here, because the executable does not exist).
+        supervisor.circuit_open_until = Some(Instant::now() - Duration::from_secs(1));
+        supervisor.retry_after = None;
+        supervisor.consecutive_failures = 0;
+        let error = supervisor.ensure_process().expect_err("the spawn itself still fails");
+        assert!(error.contains("start isolated ASR worker"), "an expired circuit must retry, not refuse: {error}");
+        assert_eq!(supervisor.consecutive_failures, 1, "the retry's own failure recharges the breaker");
+    }
 }

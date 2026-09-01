@@ -394,6 +394,21 @@ pub fn snapshot_health() -> SnapshotHealth {
     }
 }
 
+/// The two counters above are PROCESS-global, so every test that reads them across a window while
+/// another test can move them is racing: a concurrent `take_snapshot` success resets the failure
+/// streak a health assertion is halfway through checking. Measured on this box: the three
+/// counter-touching tests in `mod tests`, run alone together, fail roughly one run in three, and
+/// adding unrelated snapshot work elsewhere in the module widens the window until it fails two in
+/// three. Every test that reads or moves these counters takes this lock; nothing else serializes.
+#[cfg(test)]
+static HEALTH_COUNTERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn lock_health_counters() -> std::sync::MutexGuard<'static, ()> {
+    // A panicking test must not cascade into unrelated failures for everyone after it.
+    HEALTH_COUNTERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Take a rotating snapshot into `<data_dir>/snapshots/snapshot_<ts>/`, then prune to newest `keep`.
 /// Returns `Ok(None)` when the EMPTY-DB GUARD refuses the snapshot (see below) — a skip, not an error.
 pub fn take_snapshot(db: &Database, data_dir: &Path, keep: usize) -> AppResult<Option<PathBuf>> {
@@ -2467,7 +2482,9 @@ mod tests {
         // True-10 audit: the safety net must never fail silently — health_check reads these
         // counters. A failing snapshot (data_dir path occupied by a FILE, so the snapshot dir
         // cannot be created) increments consecutive_failures; a success resets them and stamps
-        // last_success. (Statics are process-wide; assert on relative movement, not absolutes.)
+        // last_success. (Statics are process-wide; assert on relative movement, not absolutes, and
+        // hold the shared-counter lock so no concurrent test can move them mid-assertion.)
+        let _health = lock_health_counters();
         let db = seeded_db();
 
         // Failure: 'snapshots' cannot be created because a file sits at data_dir/snapshots' parent.
@@ -3171,7 +3188,8 @@ mod tests {
         assert!(select_snapshots_to_keep(&[5000, 5000], 1).contains(&5000));
 
         // A snapshot-loop panic must surface in health accounting (same shared-static contract as
-        // snapshot_health_tracks_success_and_consecutive_failures above).
+        // snapshot_health_tracks_success_and_consecutive_failures above — and the same lock).
+        let _health = lock_health_counters();
         let before = snapshot_health().consecutive_failures;
         record_snapshot_panic();
         assert_eq!(snapshot_health().consecutive_failures, before + 1, "a panic counts as a failure");
@@ -3265,6 +3283,8 @@ mod tests {
     #[test]
     fn production_take_snapshot_skips_an_empty_library_with_history() {
         // The production wrapper's Ok(None) arm: the guard-skip is neither success nor failure.
+        // Goes through `take_snapshot`, which MOVES the shared health counters, so it takes the lock.
+        let _health = lock_health_counters();
         let tmp = tempfile::TempDir::new().unwrap();
         seed_test_required_snapshot_state(tmp.path()).unwrap();
         let seeded = file_seeded_db(tmp.path(), "wave4-full.db");
@@ -3637,6 +3657,99 @@ mod tests {
         assert!(!image.manifest_verified(), "no manifest can never mean verified");
         assert!(image.database_path().is_file());
     }
+
+    // ── Wave-5 branch coverage.
+
+    #[test]
+    fn manifest_duplicate_declarations_and_exact_byte_drift_are_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+
+        // A manifest that names the same artifact twice is not an inventory: whichever row is read
+        // last would silently decide what "verified" means for those bytes.
+        let duplicated = take_snapshot_at(&db, tmp.path(), 5, 4000).unwrap().unwrap();
+        assert!(verify_snapshot_manifest_for_restore(&duplicated).unwrap(), "a fresh snapshot must verify first");
+        let manifest_path = duplicated.join(MANIFEST_FILE);
+        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let repeated = manifest["files"][0].clone();
+        manifest["files"].as_array_mut().unwrap().push(repeated);
+        write_settled(&manifest_path, &serde_json::to_vec_pretty(&manifest).unwrap());
+        let error = verify_snapshot_manifest_for_restore(&duplicated).unwrap_err();
+        assert!(error.contains("duplicate/case-colliding file"), "{error}");
+
+        // Same length, different bytes. Only the digest can see this, and it is the arm that stands
+        // between a restore and a swapped database.
+        let swapped = take_snapshot_at(&db, tmp.path(), 5, 5000).unwrap().unwrap();
+        assert!(verify_snapshot_manifest_for_restore(&swapped).unwrap());
+        let database = swapped.join(DB_FILE);
+        let mut bytes = std::fs::read(&database).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        write_settled(&database, &bytes);
+        let error = verify_snapshot_manifest_for_restore(&swapped).unwrap_err();
+        assert!(error.contains("SHA-256 mismatch"), "{error}");
+
+        // A changed length is refused before anything is hashed at all.
+        let grown = take_snapshot_at(&db, tmp.path(), 5, 6000).unwrap().unwrap();
+        assert!(verify_snapshot_manifest_for_restore(&grown).unwrap());
+        let database = grown.join(DB_FILE);
+        let mut bytes = std::fs::read(&database).unwrap();
+        bytes.push(0);
+        write_settled(&database, &bytes);
+        let error = verify_snapshot_manifest_for_restore(&grown).unwrap_err();
+        assert!(error.contains("size mismatch"), "{error}");
+    }
+
+    #[test]
+    fn absent_sources_and_shapeless_manifests_fail_closed() {
+        // A source directory that is not there at all: refused as unreadable, never captured empty.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("no-such-generation");
+        let error = match VerifiedSnapshotImage::capture(&missing, || {}) {
+            Ok(_) => panic!("a missing snapshot directory must never capture"),
+            Err(error) => error,
+        };
+        assert!(error.contains("snapshot directory is unreadable"), "{error}");
+
+        // A manifest with no files array at all declares nothing, so EVERY required artifact is
+        // missing — the drill's contract must not read a shapeless manifest as complete.
+        let shapeless = manifest_missing_required(&serde_json::json!({"schema": 1}));
+        assert!(shapeless.contains(&DB_FILE.to_string()), "{shapeless:?}");
+        assert!(shapeless.contains(&crate::review_pilot::REVIEW_PILOT_FILE.to_string()), "{shapeless:?}");
+
+        // The settings arm of the optional-state validator: recovery bytes that are not settings at
+        // all must fail rather than install as an empty configuration.
+        assert!(validate_present_optional_state("settings.json", b"not json at all").is_err());
+    }
+
+    #[test]
+    fn device_name_lookalikes_are_accepted_and_pinned_selectors_parse_exactly() {
+        // The reserved-name guard must bite ONLY the real DOS devices. Refusing a near-miss would
+        // silently drop recovery state from a snapshot's inventory, failing the restore later.
+        for name in ["com0.json", "lpt0.db", "comx.json", "communication.json", "nullable.json", "console.log"] {
+            safe_manifest_name(name).unwrap_or_else(|error| panic!("{name} must be accepted: {error}"));
+        }
+
+        // The selector parsers are the only thing standing between a picker string and a path.
+        assert_eq!(parse_fixed_timestamp("0000000000"), Some(0));
+        assert_eq!(parse_fixed_timestamp("0000001000"), Some(1_000));
+        assert_eq!(parse_fixed_timestamp("999999999"), None, "nine digits is not the fixed width");
+        assert_eq!(parse_fixed_timestamp("00000000001"), None, "eleven digits is not the fixed width");
+        assert_eq!(parse_fixed_timestamp("00000000a0"), None);
+
+        assert_eq!(parse_pinned_name("drill_0000000300"), Some(300));
+        assert_eq!(parse_pinned_name("pre_migration-1_0000000300"), Some(300), "labels may carry _ and -");
+        assert_eq!(parse_pinned_name("nounderscore"), None);
+        assert_eq!(parse_pinned_name("_0000000300"), None, "an empty label names nothing");
+        assert_eq!(parse_pinned_name("-lead_0000000300"), None, "a label must start alphanumeric");
+        assert_eq!(parse_pinned_name("la bel_0000000300"), None);
+        assert_eq!(
+            parse_pinned_name(&format!("{}_0000000300", "x".repeat(64))),
+            Some(300),
+            "64 characters is the cap, not one past it"
+        );
+        assert_eq!(parse_pinned_name(&format!("{}_0000000300", "x".repeat(65))), None);
+    }
 }
 
 #[cfg(test)]
@@ -3794,6 +3907,9 @@ mod offsite_state_tests {
     /// The local snapshot path is unchanged by the fix: destination and primary are one directory.
     #[test]
     fn a_local_snapshot_still_carries_its_own_state_files() {
+        // `take_snapshot` moves the process-global health counters; the lock keeps that out of the
+        // health tests' assertion windows.
+        let _health = lock_health_counters();
         let data = tempfile::TempDir::new().unwrap();
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();

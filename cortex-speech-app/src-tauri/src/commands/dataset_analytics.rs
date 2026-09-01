@@ -247,3 +247,119 @@ mod tests {
         validate_certificate_request(0.05, 0.95).expect("normal certificate request");
     }
 }
+
+/// Wave-4 state-boundary coverage: each read command invoked through a genuine managed
+/// `State<'_, AppState>`, so the limiter check, the settings snapshot and the blocking closure run
+/// exactly as production IPC runs them. The analytics engines are covered in their own modules.
+#[cfg(test)]
+mod state_command_surface_tests {
+    use super::*;
+    use crate::test_support::managed_app_state;
+    use tauri::Manager;
+
+    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread().build().expect("build test runtime").block_on(future)
+    }
+
+    fn wire<T: serde::Serialize>(value: &T) -> serde_json::Value {
+        serde_json::to_value(value).expect("serialize analytics payload")
+    }
+
+    /// The four dataset readouts on an empty library. An empty corpus must report an honest zero
+    /// through the whole wrapper — never a refusal, and never a number nothing measured.
+    #[test]
+    fn dataset_readouts_report_an_honest_zero_for_an_empty_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+
+        let stats = wire(&block_on(get_dataset_stats(app.state())).expect("dataset stats"));
+        assert_eq!(stats["totalSegments"], 0);
+        assert_eq!(stats["verifiedCount"], 0);
+        assert_eq!(stats["pendingCount"], 0);
+        assert_eq!(stats["verificationRate"], 0.0, "0/0 must not become 100% verified");
+        assert_eq!(stats["reviewTiming"]["decisionsLogged"], 0);
+        assert_eq!(stats["reviewTiming"]["medianSeconds"], serde_json::Value::Null, "no timing is Null, not 0");
+        assert_eq!(stats["topSpeakers"].as_array().map(Vec::len), Some(0));
+        assert!(stats["dbSizeBytes"].as_u64().unwrap_or(0) > 0, "the real file-backed library has a real size");
+
+        let quality = wire(&block_on(get_dataset_quality(app.state())).expect("dataset quality"));
+        assert_eq!(quality["totalSegments"], 0);
+        assert_eq!(quality["emptyTranscriptCount"], 0);
+        assert_eq!(quality["duplicateTranscriptGroups"], 0);
+        assert_eq!(quality["meanCer"], serde_json::Value::Null, "no reference text means no measured CER");
+        assert_eq!(quality["meanWer"], serde_json::Value::Null);
+        assert_eq!(quality["qualityGatePassed"], true);
+
+        let grade = wire(&block_on(get_training_grade_breakdown(app.state())).expect("training grade breakdown"));
+        assert_eq!(grade["summary"]["totalSegments"], 0);
+        assert_eq!(grade["summary"]["trainingReadySegments"], 0);
+        assert_eq!(grade["summary"]["goldSegments"], 0);
+        assert_eq!(grade["reasonCounts"], serde_json::json!({}), "no rows means no grade reasons to tally");
+
+        let report = wire(&block_on(validate_dataset_cmd(app.state())).expect("dataset validation"));
+        assert_eq!(report["totalSegments"], 0);
+        assert_eq!(report["passed"], 0);
+        assert_eq!(report["summary"], "All 0 segments passed validation checks");
+        assert_eq!(report["errors"].as_array().map(Vec::len), Some(0));
+        assert_eq!(report["warnings"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// The three evidence readouts. Each one's job is to say "nothing measured yet" without
+    /// implying a guarantee it does not have.
+    #[test]
+    fn evidence_readouts_declare_zero_observations_without_implying_a_guarantee() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+
+        let intel = wire(&block_on(get_intelligence_report(app.state())).expect("intelligence report"));
+        assert_eq!(intel["loop0Shadow"]["totalObservations"], 0);
+        assert_eq!(intel["loop0Shadow"]["wouldFire"], 0);
+        assert_eq!(intel["autoAcceptPrecision"]["t0Accepts"], 0);
+        assert_eq!(intel["autoAcceptPrecision"]["t1Escalations"], 0);
+        assert_eq!(intel["conformalCalibration"]["targetErrorCer"], 0.05);
+        let buckets = intel["conformalCalibration"]["buckets"].as_array().expect("SNR buckets");
+        assert_eq!(buckets.len(), 5, "the calibration readout is bucketed by SNR band");
+        assert!(buckets.iter().all(|b| b["verifiedWithReference"] == 0));
+
+        let certificate =
+            wire(&block_on(get_dataset_certificate(app.state(), 0.05, 0.95)).expect("dataset certificate"));
+        assert_eq!(certificate["targetError"], 0.05, "the requested probabilities round-trip verbatim");
+        assert_eq!(certificate["confidenceLevel"], 0.95);
+        assert_eq!(certificate["isCalibrated"], false, "zero calibration rows can never be calibrated");
+        assert_eq!(certificate["totalCertified"], 0);
+        assert_eq!(certificate["certifiedSegmentIds"].as_array().map(Vec::len), Some(0));
+        assert_eq!(certificate["calibrationRealPosterior"], 0);
+        assert_eq!(certificate["calibrationHeuristic"], 0);
+        assert_eq!(certificate["calibrationNoConfidence"], 0);
+
+        let lift = wire(&block_on(get_label_quality_lift(app.state())).expect("label quality lift"));
+        assert_eq!(lift["n"], 0);
+        assert_eq!(lift["cerLift"], 0.0, "no triples means no measured lift");
+        assert_eq!(lift["liftCiLow"], 0.0);
+        assert_eq!(lift["liftCiHigh"], 0.0);
+    }
+
+    /// The parameter guard runs at the command boundary, AFTER the limiter and BEFORE any DB work —
+    /// so a nonsense probability never reaches a full-corpus scan.
+    #[test]
+    fn the_certificate_command_refuses_non_probability_parameters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+
+        for (target, confidence, why) in [
+            (f64::NAN, 0.95, "a non-finite target error"),
+            (f64::INFINITY, 0.95, "an infinite target error"),
+            (0.0, 0.95, "a zero target error"),
+            (1.5, 0.95, "a target error above 1"),
+            (0.05, 0.0, "a zero confidence level"),
+            (0.05, 1.0, "a confidence level of exactly 1"),
+        ] {
+            let refused = match block_on(get_dataset_certificate(app.state(), target, confidence)) {
+                Ok(_) => panic!("{why} must be refused, not certified"),
+                Err(error) => error,
+            };
+            assert_eq!(refused.code, "INVALID_CERTIFICATE_PARAMETERS", "{why}");
+            assert!(!refused.retryable, "{why} is a caller error, not a transient one");
+        }
+    }
+}

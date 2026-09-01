@@ -3154,4 +3154,457 @@ mod tests {
             "removing a derived memory must be refused as an incomplete derivation: {error}"
         );
     }
+
+    // ── Wave-5 branch coverage. Same threat model as above (a restored file can already contain
+    // rows written with the guards disabled); each test still corrupts exactly ONE thing and pins
+    // the message the validator ACTUALLY produces.
+
+    /// A real phone REJECT through the production API. Reject is the only decision whose terminal
+    /// state keeps the PRIOR verdict transcript instead of writing a new one, so it reaches arms
+    /// that no accept/edit fixture can.
+    fn rejected(db: &Database, id: &str, index: u64) -> i64 {
+        let revision = db.segment_review_revision(id).unwrap().unwrap();
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            id,
+            "reject",
+            None,
+            "Reviewer",
+            revision,
+            &canonical_operation(index),
+            &crate::db::review_operation_payload_hash(id, "reject", "", "Reviewer"),
+        )
+        .unwrap()
+        .unwrap();
+        db.connection().query_row("SELECT MAX(id) FROM human_decision_effect_events", [], |row| row.get(0)).unwrap()
+    }
+
+    #[test]
+    fn a_genuine_phone_reject_validates_and_may_not_carry_post_decision_text() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "reject-clip");
+        rejected(&db, "reject-clip", 600);
+        validate_review_effect_semantics(&db).expect("a phone reject written by the production API must restore");
+
+        // Documents the reject arm's shape: the verdict names the rejection, and the transcript the
+        // dataset serves is the untouched prior one — a reject never mints reviewed text.
+        let (verdict, decision_transcript): (Option<String>, Option<String>) = db
+            .connection()
+            .query_row(
+                "SELECT segment.verdict, effect.decision_transcript
+                   FROM speech_segments segment
+                   JOIN human_decision_effect_events effect ON effect.segment_id = segment.id
+                  WHERE segment.id = 'reject-clip'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(verdict.as_deref(), Some("human_reject"));
+        assert_eq!(decision_transcript, None, "a reject owns no post-decision transcript");
+
+        // Giving a reject its own decision text would let a refusal masquerade as reviewed output.
+        unlock_effects(&db);
+        db.connection()
+            .execute("UPDATE human_decision_effect_events SET decision_transcript = 'sneaked in'", [])
+            .unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("no exact canonical post-decision transcript"), "{error}");
+    }
+
+    #[test]
+    fn a_desktop_request_tuple_outside_its_contract_shape_is_refused() {
+        // The unlinked desktop branch accepts exactly one operation tuple. These are the member-level
+        // violations the existing boundary test (which erases whole members) cannot reach.
+        let authority = "11111111-2222-4333-8444-555555555555";
+        for (label, sabotage) in [
+            ("non-positive request timestamp", "UPDATE human_decision_effect_events SET requested_timestamp_ms = 0"),
+            ("requested action is not a decision", "UPDATE human_decision_effect_events SET requested_action = 'skip'"),
+            ("empty requested transcript", "UPDATE human_decision_effect_events SET requested_transcript = ''"),
+        ] {
+            // A fresh directory per case: `file_seeded_db` derives the file name from the segment id,
+            // so reusing one directory would re-open the previous case's database.
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = file_seeded_db(&dir, "request-shape");
+            let prior_revision = db.segment_review_revision("request-shape").unwrap().unwrap();
+            let hash = crate::db::desktop_review_v1_payload_hash(
+                "request-shape",
+                prior_revision,
+                "edit",
+                Some("desktop corrected"),
+                authority,
+            );
+            insert_typed_desktop_effect(&db, "request-shape", authority, &hash);
+            validate_review_effect_semantics(&db).expect("the genuine desktop effect must validate first");
+            assert_eq!(db.connection().execute(sabotage, []).unwrap(), 1, "{label}");
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(error.contains("outside the exact anonymous desktop operation boundary"), "{label}: {error}");
+        }
+
+        // The other side of the same clause: a v1 row whose request carried NO transcript is legal,
+        // provided its digest was taken over that absence. Nothing here is loosened by the arms above.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "null-request");
+        let prior_revision = db.segment_review_revision("null-request").unwrap().unwrap();
+        let hash = crate::db::desktop_review_v1_payload_hash("null-request", prior_revision, "edit", None, authority);
+        insert_typed_desktop_effect(&db, "null-request", authority, &hash);
+        db.connection().execute("UPDATE human_decision_effect_events SET requested_transcript = NULL", []).unwrap();
+        validate_review_effect_semantics(&db)
+            .expect("a v1 desktop row whose digest answers an absent request transcript must restore");
+    }
+
+    #[test]
+    fn a_desktop_reversal_reusing_a_paid_inverse_identity_is_refused() {
+        // A desktop undo is anonymous and pays nothing. If its operation id also addresses a
+        // compensation inverse (`entry_key = 'undo:' || id`), one undo would be claiming both an
+        // anonymous desktop reversal AND a reviewer's clawback — two meanings, one identity.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "desktop-inverse");
+        let authority = "11111111-2222-4333-8444-555555555555";
+        let prior_revision = db.segment_review_revision("desktop-inverse").unwrap().unwrap();
+        let hash = crate::db::desktop_review_v1_payload_hash(
+            "desktop-inverse",
+            prior_revision,
+            "edit",
+            Some("desktop corrected"),
+            authority,
+        );
+        insert_typed_desktop_effect(&db, "desktop-inverse", authority, &hash);
+        validate_review_effect_semantics(&db).expect("the genuine desktop effect must validate first");
+
+        let effect_id: i64 = db
+            .connection()
+            .query_row("SELECT MAX(id) FROM human_decision_effect_events", [], |row| row.get(0))
+            .unwrap();
+        let undo_operation = canonical_operation(610);
+        unlock_table(&db, "human_decision_effect_reversals");
+        db.connection()
+            .execute(
+                "INSERT INTO human_decision_effect_reversals (effect_event_id, operation_id) VALUES (?1, ?2)",
+                rusqlite::params![effect_id, undo_operation],
+            )
+            .unwrap();
+        // A pay inverse addressed by the SAME operation. `reverses_entry_id` stays NULL so the
+        // post-v60 reversal-ownership scan does not claim this row first; the collision under test
+        // is the identity itself.
+        unlock_table(&db, "review_compensation_ledger");
+        db.connection()
+            .execute(
+                "INSERT INTO review_compensation_ledger
+                    (entry_id, entry_key, policy_version, canonical_work_id, canonical_identity_kind,
+                     reviewer, segment_id, source, compensation_action, effective_decision,
+                     decision_revision, duration_ms, rate_basis_points, entitlement_micro_iqd,
+                     delta_micro_iqd, corrected_entitlement_ms, delta_corrected_ms, reverses_entry_id)
+                 VALUES (?1, ?2, ?3, 'forged-work', 'audio_content_hash+source_span', 'Reviewer',
+                         'desktop-inverse', 'couch_undo', 'undo', 'undo', 1, 1000, 0, 0, 0, 0, 0, NULL)",
+                rusqlite::params![
+                    canonical_operation(611),
+                    format!("undo:{undo_operation}"),
+                    crate::db::REVIEW_PAY_POLICY_VERSION,
+                ],
+            )
+            .unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("reuses a paid-review inverse identity"), "{error}");
+    }
+
+    #[test]
+    fn a_redefined_effective_effect_projection_is_refused() {
+        // The two `effective_*_v60` views ARE schema objects, so a restored file can carry rewritten
+        // ones. Everything downstream (serving, export, pay) reads the projection, not the journal,
+        // so a view that hides or invents an active effect must be caught before publication.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "projection-decision");
+        decided(&db, "projection-decision", 620);
+        validate_review_effect_semantics(&db).expect("the genuine decision must validate first");
+        db.connection()
+            .execute_batch(
+                "DROP VIEW effective_human_decision_effects_v60;
+                 CREATE VIEW effective_human_decision_effects_v60 AS
+                     SELECT * FROM human_decision_effect_events WHERE 0;",
+            )
+            .unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(
+            error.contains("effective human-decision projection does not select the latest active effect"),
+            "{error}"
+        );
+
+        let db = file_seeded_db(&dir, "projection-flag");
+        flagged(&db, "projection-flag", "needs another listen", 621);
+        validate_review_effect_semantics(&db).expect("the genuine flag must validate first");
+        db.connection()
+            .execute_batch(
+                "DROP VIEW effective_review_flag_effects_v60;
+                 CREATE VIEW effective_review_flag_effects_v60 AS
+                     SELECT * FROM review_flag_effect_events WHERE 0;",
+            )
+            .unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("effective review-flag projection does not select the latest active effect"), "{error}");
+    }
+
+    #[test]
+    fn a_later_flag_reaching_back_into_a_shadowed_revision_window_is_refused() {
+        // Revisions are the chain's only ordering authority. A reversed mutation OWNS two revisions
+        // (the flag and its inverse), so a later mutation whose prior state predates that inverse is
+        // describing a segment state the chain already moved past — whichever the projection then
+        // picks decides what the dataset serves. Built from real APIs (flag → undo → flag), then the
+        // SECOND flag's window is pulled back over the first's reversal.
+        //
+        // The neighbouring arm — two mutations claiming the SAME applied revision — cannot be
+        // written at all: `review_flag_effect_events` carries a UNIQUE(segment_id, flag_revision)
+        // index, which is table authority no PRAGMA or trigger drop can disable (measured: the
+        // insert fails with extended code 2067). This overlapping-window arm is the reachable half.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "overlap-flag");
+        let first_flag = flagged(&db, "overlap-flag", "first flag", 630);
+        assert!(matches!(
+            db.undo_review_flag(first_flag, &canonical_operation(631)).unwrap(),
+            crate::db::HumanFlagUndoOutcome::Applied { .. }
+        ));
+        flagged(&db, "overlap-flag", "second flag", 632);
+        validate_review_effect_semantics(&db).expect("the genuine flag chain must validate first");
+
+        // The reversed first flag applies at `applied` and its inverse owns `applied + 1`; moving the
+        // second flag's prior state to `applied` makes it start inside that shadowed window.
+        let applied: i64 = db
+            .connection()
+            .query_row("SELECT flag_revision FROM review_flag_effect_events ORDER BY id LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        unlock_table(&db, "review_flag_effect_events");
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "UPDATE review_flag_effect_events SET prior_revision = ?1, flag_revision = ?1 + 1
+                      WHERE id = (SELECT MAX(id) FROM review_flag_effect_events)",
+                    rusqlite::params![applied],
+                )
+                .unwrap(),
+            1
+        );
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("overlap or reverse a shadowed mutation"), "{error}");
+    }
+
+    #[test]
+    fn a_segment_drifting_from_its_replayed_chain_state_is_refused() {
+        // The chain replay produces the EXACT human/rationale state the segment must hold. These two
+        // fields are carried by the replay rather than by the latest-effect arm, so drifting them is
+        // caught by the chain comparison, not by the terminal check the drift test above pins.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "stable-drift");
+        decided(&db, "stable-drift", 640);
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_table(&db, "speech_segments");
+        db.connection().execute("UPDATE speech_segments SET annotated_transcript = 'unbound human text'", []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(
+            error.contains("unbound human transcript/verification state outside its exact review-effect chain"),
+            "{error}"
+        );
+
+        let db = file_seeded_db(&dir, "rationale-drift");
+        flagged(&db, "rationale-drift", "needs another listen", 641);
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_table(&db, "speech_segments");
+        db.connection().execute("UPDATE speech_segments SET rationale = 'somebody else''s reason'", []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("rationale disagrees with its exact mixed decision/flag effect chain"), "{error}");
+    }
+
+    #[test]
+    fn correction_memory_contributions_and_outcomes_must_re_derive_from_the_decision() {
+        // The contribution rows are what move a memory's confidence, and those memories feed the live
+        // corrector. A contribution claiming evidence it cannot prove is how a forged file teaches the
+        // corrector something no human ever said.
+        let fixture = |dir: &tempfile::TempDir, id: &str, index: u64| {
+            let db = file_seeded_db(dir, id);
+            decided(&db, id, index);
+            validate_review_effect_semantics(&db).unwrap();
+            unlock_table(&db, "correction_memory_contributions");
+            db
+        };
+
+        // Claimed confirm evidence with no firing timestamp: the two must agree exactly.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = fixture(&dir, "contribution-evidence", 650);
+        assert!(
+            db.connection().execute("UPDATE correction_memory_contributions SET confirm_delta = 1", []).unwrap() > 0
+        );
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("violates its action/evidence identity"), "{error}");
+
+        // Coherent-looking evidence still has to be re-derivable: a memory cannot be confirmed by the
+        // very effect that first captured it, because it did not exist when that decision was served.
+        let db = fixture(&dir, "contribution-outcome", 651);
+        assert!(
+            db.connection()
+                .execute(
+                    "UPDATE correction_memory_contributions
+                        SET confirm_delta = 1, fired_at = '2026-08-29 00:00:00'",
+                    [],
+                )
+                .unwrap()
+                > 0
+        );
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("is not re-derived from the served/decision text"), "{error}");
+    }
+
+    #[test]
+    fn effect_bound_examples_and_corrections_must_re_derive_their_edit_identity() {
+        // The learning rows are the training-data side of a paid edit. Each case leaves the decision
+        // effect untouched and breaks one identity clause on the row that claims to descend from it.
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let db = file_seeded_db(&dir, "example-provenance");
+        decided(&db, "example-provenance", 660);
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_table(&db, "agent_examples");
+        assert_eq!(db.connection().execute("UPDATE agent_examples SET source = 'machine'", []).unwrap(), 1);
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("is not one genuine human edit"), "{error}");
+
+        // A correction attributed to a reviewer its effect never names.
+        let db = file_seeded_db(&dir, "correction-reviewer");
+        decided(&db, "correction-reviewer", 661);
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_table(&db, "corrections");
+        assert_eq!(db.connection().execute("UPDATE corrections SET reviewer_id = 'Sara'", []).unwrap(), 1);
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("violates edit/audio/reviewer identity"), "{error}");
+
+        // A correction whose audio identity is not the retained clip's is evidence about other audio.
+        let db = file_seeded_db(&dir, "correction-audio");
+        decided(&db, "correction-audio", 662);
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_table(&db, "corrections");
+        assert_eq!(db.connection().execute("UPDATE corrections SET audio_content_hash = 'not-a-hash'", []).unwrap(), 1);
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("violates edit/audio/reviewer identity"), "{error}");
+    }
+
+    #[test]
+    fn a_flag_reversal_needs_a_canonical_unshared_operation_identity() {
+        // The flag undo's operation id is cross-table identity. A malformed one addresses nothing; a
+        // stolen one lets the reversal inherit another operation's evidence.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "flag-undo-identity");
+        let flag_effect = flagged(&db, "flag-undo-identity", "needs another listen", 670);
+        assert!(matches!(
+            db.undo_review_flag(flag_effect, &canonical_operation(671)).unwrap(),
+            crate::db::HumanFlagUndoOutcome::Applied { .. }
+        ));
+        validate_review_effect_semantics(&db).expect("the genuine flag undo must validate first");
+        unlock_table(&db, "review_flag_effect_reversals");
+        assert_eq!(
+            db.connection().execute("UPDATE review_flag_effect_reversals SET operation_id = 'not-a-uuid'", []).unwrap(),
+            1
+        );
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("violates its immutable revision/operation identity"), "{error}");
+
+        let db = file_seeded_db(&dir, "flag-undo-collision");
+        couch_event(&db, "flag-undo-collision", "skip", 672);
+        let flag_effect = flagged(&db, "flag-undo-collision", "needs another listen", 673);
+        assert!(matches!(
+            db.undo_review_flag(flag_effect, &canonical_operation(674)).unwrap(),
+            crate::db::HumanFlagUndoOutcome::Applied { .. }
+        ));
+        validate_review_effect_semantics(&db).expect("distinct operations must validate first");
+        unlock_table(&db, "review_flag_effect_reversals");
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "UPDATE review_flag_effect_reversals
+                        SET operation_id = (SELECT operation_id FROM review_events ORDER BY id LIMIT 1)",
+                    [],
+                )
+                .unwrap(),
+            1
+        );
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(
+            error.contains("review-flag reversal") && error.contains("reuses another review operation identity"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn every_remaining_effect_identity_clause_is_load_bearing() {
+        // The identity clause is one long disjunction; each arm below is the only thing standing
+        // between a restored file and a decision row that no longer describes what was decided.
+        for (label, sabotage) in [
+            ("verification flag is not a boolean", "UPDATE human_decision_effect_events SET decision_verified = 2"),
+            ("prior verification flag is not a boolean", "UPDATE human_decision_effect_events SET prior_verified = 2"),
+            (
+                "a decision invented a rationale",
+                "UPDATE human_decision_effect_events SET decision_rationale = 'invented'",
+            ),
+            ("blank served transcript", "UPDATE human_decision_effect_events SET served_transcript = ''"),
+            (
+                "untrimmed served transcript is not canonical",
+                "UPDATE human_decision_effect_events SET served_transcript = '  machine draft  '",
+            ),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = file_seeded_db(&dir, "identity-clause");
+            decided(&db, "identity-clause", 690);
+            validate_review_effect_semantics(&db).expect("the genuine decision must validate first");
+            unlock_effects(&db);
+            assert_eq!(db.connection().execute(sabotage, []).unwrap(), 1, "{label}");
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(error.contains("violates its immutable identity/revision boundary"), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_hidden_spot_check_event_must_not_own_a_paid_decision_effect() {
+        // couch_spot_check is a legitimate event source, but hidden QC is not a paid corpus decision:
+        // it never mints the human-decision effect that drives the dataset and the ledger.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "spot-check-clip");
+        decided(&db, "spot-check-clip", 692);
+        validate_review_effect_semantics(&db).expect("the genuine Couch decision must validate first");
+
+        for trigger in [
+            "review_events_v60_post_cutoff_immutable_update",
+            "review_events_v60_provenance_immutable_update",
+            "review_event_operation_immutable_update",
+        ] {
+            db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).ok();
+        }
+        assert_eq!(
+            db.connection().execute("UPDATE review_events SET source = 'couch_spot_check'", []).unwrap(),
+            1,
+            "the corruption must apply, or this test proves nothing"
+        );
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("must not create a human-decision effect"), "{error}");
+    }
+
+    #[test]
+    fn a_ledger_frontier_that_swallows_the_undo_inverse_is_refused() {
+        // The frontier declares which ledger rows are post-v60 evidence. Advancing it past a genuine
+        // clawback would reclassify that inverse as untouchable legacy history, leaving the decision
+        // reversal with nothing to prove the money moved.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "frontier-undo");
+        decided_then_undone(&db, "frontier-undo", 680, 681);
+        validate_review_effect_semantics(&db).expect("the genuine undo must validate first");
+
+        unlock_table(&db, "review_effect_state");
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "UPDATE review_effect_state
+                        SET effective_after_ledger_id = (SELECT MAX(id) FROM review_compensation_ledger)
+                      WHERE singleton_key = 1",
+                    [],
+                )
+                .unwrap(),
+            1
+        );
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("lacks its exact operation-bound compensation inverse"), "{error}");
+    }
 }

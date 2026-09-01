@@ -520,3 +520,166 @@ mod tests {
         assert!(crate::snapshot::resolve_snapshot_dir(data_dir, "snapshots/../snapshots").is_err());
     }
 }
+
+/// Wave-4 state-boundary coverage for the recovery `#[tauri::command]` wrappers, invoked through a
+/// genuine managed `State<'_, AppState>`. These deliberately never take a real restore reservation:
+/// `RESTORE_ADMISSION` is process-global, so an in-flight restore in one test would be visible to
+/// every other test in the binary. The refusal arms and the two non-restoring tools are what the
+/// wrappers own.
+#[cfg(test)]
+mod state_command_surface_tests {
+    use super::*;
+    use crate::test_support::managed_app_state;
+    use tauri::Manager;
+
+    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread().build().expect("build test runtime").block_on(future)
+    }
+
+    /// Seed one clip so a backup's verification count is a measured row count, not a constant 0.
+    fn seed_one_clip(app: &tauri::App<tauri::test::MockRuntime>) {
+        app.state::<AppState>()
+            .lock_db()
+            .insert_segment(&crate::db::SpeechSegment {
+                id: "recovery-seg".into(),
+                audio_path: "C:\\audio\\recovery.wav".into(),
+                raw_transcript: "دەق".into(),
+                ..crate::db::SpeechSegment::default()
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn db_backup_verifies_the_copy_it_wrote_and_refuses_an_unusable_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        seed_one_clip(&app);
+
+        let dest = tmp.path().join("backup.db");
+        let verified = block_on(db_backup(dest.to_string_lossy().into_owned(), app.state())).expect("db backup");
+        assert!(verified.integrity_ok, "the command only returns a backup it re-opened and integrity-checked");
+        assert_eq!(verified.segment_count, 1, "the count is read back out of the copy, not the live library");
+        assert!(dest.metadata().unwrap().len() > 0, "a verified backup is a real non-empty file");
+
+        let refused = block_on(db_backup(
+            tmp.path().join("no-such-dir").join("backup.db").to_string_lossy().into_owned(),
+            app.state(),
+        ))
+        .expect_err("a destination whose parent does not exist is refused");
+        assert_eq!(refused.code, "INVALID_BACKUP_DESTINATION");
+        assert!(!refused.retryable, "the owner repairs this by choosing another destination");
+        assert_eq!(refused.suggested_action, None, "there is no in-app chooser to send them to");
+    }
+
+    #[test]
+    fn db_vacuum_completes_and_db_restore_refuses_an_unreadable_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        seed_one_clip(&app);
+
+        block_on(db_vacuum(app.state())).expect("maintenance on a healthy library");
+        // Maintenance is not destructive: the seeded row survives it.
+        assert!(app.state::<AppState>().lock_db().get_segment_by_id("recovery-seg").unwrap().is_some());
+
+        let refused = block_on(db_restore("Z:\\nope\\not-a-backup.db".into(), app.state()))
+            .expect_err("an unreadable source never reaches restore admission");
+        assert_eq!(refused.code, "INVALID_BACKUP_SOURCE");
+        assert!(!refused.retryable);
+        assert_eq!(refused.suggested_action, None);
+    }
+
+    /// The notice counts only files the owner can act on; `-wal`/`-shm` sidecars are noise. Archiving
+    /// deliberately moves the sidecars too, so the two numbers are not the same number — and a change
+    /// that made them agree would either under-report the warning or strand half a corrupt database.
+    #[test]
+    fn the_quarantine_notice_hides_sidecars_that_archiving_still_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        for (name, body) in [
+            ("cortex-speech.db.corrupt.1700000000", &b"corrupt"[..]),
+            ("cortex-speech.db.corrupt.1700000000-wal", &b"wal"[..]),
+            ("cortex-speech.db.corrupt.1700000000-shm", &b"shm"[..]),
+        ] {
+            std::fs::write(tmp.path().join(name), body).unwrap();
+        }
+        let snap_dir = tmp.path().join("snapshots").join("snapshot_1700000000");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        {
+            let db = crate::db::Database::open(snap_dir.join("cortex-speech.db").to_string_lossy().as_ref()).unwrap();
+            db.initialize().unwrap();
+        }
+
+        let notice = get_quarantine_notice(app.state()).expect("quarantine notice");
+        assert_eq!(notice.quarantined_file_count, 1, "three files, one recoverable database");
+        assert_eq!(notice.snapshot_count, 1);
+        assert_eq!(notice.newest_snapshot_segments, Some(0));
+
+        let snapshots = list_db_snapshots(app.state()).expect("snapshot list");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].name, "snapshot_1700000000", "the name is the opaque restore selector");
+        assert_eq!(snapshots[0].timestamp, 1_700_000_000);
+        assert_eq!(snapshots[0].segment_count, Some(0));
+        assert!(snapshots[0].db_size_bytes > 0);
+
+        let archived = acknowledge_quarantine(app.state()).expect("archive the quarantined files");
+        assert_eq!(archived, 3, "archiving moves the whole corrupt set, sidecars included");
+        for name in [
+            "cortex-speech.db.corrupt.1700000000",
+            "cortex-speech.db.corrupt.1700000000-wal",
+            "cortex-speech.db.corrupt.1700000000-shm",
+        ] {
+            assert!(tmp.path().join("quarantine").join(name).is_file(), "{name} must be preserved, not deleted");
+            assert!(!tmp.path().join(name).exists(), "{name} must leave the live data dir");
+        }
+
+        let cleared = get_quarantine_notice(app.state()).expect("notice after archiving");
+        assert_eq!(cleared.quarantined_file_count, 0, "the warning clears once the files are archived");
+        assert_eq!(cleared.snapshot_count, 1, "archiving quarantine must not disturb the snapshots");
+    }
+
+    /// The selector guard is syntactic and runs before `resolve_snapshot_dir` — a malformed name must
+    /// never become a filesystem lookup, and an unknown-but-well-formed one must fail closed with the
+    /// public code rather than leaking the resolver's message.
+    #[test]
+    fn snapshot_restore_refuses_malformed_and_unknown_selectors_without_touching_the_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let too_long = "a".repeat(256);
+
+        for (selector, why) in [
+            ("", "an empty selector"),
+            ("   ", "a whitespace-only selector"),
+            (too_long.as_str(), "a selector over 255 chars"),
+            ("bad\u{7}name", "a selector carrying a control character"),
+        ] {
+            let refused = block_on(restore_db_from_snapshot(selector.to_string(), app.state())).expect_err(why);
+            assert_eq!(refused.code, "INVALID_SNAPSHOT_SELECTOR", "{why}");
+            assert!(!refused.retryable, "{why}");
+            assert_eq!(refused.suggested_action, None, "{why}: the owner picks another snapshot, not Health");
+        }
+
+        let unknown = block_on(restore_db_from_snapshot("snapshot_1600000000".into(), app.state()))
+            .expect_err("a well-formed selector for a snapshot that does not exist");
+        assert_eq!(unknown.code, "SNAPSHOT_RESTORE_FAILED");
+        assert!(!unknown.retryable, "a missing snapshot will not appear on retry");
+        assert_eq!(unknown.suggested_action, Some(SuggestedActionV1::OpenHealth));
+    }
+
+    /// Without a data dir there is no quarantine, no snapshot store and no pre-restore safety
+    /// snapshot. All three read tools must say so with the same actionable code.
+    #[test]
+    fn recovery_reads_refuse_when_the_app_data_directory_is_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        *app.state::<AppState>().lock_data_dir() = None;
+
+        let ack = acknowledge_quarantine(app.state()).expect_err("archiving needs a data dir");
+        let notice = get_quarantine_notice(app.state()).expect_err("the notice needs a data dir");
+        let list = list_db_snapshots(app.state()).expect_err("the snapshot list needs a data dir");
+        for error in [&ack, &notice, &list] {
+            assert_eq!(error.code, "RECOVERY_STATE_UNAVAILABLE");
+            assert!(!error.retryable, "a missing data dir does not fix itself on retry");
+            assert_eq!(error.suggested_action, Some(SuggestedActionV1::OpenHealth));
+        }
+    }
+}

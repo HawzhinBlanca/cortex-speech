@@ -12459,3 +12459,66 @@ drops all 111 `#[test]` functions, and an injected `.execute(` in production cod
 
 No layering violations were found in the newly-scanned code: the architecture was clean, the gate
 simply was not looking at it.
+
+---
+
+## 2026-09-01 — Coverage wave 5: seven agents at the remaining function and branch mass
+
+The wave-4 measurement at f38fdfc1 crossed two of the four contract bars for the first time
+(regions 85.35% and lines 85.18%, both against 85) and localized the rest: functions 74.50% and
+branches 65.96% against 80, with 17 critical-domain criteria still short and `playback` the one
+domain that had moved zero. Seven agents added **132 tests, 4,105 insertions, 2 deletions across
+22 files**; no agent changed production code. Full library suite green: **2555 passed, 0 failed**,
+8 pre-existing ignored. Two agents reported that same figure independently.
+
+Coverage of previously untested surfaces: `couch/lifecycle.rs` (which mints and revokes reviewer
+pairing links) and `couch/queue_audio.rs` had no test module at all and now have 10 and 8; the CTC
+aligner's repeated-character path — the mandatory-blank transition every prior test missed by
+using distinct characters — is covered; the ASR circuit breaker's expired arm joins its open arm.
+
+What the wave found beyond the number, all of it recorded because it will recur:
+
+- **Tests could make REAL Gemini uploads.** `ApiKeys::load` merges the process environment OVER
+  `secrets.env`, so a jury/cloud-path test uploads fixture audio for real on any machine that
+  exports `GEMINI_API_KEY`. The suite is offline only because this box has it unset — a
+  pre-existing test depends on that silently. Two new tests now assert `jury_cloud_api_key()
+  .is_none()` up front and fail loudly. The durable fix (harness strips cloud keys) is still open.
+- **`STRICT_RATE_LIMITER` is a process-global token bucket keyed by command name** (burst 5). A
+  second test on an already-tested command drained it and deterministically reddened the OTHER
+  test with `RATE_LIMITED`. The new test was dropped rather than leave a red suite.
+- **A pre-existing snapshot flake, fixed.** Four tests share the process-global
+  `CONSECUTIVE_FAILURES`/`LAST_SUCCESS_EPOCH` atomics; measured ~1 failure in 3 with no new code
+  present, widening to 2 in 3. Now serialized by a `#[cfg(test)]` mutex; no assertion relaxed.
+- **`speech_segments` IS a STRICT table** on the live database — the migration shipped, correcting
+  a stale note that called it blocked. Extended code 3091 refuses a wrong-typed write, so a type
+  violation is not available as a fault-injection route there.
+- **A failing assertion turned into a real regression guard.** `export_huggingface_dataset` returns
+  Ok without creating `data/` when nothing is exportable; that no-op guard exists because an
+  earlier version `remove_dir_all`'d the previous good dataset and wrote nothing whenever the
+  missing aligner graded every clip REVIEW. The test now seeds a prior dataset and asserts it is
+  byte-identical afterward.
+- **`the_queue_never_serves_a_blank_or_placeholder_draft` was NOT a defect.** It failed on a
+  ConstraintViolation in its own fixture, so it never made a claim about queue contents; admission
+  refuses blank/`[bracketed]` drafts and a v64 trigger freezes a member's transcript, both already
+  pinned. Note for the recurring "counts include rows the export drops" class: here the queue is
+  the STRICTER of the two, and admission is what guarantees they agree.
+
+Agents proved arms unreachable rather than faking them — a dead `_ => 3` in `distance_to_decision`,
+a `UNIQUE(segment_id, flag_revision)` that no PRAGMA can disable, NTFS case-insensitivity making
+on-disk case-fold duplicates impossible, and several guards already refused earlier in their own
+loops. Those will read as permanently uncovered branches in llvm-cov; that is correct, not debt.
+
+**Structural ceiling, reported independently by both `commands/` agents and NOT yet resolved:**
+every command taking `app: tauri::AppHandle` is unreachable from `cargo test --lib`, because
+`tauri::test::mock_app()` yields `App<MockRuntime>` while `AppHandle` resolves to `AppHandle<Wry>`
+under the enabled `wry` feature. `import_directory`, `import_audio_file`,
+`resume_interrupted_import`, `open_audio_file`, `batch_transcribe`, the WSL refinement pair,
+`undo`/`redo`, `import_model_deployment`, `bootstrap_legacy_champion` and every `emit_*` helper sit
+behind it — the four ingest commands alone are ~990 lines. Closing it needs generic `R: Runtime`
+signatures (a production change) or integration tests outside the lib target. This may be the real
+reason the functions bar is hard to reach, and it is an owner decision, not a quiet refactor.
+
+Process: seven agents on one crate was too many. The shared cargo lock and MSVC PDB writer made
+the linker the bottleneck — one agent needed 22 attempts over ~40 minutes for a clean full run.
+Five would have been faster in wall-clock. Reviewers worked through it at below-normal priority
+(31 decisions today, 25 of them during the storm) with no sign of disruption.

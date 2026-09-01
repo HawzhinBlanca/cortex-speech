@@ -2144,6 +2144,71 @@ mod typed_ingest_refusal_and_identity_tests {
         // "which build is running" unanswerable (see the silent-rollback incident).
         assert!(!sha.trim().is_empty(), "build identity must never be blank");
     }
+
+    #[test]
+    fn import_journal_failure_helpers_stay_retryable_and_scrub_the_private_detail() {
+        // Both helpers exist so a durable-journal failure never leaks SQL text or an absolute
+        // library path into the webview, and never reads as a permanent loss: the journal itself
+        // survives every one of these refusals, so retrying is the honest owner action.
+        let read = import_journal_read_error(r"SQLITE_CORRUPT reading D:\private\library.db token=secret");
+        assert_eq!(read.code, "IMPORT_JOURNAL_READ_FAILED");
+        assert!(read.retryable);
+        assert_eq!(read.suggested_action, Some(SuggestedActionV1::Retry));
+
+        let write = import_journal_write_error(r"SQLITE_BUSY writing D:\private\library.db token=secret");
+        assert_eq!(write.code, "IMPORT_JOURNAL_UPDATE_FAILED");
+        assert!(write.retryable);
+        assert_eq!(write.suggested_action, Some(SuggestedActionV1::Retry));
+
+        for error in [&read, &write] {
+            let wire = serde_json::to_string(error).expect("serialize journal failure");
+            for forbidden in ["SQLITE", "D:\\", "private", "token", "secret"] {
+                assert!(!wire.contains(forbidden), "{wire} leaked {forbidden}");
+            }
+        }
+    }
+
+    #[test]
+    fn public_import_start_error_classifies_every_private_admission_detail() {
+        let restore = public_import_start_error(RESTORE_IN_PROGRESS_MSG);
+        assert_eq!(restore.code, "RESTORE_IN_PROGRESS");
+        assert!(restore.retryable);
+        assert_eq!(restore.suggested_action, Some(SuggestedActionV1::Retry));
+
+        let busy = public_import_start_error("Import already in progress");
+        assert_eq!(busy.code, "IMPORT_IN_PROGRESS");
+        assert!(busy.retryable);
+        assert_eq!(busy.suggested_action, Some(SuggestedActionV1::Retry));
+
+        // Dedup unavailability arrives wrapped inside a longer private admission message. It must
+        // still degrade to the hard-stop Health refusal — a retryable code here would invite exactly
+        // the import without duplicate protection this refusal exists to prevent.
+        let not_ready =
+            public_import_start_error(&format!("audio import refused: {}", crate::DEDUP_INDEX_UNAVAILABLE_CODE));
+        assert_eq!(not_ready.code, crate::DEDUP_INDEX_UNAVAILABLE_CODE);
+        assert!(!not_ready.retryable);
+        assert_eq!(not_ready.suggested_action, Some(SuggestedActionV1::OpenHealth));
+
+        // Anything else is the generic resume failure, with the private detail left behind.
+        let other = public_import_start_error(r"OS thread creation failed for D:\private\audio");
+        assert_eq!(other.code, "IMPORT_RESUME_FAILED");
+        assert!(other.retryable);
+        let wire = serde_json::to_string(&other).expect("serialize resume failure");
+        for forbidden in ["D:\\", "private", "thread"] {
+            assert!(!wire.contains(forbidden), "{wire} leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn jury_pipeline_failure_logging_never_unwinds_the_import_worker() {
+        // Diagnostics only. The post-import jury runs ON the import worker thread, so this helper
+        // must absorb any context/error pair — including empty and pathologically long text — and
+        // return normally. An unwind here would skip the worker's terminal import-complete event
+        // and wedge the import UI at "processing" forever.
+        log_jury_pipeline_failure("single-file import", "jury adjudication failed");
+        log_jury_pipeline_failure("", "");
+        log_jury_pipeline_failure("directory import", &"e".repeat(10_000));
+    }
 }
 
 #[cfg(test)]
@@ -2400,5 +2465,76 @@ mod state_ingest_command_harness_tests {
         let refused = normalize_text("ک".repeat(100_001), app.state())
             .expect_err("input beyond the character budget must refuse");
         assert_eq!(refused.code, "INVALID_NORMALIZATION_TEXT");
+    }
+
+    #[test]
+    fn claimed_import_start_rejects_on_drop_unless_a_worker_disarmed_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let harness = app.state::<AppState>();
+
+        // A pre-worker early return (validation, recovery inspection, OS thread creation): the
+        // claim is still armed when it drops, so the run must settle as REJECTED — the renderer may
+        // surface the original command error only for a definitively rejected run.
+        let aborted = "00000000-0000-4000-8000-0000000000b1".to_string();
+        harness.try_start_import_for_run(&aborted).expect("claim the import gate");
+        assert_eq!(
+            get_import_run_status(aborted.clone(), app.state()).expect("claimed run status").status,
+            ImportRunStatusV1::Running
+        );
+        drop(ClaimedImportStart::new(&harness, &aborted));
+        assert_eq!(
+            get_import_run_status(aborted, app.state()).expect("aborted run status").status,
+            ImportRunStatusV1::Rejected,
+            "an armed claim that drops before a worker exists must publish a rejection, never a settlement"
+        );
+
+        // The gate must also have reopened: an armed drop that released the run identity but kept
+        // ImportState::Running would wedge every later import behind IMPORT_IN_PROGRESS.
+        let handed_off = "00000000-0000-4000-8000-0000000000b2".to_string();
+        harness.try_start_import_for_run(&handed_off).expect("the gate reopened after an aborted claim");
+        {
+            let mut claim = ClaimedImportStart::new(&harness, &handed_off);
+            claim.disarm();
+        }
+        assert_eq!(
+            get_import_run_status(handed_off.clone(), app.state()).expect("disarmed run status").status,
+            ImportRunStatusV1::Running,
+            "a disarmed claim hands the run to the spawned worker; only the worker may settle it"
+        );
+        harness.finish_import();
+        assert_eq!(
+            get_import_run_status(handed_off, app.state()).expect("settled run status").status,
+            ImportRunStatusV1::Settled
+        );
+    }
+
+    #[test]
+    fn claimed_file_picker_releases_only_the_token_it_armed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let harness = app.state::<AppState>();
+
+        let token = harness.try_start_file_picker().expect("claim the native picker slot");
+        assert_eq!(
+            harness.try_start_file_picker().err().as_deref(),
+            Some("E_FILE_PICKER_BUSY"),
+            "the picker slot is exclusive while a claim holds it"
+        );
+
+        drop(ClaimedFilePicker { state: &harness, token: token.clone() });
+        let successor = harness.try_start_file_picker().expect("the picker slot reopened when the claim dropped");
+
+        // Cancellation, timeout and channel closure can all drop a STALE claim after a successor
+        // armed its own token. Releasing the slot on that stale token would strand the live picker
+        // with an empty cancel slot, exactly the token-loss shape finish_import documents.
+        drop(ClaimedFilePicker { state: &harness, token });
+        assert_eq!(
+            harness.try_start_file_picker().err().as_deref(),
+            Some("E_FILE_PICKER_BUSY"),
+            "a stale claim must never release the live picker's slot"
+        );
+        harness.finish_file_picker(&successor);
+        harness.try_start_file_picker().expect("the owner's own release reopens the slot");
     }
 }

@@ -618,3 +618,184 @@ mod tests {
         assert_eq!(info["duration_ms"], 50);
     }
 }
+
+/// Wave-4 state-boundary coverage for the transcription/alignment `#[tauri::command]` wrappers,
+/// invoked through a genuine managed `State<'_, AppState>`. Deliberately only the arms that refuse
+/// BEFORE any ONNX/WSL inference: a unit test must never depend on a downloaded model, and the
+/// champion is a hard stop by canon, not something a test may stub.
+#[cfg(test)]
+mod state_command_surface_tests {
+    use super::*;
+    use crate::test_support::managed_app_state;
+    use tauri::Manager;
+
+    type MockApp = tauri::App<tauri::test::MockRuntime>;
+
+    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread().build().expect("build test runtime").block_on(future)
+    }
+
+    /// A real 50 ms mono 16 kHz WAV, so `validate_file_path` passes and any decode is trivial.
+    fn probe_wav(dir: &std::path::Path, name: &str) -> String {
+        let path = dir.join(name);
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).expect("create wav");
+        for n in 0..800u32 {
+            writer.write_sample(((n % 320) as i16).wrapping_mul(90)).expect("write sample");
+        }
+        writer.finalize().expect("finalize wav");
+        crate::test_support::await_stable_fixture(&path);
+        path.to_string_lossy().into_owned()
+    }
+
+    fn seed_segment(app: &MockApp, id: &str, audio_path: &str, transcript: &str) {
+        app.state::<AppState>()
+            .lock_db()
+            .insert_segment(&crate::db::SpeechSegment {
+                id: id.into(),
+                audio_path: audio_path.into(),
+                raw_transcript: transcript.into(),
+                duration_ms: 50,
+                ..crate::db::SpeechSegment::default()
+            })
+            .unwrap();
+    }
+
+    type Action = crate::ipc_contract::SuggestedActionV1;
+
+    fn expect_error<T>(result: Result<T, CommandErrorV1>, code: &str, action: Option<Action>) {
+        let error = match result {
+            Ok(_) => panic!("expected {code}, got a success"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, code);
+        assert!(!error.retryable, "{code} is a caller-repairable input, never a retry");
+        assert_eq!(error.suggested_action, action, "{code} suggested action");
+    }
+
+    /// Transcription is bound to an imported clip. Every argument is validated at the boundary, and
+    /// an id-less request is refused with the reload affordance instead of transcribing a loose file.
+    #[test]
+    fn transcribe_segment_validates_its_arguments_and_refuses_an_unbound_clip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let wav = probe_wav(tmp.path(), "bound.wav");
+
+        expect_error(
+            block_on(transcribe_segment(Some("../evil".into()), wav.clone(), None, app.state())),
+            "INVALID_SEGMENT_ID",
+            None,
+        );
+        expect_error(
+            block_on(transcribe_segment(None, "Z:\\nope\\missing.wav".into(), None, app.state())),
+            "INVALID_AUDIO_PATH",
+            None,
+        );
+        expect_error(
+            block_on(transcribe_segment(None, wav.clone(), Some("{not json".into()), app.state())),
+            "INVALID_ALIGNMENT",
+            Some(Action::ReloadClip),
+        );
+        // A valid file with no segment id is the E_TRANSCRIPTION_SOURCE_UNBOUND arm: the champion
+        // never drafts a clip that has no durable identity to commit the provenance against.
+        expect_error(
+            block_on(transcribe_segment(None, wav, None, app.state())),
+            "TRANSCRIPTION_SOURCE_UNBOUND",
+            Some(Action::ReloadClip),
+        );
+    }
+
+    /// Alignment validates audio path, timing JSON, id and text before any decode. The size limit is
+    /// 100 000 chars; one over must be refused as text, not truncated.
+    #[test]
+    fn align_segment_validates_every_argument_before_decoding_audio() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let wav = probe_wav(tmp.path(), "align.wav");
+
+        expect_error(
+            block_on(align_segment("Z:\\nope\\missing.wav".into(), "words".into(), None, None, app.state())),
+            "INVALID_AUDIO_PATH",
+            None,
+        );
+        expect_error(
+            block_on(align_segment(wav.clone(), "words".into(), Some("{not json".into()), None, app.state())),
+            "INVALID_ALIGNMENT",
+            Some(Action::ReloadClip),
+        );
+        expect_error(
+            block_on(align_segment(wav.clone(), "words".into(), None, Some("../evil".into()), app.state())),
+            "INVALID_SEGMENT_ID",
+            None,
+        );
+        expect_error(
+            block_on(align_segment(wav.clone(), "   \n\t".into(), None, None, app.state())),
+            "INVALID_ALIGNMENT_TEXT",
+            None,
+        );
+        expect_error(
+            block_on(align_segment(wav, "x".repeat(100_001), None, None, app.state())),
+            "INVALID_ALIGNMENT_TEXT",
+            None,
+        );
+    }
+
+    /// Word timings are durable evidence about ONE transcript. When the caller names a segment, the
+    /// database row is the authority: a vanished clip, a changed source path and a stale transcript
+    /// each fail closed, and nothing is written.
+    #[test]
+    fn align_segment_fails_closed_on_a_vanished_or_edited_clip_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let wav = probe_wav(tmp.path(), "stored.wav");
+        let other_wav = probe_wav(tmp.path(), "elsewhere.wav");
+        seed_segment(&app, "seg-align", &wav, "authoritative words");
+
+        expect_error(
+            block_on(align_segment(wav.clone(), "words".into(), None, Some("seg-gone".into()), app.state())),
+            "SEGMENT_NOT_FOUND",
+            Some(Action::ReloadClip),
+        );
+        expect_error(
+            block_on(align_segment(
+                other_wav,
+                "authoritative words".into(),
+                None,
+                Some("seg-align".into()),
+                app.state(),
+            )),
+            "ALIGNMENT_SOURCE_CHANGED",
+            Some(Action::ReloadClip),
+        );
+        expect_error(
+            block_on(align_segment(wav, "stale caller text".into(), None, Some("seg-align".into()), app.state())),
+            "ALIGNMENT_SOURCE_CHANGED",
+            Some(Action::ReloadClip),
+        );
+
+        let stored = app.state::<AppState>().lock_db().get_segment_by_id("seg-align").unwrap().expect("clip survives");
+        assert_eq!(stored.alignment_json, None, "a refused alignment must never persist timings");
+        assert_eq!(stored.raw_transcript, "authoritative words", "and must never touch the transcript");
+    }
+
+    #[test]
+    fn rediarize_segments_validates_ids_and_accepts_an_empty_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+
+        let refused = match block_on(rediarize_segments(vec!["ok-id".into(), "../evil".into()], app.state())) {
+            Ok(_) => panic!("one bad id must refuse the whole batch"),
+            Err(error) => error,
+        };
+        assert_eq!(refused.code, "INVALID_SEGMENT_ID");
+        assert!(!refused.retryable);
+
+        let none = block_on(rediarize_segments(vec![], app.state())).expect("an empty request is a no-op");
+        assert_eq!(none, 0, "no ids means no clips re-diarized");
+    }
+}

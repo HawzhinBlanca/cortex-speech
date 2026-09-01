@@ -2919,4 +2919,165 @@ mod tests {
         prune_media_cache_on_startup(&ghost);
         assert!(!ghost.exists(), "the janitor must not create the directory it could not read");
     }
+
+    // The Content-Type the phone/WebView <audio> element gets. A wrong or missing type is a clip that
+    // will not play at all in some engines, so every container the importer accepts must map, and
+    // anything unrecognised must fall to octet-stream rather than to a guess (the response also sets
+    // X-Content-Type-Options: nosniff, so a wrong type is not silently corrected downstream).
+    #[test]
+    fn media_content_type_covers_every_shipped_container_and_defaults_to_octet_stream() {
+        for (name, expected) in [
+            ("clip.wav", "audio/wav"),
+            ("clip.wave", "audio/wav"),
+            ("clip.mp3", "audio/mpeg"),
+            ("clip.flac", "audio/flac"),
+            ("clip.ogg", "audio/ogg"),
+            ("clip.oga", "audio/ogg"),
+            ("clip.m4a", "audio/mp4"),
+            ("clip.mp4", "audio/mp4"),
+            ("clip.webm", "audio/webm"),
+            ("clip.aac", "audio/aac"),
+        ] {
+            assert_eq!(media_content_type(Path::new(name)), expected, "{name}");
+        }
+        // Extensions arrive from the filesystem in whatever case the owner's files carry.
+        assert_eq!(media_content_type(Path::new("CLIP.WAV")), "audio/wav", "extension match is case-insensitive");
+        assert_eq!(media_content_type(Path::new("clip.M4A")), "audio/mp4");
+        // Unknown / absent / dotfile: never guessed.
+        assert_eq!(media_content_type(Path::new("clip.txt")), "application/octet-stream");
+        assert_eq!(media_content_type(Path::new("clip")), "application/octet-stream", "no extension at all");
+        assert_eq!(media_content_type(Path::new(".wav")), "application/octet-stream", "a dotfile has no extension");
+    }
+
+    // Every rejecting arm of the single-range parser. Each None here becomes a 416 rather than a
+    // guessed window, and a guessed window on this path is wrong audio served to a paid reviewer.
+    #[test]
+    fn single_byte_range_refuses_each_unsatisfiable_form() {
+        // Accepting forms first, so a change that breaks real playback fails here too.
+        assert_eq!(parse_single_byte_range("bytes=0-1", 10), Some((0, 1)), "Safari's opening probe");
+        assert_eq!(parse_single_byte_range(" bytes=2-4 ", 10), Some((2, 4)), "surrounding whitespace tolerated");
+        assert_eq!(parse_single_byte_range("bytes=0-99", 10), Some((0, 9)), "an over-long end CLAMPS to the body");
+        assert_eq!(parse_single_byte_range("bytes=-99", 10), Some((0, 9)), "a suffix longer than the body is the body");
+        assert_eq!(parse_single_byte_range("bytes=9-9", 10), Some((9, 9)), "the final byte alone is satisfiable");
+
+        assert_eq!(parse_single_byte_range("bytes=0-1", 0), None, "an empty body satisfies no range");
+        assert_eq!(parse_single_byte_range("items=0-1", 10), None, "only the bytes unit is understood");
+        assert_eq!(parse_single_byte_range("bytes=0-1,4-5", 10), None, "multi-range is refused, not partly honoured");
+        assert_eq!(parse_single_byte_range("bytes=5", 10), None, "a range with no dash is malformed");
+        assert_eq!(parse_single_byte_range("bytes=-0", 10), None, "a zero-length suffix is unsatisfiable per RFC 9110");
+        assert_eq!(parse_single_byte_range("bytes=10-11", 10), None, "a start at or past the end is unsatisfiable");
+        assert_eq!(parse_single_byte_range("bytes=6-3", 10), None, "an inverted range is unsatisfiable");
+        assert_eq!(parse_single_byte_range("bytes=x-3", 10), None, "a non-numeric start is malformed");
+        assert_eq!(parse_single_byte_range("bytes=3-x", 10), None, "a non-numeric end is malformed");
+        assert_eq!(parse_single_byte_range("bytes=-x", 10), None, "a non-numeric suffix is malformed");
+        assert_eq!(parse_single_byte_range("bytes=-", 10), None, "a bare dash names no range");
+    }
+
+    // The protocol's identity gate, exercised directly rather than only through a served request: a
+    // path that is not exactly one canonical v4 UUID on the media host must resolve to no grant, so a
+    // hostile renderer cannot turn the custom scheme into a file reader.
+    #[test]
+    fn protocol_grant_id_is_only_a_bare_canonical_v4_uuid_on_the_media_host() {
+        let id = "2f2d9b66-8566-4d1c-8c14-e18d006b776f";
+        let request = |uri: &str| Request::builder().method(Method::GET).uri(uri).body(Vec::new()).unwrap();
+
+        let good = request(&format!("http://{MEDIA_PROTOCOL_SCHEME}.localhost/{id}"));
+        assert_eq!(protocol_request_grant_id(&good), Some(id), "the scheme host serves a live grant");
+        let plain_localhost = request(&format!("http://localhost/{id}"));
+        assert_eq!(protocol_request_grant_id(&plain_localhost), Some(id), "plain localhost is the other legal host");
+
+        assert_eq!(
+            protocol_request_grant_id(&request(&format!(
+                "http://{MEDIA_PROTOCOL_SCHEME}.localhost/{id}?path=C:/x.wav"
+            ))),
+            None,
+            "ANY query string is refused outright — no parameter may steer this route"
+        );
+        assert_eq!(
+            protocol_request_grant_id(&request(&format!("http://evil.localhost/{id}"))),
+            None,
+            "another host is not this protocol"
+        );
+        assert_eq!(
+            protocol_request_grant_id(&request(&format!("http://{MEDIA_PROTOCOL_SCHEME}.localhost/media/{id}"))),
+            None,
+            "a nested path is not a grant id"
+        );
+        assert_eq!(
+            protocol_request_grant_id(&request(&format!("http://{MEDIA_PROTOCOL_SCHEME}.localhost/"))),
+            None,
+            "an empty path names no grant"
+        );
+        assert_eq!(
+            protocol_request_grant_id(&request(&format!(
+                "http://{MEDIA_PROTOCOL_SCHEME}.localhost/{}",
+                id.to_uppercase()
+            ))),
+            None,
+            "a non-canonical (upper-case) rendering is not the id we minted"
+        );
+        // The braced and simple UUID renderings are refused too. Asserted through the id predicate
+        // rather than through a URI: `{`/`}` are not legal URI path bytes, so a braced request could
+        // not even be constructed, and a test that cannot build its input proves nothing.
+        assert!(!is_canonical_media_grant_id(&format!("{{{id}}}")), "the braced rendering is not canonical");
+        assert!(!is_canonical_media_grant_id(&id.replace('-', "")), "the simple rendering is not canonical");
+        assert!(is_canonical_media_grant_id(id), "and the one we mint is");
+        // Version nibble 0 instead of 4: parses as a UUID, is not one of ours.
+        assert_eq!(
+            protocol_request_grant_id(&request(&format!(
+                "http://{MEDIA_PROTOCOL_SCHEME}.localhost/2f2d9b66-8566-0d1c-8c14-e18d006b776f"
+            ))),
+            None,
+            "only v4 RFC4122 grants exist"
+        );
+    }
+
+    // The internal materialization deadline. Its Err arm is what stops a wedged decode from holding a
+    // media worker open; its Ok arms are what let ordinary work through.
+    #[test]
+    fn media_deadline_passes_until_the_instant_is_reached() {
+        assert!(ensure_media_deadline(None, "unbounded").is_ok(), "no deadline never trips");
+        assert!(
+            ensure_media_deadline(Some(Instant::now() + StdDuration::from_secs(60)), "plenty of time").is_ok(),
+            "a future deadline is not exceeded"
+        );
+        let expired = Instant::now() - StdDuration::from_millis(1);
+        let error = ensure_media_deadline(Some(expired), "after duration probe").unwrap_err();
+        assert_eq!(
+            error, "Canonical review media exceeded its internal deadline after duration probe",
+            "the phase must reach the caller so a wedge is attributable"
+        );
+    }
+
+    // The admission counter that bounds protocol work before an OS thread is created. A compromised
+    // renderer can issue custom-scheme requests at will; this is what stops that becoming unbounded
+    // thread growth. Exercised on a LOCAL counter, not the process-wide one — a sibling test
+    // deliberately exhausts all eight real permits, and reading that global here would race it.
+    #[test]
+    fn the_worker_admission_counter_refuses_at_its_limit() {
+        let counter = AtomicUsize::new(0);
+        assert!(try_increment_below(&counter, 2), "first slot is free");
+        assert!(try_increment_below(&counter, 2), "second slot is free");
+        assert!(!try_increment_below(&counter, 2), "the third is refused at the limit");
+        assert_eq!(counter.load(Ordering::Acquire), 2, "a refused acquire must NOT have incremented");
+        assert!(!try_increment_below(&counter, 0), "a zero limit admits nobody");
+        assert_eq!(counter.load(Ordering::Acquire), 2, "and still must not have incremented");
+        // Above the limit (as a leaked permit or an accounting slip would leave it) stays refused
+        // rather than wrapping back into acceptance.
+        counter.store(usize::MAX, Ordering::Release);
+        assert!(!try_increment_below(&counter, 2), "already over the limit is still refused");
+    }
+
+    // The refusal the renderer sees when every worker slot is taken. It must carry no body and no
+    // filesystem detail — only the status the player can retry on.
+    #[test]
+    fn busy_response_is_an_empty_503_that_leaks_nothing() {
+        let response = media_protocol_busy_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.body().is_empty(), "a refusal carries no bytes");
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store", "a transient refusal is never cached");
+        assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(response.headers()["X-Content-Type-Options"], "nosniff");
+    }
 }

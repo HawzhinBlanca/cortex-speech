@@ -4123,4 +4123,157 @@ mod tests {
         assert!(latest_decision(&db, &pool.pool_id, "Hemn").unwrap().is_none());
         assert!(operation(&db, "123e4567-e89b-42d3-a456-4266141740aa").unwrap().is_none());
     }
+
+    /// Two fail-closed arms of `load` nothing else reached. Both model low-level corruption — the
+    /// immutability triggers make either shape unwritable through the app — and both must refuse to
+    /// hand back a pool whose identity cannot be proven, rather than serve it.
+    #[test]
+    fn orphaned_pool_authority_and_off_champion_drafts_refuse_to_load() {
+        let (_dir, db, pool) = one_clip_pool("دەقی دروست");
+        const OTHER_DRAFT: &str = "omniasr-7b-test-other";
+        crate::registry::register_candidate(
+            &db,
+            &crate::registry::NewModelVersion {
+                id: OTHER_DRAFT.to_string(),
+                family: crate::deployment::OMNIASR_7B_FAMILY.to_string(),
+                model_card_name: Some("other draft".to_string()),
+                checkpoint_sha256: "d".repeat(64),
+                checkpoint_path: "/test/other.json".to_string(),
+                source: "cortex-finetuned".to_string(),
+                license: "owner-full-rights".to_string(),
+            },
+        )
+        .unwrap();
+
+        // The membership digest covers model_version_id, so a tampered member alone trips the
+        // DIGEST arm first. Re-stamping the registry with the recomputed digest is what makes the
+        // champion-scope arm the one that fires — it is the last line of defence, not the first.
+        let mut drifted = (*pool.members).clone();
+        drifted.get_mut("clip").unwrap().model_version_id = OTHER_DRAFT.to_string();
+        let (count, digest) = member_evidence(&drifted).unwrap();
+        db.connection()
+            .execute_batch(
+                "DROP TRIGGER review_pool_members_immutable_update;
+             DROP TRIGGER review_pool_registry_immutable_update;
+             DROP TRIGGER review_pool_registry_immutable_delete;",
+            )
+            .unwrap();
+        db.connection().execute("UPDATE review_pool_members SET model_version_id=?1", [OTHER_DRAFT]).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE review_pool_registry SET focus_segment_count=?1, focus_sha256=?2",
+                rusqlite::params![count as i64, digest],
+            )
+            .unwrap();
+        let error = load(&db).unwrap_err();
+        assert!(error.contains("draft from outside its frozen champion identity"), "{error}");
+
+        // Authority rows that outlive their registry are not "no pool" — they are an unprovable one.
+        db.connection().execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        db.connection().execute("DELETE FROM review_pool_registry", []).unwrap();
+        let error = load(&db).unwrap_err();
+        assert!(error.contains("without its immutable registry"), "{error}");
+        assert!(
+            exportable_segment_ids(&db).unwrap().is_none(),
+            "the export scope reader must never widen when the registry is gone"
+        );
+    }
+
+    /// OWNER CANON 2026-08-29: a sentence is decided by any two DIFFERENT reviewers, so the queue
+    /// serves whatever is NEAREST a decision. All three live ranks in one queue, including the
+    /// middle one nothing else pinned — a disagreeing pair still needs a third opinion, which makes
+    /// it worth more than a member no one has judged and less than one already holding a single
+    /// opinion.
+    ///
+    /// The canonical `reviewed_by` row IS judgement one (`reviewer_sets_on` reads it alongside the
+    /// pool decisions), and `record_decision` only accepts an observation on a clip that already
+    /// carries one — so "untouched" here means a member with no canonical answer at all, not a
+    /// member nobody has opened.
+    #[test]
+    fn the_queue_ranks_a_disagreeing_pair_between_one_opinion_and_an_unjudged_clip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        seed_champion(&db);
+        rollback_fixture_to(&db, 59);
+        for (id, canonical_reviewer) in [("fresh", Some("Nechir")), ("needs", Some("Nechir")), ("untouched", None)] {
+            let audio = dir.path().join(format!("{id}.wav"));
+            std::fs::write(&audio, b"wav").unwrap();
+            db.insert_segment_full(&segment(id, &audio, canonical_reviewer)).unwrap();
+        }
+        upgrade_fixture_from(&db, 59);
+        for (id, byte) in [("fresh", "a"), ("needs", "b"), ("untouched", "c")] {
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+                    rusqlite::params![id, byte.repeat(64)],
+                )
+                .unwrap();
+        }
+        let pool = activate(
+            &db,
+            "123e4567-e89b-42d3-a456-426614174052",
+            &[
+                PoolMemberInput { segment_id: "fresh".into(), voice_name: "Lamo".into() },
+                PoolMemberInput { segment_id: "needs".into(), voice_name: "Lamo".into() },
+                PoolMemberInput { segment_id: "untouched".into(), voice_name: "Lamo".into() },
+            ],
+        )
+        .unwrap();
+
+        // Sara disagrees with the canonical answer on "needs": two distinct outcomes from two
+        // distinct reviewers is exactly the state a third opinion exists to break.
+        let (_, revision) = db.get_segment_by_id_with_revision("needs").unwrap().unwrap();
+        let audio_content_hash = pool.members.get("needs").unwrap().audio_content_hash.clone();
+        record_decision(
+            &db,
+            &pool,
+            &PoolDecisionInput {
+                segment_id: "needs",
+                reviewer: "Sara",
+                action: "edit",
+                submitted_transcript: Some("دەقی جیاواز"),
+                served_transcript: "دەقی چامپیۆن",
+                served_revision: revision,
+                audio_content_hash: Some(&audio_content_hash),
+                source_start_ms: Some(0),
+                source_end_ms: Some(1_000),
+                duration_ms: 1_000,
+                requested_action: "edit",
+                requested_transcript: "دەقی جیاواز",
+                operation_id: "123e4567-e89b-42d3-a456-426614174060",
+                operation_payload_hash: &"b".repeat(64),
+                created_at_ms: 1,
+            },
+        )
+        .unwrap()
+        .expect("a pool observation on a verified, decided clip is recorded");
+
+        let resolutions = segment_resolutions(&db, None).unwrap();
+        let row = |segment_id: &str| {
+            resolutions
+                .iter()
+                .find(|row| row.segment_id == segment_id)
+                .unwrap_or_else(|| panic!("{segment_id} is missing from the resolutions"))
+        };
+        assert_eq!((row("fresh").status.as_str(), row("fresh").reviewer_count), ("pending", 1));
+        assert_eq!((row("needs").status.as_str(), row("needs").reviewer_count), ("needsThirdReview", 2));
+        assert_eq!((row("untouched").status.as_str(), row("untouched").reviewer_count), ("pending", 0));
+
+        assert_eq!(
+            pending_segment_ids(&db, &pool, "Hemn", None).unwrap(),
+            vec!["fresh", "needs", "untouched"],
+            "nearest a decision first: one opinion, then a disagreeing pair, then an unjudged clip"
+        );
+        assert_eq!(
+            pending_segment_ids(&db, &pool, "Sara", None).unwrap(),
+            vec!["fresh", "untouched"],
+            "a reviewer never sees a clip they already judged"
+        );
+        assert_eq!(
+            pending_segment_ids(&db, &pool, "  nEcHiR  ", None).unwrap(),
+            vec!["untouched"],
+            "the canonical answer is that reviewer's judgement, and identity is trim/case normalized"
+        );
+    }
 }

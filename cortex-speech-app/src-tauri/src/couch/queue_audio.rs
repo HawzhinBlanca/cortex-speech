@@ -1678,3 +1678,205 @@ pub(super) fn api_renew(body: &[u8], reviewer: &str, state: &Mutex<CouchState>) 
     guard.leases.insert(parsed.id.clone(), (reviewer.to_string(), now));
     json_reply(200, serde_json::json!({ "ok": true, "ttlSeconds": LEASE_TTL.as_secs() }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seg(id: &str) -> SpeechSegment {
+        SpeechSegment { id: id.to_string(), audio_path: format!(r"D:\clips\{id}.wav"), ..SpeechSegment::default() }
+    }
+
+    fn header(reply: &Reply, name: &str) -> Option<String> {
+        reply.3.iter().find(|(key, _)| *key == name).map(|(_, value)| value.clone())
+    }
+
+    // The two-speaker badge the reviewer sees BEFORE deciding. `None` is "not measured", and it must
+    // read as false — absence of a measurement is not evidence of a single speaker, and a clip
+    // wrongly presented as ordinary work walks a two-speaker chunk into a single-speaker corpus.
+    #[test]
+    fn a_speaker_change_is_claimed_only_when_it_was_actually_measured() {
+        let with_score = |score: Option<f64>| {
+            let mut s = seg("s1");
+            s.speaker_change_score = score;
+            s
+        };
+        assert!(!holds_a_speaker_change(&with_score(None)), "unmeasured must never claim one speaker or two");
+        let threshold = crate::diarization::SPEAKER_CHANGE_THRESHOLD as f64;
+        assert!(holds_a_speaker_change(&with_score(Some(threshold - 0.01))), "below the threshold IS a turn");
+        assert!(!holds_a_speaker_change(&with_score(Some(threshold))), "exactly at the threshold is not below it");
+        assert!(!holds_a_speaker_change(&with_score(Some(0.99))), "a confidently single-speaker clip");
+    }
+
+    // Both authorization filters the queue and the decision boundary share. Getting either backwards
+    // serves a restricted reviewer a dialect they cannot judge, which is the failure dialect.rs exists
+    // to stop.
+    #[test]
+    fn reviewer_policy_allows_combines_dialect_and_focus() {
+        let hawleri = SpeechSegment {
+            id: "h1".into(),
+            audio_path: r"D:\Kurdish Corpora\KBHP_ep01.wav".into(),
+            ..SpeechSegment::default()
+        };
+        let unmapped = seg("u1");
+
+        assert!(reviewer_policy_allows(None, None, &hawleri), "no roster and no focus is unrestricted");
+        let sorani_only = vec![crate::dialect::SORANI.to_string()];
+        assert!(
+            !reviewer_policy_allows(Some(sorani_only.as_slice()), None, &hawleri),
+            "a Sorani-only reviewer is not given KBHP"
+        );
+        let hawleri_ok = vec![crate::dialect::HAWLERI.to_string()];
+        assert!(reviewer_policy_allows(Some(hawleri_ok.as_slice()), None, &hawleri), "the competent reviewer is");
+        assert!(
+            !reviewer_policy_allows(Some(hawleri_ok.as_slice()), None, &unmapped),
+            "an UNMAPPED source fails closed for a restricted reviewer"
+        );
+        assert!(reviewer_policy_allows(None, None, &unmapped), "but not for an unrestricted one");
+
+        // Focus narrows independently of dialect, and both must agree.
+        let focus: HashSet<String> = ["h1".to_string()].into_iter().collect();
+        assert!(reviewer_policy_allows(None, Some(&focus), &hawleri), "the focused clip passes");
+        assert!(!reviewer_policy_allows(None, Some(&focus), &unmapped), "anything outside the focus does not");
+        assert!(
+            !reviewer_policy_allows(Some(sorani_only.as_slice()), Some(&focus), &hawleri),
+            "focus does not override the dialect refusal"
+        );
+    }
+
+    // Every status this maps to is a different instruction to the phone: 428 = replay the clip,
+    // 409 = reload it, 400 = the request itself was malformed, 500 = the server broke. Collapsing any
+    // pair strands a reviewer with typed corrections and no usable next step.
+    #[test]
+    fn playback_errors_map_to_the_status_that_tells_the_phone_what_to_do() {
+        let status = |message: &str| playback_error_reply(message).0;
+
+        assert_eq!(status("E_NO_PLAYBACK_EVIDENCE: this attempt never received authorized media"), 428);
+        assert_eq!(status("E_PLAYBACK_TIME_IMPLAUSIBLE: 4000 ms claimed in 40 ms"), 428);
+
+        assert_eq!(status(PLAYBACK_EVIDENCE_CHANGED), 409, "the evidence moved under the decision");
+        assert_eq!(status("the served clip was different"), 409);
+        assert_eq!(status("clientAttemptId is already bound to another exact playback request"), 409);
+        assert_eq!(status("this receipt is a replay"), 409);
+
+        assert_eq!(status("invalid playback attempt identity"), 400);
+        assert_eq!(status("malformed request body"), 400);
+        assert_eq!(status("interval ends before it starts"), 400);
+
+        assert_eq!(status("database is locked"), 500, "anything unrecognised is a server fault, not the phone's");
+        // The message itself always reaches the reviewer, whatever the status.
+        let reply = playback_error_reply("database is locked");
+        assert_eq!(String::from_utf8(reply.2).unwrap(), "database is locked");
+    }
+
+    // A refusal on the audio route must be as unshareable as the audio it refused: caches are
+    // per-session and vary on the credential, so a proxy or a shared device cannot replay one
+    // reviewer's refusal (or its absence) to another.
+    #[test]
+    fn private_audio_failures_are_never_shared_across_sessions() {
+        let reply = private_audio_failure(err_reply(403, "audio is not assigned to this reviewer"));
+        assert_eq!(reply.0, 403, "the status and body pass through untouched");
+        assert_eq!(String::from_utf8(reply.2.clone()).unwrap(), "audio is not assigned to this reviewer");
+        assert_eq!(header(&reply, "Cache-Control").as_deref(), Some("private, no-store"));
+        assert_eq!(header(&reply, "Vary").as_deref(), Some("Cookie"));
+    }
+
+    // The identity gate on every playback receipt. It accepts EXACTLY the canonical hyphenated
+    // rendering — a re-cased or braced spelling of the same UUID is a different string everywhere the
+    // receipt is later matched, so accepting it would silently split one attempt into two.
+    #[test]
+    fn canonical_uuid_accepts_only_the_exact_hyphenated_rendering() {
+        let id = "2f2d9b66-8566-4d1c-8c14-e18d006b776f";
+        assert!(canonical_uuid(id));
+        assert!(!canonical_uuid(&id.to_uppercase()), "a re-cased rendering is a different key");
+        assert!(!canonical_uuid(&format!("{{{id}}}")), "the braced form is not canonical");
+        assert!(!canonical_uuid(&id.replace('-', "")), "the simple form is not canonical");
+        assert!(!canonical_uuid(&format!("urn:uuid:{id}")), "the URN form is not canonical");
+        assert!(!canonical_uuid(""), "empty is not an identity");
+        assert!(!canonical_uuid("not-a-uuid"), "and neither is arbitrary text");
+        // Version is NOT checked here (unlike the media grant id) — canonical rendering is the whole
+        // contract, because these ids are minted by this process and only ever compared for equality.
+        assert!(canonical_uuid("2f2d9b66-8566-1d1c-8c14-e18d006b776f"), "any version renders canonically");
+    }
+
+    // The audio URL's only accepted parameter. A second copy, or a value that is not exactly one
+    // canonical UUID, is refused outright rather than resolved to "the first one wins" — a receipt
+    // chosen by parameter order is a receipt an attacker chooses.
+    #[test]
+    fn playback_attempt_query_takes_one_canonical_id_or_refuses() {
+        let id = "2f2d9b66-8566-4d1c-8c14-e18d006b776f";
+
+        assert_eq!(playback_attempt_query("/api/audio/seg-1"), Ok(None), "no query, no attempt");
+        assert_eq!(playback_attempt_query("/api/audio/seg-1?"), Ok(None), "an empty query is not a bad one");
+        assert_eq!(playback_attempt_query("/api/audio/seg-1?t=123"), Ok(None), "unrelated parameters are ignored");
+        assert_eq!(
+            playback_attempt_query(&format!("/api/audio/seg-1?t=1&playbackAttemptId={id}&x=2")),
+            Ok(Some(id.to_string())),
+            "the parameter is found wherever it sits"
+        );
+
+        for bad in [
+            format!("/api/audio/seg-1?playbackAttemptId={id}&playbackAttemptId={id}"),
+            "/api/audio/seg-1?playbackAttemptId=not-a-uuid".to_string(),
+            "/api/audio/seg-1?playbackAttemptId=".to_string(),
+            "/api/audio/seg-1?playbackAttemptId".to_string(),
+            format!("/api/audio/seg-1?playbackAttemptId={}", id.to_uppercase()),
+        ] {
+            let reply = playback_attempt_query(&bad).expect_err(&format!("{bad} must be refused"));
+            assert_eq!(reply.0, 400, "{bad}");
+            assert_eq!(
+                header(&reply, "Cache-Control").as_deref(),
+                Some("private, no-store"),
+                "a refusal on the audio route stays private: {bad}"
+            );
+        }
+    }
+
+    // The bounded pilot's refill arithmetic. The whole point is that a page reload can neither evade
+    // the hidden checks nor burn a fresh key, so `resend` must always be preferred and `fresh` must
+    // never push the distinct-key count past the proven quota.
+    #[test]
+    fn spot_check_plan_reuses_outstanding_keys_before_minting_any() {
+        // A full batch with nothing outstanding mints up to the quota and no more.
+        assert_eq!(pilot_spot_check_plan(25, 2, 0, 0, false), (0, 2), "25 work items want 4 checks, quota allows 2");
+        // One check already handed out is RE-SERVED, and does not consume a second quota unit.
+        assert_eq!(pilot_spot_check_plan(8, 2, 0, 1, false), (1, 0), "the outstanding key is re-served, not replaced");
+        // Outstanding beyond the desire is capped at the desire.
+        assert_eq!(pilot_spot_check_plan(25, 2, 1, 3, false), (2, 0), "never re-serve more than this refill wants");
+        // Quota already spent on distinct keys: nothing fresh may be minted.
+        assert_eq!(pilot_spot_check_plan(25, 2, 2, 0, false), (0, 0), "a spent quota mints nothing");
+        // No work in this batch means no checks unless completion is being forced.
+        assert_eq!(pilot_spot_check_plan(0, 2, 0, 0, false), (0, 0), "no work, no checks");
+        assert_eq!(pilot_spot_check_plan(0, 2, 0, 0, true), (0, 2), "forcing completion asks for the whole quota");
+        // Forcing completion with one key already served and still outstanding: that key is re-served
+        // (it does not spend a second quota unit) and exactly one fresh key is minted, landing on the
+        // quota of two DISTINCT keys and never past it.
+        assert_eq!(pilot_spot_check_plan(0, 2, 1, 1, true), (1, 1), "re-serve first, then mint the last slot");
+        assert_eq!(pilot_spot_check_plan(0, 2, 2, 1, true), (1, 0), "with the quota already spent, only re-serve");
+    }
+
+    // The clip-bytes cache key. It must move when the AUDIO would move (identity, source, boundaries,
+    // length) and stay put when only the transcript changes — a stale ETag here serves a reviewer the
+    // previous clip's bytes against the current clip's text.
+    #[test]
+    fn the_audio_fingerprint_tracks_the_bytes_not_the_text() {
+        let base = seg("s1");
+        let fingerprint = audio_fingerprint(&base);
+        assert_eq!(fingerprint, audio_fingerprint(&seg("s1")), "the same clip fingerprints the same");
+
+        let mut retranscribed = base.clone();
+        retranscribed.raw_transcript = "a different draft".into();
+        retranscribed.annotated_transcript = Some("a human correction".into());
+        assert_eq!(audio_fingerprint(&retranscribed), fingerprint, "editing the TEXT does not move the audio");
+
+        let mut realigned = base.clone();
+        realigned.alignment_json = Some(r#"{"words":[]}"#.into());
+        assert_ne!(audio_fingerprint(&realigned), fingerprint, "a re-alignment moves the clip boundaries");
+        let mut relinked = base.clone();
+        relinked.audio_path = r"D:\clips\elsewhere.wav".into();
+        assert_ne!(audio_fingerprint(&relinked), fingerprint, "a different source is different bytes");
+        let mut retrimmed = base.clone();
+        retrimmed.duration_ms = base.duration_ms + 1;
+        assert_ne!(audio_fingerprint(&retrimmed), fingerprint, "a different length is different bytes");
+    }
+}

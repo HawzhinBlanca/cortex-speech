@@ -3117,4 +3117,235 @@ mod tests {
             ),
         }
     }
+
+    #[test]
+    fn directory_scan_selects_only_supported_audio_extensions() {
+        // The scan's extension filter, in and below the selected folder. A file the owner did not
+        // intend to import (notes, a `.bak` of a WAV, an extension-less blob) must be invisible —
+        // and the match is case-insensitive, because Windows spells extensions either way.
+        let (pipeline, dir) = test_pipeline(local_import_settings());
+        pipeline.open_db().unwrap().initialize().unwrap();
+        let import_dir = dir.path().join("mixed");
+        let nested = import_dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        for name in ["keep.wav", "KEEP.MP3", "skip.txt", "skip.wav.bak", "no_extension"] {
+            std::fs::write(import_dir.join(name), b"never-decoded").unwrap();
+        }
+        std::fs::write(nested.join("keep.opus"), b"never-decoded").unwrap();
+
+        let events = RefCell::new(Vec::new());
+        // Every selected file is unreadable, so the run halts on the first one. The announced total
+        // is what this pins.
+        let _ = pipeline.import_directory(&import_dir, None, |event| events.borrow_mut().push(event));
+
+        let events = events.into_inner();
+        match events.first() {
+            Some(PipelineEvent::Started { total }) => {
+                assert_eq!(*total, 3, "only the three audio files, recursively, may be selected");
+            }
+            other => panic!("the scan must announce its total first, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_with_no_supported_audio_retains_the_durable_journal() {
+        // A fresh empty selection is a successful no-op. A RESUME already owns a successor journal,
+        // so reporting success would leave that row running and re-surface the same interruption
+        // after every restart. It must fail while KEEPING the journal, so a moved or renamed source
+        // folder can be repaired without losing recovery authority.
+        let (pipeline, dir) = test_pipeline(AppSettings::default());
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        let import_dir = dir.path().join("moved_away");
+        std::fs::create_dir_all(&import_dir).unwrap();
+        std::fs::write(import_dir.join("notes.txt"), b"not audio").unwrap();
+        let journal_writer = &db;
+        let crashed = journal_writer.begin_import_job(&import_dir.to_string_lossy(), 1).unwrap();
+        let successor = db.handoff_import_job_for_resume(&crashed).unwrap();
+
+        let done = std::collections::HashSet::new();
+        let events = RefCell::new(Vec::new());
+        let error = pipeline
+            .import_directory_with_agent_run_id(&import_dir, None, None, Some(&done), Some(&successor), |event| {
+                events.borrow_mut().push(event)
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("no supported audio files"), "{error}");
+        assert!(error.contains("journal was retained"), "{error}");
+        let retained = db.find_interrupted_import_job().unwrap().expect("the successor journal must survive");
+        assert_eq!(retained.id, successor);
+        assert!(
+            events.into_inner().iter().all(|event| !matches!(event, PipelineEvent::Completed { .. })),
+            "a retained-journal refusal must never emit a completion"
+        );
+        assert!(!pipeline.import_status().running);
+    }
+
+    #[test]
+    fn champion_pass_halts_the_whole_file_when_every_attempt_is_infrastructure() {
+        // run_primary_wsl_pass_for_import's Infra arm through the real wave loop: the champion is
+        // the selected primary (the repo client resolves under test), the source cannot be read, and
+        // every retry fails the same way. The file halts with the operator-actionable message and
+        // NOTHING is copied into the in-memory batch — no identity, no draft, no publication.
+        let (pipeline, dir) = test_pipeline(AppSettings {
+            asr_model_size: AsrModelSize::WSL7B,
+            enable_diarization: false,
+            enable_denoising: false,
+            ..AppSettings::default()
+        });
+        let missing = dir.path().join("never-created.wav").to_string_lossy().to_string();
+        let mut segments = vec![SpeechSegment {
+            id: "champion-halt-1".into(),
+            audio_path: missing,
+            raw_transcript: "[Pending WSL 7B ASR]".into(),
+            duration_ms: 1_000,
+            ..SpeechSegment::default()
+        }];
+
+        let error = pipeline.run_primary_wsl_pass_for_import(&mut segments, None).unwrap_err().to_string();
+
+        assert!(error.contains("OmniASR 7B server is not running"), "{error}");
+        assert!(error.contains("halted before"), "the halt must state that nothing was published: {error}");
+        assert_eq!(segments[0].raw_transcript, "[Pending WSL 7B ASR]", "a halted pass must not mutate the batch");
+        assert!(segments[0].model_version_id.is_none(), "no identity may be attributed to a failed draft");
+    }
+
+    #[test]
+    fn single_file_import_announces_the_source_reference_stage_and_fails_without_a_key() {
+        // The opt-in branch of import_single_file_with_events: the reference phase/stage/progress
+        // events are emitted BEFORE the work, and a missing key ends the import 0 succeeded /
+        // 1 failed rather than quietly skipping the stage it just announced. No network call — the
+        // encrypted key store is this test's own temp directory and holds nothing.
+        let (pipeline, dir) = test_pipeline(AppSettings {
+            jury_cloud_opt_in: true,
+            source_reference_models: vec!["gemini-2.5-pro".to_string()],
+            ..local_import_settings()
+        });
+        pipeline.open_db().unwrap().initialize().unwrap();
+        // The key store is this test's own temp directory, but ApiKeys::load also honours the PROCESS
+        // environment. Fail loudly here rather than letting a machine that happens to export
+        // GEMINI_API_KEY turn a unit test into a real cloud upload.
+        assert!(
+            pipeline.jury_cloud_api_key().unwrap().is_none(),
+            "this test requires no Gemini key in scope (unset GEMINI_API_KEY); it must never upload audio"
+        );
+        let wav = dir.path().join("reference.wav");
+        write_sine_wav(&wav, 16_000);
+
+        let events = RefCell::new(Vec::new());
+        let error = pipeline
+            .import_single_file_with_events(&wav, None, None, |event| events.borrow_mut().push(event))
+            .expect_err("an announced reference stage with no key must fail loudly");
+        let error = error.to_string();
+        assert!(error.contains("Whole-file reference transcript failed before chunking"), "{error}");
+        assert!(error.contains("Gemini API key is required"), "{error}");
+
+        let events = events.into_inner();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, PipelineEvent::Phase { phase } if phase == "reference_transcribing")),
+            "the reference phase must be announced before the work"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                PipelineEvent::AgentStage { stage, status, .. } if stage == "source_reference" && status == "running"
+            )),
+            "the stage must report running, never a silent skip"
+        );
+        assert!(
+            events.iter().any(|event| matches!(event, PipelineEvent::Completed { total: 1, succeeded: 0, failed: 1 })),
+            "a failed reference stage completes 0/1, never a flattering success"
+        );
+        assert!(!pipeline.import_status().running, "the RAII guard clears the status on this path too");
+    }
+
+    #[test]
+    fn directory_import_announces_the_reference_stage_per_file_before_halting() {
+        // The directory path has its OWN per-file reference-stage branch. It must announce the stage
+        // it is about to run and then halt honestly when that stage cannot run, rather than
+        // continuing to the next file with a silently skipped reference.
+        let (pipeline, dir) = test_pipeline(AppSettings {
+            jury_cloud_opt_in: true,
+            source_reference_models: vec!["gemini-2.5-pro".to_string()],
+            ..local_import_settings()
+        });
+        pipeline.open_db().unwrap().initialize().unwrap();
+        // Same guard as the single-file case: no key in scope, so no audio can leave the machine.
+        assert!(
+            pipeline.jury_cloud_api_key().unwrap().is_none(),
+            "this test requires no Gemini key in scope (unset GEMINI_API_KEY); it must never upload audio"
+        );
+        let import_dir = dir.path().join("reference_dir");
+        std::fs::create_dir_all(&import_dir).unwrap();
+        write_sine_wav(&import_dir.join("one.wav"), 16_000);
+
+        let events = RefCell::new(Vec::new());
+        let error = pipeline
+            .import_directory(&import_dir, None, |event| events.borrow_mut().push(event))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("import HALTED at one.wav"), "{error}");
+        assert!(error.contains("Gemini API key is required"), "the terminal cause must survive the halt: {error}");
+
+        let events = events.into_inner();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                PipelineEvent::AgentStage { stage, status, .. } if stage == "source_reference" && status == "running"
+            )),
+            "the per-file reference stage must be announced"
+        );
+        assert!(
+            events.iter().any(|event| matches!(event, PipelineEvent::Error { file, .. } if file == "one.wav")),
+            "the failing file must be named in an Error event"
+        );
+        assert!(
+            events.iter().all(|event| !matches!(event, PipelineEvent::Completed { .. })),
+            "a halted directory import must never emit a completion"
+        );
+    }
+
+    #[test]
+    fn machine_rows_without_a_champion_registry_refuse_adoption_instead_of_duplicating() {
+        // The registry-unavailable arm's MACHINE side (its human side is already pinned above).
+        // Rows whose only authority is machine provenance cannot be adopted while the current
+        // champion identity is unknowable — and the refusal must leave them exactly as they are
+        // rather than minting a second copy of the same recording.
+        let (pipeline, dir) = test_pipeline(local_import_settings());
+        let db = pipeline.open_db().unwrap();
+        db.initialize().unwrap();
+        let wav = dir.path().join("machine-rows.wav");
+        write_sine_wav(&wav, 16_000);
+        let wav_str = wav.to_string_lossy().to_string();
+        db.insert_segment(&SpeechSegment {
+            id: "machine-1".into(),
+            audio_path: wav_str.clone(),
+            raw_transcript: "دەقی مەکینە".into(),
+            model_version_id: Some("someone-else".into()),
+            duration_ms: 1_000,
+            alignment_json: Some(
+                chunking::SegmentSourceMeta {
+                    source_start_ms: 0,
+                    source_end_ms: 1_000,
+                    chunk_index: 0,
+                    chunk_count: 1,
+                }
+                .to_alignment_json(),
+            ),
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+        let identity_writer = &db;
+        identity_writer.set_audio_identity(&wav_str, &canonical_identity(&wav)).unwrap();
+
+        let error = pipeline.process_single_file(&wav, &db).unwrap_err().to_string();
+
+        assert!(error.contains("current champion authority could not be established"), "{error}");
+        assert!(error.contains("left untouched"), "{error}");
+        assert_eq!(db.segment_count().unwrap(), 1, "a refusal must neither duplicate nor delete the existing row");
+    }
 }
