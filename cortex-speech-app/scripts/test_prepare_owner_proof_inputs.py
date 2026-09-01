@@ -2006,7 +2006,20 @@ proof.prepare_bundle(
     @unittest.skipUnless(os.name == "nt", "release tool identity is Windows-only")
     def test_pinned_git_legitimate_installed_hardlinks_are_hash_bound_not_rejected(self) -> None:
         contract = proof.load_contract(proof.DEFAULT_CONTRACT)
-        git = proof._pinned_git_tool(contract["helperToolchain"])
+        toolchain = contract["helperToolchain"]
+        # The contract pins the OWNER'S RELEASE TOOLCHAIN by hash, which is the point: a proof
+        # bundle may only be built with the exact Git binary the release contract names.
+        #
+        # Skip ONLY on a hosted CI runner, where that toolchain cannot exist by construction. Do
+        # NOT skip merely because the hash differs: on the release workstation a mismatch means the
+        # pinned Git drifted from the contract, and that must stay a LOUD FAILURE rather than a
+        # quiet skip -- a gate that skips itself when its subject changes is worse than no gate.
+        if os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("CI") == "true":
+            raise unittest.SkipTest(
+                "SKIP-ENV: hosted CI runner - the release contract pins the owner workstation's "
+                "Git binary by hash, which no runner can have; the refusal there is the pin working"
+            )
+        git = proof._pinned_git_tool(toolchain)
         self.assertGreaterEqual(os.stat(git).st_nlink, 1)
 
     def test_schema_fingerprint_is_pinned_not_merely_well_formed(self) -> None:
