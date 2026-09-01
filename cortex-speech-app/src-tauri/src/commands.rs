@@ -6075,6 +6075,21 @@ mod state_command_harness_tests {
         assert_eq!(refused.code, "DATASET_MERGE_FAILED");
         let untouched = app.state::<AppState>().lock_db().get_segment_by_id("seg-merge-1").unwrap().unwrap();
         assert_eq!(untouched.raw_transcript, "deng yek du", "the refusal must leave the good draft intact");
+
+        // The other honest counter: re-merging an existing id with a fresh non-blank draft reports
+        // updated (never created) and actually replaces the stored machine text.
+        let refreshed = serde_json::to_string(&vec![crate::db::SpeechSegment {
+            id: "seg-merge-1".to_string(),
+            audio_path: "C:/fixtures/seg-merge-1.wav".to_string(),
+            raw_transcript: "deng yek du sê".to_string(),
+            ..Default::default()
+        }])
+        .unwrap();
+        let second = tauri::async_runtime::block_on(merge_dataset_json(refreshed, app.state()))
+            .expect("merge onto an existing unreviewed row");
+        assert_eq!(second, crate::ipc_contract::MergeDatasetResultV1 { created: 0, updated: 1 });
+        let replaced = app.state::<AppState>().lock_db().get_segment_by_id("seg-merge-1").unwrap().unwrap();
+        assert_eq!(replaced.raw_transcript, "deng yek du sê");
     }
 
     #[test]
@@ -6201,5 +6216,697 @@ mod state_command_harness_tests {
         assert!(!status.running, "no test starts the couch server; status must say stopped");
         assert!(status.reviewers.is_empty(), "a stopped server mints no reviewer links");
         assert_eq!(status.certificate_fingerprint, None);
+    }
+
+    // ── Wave-4: commands.rs-root helpers + remaining State commands ─────────────────────────────
+
+    fn selection_report(
+        model: &str,
+        transcript: &str,
+        score: f64,
+        margin: f64,
+        commit: bool,
+    ) -> crate::agentic::CandidateSelectionReport {
+        crate::agentic::CandidateSelectionReport {
+            reference_model_id: Some(format!("ref-{model}")),
+            selected_model_id: model.to_string(),
+            selected_transcript: transcript.to_string(),
+            selected_score: score,
+            confidence: 0.5,
+            margin,
+            should_commit: commit,
+            positional_window: false,
+            rationale: "test rationale".to_string(),
+            reference_window_preview: String::new(),
+            scores: Vec::new(),
+            reference_agreement: Vec::new(),
+        }
+    }
+
+    fn eval_run_fixture(id: &str, wer: f64, cer: f64) -> crate::ipc_contract::EvalRunResultV1 {
+        crate::ipc_contract::EvalRunResultV1 {
+            run: crate::ipc_contract::EvalRunV1 {
+                id: id.to_string(),
+                model_id: "engine-under-eval".to_string(),
+                run_at: "2026-08-31T00:00:00Z".to_string(),
+                num_segs: 2,
+                wer,
+                cer,
+                meta_json: None,
+            },
+            segments: vec![
+                crate::ipc_contract::EvalSegmentResultV1 {
+                    gold_id: "gold-1".to_string(),
+                    audio_path: "C:/fixtures/gold-1.wav".to_string(),
+                    reference: "deng yek du".to_string(),
+                    hypothesis: "deng yek".to_string(),
+                    wer,
+                    cer,
+                },
+                crate::ipc_contract::EvalSegmentResultV1 {
+                    gold_id: "gold-2".to_string(),
+                    audio_path: "C:/fixtures/gold-2.wav".to_string(),
+                    reference: "deng sê".to_string(),
+                    hypothesis: "deng sê".to_string(),
+                    wer: 0.0,
+                    cer: 0.0,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn build_scorecard_serves_both_baseline_arms_from_real_eval_rows() {
+        let solo = build_scorecard(eval_run_fixture("run-sys", 0.5, 0.25), None).expect("scorecard without baseline");
+        assert!(
+            matches!(solo.scorecard, crate::ipc_contract::ScorecardV1::WithoutBaseline(_)),
+            "no baseline supplied means no comparison may be invented"
+        );
+        assert!(solo.markdown.contains("engine-under-eval"), "markdown names the measured engine");
+        assert!(solo.markdown.contains("ASR Scorecard"), "markdown renders the scorecard header");
+
+        let compared =
+            build_scorecard(eval_run_fixture("run-sys", 0.5, 0.25), Some(eval_run_fixture("run-base", 1.0, 0.5)))
+                .expect("scorecard with baseline");
+        assert!(
+            matches!(compared.scorecard, crate::ipc_contract::ScorecardV1::WithBaseline(_)),
+            "a supplied baseline must produce the significance comparison"
+        );
+    }
+
+    #[test]
+    fn batch_identity_and_config_hashing_are_deterministic_and_typed() {
+        #[derive(serde::Serialize)]
+        struct Config {
+            schema: u8,
+            flag: bool,
+        }
+        let first = canonical_batch_config_sha256(&Config { schema: 1, flag: true }).expect("hash config");
+        let again = canonical_batch_config_sha256(&Config { schema: 1, flag: true }).expect("hash config again");
+        let other = canonical_batch_config_sha256(&Config { schema: 1, flag: false }).expect("hash other config");
+        assert_eq!(first, again, "the same closed config must hash identically");
+        assert_ne!(first, other, "a result-affecting flag change must change the hash");
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+
+        // Real serde_json behavior: a non-finite float does NOT error — it canonicalizes silently as
+        // JSON null, so it hashes identically to `()` (also "null"). Callers must therefore pass
+        // closed structs, never raw floats, or two different broken configs share one digest.
+        let non_finite = canonical_batch_config_sha256(&f64::NAN).expect("non-finite floats canonicalize as null");
+        assert_eq!(non_finite, canonical_batch_config_sha256(&()).expect("unit serializes as null"));
+
+        // The error arm needs a value serde_json genuinely refuses: a map with non-string keys.
+        let mut tuple_keyed = std::collections::HashMap::new();
+        tuple_keyed.insert((1_u8, 2_u8), 3_u8);
+        let unserializable =
+            canonical_batch_config_sha256(&tuple_keyed).expect_err("non-string map keys cannot serialize");
+        assert!(unserializable.starts_with("BATCH_CONFIG_SERIALIZATION_FAILED"));
+
+        let identity = new_batch_executor_identity();
+        assert_eq!(identity.git_sha, crate::GIT_SHA);
+        assert_eq!(identity.attempt_generation, 1);
+        assert_eq!(identity.token_sha256.len(), 64);
+        assert_ne!(identity.token_sha256, new_batch_executor_identity().token_sha256, "attempt tokens are unique");
+
+        let cancelled = batch_start_commit_error(crate::BatchStartCommitError::Cancelled);
+        assert_eq!(cancelled.code, "BATCH_START_CANCELLED");
+        assert!(cancelled.retryable);
+        let lost = batch_start_commit_error(crate::BatchStartCommitError::AuthorityLost);
+        assert_eq!(lost.code, "BATCH_START_AUTHORITY_LOST");
+        assert!(!lost.retryable);
+        assert_eq!(lost.suggested_action, Some(crate::ipc_contract::SuggestedActionV1::OpenHealth));
+    }
+
+    #[test]
+    fn model_status_probe_and_readiness_snapshot_report_reality() {
+        let status = vec![
+            serde_json::json!({ "filename": "model-a.onnx", "downloaded": true }),
+            serde_json::json!({ "filename": "model-b.onnx", "downloaded": false }),
+            serde_json::json!({ "note": "no filename or downloaded keys" }),
+        ];
+        assert!(model_downloaded(&status, "model-a.onnx"));
+        assert!(!model_downloaded(&status, "model-b.onnx"), "a present-but-not-downloaded model is not ready");
+        assert!(!model_downloaded(&status, "model-c.onnx"), "an unlisted model is not ready");
+
+        // Offline default: no provider script configured — the exact closed message, no probe run.
+        let settings = AppSettings::default();
+        let no_script = external_provider_status(&settings);
+        assert_eq!(no_script["available"], false);
+        assert_eq!(no_script["message"], "No external ASR provider script configured");
+
+        let snapshot = build_agentic_readiness_snapshot(&settings, &[], &no_script);
+        assert_eq!(snapshot["ready"], false, "an unconfigured champion provider cannot claim readiness");
+        assert_eq!(snapshot["status"], "blocked");
+        assert_eq!(
+            snapshot["requiredHypothesisModels"].as_u64().map(|count| count as usize),
+            Some(quality::MIN_HYPOTHESIS_MODELS_FOR_TRAINING_READY_MACHINE)
+        );
+        let checks = snapshot["checks"].as_array().expect("readiness checks");
+        assert_eq!(checks[0]["id"], "source_reference");
+        assert_eq!(checks[0]["status"], "not_required", "cloud references off by choice is not a green tick");
+        assert_eq!(checks[1]["id"], "primary_asr");
+        assert_eq!(checks[1]["status"], "blocked");
+        assert_eq!(checks[2]["id"], "hypothesis_coverage");
+        assert_eq!(checks[2]["status"], "not_required");
+    }
+
+    #[test]
+    fn agentic_readiness_reports_cloud_reference_and_diagnostic_engine_arms() {
+        let no_script = serde_json::json!({ "available": false, "message": "no provider" });
+
+        // Opted-in but keyless: whole-file references are blocked and block the verdict.
+        let keyless = AppSettings { jury_cloud_opt_in: true, ..AppSettings::default() };
+        let readiness = build_agentic_readiness(&keyless, &[], &no_script);
+        assert_eq!(readiness.checks[0].id, "source_reference");
+        assert_eq!(readiness.checks[0].status, "blocked");
+        assert!(!readiness.ready);
+
+        // Opted-in with a loaded session key: references are ready and name the advisory model.
+        let keyed =
+            AppSettings { jury_cloud_opt_in: true, llm_api_key: "session-key".to_string(), ..AppSettings::default() };
+        let readiness = build_agentic_readiness(&keyed, &[], &no_script);
+        assert_eq!(readiness.checks[0].status, "ready");
+        assert!(readiness.checks[0].detail.contains("gemini-2.5-pro"));
+
+        // Explicit diagnostic CTC selection with its model files present: the selected primary is
+        // ready and single-engine mode reports coverage as not_required, so the verdict is ready.
+        let ctc = AppSettings { asr_model_size: AsrModelSize::CTC300M, ..AppSettings::default() };
+        let ctc_status = vec![
+            serde_json::json!({ "filename": models::OMNIASR_CTC_300M_MODEL, "downloaded": true }),
+            serde_json::json!({ "filename": models::OMNIASR_CTC_300M_TOKENS, "downloaded": true }),
+        ];
+        let readiness = build_agentic_readiness(&ctc, &ctc_status, &no_script);
+        assert_eq!(readiness.status, "ready");
+        assert_eq!(readiness.available_hypothesis_models, vec!["omniasr-ctc-300m".to_string()]);
+        assert_eq!(readiness.checks[2].id, "hypothesis_coverage");
+        assert_eq!(readiness.checks[2].status, "not_required");
+
+        // Auxiliary multi-engine mode with only one engine ready: hypothesis coverage blocks.
+        let auxiliary = AppSettings {
+            asr_model_size: AsrModelSize::CTC300M,
+            multi_engine_hypotheses: true,
+            ..AppSettings::default()
+        };
+        let readiness = build_agentic_readiness(&auxiliary, &ctc_status, &no_script);
+        assert_eq!(readiness.checks[2].status, "blocked");
+        assert!(!readiness.ready, "one usable engine cannot claim multi-model corroboration coverage");
+    }
+
+    #[test]
+    fn external_provider_status_with_a_script_runs_the_real_wsl_probe() {
+        let settings =
+            AppSettings { external_asr_script_path: "/opt/cortex/provider.py".to_string(), ..AppSettings::default() };
+        let status = external_provider_status(&settings);
+        assert_eq!(status["script"], "/opt/cortex/provider.py");
+        let available = status["available"].as_bool().expect("probe result is a bool");
+        let message = status["message"].as_str().expect("probe message");
+        if available {
+            assert_eq!(message, "WSL is available; provider script will be used for external ASR");
+        } else {
+            assert_eq!(message, "WSL is not available or not healthy on this machine");
+        }
+    }
+
+    #[test]
+    fn kill_and_reap_child_stops_a_live_worker_process() {
+        // Spawn the long-running probe binary directly (no shell wrapper) so the kill reaps the
+        // actual worker instead of a shell that would orphan it.
+        let mut command = if cfg!(windows) {
+            let mut c = std::process::Command::new("ping");
+            c.args(["-n", "30", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        let mut child = command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleeper child");
+        kill_and_reap_child(&mut child, "test sleeper");
+        assert!(
+            child.try_wait().expect("reaped child reports a status").is_some(),
+            "kill_and_reap_child must leave the child fully reaped"
+        );
+    }
+
+    #[test]
+    fn run_blocking_returns_worker_results_and_converts_panics_to_errors() {
+        let ok = tauri::async_runtime::block_on(run_blocking(|| Ok::<_, String>(41 + 1))).expect("worker result");
+        assert_eq!(ok, 42);
+
+        let failed = tauri::async_runtime::block_on(run_blocking::<(), _>(|| panic!("worker exploded")))
+            .expect_err("a worker panic must become a clean error, never an abort");
+        assert!(failed.starts_with("background task failed"), "unexpected panic mapping: {failed}");
+    }
+
+    #[test]
+    fn job_center_rate_refusal_and_cloud_consent_gate_are_exact() {
+        let busy = public_job_rate_limited_error();
+        assert_eq!(busy.code, "JOB_CENTER_BUSY");
+        assert!(busy.retryable);
+        assert_eq!(busy.suggested_action, Some(crate::ipc_contract::SuggestedActionV1::Retry));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let app_state = crate::test_support::app_state(tmp.path().to_path_buf());
+        let refused = require_cloud_llm_consent(&app_state).expect_err("consent defaults OFF");
+        assert_eq!(refused, "Cloud LLM opt-in is required for this cloud upload. Enable it in Settings.");
+        app_state.lock_settings().cloud_llm_opt_in = true;
+        require_cloud_llm_consent(&app_state).expect("explicit opt-in unlocks the cloud channel");
+    }
+
+    #[test]
+    fn background_db_writer_guard_arms_the_restore_fence_for_its_lifetime() {
+        let before = BG_DB_WRITERS.load(std::sync::atomic::Ordering::SeqCst);
+        {
+            let _writer = BgDbWriterGuard::new();
+            assert!(bg_db_writers_active(), "a live background writer must fence a restore");
+            assert!(BG_DB_WRITERS.load(std::sync::atomic::Ordering::SeqCst) > before);
+        }
+        // No absolute zero assertion: other suites may hold their own writers concurrently. The
+        // guard's own increment must be gone.
+        assert!(BG_DB_WRITERS.load(std::sync::atomic::Ordering::SeqCst) >= before);
+    }
+
+    #[test]
+    fn jury_db_access_uses_a_dedicated_connection_and_falls_back_to_the_shared_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let state = app.state::<AppState>();
+
+        // File-backed library: `with` opens its own dedicated connection to the same database.
+        let source = jury_db_source(&state);
+        assert!(source.with(|db| db.get_segment_by_id("seg-nope").expect("dedicated read")).is_none());
+
+        // ":memory:" is connection-private, so `with` must fall back to the shared handle.
+        let fallback = JuryDbSource { db_path: ":memory:".to_string(), shared: state.db_arc() };
+        assert!(fallback.with(|db| db.get_segment_by_id("seg-nope").expect("shared-handle read")).is_none());
+    }
+
+    #[test]
+    fn open_jury_db_connection_requires_a_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let state = app.state::<AppState>();
+        assert!(open_jury_db_connection(&state).is_some(), "a configured data dir opens a dedicated connection");
+        *state.lock_data_dir() = None;
+        assert!(open_jury_db_connection(&state).is_none(), "no data dir means no jury connection, not a panic");
+    }
+
+    #[test]
+    fn champion_provenance_recognition_fails_closed_on_unknown_models() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        {
+            let state = app.state::<AppState>();
+            let db = state.lock_db();
+            crate::registry::register_candidate(
+                &db,
+                &crate::registry::NewModelVersion {
+                    id: "cand-7b-prov".to_string(),
+                    family: crate::deployment::OMNIASR_7B_FAMILY.to_string(),
+                    model_card_name: None,
+                    checkpoint_sha256: "c".repeat(64),
+                    checkpoint_path: "/ckpt/cand-7b-prov".to_string(),
+                    source: "meta-stock".to_string(),
+                    license: "SAIL".to_string(),
+                },
+            )
+            .expect("register champion-family candidate");
+            crate::registry::register_candidate(
+                &db,
+                &crate::registry::NewModelVersion {
+                    id: "diag-mms-prov".to_string(),
+                    family: "mms".to_string(),
+                    model_card_name: None,
+                    checkpoint_sha256: "d".repeat(64),
+                    checkpoint_path: "/ckpt/diag-mms-prov".to_string(),
+                    source: "meta-stock".to_string(),
+                    license: "CC-BY-NC".to_string(),
+                },
+            )
+            .expect("register diagnostic-family candidate");
+        }
+        let state = app.state::<AppState>();
+        let db = state.lock_db();
+        let segment_with = |model: Option<&str>| crate::db::SpeechSegment {
+            id: "seg-prov".to_string(),
+            audio_path: "C:/fixtures/seg-prov.wav".to_string(),
+            model_version_id: model.map(str::to_string),
+            ..Default::default()
+        };
+        assert!(!segment_recorded_model_is_champion(&db, &segment_with(None)), "no provenance is never champion");
+        assert!(!segment_recorded_model_is_champion(&db, &segment_with(Some("   "))));
+        assert!(segment_recorded_model_is_champion(&db, &segment_with(Some(LEGACY_CHAMPION_MODEL_ID))));
+        assert!(segment_recorded_model_is_champion(&db, &segment_with(Some("cand-7b-prov"))));
+        assert!(!segment_recorded_model_is_champion(&db, &segment_with(Some("diag-mms-prov"))));
+        assert!(
+            !segment_recorded_model_is_champion(&db, &segment_with(Some("never-registered"))),
+            "unknown provenance must fail closed"
+        );
+    }
+
+    #[test]
+    fn decision_predicates_read_only_real_recorded_signals() {
+        let base = crate::db::SpeechSegment {
+            id: "seg-pred".to_string(),
+            audio_path: "C:/fixtures/seg-pred.wav".to_string(),
+            ..Default::default()
+        };
+        assert!(!has_human_decision(&base));
+        assert!(!has_human_decision(&crate::db::SpeechSegment {
+            human_decision: Some("   ".to_string()),
+            ..base.clone()
+        }));
+        assert!(has_human_decision(&crate::db::SpeechSegment {
+            human_decision: Some("approved".to_string()),
+            ..base.clone()
+        }));
+
+        assert!(!has_final_machine_verdict(&base), "no verdict is not final");
+        assert!(!has_final_machine_verdict(&crate::db::SpeechSegment {
+            verdict: Some("  ".to_string()),
+            ..base.clone()
+        }));
+        assert!(has_final_machine_verdict(&crate::db::SpeechSegment {
+            verdict: Some("jury_accept".to_string()),
+            escalated: false,
+            ..base.clone()
+        }));
+        assert!(
+            !has_final_machine_verdict(&crate::db::SpeechSegment {
+                verdict: Some("escalated".to_string()),
+                escalated: true,
+                ..base
+            }),
+            "an escalated row is still open, never final"
+        );
+    }
+
+    #[test]
+    fn openrouter_jury_model_slug_mapping_is_a_closed_mechanism() {
+        assert_eq!(openrouter_jury_model_id(""), "google/gemini-2.5-pro");
+        assert_eq!(openrouter_jury_model_id("  "), "google/gemini-2.5-pro");
+        assert_eq!(openrouter_jury_model_id("gemini-2.5-pro"), "google/gemini-2.5-pro");
+        assert_eq!(openrouter_jury_model_id("google/gemini-2.5-pro"), "google/gemini-2.5-pro");
+        assert_eq!(openrouter_jury_model_id("vendor/some-model"), "vendor/some-model");
+    }
+
+    #[test]
+    fn reference_report_consensus_and_best_selection_are_exact() {
+        assert!(!reference_reports_have_commit_consensus(&[]), "no reports can never be consensus");
+        assert!(!reference_reports_have_commit_consensus(&[
+            selection_report("model-a", "deng yek", 0.9, 0.2, true),
+            selection_report("model-b", "deng yek", 0.8, 0.1, false),
+        ]));
+        assert!(reference_reports_have_commit_consensus(&[
+            selection_report("model-a", "deng yek", 0.9, 0.2, true),
+            selection_report("model-b", "deng yek", 0.8, 0.1, true),
+        ]));
+        assert!(!reference_reports_have_commit_consensus(&[
+            selection_report("model-a", "deng yek", 0.9, 0.2, true),
+            selection_report("model-b", "deng du", 0.8, 0.1, true),
+        ]));
+        assert!(
+            !reference_reports_have_commit_consensus(&[
+                selection_report("model-a", "", 0.9, 0.2, true),
+                selection_report("model-b", "", 0.8, 0.1, true),
+            ]),
+            "an empty normalized transcript can never count as agreement"
+        );
+
+        assert!(best_reference_report(&[]).is_none());
+        let best = best_reference_report(&[
+            selection_report("model-low", "deng", 0.4, 0.9, true),
+            selection_report("model-high", "deng", 0.9, 0.1, true),
+        ])
+        .expect("best by score");
+        assert_eq!(best.selected_model_id, "model-high");
+        let tie_break = best_reference_report(&[
+            selection_report("model-thin", "deng", 0.9, 0.05, true),
+            selection_report("model-wide", "deng", 0.9, 0.4, true),
+        ])
+        .expect("best by margin on a score tie");
+        assert_eq!(tie_break.selected_model_id, "model-wide");
+
+        let mut scored = selection_report("model-scored", "deng", 0.8, 0.2, true);
+        scored.scores.push(crate::agentic::CandidateSelectionScore {
+            model_id: "model-scored".to_string(),
+            transcript: "deng".to_string(),
+            final_score: 0.8,
+            reference_window_overlap: 0.7,
+            reference_global_overlap: 0.4,
+            text_quality: 0.9,
+            model_prior: 0.5,
+        });
+        let unscored = selection_report("model-unscored", "deng", 0.6, 0.1, false);
+        let agreement = reference_agreement_reports(&[scored, unscored]);
+        assert_eq!(agreement.len(), 2);
+        assert_eq!(agreement[0].reference_window_overlap, 0.7);
+        assert_eq!(agreement[0].reference_global_overlap, 0.4);
+        assert!(agreement[0].should_commit);
+        assert_eq!(agreement[1].reference_window_overlap, 0.0, "no score rows means no invented overlap");
+        assert!(!agreement[1].should_commit);
+
+        let evidence = reference_selection_evidence(&agreement_source_report());
+        assert_eq!(evidence.tool, "source_reference_adjudicator");
+        assert!(evidence.supports_hypothesis);
+        assert!(evidence.result.contains("winner=model-scored"));
+    }
+
+    fn agreement_source_report() -> crate::agentic::CandidateSelectionReport {
+        let mut report = selection_report("model-scored", "deng", 0.8, 0.2, true);
+        report.scores.push(crate::agentic::CandidateSelectionScore {
+            model_id: "model-scored".to_string(),
+            transcript: "deng".to_string(),
+            final_score: 0.8,
+            reference_window_overlap: 0.7,
+            reference_global_overlap: 0.4,
+            text_quality: 0.9,
+            model_prior: 0.5,
+        });
+        report
+    }
+
+    #[test]
+    fn hypothesis_coverage_guard_blocks_thin_corroboration_with_the_served_transcript() {
+        let segment = crate::db::SpeechSegment {
+            id: "seg-coverage".to_string(),
+            audio_path: "C:/fixtures/seg-coverage.wav".to_string(),
+            raw_transcript: "raw machine draft".to_string(),
+            normalized_transcript: Some("normalized draft".to_string()),
+            verdict_transcript: Some("verdict draft".to_string()),
+            ..Default::default()
+        };
+        let hypothesis = |model: &str, transcript: &str| crate::db::SegmentHypothesis {
+            segment_id: segment.id.clone(),
+            model_id: model.to_string(),
+            transcript: transcript.to_string(),
+            confidence: Some(0.9),
+        };
+
+        assert!(
+            hypothesis_coverage_guard(&segment, &[hypothesis("model-a", "deng"), hypothesis("model-b", "deng")])
+                .is_none(),
+            "two distinct non-empty model hypotheses satisfy the corroboration floor"
+        );
+
+        let guard = hypothesis_coverage_guard(&segment, &[hypothesis("model-a", "deng")])
+            .expect("a single model must be guarded");
+        assert_eq!(guard.selected_model_id, "multi-model-hypothesis-coverage-guard");
+        assert!(!guard.should_commit);
+        assert_eq!(guard.selected_transcript, "verdict draft", "the guard serves the segment's precedence text");
+        assert!(guard.rationale.contains("fewer than 2 non-empty model hypotheses"));
+    }
+
+    #[test]
+    fn source_reference_identity_checks_guard_stale_whole_file_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audio = tmp.path().join("source-identity.wav");
+        std::fs::write(&audio, b"source-identity-fixture-bytes").unwrap();
+        crate::test_support::await_stable_fixture(&audio);
+        let audio_path = audio.to_string_lossy().to_string();
+
+        let record = |hash: Option<&str>, size: Option<i64>| crate::db::SourceTranscriptRecord {
+            audio_path: audio_path.clone(),
+            model_id: "gemini-2.5-pro".to_string(),
+            audio_content_hash: hash.map(str::to_string),
+            audio_size_bytes: size,
+            transcript_path: "C:/fixtures/reference.json".to_string(),
+            transcript_text: "deng yek du".to_string(),
+            created_at: None,
+        };
+        assert!(!source_reference_has_stored_audio_identity(&record(None, None)));
+        assert!(!source_reference_has_stored_audio_identity(&record(Some("   "), None)));
+        assert!(source_reference_has_stored_audio_identity(&record(Some("hash"), None)));
+        assert!(source_reference_has_stored_audio_identity(&record(None, Some(1))));
+
+        let mut cache = std::collections::HashMap::new();
+        let identity = source_reference_current_audio_identity(&audio_path, &mut cache)
+            .expect("a readable source file has an identity");
+        assert_eq!(identity.content_hash.len(), 64);
+        assert!(identity.size_bytes > 0);
+        // Cache arm: mutate the file, then re-ask — the cached identity (not a re-hash) is served.
+        std::fs::write(&audio, b"different bytes entirely").unwrap();
+        let cached = source_reference_current_audio_identity(&audio_path, &mut cache).expect("cached identity");
+        assert_eq!(cached.content_hash, identity.content_hash, "the per-run identity cache must serve its snapshot");
+        std::fs::write(&audio, b"source-identity-fixture-bytes").unwrap();
+        crate::test_support::await_stable_fixture(&audio);
+
+        let missing = tmp.path().join("never-existed.wav").to_string_lossy().to_string();
+        assert!(source_reference_current_audio_identity(&missing, &mut cache).is_none());
+
+        let matching = record(Some(&identity.content_hash), Some(identity.size_bytes));
+        assert!(source_reference_matches_current_audio(&matching, &mut cache));
+        let wrong_hash = record(Some(&"0".repeat(64)), Some(identity.size_bytes));
+        assert!(!source_reference_matches_current_audio(&wrong_hash, &mut cache));
+        assert!(
+            !source_reference_matches_current_audio(&record(None, None), &mut cache),
+            "a reference without stored identity can never match"
+        );
+
+        let (usable, stale) =
+            filter_source_references_for_current_audio(vec![matching.clone(), wrong_hash.clone()], &mut cache);
+        assert_eq!(usable.len(), 1);
+        assert_eq!(usable[0].audio_content_hash.as_deref(), Some(identity.content_hash.as_str()));
+        assert_eq!(stale, vec!["gemini-2.5-pro".to_string()]);
+    }
+
+    #[test]
+    fn source_reference_coverage_guard_arms_are_exact() {
+        let segment = crate::db::SpeechSegment {
+            id: "seg-ref-guard".to_string(),
+            audio_path: "C:/fixtures/seg-ref-guard.wav".to_string(),
+            raw_transcript: "raw draft".to_string(),
+            ..Default::default()
+        };
+        let reference = |model: &str, text: &str| crate::db::SourceTranscriptRecord {
+            audio_path: segment.audio_path.clone(),
+            model_id: model.to_string(),
+            audio_content_hash: Some("hash".to_string()),
+            audio_size_bytes: Some(1),
+            transcript_path: "C:/fixtures/reference.json".to_string(),
+            transcript_text: text.to_string(),
+            created_at: None,
+        };
+
+        let offline = AppSettings::default();
+        assert!(
+            source_reference_coverage_guard(&offline, &segment, &[], &[]).is_none(),
+            "offline mode with no stored references requires no coverage"
+        );
+
+        let stale = source_reference_coverage_guard(&offline, &segment, &[], &["gemini-2.5-pro".to_string()])
+            .expect("a stale required reference must guard even offline");
+        assert_eq!(stale.selected_model_id, "source-reference-audio-identity-guard");
+        assert!(!stale.should_commit);
+        assert!(stale.reference_model_id.as_deref().unwrap().contains("stale:gemini-2.5-pro"));
+
+        let opted_in = AppSettings { jury_cloud_opt_in: true, ..AppSettings::default() };
+        let missing = source_reference_coverage_guard(&opted_in, &segment, &[], &[])
+            .expect("opt-in with no stored references must guard");
+        assert_eq!(missing.selected_model_id, "source-reference-coverage-guard");
+        assert!(missing.rationale.contains("gemini-2.5-pro"));
+        assert_eq!(missing.selected_transcript, "raw draft", "no verdict/normalized text falls back to raw");
+
+        assert!(
+            source_reference_coverage_guard(&opted_in, &segment, &[reference("gemini-2.5-pro", "deng yek du")], &[],)
+                .is_none(),
+            "full non-empty coverage of the required model needs no guard"
+        );
+        assert!(
+            source_reference_coverage_guard(&opted_in, &segment, &[reference("gemini-2.5-pro", "   ")], &[]).is_some(),
+            "an empty-text reference is not coverage"
+        );
+    }
+
+    #[test]
+    fn reference_selection_for_segment_serves_none_without_references_and_guards_stale_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let audio = tmp.path().join("selection-source.wav");
+        std::fs::write(&audio, b"selection-source-fixture-bytes").unwrap();
+        crate::test_support::await_stable_fixture(&audio);
+        let segment = crate::db::SpeechSegment {
+            id: "seg-selection".to_string(),
+            audio_path: audio.to_string_lossy().to_string(),
+            raw_transcript: "deng yek du".to_string(),
+            ..Default::default()
+        };
+        let settings = AppSettings::default();
+        let mut duration_cache = std::collections::HashMap::new();
+        let mut identity_cache = std::collections::HashMap::new();
+
+        let state = app.state::<AppState>();
+        let db = state.lock_db();
+        db.insert_segment(&segment).expect("seed segment");
+        let none =
+            reference_selection_for_segment(&db, &settings, &segment, &[], &mut duration_cache, &mut identity_cache)
+                .expect("selection without references");
+        assert!(none.is_none(), "no stored whole-file references means no reference report");
+
+        db.upsert_source_transcript(&crate::db::SourceTranscriptRecord {
+            audio_path: segment.audio_path.clone(),
+            model_id: "gemini-2.5-pro".to_string(),
+            audio_content_hash: Some("1".repeat(64)),
+            audio_size_bytes: Some(1),
+            transcript_path: "C:/fixtures/stale-reference.json".to_string(),
+            transcript_text: "deng yek du".to_string(),
+            created_at: None,
+        })
+        .expect("seed stale reference");
+        let guarded =
+            reference_selection_for_segment(&db, &settings, &segment, &[], &mut duration_cache, &mut identity_cache)
+                .expect("selection with a stale reference")
+                .expect("stale identity must produce a guard report");
+        assert_eq!(guarded.selected_model_id, "source-reference-audio-identity-guard");
+        assert!(!guarded.should_commit);
+    }
+
+    #[test]
+    fn load_hypotheses_synthesizes_a_vote_only_for_diagnostic_engines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let state = app.state::<AppState>();
+        let db = state.lock_db();
+        let segment = crate::db::SpeechSegment {
+            id: "seg-hyps".to_string(),
+            audio_path: "C:/fixtures/seg-hyps.wav".to_string(),
+            raw_transcript: "deng yek du".to_string(),
+            confidence: Some(0.7),
+            ..Default::default()
+        };
+        db.insert_segment(&segment).expect("seed segment");
+
+        let champion_mode = AppSettings::default();
+        assert_eq!(champion_mode.asr_model_size, AsrModelSize::WSL7B, "champion is the shipped default");
+        let champion_hyps =
+            load_hypotheses_for_segment(&db, &champion_mode, &segment.id, &segment).expect("champion-mode load");
+        assert!(
+            champion_hyps.is_empty(),
+            "champion mode must never invent provenance for a row without a recorded producer"
+        );
+
+        let diagnostic_mode = AppSettings { asr_model_size: AsrModelSize::CTC300M, ..AppSettings::default() };
+        let diagnostic_hyps =
+            load_hypotheses_for_segment(&db, &diagnostic_mode, &segment.id, &segment).expect("diagnostic-mode load");
+        assert_eq!(diagnostic_hyps.len(), 1, "diagnostic mode synthesizes the one honest ASR vote");
+        assert_eq!(diagnostic_hyps[0].model_id, "asr");
+        assert_eq!(diagnostic_hyps[0].transcript, "deng yek du");
+        assert_eq!(diagnostic_hyps[0].confidence, Some(0.7));
+    }
+
+    #[test]
+    fn reference_selection_text_key_normalizes_for_metric_equality() {
+        let spaced = selection_report("model-a", "  deng   yek  ", 0.9, 0.2, true);
+        let tight = selection_report("model-b", "deng yek", 0.9, 0.2, true);
+        assert_eq!(
+            reference_selection_text_key(&spaced),
+            reference_selection_text_key(&tight),
+            "whitespace variants must agree on one metric key"
+        );
+        assert!(reference_selection_text_key(&selection_report("model-c", "   ", 0.9, 0.2, true)).is_empty());
     }
 }

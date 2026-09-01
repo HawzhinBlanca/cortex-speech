@@ -1135,4 +1135,427 @@ mod tests {
         let error = validate_review_compensation_semantics(&blank).unwrap_err();
         assert!(error.contains("empty or duplicate payout reference"), "{error}");
     }
+
+    // ── Wave-4 branch coverage. File-backed databases (tempfile, never :memory:) and direct arms
+    // on the pure identity/arithmetic helpers this module owns.
+
+    fn file_paid_db(dir: &tempfile::TempDir, id: &str) -> Database {
+        let path = dir.path().join(format!("{id}.db"));
+        let db = Database::open(path.to_string_lossy().as_ref()).unwrap();
+        db.initialize().unwrap();
+        paid_segment(&db, id);
+        db
+    }
+
+    #[test]
+    fn entitlement_arithmetic_and_action_rates_are_exact() {
+        // 1000 ms at the full edit rate is exactly 5,000,000 micro-IQD under the canon constants
+        // (18,000,000,000 micro-IQD/h × 10,000 bps): duration × bps / 2.
+        assert_eq!(super::exact_review_entitlement(1_000, crate::db::REVIEW_PAY_EDIT_BPS).unwrap(), 5_000_000);
+        assert_eq!(super::exact_review_entitlement(1_000, crate::db::REVIEW_PAY_ACCEPT_BPS).unwrap(), 500_000);
+
+        let invalid_duration = super::exact_review_entitlement(0, 100).unwrap_err();
+        assert!(invalid_duration.contains("invalid duration or basis points"), "{invalid_duration}");
+        assert!(super::exact_review_entitlement(-5, 100).is_err());
+        assert!(super::exact_review_entitlement(1_000, 10_001).is_err());
+        assert!(super::exact_review_entitlement(1_000, -1).is_err());
+        // 1 ms at 1 bps is 18e9/36e10 of a micro-IQD — not an integer amount, never roundable.
+        let inexact = super::exact_review_entitlement(1, 1).unwrap_err();
+        assert!(inexact.contains("not an exact micro-IQD amount"), "{inexact}");
+
+        assert_eq!(super::review_action_basis_points("edit"), Some(crate::db::REVIEW_PAY_EDIT_BPS));
+        assert_eq!(super::review_action_basis_points("accept"), Some(crate::db::REVIEW_PAY_ACCEPT_BPS));
+        assert_eq!(super::review_action_basis_points("reject"), Some(crate::db::REVIEW_PAY_REJECT_BPS));
+        assert_eq!(super::review_action_basis_points("skip"), Some(crate::db::REVIEW_PAY_SKIP_BPS));
+        assert_eq!(super::review_action_basis_points("undo"), None);
+    }
+
+    #[test]
+    fn identity_helpers_accept_only_canonical_shapes() {
+        assert!(super::is_canonical_lowercase_uuid("00000000-0000-4000-8000-000000000001"));
+        assert!(!super::is_canonical_lowercase_uuid("00000000-0000-4000-8000-0000000000ZZ"));
+        // Parseable but not canonical lowercase-hyphenated.
+        assert!(!super::is_canonical_lowercase_uuid("00000000-0000-4000-8000-0000000000AB"));
+        assert!(super::is_canonical_lowercase_64_hex(&"a".repeat(64)));
+        assert!(!super::is_canonical_lowercase_64_hex(&"A".repeat(64)));
+        assert!(!super::is_canonical_lowercase_64_hex("abc"));
+
+        assert!(super::valid_compensation_reviewer("Reviewer"));
+        assert!(!super::valid_compensation_reviewer(""));
+        assert!(!super::valid_compensation_reviewer(" Reviewer "));
+        assert!(!super::valid_compensation_reviewer(&"x".repeat(41)));
+        assert!(!super::valid_compensation_reviewer("Re\u{7}viewer"));
+
+        let work = format!("reviewer-work-v1:8:reviewer:audio-segment-v1:{}:0:1000", "a".repeat(64));
+        assert!(super::canonical_work_id_has_writer_shape(&work, "Reviewer", 1_000));
+        assert!(!super::canonical_work_id_has_writer_shape(&work, "Somebody", 1_000), "wrong reviewer namespace");
+        assert!(!super::canonical_work_id_has_writer_shape(&work, "Reviewer", 900_000), "span must match duration");
+        assert!(!super::canonical_work_id_has_writer_shape("reviewer-work-v1:8:reviewer:legacy:x", "Reviewer", 1_000));
+        let extra_part = format!("{work}:9");
+        assert!(!super::canonical_work_id_has_writer_shape(&extra_part, "Reviewer", 1_000));
+        let bad_hash = format!("reviewer-work-v1:8:reviewer:audio-segment-v1:{}:0:1000", "Z".repeat(64));
+        assert!(!super::canonical_work_id_has_writer_shape(&bad_hash, "Reviewer", 1_000));
+        let bad_number = format!("reviewer-work-v1:8:reviewer:audio-segment-v1:{}:zero:1000", "a".repeat(64));
+        assert!(!super::canonical_work_id_has_writer_shape(&bad_number, "Reviewer", 1_000));
+
+        let expected_hash = "a".repeat(64);
+        assert_eq!(super::canonical_work_audio_identity(&work, "Reviewer"), Some((expected_hash.as_str(), 0, 1_000)));
+        assert!(super::canonical_work_audio_identity(&work, "Somebody").is_none());
+        assert!(super::canonical_work_audio_identity(&extra_part, "Reviewer").is_none());
+        let negative_span = format!("reviewer-work-v1:8:reviewer:audio-segment-v1:{}:-1:1000", "a".repeat(64));
+        assert!(super::canonical_work_audio_identity(&negative_span, "Reviewer").is_none());
+        let empty_span = format!("reviewer-work-v1:8:reviewer:audio-segment-v1:{}:1000:1000", "a".repeat(64));
+        assert!(super::canonical_work_audio_identity(&empty_span, "Reviewer").is_none());
+    }
+
+    #[test]
+    fn canonical_compensation_work_rederives_only_exact_segment_identity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_paid_db(&dir, "work-clip");
+        db.connection().execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
+        // Every UPDATE that leaves review_revision untouched is auto-bumped by the
+        // speech_segments_review_revision trigger, so each mutation below PINS the revision to a
+        // fresh explicit value (which the trigger then leaves alone) and asks about exactly it.
+        db.connection().execute("UPDATE speech_segments SET review_revision=7 WHERE id='work-clip'", []).unwrap();
+
+        let (work_id, duration) =
+            super::canonical_compensation_work(&db, "work-clip", "Reviewer", 7).unwrap().expect("exact current work");
+        assert_eq!(work_id, format!("reviewer-work-v1:8:reviewer:audio-segment-v1:{}:0:1000", "a".repeat(64)));
+        assert_eq!(duration, 1_000);
+
+        assert_eq!(super::canonical_compensation_work(&db, "no-such-clip", "Reviewer", 0).unwrap(), None);
+        let invalid_reviewer = super::canonical_compensation_work(&db, "work-clip", " ", 7).unwrap_err();
+        assert!(invalid_reviewer.contains("invalid reviewer identity"), "{invalid_reviewer}");
+        let regressed = super::canonical_compensation_work(&db, "work-clip", "Reviewer", 12).unwrap_err();
+        assert!(regressed.contains("regresses its decision revision"), "{regressed}");
+
+        // A decision at an older revision than the segment is simply not current — no identity claim.
+        assert_eq!(super::canonical_compensation_work(&db, "work-clip", "Reviewer", 5).unwrap(), None);
+
+        let mutate = |sql: &str| {
+            db.connection().execute(sql, []).unwrap();
+        };
+        mutate("UPDATE speech_segments SET review_revision=8, duration_ms=0 WHERE id='work-clip'");
+        let bad_duration = super::canonical_compensation_work(&db, "work-clip", "Reviewer", 8).unwrap_err();
+        assert!(bad_duration.contains("invalid duration"), "{bad_duration}");
+
+        mutate("UPDATE speech_segments SET review_revision=9, duration_ms=1000, audio_content_hash='  ' WHERE id='work-clip'");
+        let fallback = super::canonical_compensation_work(&db, "work-clip", "Reviewer", 9).unwrap_err();
+        assert!(fallback.contains("fallback audio identity"), "{fallback}");
+
+        let restore_hash = format!(
+            "UPDATE speech_segments SET review_revision=10, audio_content_hash='{}', alignment_json=NULL WHERE id='work-clip'",
+            "a".repeat(64)
+        );
+        mutate(&restore_hash);
+        let missing_span = super::canonical_compensation_work(&db, "work-clip", "Reviewer", 10).unwrap_err();
+        assert!(missing_span.contains("no source-span identity"), "{missing_span}");
+
+        mutate("UPDATE speech_segments SET review_revision=11, alignment_json='not json' WHERE id='work-clip'");
+        let invalid_span = super::canonical_compensation_work(&db, "work-clip", "Reviewer", 11).unwrap_err();
+        assert!(invalid_span.contains("invalid source-span identity"), "{invalid_span}");
+
+        mutate("UPDATE speech_segments SET review_revision=12, alignment_json='{}' WHERE id='work-clip'");
+        let incomplete = super::canonical_compensation_work(&db, "work-clip", "Reviewer", 12).unwrap_err();
+        assert!(incomplete.contains("incomplete source-span identity"), "{incomplete}");
+
+        mutate(
+            "UPDATE speech_segments
+                SET review_revision=13, alignment_json='{\"source_start_ms\":0,\"source_end_ms\":400}'
+              WHERE id='work-clip'",
+        );
+        let mismatched = super::canonical_compensation_work(&db, "work-clip", "Reviewer", 13).unwrap_err();
+        assert!(mismatched.contains("disagrees with decoded duration"), "{mismatched}");
+    }
+
+    /// A paid phone edit undone through the production API, with the couch undo shape: the undo is
+    /// addressed by the DECISION's own operation id (couch::api_undo replays `entry.operation_id`),
+    /// which is what binds `entry_key = 'undo:<op>'` to the reversed event.
+    fn undone_paid_fixture(dir: &tempfile::TempDir, id: &str, index: u64) -> Database {
+        let db = file_paid_db(dir, id);
+        listened(&db, id);
+        decided(&db, id, index);
+        let effect_id: i64 = db
+            .connection()
+            .query_row("SELECT MAX(id) FROM human_decision_effect_events", [], |row| row.get(0))
+            .unwrap();
+        assert!(matches!(
+            db.undo_human_decision(effect_id, Some("Reviewer"), &canonical_operation(index)).unwrap(),
+            crate::db::HumanDecisionUndoOutcome::Applied { .. }
+        ));
+        validate_review_compensation_semantics(&db)
+            .expect("a phone decision undone through the production API must validate first");
+        db
+    }
+
+    #[test]
+    fn undo_ledger_rows_must_be_exact_operation_bound_inverses() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let db = undone_paid_fixture(&dir, "undo-fixed", 200);
+        unlock(&db, "review_compensation_ledger");
+        db.connection()
+            .execute("UPDATE review_compensation_ledger SET rate_basis_points=1 WHERE compensation_action='undo'", [])
+            .unwrap();
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("invalid fixed semantics"), "{error}");
+
+        let db = undone_paid_fixture(&dir, "undo-unnamed", 201);
+        unlock(&db, "review_compensation_ledger");
+        db.connection()
+            .execute(
+                "UPDATE review_compensation_ledger SET reverses_entry_id=NULL WHERE compensation_action='undo'",
+                [],
+            )
+            .unwrap();
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("does not name an earlier entry"), "{error}");
+
+        let db = undone_paid_fixture(&dir, "undo-missing", 202);
+        unlock(&db, "review_compensation_ledger");
+        db.connection()
+            .execute(
+                "UPDATE review_compensation_ledger
+                    SET reverses_entry_id='10101010-1010-4010-8010-101010101010'
+                  WHERE compensation_action='undo'",
+                [],
+            )
+            .unwrap();
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("references a missing or later entry"), "{error}");
+
+        // A revision drift between the undo and the entry it reverses breaks the exact binding.
+        let db = undone_paid_fixture(&dir, "undo-binding", 203);
+        unlock(&db, "review_compensation_ledger");
+        db.connection()
+            .execute(
+                "UPDATE review_compensation_ledger SET decision_revision=decision_revision+1
+                  WHERE compensation_action='undo'",
+                [],
+            )
+            .unwrap();
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("does not exactly bind its earlier decision entry"), "{error}");
+
+        // A second inverse for the same reversed entry can only double the clawback. The schema's
+        // partial unique index forbids writing this state here, so the restored-file threat model
+        // includes losing that index too.
+        let db = undone_paid_fixture(&dir, "undo-double", 204);
+        unlock(&db, "review_compensation_ledger");
+        db.connection().execute("DROP INDEX idx_review_compensation_one_reversal_per_entry", []).unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO review_compensation_ledger
+                    (entry_id, entry_key, policy_version, canonical_work_id, canonical_identity_kind,
+                     reviewer, segment_id, source, compensation_action, effective_decision,
+                     decision_revision, duration_ms, rate_basis_points, entitlement_micro_iqd,
+                     delta_micro_iqd, corrected_entitlement_ms, delta_corrected_ms, reverses_entry_id)
+                 SELECT '20202020-2020-4020-8020-202020202020',
+                        'undo:20202020-2020-4020-8020-202020202020', policy_version,
+                        canonical_work_id, canonical_identity_kind, reviewer, segment_id, source,
+                        compensation_action, effective_decision, decision_revision, duration_ms,
+                        rate_basis_points, entitlement_micro_iqd, delta_micro_iqd,
+                        corrected_entitlement_ms, delta_corrected_ms, reverses_entry_id
+                   FROM review_compensation_ledger WHERE compensation_action='undo'",
+                [],
+            )
+            .unwrap();
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("does not exactly bind its earlier decision entry"), "{error}");
+
+        let db = undone_paid_fixture(&dir, "undo-math", 205);
+        unlock(&db, "review_compensation_ledger");
+        db.connection()
+            .execute(
+                "UPDATE review_compensation_ledger SET delta_micro_iqd=delta_micro_iqd+1
+                  WHERE compensation_action='undo'",
+                [],
+            )
+            .unwrap();
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("undo compensation math is invalid"), "{error}");
+
+        // An unlinked row that is not an undo has no semantics at all.
+        let db = undone_paid_fixture(&dir, "undo-neither", 206);
+        unlock(&db, "review_compensation_ledger");
+        db.connection()
+            .execute(
+                "UPDATE review_compensation_ledger SET compensation_action='edit'
+                  WHERE compensation_action='undo'",
+                [],
+            )
+            .unwrap();
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("has neither event nor undo semantics"), "{error}");
+    }
+
+    #[test]
+    fn a_spot_check_event_without_its_immutable_result_is_refused() {
+        // Hidden-QC pay evidence: a couch_spot_check event must carry exactly one spot_checks row.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_paid_db(&dir, "spot-clip");
+        listened(&db, "spot-clip");
+        decided(&db, "spot-clip", 210);
+        validate_review_compensation_semantics(&db).unwrap();
+        unlock(&db, "review_events");
+        db.connection().execute("UPDATE review_events SET source='couch_spot_check'", []).unwrap();
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("lacks its exact immutable spot-check result"), "{error}");
+    }
+
+    #[test]
+    fn event_reviewer_request_and_served_evidence_are_strictly_validated() {
+        let cases: [(&str, &str, &str); 3] = [
+            (
+                "untrimmed reviewer identity",
+                "UPDATE review_events SET reviewer=' Reviewer '",
+                "not a valid production Couch action",
+            ),
+            (
+                "unknown requested action",
+                "UPDATE review_events SET requested_action='mystery'",
+                "invalid action/pay semantics",
+            ),
+            (
+                "blank served transcript",
+                "UPDATE review_events SET served_transcript=''",
+                "invalid served/request evidence",
+            ),
+        ];
+        for (label, sabotage, expected) in cases {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = file_paid_db(&dir, "evidence-clip");
+            listened(&db, "evidence-clip");
+            decided(&db, "evidence-clip", 220);
+            validate_review_compensation_semantics(&db).unwrap();
+            unlock(&db, "review_events");
+            assert_eq!(db.connection().execute(sabotage, []).unwrap(), 1, "{label}");
+            let error = validate_review_compensation_semantics(&db).unwrap_err();
+            assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
+        }
+    }
+
+    #[test]
+    fn ledger_rows_must_stay_bound_to_retained_post_cutoff_events() {
+        // Repointed outside the retained post-cutoff event range.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_paid_db(&dir, "orphan-ledger");
+        listened(&db, "orphan-ledger");
+        decided(&db, "orphan-ledger", 230);
+        validate_review_compensation_semantics(&db).unwrap();
+        unlock(&db, "review_compensation_ledger");
+        db.connection().execute("UPDATE review_compensation_ledger SET review_event_id=999", []).unwrap();
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("points outside the post-cutoff event range"), "{error}");
+
+        // A decision entry without its revision has lost its identity.
+        let db = file_paid_db(&dir, "revisionless-ledger");
+        listened(&db, "revisionless-ledger");
+        decided(&db, "revisionless-ledger", 231);
+        validate_review_compensation_semantics(&db).unwrap();
+        unlock(&db, "review_compensation_ledger");
+        db.connection().execute("UPDATE review_compensation_ledger SET decision_revision=NULL", []).unwrap();
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("has no decision revision"), "{error}");
+
+        // A paid event whose ledger entry vanished is unpaid work — the exact loss restore must refuse.
+        let db = file_paid_db(&dir, "unpaid-event");
+        listened(&db, "unpaid-event");
+        decided(&db, "unpaid-event", 232);
+        validate_review_compensation_semantics(&db).unwrap();
+        unlock(&db, "review_compensation_ledger");
+        assert_eq!(db.connection().execute("DELETE FROM review_compensation_ledger", []).unwrap(), 1);
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("does not have exactly one current-policy ledger entry"), "{error}");
+    }
+
+    #[test]
+    fn settlement_chains_must_be_contiguous_with_unique_references() {
+        // Two paid decisions on distinct audio identities, settled in two contiguous ranges through
+        // the production settlement writer; then one field is broken per case.
+        let build = || {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = file_paid_db(&dir, "settle-a");
+            paid_segment(&db, "settle-b");
+            db.connection()
+                .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='settle-b'", [&"b".repeat(64)])
+                .unwrap();
+            listened(&db, "settle-a");
+            db.record_playback_receipt(&crate::db::PlaybackReceipt {
+                segment_id: "settle-b".to_string(),
+                segment_revision: 0,
+                audio_content_hash: "b".repeat(64),
+                reviewer: Some("Reviewer".to_string()),
+                session_id: None,
+                started_at_ms: 1,
+                played_ms: 1_000,
+                clip_duration_ms: 1_000,
+                source_start_ms: None,
+                source_end_ms: None,
+            })
+            .unwrap();
+            decided(&db, "settle-a", 240);
+            decided(&db, "settle-b", 241);
+            let (first, second): (i64, i64) = db
+                .connection()
+                .query_row("SELECT MIN(id), MAX(id) FROM review_compensation_ledger", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap();
+            assert!(first < second, "two paid decisions must mint two ledger entries");
+            db.record_review_compensation_settlement("Reviewer", first, "payout-first").unwrap();
+            db.record_review_compensation_settlement("Reviewer", second, "payout-second").unwrap();
+            validate_review_compensation_semantics(&db)
+                .expect("two contiguous production settlements must validate first");
+            unlock(&db, "review_compensation_settlements");
+            (dir, db)
+        };
+
+        let (_dir, db) = build();
+        db.connection()
+            .execute(
+                "UPDATE review_compensation_settlements SET from_ledger_id_exclusive=0
+                  WHERE payout_reference='payout-second'",
+                [],
+            )
+            .unwrap();
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("non-contiguous or invalid ledger range"), "{error}");
+
+        // The table-level UNIQUE on payout_reference is undroppable authority, so the reachable
+        // forgery is an untrimmed reference — refused by the same durable-reference guard.
+        let (_dir, db) = build();
+        db.connection()
+            .execute(
+                "UPDATE review_compensation_settlements SET payout_reference=' payout-second '
+                  WHERE payout_reference='payout-second'",
+                [],
+            )
+            .unwrap();
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("empty or duplicate payout reference"), "{error}");
+
+        let (_dir, db) = build();
+        db.connection()
+            .execute(
+                "UPDATE review_compensation_settlements SET settlement_id='NOT-A-UUID'
+                  WHERE payout_reference='payout-first'",
+                [],
+            )
+            .unwrap();
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("non-contiguous or invalid ledger range"), "{error}");
+
+        // A settlement claiming a reviewer with no ledger rows in range settles nothing.
+        let (_dir, db) = build();
+        db.connection()
+            .execute(
+                "UPDATE review_compensation_settlements SET reviewer='Nobody'
+                  WHERE payout_reference='payout-first'",
+                [],
+            )
+            .unwrap();
+        let error = validate_review_compensation_semantics(&db).unwrap_err();
+        assert!(error.contains("amount differs from its immutable ledger range"), "{error}");
+    }
 }

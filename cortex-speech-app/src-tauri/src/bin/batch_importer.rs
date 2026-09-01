@@ -603,6 +603,40 @@ fn import_prepared_voice_parallel(
     Ok((total, succeeded))
 }
 
+/// Prepared voice datasets are already one-speaker, cleaned, and chunked. This mode removes every
+/// optional inference path that could waste CPU/RAM, alter the prepared audio, or confuse model
+/// provenance. The production loader already forces the champion; repeat the invariant here so a
+/// future settings refactor fails closed at this executable boundary. (Exact former inline body of
+/// `main`'s prepared-voice block, extracted unchanged so the boundary is testable.)
+fn harden_prepared_voice_settings(settings: &mut AppSettings) {
+    settings.enforce_desktop_asr_canon();
+    settings.multi_engine_hypotheses = false;
+    settings.use_finetuned_asr = false;
+    settings.enable_diarization = false;
+    settings.enable_denoising = false;
+    settings.auto_align = false;
+    settings.assign_speaker_from_filename = false;
+    settings.llm_mode = LlmMode::None;
+    settings.cloud_llm_opt_in = false;
+    settings.jury_cloud_opt_in = false;
+    settings.ger_refinement_enabled = false;
+}
+
+/// Exact former inline invocation match from `main`, extracted unchanged so the mode/target
+/// selection is testable. Consumes the mode flag and, for `--prepared-voice`, the directory that
+/// follows it; any argument left on the iterator remains the caller's usage error to report.
+fn parse_import_invocation(args: &mut impl Iterator<Item = OsString>) -> (bool, Option<PathBuf>) {
+    let first_arg = args.next();
+    match first_arg.as_deref() {
+        Some(value) if value == OsStr::new("--prepared-voice") => (true, args.next().map(PathBuf::from)),
+        Some(path) => (false, Some(PathBuf::from(path))),
+        None => (
+            std::env::var_os("CORTEX_IMPORT_PREPARED_VOICE").as_deref() == Some(std::ffi::OsStr::new("1")),
+            std::env::var_os("CORTEX_IMPORT_DIR").map(PathBuf::from),
+        ),
+    }
+}
+
 fn require_complete_import(total: usize, succeeded: usize, failed: usize, target_dir: &Path) -> Result<(), String> {
     if total == 0 {
         return Err(format!("No audio files found to import in {}", target_dir.display()));
@@ -657,35 +691,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut settings = AppSettings::load_production(&app_data_dir.join("settings.json"));
 
     let mut args = cli_args.into_iter();
-    let first_arg = args.next();
-    let (prepared_voice, target_dir) = match first_arg.as_deref() {
-        Some(value) if value == OsStr::new("--prepared-voice") => (true, args.next().map(PathBuf::from)),
-        Some(path) => (false, Some(PathBuf::from(path))),
-        None => (
-            std::env::var_os("CORTEX_IMPORT_PREPARED_VOICE").as_deref() == Some(std::ffi::OsStr::new("1")),
-            std::env::var_os("CORTEX_IMPORT_DIR").map(PathBuf::from),
-        ),
-    };
+    let (prepared_voice, target_dir) = parse_import_invocation(&mut args);
     if args.next().is_some() {
         return Err("Usage: batch_importer [--prepared-voice] <audio-directory>".into());
     }
 
-    // Prepared voice datasets are already one-speaker, cleaned, and chunked. This mode removes every
-    // optional inference path that could waste CPU/RAM, alter the prepared audio, or confuse model
-    // provenance. The production loader above already forces the champion; repeat the invariant here
-    // so a future settings refactor fails closed at this executable boundary.
     if prepared_voice {
-        settings.enforce_desktop_asr_canon();
-        settings.multi_engine_hypotheses = false;
-        settings.use_finetuned_asr = false;
-        settings.enable_diarization = false;
-        settings.enable_denoising = false;
-        settings.auto_align = false;
-        settings.assign_speaker_from_filename = false;
-        settings.llm_mode = LlmMode::None;
-        settings.cloud_llm_opt_in = false;
-        settings.jury_cloud_opt_in = false;
-        settings.ger_refinement_enabled = false;
+        harden_prepared_voice_settings(&mut settings);
         println!(
             "Prepared-voice mode: OmniASR-7B champion only; auxiliary ASR, cloud reference/refinement, diarization, denoising, and forced alignment are disabled."
         );
@@ -1126,5 +1138,335 @@ mod tests {
             assert!(error.contains("remain durably committed for resume"));
         }
         assert!(require_complete_import(0, 0, 0, target).unwrap_err().contains("No audio files"));
+    }
+
+    // ── Staging token and SQLite identity ────────────────────────────────────────────────────────
+
+    #[test]
+    fn staging_tokens_must_be_exact_lowercase_hex() {
+        assert!(valid_staging_token(&valid_test_token()));
+        assert!(!valid_staging_token(&valid_test_token()[..63]));
+        assert!(!valid_staging_token(&"0123456789ABCDEF".repeat(4)), "uppercase hex is not a minted token");
+        assert!(!valid_staging_token(&"0123456789abcdeg".repeat(4)));
+
+        assert!(staging_application_id("short").unwrap_err().contains(STAGING_TOKEN_ENV));
+        assert_eq!(staging_application_id(&"0".repeat(64)).unwrap(), 1, "an all-zero prefix still yields an identity");
+        assert_eq!(staging_application_id(&"f".repeat(64)).unwrap(), 0x7fff_ffff, "the sign bit is masked off");
+        assert_eq!(staging_application_id(&format!("12345678{}", "0".repeat(56))).unwrap(), 0x1234_5678);
+    }
+
+    #[test]
+    fn sqlite_identity_comes_from_the_raw_header_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("absent.db");
+        assert!(sqlite_application_id_from_header(&missing).unwrap_err().contains("cannot read"));
+
+        let truncated = dir.path().join("truncated.db");
+        std::fs::write(&truncated, b"SQLite fo").expect("truncated file");
+        assert!(sqlite_application_id_from_header(&truncated).unwrap_err().contains("missing or truncated"));
+
+        let foreign = dir.path().join("foreign.db");
+        std::fs::write(&foreign, vec![b'x'; SQLITE_HEADER_LEN]).expect("foreign file");
+        assert!(sqlite_application_id_from_header(&foreign).unwrap_err().contains("not a SQLite 3 file"));
+
+        let genuine = dir.path().join("genuine.db");
+        let mut header = vec![0u8; SQLITE_HEADER_LEN];
+        header[..16].copy_from_slice(b"SQLite format 3\0");
+        header[68..72].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+        std::fs::write(&genuine, header).expect("genuine header");
+        assert_eq!(sqlite_application_id_from_header(&genuine).unwrap(), 0x1234_5678);
+    }
+
+    // ── Sentinel structure and field binding ─────────────────────────────────────────────────────
+
+    #[test]
+    fn sentinel_structure_is_validated_before_parsing() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let profile = root.path().join("structural");
+        std::fs::create_dir(&profile).expect("profile dir");
+        let profile = std::fs::canonicalize(&profile).expect("canonical profile");
+        let sentinel = profile.join(STAGING_SENTINEL_NAME);
+
+        assert!(read_staging_sentinel(&profile).unwrap_err().contains("not a batch-importer-minted staging profile"));
+
+        std::fs::create_dir(&sentinel).expect("sentinel-as-directory");
+        assert!(read_staging_sentinel(&profile).unwrap_err().contains("regular, non-link file"));
+        std::fs::remove_dir(&sentinel).expect("remove decoy directory");
+
+        std::fs::write(&sentinel, b"").expect("empty sentinel");
+        assert!(read_staging_sentinel(&profile).unwrap_err().contains("invalid size"));
+
+        std::fs::write(&sentinel, vec![b' '; (SENTINEL_MAX_BYTES + 1) as usize]).expect("oversized sentinel");
+        assert!(read_staging_sentinel(&profile).unwrap_err().contains("invalid size"));
+
+        std::fs::write(&sentinel, b"{not json").expect("garbage sentinel");
+        assert!(read_staging_sentinel(&profile).unwrap_err().contains("invalid import-staging sentinel"));
+    }
+
+    fn rewrite_sentinel(profile: &Path, mutate: impl FnOnce(&mut serde_json::Value)) {
+        let path = profile.join(STAGING_SENTINEL_NAME);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read sentinel")).expect("parse sentinel");
+        mutate(&mut value);
+        std::fs::write(&path, serde_json::to_vec(&value).expect("encode sentinel")).expect("write sentinel");
+    }
+
+    #[test]
+    fn every_sentinel_field_binds_the_minted_contract() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let staging = root.path().join("field-binding");
+        let minted = mint_import_staging_profile(&staging).expect("mint staging profile");
+        let profile = std::fs::canonicalize(&staging).expect("canonical profile");
+        let original = std::fs::read(profile.join(STAGING_SENTINEL_NAME)).expect("original sentinel");
+        let admit =
+            |token: &str| isolated_import_data_dir(Some(profile.as_os_str().to_owned()), Some(OsString::from(token)));
+
+        rewrite_sentinel(&profile, |value| value["schema"] = serde_json::json!(2));
+        assert!(admit(&minted.profile_token).unwrap_err().contains("schema or purpose is not supported"));
+        std::fs::write(profile.join(STAGING_SENTINEL_NAME), &original).expect("restore");
+
+        rewrite_sentinel(&profile, |value| value["purpose"] = serde_json::json!("another-tool-entirely"));
+        assert!(admit(&minted.profile_token).unwrap_err().contains("schema or purpose is not supported"));
+        std::fs::write(profile.join(STAGING_SENTINEL_NAME), &original).expect("restore");
+
+        rewrite_sentinel(&profile, |value| {
+            value["sqliteApplicationId"] = serde_json::json!(minted.sqlite_application_id ^ 1);
+        });
+        assert!(admit(&minted.profile_token).unwrap_err().contains("does not match its token"));
+        std::fs::write(profile.join(STAGING_SENTINEL_NAME), &original).expect("restore");
+
+        rewrite_sentinel(&profile, |value| value["createdAtUtc"] = serde_json::json!("   "));
+        assert!(admit(&minted.profile_token).unwrap_err().contains("no creation timestamp"));
+        std::fs::write(profile.join(STAGING_SENTINEL_NAME), &original).expect("restore");
+
+        // Database-side drift under a valid sentinel: identity header, file kind, then absence.
+        let db_path = profile.join(SQLITE_DB_NAME);
+        let mut db_bytes = std::fs::read(&db_path).expect("db bytes");
+        db_bytes[68..72].copy_from_slice(&(minted.sqlite_application_id ^ 1).to_be_bytes());
+        std::fs::write(&db_path, &db_bytes).expect("patch header");
+        assert!(admit(&minted.profile_token)
+            .unwrap_err()
+            .contains("SQLite database identity does not match the minted import-staging contract"));
+
+        std::fs::remove_file(&db_path).expect("remove db");
+        std::fs::create_dir(&db_path).expect("db-as-directory");
+        assert!(admit(&minted.profile_token).unwrap_err().contains("regular, non-link file"));
+        std::fs::remove_dir(&db_path).expect("remove decoy");
+        assert!(admit(&minted.profile_token).unwrap_err().contains("import-staging database is missing"));
+    }
+
+    #[test]
+    fn data_dir_env_must_name_an_existing_directory() {
+        assert!(isolated_import_data_dir(None, None).unwrap_err().contains("CORTEX_APP_DATA_DIR is required"));
+        assert!(isolated_import_data_dir(Some(OsString::new()), None)
+            .unwrap_err()
+            .contains("CORTEX_APP_DATA_DIR is required"));
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let missing = root.path().join("never-minted");
+        assert!(isolated_import_data_dir(Some(missing.as_os_str().to_owned()), None)
+            .unwrap_err()
+            .contains("must point to an existing minted staging directory"));
+
+        let file = root.path().join("a-file-not-a-profile");
+        std::fs::write(&file, b"fixture").expect("plain file");
+        assert!(isolated_import_data_dir(Some(file.as_os_str().to_owned()), None)
+            .unwrap_err()
+            .contains("must point to an existing minted staging directory"));
+    }
+
+    #[test]
+    fn minting_requires_a_creatable_new_child_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dotted = root.path().join("child").join("..");
+        assert!(mint_import_staging_profile(&dotted).unwrap_err().contains("requires a new child directory"));
+
+        let orphan = root.path().join("missing-parent").join("child");
+        assert!(mint_import_staging_profile(&orphan)
+            .unwrap_err()
+            .contains("cannot resolve the staging profile parent"));
+
+        let file_parent = root.path().join("occupied");
+        std::fs::write(&file_parent, b"fixture").expect("file parent");
+        assert!(mint_import_staging_profile(&file_parent.join("child"))
+            .unwrap_err()
+            .contains("staging profile parent is not a directory"));
+    }
+
+    // ── Human-ownership and prepared-row admission ───────────────────────────────────────────────
+
+    #[test]
+    fn every_human_owned_field_is_recognized_individually() {
+        let base = cortex_speech_app_lib::db::SpeechSegment::default();
+        assert!(!segment_has_human_owned_fields(&base), "a machine-only default row is not human-owned");
+
+        let owned: Vec<cortex_speech_app_lib::db::SpeechSegment> = vec![
+            cortex_speech_app_lib::db::SpeechSegment { verified: true, ..Default::default() },
+            cortex_speech_app_lib::db::SpeechSegment { is_gold: true, ..Default::default() },
+            cortex_speech_app_lib::db::SpeechSegment { human_decision: Some("accept".into()), ..Default::default() },
+            cortex_speech_app_lib::db::SpeechSegment { reviewed_by: Some("owner".into()), ..Default::default() },
+            cortex_speech_app_lib::db::SpeechSegment {
+                corrected_at: Some("2026-01-01T00:00:00Z".into()),
+                ..Default::default()
+            },
+            cortex_speech_app_lib::db::SpeechSegment {
+                annotated_transcript: Some("دەستکاری مرۆڤ".into()),
+                ..Default::default()
+            },
+            cortex_speech_app_lib::db::SpeechSegment { escalated: true, ..Default::default() },
+        ];
+        for (index, segment) in owned.iter().enumerate() {
+            assert!(segment_has_human_owned_fields(segment), "field {index} must mark the row human-owned");
+        }
+
+        for verdict in ["human_edit", "human_accept", "escalated", "auto_accept", "jury_accept", "jury_edit"] {
+            let segment =
+                cortex_speech_app_lib::db::SpeechSegment { verdict: Some(verdict.into()), ..Default::default() };
+            assert!(segment_has_human_owned_fields(&segment), "verdict {verdict} must mark the row human-owned");
+        }
+        let machine =
+            cortex_speech_app_lib::db::SpeechSegment { verdict: Some("machine_draft".into()), ..Default::default() };
+        assert!(!segment_has_human_owned_fields(&machine), "a machine verdict alone never claims human ownership");
+    }
+
+    #[test]
+    fn prepared_admission_is_fresh_without_stored_rows_and_fails_on_vanished_inventory() {
+        let (_directory, db, wav, _path_text) = prepared_identity_fixture(false);
+        assert_eq!(
+            inspect_prepared_existing_file(&db, &wav, &[], "champion-v1").unwrap(),
+            PreparedExistingAction::Fresh
+        );
+
+        let vanished = vec!["d:/voice/vanished.wav".to_string()];
+        let error = inspect_prepared_existing_file(&db, &wav, &vanished, "champion-v1").unwrap_err();
+        assert!(error.contains("PREPARED_INVENTORY_CHANGED"), "unexpected refusal: {error}");
+    }
+
+    #[test]
+    fn prepared_machine_rows_with_matching_audio_are_replaced_not_reused() {
+        let (_directory, db, wav, path_text) = prepared_identity_fixture(false);
+        // Identity matches, the row is machine-owned, and the stored model is not this champion.
+        assert_eq!(
+            inspect_prepared_existing_file(&db, &wav, std::slice::from_ref(&path_text), "champion-v2").unwrap(),
+            PreparedExistingAction::Replace(vec!["existing-prepared".into()])
+        );
+    }
+
+    #[test]
+    fn prepared_human_rows_with_matching_audio_are_never_replaced() {
+        let (_directory, db, wav, path_text) = prepared_identity_fixture(true);
+        let error =
+            inspect_prepared_existing_file(&db, &wav, std::slice::from_ref(&path_text), "champion-v2").unwrap_err();
+        assert!(error.contains("HUMAN_SOURCE_AUTHORITY"), "unexpected refusal: {error}");
+        let retained = db.get_segment_by_id("existing-prepared").unwrap().unwrap();
+        assert!(retained.verified, "the protected row must survive the refusal");
+    }
+
+    #[test]
+    fn prepared_admission_hard_stops_when_the_current_file_cannot_be_decoded() {
+        let (_directory, db, wav, path_text) = prepared_identity_fixture(false);
+        std::fs::write(&wav, b"no longer a WAV at all").expect("corrupt current file");
+        let error = inspect_prepared_existing_file(&db, &wav, std::slice::from_ref(&path_text), "unknown@pre-registry")
+            .unwrap_err();
+        assert!(error.contains("cannot decode current prepared WAV"), "unexpected refusal: {error}");
+    }
+
+    #[test]
+    fn prepared_inventory_refuses_empty_missing_and_overdeep_directories() {
+        let root = tempfile::tempdir().expect("tempdir");
+        assert!(collect_prepared_wavs(root.path()).unwrap_err().contains("no WAV files found"));
+        assert!(collect_prepared_wavs(&root.path().join("missing"))
+            .unwrap_err()
+            .contains("cannot read prepared voice directory"));
+
+        let mut deep = root.path().to_path_buf();
+        for level in 0..33 {
+            deep.push(format!("d{level}"));
+        }
+        std::fs::create_dir_all(&deep).expect("deep nesting");
+        std::fs::write(deep.join("buried.wav"), b"wave").expect("buried wav");
+        assert!(collect_prepared_wavs(root.path()).unwrap_err().contains("nesting exceeds 32 levels"));
+    }
+
+    #[test]
+    fn alias_indexing_keeps_only_paths_under_the_target_and_dedups() {
+        let target = r"D:\Voice";
+        let indexed = prepared_stored_paths_by_alias(
+            [r"d:/voice/clip.wav".to_string(), r"d:/voice/clip.wav".to_string(), r"e:/elsewhere/clip.wav".to_string()],
+            target,
+        );
+        assert_eq!(indexed.len(), 1, "paths outside the target directory are never candidates");
+        let candidates = indexed.get(&prepared_path_alias_key(r"D:\Voice\clip.wav")).expect("indexed alias");
+        assert_eq!(candidates, &vec![r"d:/voice/clip.wav".to_string()], "identical stored paths deduplicate");
+        assert_eq!(rebase_onto_import_dir("d:/v", target), None, "a stored path shorter than the target never matches");
+    }
+
+    // ── Executable-boundary invocation and settings hardening ────────────────────────────────────
+
+    #[test]
+    fn prepared_voice_settings_are_forced_to_the_champion_only_profile() {
+        let mut settings = AppSettings {
+            asr_model_size: AsrModelSize::CTC300M,
+            multi_engine_hypotheses: true,
+            use_finetuned_asr: true,
+            enable_diarization: true,
+            enable_denoising: true,
+            auto_align: true,
+            assign_speaker_from_filename: true,
+            llm_mode: LlmMode::Gemini,
+            cloud_llm_opt_in: true,
+            jury_cloud_opt_in: true,
+            ger_refinement_enabled: true,
+            ..Default::default()
+        };
+        harden_prepared_voice_settings(&mut settings);
+
+        assert_eq!(settings.asr_model_size, AsrModelSize::WSL7B);
+        assert!(!settings.multi_engine_hypotheses);
+        assert!(!settings.use_finetuned_asr);
+        assert!(!settings.enable_diarization);
+        assert!(!settings.enable_denoising);
+        assert!(!settings.auto_align);
+        assert!(!settings.assign_speaker_from_filename);
+        assert_eq!(settings.llm_mode, LlmMode::None);
+        assert!(!settings.cloud_llm_opt_in);
+        assert!(!settings.jury_cloud_opt_in);
+        assert!(!settings.ger_refinement_enabled);
+        // The exact refusal predicate main() applies after hardening must be satisfiable.
+        assert!(
+            !(settings.asr_model_size != AsrModelSize::WSL7B
+                || settings.multi_engine_hypotheses
+                || settings.use_finetuned_asr),
+            "hardened settings must pass the production import gate"
+        );
+    }
+
+    #[test]
+    fn invocation_parsing_selects_mode_and_target_from_arguments_then_environment() {
+        let mut prepared = vec![OsString::from("--prepared-voice"), OsString::from(r"D:\prepared")].into_iter();
+        assert_eq!(parse_import_invocation(&mut prepared), (true, Some(PathBuf::from(r"D:\prepared"))));
+        assert!(prepared.next().is_none(), "the prepared directory argument must be consumed");
+
+        let mut plain = vec![OsString::from(r"D:\plain")].into_iter();
+        assert_eq!(parse_import_invocation(&mut plain), (false, Some(PathBuf::from(r"D:\plain"))));
+
+        let mut flag_only = vec![OsString::from("--prepared-voice")].into_iter();
+        assert_eq!(parse_import_invocation(&mut flag_only), (true, None));
+
+        // Environment fallback, exercised serially inside this one test to avoid variable races.
+        std::env::set_var("CORTEX_IMPORT_PREPARED_VOICE", "1");
+        std::env::set_var("CORTEX_IMPORT_DIR", r"D:\env-dir");
+        assert_eq!(
+            parse_import_invocation(&mut Vec::<OsString>::new().into_iter()),
+            (true, Some(PathBuf::from(r"D:\env-dir")))
+        );
+        std::env::set_var("CORTEX_IMPORT_PREPARED_VOICE", "0");
+        assert_eq!(
+            parse_import_invocation(&mut Vec::<OsString>::new().into_iter()),
+            (false, Some(PathBuf::from(r"D:\env-dir")))
+        );
+        std::env::remove_var("CORTEX_IMPORT_PREPARED_VOICE");
+        std::env::remove_var("CORTEX_IMPORT_DIR");
+        assert_eq!(parse_import_invocation(&mut Vec::<OsString>::new().into_iter()), (false, None));
     }
 }

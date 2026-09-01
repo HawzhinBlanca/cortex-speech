@@ -834,3 +834,288 @@ mod read_command_surface_tests {
         });
     }
 }
+
+/// Wave-4 state-boundary coverage: every read command above invoked through a genuine managed
+/// `State<'_, AppState>` (`crate::test_support::managed_app_state`), driving the same
+/// limiter/validation/worker closures production IPC runs.
+#[cfg(test)]
+mod state_read_command_surface_tests {
+    use super::*;
+    use crate::ipc_contract::ReviewScope;
+    use crate::test_support::managed_app_state;
+    use tauri::Manager;
+
+    type MockApp = tauri::App<tauri::test::MockRuntime>;
+
+    fn seed_segment(app: &MockApp, id: &str, transcript: &str) {
+        app.state::<AppState>()
+            .lock_db()
+            .insert_segment(&SpeechSegment {
+                id: id.into(),
+                audio_path: format!("C:/fixtures/{id}.wav"),
+                raw_transcript: transcript.into(),
+                duration_ms: 1_000,
+                ..SpeechSegment::default()
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn review_page_scopes_and_voice_focus_serve_and_refuse_through_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = managed_app_state(dir.path());
+        seed_segment(&app, "review-a", "deng yek du");
+        seed_segment(&app, "review-b", "wusha ciya jida");
+
+        tauri::async_runtime::block_on(async {
+            assert!(
+                get_active_voice_focus_v1(app.state()).await.expect("no focus file yet").is_none(),
+                "a missing focus policy is honestly no focus, not an error"
+            );
+
+            let pending =
+                get_review_page_v1(ReviewScope::Pending, None, None, app.state()).await.expect("pending review page");
+            assert_eq!(pending.total, 2);
+            assert_eq!(pending.items.len(), 2);
+            assert_eq!(pending.scope_label, "pending");
+            assert!(!pending.focus_narrowed);
+            assert!(pending.items.iter().all(|item| item.eligible && item.base_revision == 0));
+
+            let oversized =
+                get_review_page_v1(ReviewScope::Search { query: "q".repeat(1001) }, None, None, app.state())
+                    .await
+                    .expect_err("an oversized search scope must be refused");
+            assert_eq!(oversized.code, "INVALID_REVIEW_SCOPE");
+
+            let searched = get_review_page_v1(ReviewScope::Search { query: "deng".into() }, None, None, app.state())
+                .await
+                .expect("search scope");
+            assert_eq!(searched.scope_label, "search");
+            assert_eq!(searched.items.len(), 1);
+            assert_eq!(searched.items[0].segment.id, "review-a");
+
+            for bad_cursor in ["../evil".to_string(), "c".repeat(2049)] {
+                let refused = get_review_page_v1(ReviewScope::Pending, None, Some(bad_cursor), app.state())
+                    .await
+                    .expect_err("cursor validation");
+                assert_eq!(refused.code, "INVALID_REVIEW_CURSOR");
+            }
+
+            let escalation =
+                get_review_page_v1(ReviewScope::Escalation, None, None, app.state()).await.expect("escalation scope");
+            assert_eq!(escalation.scope_label, "escalation");
+            assert_eq!(escalation.total, 0);
+
+            let opaque = get_review_page_v1(
+                ReviewScope::VoiceFocus { focus_id: "not-an-opaque-digest".into() },
+                None,
+                None,
+                app.state(),
+            )
+            .await
+            .expect_err("a non-opaque focus identity must be refused");
+            assert_eq!(opaque.code, "INVALID_REVIEW_SCOPE");
+
+            std::fs::write(
+                dir.path().join(crate::voice_focus::VOICE_FOCUS_FILE),
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "private owner label",
+                    "segment_ids": ["review-a"],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let active =
+                get_active_voice_focus_v1(app.state()).await.expect("focus discovery").expect("focus is active");
+            assert_eq!(active.segment_count, 1);
+            assert!(!active.focus_id.contains("private owner label"), "the private policy name never crosses IPC");
+
+            let focused = get_review_page_v1(
+                ReviewScope::VoiceFocus { focus_id: active.focus_id.clone() },
+                None,
+                None,
+                app.state(),
+            )
+            .await
+            .expect("focused review page");
+            assert_eq!(focused.scope_label, "voiceFocus");
+            assert!(focused.focus_narrowed, "a focus page must say its total counts a subset");
+            assert_eq!(focused.total, 1);
+            assert_eq!(focused.items[0].segment.id, "review-a");
+
+            std::fs::write(
+                dir.path().join(crate::voice_focus::VOICE_FOCUS_FILE),
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "replacement label",
+                    "segment_ids": ["review-b"],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let stale = get_review_page_v1(
+                ReviewScope::VoiceFocus { focus_id: active.focus_id.clone() },
+                None,
+                None,
+                app.state(),
+            )
+            .await
+            .expect_err("a replaced focus generation must invalidate the request");
+            assert_eq!(stale.code, "STALE_VOICE_FOCUS");
+
+            std::fs::remove_file(dir.path().join(crate::voice_focus::VOICE_FOCUS_FILE)).unwrap();
+            let inactive =
+                get_review_page_v1(ReviewScope::VoiceFocus { focus_id: active.focus_id }, None, None, app.state())
+                    .await
+                    .expect_err("a deactivated focus must not serve rows");
+            assert_eq!(inactive.code, "VOICE_FOCUS_NOT_ACTIVE");
+        });
+    }
+
+    #[test]
+    fn library_reads_serve_pages_ids_and_rows_through_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = managed_app_state(dir.path());
+        seed_segment(&app, "lib-a", "deng yek du");
+        seed_segment(&app, "lib-b", "wusha ciya jida");
+        seed_segment(&app, "lib-c", "uniquetoken body");
+
+        tauri::async_runtime::block_on(async {
+            let invalid = get_segment("bad id!".into(), app.state()).await.expect_err("identifier gate");
+            assert_eq!(invalid.code, "INVALID_SEGMENT_ID");
+            let missing = get_segment("lib-missing".into(), app.state()).await.expect_err("unknown row");
+            assert_eq!(missing.code, "SEGMENT_NOT_FOUND");
+            assert_eq!(get_segment("lib-a".into(), app.state()).await.expect("hydrate one row").id, "lib-a");
+
+            let page = get_segments_page(None, None, None, None, None, None, app.state()).await.expect("default page");
+            assert_eq!(page.total, 3);
+            assert_eq!(page.items.len(), 3);
+            assert!(!page.focus_narrowed);
+
+            let verified_only = get_segments_page(Some(true), None, None, None, None, None, app.state())
+                .await
+                .expect("verified filter");
+            assert_eq!(verified_only.total, 0, "nothing is verified on a fresh library");
+
+            assert_eq!(
+                get_segments_page(None, None, Some("DROP TABLE".into()), None, None, None, app.state())
+                    .await
+                    .unwrap_err()
+                    .code,
+                "INVALID_LIBRARY_SORT"
+            );
+            assert_eq!(
+                get_segments_page(None, None, None, None, Some("../evil".into()), None, app.state())
+                    .await
+                    .unwrap_err()
+                    .code,
+                "INVALID_LIBRARY_CURSOR"
+            );
+            assert_eq!(
+                get_segments_page(None, Some("q".repeat(1001)), None, None, None, None, app.state())
+                    .await
+                    .unwrap_err()
+                    .code,
+                "INVALID_LIBRARY_QUERY"
+            );
+            let unfocused = get_segments_page(None, None, None, None, None, Some(true), app.state())
+                .await
+                .expect("a focused read with no policy file stays corpus-wide");
+            assert_eq!(unfocused.total, 3);
+            assert!(!unfocused.focus_narrowed);
+
+            assert_eq!(
+                get_segment_ids_for_view(None, None, Some("everything".into()), app.state()).await.unwrap_err().code,
+                "INVALID_TRANSCRIPT_STATE"
+            );
+            assert_eq!(
+                get_segment_ids_for_view(None, Some("q".repeat(1001)), None, app.state()).await.unwrap_err().code,
+                "INVALID_LIBRARY_QUERY"
+            );
+            assert_eq!(get_segment_ids_for_view(None, None, None, app.state()).await.expect("all ids").len(), 3);
+
+            assert!(
+                get_signal_anomaly_segments(None, app.state()).await.expect("anomaly page").is_empty(),
+                "no segment carries an anomaly score yet"
+            );
+
+            assert_eq!(get_segments(None, app.state()).await.expect("whole library").len(), 3);
+            assert_eq!(get_segments(Some(true), app.state()).await.expect("verified subset").len(), 0);
+            assert_eq!(get_segments_suspect_first(None, app.state()).await.expect("suspect-first order").len(), 3);
+
+            let bounded = search_segments("q".repeat(1001), app.state()).await.expect_err("bounded query");
+            assert!(bounded.contains("Search query"), "{bounded}");
+            let hits = search_segments("uniquetoken".into(), app.state()).await.expect("FTS search");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].id, "lib-c");
+        });
+    }
+
+    #[test]
+    fn audio_probes_health_relink_and_learning_queue_through_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = managed_app_state(dir.path());
+        let wav = dir.path().join("waveform.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav, spec).unwrap();
+        for sample in 0..16_000 {
+            writer.write_sample(((sample % 127) as i16) - 63).unwrap();
+        }
+        writer.finalize().unwrap();
+        let garbage = dir.path().join("garbage.wav");
+        std::fs::write(&garbage, b"this is not a RIFF container").unwrap();
+
+        tauri::async_runtime::block_on(async {
+            let points = get_waveform(wav.to_string_lossy().into_owned(), 16, None, app.state())
+                .await
+                .expect("waveform for real audio");
+            assert_eq!(points.len(), 16, "one second at 16 kHz bins into exactly the requested points");
+            assert!(points.iter().all(|point| point.is_finite()));
+
+            assert_eq!(
+                get_waveform(dir.path().join("missing.wav").to_string_lossy().into_owned(), 16, None, app.state())
+                    .await
+                    .unwrap_err()
+                    .code,
+                "INVALID_AUDIO_PATH"
+            );
+            assert_eq!(
+                get_waveform(wav.to_string_lossy().into_owned(), 16, Some("{ broken".into()), app.state())
+                    .await
+                    .unwrap_err()
+                    .code,
+                "INVALID_ALIGNMENT"
+            );
+            let undecodable = get_waveform(garbage.to_string_lossy().into_owned(), 16, None, app.state())
+                .await
+                .expect_err("garbage bytes cannot decode");
+            assert_eq!(undecodable.code, "WAVEFORM_FAILED");
+            assert!(undecodable.retryable);
+
+            let health = get_audio_health(app.state()).await.expect("audio health scan");
+            assert_eq!(health.total_files, 0);
+            assert_eq!(health.missing_files, 0);
+            assert!(health.missing_paths.is_empty());
+
+            assert_eq!(
+                relink_audio(r"\\attacker\share".into(), app.state()).await.unwrap_err().code,
+                "INVALID_RELINK_FOLDER",
+                "a renderer-supplied UNC search dir must be refused before any filesystem probe"
+            );
+            let relinked = relink_audio(dir.path().to_string_lossy().into_owned(), app.state())
+                .await
+                .expect("relink over an empty library");
+            assert_eq!(relinked.relinked, 0);
+            assert_eq!(relinked.still_missing, 0);
+
+            assert!(
+                get_active_learning_queue(app.state(), 0.05, 0.95, 10).await.expect("empty queue").is_empty(),
+                "an empty library has nothing to prioritize"
+            );
+        });
+    }
+}

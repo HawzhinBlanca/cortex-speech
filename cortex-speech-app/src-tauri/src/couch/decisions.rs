@@ -3279,4 +3279,596 @@ mod tests {
         );
         assert_eq!((code, body.as_str()), (403, "this clip is outside the active review pool"));
     }
+
+    // ── Independent second-pass and policy-binding arms ──────────────────────
+
+    /// A hand-assembled second-pass campaign shaped exactly like the durable one, so the
+    /// independent handler's own refusal ladder can be driven without a full activation fixture.
+    fn second_pass_campaign(
+        phase: crate::review_campaign::CampaignPhase,
+    ) -> crate::review_campaign::SequentialReviewCampaign {
+        let focus: std::collections::HashSet<String> = ["in-pool".to_string()].into_iter().collect();
+        let evidence = crate::review_campaign::focus_evidence(&focus).unwrap();
+        let campaign_id = "123e4567-e89b-42d3-a456-426614174600".to_string();
+        crate::review_campaign::SequentialReviewCampaign {
+            schema_version: 1,
+            campaign_id: campaign_id.clone(),
+            mode: crate::review_campaign::SEQUENTIAL_CAMPAIGN_MODE.into(),
+            status: crate::review_campaign::SEQUENTIAL_CAMPAIGN_STATUS.into(),
+            reviewer: "Rubar".into(),
+            after_review_event_id: 0,
+            activated_at_review_event_id: 0,
+            focus_segment_count: evidence.segment_count,
+            focus_sha256: evidence.sha256.clone(),
+            provisional_export_block: true,
+            independent_second_pass_required: true,
+            progress: Some(crate::review_campaign::CampaignProgress {
+                schema_version: 1,
+                campaign_id,
+                phase,
+                transition_id: "123e4567-e89b-42d3-a456-426614174601".into(),
+                first_reviewer: "Rubar".into(),
+                second_reviewer: crate::review_campaign::SECOND_PASS_REVIEWER.into(),
+                focus_segment_count: evidence.segment_count,
+                focus_sha256: evidence.sha256,
+                max_review_event_id: 0,
+                independent_decision_count: 0,
+                adjudication_count: 0,
+                conflicts_remaining: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn independent_decisions_walk_their_own_refusal_ladder_before_any_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        let st = state();
+        let binding = couch_session_binding_sha256("couch-test-session");
+        let blinded = second_pass_campaign(crate::review_campaign::CampaignPhase::SecondPassActive);
+        let call =
+            |value: serde_json::Value, policy: &crate::review_campaign::SequentialReviewCampaign| -> (u16, String) {
+                let body = pool_body(value);
+                let (code, _, reply, _) = api_independent_decision(&db, &body, "Alle", &binding, &st, policy);
+                (code, String::from_utf8(reply).unwrap())
+            };
+
+        let (code, body) = call(serde_json::json!({"id": "ind-1", "action": "accept", "text": "x"}), &blinded);
+        assert_eq!((code, body.as_str()), (400, "operationId is required — reload this page before deciding"));
+        let (code, body) =
+            call(serde_json::json!({"operationId": "nope", "id": "ind-1", "action": "accept", "text": "x"}), &blinded);
+        assert_eq!((code, body.as_str()), (400, "operationId must be a canonical UUID"));
+        let (code, body) = call(
+            serde_json::json!({
+                "operationId": "20000000-0000-4000-8000-0000000000AA",
+                "id": "ind-1",
+                "action": "accept",
+                "text": "x",
+            }),
+            &blinded,
+        );
+        assert_eq!((code, body.as_str()), (400, "operationId must be a lowercase hyphenated UUID"));
+
+        // A campaign whose phase carries no reviewer identity cannot authorize anything.
+        let finished = second_pass_campaign(crate::review_campaign::CampaignPhase::Completed);
+        let (code, body) = call(
+            serde_json::json!({
+                "operationId": "20000000-0000-4000-8000-0000000000a1",
+                "id": "ind-1",
+                "action": "accept",
+                "text": "x",
+            }),
+            &finished,
+        );
+        assert_eq!((code, body.as_str()), (503, "independent review campaign has no active reviewer identity"));
+
+        let (code, body) = call(
+            serde_json::json!({
+                "operationId": "20000000-0000-4000-8000-0000000000a2",
+                "id": "ghost",
+                "action": "accept",
+                "text": "x",
+            }),
+            &blinded,
+        );
+        assert_eq!((code, body.as_str()), (404, "no such segment"));
+
+        db.insert_segment(&seg("ind-1", "دەقی خاو")).unwrap();
+        let (code, body) = call(
+            serde_json::json!({
+                "operationId": "20000000-0000-4000-8000-0000000000a3",
+                "id": "ind-1",
+                "action": "accept",
+                "text": "x",
+            }),
+            &blinded,
+        );
+        assert_eq!((code, body.as_str()), (400, "rowVersion is required — reload this clip before deciding"));
+        let (code, body) = call(
+            serde_json::json!({
+                "operationId": "20000000-0000-4000-8000-0000000000a4",
+                "id": "ind-1",
+                "action": "accept",
+                "text": "x",
+                "rowVersion": "later",
+            }),
+            &blinded,
+        );
+        assert_eq!((code, body.as_str()), (400, "rowVersion is invalid — reload this clip before deciding"));
+        let current = stamp(&db, "ind-1");
+        let stale = (current.parse::<i64>().unwrap() + 3).to_string();
+        let (code, body) = call(
+            serde_json::json!({
+                "operationId": "20000000-0000-4000-8000-0000000000a5",
+                "id": "ind-1",
+                "action": "accept",
+                "text": "x",
+                "rowVersion": stale,
+            }),
+            &blinded,
+        );
+        assert_eq!((code, body.as_str()), (409, "this clip changed since it was served — reload for the fresh draft"));
+        let (code, body) = call(
+            serde_json::json!({
+                "operationId": "20000000-0000-4000-8000-0000000000a6",
+                "id": "ind-1",
+                "action": "accept",
+                "text": "x",
+                "rowVersion": current,
+            }),
+            &blinded,
+        );
+        assert_eq!(
+            (code, body.as_str()),
+            (409, "independent review requires this clip to be served first — reload the queue")
+        );
+
+        // Served, but the database no longer carries ANY campaign: the live re-check pauses it.
+        lock_state(&st).served_work.insert(("ind-1".into(), "Alle".into()));
+        let (code, body) = call(
+            serde_json::json!({
+                "operationId": "20000000-0000-4000-8000-0000000000a7",
+                "id": "ind-1",
+                "action": "accept",
+                "text": "x",
+                "rowVersion": current,
+            }),
+            &blinded,
+        );
+        assert_eq!((code, body.as_str()), (503, "independent review campaign is no longer active"));
+
+        assert_eq!(
+            db.connection()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM independent_review_decisions", [], |r| r.get(0))
+                .unwrap(),
+            0,
+            "every refusal above must write nothing"
+        );
+        assert_eq!(review_event_count(&db), 0);
+    }
+
+    #[test]
+    fn independent_undo_refuses_missing_targets_and_keeps_the_replay_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        let blinded = second_pass_campaign(crate::review_campaign::CampaignPhase::SecondPassActive);
+        let undo = |st: &Mutex<CouchState>| -> (u16, String) {
+            let (code, _, reply, _) = api_independent_undo(&db, "Alle", st, &blinded);
+            (code, String::from_utf8(reply).unwrap())
+        };
+
+        let st = state();
+        let (code, body) = undo(&st);
+        assert_eq!((code, body.as_str()), (409, "nothing to undo"));
+
+        // A remembered token naming a decision that does not exist fails closed AND is retained,
+        // so the retry replays the same target instead of sliding to an older decision.
+        remember_independent_undo(&st, "Alle", "20000000-0000-4000-8000-0000000000b1", "ind-gone", 4_242);
+        let (code, body) = undo(&st);
+        assert_eq!(code, 500, "{body}");
+        assert!(body.contains("target is missing or outside this campaign"), "{body}");
+        assert_eq!(
+            lock_state(&st).independent_undo.get("Alle").map(Vec::len),
+            Some(1),
+            "the exact token is pushed back for the retry"
+        );
+
+        // A token whose forward UUID cannot derive a reversal identity is also retained.
+        let derived = state();
+        remember_independent_undo(&derived, "Alle", "NOT-A-UUID", "ind-bad", 7);
+        let (code, body) = undo(&derived);
+        assert_eq!(code, 500, "{body}");
+        assert!(body.contains("independent undo identity cannot be derived"), "{body}");
+        assert_eq!(lock_state(&derived).independent_undo.get("Alle").map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn stale_policy_bindings_pause_decisions_before_any_corpus_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (plain, _) = test_db(tmp.path());
+
+        // (a) A campaign bound in memory but absent from the database pauses the whole route.
+        let bound_campaign = Mutex::new(CouchState {
+            campaign_policy: Some(second_pass_campaign(crate::review_campaign::CampaignPhase::SecondPassActive)),
+            ..CouchState::default()
+        });
+        let (code, body) =
+            decide(&plain, &bound_campaign, "Sara", &serde_json::json!({"id": "s1", "action": "accept", "text": "x"}));
+        assert_eq!(code, 503, "{body}");
+        assert!(body.contains("sequential review campaign changed during this session"), "{body}");
+
+        // (b) A pool active in the database but not bound in memory pauses it symmetrically.
+        let pool_dir = tempfile::tempdir().unwrap();
+        let (pooled, pool) = pool_fixture(pool_dir.path());
+        let unbound = state();
+        let (code, body) =
+            decide(&pooled, &unbound, "Sara", &serde_json::json!({"id": "in-pool", "action": "accept", "text": "x"}));
+        assert_eq!(code, 503, "{body}");
+        assert!(body.contains("review pool changed during this session"), "{body}");
+
+        // (c) The pool handler compares the serving pool with the caller's bound pool.
+        let bound_pool = Mutex::new(CouchState { pool_policy: Some(pool.clone()), ..CouchState::default() });
+        lock_state(&bound_pool).served_work.insert(("in-pool".into(), "Sara".into()));
+        let mut drifted = pool.clone();
+        drifted.pool_id = "123e4567-e89b-42d3-a456-426614174778".into();
+        let parsed = pool_body(serde_json::json!({
+            "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaab01",
+            "id": "in-pool",
+            "action": "accept",
+            "text": "دەقی چامپیۆن",
+            "rowVersion": stamp(&pooled, "in-pool"),
+        }));
+        let (code, _, reply, _) = api_pool_decision(&pooled, &parsed, "Sara", &bound_pool, &drifted);
+        let reply = String::from_utf8(reply).unwrap();
+        assert_eq!((code, reply.as_str()), (503, "review pool changed while this decision was being checked"));
+
+        // (d) No pool anywhere: the pool route reports the pool itself as gone.
+        plain.insert_segment(&seg("in-pool", "دەقی چامپیۆن")).unwrap();
+        lock_state(&unbound).served_work.insert(("in-pool".into(), "Sara".into()));
+        let parsed = pool_body(serde_json::json!({
+            "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaab02",
+            "id": "in-pool",
+            "action": "accept",
+            "text": "دەقی چامپیۆن",
+            "rowVersion": stamp(&plain, "in-pool"),
+        }));
+        let (code, _, reply, _) = api_pool_decision(&plain, &parsed, "Sara", &unbound, &pool);
+        let reply = String::from_utf8(reply).unwrap();
+        assert_eq!((code, reply.as_str()), (503, "review pool is no longer active"));
+    }
+
+    #[test]
+    fn pool_decisions_honor_leases_inflight_state_and_the_second_opinion_law() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, pool) = pool_fixture(tmp.path());
+        let st = Mutex::new(CouchState { pool_policy: Some(pool.clone()), ..CouchState::default() });
+        let pool_decisions = || -> i64 {
+            db.connection().query_row("SELECT COUNT(*) FROM review_pool_decisions", [], |r| r.get(0)).unwrap()
+        };
+        let serve = |reviewer: &str| {
+            lock_state(&st).served_work.insert(("in-pool".into(), reviewer.to_string()));
+        };
+
+        // (a) The canonical row has NO first-pass answer yet, so the guarded observation insert
+        // matches nothing: the pool law demands verified+decided before a second opinion exists.
+        serve("Sara");
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaab11",
+                "id": "in-pool",
+                "action": "accept",
+                "text": "دەقی چامپیۆن",
+                "rowVersion": stamp(&db, "in-pool"),
+                "heardMs": 1500,
+            }),
+        );
+        assert_eq!((code, body.as_str()), (409, "this clip changed while the decision was being saved — reload"));
+        assert_eq!(pool_decisions(), 0);
+
+        // (b) Another reviewer's live lease refuses the write after evidence but before any insert.
+        lock_state(&st).leases.insert("in-pool".into(), ("Nechir".into(), Instant::now()));
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaab12",
+                "id": "in-pool",
+                "action": "accept",
+                "text": "دەقی چامپیۆن",
+                "rowVersion": stamp(&db, "in-pool"),
+                "heardMs": 1500,
+            }),
+        );
+        assert_eq!((code, body.as_str()), (409, "another reviewer is working on this clip"));
+        lock_state(&st).leases.remove("in-pool");
+
+        // (c) An operation still being committed by a concurrent request refuses its own retry.
+        lock_state(&st).in_flight_operations.insert("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaab13".into());
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaab13",
+                "id": "in-pool",
+                "action": "accept",
+                "text": "دەقی چامپیۆن",
+                "rowVersion": stamp(&db, "in-pool"),
+                "heardMs": 1500,
+            }),
+        );
+        assert_eq!((code, body.as_str()), (503, "this operation is still being saved — retrying is safe"));
+        lock_state(&st).in_flight_operations.remove("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaab13");
+        assert_eq!(pool_decisions(), 0);
+
+        // Mint the canonical first answer, exactly as production held it before pool activation.
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET verified=1, human_decision='edit', reviewed_by='Hemn',
+                        annotated_transcript='دەقی یەکسان' WHERE id='in-pool'",
+                [],
+            )
+            .unwrap();
+        let planted_op = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaab14";
+        let planted_hash = decision_operation_payload_hash("in-pool", "edit", "دەقی یەکسان", "Sara");
+        let revision = db.segment_review_revision("in-pool").unwrap().unwrap();
+        let content_hash = db.segment_audio_content_hash("in-pool").unwrap().unwrap();
+        let planted_id = crate::review_pool::record_decision(
+            &db,
+            &pool,
+            &crate::review_pool::PoolDecisionInput {
+                segment_id: "in-pool",
+                reviewer: "Sara",
+                action: "edit",
+                submitted_transcript: Some("دەقی یەکسان"),
+                served_transcript: "دەقی چامپیۆن",
+                served_revision: revision,
+                audio_content_hash: Some(&content_hash),
+                source_start_ms: Some(0),
+                source_end_ms: Some(1500),
+                duration_ms: 1500,
+                requested_action: "edit",
+                requested_transcript: "دەقی یەکسان",
+                operation_id: planted_op,
+                operation_payload_hash: &planted_hash,
+                created_at_ms: 1_700_000_000_000,
+            },
+        )
+        .unwrap()
+        .expect("pool observation planted");
+
+        // (d) The planted UUID with ANY different contract is a hard conflict, never a fresh write.
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": planted_op,
+                "id": "in-pool",
+                "action": "edit",
+                "text": "دەقی جیاواز",
+            }),
+        );
+        assert_eq!((code, body.as_str()), (409, "operation UUID is already bound to another pool decision"));
+
+        // (e) A UUID already bound to canonical first-pass truth can never name a pool observation.
+        let outside_revision = db.segment_review_revision("outside").unwrap().unwrap();
+        let outside_hash = decision_operation_payload_hash("outside", "edit", "دەقی نێچیر", "Nechir");
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "outside",
+            "edit",
+            Some("دەقی نێچیر"),
+            "Nechir",
+            outside_revision,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaab15",
+            &outside_hash,
+        )
+        .unwrap()
+        .unwrap();
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaab15",
+                "id": "in-pool",
+                "action": "accept",
+                "text": "دەقی چامپیۆن",
+            }),
+        );
+        assert_eq!((code, body.as_str()), (409, "operation UUID is already bound to a canonical decision"));
+
+        // (f) Hemn (canonical) + Sara (pool) agree, so the clip is RESOLVED: a third opinion is
+        // refused by the recording authority and surfaces as the storage refusal it is.
+        serve("Nechir");
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Nechir",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaab16",
+                "id": "in-pool",
+                "action": "accept",
+                "text": "دەقی چامپیۆن",
+                "rowVersion": stamp(&db, "in-pool"),
+                "heardMs": 1500,
+            }),
+        );
+        assert_eq!(code, 500, "{body}");
+        assert!(body.contains("review pool clip is already resolved"), "{body}");
+
+        // (g) The addressed undo with the exact durable coordinates reverses Sara's observation,
+        // re-leases the clip to her, and re-serves it.
+        let addressed = serde_json::json!({
+            "poolDecisionId": planted_id.to_string(),
+            "decisionOperationId": planted_op,
+            "reversalOperationId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbb17",
+        });
+        let (code, body) = undo_raw(&db, &st, "Sara", addressed.to_string().as_bytes());
+        assert_eq!(code, 200, "{body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["id"], "in-pool");
+        assert_eq!(reply["reviewPool"], true);
+        assert_eq!(reply["poolDecisionId"], planted_id);
+        assert_eq!(reply["reversalOperationId"], "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbb17");
+        assert_eq!(reply["rowVersion"], stamp(&db, "in-pool"));
+        assert_eq!(
+            db.connection()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM review_pool_reversals", [], |r| r.get(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(lock_state(&st).holder("in-pool", Instant::now()), Some("Sara"));
+        assert!(lock_state(&st).served_work.contains(&("in-pool".to_string(), "Sara".to_string())));
+
+        // (h) After the reversal the clip is one opinion again, so Sara's fresh judgement commits
+        // through the full production path: receipt, evidence, lease, guarded append-only insert.
+        let (code, body) = pool_decide(
+            &db,
+            &st,
+            &pool,
+            "Sara",
+            serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaab18",
+                "id": "in-pool",
+                "action": "accept",
+                "text": "دەقی چامپیۆن",
+                "rowVersion": stamp(&db, "in-pool"),
+                "heardMs": 1500,
+            }),
+        );
+        assert_eq!(code, 200, "{body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["ok"], true);
+        let second_id = reply["poolDecisionId"].as_i64().expect("a fresh observation id");
+        assert!(second_id > planted_id, "observations are append-only");
+        assert_eq!(pool_decisions(), 2, "the reversed observation remains in the append-only history");
+        let canonical = row(&db, "in-pool");
+        assert_eq!(canonical.reviewed_by.as_deref(), Some("Hemn"), "the first answer is never touched");
+        assert_eq!(canonical.annotated_transcript.as_deref(), Some("دەقی یەکسان"));
+    }
+
+    #[test]
+    fn spot_check_keys_that_lost_their_answer_pause_or_become_real_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+
+        // (a) A pilot-budgeted key whose answer is gone PAUSES review instead of consuming a third
+        // key or silently converting the measurement into ordinary work.
+        db.insert_segment(&seg("sc-p1", "دەقی خاو")).unwrap();
+        let st = state();
+        {
+            let mut guard = lock_state(&st);
+            guard.spot_checks.insert(("sc-p1".into(), "Sara".into()));
+            guard.pilot_spot_checks.insert(("sc-p1".into(), "Sara".into()));
+        }
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaab21",
+                "id": "sc-p1",
+                "action": "accept",
+                "text": "دەقی خاو",
+                "rowVersion": stamp(&db, "sc-p1"),
+            }),
+        );
+        assert_eq!(
+            (code, body.as_str()),
+            (503, "Review is temporarily paused: a controlled hidden-check key is no longer valid")
+        );
+        assert!(
+            lock_state(&st).spot_checks.contains(&("sc-p1".to_string(), "Sara".to_string())),
+            "a paused pilot key is kept, never dropped"
+        );
+        let untouched = row(&db, "sc-p1");
+        assert!(!untouched.verified && untouched.human_decision.is_none());
+
+        // (b) An ordinary stale key is dropped and the submit is what it is: real first-pass work.
+        db.insert_segment(&seg("sc-s1", "دەقی خاو")).unwrap();
+        lock_state(&st).spot_checks.insert(("sc-s1".into(), "Sara".into()));
+        let receipt = policy4_receipt(&db, "Sara", "sc-s1");
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaab22",
+                "id": "sc-s1",
+                "action": "accept",
+                "text": "دەقی خاو",
+                "rowVersion": stamp(&db, "sc-s1"),
+                "playbackReceiptId": receipt,
+            }),
+        );
+        assert_eq!(code, 200, "{body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["ok"], true);
+        assert!(reply["effectEventId"].is_i64(), "real work mints a real decision effect: {reply}");
+        assert!(
+            !lock_state(&st).spot_checks.contains(&("sc-s1".to_string(), "Sara".to_string())),
+            "the stale pair is dropped so it cannot swallow this clip again"
+        );
+        let decided = row(&db, "sc-s1");
+        assert!(decided.verified);
+        assert_eq!(decided.reviewed_by.as_deref(), Some("Sara"));
+
+        // (c) A completed verdict retried under a NEW UUID carrying a playback receipt is a hard
+        // conflict: the compatibility ACK belongs only to the pre-policy-4 no-receipt outbox.
+        db.insert_segment(&seg("sc-d1", "دەقی خاو")).unwrap();
+        let revision = db.segment_review_revision("sc-d1").unwrap().unwrap();
+        let planted = decision_operation_payload_hash("sc-d1", "edit", "دەقی ڕاست", "Sara");
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "sc-d1",
+            "edit",
+            Some("دەقی ڕاست"),
+            "Sara",
+            revision,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaab23",
+            &planted,
+        )
+        .unwrap()
+        .unwrap();
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaab24",
+                "id": "sc-d1",
+                "action": "accept",
+                "text": "دەقی ڕاست",
+                "playbackReceiptId": "cccccccc-cccc-4ccc-8ccc-cccccccccc99",
+            }),
+        );
+        assert_eq!(
+            (code, body.as_str()),
+            (409, "this decision already committed under a different operation identity")
+        );
+    }
+
+    #[test]
+    fn release_unserved_leases_returns_only_this_reviewers_still_held_clips() {
+        let st = state();
+        {
+            let mut guard = lock_state(&st);
+            guard.leases.insert("held-a".into(), ("Sara".into(), Instant::now()));
+            guard.leases.insert("held-b".into(), ("Hemn".into(), Instant::now()));
+        }
+        release_unserved_leases(&st, &["held-a".to_string(), "held-b".to_string(), "held-c".to_string()], "Sara");
+        let mut guard = lock_state(&st);
+        assert!(guard.holder("held-a", Instant::now()).is_none(), "Sara's own unserved lease is returned");
+        assert_eq!(guard.holder("held-b", Instant::now()), Some("Hemn"), "another reviewer's work is never freed");
+    }
 }

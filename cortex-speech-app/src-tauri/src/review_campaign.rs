@@ -2740,4 +2740,144 @@ mod tests {
         assert_eq!(exact_independent_consensus("accept", None, "accept", Some("text")), None);
         assert_eq!(exact_independent_consensus("skip", Some("text"), "accept", Some("text")), None);
     }
+
+    fn progress_for(policy: &SequentialReviewCampaign) -> CampaignProgress {
+        CampaignProgress {
+            schema_version: 1,
+            campaign_id: policy.campaign_id.clone(),
+            phase: CampaignPhase::SecondPassActive,
+            transition_id: "123e4567-e89b-42d3-a456-426614174123".into(),
+            first_reviewer: "Rubar".into(),
+            second_reviewer: SECOND_PASS_REVIEWER.into(),
+            focus_segment_count: policy.focus_segment_count,
+            focus_sha256: policy.focus_sha256.clone(),
+            max_review_event_id: policy.activated_at_review_event_id,
+            independent_decision_count: 0,
+            adjudication_count: 0,
+            conflicts_remaining: 0,
+        }
+    }
+
+    #[test]
+    fn authority_scope_and_pre_schema_row_counts_guard_the_load_path() {
+        // Progress present with ZERO registries: the scope validator refuses before trusting it.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("scope.db").to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        let policy = valid_policy();
+        db.connection()
+            .execute(
+                "INSERT INTO settings(key,value) VALUES(?1,?2)",
+                [SEQUENTIAL_CAMPAIGN_SETTINGS_KEY, &serde_json::to_string(&policy).unwrap()],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO settings(key,value) VALUES(?1,?2)",
+                [SEQUENTIAL_CAMPAIGN_PROGRESS_SETTINGS_KEY, &serde_json::to_string(&progress_for(&policy)).unwrap()],
+            )
+            .unwrap();
+        let missing = load(&db).unwrap_err();
+        assert!(missing.contains("not exclusively bound to the active campaign"), "{missing}");
+
+        // A registry row for a DIFFERENT campaign is the other side of the same scope refusal.
+        let mut foreign = policy.clone();
+        foreign.campaign_id = "123e4567-e89b-42d3-a456-426614174999".into();
+        insert_test_campaign_registry(&db, &foreign);
+        let foreign_error = load(&db).unwrap_err();
+        assert!(foreign_error.contains("not exclusively bound to the active campaign"), "{foreign_error}");
+
+        // Below schema 61 the database-authority counter reads as zero rows, so a bare base
+        // policy still loads instead of erroring on tables that do not exist yet.
+        let old_dir = tempfile::tempdir().unwrap();
+        let old = Database::open(old_dir.path().join("pre61.db").to_str().unwrap()).unwrap();
+        old.initialize().unwrap();
+        let rollback = crate::migrations::MIGRATIONS.iter().filter(|m| m.version > 59).count();
+        crate::migrations::rollback(&old, rollback).unwrap();
+        old.connection()
+            .execute(
+                "INSERT INTO settings(key,value) VALUES(?1,?2)",
+                [SEQUENTIAL_CAMPAIGN_SETTINGS_KEY, &serde_json::to_string(&valid_policy()).unwrap()],
+            )
+            .unwrap();
+        let loaded = load(&old).unwrap().expect("a pre-61 schema still loads the base policy");
+        assert_eq!(loaded.phase(), CampaignPhase::FirstPassActive);
+        assert!(loaded.progress.is_none());
+    }
+
+    #[test]
+    fn progress_tamper_arms_bind_reviewers_focus_and_the_adjudication_phase() {
+        let (db, ids, _, _temp) = seeded_first_pass(1);
+        activate_second_pass(&db, &ids, db.max_review_event_id().unwrap()).unwrap();
+        let original: String = db
+            .connection()
+            .query_row("SELECT value FROM settings WHERE key=?1", [SEQUENTIAL_CAMPAIGN_PROGRESS_SETTINGS_KEY], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let expect_tamper = |mutate: &dyn Fn(&mut serde_json::Value), needle: &str| {
+            let mut value: serde_json::Value = serde_json::from_str(&original).unwrap();
+            mutate(&mut value);
+            db.connection()
+                .execute(
+                    "UPDATE settings SET value=?2 WHERE key=?1",
+                    [SEQUENTIAL_CAMPAIGN_PROGRESS_SETTINGS_KEY, &value.to_string()],
+                )
+                .unwrap();
+            let error = load(&db).unwrap_err();
+            assert!(error.contains(needle), "expected {needle:?} in {error}");
+        };
+        expect_tamper(&|value| value["first_reviewer"] = "Sara".into(), "does not match the bound campaign");
+        expect_tamper(&|value| value["second_reviewer"] = "Nechir".into(), "does not match the bound campaign");
+        expect_tamper(&|value| value["focus_segment_count"] = 5.into(), "does not match the bound campaign");
+        expect_tamper(&|value| value["focus_sha256"] = "b".repeat(64).into(), "does not match the bound campaign");
+        expect_tamper(&|value| value["schema_version"] = 2.into(), "does not match the bound campaign");
+        expect_tamper(
+            &|value| value["transition_id"] = "123E4567-E89B-42D3-A456-426614174000".into(),
+            "lowercase hyphenated UUID",
+        );
+        expect_tamper(&|value| value["phase"] = "adjudication_active".into(), "impossible completion counts");
+        expect_tamper(
+            &|value| {
+                value["phase"] = "completed".into();
+                value["independent_decision_count"] = 1.into();
+                value["adjudication_count"] = 1.into();
+            },
+            "disagrees with its immutable transition",
+        );
+        db.connection()
+            .execute(
+                "UPDATE settings SET value=?2 WHERE key=?1",
+                [SEQUENTIAL_CAMPAIGN_PROGRESS_SETTINGS_KEY, &original],
+            )
+            .unwrap();
+        assert!(load(&db).unwrap().unwrap().is_blinded_second_pass(), "restoring the exact bytes restores the phase");
+    }
+
+    #[test]
+    fn adjudication_demands_a_complete_second_pass_and_names_partial_seal_counts() {
+        let (db, ids, _, _temp) = seeded_first_pass(1);
+        activate_second_pass(&db, &ids, db.max_review_event_id().unwrap()).unwrap();
+        let premature = adjudicate_and_advance(&db, &[]).unwrap_err();
+        assert!(premature.contains("independent pass is incomplete: 0/1"), "{premature}");
+
+        let (db, ids, _, _temp) = seeded_first_pass(2);
+        activate_second_pass(&db, &ids, db.max_review_event_id().unwrap()).unwrap();
+        let policy = load(&db).unwrap().unwrap();
+        let mut sorted: Vec<String> = ids.iter().cloned().collect();
+        sorted.sort();
+        let agreed_raw = db.get_segment_by_id(&sorted[0]).unwrap().unwrap().raw_transcript;
+        record_alle(&db, &policy, &sorted[0], "accept", Some(&agreed_raw), "accept", 0x701);
+        record_alle(&db, &policy, &sorted[1], "edit", Some("دەقی جیاوازی دووەم"), "edit", 0x702);
+        let partial = adjudicate_and_advance(&db, &[]).unwrap();
+        assert_eq!(partial.phase, CampaignPhase::AdjudicationActive);
+        assert_eq!((partial.adjudication_count, partial.conflicts_remaining), (1, 1));
+
+        // The completion validator itself must name exactly how many clips are sealed.
+        let adjudicating = load(&db).unwrap().unwrap();
+        let sealed = verify_campaign_completion(&db, &adjudicating).unwrap_err();
+        assert!(sealed.contains("campaign adjudication is incomplete or stale: 1/2"), "{sealed}");
+        let production = require_finalized_production_export(&db, "production export").unwrap_err().to_string();
+        assert!(production.contains("is adjudication_active"), "{production}");
+    }
 }

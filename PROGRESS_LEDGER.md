@@ -12408,3 +12408,25 @@ pattern, and mismatched-artifact refusals. The JSON is deliberately described as
 owner-published statement, not a cryptographic workstation signature: branch authorization and
 review remain its publisher-authentication boundary until a signing key or trusted self-hosted
 runner is configured.
+
+---
+
+## 2026-09-01 — Coverage wave 4: the function/branch walls, attacked at their twelve files
+
+The first completed wave-3 measurement (regions 83.42%, lines 83.00%, functions 71.95% vs 80,
+branches 63.28% vs 80) localized the remaining contract gap to twelve files. Six agents wrote
+~174 tests (+~6,800 lines, zero production deletions; the only production edits are three
+verified exact-code-motion extracts in the two newly-tested bins) aimed functions-first at
+segments_write/segments_read/system_ops/ingest/commands-root through the State harness,
+branch-hard at restore effects/compensation/snapshot, review_pool/review_campaign/decisions'
+refusal ladders, pipeline import_flow/root, db batch_jobs/core, and the owner_proof_db +
+batch_importer bins.
+
+First execution surfaced 14 honest failures; every one was a test corrected to production
+reality, never the reverse — among them: serde_json serializes NaN as null (so batch-config
+digests of raw floats collide — now pinned with a warning comment), the revision trigger bumps
+on every UPDATE, the modern pool queue fails closed below the dedup schema, zero-sample WAVs
+die at the entry probe before events exist, and the schema's own NOCASE PK + quota trigger make
+two validator arms unreachable (recorded as defense-in-depth). Final gate: lib 2422/0,
+owner_proof_db 26/0, batch_importer 29/0. The re-measure runs in the next reviewer-idle window;
+the machine stays the reviewers' during work hours after yesterday's PDB-collision lesson.

@@ -2255,4 +2255,107 @@ mod tests {
             .any(|entry| entry.file_name().to_string_lossy().contains(".extracting-"));
         assert!(!extracting_left, "staged extraction files should be promoted or removed");
     }
+
+    #[test]
+    fn pin_presence_gate_and_its_error_name_the_refused_label() {
+        ensure_pinned_sha256("Probe Archive", "abc").expect("a populated pin passes");
+        let err = ensure_pinned_sha256("Probe Archive", "").expect_err("an empty pin refuses");
+        assert_eq!(err, missing_pinned_sha256_error("Probe Archive"));
+        assert!(err.contains("Missing pinned SHA256 for Probe Archive"), "{err}");
+        assert!(err.contains("refusing to download unverifiable artifact"), "{err}");
+    }
+
+    #[test]
+    fn model_file_state_reports_presence_and_exact_size() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(model_file_state(tmp.path(), "absent.onnx"), (false, None));
+        std::fs::write(tmp.path().join("present.onnx"), b"12345").expect("write model");
+        assert_eq!(model_file_state(tmp.path(), "present.onnx"), (true, Some(5)));
+        assert!(model_file_meets_min_size(tmp.path(), "present.onnx", 5));
+        assert!(!model_file_meets_min_size(tmp.path(), "present.onnx", 6));
+        assert!(!model_file_meets_min_size(tmp.path(), "absent.onnx", 1));
+    }
+
+    #[test]
+    fn production_runtime_classification_follows_the_shipped_manifest() {
+        for model in MODELS {
+            assert_eq!(
+                is_production_runtime_model(model),
+                PRODUCTION_RUNTIME_MODEL_FILENAMES.contains(&model.filename),
+                "{}",
+                model.filename
+            );
+        }
+        assert!(
+            MODELS.iter().any(is_production_runtime_model),
+            "at least one shipped model must be production-runtime"
+        );
+        assert!(
+            MODELS.iter().any(|model| !is_production_runtime_model(model)),
+            "auxiliary models must not be classified as production runtime"
+        );
+    }
+
+    #[test]
+    fn finetuned_pair_resolution_never_splits_across_roots() {
+        // Machine-dependent presence is fine; the INVARIANT is not: when the pair resolves, both
+        // files exist and share one root, and when it does not, no root holds a complete pair.
+        match finetuned_model_paths() {
+            Some((onnx, vocab)) => {
+                assert!(onnx.exists() && vocab.exists());
+                assert_eq!(onnx.parent(), vocab.parent(), "onnx and vocab must come from the SAME root");
+                assert!(onnx.ends_with(Path::new("finetuned-mms-ckb").join("model.onnx")), "{}", onnx.display());
+            }
+            None => {
+                for root in model_root_candidates() {
+                    let dir = root.join("finetuned-mms-ckb");
+                    assert!(
+                        !(dir.join("model.onnx").exists() && dir.join("vocab.json").exists()),
+                        "a complete pair at {} must have resolved",
+                        dir.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn temp_file_helpers_are_idempotent_and_prepare_parents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let nested = tmp.path().join("deep").join("model.onnx");
+        ensure_model_parent_dir(&nested);
+        assert!(nested.parent().unwrap().is_dir(), "the parent must exist after preparation");
+        ensure_model_parent_dir(&nested); // second call is a no-op, not an error
+
+        let staged_a = tmp.path().join("a.extracting-1");
+        let staged_b = tmp.path().join("b.extracting-2");
+        std::fs::write(&staged_a, b"tmp").expect("staged a");
+        std::fs::write(&staged_b, b"tmp").expect("staged b");
+        cleanup_staged_files(&[
+            (staged_a.clone(), tmp.path().join("a.onnx")),
+            (staged_b.clone(), tmp.path().join("b.onnx")),
+        ]);
+        assert!(!staged_a.exists() && !staged_b.exists(), "every staged temp must be removed");
+
+        // Removing an already-absent temp is silent (NotFound is not an error condition).
+        remove_model_temp_file(&staged_a, "already removed temp");
+    }
+
+    #[test]
+    fn bundled_candidate_roots_always_include_the_manifest_models_dir() {
+        let candidates = bundled_model_dir_candidates();
+        assert!(!candidates.is_empty());
+        assert!(
+            candidates.contains(&Path::new(env!("CARGO_MANIFEST_DIR")).join("models")),
+            "the compiled-in manifest models dir is the guaranteed last-resort candidate"
+        );
+        for (index, candidate) in candidates.iter().enumerate() {
+            assert!(!candidates[..index].contains(candidate), "candidates must be deduped: {candidate:?}");
+        }
+        // The per-file bundled locator prefers a candidate that actually holds the file and falls
+        // back to the CTC-selected default for a file no candidate ships.
+        let vad_dir = bundled_dir_containing("silero_vad_v4.onnx");
+        assert!(vad_dir.join("silero_vad_v4.onnx").exists(), "{}", vad_dir.display());
+        assert_eq!(bundled_dir_containing("no-such-model-anywhere.onnx"), bundled_models_dir());
+    }
 }

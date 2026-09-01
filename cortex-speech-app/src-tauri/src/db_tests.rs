@@ -10060,3 +10060,632 @@ fn placeholder_rows_mark_a_file_as_an_interrupted_stage() {
 
     assert!(!db.audio_path_has_placeholder_rows("/audio/other.wav").unwrap(), "no rows = nothing staged");
 }
+
+// ---------------------------------------------------------------------------------------------
+// db/core.rs helper coverage: both sides of every guard these shared helpers implement.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn schema_sql_normalization_binds_cortex_objects_and_masks_fts_shadows() {
+    use super::core as c;
+    // FTS5 shadow tables are engine-generated: bound by name, never by SQL spelling.
+    assert_eq!(c::normalized_schema_sql("segments_fts_data", Some("CREATE TABLE x(a)".into())), "<sqlite-fts5-shadow>");
+    // Cortex-authored SQL is whitespace/case/semicolon-normalized so formatting cannot drift a pin.
+    assert_eq!(
+        c::normalized_schema_sql("speech_segments", Some("  CREATE  TABLE\n a (b\tINTEGER) ; ".into())),
+        "create table a (b integer)"
+    );
+    assert_eq!(c::normalized_schema_sql("indexless", None), "", "objects without SQL normalize to empty");
+}
+
+#[test]
+fn human_verdict_mapping_is_closed_over_the_three_decisions() {
+    use super::core as c;
+    assert_eq!(c::human_verdict_for_decision("accept").unwrap(), "human_accept");
+    assert_eq!(c::human_verdict_for_decision("edit").unwrap(), "human_edit");
+    assert_eq!(c::human_verdict_for_decision("reject").unwrap(), "human_reject");
+    let error = c::human_verdict_for_decision("approve").unwrap_err().to_string();
+    assert!(error.contains("Unknown human decision"), "{error}");
+}
+
+#[test]
+fn canonical_source_span_and_duration_matching_reject_degenerate_windows() {
+    use super::core as c;
+    assert_eq!(c::canonical_source_span(Some(r#"{"source_start_ms":100,"source_end_ms":900}"#)), Some((100, 900)));
+    assert_eq!(c::canonical_source_span(None), None);
+    assert_eq!(c::canonical_source_span(Some("not json")), None);
+    assert_eq!(c::canonical_source_span(Some(r#"{"source_start_ms":100}"#)), None, "a lone endpoint is no span");
+    assert_eq!(c::canonical_source_span(Some(r#"{"source_start_ms":-1,"source_end_ms":10}"#)), None);
+    assert_eq!(c::canonical_source_span(Some(r#"{"source_start_ms":10,"source_end_ms":10}"#)), None);
+
+    assert!(c::source_span_matches_duration(0, 1_000, 1_000));
+    assert!(c::source_span_matches_duration(0, 1_001, 1_000), "1 ms of endpoint rounding is tolerated");
+    assert!(!c::source_span_matches_duration(0, 1_002, 1_000), "2 ms is a different amount of work");
+    assert!(!c::source_span_matches_duration(-1, 999, 1_000));
+    assert!(!c::source_span_matches_duration(500, 500, 0));
+    assert!(!c::source_span_matches_duration(0, 1_000, 0), "a zero-duration clip authorizes nothing");
+}
+
+#[test]
+fn playback_receipt_field_guards_refuse_each_negative_axis() {
+    use super::core as c;
+    let receipt = |revision: i64, started: i64, played: i64| c::PlaybackReceipt {
+        segment_id: "seg".into(),
+        segment_revision: revision,
+        audio_content_hash: TEST_AUDIO_CONTENT_HASH.into(),
+        reviewer: None,
+        session_id: None,
+        started_at_ms: started,
+        played_ms: played,
+        clip_duration_ms: 1_000,
+        source_start_ms: None,
+        source_end_ms: None,
+    };
+    c::validate_playback_receipt_nonnegative_fields(&receipt(0, 0, 0)).unwrap();
+    for (revision, started, played, needle) in [
+        (-1, 0, 0, "negative segment revision"),
+        (0, -1, 0, "negative start timestamp"),
+        (0, 0, -1, "negative played media time"),
+    ] {
+        let error = c::validate_playback_receipt_nonnegative_fields(&receipt(revision, started, played)).unwrap_err();
+        assert!(error.to_string().contains(needle), "{error}");
+    }
+    assert!(c::playback_server_now_ms().unwrap() > 0, "the server clock reads a positive epoch value");
+}
+
+#[test]
+fn desktop_playback_interval_union_validates_shape_order_and_bounds() {
+    use super::core as c;
+    let interval = |start_ms: i64, end_ms: i64| c::DesktopPlaybackInterval { start_ms, end_ms };
+
+    let (unique, digest) = c::validate_desktop_playback_intervals(&[interval(0, 400), interval(500, 900)], 1_000)
+        .expect("sorted disjoint in-bounds intervals are valid");
+    assert_eq!(unique, 800);
+    assert_eq!(digest.len(), 64);
+    let (_, same_digest) =
+        c::validate_desktop_playback_intervals(&[interval(0, 400), interval(500, 900)], 1_000).unwrap();
+    assert_eq!(digest, same_digest, "the union hash must be deterministic");
+
+    let empty = c::validate_desktop_playback_intervals(&[], 1_000).unwrap_err().to_string();
+    assert!(empty.contains("E_NO_PLAYBACK_EVIDENCE"), "{empty}");
+    let no_duration = c::validate_desktop_playback_intervals(&[interval(0, 10)], 0).unwrap_err().to_string();
+    assert!(no_duration.contains("no positive server clip duration"), "{no_duration}");
+    for bad in [interval(-1, 10), interval(10, 10), interval(990, 1_100)] {
+        let error = c::validate_desktop_playback_intervals(&[bad], 1_000).unwrap_err().to_string();
+        assert!(error.contains("invalid or out-of-bounds"), "{error}");
+    }
+    for pair in [[interval(0, 400), interval(300, 500)], [interval(0, 400), interval(400, 500)]] {
+        let error = c::validate_desktop_playback_intervals(&pair, 1_000).unwrap_err().to_string();
+        assert!(error.contains("sorted, non-overlapping, and non-adjacent"), "{error}");
+    }
+    let too_many: Vec<_> =
+        (0..(c::MAX_DESKTOP_PLAYBACK_INTERVALS as i64 + 1)).map(|index| interval(index * 10, index * 10 + 5)).collect();
+    let flood = c::validate_desktop_playback_intervals(&too_many, 10_000_000).unwrap_err().to_string();
+    assert!(flood.contains("interval safety bound"), "{flood}");
+}
+
+#[test]
+fn fts_match_and_search_normalization_neutralize_hostile_query_text() {
+    use super::core as c;
+    assert_eq!(c::to_fts5_match("  "), "", "whitespace-only input short-circuits");
+    assert_eq!(c::to_fts5_match("hello world"), "\"hello\" \"world\"");
+    assert_eq!(c::to_fts5_match("say \"quoted\""), "\"say\" \"\"\"quoted\"\"\"", "internal quotes are doubled");
+    assert_eq!(c::to_fts5_match("a\u{0}b\tc"), "\"a\" \"b\" \"c\"", "control characters become separators");
+    assert_eq!(c::to_fts5_match("AND OR NEAR"), "\"AND\" \"OR\" \"NEAR\"", "keywords are quoted literals");
+
+    // The search normalizer folds Arabic Kaf/Yeh to the canonical Sorani codepoints without
+    // touching digits, so a raw-digit query still matches raw transcripts.
+    let folded = c::normalize_search_query("\u{0643}\u{064a} 12");
+    assert!(folded.contains('\u{06a9}') && folded.contains('\u{06cc}'), "{folded}");
+    assert!(folded.contains("12"), "digits must survive query normalization: {folded}");
+}
+
+#[test]
+fn segment_sort_canonicalization_and_page_scope_are_stable() {
+    use super::core as c;
+    assert_eq!(c::canonical_segment_sort("active_learning"), "activeLearning");
+    assert_eq!(c::canonical_segment_sort("suspect_first"), "suspectFirst");
+    for passthrough in ["oldest", "duration", "verified", "confidence", "activeLearning", "suspectFirst"] {
+        assert_eq!(c::canonical_segment_sort(passthrough), passthrough);
+    }
+    assert_eq!(c::canonical_segment_sort("sneaky'); DROP TABLE"), "newest", "unknown sorts fall back to newest");
+
+    let all = c::segment_page_scope(None, None, None);
+    let verified = c::segment_page_scope(Some(true), None, None);
+    let unverified = c::segment_page_scope(Some(false), None, None);
+    let queried = c::segment_page_scope(None, Some("دەق"), None);
+    assert!(all != verified && verified != unverified && all != queried, "each filter is its own scope");
+
+    let focus_ab: std::collections::HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
+    let focus_ba: std::collections::HashSet<String> = ["b".to_string(), "a".to_string()].into_iter().collect();
+    assert_eq!(
+        c::segment_page_scope(None, None, Some(&focus_ab)),
+        c::segment_page_scope(None, None, Some(&focus_ba)),
+        "the focus SET is order-independent"
+    );
+    let focus_a: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
+    assert_ne!(
+        c::segment_page_scope(None, None, Some(&focus_ab)),
+        c::segment_page_scope(None, None, Some(&focus_a)),
+        "an edited focus list retires every old cursor"
+    );
+}
+
+#[test]
+fn segment_page_cursors_round_trip_and_refuse_foreign_payloads() {
+    use super::core as c;
+    fn page_key(id: &str) -> SegmentPageKey {
+        SegmentPageKey {
+            id: id.to_string(),
+            created_at: "2026-08-01T00:00:00Z".into(),
+            duration_ms: 1_000,
+            verified: false,
+            confidence: 0.5,
+            active_learning: 0.0,
+            escalated: false,
+            poor_audio: false,
+            agreement: 0.5,
+        }
+    }
+    let cursor = SegmentPageCursor {
+        version: 1,
+        sort: "newest".into(),
+        scope: "scope".into(),
+        anchor_rowid: 42,
+        total: 7,
+        emitted: 2,
+        last: page_key("seg-1"),
+    };
+    let encoded = c::encode_segment_cursor(&cursor).unwrap();
+    let decoded = c::decode_segment_cursor(&encoded).unwrap();
+    assert_eq!(decoded.anchor_rowid, 42);
+    assert_eq!(decoded.last.id, "seg-1");
+    assert_eq!((decoded.total, decoded.emitted), (7, 2));
+
+    assert!(c::decode_segment_cursor("!!not-base64!!").is_err());
+    let not_json = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json");
+    assert!(c::decode_segment_cursor(&not_json).is_err());
+    let wrong_version = SegmentPageCursor { version: 2, ..cursor.clone() };
+    let encoded = c::encode_segment_cursor(&wrong_version).unwrap();
+    assert!(c::decode_segment_cursor(&encoded).is_err(), "a future cursor version must be refused");
+    let negative_anchor = SegmentPageCursor { anchor_rowid: -1, ..cursor.clone() };
+    let encoded = c::encode_segment_cursor(&negative_anchor).unwrap();
+    assert!(c::decode_segment_cursor(&encoded).is_err());
+    let blank_id = SegmentPageCursor { last: page_key(""), ..cursor };
+    let encoded = c::encode_segment_cursor(&blank_id).unwrap();
+    assert!(c::decode_segment_cursor(&encoded).is_err());
+}
+
+#[test]
+fn segment_write_validation_refuses_each_corrupt_shape() {
+    use super::core as c;
+    let valid = SpeechSegment {
+        id: "shape-ok".into(),
+        audio_path: "C:/audio/ok.wav".into(),
+        raw_transcript: "دەق".into(),
+        duration_ms: 1_000,
+        split: Some("train".into()),
+        ..SpeechSegment::default()
+    };
+    c::validate_segment(&valid).unwrap();
+
+    let blank_id = SpeechSegment { id: "  ".into(), ..valid.clone() };
+    assert!(c::validate_segment(&blank_id).unwrap_err().to_string().contains("id must not be empty"));
+    let unc = SpeechSegment { audio_path: r"\\attacker\share\clip.wav".into(), ..valid.clone() };
+    assert!(c::validate_segment(&unc).is_err(), "a UNC audio path must be refused at the write boundary");
+    let negative = SpeechSegment { duration_ms: -5, ..valid.clone() };
+    assert!(c::validate_segment(&negative).unwrap_err().to_string().contains("negative duration_ms"));
+    let bad_alignment = SpeechSegment { alignment_json: Some("{not json".into()), ..valid.clone() };
+    assert!(c::validate_segment(&bad_alignment).is_err());
+    let bad_split = SpeechSegment { split: Some("holdout".into()), ..valid };
+    assert!(c::validate_segment(&bad_split).unwrap_err().to_string().contains("invalid split"));
+}
+
+#[test]
+fn blank_asr_guard_and_placeholder_sql_share_one_placeholder_notion() {
+    use super::core as c;
+    c::refuse_blank_asr_persist("seg-live", "دەقی ڕاستەقینە").unwrap();
+    let error = c::refuse_blank_asr_persist("seg-blank", " \n\t").unwrap_err().to_string();
+    assert!(error.contains("refusing to persist a blank ASR transcript"), "{error}");
+    assert!(error.contains("seg-blank"), "the refusal names the exact segment: {error}");
+
+    // The SQL mirror must agree with the Rust authority on every placeholder class.
+    let db = make_db();
+    let predicate = c::placeholder_or_empty_transcript_sql("?1");
+    let sql = format!("SELECT {predicate}");
+    for (value, expected) in [
+        ("", true),
+        ("   ", true),
+        ("[Pending WSL 7B ASR]", true),
+        ("n/a", true),
+        (" NULL ", true),
+        ("دەقی ڕاستەقینە", false),
+    ] {
+        let is_placeholder: bool = db.connection().query_row(&sql, [value], |row| row.get(0)).unwrap();
+        assert_eq!(is_placeholder, expected, "{value:?}");
+        assert_eq!(
+            crate::quality::is_placeholder_transcript(value) || value.trim().is_empty(),
+            expected,
+            "SQL and Rust placeholder authorities drifted on {value:?}"
+        );
+    }
+}
+
+#[test]
+fn stored_hypothesis_limits_hold_at_the_payload_and_projection_boundaries() {
+    use super::core as c;
+    c::validate_stored_hypothesis_payload("seg-1", "model-1", "دەق").unwrap();
+    assert!(c::validate_stored_hypothesis_payload("../seg", "model-1", "x").is_err(), "identifier boundary");
+    assert!(c::validate_stored_hypothesis_payload("seg-1", "bad/model", "x").is_err());
+    let oversized = "x".repeat(c::MAX_STORED_HYPOTHESIS_TRANSCRIPT_BYTES + 1);
+    let error = c::validate_stored_hypothesis_payload("seg-1", "model-1", &oversized).unwrap_err().to_string();
+    assert!(error.contains("E_HYPOTHESIS_LIMIT_EXCEEDED"), "{error}");
+
+    // The upsert-time aggregate guard counts OTHER models' rows plus the incoming one.
+    let db = make_db();
+    db.insert_segment(&SpeechSegment {
+        id: "hyp-agg".into(),
+        audio_path: "/audio/hyp-agg.wav".into(),
+        raw_transcript: "دەق".into(),
+        duration_ms: 1_000,
+        ..SpeechSegment::default()
+    })
+    .unwrap();
+    let hypothesis_writer = &db;
+    for index in 0..MAX_STORED_HYPOTHESES_PER_SEGMENT {
+        hypothesis_writer
+            .insert_hypothesis(&SegmentHypothesis {
+                segment_id: "hyp-agg".into(),
+                model_id: format!("voter-{index}"),
+                transcript: "دەنگ".into(),
+                confidence: None,
+            })
+            .unwrap();
+    }
+    let error = c::validate_stored_hypothesis_upsert_on(db.connection(), "hyp-agg", "voter-new", "دەنگ")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("E_HYPOTHESIS_LIMIT_EXCEEDED"), "a 65th distinct voter must be refused: {error}");
+    // Re-upserting an EXISTING model is not a new row and stays within the cap.
+    c::validate_stored_hypothesis_upsert_on(db.connection(), "hyp-agg", "voter-0", "دەنگی نوێ").unwrap();
+}
+
+#[test]
+fn review_owned_field_listing_names_every_smuggled_authority() {
+    use super::core as c;
+    let clean = SpeechSegment { id: "own-clean".into(), ..SpeechSegment::default() };
+    assert!(c::imported_review_owned_fields(&clean).is_empty(), "a machine-only row imports freely");
+
+    let loaded = SpeechSegment {
+        id: "own-loaded".into(),
+        annotated_transcript: Some("دەق".into()),
+        verified: true,
+        verdict: Some("human_accept".into()),
+        verdict_transcript: Some("دەق".into()),
+        rationale: Some("because".into()),
+        evidence_json: Some("{}".into()),
+        agreement_score: Some(0.5),
+        escalated: true,
+        human_decision: Some("accept".into()),
+        corrected_at: Some("2026-08-01T00:00:00Z".into()),
+        is_gold: true,
+        reviewed_by: Some("desktop".into()),
+        ..SpeechSegment::default()
+    };
+    let fields = c::imported_review_owned_fields(&loaded);
+    for expected in [
+        "annotatedTranscript",
+        "verified",
+        "verdict",
+        "verdictTranscript",
+        "rationale",
+        "evidenceJson",
+        "agreementScore",
+        "escalated",
+        "humanDecision",
+        "correctedAt",
+        "isGold",
+        "reviewedBy",
+    ] {
+        assert!(fields.contains(&expected), "{expected} must be reported as review-owned; got {fields:?}");
+    }
+}
+
+#[test]
+fn projection_matchers_detect_drift_on_their_own_axes_only() {
+    use super::core as c;
+    let base = SpeechSegment {
+        id: "match-1".into(),
+        audio_path: "/audio/match.wav".into(),
+        raw_transcript: "دەق".into(),
+        duration_ms: 1_000,
+        ..SpeechSegment::default()
+    };
+    assert!(c::review_owned_projection_matches(&base, &base.clone()));
+    assert!(c::history_source_identity_matches(&base, &base.clone()));
+    assert!(c::history_machine_projection_matches(&base, &base.clone()));
+
+    let mut review_drift = base.clone();
+    review_drift.human_decision = Some("accept".into());
+    assert!(!c::review_owned_projection_matches(&base, &review_drift));
+    assert!(c::history_source_identity_matches(&base, &review_drift), "a review edit is not source drift");
+    assert!(c::history_machine_projection_matches(&base, &review_drift), "a review edit is not machine drift");
+
+    let mut source_drift = base.clone();
+    source_drift.duration_ms = 2_000;
+    assert!(!c::history_source_identity_matches(&base, &source_drift));
+    assert!(c::review_owned_projection_matches(&base, &source_drift));
+
+    let mut machine_drift = base.clone();
+    machine_drift.raw_transcript = "دەقی گۆڕاو".into();
+    assert!(!c::history_machine_projection_matches(&base, &machine_drift));
+    assert!(c::history_source_identity_matches(&base, &machine_drift));
+
+    // The legacy-provenance defaults: None and the explicit pre-registry marker compare equal.
+    let mut legacy = base.clone();
+    legacy.model_version_id = Some("unknown@pre-registry".into());
+    assert!(c::history_machine_projection_matches(&base, &legacy), "pre-registry provenance is one identity");
+}
+
+#[test]
+fn rejected_transcript_selection_skips_blank_and_equivalent_candidates() {
+    use super::core as c;
+    let corrected = "دەقی ڕاست";
+    assert_eq!(c::rejected_transcript_for_learning(corrected, &[]), None);
+    assert_eq!(
+        c::rejected_transcript_for_learning(corrected, &[None, Some("   ".into()), Some(corrected.to_string())]),
+        None,
+        "blank and learning-equivalent candidates teach nothing"
+    );
+    assert_eq!(
+        c::rejected_transcript_for_learning(
+            corrected,
+            &[None, Some("  دەقی هەڵە  ".into()), Some("دەقی دواتر".into())]
+        ),
+        Some("دەقی هەڵە".to_string()),
+        "the first genuinely different candidate wins, trimmed"
+    );
+}
+
+#[test]
+fn schema_contract_versioning_accepts_head_and_refuses_impossible_versions() {
+    use super::core as c;
+    let db = make_db();
+    let head = current_test_schema_version();
+    c::validate_schema_contract_at_version(db.connection(), head).unwrap();
+    assert!(c::is_canonical_audio_content_hash(TEST_AUDIO_CONTENT_HASH));
+    assert!(!c::is_canonical_audio_content_hash("ABCDEF"), "uppercase/short values are not canonical");
+
+    let below = c::validate_schema_contract_at_version(db.connection(), 0).unwrap_err().to_string();
+    assert!(below.contains("unsupported migration"), "{below}");
+    let above = c::validate_schema_contract_at_version(db.connection(), head + 1).unwrap_err().to_string();
+    assert!(above.contains("unsupported migration"), "{above}");
+
+    // A HEAD database checked against the previous version's contract must fail with a named diff,
+    // proving the historical-prefix reconstruction and the mismatch reporter both work.
+    if head > 1 {
+        let error = c::validate_schema_contract_at_version(db.connection(), head - 1).unwrap_err().to_string();
+        assert!(error.contains("does not match this release"), "{error}");
+    }
+}
+
+#[test]
+fn grant_and_unusable_source_path_hashes_are_canonical_and_fail_closed() {
+    use super::core as c;
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("Grant Source.wav");
+    std::fs::write(&file, b"bytes").unwrap();
+
+    let digest = c::canonical_grant_source_path_sha256(&file).unwrap();
+    assert_eq!(digest.len(), 64);
+    assert_eq!(digest, c::canonical_grant_source_path_sha256(&file).unwrap(), "path identity is deterministic");
+    let missing = c::canonical_grant_source_path_sha256(&temp.path().join("gone.wav")).unwrap_err().to_string();
+    assert!(missing.contains("missing or unreadable"), "a grant for an absent source must fail: {missing}");
+
+    // The unusable-source identity survives the file being absent (the audited failure itself).
+    let absent = temp.path().join("never-existed.wav");
+    let unusable = c::technical_unusable_source_path_sha256(&absent).unwrap();
+    assert_eq!(unusable.len(), 64);
+    assert_eq!(unusable, c::technical_unusable_source_path_sha256(&absent).unwrap());
+    let present = c::technical_unusable_source_path_sha256(&file).unwrap();
+    assert_ne!(present, unusable, "different sources must never share a path identity");
+}
+
+#[test]
+fn couch_playback_consumption_is_exactly_once_across_namespaces() {
+    use super::core as c;
+    let db = make_db();
+    db.insert_segment(&SpeechSegment {
+        id: "seg-1".into(),
+        audio_path: "/audio/seg-1.wav".into(),
+        raw_transcript: "دەقی مەکینە".into(),
+        duration_ms: 1_000,
+        ..SpeechSegment::default()
+    })
+    .unwrap();
+    // A consumption row must be bound to an EXACT finalized policy-4 authority (trigger-enforced),
+    // so build one through the real Couch finalize path rather than forging parent rows.
+    let playback = canonical_policy4_phone_playback(&db, "seg-1", "couch-tester");
+    let receipt_id = playback.authority_session_id.clone().expect("policy-4 proof carries its receipt id");
+    let receipt = receipt_id.as_str();
+    let operation = "10000000-0000-4000-8000-0000000000ab";
+
+    // Malformed identities are refused before any read or write.
+    for (namespace, receipt_id, operation_id, reviewer, segment, at) in [
+        ("gossip", receipt, operation, "couch-tester", "seg-1", 5_i64),
+        ("canonical", "not-a-uuid", operation, "couch-tester", "seg-1", 5),
+        ("canonical", receipt, "not-a-uuid", "couch-tester", "seg-1", 5),
+        ("canonical", receipt, operation, "  ", "seg-1", 5),
+        ("canonical", receipt, operation, "couch-tester", "  ", 5),
+        ("canonical", receipt, operation, "couch-tester", "seg-1", 0),
+    ] {
+        let error = c::consume_couch_playback_authority_on(
+            db.connection(),
+            receipt_id,
+            namespace,
+            operation_id,
+            reviewer,
+            segment,
+            at,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("consumption identity is invalid"), "{error}");
+    }
+
+    c::consume_couch_playback_authority_on(
+        db.connection(),
+        receipt,
+        "canonical",
+        operation,
+        "couch-tester",
+        "seg-1",
+        5,
+    )
+    .unwrap();
+    // The exact same operation retrying is harmless (case-insensitive reviewer identity).
+    c::consume_couch_playback_authority_on(
+        db.connection(),
+        receipt,
+        "canonical",
+        operation,
+        "COUCH-TESTER",
+        "seg-1",
+        9,
+    )
+    .unwrap();
+    // Any DIFFERENT operation reusing the receipt is a hard replay conflict.
+    let other_operation = "10000000-0000-4000-8000-0000000000ac";
+    let error = c::consume_couch_playback_authority_on(
+        db.connection(),
+        receipt,
+        "spot_check",
+        other_operation,
+        "couch-tester",
+        "seg-1",
+        9,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("E_PLAYBACK_RECEIPT_CONSUMED"), "{error}");
+}
+
+#[test]
+fn playback_evidence_precheck_rejects_forged_claims_before_touching_storage() {
+    use super::core as c;
+    let db = make_db();
+    // A legacy spectral bucket, an inverted span, and a negative start are all refused by the
+    // claim-shape gate without consulting the receipts table at all.
+    assert!(
+        !c::has_sufficient_playback_evidence_on(db.connection(), "seg", 0, "not-canonical", 0, 1_000, None).unwrap()
+    );
+    assert!(!c::has_sufficient_playback_evidence_on(
+        db.connection(),
+        "seg",
+        0,
+        TEST_AUDIO_CONTENT_HASH,
+        -1,
+        1_000,
+        None
+    )
+    .unwrap());
+    assert!(!c::has_sufficient_playback_evidence_on(
+        db.connection(),
+        "seg",
+        0,
+        TEST_AUDIO_CONTENT_HASH,
+        1_000,
+        1_000,
+        None
+    )
+    .unwrap());
+    // A well-formed claim with no stored receipt is simply insufficient, not an error.
+    assert!(!c::has_sufficient_playback_evidence_on(
+        db.connection(),
+        "seg",
+        0,
+        TEST_AUDIO_CONTENT_HASH,
+        0,
+        1_000,
+        None
+    )
+    .unwrap());
+
+    // The v4 variant additionally requires a receipt UUID before anything else.
+    assert!(!c::has_sufficient_desktop_playback_evidence_v4_on(
+        db.connection(),
+        "seg",
+        0,
+        TEST_AUDIO_CONTENT_HASH,
+        0,
+        1_000,
+        None,
+        "not-a-uuid",
+    )
+    .unwrap());
+    // And the historical validator returns false (never errors) for an unknown authority id.
+    assert!(!c::has_sufficient_historical_desktop_playback_authority_v4_on(
+        db.connection(),
+        "seg",
+        0,
+        "10000000-0000-4000-8000-0000000000ad",
+    )
+    .unwrap());
+}
+
+#[test]
+fn hidden_answer_key_serves_only_exportable_human_truth() {
+    use super::core as c;
+    let db = make_db();
+    assert_eq!(c::current_hidden_answer_key_on(db.connection(), "absent").unwrap(), None);
+
+    db.insert_segment(&SpeechSegment {
+        id: "hidden-key".into(),
+        audio_path: "/audio/hidden-key.wav".into(),
+        raw_transcript: "دەقی مەکینە".into(),
+        duration_ms: 1_000,
+        ..SpeechSegment::default()
+    })
+    .unwrap();
+    assert_eq!(
+        c::current_hidden_answer_key_on(db.connection(), "hidden-key").unwrap(),
+        None,
+        "a machine draft is never the spot-check answer key"
+    );
+
+    // Human decisions require the canonical server-owned PCM identity before they can commit.
+    ensure_test_audio_content_hash(&db, "hidden-key");
+    db.record_human_decision("hidden-key", "edit", Some("دەقی مرۆڤ"), None).unwrap();
+    assert_eq!(
+        c::current_hidden_answer_key_on(db.connection(), "hidden-key").unwrap().as_deref(),
+        Some("دەقی مرۆڤ"),
+        "human-verified text is the answer key"
+    );
+
+    db.record_human_decision("hidden-key", "reject", None, None).unwrap();
+    assert_eq!(
+        c::current_hidden_answer_key_on(db.connection(), "hidden-key").unwrap(),
+        None,
+        "an export-excluded rejected row cannot grade a reviewer"
+    );
+}
+
+#[test]
+fn nfc_canonicalization_covers_all_three_transcript_slots() {
+    use super::core as c;
+    // U+0645 U+0651 stays; a decomposed sequence (base + combining) recomposes under NFC.
+    let decomposed = "\u{0644}\u{0627}\u{0654}"; // lam + alef + hamza-above (recomposes)
+    let seg = SpeechSegment {
+        id: "nfc-1".into(),
+        raw_transcript: decomposed.into(),
+        normalized_transcript: Some(decomposed.into()),
+        annotated_transcript: None,
+        ..SpeechSegment::default()
+    };
+    let (raw, normalized, annotated) = c::nfc_transcripts(&seg);
+    assert_eq!(raw, c::to_nfc(decomposed));
+    assert_eq!(normalized.as_deref(), Some(c::to_nfc(decomposed).as_str()));
+    assert_eq!(annotated, None, "absent slots stay absent");
+    assert_ne!(raw, decomposed, "the fixture must actually exercise a recomposition");
+    assert_eq!(c::to_nfc(&raw), raw, "NFC is idempotent");
+}

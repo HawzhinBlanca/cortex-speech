@@ -65,3 +65,19 @@ pub(crate) fn managed_app_state(data_dir: &Path) -> tauri::App<tauri::test::Mock
     app.manage(app_state(data_dir.to_path_buf()));
     app
 }
+
+/// Wait until a freshly written fixture file reports a stable non-zero length. Write-then-read
+/// fixtures have flaked on this Windows box (metadata visible before content settles); a short
+/// settle loop keeps fixture-hashing tests deterministic without weakening any assertion.
+pub(crate) fn await_stable_fixture(path: &Path) {
+    let mut last_len = 0u64;
+    for _ in 0..100 {
+        let len = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        if len > 0 && len == last_len {
+            return;
+        }
+        last_len = len;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("fixture file at {} never stabilized", path.display());
+}

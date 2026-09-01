@@ -3286,4 +3286,624 @@ mod tests {
             .expect_err("the canonical writer must not replace missing identity with a client claim");
         assert!(error.to_string().contains("server-derived audio content hash"));
     }
+
+    /// Wave-4 state-boundary coverage: the `#[tauri::command]` wrappers above, invoked through a
+    /// genuine managed `State<'_, AppState>` (`crate::test_support::managed_app_state`), so the
+    /// limiter/validation/store-mapping closures run exactly as production IPC runs them. The `_on`
+    /// helpers already carry the deep semantics in the parent module; these tests own the wrappers.
+    mod state_command_surface_tests {
+        use super::super::{
+            begin_desktop_playback_session_v1, cancel_desktop_playback_session_v1, clear_human_decision,
+            commit_review_v1, delete_review_draft_v1, delete_segments_v1, finalize_desktop_playback_session_v1,
+            get_desktop_review_undo_target_v1, get_review_draft_v1, list_recording_rights, mark_segment_unusable_v1,
+            record_human_decision, record_playback_receipt, record_review_flag, reserve_review_draft_write_v1,
+            restore_segment_snapshot, revoke_recording_consent, save_review_draft_v1, set_recording_rights,
+            undo_desktop_review_action_v1, undo_human_decision, update_segment, update_segment_metadata_v1,
+        };
+        use super::{available_undo_target, exact_policy4_receipt, exact_undo_request};
+        use crate::db::SpeechSegment;
+        use crate::ipc_contract::{
+            CommitReviewRequestV1, DeleteSegmentsRequestV1, DesktopReviewUndoAvailabilityV1,
+            DesktopReviewUndoOutcomeV1, MarkSegmentUnusableRequestV1, PlaybackIntervalV1, RecordReviewFlagRequestV1,
+            ReviewDecisionV1, SegmentMetadataChangeV1, TechnicalUnusableReasonV1, UpdateSegmentMetadataRequestV1,
+        };
+        use crate::test_support::managed_app_state;
+        use crate::validation::input as validate;
+        use crate::AppState;
+        use tauri::Manager;
+
+        type MockApp = tauri::App<tauri::test::MockRuntime>;
+
+        /// Seed one real clip into the MANAGED state's database — the same shape as the parent
+        /// module's `db_with_clip`, but writing through the state so the commands under test read it.
+        fn seed_state_clip(app: &MockApp, dir: &std::path::Path, id: &str) -> i64 {
+            let state = app.state::<AppState>();
+            let db = state.lock_db();
+            db.insert_segment(&SpeechSegment {
+                id: id.into(),
+                audio_path: dir.join(format!("{id}.wav")).to_string_lossy().into_owned(),
+                raw_transcript: "دەق".into(),
+                duration_ms: 10_000,
+                alignment_json: Some(
+                    r#"{"source_start_ms":0,"source_end_ms":10000,"chunk_index":0,"chunk_count":1}"#.into(),
+                ),
+                ..SpeechSegment::default()
+            })
+            .unwrap();
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments SET audio_content_hash = ?2 WHERE id = ?1",
+                    rusqlite::params![id, "a".repeat(64)],
+                )
+                .unwrap();
+            db.segment_review_revision(id).unwrap().unwrap_or(0)
+        }
+
+        fn owner_rights(license: Option<String>) -> crate::db::RecordingRights {
+            crate::db::RecordingRights {
+                license,
+                consent_basis: Some("explicit_consent".into()),
+                permitted_use: Some("train".into()),
+                attribution: None,
+                source: Some("owner supplied".into()),
+                revoked_at: None,
+            }
+        }
+
+        #[test]
+        fn recording_rights_commands_declare_revoke_and_list_through_state() {
+            let tmp = tempfile::tempdir().unwrap();
+            let app = managed_app_state(tmp.path());
+            let raw_path = tmp.path().join("rights-recording.wav");
+            std::fs::write(&raw_path, b"recording bytes").unwrap();
+            // The command canonicalizes before matching rows, so the seeded clip must carry the
+            // exact validated form of the path or the declaration would cover zero segments.
+            let validated = validate::validate_file_path(raw_path.to_string_lossy().as_ref()).unwrap();
+            app.state::<AppState>()
+                .lock_db()
+                .insert_segment(&SpeechSegment {
+                    id: "rights-seg".into(),
+                    audio_path: validated.clone(),
+                    raw_transcript: "دەق".into(),
+                    ..SpeechSegment::default()
+                })
+                .unwrap();
+
+            let missing = set_recording_rights(
+                tmp.path().join("never-created.wav").to_string_lossy().into_owned(),
+                owner_rights(Some("owner-full-rights".into())),
+                app.state(),
+            )
+            .expect_err("a nonexistent recording path must fail validation");
+            assert!(missing.contains("Invalid path"), "{missing}");
+
+            let oversized = set_recording_rights(
+                raw_path.to_string_lossy().into_owned(),
+                owner_rights(Some("l".repeat(2001))),
+                app.state(),
+            )
+            .expect_err("an unbounded licence field must be refused");
+            assert!(oversized.contains("Licence"), "{oversized}");
+
+            let covered = set_recording_rights(
+                raw_path.to_string_lossy().into_owned(),
+                owner_rights(Some("owner-full-rights".into())),
+                app.state(),
+            )
+            .expect("declare rights for a real recording");
+            assert_eq!(covered, 1, "the one segment cut from this recording is covered");
+
+            let revoked = revoke_recording_consent(raw_path.to_string_lossy().into_owned(), app.state())
+                .expect("withdrawal stamps every clip of the recording");
+            assert_eq!(revoked, 1);
+
+            let rows = list_recording_rights(app.state()).expect("list recordings");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["audioPath"], serde_json::json!(validated));
+            assert_eq!(rows[0]["segmentCount"], serde_json::json!(1));
+            assert_eq!(rows[0]["disposition"], serde_json::json!("Revoked"), "revocation outranks the declaration");
+        }
+
+        #[test]
+        fn retired_segment_write_endpoints_refuse_through_state_without_mutation() {
+            let tmp = tempfile::tempdir().unwrap();
+            let app = managed_app_state(tmp.path());
+            seed_state_clip(&app, tmp.path(), "retired-state");
+
+            let whole_row =
+                update_segment(SpeechSegment { id: "retired-state".into(), ..SpeechSegment::default() }, app.state())
+                    .expect_err("the whole-row writer stays retired at the IPC boundary");
+            assert!(whole_row.contains("retired"), "{whole_row}");
+
+            let restore = restore_segment_snapshot(
+                SpeechSegment { id: "retired-state".into(), ..SpeechSegment::default() },
+                app.state(),
+            )
+            .expect_err("renderer-owned whole-row restore is disabled");
+            assert!(restore.contains("disabled"), "{restore}");
+
+            let legacy = record_human_decision(
+                app.state(),
+                "retired-state".into(),
+                "accept".into(),
+                Some("دەق".into()),
+                Some(1_700_000_000_001),
+                "eeee0000-0000-4000-8000-000000000001".into(),
+            )
+            .expect_err("the legacy decision boundary is retired");
+            assert!(legacy.starts_with("TYPED_REVIEW_REQUIRED:"), "{legacy}");
+
+            let undo = undo_human_decision(app.state(), 1, "eeee0000-0000-4000-8000-000000000002".into())
+                .expect_err("the identity-free undo boundary is retired");
+            assert!(undo.starts_with("TYPED_UNDO_REQUIRED:"), "{undo}");
+
+            // The retained scalar playback endpoint still validates and bounds before it refuses.
+            let negative = record_playback_receipt(app.state(), "retired-state".into(), -1, 10_000, None, None, 0)
+                .expect_err("negative playback durations are refused");
+            assert!(negative.contains("must not be negative"), "{negative}");
+            let unbounded = record_playback_receipt(
+                app.state(),
+                "retired-state".into(),
+                1_000,
+                10_000,
+                None,
+                Some("s".repeat(129)),
+                0,
+            )
+            .expect_err("the receipt session identity must stay bounded");
+            assert!(unbounded.contains("Session"), "{unbounded}");
+            let refused = record_playback_receipt(
+                app.state(),
+                "retired-state".into(),
+                9_000,
+                10_000,
+                Some("reviewer-a".into()),
+                Some("session-1".into()),
+                0,
+            )
+            .expect_err("a raw scalar can never mint policy-4 evidence");
+            assert!(refused.starts_with("PLAYBACK_SESSION_REQUIRED:"), "{refused}");
+
+            let invalid = clear_human_decision(app.state(), "bad id!".into()).expect_err("identifier gate first");
+            assert_eq!(invalid, "Identifier must be alphanumeric (underscore, hyphen, dot allowed)");
+            let disabled = clear_human_decision(app.state(), "retired-state".into())
+                .expect_err("identity-free decision clearing is disabled in the database boundary");
+            assert!(disabled.contains("clear_human_decision is disabled"), "{disabled}");
+
+            let row = app.state::<AppState>().lock_db().get_segment_by_id("retired-state").unwrap().unwrap();
+            assert_eq!(row.raw_transcript, "دەق");
+            assert!(row.human_decision.is_none() && !row.verified, "no retired endpoint may have written truth");
+        }
+
+        #[test]
+        fn update_segment_metadata_v1_refuses_invalid_missing_and_stale_then_saves() {
+            let tmp = tempfile::tempdir().unwrap();
+            let app = managed_app_state(tmp.path());
+            seed_state_clip(&app, tmp.path(), "meta-clip");
+
+            let invalid = update_segment_metadata_v1(
+                UpdateSegmentMetadataRequestV1 { segment_id: "bad id!".into(), changes: Vec::new() },
+                app.state(),
+            )
+            .expect_err("identity gate first");
+            assert_eq!(invalid.code, "INVALID_SEGMENT_ID");
+
+            let empty = update_segment_metadata_v1(
+                UpdateSegmentMetadataRequestV1 { segment_id: "meta-clip".into(), changes: Vec::new() },
+                app.state(),
+            )
+            .expect_err("a change-free request is invalid");
+            assert_eq!(empty.code, "INVALID_SEGMENT_METADATA");
+
+            let missing = update_segment_metadata_v1(
+                UpdateSegmentMetadataRequestV1 {
+                    segment_id: "meta-missing".into(),
+                    changes: vec![SegmentMetadataChangeV1::SpeakerId {
+                        expected: None,
+                        value: Some("spk-state".into()),
+                    }],
+                },
+                app.state(),
+            )
+            .expect_err("an unknown segment refuses");
+            assert_eq!(missing.code, "SEGMENT_NOT_FOUND");
+
+            let saved = update_segment_metadata_v1(
+                UpdateSegmentMetadataRequestV1 {
+                    segment_id: "meta-clip".into(),
+                    changes: vec![SegmentMetadataChangeV1::SpeakerId {
+                        expected: None,
+                        value: Some("spk-state".into()),
+                    }],
+                },
+                app.state(),
+            )
+            .expect("compare-and-set save");
+            assert!(saved.changed);
+            assert_eq!(saved.segment_id, "meta-clip");
+            assert_eq!(saved.speaker_id.as_deref(), Some("spk-state"));
+
+            let stale = update_segment_metadata_v1(
+                UpdateSegmentMetadataRequestV1 {
+                    segment_id: "meta-clip".into(),
+                    changes: vec![SegmentMetadataChangeV1::SpeakerId {
+                        expected: None,
+                        value: Some("must-not-clobber".into()),
+                    }],
+                },
+                app.state(),
+            )
+            .expect_err("a stale expectation conflicts instead of overwriting");
+            assert_eq!(stale.code, "STALE_SEGMENT_METADATA");
+            assert_eq!(
+                app.state::<AppState>()
+                    .lock_db()
+                    .get_segment_by_id("meta-clip")
+                    .unwrap()
+                    .unwrap()
+                    .speaker_id
+                    .as_deref(),
+                Some("spk-state"),
+                "the conflicting save must leave the newer value in place"
+            );
+        }
+
+        #[test]
+        fn delete_segments_v1_bounds_ids_deletes_and_replays_idempotently() {
+            let tmp = tempfile::tempdir().unwrap();
+            let app = managed_app_state(tmp.path());
+            seed_state_clip(&app, tmp.path(), "del-a");
+            seed_state_clip(&app, tmp.path(), "del-b");
+
+            let empty = delete_segments_v1(DeleteSegmentsRequestV1 { ids: Vec::new() }, app.state())
+                .expect_err("zero ids is invalid");
+            assert_eq!(empty.code, "INVALID_DELETE_REQUEST");
+
+            let invalid = delete_segments_v1(DeleteSegmentsRequestV1 { ids: vec!["bad id!".into()] }, app.state())
+                .expect_err("identifier gate");
+            assert_eq!(invalid.code, "INVALID_SEGMENT_ID");
+
+            let deleted =
+                delete_segments_v1(DeleteSegmentsRequestV1 { ids: vec!["del-a".into(), "del-b".into()] }, app.state())
+                    .expect("batch delete");
+            assert_eq!(deleted.requested_count, 2);
+            assert_eq!(deleted.deleted_count, 2);
+            assert!(app.state::<AppState>().lock_db().get_segment_by_id("del-a").unwrap().is_none());
+
+            let replay =
+                delete_segments_v1(DeleteSegmentsRequestV1 { ids: vec!["del-a".into(), "del-b".into()] }, app.state())
+                    .expect("a lost-response replay proves the requested final state");
+            assert_eq!(replay.requested_count, 2);
+            assert_eq!(replay.deleted_count, 0);
+        }
+
+        #[test]
+        fn review_draft_commands_reserve_save_read_and_delete_through_state() {
+            let tmp = tempfile::tempdir().unwrap();
+            let app = managed_app_state(tmp.path());
+            let base_revision = seed_state_clip(&app, tmp.path(), "draft-clip");
+
+            assert_eq!(
+                reserve_review_draft_write_v1(app.state(), "bad id!".into(), "op-1".into()).unwrap_err().code,
+                "INVALID_SEGMENT_ID"
+            );
+            assert_eq!(
+                reserve_review_draft_write_v1(app.state(), "draft-clip".into(), "op !".into()).unwrap_err().code,
+                "INVALID_OPERATION_ID"
+            );
+
+            assert_eq!(get_review_draft_v1(app.state(), "bad id!".into()).unwrap_err().code, "INVALID_SEGMENT_ID");
+            assert!(get_review_draft_v1(app.state(), "draft-clip".into()).expect("no draft yet").is_none());
+
+            assert_eq!(
+                save_review_draft_v1(app.state(), "draft-clip".into(), -1, "x".into(), "op-save".into())
+                    .unwrap_err()
+                    .code,
+                "INVALID_REVIEW_REVISION"
+            );
+            assert_eq!(
+                save_review_draft_v1(
+                    app.state(),
+                    "draft-clip".into(),
+                    base_revision,
+                    "x".repeat(100_001),
+                    "op-save".into(),
+                )
+                .unwrap_err()
+                .code,
+                "INVALID_REVIEW_DRAFT"
+            );
+
+            reserve_review_draft_write_v1(app.state(), "draft-clip".into(), "op-save".into()).expect("reserve save");
+            let saved = save_review_draft_v1(
+                app.state(),
+                "draft-clip".into(),
+                base_revision,
+                "نیوە کار".into(),
+                "op-save".into(),
+            )
+            .expect("durable draft save");
+            assert_eq!(saved.segment_id, "draft-clip");
+            assert_eq!(saved.base_revision, base_revision);
+            assert_eq!(saved.text, "نیوە کار");
+
+            let loaded = get_review_draft_v1(app.state(), "draft-clip".into()).expect("read").expect("draft exists");
+            assert_eq!(loaded.text, "نیوە کار");
+
+            assert_eq!(
+                delete_review_draft_v1(app.state(), "draft-clip".into(), -1, "op-del".into()).unwrap_err().code,
+                "INVALID_REVIEW_REVISION"
+            );
+            reserve_review_draft_write_v1(app.state(), "draft-clip".into(), "op-del".into()).expect("reserve delete");
+            assert!(delete_review_draft_v1(app.state(), "draft-clip".into(), base_revision, "op-del".into())
+                .expect("revision-guarded delete"));
+            assert!(get_review_draft_v1(app.state(), "draft-clip".into()).expect("read after delete").is_none());
+        }
+
+        #[test]
+        fn commit_review_v1_commits_policy4_truth_and_refuses_bad_requests_through_state() {
+            let tmp = tempfile::tempdir().unwrap();
+            let app = managed_app_state(tmp.path());
+            seed_state_clip(&app, tmp.path(), "state-commit");
+            // Minting the policy-4 receipt rewrites the row's canonical audio hash, which advances
+            // review_revision. Read the revision AFTER arming, exactly as production sends the
+            // served revision from the fresh review-queue payload (same order as the parent
+            // module's typed_review_commit test).
+            let (playback_receipt_id, base_revision) = {
+                let state = app.state::<AppState>();
+                let db = state.lock_db();
+                let playback_receipt_id = exact_policy4_receipt(&db, "state-commit", 9_000);
+                let base_revision = db.segment_review_revision("state-commit").unwrap().unwrap();
+                (playback_receipt_id, base_revision)
+            };
+
+            let invalid = commit_review_v1(
+                app.state(),
+                CommitReviewRequestV1 {
+                    operation_id: "aaaa1111-1111-4111-8111-111111111111".into(),
+                    segment_id: "bad id!".into(),
+                    base_revision,
+                    decision: ReviewDecisionV1::Accept,
+                    transcript: Some("دەق".into()),
+                    reason_code: None,
+                    playback_receipt_id: playback_receipt_id.clone(),
+                },
+            )
+            .expect_err("identity gate");
+            assert_eq!(invalid.code, "INVALID_REVIEW_REQUEST");
+
+            let reason = commit_review_v1(
+                app.state(),
+                CommitReviewRequestV1 {
+                    operation_id: "aaaa2222-2222-4222-8222-222222222222".into(),
+                    segment_id: "state-commit".into(),
+                    base_revision,
+                    decision: ReviewDecisionV1::Reject,
+                    transcript: None,
+                    reason_code: Some("noise".into()),
+                    playback_receipt_id: playback_receipt_id.clone(),
+                },
+            )
+            .expect_err("structured unusable reasons are not persistable in this release");
+            assert_eq!(reason.code, "REASON_CODE_NOT_SUPPORTED");
+
+            let committed = commit_review_v1(
+                app.state(),
+                CommitReviewRequestV1 {
+                    operation_id: "aaaa3333-3333-4333-8333-333333333333".into(),
+                    segment_id: "state-commit".into(),
+                    base_revision,
+                    decision: ReviewDecisionV1::Accept,
+                    transcript: Some("دەق".into()),
+                    reason_code: None,
+                    playback_receipt_id,
+                },
+            )
+            .expect("typed accept through the full state boundary");
+            assert_eq!(committed.segment_id, "state-commit");
+            assert!(committed.committed_revision > base_revision, "the commit must advance review truth");
+            assert_eq!(committed.authoritative_transcript, "دەق");
+            assert!(committed.decision_id.starts_with("effect:"));
+            let row = app.state::<AppState>().lock_db().get_segment_by_id("state-commit").unwrap().unwrap();
+            assert_eq!(row.human_decision.as_deref(), Some("accept"));
+            assert!(row.verified);
+        }
+
+        #[test]
+        fn mark_segment_unusable_v1_seals_reproduced_corruption_through_state() {
+            let tmp = tempfile::tempdir().unwrap();
+            let app = managed_app_state(tmp.path());
+            let base_revision = seed_state_clip(&app, tmp.path(), "state-unusable");
+            std::fs::write(tmp.path().join("state-unusable.wav"), b"not an audio container").unwrap();
+
+            let invalid = mark_segment_unusable_v1(
+                app.state(),
+                MarkSegmentUnusableRequestV1 {
+                    operation_id: "bbbb1111-1111-4111-8111-111111111111".into(),
+                    segment_id: "bad id!".into(),
+                    base_revision,
+                    reason: TechnicalUnusableReasonV1::CorruptContainer,
+                },
+            )
+            .expect_err("identity gate");
+            assert_eq!(invalid.code, "INVALID_MARK_UNUSABLE_REQUEST");
+
+            let marked = mark_segment_unusable_v1(
+                app.state(),
+                MarkSegmentUnusableRequestV1 {
+                    operation_id: "bbbb2222-2222-4222-8222-222222222222".into(),
+                    segment_id: "state-unusable".into(),
+                    base_revision,
+                    reason: TechnicalUnusableReasonV1::CorruptContainer,
+                },
+            )
+            .expect("a reproduced corrupt container seals the technical flag");
+            assert_eq!(marked.segment_id, "state-unusable");
+            assert_eq!(marked.committed_revision, base_revision + 1);
+            assert_eq!(marked.reason, TechnicalUnusableReasonV1::CorruptContainer);
+            assert!(marked.effect_id.starts_with("flag-effect:"));
+            let row = app.state::<AppState>().lock_db().get_segment_by_id("state-unusable").unwrap().unwrap();
+            assert!(crate::quality::is_technically_unusable(&row));
+            assert!(row.human_decision.is_none(), "a technical failure is never human truth");
+        }
+
+        #[test]
+        fn record_review_flag_commits_and_refuses_non_uuid_operations_through_state() {
+            let tmp = tempfile::tempdir().unwrap();
+            let app = managed_app_state(tmp.path());
+            let base_revision = seed_state_clip(&app, tmp.path(), "state-flag");
+
+            let invalid = record_review_flag(
+                app.state(),
+                RecordReviewFlagRequestV1 {
+                    operation_id: "not-a-uuid".into(),
+                    segment_id: "state-flag".into(),
+                    base_revision,
+                    rationale: "Needs a second listen".into(),
+                },
+            )
+            .expect_err("flag idempotency requires a canonical UUID");
+            assert_eq!(invalid.code, "INVALID_REVIEW_FLAG_REQUEST");
+
+            let committed = record_review_flag(
+                app.state(),
+                RecordReviewFlagRequestV1 {
+                    operation_id: "cccc1111-1111-4111-8111-111111111111".into(),
+                    segment_id: "state-flag".into(),
+                    base_revision,
+                    rationale: "Needs a second listen".into(),
+                },
+            )
+            .expect("generic owner flag");
+            assert_eq!(committed.segment_id, "state-flag");
+            assert_eq!(committed.prior_revision, base_revision);
+            assert_eq!(committed.flag_revision, base_revision + 1);
+            assert!(committed.segment.escalated);
+        }
+
+        #[test]
+        fn desktop_undo_commands_discover_and_apply_the_flag_inverse_through_state() {
+            let tmp = tempfile::tempdir().unwrap();
+            let app = managed_app_state(tmp.path());
+            let base_revision = seed_state_clip(&app, tmp.path(), "state-undo-flag");
+
+            let fresh = tauri::async_runtime::block_on(get_desktop_review_undo_target_v1(app.state()))
+                .expect("empty history read");
+            assert!(matches!(fresh, DesktopReviewUndoAvailabilityV1::None));
+
+            app.state::<AppState>()
+                .review_writes()
+                .record_flag(
+                    "state-undo-flag",
+                    base_revision,
+                    "Undo me exactly once",
+                    "dddd1111-1111-4111-8111-111111111111",
+                )
+                .expect("seed a durable flag effect");
+
+            let target = available_undo_target(
+                tauri::async_runtime::block_on(get_desktop_review_undo_target_v1(app.state()))
+                    .expect("restart-safe target read"),
+            );
+
+            let forged = tauri::async_runtime::block_on(undo_desktop_review_action_v1(
+                app.state(),
+                exact_undo_request(&target, "not-a-uuid"),
+            ))
+            .expect_err("a non-UUID inverse identity must be refused");
+            assert_eq!(forged.code, "INVALID_UNDO_REQUEST");
+            assert!(app.state::<AppState>().lock_db().get_segment_by_id("state-undo-flag").unwrap().unwrap().escalated);
+
+            let applied = tauri::async_runtime::block_on(undo_desktop_review_action_v1(
+                app.state(),
+                exact_undo_request(&target, "dddd2222-2222-4222-8222-222222222222"),
+            ))
+            .expect("exact typed inverse applies");
+            assert!(matches!(applied, DesktopReviewUndoOutcomeV1::Applied { .. }));
+            assert!(
+                !app.state::<AppState>().lock_db().get_segment_by_id("state-undo-flag").unwrap().unwrap().escalated,
+                "the applied inverse must clear the escalation"
+            );
+        }
+
+        #[test]
+        fn playback_session_commands_validate_and_refuse_unknown_authority_through_state() {
+            let tmp = tempfile::tempdir().unwrap();
+            let app = managed_app_state(tmp.path());
+
+            assert_eq!(
+                begin_desktop_playback_session_v1(app.state(), "bad id!".into(), "grant-1".into(), 0, "att-1".into())
+                    .unwrap_err()
+                    .code,
+                "INVALID_SEGMENT_ID"
+            );
+            assert_eq!(
+                begin_desktop_playback_session_v1(app.state(), "seg-1".into(), "bad grant!".into(), 0, "att-1".into())
+                    .unwrap_err()
+                    .code,
+                "INVALID_MEDIA_GRANT"
+            );
+            assert_eq!(
+                begin_desktop_playback_session_v1(app.state(), "seg-1".into(), "grant-1".into(), 0, "bad att!".into())
+                    .unwrap_err()
+                    .code,
+                "INVALID_PLAYBACK_ATTEMPT"
+            );
+            assert_eq!(
+                begin_desktop_playback_session_v1(app.state(), "seg-1".into(), "grant-1".into(), -1, "att-1".into())
+                    .unwrap_err()
+                    .code,
+                "INVALID_REVIEW_REVISION"
+            );
+            let expired = begin_desktop_playback_session_v1(
+                app.state(),
+                "seg-1".into(),
+                uuid::Uuid::new_v4().to_string(),
+                0,
+                "att-1".into(),
+            )
+            .expect_err("a grant the registry never issued cannot begin playback");
+            assert_eq!(expired.code, "PLAYBACK_SESSION_EXPIRED");
+
+            let proof_failed = cancel_desktop_playback_session_v1(app.state(), "seg-receipt".into(), "att-1".into())
+                .expect_err("a non-UUID receipt identity fails the database boundary");
+            assert_eq!(proof_failed.code, "PLAYBACK_PROOF_FAILED");
+            assert!(
+                !cancel_desktop_playback_session_v1(
+                    app.state(),
+                    uuid::Uuid::new_v4().to_string(),
+                    uuid::Uuid::new_v4().to_string(),
+                )
+                .expect("cancelling an authority that no longer exists is an idempotent no-op"),
+                "nothing durable was retired"
+            );
+
+            assert_eq!(
+                finalize_desktop_playback_session_v1(app.state(), "bad receipt!".into(), "grant-1".into(), Vec::new())
+                    .unwrap_err()
+                    .code,
+                "INVALID_PLAYBACK_RECEIPT"
+            );
+            assert_eq!(
+                finalize_desktop_playback_session_v1(
+                    app.state(),
+                    uuid::Uuid::new_v4().to_string(),
+                    "bad grant!".into(),
+                    Vec::new(),
+                )
+                .unwrap_err()
+                .code,
+                "INVALID_MEDIA_GRANT"
+            );
+            let unavailable = finalize_desktop_playback_session_v1(
+                app.state(),
+                uuid::Uuid::new_v4().to_string(),
+                uuid::Uuid::new_v4().to_string(),
+                vec![PlaybackIntervalV1 { start_ms: 0, end_ms: 1_000 }],
+            )
+            .expect_err("no committed receipt and no live grant is a proven non-commit");
+            assert_eq!(unavailable.code, "PLAYBACK_MEDIA_GRANT_UNAVAILABLE");
+            assert!(unavailable.retryable);
+        }
+    }
 }

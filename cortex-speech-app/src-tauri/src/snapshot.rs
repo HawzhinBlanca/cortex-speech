@@ -3191,6 +3191,452 @@ mod tests {
             "a directory squatting on config state must never be promoted as absence"
         );
     }
+
+    // ── Wave-4 branch coverage. File-backed fixtures throughout (tempfile, never :memory: for the
+    // databases these arms inspect).
+
+    fn file_seeded_db(dir: &Path, name: &str) -> Database {
+        let db = Database::open(dir.join(name).to_string_lossy().as_ref()).unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "wave4-row".to_string(),
+            audio_path: "/wave4.wav".to_string(),
+            raw_transcript: "ڕەفەرێنس".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        db
+    }
+
+    /// Windows on this box can briefly serve a stale read after a write; settle until the exact
+    /// bytes read back before any hash-sensitive verification runs.
+    fn write_settled(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+        for _ in 0..50 {
+            if std::fs::read(path).map(|read| read == bytes).unwrap_or(false) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("write to {} never settled", path.display());
+    }
+
+    /// Re-stamp one file's size/sha row in a snapshot's manifest so byte-tamper tests exercise the
+    /// SEMANTIC validators rather than the hash mismatch.
+    fn refresh_manifest_row(snap: &Path, name: &str) {
+        let manifest_path = snap.join(MANIFEST_FILE);
+        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let target = snap.join(name);
+        let row = manifest["files"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["path"] == name)
+            .unwrap_or_else(|| panic!("manifest must declare {name}"));
+        row["sizeBytes"] = serde_json::json!(target.metadata().unwrap().len());
+        row["sha256"] = serde_json::json!(crate::models::compute_file_sha256(&target).unwrap());
+        write_settled(&manifest_path, &serde_json::to_vec_pretty(&manifest).unwrap());
+    }
+
+    #[test]
+    fn pinned_snapshot_during_restore_requires_an_active_reservation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_test_required_snapshot_state(tmp.path()).unwrap();
+        let db = file_seeded_db(tmp.path(), "wave4-restore.db");
+        let runtime = crate::database_runtime::DatabaseRuntime::isolated_for_test(
+            Database::open(tmp.path().join("wave4-runtime.db").to_string_lossy().as_ref()).unwrap(),
+        );
+        let reservation = runtime.try_reserve_restore_for_test().unwrap();
+        assert!(reservation.is_active());
+
+        let pin = take_pinned_snapshot_during_restore(&reservation, &db, tmp.path(), "prerestore", 3).unwrap();
+        assert!(verify_snapshot_manifest_for_restore(&pin).unwrap(), "the in-restore pin must self-verify");
+
+        // Committing the restore releases exclusivity; the stale capability must be refused.
+        reservation.arm_named_restore().unwrap();
+        reservation.commit_named_restore().unwrap();
+        assert!(!reservation.is_active());
+        let error = take_pinned_snapshot_during_restore(&reservation, &db, tmp.path(), "prerestore", 3)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires an active exclusive restore reservation"), "{error}");
+    }
+
+    #[test]
+    fn production_take_snapshot_skips_an_empty_library_with_history() {
+        // The production wrapper's Ok(None) arm: the guard-skip is neither success nor failure.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_test_required_snapshot_state(tmp.path()).unwrap();
+        let seeded = file_seeded_db(tmp.path(), "wave4-full.db");
+        assert!(take_snapshot(&seeded, tmp.path(), 3).unwrap().is_some());
+
+        let empty = Database::open(tmp.path().join("wave4-empty.db").to_string_lossy().as_ref()).unwrap();
+        empty.initialize().unwrap();
+        assert!(
+            take_snapshot(&empty, tmp.path(), 3).unwrap().is_none(),
+            "an empty library with prior snapshots is a guard-skip through the production wrapper too"
+        );
+    }
+
+    #[test]
+    fn a_fresh_profile_needs_no_pre_migration_pin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Database::open(tmp.path().join("wave4-fresh.db").to_string_lossy().as_ref()).unwrap();
+        assert!(
+            initialize_with_required_pre_migration_pin(&db, tmp.path()).unwrap().is_none(),
+            "a pristine schema-0 file is not an established profile; no pin is owed"
+        );
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), current_test_schema_version());
+    }
+
+    fn grant(db: &Database, digest: &str, baseline: i64, reviewer: &str, segment: &str) {
+        db.connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![digest, baseline, reviewer, segment],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn pilot_snapshot_authority_rejects_forged_grant_shapes() {
+        // The duplicate-grant and quota-excess validator arms are unreachable through inserts: the
+        // table's PRIMARY KEY collates the reviewer NOCASE and the quota trigger counts the same
+        // way, and dropping either guard trips the exact schema-contract check first. Those arms
+        // remain defense-in-depth; the rows below are the ones a real file can carry.
+        let policy = pilot_policy();
+        let digest = policy.policy_sha256().unwrap();
+        let cases: [(&dyn Fn(&Database), &str); 3] = [
+            (&|db| grant(db, &digest, 0, "Nobody", "seg-a"), "unauthorized reviewer"),
+            (&|db| grant(db, &digest, 0, "Hawzhin", "bad seg!"), "invalid segment"),
+            // Same active policy digest at a foreign baseline: a namespace the policy never armed.
+            (&|db| grant(db, &digest, 1, "Hawzhin", "seg-b"), "disagree with the active policy SHA/baseline"),
+        ];
+        for (forge, expected) in cases {
+            let profile = tempfile::TempDir::new().unwrap();
+            let db = file_seeded_db(profile.path(), "wave4-grants.db");
+            forge(&db);
+            let error = validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap_err();
+            assert!(error.contains(expected), "expected '{expected}', got: {error}");
+        }
+    }
+
+    /// One raw hidden-completion event, in the exact column shape the production writer records.
+    /// `requested_action` stays in the canonical vocabulary (the provenance trigger pins it); the
+    /// recorded `action` is what the snapshot validator re-derives meaning from.
+    fn hidden_completion_event(db: &Database, segment: &str, reviewer: &str, action: &str, index: u64) {
+        db.connection()
+            .execute(
+                "INSERT INTO review_events
+                    (segment_id, reviewer, action, source, timestamp_ms, operation_id,
+                     operation_payload_hash, requested_action, requested_transcript,
+                     served_transcript, served_revision, app_git_sha, playback_guard_version)
+                 VALUES (?1, ?2, ?3, 'couch_spot_check', 1, ?4, ?5, 'accept', '', 'ڕەفەرێنس', 0, ?6,
+                         'content-hash-raw-counter-v3')",
+                rusqlite::params![
+                    segment,
+                    reviewer,
+                    action,
+                    format!("00000000-0000-4000-8000-{index:012x}"),
+                    "a".repeat(64),
+                    crate::GIT_SHA,
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn pilot_snapshot_authority_rejects_forged_hidden_completions() {
+        let policy = pilot_policy();
+        let digest = policy.policy_sha256().unwrap();
+
+        // An action outside the review vocabulary is refused before any grant lookup.
+        let profile = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(profile.path(), "wave4-hidden.db");
+        hidden_completion_event(&db, "hidden-a", "Hawzhin", "flag", 600);
+        let error = validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap_err();
+        assert!(error.contains("has invalid action"), "{error}");
+
+        // A granted completion with no immutable spot-check result behind it.
+        let profile = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(profile.path(), "wave4-hidden.db");
+        grant(&db, &digest, 0, "Hawzhin", "hidden-b");
+        hidden_completion_event(&db, "hidden-b", "Hawzhin", "accept", 601);
+        let error = validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap_err();
+        assert!(error.contains("result mismatch"), "{error}");
+
+        // Two completion events for one hidden key: the second is a forged replay.
+        let profile = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(profile.path(), "wave4-hidden.db");
+        grant(&db, &digest, 0, "Hawzhin", "hidden-c");
+        db.connection()
+            .execute(
+                "INSERT INTO spot_checks
+                    (segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer)
+                 VALUES ('hidden-c', 'Hawzhin', 'accept', 'ڕەفەرێنس', 'ڕەفەرێنس', 1, 0.0)",
+                [],
+            )
+            .unwrap();
+        hidden_completion_event(&db, "hidden-c", "Hawzhin", "accept", 602);
+        validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy)
+            .expect("one granted, resulted completion is coherent");
+        hidden_completion_event(&db, "hidden-c", "Hawzhin", "accept", 603);
+        let error = validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap_err();
+        assert!(error.contains("multiple completion events"), "{error}");
+    }
+
+    #[test]
+    fn pilot_snapshot_authority_validates_the_live_session_binding() {
+        let policy = pilot_policy();
+        let with_session = |bytes: &[u8]| -> (tempfile::TempDir, Database, PathBuf) {
+            let profile = tempfile::TempDir::new().unwrap();
+            let db_path = profile.path().join(DB_FILE);
+            let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+            db.initialize().unwrap();
+            std::fs::write(profile.path().join("couch_session.json"), bytes).unwrap();
+            (profile, db, db_path)
+        };
+        let session_json = |db_path: &Path, policy: &crate::review_pilot::ReviewPilotPolicy| {
+            serde_json::to_vec(&serde_json::json!({
+                "db_path": db_path,
+                "reviewers": {"token-h": "Hawzhin", "token-p": "Pavel"},
+                "pilot_spot_checks": [],
+                "pilot_policy": policy,
+            }))
+            .unwrap()
+        };
+
+        let (profile, db, db_path) = with_session(b"{not json");
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("couch_session.json is invalid"), "{error}");
+
+        // A session bound to some other database file.
+        let (profile, db, db_path) = with_session(b"placeholder");
+        let foreign = profile.path().join("foreign.db");
+        std::fs::write(&foreign, b"other database").unwrap();
+        std::fs::write(profile.path().join("couch_session.json"), session_json(&foreign, &policy)).unwrap();
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("belongs to a different database"), "{error}");
+
+        // A session with no pilot binding at all.
+        let (profile, db, db_path) = with_session(b"placeholder");
+        std::fs::write(
+            profile.path().join("couch_session.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "db_path": &db_path,
+                "reviewers": {"token-h": "Hawzhin", "token-p": "Pavel"},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("not bound to the active pilot policy"), "{error}");
+
+        // A session bound to a DIFFERENT (still well-formed) pilot policy. The corpus caps are
+        // owner-pinned, so the only field a parseable policy can differ in is its armed baseline —
+        // which the digest covers.
+        let (profile, db, db_path) = with_session(b"placeholder");
+        let other_policy = crate::review_pilot::parse(
+            r#"{
+              "schema_version": 1,
+              "after_review_event_id": 5,
+              "max_total_corpus_actions": 20,
+              "reviewers": [
+                {"name": "Hawzhin", "max_corpus_actions": 10},
+                {"name": "Pavel", "max_corpus_actions": 10}
+              ]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(profile.path().join("couch_session.json"), session_json(&db_path, &other_policy)).unwrap();
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("bound to a different pilot policy"), "{error}");
+
+        // A roster that is not the exact paired pilot.
+        let (profile, db, db_path) = with_session(b"placeholder");
+        std::fs::write(
+            profile.path().join("couch_session.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "db_path": &db_path,
+                "reviewers": {"token-h": "Hawzhin"},
+                "pilot_spot_checks": [],
+                "pilot_policy": &policy,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("roster does not match the active pilot"), "{error}");
+
+        // The same hidden key cached twice (case-folded) in one session. The first cache entry is
+        // durably granted, so the refusal under test is the duplication itself.
+        let (profile, db, db_path) = with_session(b"placeholder");
+        grant(&db, &policy.policy_sha256().unwrap(), 0, "Hawzhin", "hidden-dup");
+        std::fs::write(
+            profile.path().join("couch_session.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "db_path": &db_path,
+                "reviewers": {"token-h": "Hawzhin", "token-p": "Pavel"},
+                "pilot_spot_checks": [["hidden-dup", "Hawzhin"], ["hidden-dup", "HAWZHIN"]],
+                "pilot_policy": &policy,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("duplicates hidden key"), "{error}");
+    }
+
+    #[test]
+    fn unreadable_policy_and_incomplete_staging_are_refused() {
+        // A directory squatting on the pilot policy is unreadable, which must fail the snapshot —
+        // never be recorded as intentional absence.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        seed_test_required_snapshot_state(tmp.path()).unwrap();
+        std::fs::create_dir(tmp.path().join(crate::review_pilot::REVIEW_PILOT_FILE)).unwrap();
+        let error = take_snapshot_at_from(&db, tmp.path(), tmp.path(), 5, 1000).unwrap_err().to_string();
+        assert!(error.contains("could not be read"), "{error}");
+        assert!(!tmp.path().join("snapshots").join("snapshot_0000001000").exists());
+
+        // Staging without its manifest can never reach the durability barriers.
+        let staging = tmp.path().join("staging-probe");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join(DB_FILE), b"payload").unwrap();
+        let error = sync_snapshot_staging(&staging).unwrap_err().to_string();
+        assert!(error.contains("cannot be committed without"), "{error}");
+
+        // The private-image primitives refuse non-regular sources and occupied destinations.
+        let squatted_dir = tmp.path().join("not-a-file");
+        std::fs::create_dir_all(&squatted_dir).unwrap();
+        let error = hash_snapshot_file(&squatted_dir, "not-a-file").unwrap_err();
+        assert!(error.contains("must be a regular, non-symlink file"), "{error}");
+        let error = copy_snapshot_file(&squatted_dir, &tmp.path().join("dest.bin"), "not-a-file").unwrap_err();
+        assert!(error.contains("must be a regular, non-symlink file"), "{error}");
+        let source = tmp.path().join("source.bin");
+        std::fs::write(&source, b"bytes").unwrap();
+        let occupied = tmp.path().join("occupied.bin");
+        std::fs::write(&occupied, b"already here").unwrap();
+        let error = copy_snapshot_file(&source, &occupied, "occupied.bin").unwrap_err();
+        assert!(error.contains("could not be privately staged"), "{error}");
+    }
+
+    #[test]
+    fn schema2_identity_and_semantic_state_survive_hash_refreshing_forgeries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let snap = take_snapshot_at(&db, tmp.path(), 5, 1000).unwrap().unwrap();
+
+        // Schema-2 identity fields are hard requirements even with perfect hashes and evidence.
+        let schema1: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(snap.join(MANIFEST_FILE)).unwrap()).unwrap();
+        let evidence = inspect_schema2_database_evidence(&snap.join(DB_FILE)).unwrap();
+        let forged = serde_json::json!({
+            "schema": 2,
+            "createdAtEpochSecs": 1000,
+            "appGitSha": crate::GIT_SHA,
+            "sourceDataDir": "",
+            "databaseEvidence": evidence,
+            "files": schema1["files"].clone(),
+        });
+        write_settled(&snap.join(MANIFEST_FILE), &serde_json::to_vec_pretty(&forged).unwrap());
+        let error = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+        assert!(error.contains("identity fields are invalid"), "{error}");
+        write_settled(&snap.join(MANIFEST_FILE), &serde_json::to_vec_pretty(&schema1).unwrap());
+
+        // A semantically invalid champion pointer is refused even when its manifest row is
+        // re-stamped to match the forged bytes exactly.
+        write_settled(&snap.join("champion.json"), b"{}");
+        refresh_manifest_row(&snap, "champion.json");
+        let error = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+        assert!(error.contains("champion.json"), "{error}");
+
+        // Same for forged absence markers, in a legitimately-absent tree.
+        let absent_tmp = tempfile::TempDir::new().unwrap();
+        let absent_snap = take_snapshot_at_from(&db, absent_tmp.path(), absent_tmp.path(), 5, 1000).unwrap().unwrap();
+        write_settled(&absent_snap.join("champion.json.absent"), b"forged marker");
+        refresh_manifest_row(&absent_snap, "champion.json.absent");
+        let error = verify_snapshot_manifest_for_restore(&absent_snap).unwrap_err();
+        assert!(error.contains("invalid contents"), "{error}");
+
+        let pilot_tmp = tempfile::TempDir::new().unwrap();
+        let pilot_snap = take_snapshot_at_from(&db, pilot_tmp.path(), pilot_tmp.path(), 5, 1000).unwrap().unwrap();
+        write_settled(&pilot_snap.join(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE), b"forged pilot marker");
+        refresh_manifest_row(&pilot_snap, crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE);
+        let error = verify_snapshot_manifest_for_restore(&pilot_snap).unwrap_err();
+        assert!(
+            error.contains(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE) && error.contains("invalid contents"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_bound_pilot_policy_is_semantically_verified_at_restore() {
+        const POLICY_BASELINE_0: &[u8] = br#"{
+          "schema_version": 1,
+          "after_review_event_id": 0,
+          "max_total_corpus_actions": 20,
+          "reviewers": [
+            {"name": "Hawzhin", "max_corpus_actions": 10},
+            {"name": "Pavel", "max_corpus_actions": 10}
+          ]
+        }"#;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        seed_test_required_snapshot_state(tmp.path()).unwrap();
+        crate::review_pilot::install_test_focus(tmp.path(), ["wave4-focus"]);
+        std::fs::write(tmp.path().join(crate::review_pilot::REVIEW_PILOT_FILE), POLICY_BASELINE_0).unwrap();
+        let snap = take_snapshot_at_from(&db, tmp.path(), tmp.path(), 5, 1000).unwrap().unwrap();
+        assert!(verify_snapshot_manifest_for_restore(&snap).unwrap(), "the policy-bearing snapshot verifies");
+
+        // Rewriting the copied policy to a baseline its own database never reached is refused even
+        // with the manifest row freshly re-stamped over the forged bytes.
+        let forged_policy = String::from_utf8_lossy(POLICY_BASELINE_0)
+            .replace("\"after_review_event_id\": 0", "\"after_review_event_id\": 1");
+        write_settled(&snap.join(crate::review_pilot::REVIEW_PILOT_FILE), forged_policy.as_bytes());
+        refresh_manifest_row(&snap, crate::review_pilot::REVIEW_PILOT_FILE);
+        let error = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+        assert!(error.contains("is ahead of its database review-event maximum"), "{error}");
+    }
+
+    #[test]
+    fn partial_snapshot_trees_list_defensively_and_legacy_images_capture_unverified() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("snapshots");
+        // A bare timestamped dir with no database at all: listed, with honest empty metadata.
+        std::fs::create_dir_all(root.join("snapshot_0000000042")).unwrap();
+        // Junk that must be ignored: a malformed name and a plain file with a valid name.
+        std::fs::create_dir_all(root.join("snapshot_notdigits")).unwrap();
+        std::fs::write(root.join("snapshot_0000000099"), b"a file, not a snapshot").unwrap();
+        std::fs::create_dir_all(root.join(PINNED_DIR).join("_0000000042")).unwrap();
+        let listed = list_snapshots(tmp.path());
+        assert_eq!(listed.len(), 1, "only the well-formed directory counts: {listed:?}");
+        assert_eq!(listed[0].name, "snapshot_0000000042");
+        assert_eq!(listed[0].db_size_bytes, 0, "a missing database reads as zero bytes, not an error");
+        assert_eq!(listed[0].segment_count, None, "an unopenable database is honestly None");
+
+        // A manifest-less legacy tree captures as an image, but never as manifest-verified.
+        let legacy = tmp.path().join("legacy-tree");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join(DB_FILE), b"legacy database bytes").unwrap();
+        let image = VerifiedSnapshotImage::capture(&legacy, || {}).unwrap();
+        assert!(!image.manifest_verified(), "no manifest can never mean verified");
+        assert!(image.database_path().is_file());
+    }
 }
 
 #[cfg(test)]

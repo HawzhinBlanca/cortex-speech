@@ -1107,6 +1107,12 @@ fn migrate_path(
 
 fn run() -> Result<serde_json::Value, String> {
     let args: Vec<String> = env::args().skip(1).collect();
+    run_args(&args)
+}
+
+/// Exact former body of `run()` after the `env::args` read, extracted unchanged so the command
+/// dispatch is testable without a process boundary. Behavior is identical.
+fn run_args(args: &[String]) -> Result<serde_json::Value, String> {
     let command = args.first().map(String::as_str).ok_or_else(|| usage().to_string())?;
     match command {
         "inspect" => {
@@ -1320,5 +1326,410 @@ mod tests {
         assert!(fs::remove_file(&output).is_err());
         output_lock.write_exact_and_sync(b"serialized-output").unwrap();
         assert_eq!(output_lock.sha256().unwrap(), sha256_bytes(b"serialized-output"));
+    }
+
+    // ── Flag and schema parsing ──────────────────────────────────────────────────────────────────
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_flags_refuses_every_malformed_invocation_shape() {
+        let allowed = ["--db", "--campaign"];
+        assert_eq!(parse_flags(&args(&["--db"]), &allowed).unwrap_err(), usage().to_string());
+        assert!(parse_flags(&args(&["--bogus", "x", "--db", "a", "--campaign", "b"]), &allowed)
+            .unwrap_err()
+            .contains("unknown or unauthorized option --bogus"));
+        assert!(parse_flags(&args(&["--db", "", "--campaign", "b"]), &allowed)
+            .unwrap_err()
+            .contains("--db cannot be empty"));
+        assert!(parse_flags(&args(&["--db", "a", "--db", "b", "--campaign", "c"]), &allowed)
+            .unwrap_err()
+            .contains("duplicate option --db"));
+        assert!(parse_flags(&args(&["--db", "a"]), &allowed)
+            .unwrap_err()
+            .contains("missing required option --campaign"));
+
+        let parsed = parse_flags(&args(&["--campaign", "absent", "--db", "a.db"]), &allowed).unwrap();
+        assert_eq!(flag(&parsed, "--db").unwrap(), "a.db");
+        assert_eq!(flag(&parsed, "--campaign").unwrap(), "absent");
+        assert!(flag(&parsed, "--missing").unwrap_err().contains("missing required option --missing"));
+    }
+
+    #[test]
+    fn parse_schema_accepts_only_positive_integers() {
+        assert!(parse_schema("abc", "--expected-schema").unwrap_err().contains("positive integer"));
+        assert!(parse_schema("0", "--expected-schema").unwrap_err().contains("positive integer"));
+        assert!(parse_schema("-4", "--expected-schema").unwrap_err().contains("positive integer"));
+        assert_eq!(parse_schema("61", "--expected-schema").unwrap(), 61);
+    }
+
+    // ── Path normalization and containment ───────────────────────────────────────────────────────
+
+    #[test]
+    fn absolute_lexical_refuses_empty_and_parent_traversal() {
+        assert!(absolute_lexical(Path::new("")).unwrap_err().contains("path cannot be empty"));
+        let relative = absolute_lexical(Path::new("proof-fixture.db")).unwrap();
+        assert!(relative.is_absolute());
+        assert!(relative.ends_with("proof-fixture.db"));
+        let temporary = tempfile::tempdir().unwrap();
+        let traversal = temporary.path().join("..").join("elsewhere.db");
+        assert!(absolute_lexical(&traversal).unwrap_err().contains("parent traversal is not permitted"));
+    }
+
+    #[test]
+    fn canonical_comparison_and_containment_handle_missing_tails() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let missing_child = root.join("not-yet").join("leaf.db");
+        let comparable = canonical_comparison_path(&missing_child).unwrap();
+        assert!(comparable.ends_with(Path::new("not-yet").join("leaf.db")));
+
+        assert!(is_within(&missing_child, root).unwrap());
+        assert!(is_within(root, root).unwrap(), "a root contains itself");
+        let sibling = root.with_file_name("unrelated-sibling-dir");
+        assert!(!is_within(&sibling, root).unwrap(), "a sibling sharing the prefix is not inside");
+    }
+
+    #[test]
+    fn nt_object_prefixes_normalize_like_verbatim_prefixes() {
+        assert_eq!(normalized_path(Path::new(r"\??\C:\Proof-Root\")), "c:/proof-root");
+        assert_eq!(normalized_path(Path::new(r"C:\Proof-Root\Owner\")), "c:/proof-root/owner");
+    }
+
+    #[test]
+    fn reject_links_requires_existing_plain_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        assert!(reject_links_and_reparse_points(&temporary.path().join("missing").join("anywhere.db"))
+            .unwrap_err()
+            .contains("does not exist"));
+        let file = temporary.path().join("plain.db");
+        fs::write(&file, b"fixture").unwrap();
+        let canonical = reject_links_and_reparse_points(&file).unwrap();
+        assert_eq!(normalized_path(&canonical), normalized_path(&fs::canonicalize(&file).unwrap()));
+    }
+
+    #[test]
+    fn snapshot_pinned_and_live_appdata_paths_are_refused() {
+        let temporary = tempfile::tempdir().unwrap();
+        for reserved in ["snapshots", "pinned", "snapshot_2026-01-01"] {
+            let error = reject_live_and_snapshot_paths(&temporary.path().join(reserved).join("copy.db")).unwrap_err();
+            assert!(error.contains("immutable recovery authority"), "{reserved}: {error}");
+        }
+        // Pure path comparison against the resolved protected roots; nothing is opened or written.
+        for root in protected_roots().unwrap() {
+            let error = reject_live_and_snapshot_paths(&root.join("cortex-speech.db")).unwrap_err();
+            assert!(error.contains("never proof-input targets"), "{error}");
+        }
+        assert!(reject_live_and_snapshot_paths(&temporary.path().join("workspace.db")).is_ok());
+    }
+
+    // ── Sidecars and identity locks ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sidecar_suffixes_are_appended_and_detected() {
+        assert_eq!(sidecar(Path::new("a.db"), "-wal"), PathBuf::from("a.db-wal"));
+        let temporary = tempfile::tempdir().unwrap();
+        let db = temporary.path().join("single.db");
+        fs::write(&db, b"fixture").unwrap();
+        assert!(reject_sqlite_sidecars(&db).is_ok());
+        fs::write(sidecar(&db, "-journal"), b"leftover").unwrap();
+        let error = reject_sqlite_sidecars(&db).unwrap_err();
+        assert!(error.contains("-journal sidecar"), "{error}");
+    }
+
+    #[test]
+    fn identity_locks_refuse_directories_and_missing_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("actually-a-directory");
+        fs::create_dir(&directory).unwrap();
+        assert!(LockedPath::existing(&directory, false).is_err());
+        assert!(LockedPath::existing(&temporary.path().join("missing.db"), false).is_err());
+        let file = temporary.path().join("not-a-directory");
+        fs::write(&file, b"fixture").unwrap();
+        assert!(LockedDirectoryTree::existing(&file).is_err());
+        assert!(LockedDirectoryTree::existing(temporary.path()).is_ok());
+    }
+
+    // ── Schema fingerprint and integrity helpers ─────────────────────────────────────────────────
+
+    #[test]
+    fn schema_sql_normalization_shadows_fts_and_flattens_whitespace() {
+        assert_eq!(normalized_schema_sql("segments_fts_data", Some("CREATE ...".into())), "<sqlite-fts5-shadow>");
+        assert_eq!(normalized_schema_sql("plain_table", None), "");
+        assert_eq!(
+            normalized_schema_sql("plain_table", Some("  CREATE TABLE  X\n  (id TEXT) ;".into())),
+            "create table x (id text)"
+        );
+    }
+
+    #[test]
+    fn sqlite_check_supports_only_the_two_integrity_pragmas() {
+        let db = Database::open(":memory:").unwrap();
+        assert_eq!(sqlite_check(db.connection(), "quick_check").unwrap(), vec!["ok".to_string()]);
+        assert_eq!(sqlite_check(db.connection(), "integrity_check").unwrap(), vec!["ok".to_string()]);
+        assert!(sqlite_check(db.connection(), "journal_mode").unwrap_err().contains("unsupported SQLite integrity"));
+    }
+
+    #[test]
+    fn expected_schema_fingerprint_is_bounded_and_deterministic() {
+        let current = migrations::max_supported_version();
+        assert!(expected_schema_fingerprint(0).unwrap_err().contains("outside this helper's exact history"));
+        assert!(expected_schema_fingerprint(current + 1).unwrap_err().contains("outside this helper's exact history"));
+        let fingerprint = expected_schema_fingerprint(current).unwrap();
+        assert_eq!(fingerprint.len(), 64);
+        assert_eq!(expected_schema_fingerprint(current).unwrap(), fingerprint);
+    }
+
+    // ── Campaign-mode contract ───────────────────────────────────────────────────────────────────
+
+    fn inspection_fixture(campaign: bool, pool: bool, authority_rows: i64) -> Inspection {
+        Inspection {
+            schema: 1,
+            schema_version: migrations::max_supported_version(),
+            migration_history_entries: 0,
+            schema_fingerprint_sha256: "0".repeat(64),
+            quick_check: vec!["ok".into()],
+            integrity_check: vec!["ok".into()],
+            foreign_key_violations: 0,
+            segment_count: 0,
+            distinct_audio_path_count: 0,
+            sequential_campaign_present: campaign,
+            review_pool_present: pool,
+            campaign_authority_rows: authority_rows,
+            campaign_authority_counts: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn campaign_mode_contract_matches_only_exact_states() {
+        assert!(require_campaign_mode(&inspection_fixture(false, false, 0), "absent").is_ok());
+        assert!(require_campaign_mode(&inspection_fixture(true, false, 3), "required").is_ok());
+        assert!(require_campaign_mode(&inspection_fixture(true, false, 3), "absent")
+            .unwrap_err()
+            .contains("unexpectedly contains campaign or review-pool authority"));
+        assert!(require_campaign_mode(&inspection_fixture(false, true, 1), "absent")
+            .unwrap_err()
+            .contains("unexpectedly contains campaign or review-pool authority"));
+        assert!(require_campaign_mode(&inspection_fixture(false, false, 0), "required")
+            .unwrap_err()
+            .contains("lacks valid sequential campaign authority"));
+        assert!(require_campaign_mode(&inspection_fixture(true, false, 0), "required")
+            .unwrap_err()
+            .contains("lacks valid sequential campaign authority"));
+        assert!(require_campaign_mode(&inspection_fixture(false, false, 0), "everything")
+            .unwrap_err()
+            .contains("--campaign must be absent or required"));
+    }
+
+    // ── inspect and the CLI dispatch ─────────────────────────────────────────────────────────────
+
+    /// Current-schema single-file database fixture with no WAL/SHM sidecars.
+    fn single_file_current_db(directory: &Path) -> PathBuf {
+        let path = directory.join("inspect-fixture.db");
+        let db = Database::open(&path.to_string_lossy()).unwrap();
+        db.initialize().unwrap();
+        let journal: String = db.connection().query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0)).unwrap();
+        assert_eq!(journal, "delete");
+        drop(db);
+        path
+    }
+
+    #[test]
+    fn inspect_path_proves_single_file_read_only_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = single_file_current_db(temporary.path());
+        let before_hash = sha256_file(&path).unwrap();
+
+        let (inspection, reported_hash) = inspect_path(&path).unwrap();
+        assert_eq!(reported_hash, before_hash);
+        assert_eq!(inspection.schema_version, migrations::max_supported_version());
+        assert_eq!(inspection.segment_count, 0);
+        assert_eq!(inspection.foreign_key_violations, 0);
+        assert!(!inspection.sequential_campaign_present);
+        assert_eq!(sha256_file(&path).unwrap(), before_hash, "inspection must be read-only");
+
+        fs::write(sidecar(&path, "-wal"), b"stray").unwrap();
+        assert!(inspect_path(&path).unwrap_err().contains("-wal sidecar"));
+    }
+
+    #[test]
+    fn cli_dispatch_refuses_unknown_commands_and_serves_contracts() {
+        assert_eq!(run_args(&[]).unwrap_err(), usage().to_string());
+        assert_eq!(run_args(&args(&["sanitize-campaign"])).unwrap_err(), usage().to_string());
+
+        let current = migrations::max_supported_version();
+        let contract = run_args(&args(&["schema-contract", "--expected-schema", &current.to_string()])).unwrap();
+        assert_eq!(contract["operation"], "schema-contract");
+        assert_eq!(contract["schemaVersion"], current);
+        assert_eq!(contract["schemaFingerprintSha256"], expected_schema_fingerprint(current).unwrap());
+        assert_eq!(contract["helperSourceSha256"], helper_source_sha256());
+
+        // The migrate arm routes through the same hash-bound refusals as the direct calls below.
+        let refused = run_args(&args(&[
+            "migrate",
+            "--source-db",
+            "unused.db",
+            "--output-db",
+            "unused.work.db",
+            "--staging-root",
+            "unused-root",
+            "--source-sha256",
+            "NOT-A-HASH",
+            "--expected-source-schema",
+            "60",
+            "--expected-target-schema",
+            &current.to_string(),
+        ]))
+        .unwrap_err();
+        assert!(refused.contains("--source-sha256 must be lowercase SHA-256"), "{refused}");
+    }
+
+    #[test]
+    fn cli_inspect_binds_schema_campaign_and_hash() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = single_file_current_db(temporary.path());
+        let path_text = path.to_string_lossy().to_string();
+        let current = migrations::max_supported_version();
+
+        let report = run_args(&args(&[
+            "inspect",
+            "--db",
+            &path_text,
+            "--expected-schema",
+            &current.to_string(),
+            "--campaign",
+            "absent",
+        ]))
+        .unwrap();
+        assert_eq!(report["operation"], "inspect");
+        assert_eq!(report["databaseSha256"], sha256_file(&path).unwrap());
+        assert_eq!(report["inspection"]["schemaVersion"], current);
+
+        let wrong_schema =
+            run_args(&args(&["inspect", "--db", &path_text, "--expected-schema", "1", "--campaign", "absent"]))
+                .unwrap_err();
+        assert!(wrong_schema.contains("database schema is"), "{wrong_schema}");
+        let bad_mode = run_args(&args(&[
+            "inspect",
+            "--db",
+            &path_text,
+            "--expected-schema",
+            &current.to_string(),
+            "--campaign",
+            "everything",
+        ]))
+        .unwrap_err();
+        assert!(bad_mode.contains("--campaign must be absent or required"), "{bad_mode}");
+    }
+
+    // ── migrate refusal arms ─────────────────────────────────────────────────────────────────────
+
+    fn staged_layout(root: &Path, name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let staging = root.join(format!("{STAGING_PREFIX}{name}"));
+        let authorities = staging.join("db-authorities");
+        let derived = staging.join("db-derived");
+        fs::create_dir_all(&authorities).unwrap();
+        fs::create_dir_all(&derived).unwrap();
+        (staging, authorities, derived)
+    }
+
+    #[test]
+    fn migrate_refuses_malformed_hash_and_foreign_target_schema() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (staging, authorities, derived) = staged_layout(temporary.path(), "contract");
+        let source = authorities.join("source.db");
+        let output = derived.join("result.work.db");
+        fs::write(&source, b"fixture").unwrap();
+        let current = migrations::max_supported_version();
+
+        let uppercase = migrate_path(&source, &output, &staging, &"A".repeat(64), 60, current).unwrap_err();
+        assert!(uppercase.contains("--source-sha256 must be lowercase SHA-256"), "{uppercase}");
+        let short = migrate_path(&source, &output, &staging, "abc123", 60, current).unwrap_err();
+        assert!(short.contains("--source-sha256 must be lowercase SHA-256"), "{short}");
+        let foreign = migrate_path(&source, &output, &staging, &"0".repeat(64), 60, current + 1).unwrap_err();
+        assert!(foreign.contains("does not equal this helper's current schema"), "{foreign}");
+    }
+
+    #[test]
+    fn migrate_refuses_unowned_or_incomplete_staging_roots() {
+        let temporary = tempfile::tempdir().unwrap();
+        let unowned = temporary.path().join("plain-workspace");
+        fs::create_dir_all(unowned.join("db-authorities")).unwrap();
+        fs::create_dir_all(unowned.join("db-derived")).unwrap();
+        let error = migrate_path(
+            &unowned.join("db-authorities").join("a.db"),
+            &unowned.join("db-derived").join("a.work.db"),
+            &unowned,
+            &"0".repeat(64),
+            60,
+            migrations::max_supported_version(),
+        )
+        .unwrap_err();
+        assert!(error.contains("not owned by the proof-input preparer"), "{error}");
+
+        let bare = temporary.path().join(format!("{STAGING_PREFIX}bare"));
+        fs::create_dir_all(&bare).unwrap();
+        let error = migrate_path(
+            &bare.join("db-authorities").join("a.db"),
+            &bare.join("db-derived").join("a.work.db"),
+            &bare,
+            &"0".repeat(64),
+            60,
+            migrations::max_supported_version(),
+        )
+        .unwrap_err();
+        assert!(error.contains("ancestry does not exist"), "{error}");
+    }
+
+    #[test]
+    fn migrate_refuses_sources_and_outputs_outside_their_directories() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (staging, authorities, derived) = staged_layout(temporary.path(), "placement");
+        let stray_source = staging.join("stray.db");
+        fs::write(&stray_source, b"fixture").unwrap();
+        let current = migrations::max_supported_version();
+
+        let outside_authorities =
+            migrate_path(&stray_source, &derived.join("r.work.db"), &staging, &"0".repeat(64), 60, current)
+                .unwrap_err();
+        assert!(outside_authorities.contains("immutable authority inside staging"), "{outside_authorities}");
+
+        let source = authorities.join("source.db");
+        fs::write(&source, b"fixture").unwrap();
+        let outside_derived =
+            migrate_path(&source, &staging.join("r.work.db"), &staging, &"0".repeat(64), 60, current).unwrap_err();
+        assert!(outside_derived.contains("inside the staging db-derived directory"), "{outside_derived}");
+
+        let wrong_suffix =
+            migrate_path(&source, &derived.join("result.db"), &staging, &"0".repeat(64), 60, current).unwrap_err();
+        assert!(wrong_suffix.contains("disposable .work.db suffix"), "{wrong_suffix}");
+    }
+
+    #[test]
+    fn migrate_refuses_hash_and_source_schema_drift() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (staging, authorities, derived) = staged_layout(temporary.path(), "authority");
+        let source = authorities.join("source.db");
+        let output = derived.join("result.work.db");
+        fs::write(&source, b"not-the-promised-bytes").unwrap();
+        let current = migrations::max_supported_version();
+
+        let mismatch = migrate_path(&source, &output, &staging, &"0".repeat(64), 60, current).unwrap_err();
+        assert!(mismatch.contains("does not match its exact authority hash"), "{mismatch}");
+        assert!(!output.exists(), "a refused migration must not create output");
+
+        // A real current-schema database offered under a WRONG claimed source schema.
+        fs::remove_file(&source).unwrap();
+        let db = Database::open(&source.to_string_lossy()).unwrap();
+        db.initialize().unwrap();
+        let journal: String = db.connection().query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0)).unwrap();
+        assert_eq!(journal, "delete");
+        drop(db);
+        let real_hash = sha256_file(&source).unwrap();
+        let drift = migrate_path(&source, &output, &staging, &real_hash, current - 1, current).unwrap_err();
+        assert!(drift.contains("schema/hash does not match its contract"), "{drift}");
+        assert!(!output.exists());
     }
 }

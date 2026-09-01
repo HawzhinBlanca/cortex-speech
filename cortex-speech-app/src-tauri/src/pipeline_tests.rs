@@ -2087,3 +2087,176 @@ fn the_7b_gate_refuses_a_cancelled_caller_queued_behind_a_full_gate() {
     drop(held);
     assert!(gate.acquire_with_limit(Some(&live), 1).is_some(), "the queued refusal must not have leaked a permit");
 }
+
+#[test]
+fn gold_eval_refuses_diagnostic_engines_and_an_unregistered_champion() {
+    // Non-champion engine selected: the production gold eval must refuse outright.
+    let (local, _dir) =
+        test_pipeline_with_settings(AppSettings { asr_model_size: AsrModelSize::CTC300M, ..AppSettings::default() });
+    let error = local.run_gold_eval_asr().unwrap_err().to_string();
+    assert!(error.contains("requires the pinned OmniASR-7B champion"), "{error}");
+
+    // Champion selected but no registered content-addressed champion: preflight refuses before
+    // any eval row can be written.
+    let (champion, dir) =
+        test_pipeline_with_settings(AppSettings { asr_model_size: AsrModelSize::WSL7B, ..AppSettings::default() });
+    let db = Database::open(dir.path().join("db.sqlite").to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+    let error = champion.run_gold_eval_asr().unwrap_err().to_string();
+    assert!(error.contains(super::ASR_7B_UNAVAILABLE_TAG), "{error}");
+    assert!(error.contains("champion"), "{error}");
+}
+
+#[test]
+fn batch_champion_preflight_refuses_a_configured_diagnostic_engine() {
+    let (pipeline, _dir) =
+        test_pipeline_with_settings(AppSettings { asr_model_size: AsrModelSize::CTC1B, ..AppSettings::default() });
+    let error = pipeline.preflight_batch_champion().unwrap_err().to_string();
+    assert!(error.contains(super::ASR_7B_UNAVAILABLE_TAG), "{error}");
+    assert!(
+        error.contains("refusing the configured diagnostic engine"),
+        "durable batches must never run on a local diagnostic engine: {error}"
+    );
+}
+
+#[test]
+fn local_asr_model_id_names_the_exact_selected_engine() {
+    for (size, expected) in [
+        (AsrModelSize::CTC300M, "omniasr-ctc-300m"),
+        (AsrModelSize::CTC1B, "omniasr-ctc-1b"),
+        (AsrModelSize::WSL7B, "omniasr-wsl-7b"),
+    ] {
+        let (pipeline, _dir) =
+            test_pipeline_with_settings(AppSettings { asr_model_size: size, ..AppSettings::default() });
+        assert_eq!(pipeline.local_asr_model_id(), expected);
+    }
+}
+
+#[test]
+fn hypothesis_stage_blocks_when_nothing_persisted_or_the_database_cannot_answer() {
+    let (pipeline, dir) =
+        test_pipeline_with_settings(AppSettings { asr_model_size: AsrModelSize::CTC300M, ..AppSettings::default() });
+    let db = Database::open(dir.path().join("db.sqlite").to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    // No persisted segments at all: coverage cannot be verified, so the stage is blocked.
+    let stage = super::multi_model_hypothesis_stage(&db, &pipeline.settings_snapshot(), "empty.wav", &[]);
+    match stage {
+        super::PipelineEvent::AgentStage { stage, status, detail, .. } => {
+            assert_eq!(stage, "multi_model_hypotheses");
+            assert_eq!(status, "blocked");
+            assert!(detail.contains("No speech segments were persisted"), "{detail}");
+        }
+        other => panic!("expected an AgentStage event, got {other:?}"),
+    }
+
+    // A database that cannot answer the coverage question must be blocked too, never guessed.
+    let seg = test_segment("hyp-db-broken");
+    db.insert_segment(&seg).unwrap();
+    db.connection().execute_batch("ALTER TABLE segment_hypotheses RENAME TO segment_hypotheses_hidden;").unwrap();
+    let stage = super::multi_model_hypothesis_stage(&db, &pipeline.settings_snapshot(), "broken.wav", &[seg]);
+    match stage {
+        super::PipelineEvent::AgentStage { status, detail, .. } => {
+            assert_eq!(status, "blocked");
+            assert!(detail.contains("Failed to verify multi-model hypothesis coverage"), "{detail}");
+        }
+        other => panic!("expected an AgentStage event, got {other:?}"),
+    }
+}
+
+#[test]
+fn rediarize_skips_unreadable_sources_without_partial_writes() {
+    let (pipeline, dir) =
+        test_pipeline_with_settings(AppSettings { enable_diarization: true, ..AppSettings::default() });
+    let db = Database::open(dir.path().join("db.sqlite").to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    // One target names a path that no longer exists; the other exists but cannot decode. Both must
+    // be skipped without any speaker write and without failing the whole request.
+    let garbage = dir.path().join("garbage.wav");
+    std::fs::write(&garbage, b"not-real-audio").unwrap();
+    let mut missing_seg = test_segment("rediar-missing");
+    missing_seg.audio_path = dir.path().join("gone.wav").to_string_lossy().to_string();
+    let mut garbage_seg = test_segment("rediar-garbage");
+    garbage_seg.audio_path = garbage.to_string_lossy().to_string();
+    db.insert_segment(&missing_seg).unwrap();
+    db.insert_segment(&garbage_seg).unwrap();
+
+    let updated = pipeline
+        .rediarize_segments(&["rediar-missing".to_string(), "rediar-garbage".to_string()])
+        .expect("unreadable sources are skipped, not fatal");
+    assert_eq!(updated, 0);
+    assert_eq!(db.get_segment_by_id("rediar-missing").unwrap().unwrap().speaker_id, None);
+    assert_eq!(db.get_segment_by_id("rediar-garbage").unwrap().unwrap().speaker_id, None);
+}
+
+#[test]
+fn source_audio_identity_hashes_bytes_and_fails_closed_on_a_missing_file() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let file = dir.path().join("source.bin");
+    std::fs::write(&file, b"stable source bytes").unwrap();
+
+    let identity = super::source_audio_identity(&file).unwrap();
+    assert_eq!(identity.size_bytes, 19);
+    assert_eq!(identity.content_hash.len(), 64);
+    assert!(identity.content_hash.bytes().all(|b| b.is_ascii_hexdigit()));
+    let again = super::source_audio_identity(&file).unwrap();
+    assert_eq!(again.content_hash, identity.content_hash, "the identity must be content-deterministic");
+
+    assert!(super::source_audio_identity(&dir.path().join("absent.bin")).is_err());
+}
+
+#[test]
+fn loop0_firing_passes_through_blank_text_and_memoryless_libraries() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::open(dir.path().join("loop0.sqlite").to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    // Enabled but blank: nothing to correct, exact pass-through without a memory load.
+    assert_eq!(super::apply_loop0_firing(true, &db, "   "), "   ");
+    // Enabled with an empty correction library: the Ok(empty) arm returns the input untouched.
+    let text = "ئەو ساڵە باش بوو";
+    assert_eq!(super::apply_loop0_firing(true, &db, text), text);
+}
+
+#[test]
+fn wsl_result_parser_rejects_ambiguous_or_malformed_identity_payloads() {
+    let sha = "a".repeat(64);
+    let line = format!(
+        "__RESULT__={{\"raw_transcript\":\"دەق\",\"confidence\":0.5,\"model_version_id\":\"champ-1\",\"deployment_sha256\":\"{sha}\"}}"
+    );
+
+    // Two result lines make the model identity ambiguous.
+    let error = super::parse_wsl_segment_result(&format!("{line}\n{line}")).unwrap_err().to_string();
+    assert!(error.contains("multiple __RESULT__ lines"), "{error}");
+
+    // A path-metacharacter model id must be refused at the identifier boundary.
+    let bad_id = line.replace("champ-1", "champ/../1");
+    assert!(super::parse_wsl_segment_result(&bad_id).is_err());
+
+    // A non-canonical deployment digest is not an identity.
+    let bad_sha = line.replace(&sha, &"Z".repeat(64));
+    let error = super::parse_wsl_segment_result(&bad_sha).unwrap_err().to_string();
+    assert!(error.contains("canonical deployment SHA-256"), "{error}");
+
+    // An over-bound transcript must be refused before persistence.
+    let oversized = format!(
+        "__RESULT__={{\"raw_transcript\":\"{}\",\"confidence\":null,\"model_version_id\":\"champ-1\",\"deployment_sha256\":\"{sha}\"}}",
+        "x".repeat(100_001)
+    );
+    let error = super::parse_wsl_segment_result(&oversized).unwrap_err().to_string();
+    assert!(error.contains("100,000-byte"), "{error}");
+}
+
+#[test]
+fn wsl_result_parser_clamps_and_filters_confidence() {
+    let sha = "a".repeat(64);
+    let over = format!(
+        "__RESULT__={{\"raw_transcript\":\"دەق\",\"confidence\":1.5,\"model_version_id\":\"champ-1\",\"deployment_sha256\":\"{sha}\"}}"
+    );
+    assert_eq!(super::parse_wsl_segment_result(&over).unwrap().confidence, Some(1.0), "confidence clamps to [0,1]");
+    let negative = over.replace("1.5", "-0.25");
+    assert_eq!(super::parse_wsl_segment_result(&negative).unwrap().confidence, Some(0.0));
+    let null = over.replace("1.5", "null");
+    assert_eq!(super::parse_wsl_segment_result(&null).unwrap().confidence, None, "absent confidence stays absent");
+}

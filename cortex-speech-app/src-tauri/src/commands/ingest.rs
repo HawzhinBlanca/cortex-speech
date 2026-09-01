@@ -2265,3 +2265,140 @@ mod typed_batch_halt_classification_tests {
         }
     }
 }
+
+// State-taking ingest command coverage through the shared MockRuntime harness (test_support).
+#[cfg(test)]
+mod state_ingest_command_harness_tests {
+    use super::*;
+    use crate::test_support::managed_app_state;
+
+    #[test]
+    fn get_import_run_status_reconciles_every_admission_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let harness = app.state::<AppState>();
+
+        let invalid = get_import_run_status("not-a-run".to_string(), app.state())
+            .expect_err("a non-canonical run identity must refuse");
+        assert_eq!(invalid.code, "INVALID_IMPORT_RUN_ID");
+
+        let unseen = "00000000-0000-4000-8000-0000000000aa".to_string();
+        let status = get_import_run_status(unseen.clone(), app.state()).expect("unseen run status");
+        assert_eq!(status, ImportRunStatusResponseV1 { run_id: unseen, status: ImportRunStatusV1::Unknown });
+
+        let rejected = "00000000-0000-4000-8000-0000000000ab".to_string();
+        harness.remember_import_rejection(&rejected);
+        let status = get_import_run_status(rejected.clone(), app.state()).expect("rejected run status");
+        assert_eq!(status.status, ImportRunStatusV1::Rejected);
+
+        let live = "00000000-0000-4000-8000-0000000000ac".to_string();
+        harness.try_start_import_for_run(&live).expect("claim the import gate for a live run");
+        let status = get_import_run_status(live.clone(), app.state()).expect("running run status");
+        assert_eq!(status.status, ImportRunStatusV1::Running, "a claimed run must never read as unknown");
+        harness.finish_import();
+        let status = get_import_run_status(live, app.state()).expect("settled run status");
+        assert_eq!(status.status, ImportRunStatusV1::Settled);
+    }
+
+    #[test]
+    fn interrupted_import_recovery_serves_discards_and_refuses_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let harness = app.state::<AppState>();
+
+        assert!(
+            get_interrupted_import(app.state()).expect("fresh library").is_none(),
+            "no journal exists yet, so there is nothing to recover"
+        );
+
+        let import_dir = tmp.path().join("import-source");
+        std::fs::create_dir_all(&import_dir).unwrap();
+        let journal_id =
+            harness.job_store().begin_import(&import_dir.to_string_lossy(), 2).expect("open a durable import journal");
+        harness
+            .job_store()
+            .mark_import_file_done(&journal_id, "C:/fixtures/first.wav")
+            .expect("record one completed file");
+
+        let offered = get_interrupted_import(app.state())
+            .expect("read the crashed journal")
+            .expect("a running journal with no live worker is a crash to offer");
+        assert_eq!(offered.id, journal_id);
+        assert_eq!(offered.total_files, 2);
+        assert_eq!(offered.completed_count, 1, "progress must reflect the durable per-file journal");
+
+        let invalid = discard_interrupted_import("bad id".to_string(), app.state())
+            .expect_err("a malformed journal identity must refuse");
+        assert_eq!(invalid.code, "INVALID_IMPORT_JOB_ID");
+
+        let changed = discard_interrupted_import("import-job-mismatch".to_string(), app.state())
+            .expect_err("a stale journal identity must not delete the live successor");
+        assert_eq!(changed.code, "IMPORT_JOB_CHANGED");
+
+        discard_interrupted_import(journal_id.clone(), app.state()).expect("exact-identity discard");
+        assert!(get_interrupted_import(app.state()).expect("after discard").is_none());
+
+        let gone = discard_interrupted_import(journal_id, app.state())
+            .expect_err("discarding an already-discarded journal must say so");
+        assert_eq!(gone.code, "NO_INTERRUPTED_IMPORT");
+
+        // While an import worker owns the gate, recovery reads serve None and discards refuse —
+        // the live successor can be neither advertised nor deleted.
+        let running = "00000000-0000-4000-8000-0000000000ad".to_string();
+        harness.try_start_import_for_run(&running).expect("claim the import gate");
+        assert!(
+            get_interrupted_import(app.state()).expect("recovery read during a live import").is_none(),
+            "a running import's journal belongs to the worker, never to the recovery prompt"
+        );
+        let busy = discard_interrupted_import("import-job-any".to_string(), app.state())
+            .expect_err("discard during a live import must refuse");
+        assert_eq!(busy.code, "IMPORT_IN_PROGRESS");
+        harness.finish_import();
+    }
+
+    #[test]
+    fn app_health_serves_the_typed_workspace_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+
+        let health = app_health(app.state()).expect("health snapshot");
+
+        assert_eq!(health.segment_count, 0);
+        assert!(health.db_size > 0, "a migrated database file is never empty");
+        assert!(
+            health.status == "ok" || health.status == "models_needed",
+            "health status is a closed vocabulary, got {:?}",
+            health.status
+        );
+        if !health.missing_models.is_empty() {
+            assert_eq!(health.status, "models_needed", "missing required models must degrade the status");
+        }
+        assert!(health.primary_asr_model.contains("WSL7B"), "the champion engine is the shipped default");
+    }
+
+    #[test]
+    fn normalize_text_normalizes_sorani_through_the_typed_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let harness = app.state::<AppState>();
+
+        let input = "سلاو  جیهان ١٢".to_string();
+        let served = normalize_text(input.clone(), app.state()).expect("normalize real Sorani text");
+        let expected = {
+            let settings = harness.lock_settings();
+            crate::normalizer::SoraniNormalizer::with_config(crate::normalizer::NormalizationConfig {
+                normalize_numbers: settings.auto_normalize,
+                verbalize_numbers: settings.verbalize_numbers,
+                normalize_hamza: true,
+                remove_diacritics: false,
+            })
+            .normalize(&input)
+        };
+        assert_eq!(served, expected, "the command must serve exactly the configured production normalization");
+        assert!(!served.trim().is_empty());
+
+        let refused = normalize_text("ک".repeat(100_001), app.state())
+            .expect_err("input beyond the character budget must refuse");
+        assert_eq!(refused.code, "INVALID_NORMALIZATION_TEXT");
+    }
+}

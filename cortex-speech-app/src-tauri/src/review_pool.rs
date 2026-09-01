@@ -4002,4 +4002,125 @@ mod tests {
             "a proven duplicate must leave export scope the moment it leaves review scope"
         );
     }
+
+    /// Disk-backed sibling of `one_clip_pool` for tests that roll the schema back and forth: the
+    /// canonical clip is already reviewed by Sara, exactly one voice, one recording.
+    fn disk_one_clip_pool(pool_uuid: &str, first_text: &str) -> (tempfile::TempDir, Database, ReviewPool) {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("clip.wav");
+        std::fs::write(&audio, b"wav").unwrap();
+        let db = Database::open(dir.path().join("pool-fixture.db").to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        seed_champion(&db);
+        rollback_fixture_to(&db, 59);
+        db.insert_segment_full(&reviewed_segment("clip", &audio, "Sara", first_text)).unwrap();
+        upgrade_fixture_from(&db, 59);
+        db.connection()
+            .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='clip'", ["a".repeat(64)])
+            .unwrap();
+        let pool =
+            activate(&db, pool_uuid, &[PoolMemberInput { segment_id: "clip".into(), voice_name: "Lamo".into() }])
+                .unwrap();
+        (dir, db, pool)
+    }
+
+    #[test]
+    fn rights_coverage_buckets_track_every_rights_state_and_mint_a_digest_only_when_all_exact() {
+        let (dir, db, _pool) = disk_one_clip_pool("123e4567-e89b-42d3-a456-4266141740a0", "دەقی دروست");
+        let shared_source = dir.path().join("clip.wav");
+        db.insert_segment_full(&segment("conflict-shadow", &shared_source, None)).unwrap();
+        db.insert_segment_full(&segment("revoked-shadow", &shared_source, None)).unwrap();
+        db.connection()
+            .execute("UPDATE speech_segments SET rights_license='third-party-license' WHERE id='conflict-shadow'", [])
+            .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET rights_revoked_at='2026-08-30T00:00:00Z' WHERE id='revoked-shadow'",
+                [],
+            )
+            .unwrap();
+
+        let mixed = rights_coverage(&db).unwrap();
+        assert_eq!(mixed.recordings, 1, "all three rows share one source recording");
+        assert_eq!(mixed.segment_rows, 3);
+        assert_eq!(mixed.unstamped_rows, 1, "the pool member itself is still blank");
+        assert_eq!(mixed.conflicting_rows, 1);
+        assert_eq!(mixed.revoked_rows, 1);
+        assert_eq!(mixed.exact_rows, 0);
+        assert!(!mixed.all_exact);
+        assert!(mixed.rights_sha256.is_none(), "a mixed recording never earns a rights digest");
+
+        db.connection()
+            .execute("UPDATE speech_segments SET rights_license=NULL WHERE id='conflict-shadow'", [])
+            .unwrap();
+        db.connection()
+            .execute("UPDATE speech_segments SET rights_revoked_at=NULL WHERE id='revoked-shadow'", [])
+            .unwrap();
+        let report = stamp_owner_supplied_pool_rights(&db).unwrap();
+        assert_eq!((report.recordings, report.segments), (1, 3));
+        assert_eq!((report.stamped_recordings, report.already_exact_recordings), (1, 0));
+
+        let exact = rights_coverage(&db).unwrap();
+        assert_eq!(exact.exact_rows, 3);
+        assert_eq!((exact.unstamped_rows, exact.conflicting_rows, exact.revoked_rows), (0, 0, 0));
+        assert!(exact.all_exact);
+        assert_eq!(
+            exact.rights_sha256.as_deref(),
+            Some(report.rights_sha256.as_str()),
+            "the coverage digest and the stamping receipt are the same authority"
+        );
+    }
+
+    #[test]
+    fn schema_62_pool_revalidates_but_refuses_serving_and_63_only_authority() {
+        let (_dir, db, pool) = disk_one_clip_pool("123e4567-e89b-42d3-a456-4266141740a1", "دەقی دروست");
+        rollback_fixture_to(&db, 62);
+
+        let reloaded = load(&db).unwrap().expect("a schema-62 pool is fully loadable");
+        assert_eq!(reloaded, pool, "the pre-dedup load path reproduces the exact bound pool");
+        assert!(registry_matches(&db, &pool).unwrap(), "the pre-dedup registry branch revalidates the bound pool");
+        let mut drifted = pool.clone();
+        drifted.dedup_manifest_sha256 = Some("b".repeat(64));
+        assert!(!registry_matches(&db, &drifted).unwrap(), "schema 62 can never carry a dedup binding");
+        let mut shrunk = pool.clone();
+        shrunk.review_segment_count = 0;
+        shrunk.excluded_duplicate_count = 1;
+        assert!(!registry_matches(&db, &shrunk).unwrap());
+
+        // The modern queue's duplicate-exclusion clause names a v64 table, so serving at schema 62
+        // fails closed at prepare time — but only AFTER the pre-dedup registry proof above passed,
+        // which is exactly the branch this schema window exists for.
+        let queue_error = pending_segment_ids(&db, &pool, "Hemn", None).unwrap_err();
+        assert!(queue_error.contains("review pool queue cannot be prepared"), "unexpected refusal: {queue_error}");
+        pool.verify_audio_available("clip").unwrap();
+        assert!(pool.segment_ids().contains("clip"));
+        assert_eq!(pool.voice_for("clip"), Some("Lamo"));
+        assert_eq!(pool.voice_for("ghost"), None);
+        let resolutions = segment_resolutions(&db, None).unwrap();
+        assert_eq!(resolutions[0].status, "pending", "one opinion stays pending with owner authority absent");
+        assert_eq!(resolutions[0].reviewer_count, 1);
+
+        assert_eq!(
+            stamp_owner_supplied_pool_rights(&db).unwrap_err(),
+            "owner rights stamping requires review-pool schema 63"
+        );
+        assert!(voice_certificate(&db, "Lamo").unwrap().is_none(), "certificates do not exist below schema 63");
+        assert_eq!(
+            record_owner_adjudication(
+                &db,
+                &pool,
+                &OwnerAdjudicationInput {
+                    segment_id: "clip",
+                    final_action: "reject",
+                    final_transcript: None,
+                    operation_id: "123e4567-e89b-42d3-a456-4266141740a9",
+                    created_at_ms: 1,
+                },
+            )
+            .unwrap_err(),
+            "owner adjudication requires review-pool schema 63"
+        );
+        assert!(latest_decision(&db, &pool.pool_id, "Hemn").unwrap().is_none());
+        assert!(operation(&db, "123e4567-e89b-42d3-a456-4266141740aa").unwrap().is_none());
+    }
 }

@@ -2603,4 +2603,555 @@ mod tests {
         let error = validate_review_effect_semantics(&db).unwrap_err();
         assert!(error.contains("exceed retained history"), "{error}");
     }
+
+    // ── Wave-4 branch coverage. File-backed databases (tempfile, never :memory:) so these fixtures
+    // exercise the same open/journal path a restored file does. Every forgery drops the schema
+    // guards first (the restored-file threat model, as above) and each test corrupts ONE thing.
+
+    fn file_seeded_db(dir: &tempfile::TempDir, id: &str) -> Database {
+        let path = dir.path().join(format!("{id}.db"));
+        let db = Database::open(path.to_string_lossy().as_ref()).unwrap();
+        db.initialize().unwrap();
+        paid_segment(&db, id);
+        db
+    }
+
+    /// A real phone ACCEPT through the production API (the existing `decided` helper is an edit).
+    fn accepted(db: &Database, id: &str, index: u64) -> i64 {
+        let revision = db.segment_review_revision(id).unwrap().unwrap();
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            id,
+            "accept",
+            Some("machine draft"),
+            "Reviewer",
+            revision,
+            &canonical_operation(index),
+            &crate::db::review_operation_payload_hash(id, "accept", "machine draft", "Reviewer"),
+        )
+        .unwrap()
+        .unwrap();
+        db.connection().query_row("SELECT MAX(id) FROM human_decision_effect_events", [], |row| row.get(0)).unwrap()
+    }
+
+    /// A real review flag through the production API, returning its effect id.
+    fn flagged(db: &Database, id: &str, rationale: &str, index: u64) -> i64 {
+        let revision = db.segment_review_revision(id).unwrap().unwrap();
+        db.record_review_flag(id, revision, rationale, &canonical_operation(index)).unwrap().effect_event_id
+    }
+
+    #[test]
+    fn mixed_decision_flag_chains_built_by_production_apis_are_valid_restore_targets() {
+        // Every producible mutation-pair window in one database:
+        //  * flag → decision (deciding an escalated clip clears the flag),
+        //  * reversed decision → flag (flagging is legal again once the decision is undone),
+        //  * reversed flag → flag (a second flag after an undo).
+        // Production refuses flagging a segment holding a live human decision, so the
+        // (active-decision → flag) window cannot exist in a genuine file.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "chain-fd");
+        paid_segment(&db, "chain-df");
+        paid_segment(&db, "chain-ff");
+        // Distinct audio identities: identical hashes would fuse the segments' canonical work ids,
+        // and the undo path resolves its reversal target per work id, not per segment.
+        db.connection()
+            .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='chain-df'", [&"b".repeat(64)])
+            .unwrap();
+        db.connection()
+            .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='chain-ff'", [&"c".repeat(64)])
+            .unwrap();
+
+        flagged(&db, "chain-fd", "needs another listen", 500);
+        accepted(&db, "chain-fd", 501);
+
+        let undone_decision = decided(&db, "chain-df", 502);
+        assert!(matches!(
+            db.undo_human_decision(undone_decision, Some("Reviewer"), &canonical_operation(503)).unwrap(),
+            crate::db::HumanDecisionUndoOutcome::Applied { .. }
+        ));
+        flagged(&db, "chain-df", "second look after undo", 504);
+
+        let first_flag = flagged(&db, "chain-ff", "first flag", 505);
+        assert!(matches!(
+            db.undo_review_flag(first_flag, &canonical_operation(506)).unwrap(),
+            crate::db::HumanFlagUndoOutcome::Applied { .. }
+        ));
+        flagged(&db, "chain-ff", "second flag", 507);
+
+        let flag_reversals: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM review_flag_effect_reversals", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(flag_reversals, 1, "the fixture must contain a genuine flag reversal");
+        validate_review_effect_semantics(&db)
+            .expect("every chain producible by the production decision/flag/undo APIs must restore");
+    }
+
+    #[test]
+    fn a_segment_that_drifts_from_its_latest_active_or_reversed_effect_is_refused() {
+        // Each case sabotages the SEGMENT (not the effect journal) in a field the stable-state
+        // replay does not carry, so the refusal that fires is the terminal latest-effect check.
+        // Active decision: verdict is latest-arm-only state.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "drift-decision");
+        decided(&db, "drift-decision", 510);
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_table(&db, "speech_segments");
+        db.connection().execute("UPDATE speech_segments SET verdict='human_reject'", []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("disagrees with its latest active human-decision effect"), "{error}");
+
+        // Active flag: escalated is latest-arm-only state.
+        let db = file_seeded_db(&dir, "drift-flag");
+        flagged(&db, "drift-flag", "needs another listen", 511);
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_table(&db, "speech_segments");
+        db.connection().execute("UPDATE speech_segments SET escalated=0", []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("disagrees with its latest active review-flag effect"), "{error}");
+
+        // Reversed decision: the segment must show the exact restored prior snapshot.
+        let db = file_seeded_db(&dir, "drift-undone");
+        decided_then_undone(&db, "drift-undone", 512, 513);
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_table(&db, "speech_segments");
+        db.connection().execute("UPDATE speech_segments SET verdict='human_edit'", []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("does not reflect human-decision reversal"), "{error}");
+
+        // Reversed flag: same restored-prior contract on the flag side.
+        let db = file_seeded_db(&dir, "drift-unflagged");
+        let flag_effect = flagged(&db, "drift-unflagged", "needs another listen", 514);
+        assert!(matches!(
+            db.undo_review_flag(flag_effect, &canonical_operation(515)).unwrap(),
+            crate::db::HumanFlagUndoOutcome::Applied { .. }
+        ));
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_table(&db, "speech_segments");
+        db.connection().execute("UPDATE speech_segments SET escalated=1", []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("does not reflect review-flag reversal"), "{error}");
+
+        // A segment revision behind its own effect history is refused before any field compare.
+        let db = file_seeded_db(&dir, "drift-revision");
+        decided(&db, "drift-revision", 516);
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_table(&db, "speech_segments");
+        db.connection().execute("UPDATE speech_segments SET review_revision=0", []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("predates its latest review-effect revision"), "{error}");
+    }
+
+    #[test]
+    fn a_chain_starting_from_unsnapshotted_human_truth_is_refused() {
+        // Without a legacy_reviewed_segments_v60 row, a chain whose FIRST mutation claims a prior
+        // human state (verified work, an escalation) is laundering review truth that was never
+        // snapshotted. Decision side: prior_verified forged to 1.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "unbound-decision");
+        decided(&db, "unbound-decision", 520);
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_effects(&db);
+        db.connection().execute("UPDATE human_decision_effect_events SET prior_verified=1", []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("starts from unsnapshotted human review truth"), "{error}");
+
+        // Flag side: a first flag claiming the segment was already escalated.
+        let db = file_seeded_db(&dir, "unbound-flag");
+        flagged(&db, "unbound-flag", "needs another listen", 521);
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_table(&db, "review_flag_effect_events");
+        db.connection().execute("UPDATE review_flag_effect_events SET prior_verdict='escalated'", []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("starts from unsnapshotted human review truth"), "{error}");
+    }
+
+    #[test]
+    fn forged_prior_snapshots_between_chained_mutations_are_refused() {
+        // Two production decisions (accept then edit) whose journal is then edited in exactly one
+        // chain-order field per case. These fields are outside the per-effect identity and pay
+        // checks, so the refusal that fires is the chain-continuity guard under test.
+        let sabotage_latest = |db: &Database, set: &str| {
+            unlock_effects(db);
+            assert_eq!(
+                db.connection()
+                    .execute(
+                        &format!(
+                            "UPDATE human_decision_effect_events SET {set}
+                              WHERE id = (SELECT MAX(id) FROM human_decision_effect_events)"
+                        ),
+                        [],
+                    )
+                    .unwrap(),
+                1
+            );
+        };
+
+        // (Decision, Decision): the second effect's prior_verdict must be the first's terminal verdict.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "forged-window");
+        accepted(&db, "forged-window", 530);
+        decided(&db, "forged-window", 531);
+        validate_review_effect_semantics(&db).unwrap();
+        sabotage_latest(&db, "prior_verdict='human_reject'");
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("forged or discontinuous prior snapshot"), "{error}");
+
+        // Stable human fields (corrected_at) may not drift between mutations either.
+        let db = file_seeded_db(&dir, "forged-stable");
+        accepted(&db, "forged-stable", 532);
+        decided(&db, "forged-stable", 533);
+        validate_review_effect_semantics(&db).unwrap();
+        sabotage_latest(&db, "prior_corrected_at='1999-01-01 00:00:00'");
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("changes human transcript/verification fields"), "{error}");
+
+        // Flag then decision: the decision's rationale snapshot must carry the flag's rationale.
+        let db = file_seeded_db(&dir, "forged-rationale");
+        flagged(&db, "forged-rationale", "needs another listen", 534);
+        accepted(&db, "forged-rationale", 535);
+        validate_review_effect_semantics(&db).unwrap();
+        sabotage_latest(&db, "prior_rationale='forged', decision_rationale='forged'");
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("changes rationale across a human decision"), "{error}");
+
+        // Reversed flag then flag: the second flag's rationale prior-state must be continuous.
+        let db = file_seeded_db(&dir, "forged-flag-prior");
+        let first_flag = flagged(&db, "forged-flag-prior", "first flag", 536);
+        assert!(matches!(
+            db.undo_review_flag(first_flag, &canonical_operation(537)).unwrap(),
+            crate::db::HumanFlagUndoOutcome::Applied { .. }
+        ));
+        flagged(&db, "forged-flag-prior", "second flag", 538);
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_table(&db, "review_flag_effect_events");
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "UPDATE review_flag_effect_events SET prior_rationale='forged'
+                      WHERE id = (SELECT MAX(id) FROM review_flag_effect_events)",
+                    [],
+                )
+                .unwrap(),
+            1
+        );
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("forged flag rationale prior-state"), "{error}");
+    }
+
+    #[test]
+    fn effect_history_for_a_deleted_segment_is_refused() {
+        // Policy: reviewed-segment deletion is forbidden while immutable effect history remains. A
+        // flag-only fixture reaches the chain baseline read (an edit would be caught earlier by its
+        // learning-row provenance, which also reads the segment).
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "deleted-clip");
+        flagged(&db, "deleted-clip", "needs another listen", 540);
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_table(&db, "speech_segments");
+        assert_eq!(db.connection().execute("DELETE FROM speech_segments WHERE id='deleted-clip'", []).unwrap(), 1);
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("review-effect segment deleted-clip is missing"), "{error}");
+    }
+
+    fn install_legacy_reviewed_row(db: &Database, rowid: i64, id: &str, reviewed: bool) {
+        unlock_table(db, "legacy_reviewed_segments_v60");
+        let (verified, revision, decision, verdict, transcript, reviewer, corrected): (
+            i64,
+            i64,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+        ) = if reviewed {
+            (
+                1,
+                3,
+                Some("accept"),
+                Some("human_accept"),
+                Some("machine draft"),
+                Some("Reviewer"),
+                Some("2026-08-29 00:00:00"),
+            )
+        } else {
+            (0, 0, None, None, None, None, None)
+        };
+        db.connection()
+            .execute(
+                "INSERT INTO legacy_reviewed_segments_v60
+                    (original_rowid, id, duration_ms, human_decision, verdict, verdict_transcript,
+                     annotated_transcript, verified, reviewed_by, corrected_at, review_revision,
+                     escalated, is_gold, rationale)
+                 VALUES (?1, ?2, 1000, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, 0, 0, NULL)",
+                rusqlite::params![rowid, id, decision, verdict, transcript, verified, reviewer, corrected, revision],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn current_reviewed_rows_need_legacy_authority_or_an_effect_chain() {
+        // The exhaustive current-row scan: a segment advertising human review with NO effect chain
+        // must be explained by the immutable pre-v60 snapshot, exactly.
+        let reviewed_segment_update = "UPDATE speech_segments
+                SET verified=1, human_decision='accept', verdict='human_accept',
+                    verdict_transcript='machine draft', annotated_transcript='machine draft',
+                    reviewed_by='Reviewer', corrected_at='2026-08-29 00:00:00', review_revision=3
+              WHERE id='legacy-clip'";
+
+        // No legacy row: refused outright.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "legacy-clip");
+        unlock_table(&db, "speech_segments");
+        db.connection().execute(reviewed_segment_update, []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("has neither immutable legacy authority nor a schema-v60 effect chain"), "{error}");
+
+        // An exactly matching legacy row makes the same state a valid restore target.
+        install_legacy_reviewed_row(&db, 4242, "legacy-clip", true);
+        validate_review_effect_semantics(&db)
+            .expect("a reviewed row with its exact immutable pre-v60 authority must restore");
+
+        // Any drift from the immutable terminal state is refused.
+        db.connection().execute("UPDATE legacy_reviewed_segments_v60 SET verified=0", []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("disagrees with its immutable pre-v60 terminal state"), "{error}");
+    }
+
+    #[test]
+    fn a_chain_over_a_legacy_segment_must_start_from_the_snapshotted_state() {
+        // A pre-v60 pristine snapshot row plus a genuine production decision on top: valid. The
+        // same chain is refused once the immutable snapshot no longer matches the chain's start.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "legacy-chain");
+        install_legacy_reviewed_row(&db, 4243, "legacy-chain", false);
+        decided(&db, "legacy-chain", 550);
+        validate_review_effect_semantics(&db).expect("a decision chained onto its exact pre-v60 snapshot must restore");
+
+        db.connection().execute("UPDATE legacy_reviewed_segments_v60 SET escalated=1", []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("does not start from its immutable pre-v60 reviewed state"), "{error}");
+    }
+
+    /// Insert a desktop effect row with an explicit contract/authority/hash shape (the existing
+    /// helper is fixed to the typed v1 contract). Advances the segment like a real write.
+    fn insert_desktop_effect_shape(
+        db: &Database,
+        id: &str,
+        contract: Option<i64>,
+        authority: Option<&str>,
+        requested_transcript: &str,
+        hash: &str,
+    ) {
+        let prior_revision = db.segment_review_revision(id).unwrap().unwrap();
+        db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+        for trigger in [
+            "human_decision_effect_events_validate_review_event_insert",
+            "human_decision_effect_events_immutable_update",
+            "human_decision_effect_events_v67_policy4_validate_insert",
+        ] {
+            db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).ok();
+        }
+        db.connection()
+            .execute(
+                "INSERT INTO human_decision_effect_events
+                    (review_event_id, segment_id, reviewer, source, action,
+                     served_transcript, decision_transcript, decision_annotated_transcript,
+                     decision_verified, decision_corrected_at,
+                     prior_revision, decision_revision, prior_verified, prior_escalated,
+                     operation_id, operation_payload_hash, requested_action, requested_transcript,
+                     requested_timestamp_ms, desktop_review_contract_version,
+                     playback_authority_session_id)
+                 VALUES (NULL, ?1, NULL, 'desktop', 'edit',
+                         'machine draft', 'desktop corrected', 'desktop corrected', 1,
+                         '2026-08-29 00:00:00', ?2, ?2 + 1, 0, 0,
+                         ?3, ?4, 'edit', ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    id,
+                    prior_revision,
+                    canonical_operation(560),
+                    hash,
+                    requested_transcript,
+                    1_700_000_000_000_i64,
+                    contract,
+                    authority,
+                ],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET review_revision = ?2 + 1, verified = 1, human_decision = 'edit',
+                        annotated_transcript = 'desktop corrected', verdict = 'human_edit',
+                        verdict_transcript = 'desktop corrected', corrected_at = '2026-08-29 00:00:00'
+                  WHERE id = ?1",
+                rusqlite::params![id, prior_revision],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_legacy_contract_desktop_review_validates_and_padded_request_text_is_refused() {
+        // The retired legacy desktop command's rows (contract version NULL) keep the old digest
+        // formula; teaching the validator the typed v1 contract must not have orphaned them.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "legacy-desktop");
+        let legacy_hash = crate::db::desktop_decision_payload_hash(
+            "legacy-desktop",
+            "edit",
+            Some("desktop corrected"),
+            Some(1_700_000_000_000),
+        );
+        insert_desktop_effect_shape(&db, "legacy-desktop", None, None, "desktop corrected", &legacy_hash);
+        validate_review_effect_semantics(&db)
+            .expect("a legacy-contract desktop decision with its exact legacy digest must restore");
+
+        // Non-canonical (padded) requested text is refused whatever digest the row carries.
+        let db = file_seeded_db(&dir, "padded-desktop");
+        let padded_hash = crate::db::desktop_decision_payload_hash(
+            "padded-desktop",
+            "edit",
+            Some("  desktop corrected  "),
+            Some(1_700_000_000_000),
+        );
+        insert_desktop_effect_shape(&db, "padded-desktop", None, None, "  desktop corrected  ", &padded_hash);
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("outside the exact anonymous desktop operation boundary"), "{error}");
+    }
+
+    #[test]
+    fn an_event_payload_hash_that_does_not_answer_its_content_is_refused() {
+        // A canonical-looking 64-hex digest that is not the recomputed payload hash means the event
+        // no longer proves what was requested — distinct from the malformed-hash case above.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "hash-clip");
+        decided(&db, "hash-clip", 570);
+        validate_review_effect_semantics(&db).unwrap();
+        for trigger in [
+            "review_events_v60_post_cutoff_immutable_update",
+            "review_events_v60_provenance_immutable_update",
+            "review_event_operation_immutable_update",
+        ] {
+            db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).ok();
+        }
+        let changed = db
+            .connection()
+            .execute(&format!("UPDATE review_events SET operation_payload_hash='{}'", "a".repeat(64)), [])
+            .unwrap();
+        assert_eq!(changed, 1, "the corruption must apply, or this test proves nothing");
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("lacks canonical Couch/build/playback provenance"), "{error}");
+    }
+
+    #[test]
+    fn effect_bound_learning_rows_must_be_owned_and_singular() {
+        // One decision effect owns at most one correction.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(&dir, "learning-clip");
+        decided(&db, "learning-clip", 580);
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_table(&db, "corrections");
+        db.connection().execute("DROP INDEX IF EXISTS idx_corrections_one_per_effect_event", []).unwrap();
+        let inserted = db
+            .connection()
+            .execute(
+                "INSERT INTO corrections
+                    (id, segment_id, audio_content_hash, raw_hypothesis, human_fix,
+                     model_version_id, reviewer_id, effect_event_id)
+                 SELECT ?1, segment_id, audio_content_hash, raw_hypothesis, human_fix,
+                        model_version_id, reviewer_id, effect_event_id
+                   FROM corrections WHERE effect_event_id IS NOT NULL LIMIT 1",
+                [canonical_operation(581)],
+            )
+            .unwrap();
+        assert_eq!(inserted, 1, "the edit fixture must have minted a correction to duplicate");
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("owns more than one correction"), "{error}");
+
+        // An example repointed at a nonexistent effect is orphaned provenance.
+        let db = file_seeded_db(&dir, "orphan-example");
+        decided(&db, "orphan-example", 582);
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_table(&db, "agent_examples");
+        let repointed = db.connection().execute("UPDATE agent_examples SET effect_event_id = 999999", []).unwrap();
+        assert_eq!(repointed, 1, "the edit fixture must have minted an agent example");
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("names a missing decision effect"), "{error}");
+
+        // A post-v60 unbound row cannot claim human provenance outside the legacy snapshot.
+        let db = file_seeded_db(&dir, "forged-unbound");
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_table(&db, "agent_examples");
+        db.connection()
+            .execute(
+                "INSERT INTO agent_examples
+                    (id, segment_id, wrong_transcript, human_fix, source, verified_by_human, effect_event_id)
+                 VALUES (?1, 'forged-unbound', 'wrong words', 'right words', 'human', 1, NULL)",
+                [canonical_operation(583)],
+            )
+            .unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("cannot claim human agent-example provenance"), "{error}");
+    }
+
+    #[test]
+    fn correction_memory_rows_must_re_derive_their_capture_identity() {
+        // The edit fixture ("machine draft" → "corrected text") mints substitution memories with a
+        // zero baseline plus one capture contribution each. Each case breaks one identity clause.
+        let fixture = |id: &str, index: u64| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = file_seeded_db(&dir, id);
+            decided(&db, id, index);
+            validate_review_effect_semantics(&db).unwrap();
+            let memories: i64 =
+                db.connection().query_row("SELECT COUNT(*) FROM correction_memory", [], |row| row.get(0)).unwrap();
+            assert!(memories > 0, "the edit fixture must mint at least one substitution memory");
+            unlock_table(&db, "correction_memory");
+            unlock_table(&db, "correction_memory_contributions");
+            (dir, db)
+        };
+
+        let (_dir, db) = fixture("memory-legacy", 590);
+        db.connection().execute("UPDATE correction_memory SET legacy_seed=2", []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("invalid legacy boundary"), "{error}");
+
+        let (_dir, db) = fixture("memory-baseline", 591);
+        db.connection().execute("UPDATE correction_memory SET hit_count=1", []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("lacks its zero-baseline capture identity"), "{error}");
+
+        // A capture whose contribution rows vanished has no lineage at all.
+        let (_dir, db) = fixture("memory-lineage", 592);
+        db.connection().execute("DELETE FROM correction_memory_contributions", []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("lacks its zero-baseline capture identity"), "{error}");
+
+        // A source segment differing from the first capture effect severs the origin.
+        let (_dir, db) = fixture("memory-origin", 593);
+        db.connection().execute("UPDATE correction_memory SET source_segment='another-clip'", []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("lacks its zero-baseline capture identity"), "{error}");
+
+        // Deleting one derived memory (and its contribution) leaves the edit under-derived.
+        let (_dir, db) = fixture("memory-missing", 594);
+        db.connection()
+            .execute(
+                "DELETE FROM correction_memory_contributions
+                  WHERE memory_id = (SELECT id FROM correction_memory ORDER BY id LIMIT 1)",
+                [],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "DELETE FROM correction_memory WHERE id = (SELECT id FROM correction_memory ORDER BY id LIMIT 1)",
+                [],
+            )
+            .unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(
+            error.contains("missing an exactly derived correction memory")
+                || error.contains("arbitrary or incomplete correction-memory captures"),
+            "removing a derived memory must be refused as an incomplete derivation: {error}"
+        );
+    }
 }

@@ -1533,4 +1533,178 @@ mod system_ops_boundary_tests {
         assert!(wire["model_load_ms"].as_f64().is_some());
         assert!(wire["vad"]["p50_ms"].as_f64().is_some());
     }
+
+    // ── Wave-4: State-backed system_ops commands through the MockRuntime harness ────────────────
+
+    /// A real, decodable 16 kHz mono WAV so command tests exercise the true decode path.
+    fn wav_fixture(dir: &std::path::Path, name: &str, samples: usize) -> String {
+        let path = dir.join(name);
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).expect("create wav fixture");
+        for index in 0..samples {
+            // A small square wave: real, non-silent PCM for the signal heuristics.
+            let value = if (index / 40) % 2 == 0 { 2_000_i16 } else { -2_000_i16 };
+            writer.write_sample(value).expect("write wav sample");
+        }
+        writer.finalize().expect("finalize wav fixture");
+        crate::test_support::await_stable_fixture(&path);
+        path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn import_model_checkpoint_refuses_hostile_inputs_and_never_registers_a_bare_7b_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = crate::test_support::managed_app_state(tmp.path());
+        let import = |id: &str, path: String| {
+            tauri::async_runtime::block_on(import_model_checkpoint(
+                id.to_string(),
+                path,
+                "owner-finetune".to_string(),
+                "Apache-2.0".to_string(),
+                None,
+                app.state(),
+            ))
+        };
+
+        // Identifier gate fires before any filesystem work and names its field.
+        let invalid_id = import("bad id", "C:/fixtures/checkpoint.bin".to_string()).expect_err("hostile id refused");
+        let invalid_id = serde_json::to_value(invalid_id).expect("serialize id refusal");
+        assert_eq!(invalid_id["code"], "INVALID_MODEL_IMPORT");
+        assert_eq!(invalid_id["details"]["field"], "id");
+
+        // A path that does not resolve is refused as the checkpointPath field, still pre-worker.
+        let missing = tmp.path().join("missing.ckpt").to_string_lossy().to_string();
+        let missing = import("cand-ckpt", missing).expect_err("nonexistent checkpoint path refused");
+        let missing = serde_json::to_value(missing).expect("serialize path refusal");
+        assert_eq!(missing["code"], "INVALID_MODEL_IMPORT");
+        assert_eq!(missing["details"]["field"], "checkpointPath");
+
+        // A resolvable directory reaches the worker, whose hash step refuses a non-file — the public
+        // error is the closed write-failure contract, never the private detail.
+        let dir_target = import("cand-ckpt", tmp.path().to_string_lossy().to_string())
+            .expect_err("a directory can never be hashed as a checkpoint");
+        assert_eq!(dir_target.code, "MODEL_CHECKPOINT_IMPORT_FAILED");
+        assert_eq!(dir_target.suggested_action, Some(crate::ipc_contract::SuggestedActionV1::OpenModels));
+
+        // A real file hashes server-side, then the registry refuses a bare 7B-family checkpoint:
+        // OmniASR-7B is a composite deployment and must arrive as a verified manifest.
+        let checkpoint = tmp.path().join("cand.ckpt");
+        std::fs::write(&checkpoint, b"real checkpoint fixture bytes").unwrap();
+        crate::test_support::await_stable_fixture(&checkpoint);
+        let refused = import("cand-ckpt", checkpoint.to_string_lossy().to_string())
+            .expect_err("a bare 7B checkpoint must never become a candidate");
+        assert_eq!(refused.code, "MODEL_CHECKPOINT_IMPORT_FAILED");
+        let harness = app.state::<AppState>();
+        assert!(
+            crate::registry::list_model_versions(&harness.lock_db()).expect("read registry").is_empty(),
+            "every refusal above must leave the registry untouched"
+        );
+    }
+
+    #[test]
+    fn get_speaker_inventory_v1_serves_null_and_named_speakers_distinctly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = crate::test_support::managed_app_state(tmp.path());
+
+        assert!(
+            get_speaker_inventory_v1(app.state()).expect("empty inventory").is_empty(),
+            "a fresh library has no speaker rows to report"
+        );
+
+        {
+            let harness = app.state::<AppState>();
+            let db = harness.lock_db();
+            let seed = |id: &str, speaker: Option<&str>, duration_ms: i64| {
+                db.insert_segment(&crate::db::SpeechSegment {
+                    id: id.to_string(),
+                    audio_path: format!("C:/fixtures/{id}.wav"),
+                    raw_transcript: "deng".to_string(),
+                    speaker_id: speaker.map(str::to_string),
+                    duration_ms,
+                    ..Default::default()
+                })
+                .expect("seed segment");
+            };
+            seed("seg-spk-1", Some("spk-a"), 1_000);
+            seed("seg-spk-2", Some("spk-a"), 2_000);
+            seed("seg-spk-3", None, 500);
+        }
+
+        let inventory = get_speaker_inventory_v1(app.state()).expect("seeded inventory");
+        assert_eq!(
+            inventory,
+            vec![
+                crate::ipc_contract::SpeakerInventoryItemV1 {
+                    speaker_id: Some("spk-a".to_string()),
+                    segment_count: 2,
+                    total_duration_seconds: 3.0,
+                },
+                crate::ipc_contract::SpeakerInventoryItemV1 {
+                    speaker_id: None,
+                    segment_count: 1,
+                    total_duration_seconds: 0.5,
+                },
+            ],
+            "busiest speaker first; SQL NULL stays distinct and lossless, never collapsed into a literal id"
+        );
+    }
+
+    #[test]
+    fn compute_signal_anomaly_scores_scores_real_audio_and_skips_missing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = crate::test_support::managed_app_state(tmp.path());
+        let real_audio = wav_fixture(tmp.path(), "anomaly-real.wav", 8_000);
+        {
+            let harness = app.state::<AppState>();
+            let db = harness.lock_db();
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: "seg-anomaly-real".to_string(),
+                audio_path: real_audio.clone(),
+                raw_transcript: "deng yek du".to_string(),
+                duration_ms: 500,
+                ..Default::default()
+            })
+            .expect("seed real segment");
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: "seg-anomaly-gone".to_string(),
+                audio_path: tmp.path().join("never-existed.wav").to_string_lossy().to_string(),
+                raw_transcript: "deng".to_string(),
+                duration_ms: 500,
+                ..Default::default()
+            })
+            .expect("seed missing-file segment");
+        }
+
+        let scored = tauri::async_runtime::block_on(compute_signal_anomaly_scores(app.state()))
+            .expect("signal-anomaly pass over the backlog");
+        assert_eq!(scored, 1, "exactly the decodable segment is scored; the missing file is skipped, not failed");
+
+        let harness = app.state::<AppState>();
+        let real_row = harness.lock_db().get_segment_by_id("seg-anomaly-real").unwrap().unwrap();
+        let score = real_row.signal_anomaly_score.expect("real audio earns a persisted score");
+        assert!((0.0..=1.0).contains(&score), "anomaly score out of range: {score}");
+        let gone_row = harness.lock_db().get_segment_by_id("seg-anomaly-gone").unwrap().unwrap();
+        assert_eq!(gone_row.signal_anomaly_score, None, "a skipped file must never receive an invented score");
+
+        // The P1.3 backlog contract: already-scored rows leave the pending set.
+        let second = tauri::async_runtime::block_on(compute_signal_anomaly_scores(app.state()))
+            .expect("second signal-anomaly pass");
+        assert_eq!(second, 0, "a drained backlog scores nothing new");
+    }
+
+    #[test]
+    fn compute_acoustic_scores_halts_honestly_when_the_aligner_is_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = crate::test_support::managed_app_state(tmp.path());
+        // The harness models dir is empty, so the CTC scorer must refuse rather than stamp
+        // energy-heuristic numbers as acoustic evidence.
+        let refused = tauri::async_runtime::block_on(compute_acoustic_scores(app.state()))
+            .expect_err("no aligner model means no acoustic scores");
+        assert_eq!(refused, "MMS Forced Aligner model (mms_aligner.onnx) is not available.");
+    }
 }

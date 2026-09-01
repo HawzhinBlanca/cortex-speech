@@ -1701,4 +1701,28 @@ mod tests {
             other => panic!("expected a spawn failure, got {other:?}"),
         }
     }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn job_object_construction_refuses_zero_containment_limits() {
+        // The Job Object's own belt-and-braces guards, below run_contained_command's spec checks:
+        // a zero ceiling would mean "unlimited" to nobody and misconfigured containment to everyone.
+        let Err(error) = KillOnCloseJob::new(Some(0), None) else { panic!("a zero-byte memory ceiling is invalid") };
+        assert!(error.contains("zero-byte"), "{error}");
+        let Err(error) = KillOnCloseJob::new(None, Some(0)) else { panic!("a zero-process limit is invalid") };
+        assert!(error.contains("zero-process"), "{error}");
+        // Positive limits configure successfully and release their handle on drop.
+        let job = KillOnCloseJob::new(Some(64 * 1024 * 1024), Some(4)).expect("real limits must configure");
+        drop(job);
+    }
+
+    #[test]
+    fn contained_command_errors_render_actionable_messages() {
+        assert!(ContainedCommandError::Timeout { timeout_ms: 250 }.to_string().contains("250 ms deadline"));
+        assert!(ContainedCommandError::OutputLimitExceeded { stream: "stdout", limit_bytes: 9 }
+            .to_string()
+            .contains("stdout output limit of 9 bytes"));
+        assert!(ContainedCommandError::AbnormalExit { exit_code: Some(3) }.to_string().contains("exited abnormally"));
+        assert!(ContainedCommandError::InvalidConfiguration("x".into()).to_string().contains("configuration"));
+    }
 }

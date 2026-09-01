@@ -3717,4 +3717,223 @@ mod tests {
             assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
         }
     }
+
+    #[test]
+    fn evidence_enums_round_trip_and_refuse_unknown_stored_values() {
+        for kind in [BatchJobKindV1::Transcribe, BatchJobKindV1::Normalize] {
+            assert_eq!(BatchJobKindV1::parse(kind.as_str()).unwrap(), kind);
+        }
+        let error = BatchJobKindV1::parse("batch_delete_v1").unwrap_err().to_string();
+        assert!(error.contains(BATCH_EVIDENCE_ERROR) && error.contains("unknown batch kind"), "{error}");
+
+        for state in [
+            BatchJobLifecycleV1::Queued,
+            BatchJobLifecycleV1::Running,
+            BatchJobLifecycleV1::Succeeded,
+            BatchJobLifecycleV1::Failed,
+            BatchJobLifecycleV1::Cancelled,
+        ] {
+            assert_eq!(BatchJobLifecycleV1::parse(state.as_str()).unwrap(), state);
+            assert_eq!(
+                state.is_terminal(),
+                matches!(
+                    state,
+                    BatchJobLifecycleV1::Succeeded | BatchJobLifecycleV1::Failed | BatchJobLifecycleV1::Cancelled
+                )
+            );
+        }
+        assert!(BatchJobLifecycleV1::parse("paused").unwrap_err().to_string().contains("unknown batch state"));
+
+        for state in [
+            BatchItemStateV1::Pending,
+            BatchItemStateV1::Applied,
+            BatchItemStateV1::Skipped,
+            BatchItemStateV1::Failed,
+            BatchItemStateV1::Abandoned,
+        ] {
+            assert_eq!(BatchItemStateV1::parse(state.as_str()).unwrap(), state);
+        }
+        assert!(BatchItemStateV1::parse("retrying").unwrap_err().to_string().contains("unknown batch item state"));
+
+        assert_eq!(BatchHistorySideV1::Before.opposite(), BatchHistorySideV1::After);
+        assert_eq!(BatchHistorySideV1::After.opposite(), BatchHistorySideV1::Before);
+
+        let counts = BatchItemCountsV1 { pending: 7, applied: 1, skipped: 2, failed: 3, abandoned: 4 };
+        assert_eq!(counts.terminal(), 10, "pending never counts as terminal");
+    }
+
+    #[test]
+    fn evidence_field_validators_enforce_exact_shapes_on_both_sides() {
+        // SHA-256 fields: exact 64 lowercase hex, nothing else.
+        validate_sha256(CONFIG_SHA, "config").unwrap();
+        for bad in ["", "abc", &CONFIG_SHA[..63], &format!("{}A", &CONFIG_SHA[..63]), &"g".repeat(64)] {
+            assert!(validate_sha256(bad, "config").is_err(), "{bad:?} must be refused");
+        }
+
+        // Git SHA: exactly 40 lowercase hex.
+        validate_git_sha(GIT_SHA).unwrap();
+        assert!(validate_git_sha(&GIT_SHA[..39]).is_err());
+        assert!(validate_git_sha(&GIT_SHA.to_ascii_uppercase()).is_err());
+
+        // Result codes: 1..=64 uppercase/digit/underscore.
+        validate_result_code("E_OK_1").unwrap();
+        validate_result_code(&"A".repeat(64)).unwrap();
+        assert!(validate_result_code("").is_err());
+        assert!(validate_result_code(&"A".repeat(65)).is_err());
+        assert!(validate_result_code("lower_case").is_err());
+        assert!(validate_result_code("HAS SPACE").is_err());
+
+        // Footprint metadata must be non-negative before it can be compared to a limit.
+        assert!(checked_footprint_value(0, "field").is_ok());
+        let error = checked_footprint_value(-1, "segment text").unwrap_err().to_string();
+        assert!(error.contains("invalid byte/count metadata"), "{error}");
+
+        // Projection JSON lengths: zero and over-bound both refuse.
+        assert!(validate_projection_json_length_v1(1, "probe").is_ok());
+        assert!(validate_projection_json_length_v1(0, "probe").is_err());
+        assert!(validate_projection_json_length_v1((MAX_BATCH_PROJECTION_JSON_BYTES_V1 as i64) + 1, "probe").is_err());
+    }
+
+    #[test]
+    fn projection_footprint_limits_refuse_each_axis_independently() {
+        let within = BatchProjectionFootprintV1 {
+            segment_text_bytes: 10,
+            largest_segment_field_bytes: 10,
+            hypothesis_count: 1,
+            hypothesis_transcript_bytes: 10,
+            largest_hypothesis_transcript_bytes: 10,
+            hypothesis_metadata_bytes: 10,
+            largest_model_id_bytes: 10,
+            largest_model_version_id_bytes: 10,
+            largest_hypothesis_created_at_bytes: 10,
+        };
+        validate_batch_projection_footprint_v1("s-ok", within).unwrap();
+
+        let over_text =
+            BatchProjectionFootprintV1 { segment_text_bytes: (MAX_BATCH_SEGMENT_TEXT_BYTES_V1 as i64) + 1, ..within };
+        assert!(validate_batch_projection_footprint_v1("s-text", over_text).is_err());
+        let over_field = BatchProjectionFootprintV1 {
+            largest_segment_field_bytes: (MAX_BATCH_SEGMENT_TEXT_FIELD_BYTES_V1 as i64) + 1,
+            ..within
+        };
+        assert!(validate_batch_projection_footprint_v1("s-field", over_field).is_err());
+        let over_count =
+            BatchProjectionFootprintV1 { hypothesis_count: (MAX_STORED_HYPOTHESES_PER_SEGMENT as i64) + 1, ..within };
+        assert!(validate_batch_projection_footprint_v1("s-count", over_count).is_err());
+        let over_transcripts = BatchProjectionFootprintV1 {
+            hypothesis_transcript_bytes: (MAX_STORED_HYPOTHESIS_TRANSCRIPT_BYTES_PER_SEGMENT as i64) + 1,
+            ..within
+        };
+        assert!(validate_batch_projection_footprint_v1("s-agg", over_transcripts).is_err());
+        let over_largest = BatchProjectionFootprintV1 {
+            largest_hypothesis_transcript_bytes: (MAX_STORED_HYPOTHESIS_TRANSCRIPT_BYTES as i64) + 1,
+            ..within
+        };
+        assert!(validate_batch_projection_footprint_v1("s-largest", over_largest).is_err());
+        let over_metadata = BatchProjectionFootprintV1 {
+            hypothesis_metadata_bytes: (MAX_STORED_HYPOTHESIS_METADATA_BYTES_PER_SEGMENT as i64) + 1,
+            ..within
+        };
+        assert!(validate_batch_projection_footprint_v1("s-meta", over_metadata).is_err());
+        let over_meta_field = BatchProjectionFootprintV1 {
+            largest_hypothesis_created_at_bytes: (MAX_STORED_HYPOTHESIS_METADATA_FIELD_BYTES as i64) + 1,
+            ..within
+        };
+        assert!(validate_batch_projection_footprint_v1("s-meta-field", over_meta_field).is_err());
+    }
+
+    #[test]
+    fn cancellable_admission_is_all_or_nothing() {
+        let database = fixture(&["s1", "s2"]);
+        let operation_id = "9c000000-0000-4000-8000-000000000001";
+
+        // A cancellation observed before durable publication leaves no header and no item rows.
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let error = database
+            .admit_batch_job_v1_cancellable(
+                operation_id,
+                BatchJobKindV1::Normalize,
+                &ids(&["s1", "s2"]),
+                CONFIG_SHA,
+                &executor(),
+                &cancelled,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("BATCH_ADMISSION_CANCELLED"), "{error}");
+        let jobs: i64 = database.connection().query_row("SELECT count(*) FROM jobs", [], |row| row.get(0)).unwrap();
+        assert_eq!(jobs, 0, "a cancelled admission must publish nothing");
+        assert!(database.active_batch_job_v1().unwrap().is_none(), "no live batch after the cancelled admission");
+        assert!(database.get_batch_job_status_v1(operation_id).unwrap().is_none());
+
+        // The same identity admits normally once the flag is clear.
+        let live = std::sync::atomic::AtomicBool::new(false);
+        let status = database
+            .admit_batch_job_v1_cancellable(
+                operation_id,
+                BatchJobKindV1::Normalize,
+                &ids(&["s1", "s2"]),
+                CONFIG_SHA,
+                &executor(),
+                &live,
+            )
+            .unwrap();
+        assert_eq!(status.state, BatchJobLifecycleV1::Running);
+        assert_eq!(status.total, 2);
+        assert_eq!(status.counts.pending, 2);
+    }
+
+    #[test]
+    fn non_applied_terminalizer_refuses_wrong_states_and_missing_pending_rows() {
+        let database = fixture(&["s1"]);
+        let operation_id = "9d000000-0000-4000-8000-000000000001";
+        database
+            .admit_batch_job_v1(operation_id, BatchJobKindV1::Normalize, &ids(&["s1"]), CONFIG_SHA, &executor())
+            .unwrap();
+
+        // Applied and Pending are not legal targets for the non-applied terminalizer.
+        for state in [BatchItemStateV1::Applied, BatchItemStateV1::Pending] {
+            let error = database.mark_batch_item_terminal_v1(operation_id, 0, state, "E_CODE").unwrap_err().to_string();
+            assert!(error.contains("invalid state"), "{state:?}: {error}");
+        }
+        // A malformed result code is refused before any row is touched.
+        assert!(database.mark_batch_item_terminal_v1(operation_id, 0, BatchItemStateV1::Skipped, "bad code").is_err());
+        // An ordinal with no pending row cannot be terminalized.
+        let error = database
+            .mark_batch_item_terminal_v1(operation_id, 41, BatchItemStateV1::Skipped, "E_CODE")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("could not be terminalized"), "{error}");
+        // The one pending row is still pending after every refusal.
+        assert_eq!(database.batch_item_counts_v1(operation_id).unwrap().pending, 1);
+    }
+
+    #[test]
+    fn human_ownership_is_detected_on_every_authority_axis() {
+        let unowned = SpeechSegment { id: "own-0".into(), ..SpeechSegment::default() };
+        assert!(!segment_is_human_owned(&unowned), "a bare machine row is not human-owned");
+
+        let cases: Vec<(&str, Box<dyn Fn(&mut SpeechSegment)>)> = vec![
+            ("verified", Box::new(|seg| seg.verified = true)),
+            ("is_gold", Box::new(|seg| seg.is_gold = true)),
+            // Presence alone is authoritative, including a historical machine-seeded empty string.
+            ("annotated_transcript", Box::new(|seg| seg.annotated_transcript = Some(String::new()))),
+            ("human_decision", Box::new(|seg| seg.human_decision = Some("accept".into()))),
+            ("verdict", Box::new(|seg| seg.verdict = Some("human_edit".into()))),
+            ("reviewed_by", Box::new(|seg| seg.reviewed_by = Some("desktop".into()))),
+            ("corrected_at", Box::new(|seg| seg.corrected_at = Some("2026-08-01T00:00:00Z".into()))),
+        ];
+        for (label, mutate) in cases {
+            let mut seg = SpeechSegment { id: "own-1".into(), ..SpeechSegment::default() };
+            mutate(&mut seg);
+            assert!(segment_is_human_owned(&seg), "{label} must mark the row human-owned");
+        }
+
+        // Whitespace-only decision/reviewer values and machine verdicts do NOT mint ownership.
+        let mut blank = SpeechSegment { id: "own-2".into(), ..SpeechSegment::default() };
+        blank.human_decision = Some("   ".into());
+        blank.reviewed_by = Some(" ".into());
+        blank.verdict = Some("machine_accept".into());
+        assert!(!segment_is_human_owned(&blank), "blank/machine markers are not human authority");
+    }
 }
