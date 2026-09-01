@@ -673,7 +673,7 @@ def test_restore_refuses_a_real_concurrent_windows_instance_lock_holder() -> Non
                     "$stream = [System.IO.File]::Open($lockPath, "
                     "[System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, "
                     "[System.IO.FileShare]::None); "
-                    "try { [System.IO.File]::WriteAllText($readyPath, 'ready'); Start-Sleep -Seconds 30 } "
+                    "try { [System.IO.File]::WriteAllText($readyPath, 'ready'); Start-Sleep -Seconds 120 } "
                     "finally { $stream.Dispose() } }"
                 ),
                 str(data / "cortex.lock"),
@@ -685,10 +685,25 @@ def test_restore_refuses_a_real_concurrent_windows_instance_lock_holder() -> Non
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         try:
-            deadline = time.monotonic() + 5
-            while not ready.is_file() and time.monotonic() < deadline:
+            # Wait on the REAL condition -- the holder publishing its readiness file -- not on a
+            # guessed duration. The old 5s bound was a cold-PowerShell-startup guess that held on a
+            # quiet workstation and failed on windows-latest (measured 2026-09-01: "disposable lock
+            # holder did not start"). The holder is killed in the finally below and now sleeps well
+            # past this budget, so a generous bound costs nothing; the loop still exits immediately
+            # if the holder dies, so a genuine failure is reported at once rather than after 60s.
+            deadline = time.monotonic() + 60
+            while not ready.is_file() and holder.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.05)
-            assert ready.is_file() and holder.poll() is None, "disposable lock holder did not start"
+            if holder.poll() is not None:
+                raise AssertionError(
+                    "disposable lock holder exited before publishing readiness "
+                    f"(returncode {holder.returncode}); it never held the lock, so the refusal this "
+                    "test asserts would be vacuous"
+                )
+            assert ready.is_file(), (
+                "disposable lock holder did not publish readiness within 60s though it is still "
+                "running; treat this as a slow start, not a crash"
+            )
             try:
                 release.restore_database(snapshot, data, 65, manifest_sha)
             except release.ReleaseError as error:
