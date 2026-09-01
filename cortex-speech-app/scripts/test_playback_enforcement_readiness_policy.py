@@ -14,7 +14,6 @@ close, so it is driven against a fabricated-clean database and required to refus
 
 from __future__ import annotations
 
-import contextlib
 import importlib.util
 import os
 import re
@@ -425,9 +424,8 @@ def test_verify_10_keeps_the_current_build_empty_canary_red() -> None:
         tmp = Path(raw)
         # The child never receives CORTEX_DB: the gate's environment allowlist admits only
         # CORTEX_APP_EXE, and live-authority mode pins APPDATA to the canonical roots. Seed the
-        # database at the canonical location under a synthetic roaming root so the POSIX run
-        # audits exactly this fixture; on Windows the child reads the real live database and the
-        # just-written executable's mtime still makes the current-build window genuinely 0/20.
+        # database at the canonical location under a synthetic roaming root so every run audits
+        # exactly this fixture.
         db_path = tmp / "live-roaming" / "cortex-speech" / "cortex-speech.db"
         db_path.parent.mkdir(parents=True)
         _seed(db_path)
@@ -440,18 +438,20 @@ def test_verify_10_keeps_the_current_build_empty_canary_red() -> None:
         isolated_payload = payload.replace("--active-release", f'--exe "{exe}"')
         previous_db = os.environ.get("CORTEX_DB")
         previous_log_dir = verify.LOG_DIR
-        # run_gate builds the child environment against the canonical live data roots, which only
-        # Windows can resolve (SHGetKnownFolderPath — deliberately not overridable by env). On
-        # POSIX, stub that single seam with synthetic roots so the canary-red proof itself — a
-        # plain subprocess over an isolated SQLite file — keeps running; Windows runs unpatched.
-        live_roots = (
-            contextlib.nullcontext()
-            if os.name == "nt"
-            else mock.patch.object(
-                verify,
-                "_canonical_live_data_roots",
-                return_value=(tmp / "live-roaming", tmp / "live-local"),
-            )
+        # run_gate builds the child environment against the canonical live data roots. Resolving
+        # them is real Windows behaviour (SHGetKnownFolderPath — deliberately not overridable by
+        # env) and stays asserted here, but the roots themselves name a WORKSTATION's live library.
+        # A hosted Windows runner has none, so the child there refused with "unable to open
+        # database file" — a different, equally correct refusal that proves nothing about the 0/20
+        # canary this test exists to keep red. Point the roots at the seeded fixture on every
+        # platform so the proof is the same proof everywhere.
+        if os.name == "nt":
+            roaming, local = verify._canonical_live_data_roots()
+            assert roaming.is_dir() and local.is_dir(), (roaming, local)
+        live_roots = mock.patch.object(
+            verify,
+            "_canonical_live_data_roots",
+            return_value=(tmp / "live-roaming", tmp / "live-local"),
         )
         try:
             os.environ["CORTEX_DB"] = str(db_path)

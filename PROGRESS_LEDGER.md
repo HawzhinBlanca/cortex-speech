@@ -12559,3 +12559,49 @@ each kind before commit.
 What did NOT change: `release.yml` still measures coverage for itself and still gates the tag-release
 build on it. The regions and lines floors (85) both pass and stay. The functions floor stays at 80
 and remains reachable — roughly 1.5 more waves — and the campaign continues toward it.
+
+---
+
+## 2026-09-01 — Decoupling the Windows gate uncovered three layers of hidden breakage
+
+Removing the coverage dependency from `windows-release-gate` (owner decision, same day) let that
+required job run to completion for the first time since 2026-08-19. It did not break anything; it
+made three latent failures visible, each hidden behind the one before it.
+
+**Layer 1 — the policy suite could not finish on Windows at all.** `os.kill(pid, 0)` is not a
+liveness probe there: `signal.CTRL_C_EVENT == 0`, so CPython routes signal 0 to
+`GenerateConsoleCtrlEvent` and never reaches `OpenProcess`. The 7B launch guard used it to check a
+stale pid, so the probe itself raised a console Ctrl+C that every process on the console received —
+`KeyboardInterrupt` in the runner and its grandparent. Underneath it sat a real assertion failure:
+the dead-pid error code is console-host dependent (WinError 87 with no console, 11 under cmd.exe)
+and the guard hardcoded 87, so under CI every dead pid read LIVE and pruning deleted nothing. The
+file's own comment claimed CPython used `OpenProcess` here; that wrong comment eliminated the
+correct suspect twice. Fixed with a real `OpenProcess` handle probe; POSIX untouched, and production
+supervises the champion from inside WSL.
+
+**Layer 2 — clippy had never run against wave 5.** The job dies at the policy step, which precedes
+`cargo clippy`, so 132 new tests were never linted. Five findings, all fixed rather than silenced;
+the substantive one was `permissions_set_readonly_false`, a genuine world-writable hazard on Unix.
+
+**Layer 3 — four gates that have NEVER passed on a Windows runner.** All four were added AFTER the
+last green Windows job (2026-08-19), so they shipped broken and invisible: ipc-bindings (2026-08-25),
+playback-readiness canary (2026-08-22), private-production-release (2026-08-24), owner-proof-inputs
+(2026-08-29). Two were environment assumptions; **two were production defects**:
+
+- `prepare_owner_proof_inputs.py` **cannot build a bundle at all on Python 3.12+ Windows.** 3.12
+  fills `st_dev` from FILE_ID_INFO (64-bit volume) while the code's identity comes from
+  `GetFileInformationByHandle` (32-bit volume); five guards compared the two encodings and refused
+  every honest file. Invisible here because the local `.policy-python` is 3.11.15 and CI's is
+  3.12.10 — the pinned environment is pinned by LOCK, not by interpreter version.
+- `release_private_production.stop_app()` **returned success having stopped nothing** whenever the
+  app was launched through an 8.3 path component, because `Get-Process` reports the launch path
+  while the controller resolved the long form. A release would then overwrite files and start a
+  second instance while the old one still held the SQLite database.
+
+Every fix was proven to still bite by injecting the regression and watching it go red, then
+reverting. Two gates were strengthened beyond repair: the release stand-in now launches through an
+8.3 directory so the CI-only shape reproduces everywhere, and a same-named bystander at another path
+must SURVIVE — the old assertion only proved "something with this name died".
+
+The lesson worth keeping: a required check that is skipped is not a passing check. This job showed
+green-adjacent for weeks while 507 of its policy-step appearances were `skipped`.

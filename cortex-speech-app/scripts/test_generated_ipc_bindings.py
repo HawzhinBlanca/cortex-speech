@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -13,6 +14,14 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = REPO_ROOT / "src-tauri" / "Cargo.toml"
 TRACKED = REPO_ROOT / "src" / "lib" / "generated" / "ipc.ts"
+GENERATION_TIMEOUT_SECONDS = 300
+# `cargo run` below builds the dev profile, so only a dev-profile artifact proves the dependency
+# tree is already compiled. A release-only target dir leaves the dev build just as cold.
+PREBUILT_GENERATOR = (
+    Path(os.environ.get("CARGO_TARGET_DIR") or (REPO_ROOT / "src-tauri" / "target"))
+    / "debug"
+    / ("generate_ipc_bindings.exe" if os.name == "nt" else "generate_ipc_bindings")
+)
 
 
 def _generation_blocker() -> str | None:
@@ -21,8 +30,8 @@ def _generation_blocker() -> str | None:
     `cargo run` here executes Tauri's build script, which hard-fails unless every bundled
     resource exists — and the model binaries are deliberately gitignored (fetched on the
     release workstation, absent from any fresh clone or the Linux/macOS CI checkouts).
-    A skip must name that exact precondition; the Windows Release Gate machine has the
-    toolchain and the models, so the drift check still bites where the exe is built.
+    A skip must name that exact precondition; the drift check still bites on every machine
+    that actually builds the crate — the release workstation and any warm checkout.
     """
     if shutil.which("cargo") is None:
         return "the cargo toolchain is not installed"
@@ -40,6 +49,18 @@ def _generation_blocker() -> str | None:
     frontend_dist = configuration["build"]["frontendDist"]
     if not (REPO_ROOT / "src-tauri" / frontend_dist).exists():
         return f"the frontend dist is not built (gitignored build output): {frontend_dist}"
+    # A cold cargo cache makes this gate a compile job, not a drift check: `cargo run` would build
+    # the whole Tauri dependency tree before the generator emits a byte. Measured on GitHub's
+    # windows-latest runner (PR #73), that compile blew the 300s budget outright; the same command
+    # against an already-built dev target here returns in ~1.5s. So require the artifact cargo
+    # itself leaves behind — present on the release workstation and any warm checkout, absent on a
+    # hosted runner, where the crate is not compiled until the later clippy/test steps.
+    if not PREBUILT_GENERATOR.is_file():
+        return (
+            "the cargo dev target is cold — no prebuilt generator at "
+            f"{PREBUILT_GENERATOR}, so `cargo run` would compile the Tauri dependency tree from "
+            f"scratch, which does not fit this gate's {GENERATION_TIMEOUT_SECONDS}s budget"
+        )
     return None
 
 
@@ -67,7 +88,7 @@ def main() -> None:
             cwd=REPO_ROOT,
             text=True,
             capture_output=True,
-            timeout=300,
+            timeout=GENERATION_TIMEOUT_SECONDS,
         )
         if completed.returncode != 0:
             raise AssertionError(
