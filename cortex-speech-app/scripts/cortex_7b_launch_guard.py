@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import ctypes
 import os
 from pathlib import Path
 import re
@@ -30,6 +31,8 @@ LOG_READ_CHUNK_BYTES = 64 * 1024
 MAX_RETAINED_INACTIVE_ATTEMPTS = 16
 STALE_ATTEMPT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 PRUNE_SAFETY_AGE_SECONDS = 5 * 60
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_ERROR_INVALID_PARAMETER = 87
 _ATTEMPT_FILE = re.compile(
     r"^(?P<token>[0-9a-f]{32})\.(?:heartbeat|ready|stop|pid|log|log\.1)$"
 )
@@ -190,6 +193,33 @@ def _append_log(path: Path, message: str) -> None:
     _BoundedAttemptLog(path, path.with_name(path.name + ".1")).append_text(message)
 
 
+def _windows_process_is_live(pid: int) -> bool:
+    """Probe liveness with a real process handle, never with ``os.kill``.
+
+    On Windows ``signal 0`` IS ``CTRL_C_EVENT``, so ``os.kill(pid, 0)`` reaches
+    ``GenerateConsoleCtrlEvent`` rather than ``OpenProcess``.  Measured 2026-09-01 on this
+    repository's pinned interpreter: against a LIVE pid it succeeds, meaning the "probe"
+    actually generates a console Ctrl+C that every process on that console can receive; and
+    against a dead pid its failure code depends on the console host -- ``WinError 87`` with no
+    console attached, but ``WinError 11`` under the cmd.exe console ``npm`` creates.  A guard
+    that keyed on 87 therefore reported every dead pid as live under CI and pruned nothing.
+    ``OpenProcess`` answers the question that was actually being asked.
+    """
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # ERROR_INVALID_PARAMETER is Windows' "no such process".  Access denied and every other
+        # ambiguity stay fail-closed/live so cleanup leaks a stale log rather than deleting a
+        # live one.  ponytail: a pid whose handle is still held by an exited process's parent
+        # reads live; that is the same conservative leak PID reuse already produces.
+        return ctypes.get_last_error() != _ERROR_INVALID_PARAMETER
+    kernel32.CloseHandle(handle)
+    return True
+
+
 def _pid_is_live_or_unknown(path: Path) -> bool:
     """Return false only when an exact published PID is definitely no longer alive."""
     try:
@@ -201,17 +231,13 @@ def _pid_is_live_or_unknown(path: Path) -> bool:
         return False
     except (OSError, ValueError):
         return True
+    if os.name == "nt":
+        return _windows_process_is_live(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    except OSError as exc:
-        # CPython implements ``kill(pid, 0)`` with OpenProcess on Windows.  A
-        # positive PID that no longer exists is reported as ERROR_INVALID_PARAMETER
-        # (WinError 87), not ProcessLookupError as it is on POSIX.  Access denied
-        # and every other platform ambiguity remain fail-closed/live.
-        if os.name == "nt" and getattr(exc, "winerror", None) == 87:
-            return False
+    except OSError:
         # Permission and platform ambiguity must leak a stale log rather than delete a live one.
         return True
     return True
