@@ -415,8 +415,8 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
     // library, told at the exact moment the owner would want to widen the focus.
     let restricted_and_empty =
         (allowed_dialects.is_some() || focus.is_some() || pilot_slots.is_some()) && pending_total == 0;
-    let now = Instant::now();
     let mut guard = lock_state(state);
+    let now = guard.now();
     let mut serving: Vec<String> = Vec::new();
     let mut held_by_others = 0usize;
     let mut skipped_by_you = 0usize;
@@ -959,7 +959,8 @@ pub(super) fn audio_assignment(
     let key = (id.to_string(), reviewer.to_string());
     let (skipped, served_work, remembered_hidden, remembered_pilot_count) = {
         let mut guard = lock_state(state);
-        let holder = guard.holder(id, Instant::now()).map(str::to_string);
+        let now = guard.now();
+        let holder = guard.holder(id, now).map(str::to_string);
         let skipped = guard.skipped.get(reviewer).is_some_and(|ids| ids.contains(id));
         if skipped {
             if holder.as_deref() == Some(reviewer) {
@@ -1152,11 +1153,10 @@ pub(super) fn authorize_audio(
         let key = (id.to_string(), reviewer.to_string());
         let mut guard = lock_state(state);
         let skipped = guard.skipped.get(reviewer).is_some_and(|ids| ids.contains(id));
+        let now = guard.now();
         match assignment {
             AudioAssignment::Work => {
-                !skipped
-                    && guard.holder(id, Instant::now()).is_some_and(|who| who == reviewer)
-                    && guard.served_work.contains(&key)
+                !skipped && guard.holder(id, now).is_some_and(|who| who == reviewer) && guard.served_work.contains(&key)
             }
             AudioAssignment::HiddenCheck { .. } => !skipped && guard.spot_checks.contains(&key),
         }
@@ -1267,7 +1267,7 @@ pub(super) fn api_playback_start(
     if !crate::db::source_span_matches_duration(source_start_ms, source_end_ms, segment.duration_ms) {
         return err_reply(503, "playback duration and source span disagree");
     }
-    let now = Instant::now();
+    let now = lock_state(state).now();
     let issued_at_ms =
         SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_millis() as i64).unwrap_or(1).max(1);
     let expires_at_ms = issued_at_ms.saturating_add(COUCH_PLAYBACK_ATTEMPT_TTL.as_millis() as i64);
@@ -1349,9 +1349,9 @@ pub(super) fn validate_audio_playback_attempt(
     playback_receipt_id: &str,
     state: &Mutex<CouchState>,
 ) -> Result<(), Reply> {
-    let now = Instant::now();
     let authority = {
         let mut guard = lock_state(state);
+        let now = guard.now();
         guard.prune_playback_attempts(now);
         guard.playback_attempts.get(playback_receipt_id).map(|attempt| attempt.authority.clone())
     }
@@ -1392,12 +1392,13 @@ pub(super) fn mark_audio_playback_attempt_served(
     state: &Mutex<CouchState>,
 ) {
     let mut guard = lock_state(state);
+    let now = guard.now();
     if let Some(attempt) = guard.playback_attempts.get_mut(playback_receipt_id) {
         if attempt.authority.session_binding_sha256 == session_binding_sha256
             && same_reviewer(&attempt.authority.reviewer, reviewer)
             && attempt.media_served_at.is_none()
         {
-            attempt.media_served_at = Some(Instant::now());
+            attempt.media_served_at = Some(now);
         }
     }
 }
@@ -1462,9 +1463,9 @@ pub(super) fn api_playback_finalize(
         Ok(None) => {}
         Err(error) => return playback_error_reply(&error.to_string()),
     }
-    let now = Instant::now();
     let (authority, elapsed_ms) = {
         let mut guard = lock_state(state);
+        let now = guard.now();
         guard.prune_playback_attempts(now);
         let Some(attempt) = guard.playback_attempts.get(&parsed.playback_receipt_id) else {
             return err_reply(409, "playback attempt is missing or expired — reload and replay this clip");
@@ -1638,8 +1639,8 @@ pub(super) fn api_renew(body: &[u8], reviewer: &str, state: &Mutex<CouchState>) 
     if crate::validation::input::validate_identifier(&parsed.id).is_err() {
         return err_reply(400, "bad id");
     }
-    let now = Instant::now();
     let mut guard = lock_state(state);
+    let now = guard.now();
     let key = (parsed.id.clone(), reviewer.to_string());
     if guard.skipped.get(reviewer).is_some_and(|ids| ids.contains(&parsed.id)) {
         return err_reply(409, "this clip is no longer assigned — reload your queue");

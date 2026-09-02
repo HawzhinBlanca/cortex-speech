@@ -215,6 +215,12 @@ struct CouchState {
     /// segment id -> (reviewer who holds it, when it was granted). Entries older than [`LEASE_TTL`]
     /// are ignored and pruned, so a lease needs no explicit release on disconnect.
     leases: HashMap<String, (String, Instant)>,
+    /// Test-only time travel for lease arithmetic, ALWAYS zero in production: [`CouchState::now`]
+    /// adds it to the monotonic clock. A test ages a lease by moving time forward through this,
+    /// because `Instant::now() - LEASE_TTL` panics within one TTL of boot -- five tests read as
+    /// regressions for the first ~16 minutes after every Windows restart (measured repeatedly
+    /// through 2026-09-02; this workstation restarts several times a day).
+    clock_skew: Duration,
     /// Work ids that `/api/queue` actually returned, keyed to the reviewer who saw them.
     ///
     /// A lease alone is not proof of delivery: `/api/renew` can reclaim an expired lease for a page
@@ -299,6 +305,12 @@ struct CouchState {
 }
 
 impl CouchState {
+    /// The clock every lease decision reads. `clock_skew` is zero in production, so this IS the
+    /// monotonic clock; a test ages a lease by moving time forward through the skew.
+    fn now(&self) -> Instant {
+        Instant::now() + self.clock_skew
+    }
+
     /// Who currently holds `segment_id`, ignoring (and pruning) an expired lease.
     fn holder(&mut self, segment_id: &str, now: Instant) -> Option<&str> {
         let expired =
@@ -3479,13 +3491,7 @@ mod tests {
         assert_eq!(served.len(), 3, "all three leased to Sara in one batch");
 
         // Age every lease to the brink of expiry, as a real session does while the reviewer works.
-        {
-            let mut guard = lock_state(&state);
-            let old = Instant::now() - (LEASE_TTL - Duration::from_secs(1));
-            for (_, (_, granted)) in guard.leases.iter_mut() {
-                *granted = old;
-            }
-        }
+        lock_state(&state).clock_skew = LEASE_TTL - Duration::from_secs(1);
         // The reviewer is on the FIRST clip and the heartbeat fires for it.
         let body = serde_json::json!({"id": "s0"});
         let (code, ..) = api_renew(body.to_string().as_bytes(), "Sara", &state);
@@ -3831,6 +3837,28 @@ mod tests {
     }
 
     #[test]
+    fn lease_expiry_reads_the_state_clock_so_a_test_never_subtracts_from_boot() {
+        // A monotonic Instant cannot precede boot: `Instant::now() - LEASE_TTL` panicked for the
+        // first ~16 minutes after every Windows restart and read as a regression of whatever diff
+        // was under test (five tests, measured repeatedly through 2026-09-02). Time now travels
+        // FORWARD through `clock_skew`, which is zero in production.
+        let state = state();
+        let mut guard = lock_state(&state);
+        assert_eq!(guard.clock_skew, Duration::ZERO, "production runs on the plain monotonic clock");
+        let granted = guard.now();
+        guard.leases.insert("clock".into(), ("Sara".into(), granted));
+        let now = guard.now();
+        assert_eq!(guard.holder("clock", now), Some("Sara"));
+        guard.clock_skew = LEASE_TTL - Duration::from_secs(1);
+        let now = guard.now();
+        assert_eq!(guard.holder("clock", now), Some("Sara"), "one second short of the TTL is still held");
+        guard.clock_skew = LEASE_TTL;
+        let now = guard.now();
+        assert_eq!(guard.holder("clock", now), None, "exactly one TTL later the lease is gone");
+        assert!(!guard.leases.contains_key("clock"), "and it was pruned, not merely hidden");
+    }
+
+    #[test]
     fn an_expired_lease_returns_the_clip_to_everyone_else() {
         // A reviewer who closes the page mid-batch must not strand that work for the rest of the session.
         // Leases carry a TTL and are ignored (and pruned) once past it, so the clip flows back into the
@@ -3844,8 +3872,7 @@ mod tests {
         assert!(queue_ids(&db, "Hemn", &state).is_empty(), "while the lease is live, Hemn sees nothing");
 
         // Backdate Sara's lease past the TTL — she walked away.
-        let expired = Instant::now().checked_sub(LEASE_TTL).expect("a monotonic clock at least TTL old");
-        lock_state(&state).leases.insert("stale".into(), ("Sara".into(), expired));
+        lock_state(&state).clock_skew = LEASE_TTL;
 
         assert_eq!(queue_ids(&db, "Hemn", &state), vec!["stale"], "the abandoned clip returns to the pool");
         assert_eq!(
@@ -4283,8 +4310,7 @@ mod tests {
 
         assert_eq!(queue_ids(&db, "Sara", &state), vec!["n1"]);
         // Age her lease to the brink, then renew: the clip must stay hers rather than lapsing.
-        let stale = Instant::now().checked_sub(LEASE_TTL - Duration::from_secs(1)).unwrap();
-        lock_state(&state).leases.insert("n1".into(), ("Sara".into(), stale));
+        lock_state(&state).clock_skew = LEASE_TTL - Duration::from_secs(1);
         let (code, _, reply, ..) = api_renew(body.as_bytes(), "Sara", &state);
         assert_eq!(code, 200, "an active reviewer may extend their own hold");
         let json: serde_json::Value = serde_json::from_slice(&reply).unwrap();
@@ -4302,8 +4328,15 @@ mod tests {
         );
 
         // Reclaiming a clip whose lease lapsed with nobody else taking it is allowed and deliberate.
-        let expired = Instant::now().checked_sub(LEASE_TTL).unwrap();
-        lock_state(&state).leases.insert("n1".into(), ("Sara".into(), expired));
+        lock_state(&state).clock_skew += LEASE_TTL;
+        {
+            // The precondition, checked without pruning: on the state's clock the lease is now at least
+            // one TTL old. (The old `checked_sub` fixture made this true by construction; the skew only
+            // makes it true when every lease site honours it.)
+            let guard = lock_state(&state);
+            let (_, granted) = guard.leases.get("n1").expect("Sara's lease is still recorded");
+            assert!(guard.now().duration_since(*granted) >= LEASE_TTL, "the lease must have lapsed on the state clock");
+        }
         assert_eq!(api_renew(body.as_bytes(), "Sara", &state).0, 200, "she still has it open — give it back");
         assert_eq!(api_renew(b"not json", "Sara", &state).0, 400);
         assert_eq!(api_renew(serde_json::json!({"id": "../etc"}).to_string().as_bytes(), "Sara", &state).0, 400);
@@ -7645,15 +7678,19 @@ mod tests {
             .execute("UPDATE speech_segments SET alignment_json = NULL WHERE id LIKE 'audio-%'", [])
             .unwrap();
         let state = state();
-        let expired = Instant::now().checked_sub(LEASE_TTL).unwrap();
         {
             let mut guard = lock_state(&state);
-            guard.leases.insert("audio-own".into(), ("Sara".into(), Instant::now()));
+            // Time travels forward by one TTL: a lease granted at the state's clock is fresh, one
+            // granted at the raw monotonic clock is exactly one TTL old.
+            guard.clock_skew = LEASE_TTL;
+            let fresh = guard.now();
+            let expired = Instant::now();
+            guard.leases.insert("audio-own".into(), ("Sara".into(), fresh));
             guard.served_work.insert(("audio-own".into(), "Sara".into()));
-            guard.leases.insert("audio-other".into(), ("Hemn".into(), Instant::now()));
+            guard.leases.insert("audio-other".into(), ("Hemn".into(), fresh));
             guard.served_work.insert(("audio-other".into(), "Hemn".into()));
             // A lease without the queue-issued receipt models the old `/api/renew` bypass.
-            guard.leases.insert("audio-forged".into(), ("Sara".into(), Instant::now()));
+            guard.leases.insert("audio-forged".into(), ("Sara".into(), fresh));
             guard.leases.insert("audio-expired".into(), ("Sara".into(), expired));
             guard.served_work.insert(("audio-expired".into(), "Sara".into()));
         }
@@ -8143,14 +8180,8 @@ mod tests {
         assert_eq!(queue_ids(&db, "Sara", &state).len(), 2, "Sara holds both");
 
         // Age Sara's leases past the TTL, which is what a sleeping phone produces. Instant cannot be
-        // fabricated, but it can be walked backwards.
-        let stale = Instant::now().checked_sub(LEASE_TTL + Duration::from_secs(60)).expect("clock has headroom");
-        {
-            let mut guard = lock_state(&state);
-            for (_, (_, granted)) in guard.leases.iter_mut() {
-                *granted = stale;
-            }
-        }
+        // fabricated or walked before boot, so time travels FORWARD through the state's clock.
+        lock_state(&state).clock_skew = LEASE_TTL + Duration::from_secs(60);
 
         // NOBODY took it: renewing must succeed and hand the clip back, not refuse it.
         let renew = serde_json::json!({ "id": "s1" }).to_string();
@@ -8161,13 +8192,9 @@ mod tests {
             serde_json::json!({"heardMs": 600_000,  "id": "s1", "action": "edit", "text": "دەستکاری" }).to_string();
         assert_eq!(api_decision(&db, decide.as_bytes(), "Sara", &state).0, 200);
 
-        // Now the other half: age the remaining lease again and let HEMN pick it up.
-        {
-            let mut guard = lock_state(&state);
-            for (_, (_, granted)) in guard.leases.iter_mut() {
-                *granted = stale;
-            }
-        }
+        // Now the other half: age the remaining lease again (time travels forward once more, past
+        // the lease Sara just renewed as well) and let HEMN pick it up.
+        lock_state(&state).clock_skew += LEASE_TTL + Duration::from_secs(60);
         assert!(queue_ids(&db, "Hemn", &state).contains(&"s2".to_string()), "an expired lease is available");
 
         // Sara's phone wakes up. Renewing s2 must be REFUSED — now, not at save time.

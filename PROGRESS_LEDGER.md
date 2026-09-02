@@ -12817,3 +12817,34 @@ through the fresh connection is refused with 409 where 200 is asserted. Both fil
 hash-identical. Not covered, recorded honestly: link rotation (no rotation helper exists in the
 couch tests; a decision's eligibility does not reference session tokens, but that is reasoning, not
 a measurement).
+## 2026-09-02 — Lease time is read from the state's clock; tests age a lease by moving time forward
+
+Backlog item from the Codex audit, taken as a serving-path change rather than a test tweak. Five
+`couch::tests` (six sites) built an "expired" grant time with `Instant::now().checked_sub(LEASE_TTL)`.
+A monotonic `Instant` cannot precede boot, so for the first ~16 minutes after every Windows restart
+those tests panicked ("a monotonic clock at least TTL old") and read as regressions of whatever diff
+was under test; this workstation restarts several times a day.
+
+- `CouchState` gains `clock_skew: Duration` (derive(Default) keeps it zero everywhere) and
+  `now(&self) -> Instant { Instant::now() + self.clock_skew }`. Every production clock read in the
+  couch — four `holder()` calls, two lease grants and two `let now` in `decisions.rs`; the queue,
+  audio authorization, playback-attempt registration/prune/serve stamps in `queue_audio.rs`, eight
+  sites — goes through it. With zero skew that IS `Instant::now()`; no production behaviour changed.
+  The first pass covered `decisions.rs` alone and three tests stayed red: `queue_audio.rs` held the
+  queue and audio paths those tests exercise. A grep truncated by `head` hid them; recorded.
+- The six sites now set the skew forward (`LEASE_TTL`, `LEASE_TTL - 1 s`, `LEASE_TTL + 60 s`, and a
+  second `+=` where a test ages leases twice). The mixed-age audio test grants fresh leases at the
+  state clock and the one expired lease at the raw clock, exactly one TTL apart.
+- Proof: `lease_expiry_reads_the_state_clock_so_a_test_never_subtracts_from_boot` — held at TTL − 1 s,
+  gone and pruned at TTL, zero skew asserted as the production default.
+- Bite-proof with `now()` ignoring the skew: the proof and three converted tests fail. The two
+  `renewing_…` tests did NOT bite — their "lapsed, then renew hands it back" leg never asserted the
+  lease had lapsed (the old fixture made it true by construction). That leg now asserts, without
+  pruning, that the lease is at least one TTL old on the state clock, and bites.
+- Policy pin `test_couch_clock_policy.py`: no `checked_sub(LEASE_TTL` / `Instant::now() - LEASE_TTL`
+  outside comments in the three files; no `Instant::now()` in the production prefix of
+  `decisions.rs` or `queue_audio.rs` (prefix cut at the test MODULE, never at the first inline
+  `#[cfg(test)]`, which would have made it vacuous); the field and the exact accessor exist.
+
+Couch module 129/0, clippy clean, hygiene / layering / all-policies-execute green, pin green on 3.11
+and 3.12; full library in the same commit's verification.
