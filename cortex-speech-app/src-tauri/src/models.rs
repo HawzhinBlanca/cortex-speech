@@ -1303,9 +1303,23 @@ pub(crate) fn ort_dylib_filename() -> &'static str {
     }
 }
 
-/// Locate the ONNX Runtime shared library next to the executable, in the active
-/// models directory, or in the working directory, and set `ORT_DYLIB_PATH` if it
-/// is not already set. Runs on every platform using the per-OS library name; if
+/// The ONNX Runtime library beneath one models directory, if present: nested inside a directory
+/// literally named `onnxruntime.dll` (how the Windows fetch and the Tauri resource copy lay it out),
+/// else flat in the directory itself. `is_file()` on purpose: on Windows that nested DIRECTORY is
+/// itself named `onnxruntime.dll`, and an `exists()` check would have handed ort a directory.
+fn ort_dylib_within(models_dir: &Path) -> Option<PathBuf> {
+    let dylib = ort_dylib_filename();
+    let nested = models_dir.join("onnxruntime.dll").join(dylib);
+    if nested.is_file() {
+        return Some(nested);
+    }
+    let flat = models_dir.join(dylib);
+    flat.is_file().then_some(flat)
+}
+
+/// Locate the ONNX Runtime shared library next to the executable, beneath the active
+/// or the bundled models directory, or in the working directory, and set `ORT_DYLIB_PATH`
+/// if it is not already set. Runs on every platform using the per-OS library name; if
 /// nothing is found it leaves the variable unset so `ort` falls back to the
 /// system loader's default search (this is purely additive — it never overrides
 /// an existing `ORT_DYLIB_PATH`).
@@ -1332,24 +1346,19 @@ pub fn init_ort_dylib_path() {
         }
     }
 
-    // 2. Bundled under the active models directory. On Windows the library is
-    //    packaged inside a directory literally named `onnxruntime.dll`; all
-    //    platforms also accept it placed flat in the models directory.
+    // 2. Beneath a models directory: the ACTIVE one first, then the BUNDLED one. The active
+    //    directory is the user models dir whenever no OmniASR CTC pair is installed on either side --
+    //    the shipped shape of a clean checkout since the pair became optional -- and a user download
+    //    never places the runtime there; fetch-models and the Tauri resource copy put it under the
+    //    bundled tree. Measured 2026-09-02 on a clean checkout: with only the active directory
+    //    searched, both VAD integration tests burned the 45-second probe timeout and failed.
     if resolved_path.is_none() {
-        let active_dir = active_models_dir();
-        #[cfg(target_os = "windows")]
-        {
-            let nested = active_dir.join("onnxruntime.dll").join(dylib);
-            if nested.exists() {
-                resolved_path = Some(nested);
-            }
+        let mut roots = vec![active_models_dir()];
+        let bundled = bundled_models_dir();
+        if !roots.contains(&bundled) {
+            roots.push(bundled);
         }
-        if resolved_path.is_none() {
-            let flat = active_dir.join(dylib);
-            if flat.exists() {
-                resolved_path = Some(flat);
-            }
-        }
+        resolved_path = roots.iter().find_map(|root| ort_dylib_within(root));
     }
 
     // 3. Current working directory.
@@ -1367,7 +1376,7 @@ pub fn init_ort_dylib_path() {
         std::env::set_var("ORT_DYLIB_PATH", path);
     } else {
         tracing::warn!(
-            "{dylib} not found next to exe, in models dir, or cwd; ORT will fall back to the system loader search"
+            "{dylib} not found next to exe, beneath the active or bundled models dir, or in cwd; ORT will fall back to the system loader search"
         );
     }
 }
@@ -1443,8 +1452,8 @@ pub fn ensure_ort_runtime_loadable() -> Result<(), String> {
                      This is what a MISSING or corrupt runtime looks like: `ort` is built with \
                      load-dynamic and blocks forever rather than failing. Fix it by restoring the \
                      library - run `npm run fetch-models` - or point ORT_DYLIB_PATH at a copy. \
-                     Looked next to the executable, in the active models directory, and in the \
-                     working directory.",
+                     Looked next to the executable, beneath the active and the bundled models \
+                     directories, and in the working directory.",
                     ort_dylib_filename(),
                     ORT_RUNTIME_PROBE_TIMEOUT,
                 )),
@@ -1621,6 +1630,30 @@ mod tests {
         assert_eq!(name, "libonnxruntime.dylib");
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         assert_eq!(name, "libonnxruntime.so");
+    }
+
+    #[test]
+    fn ort_dylib_within_finds_nested_or_flat_and_never_a_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dylib = ort_dylib_filename();
+
+        // A directory literally named onnxruntime.dll with nothing inside: `exists()` would have
+        // said yes to the directory itself and handed ort a folder. Nothing must resolve.
+        let hollow = tmp.path().join("hollow");
+        std::fs::create_dir_all(hollow.join("onnxruntime.dll")).expect("hollow dir");
+        assert_eq!(ort_dylib_within(&hollow), None);
+
+        let nested_root = tmp.path().join("nested");
+        std::fs::create_dir_all(nested_root.join("onnxruntime.dll")).expect("nested dir");
+        std::fs::write(nested_root.join("onnxruntime.dll").join(dylib), b"ort").expect("nested");
+        assert_eq!(ort_dylib_within(&nested_root), Some(nested_root.join("onnxruntime.dll").join(dylib)));
+
+        let flat_root = tmp.path().join("flat");
+        std::fs::create_dir_all(&flat_root).expect("flat dir");
+        std::fs::write(flat_root.join(dylib), b"ort").expect("flat");
+        assert_eq!(ort_dylib_within(&flat_root), Some(flat_root.join(dylib)));
+
+        assert_eq!(ort_dylib_within(&tmp.path().join("absent")), None);
     }
 
     #[test]

@@ -12700,3 +12700,37 @@ Proof of the absent arms cannot come from this tree — the CTC-bearing candidat
 selection and no seam hides it — so a fresh `git worktree` holding exactly the runner's three
 artifacts is the reproduction: the old tests fail there as on CI; the new ones are being run there
 now at the runner's parallelism.
+
+## 2026-09-02 — Layer twelve: the runtime search skipped the bundled tree, and a stop that had worked was called a failure
+
+Two findings on the same head, one from the runner and one from the clean worktree that stands in
+for it, both fixed and both proven where they failed.
+
+- **The ONNX Runtime search never consulted the bundled models tree.** `init_ort_dylib_path` looked
+  next to the executable, beneath the ACTIVE models directory, and in the working directory. The
+  active directory is the user models dir whenever no OmniASR CTC pair is installed on either side —
+  the shipped shape of a clean checkout since the pair became optional — and a user download never
+  places the runtime there; fetch-models and Tauri's resource copy put it under the bundled tree.
+  `tests/e2e_pipeline.rs` sets a user models dir, so on the clean worktree both VAD integration
+  tests burned the 45-second probe timeout and failed (10 tests, 46.62 s). On this workstation the
+  bundled CTC pair wins the directory resolution and hid the gap. The search now covers the active
+  directory and then the bundled one, through `ort_dylib_within`, which uses `is_file()` — on
+  Windows the nested holder is a DIRECTORY literally named `onnxruntime.dll`, and the old `exists()`
+  check would have handed ort a folder. Unit test for nested, flat, hollow-directory and absent
+  shapes; the two e2e assertions now `expect` so the Err prints instead of "VAD should succeed".
+  Clean worktree after the fix: 10 passed in 1.87 s.
+- **`stop_app` declared a stopped process a survivor.** On the hosted runner the positive control
+  of `test_stop_app_targets_one_exact_executable_and_waits_for_exit` threw "did not stop after the
+  force deadline" although `Stop-Process -Force` raised nothing: a process TerminateProcess has
+  accepted can stay enumerable while the kernel tears it down, and the single check after the
+  10-second wait aborted on that. Here a force-killed, handle-held stand-in leaves `Get-Process`
+  within 28 ms; the runner needed longer. The check is now a bounded 15-second re-poll, whatever is
+  still listed at the end fails the stop exactly as before, and the throw carries each survivor's
+  pid, `HasExited` and path so the next occurrence explains itself. The wrapper's timeout widened to
+  `force_after_seconds + 60` to sit above the new worst case. Bite-proof: with `Stop-Process`
+  neutered in a scratch copy, the positive control fails with the new diagnostic.
+
+Verified: `models::tests` (3 targeted), `e2e_pipeline` on both trees, `test_private_production_release.py`
+31/31 on Python 3.11 and 3.12 under an 8.3 TEMP, hygiene / layering / runtime-panic policies,
+`cargo clippy --all-targets -D warnings` clean. The unbounded clean-worktree bins + integration run
+(the earlier one hit a 14-minute bound after 26 of 43 targets) is recorded in the next entry.

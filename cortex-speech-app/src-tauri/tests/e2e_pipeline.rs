@@ -84,9 +84,7 @@ fn test_e2e_vad_detects_speech() {
     let (sample_rate, pcm) = audio::decode_to_pcm(&wav_path).unwrap();
 
     let result = voice_activity_detection(&pcm, sample_rate, 0.5);
-    assert!(result.is_ok(), "VAD should succeed");
-
-    let (segments, _backend) = result.unwrap();
+    let (segments, _backend) = result.expect("VAD should succeed");
     assert!(!segments.is_empty(), "VAD should detect at least one segment in non-silent audio");
 }
 
@@ -99,9 +97,7 @@ fn test_e2e_vad_silent_fallback() {
 
     let (sample_rate, pcm) = audio::decode_to_pcm(&wav_path).unwrap();
     let result = voice_activity_detection(&pcm, sample_rate, 0.5);
-    assert!(result.is_ok(), "VAD should succeed even on silent audio");
-
-    let (segments, _backend) = result.unwrap();
+    let (segments, _backend) = result.expect("VAD should succeed even on silent audio");
     assert!(!segments.is_empty(), "VAD should return fallback segment for silent audio");
 }
 

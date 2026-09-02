@@ -890,11 +890,29 @@ if ($processes.Count) { Wait-Process -Id $processes.Id -Timeout $env:CORTEX_RELE
 $left = @(Get-TargetedProcesses)
 foreach ($process in $left) { Stop-Process -Id $process.Id -Force }
 if ($left.Count) { Wait-Process -Id $left.Id -Timeout 10 -ErrorAction SilentlyContinue }
+# A process that TerminateProcess has already accepted can stay in the kernel's process list while
+# its threads are torn down. Measured 2026-09-02 on a hosted Windows runner: a force-stopped stand-in
+# was still enumerable after the 10-second wait, and the single check that used to sit here aborted
+# with "did not stop" although nothing had survived. Re-check for a bounded time; whatever is still
+# listed at the end is a genuine survivor and fails the stop exactly as before, now with its identity.
+$deadline = (Get-Date).AddSeconds(15)
 $survivors = @(Get-TargetedProcesses)
-if ($survivors.Count) { throw "Cortex app process did not stop after the force deadline" }
+while ($survivors.Count -and ((Get-Date) -lt $deadline)) {
+    Start-Sleep -Milliseconds 250
+    $survivors = @(Get-TargetedProcesses)
+}
+if ($survivors.Count) {
+    $detail = ($survivors | ForEach-Object {
+        $exited = try { $_.HasExited } catch { "?" }
+        "pid=$($_.Id) exited=$exited path=$($_.Path)"
+    }) -join "; "
+    throw "Cortex app process did not stop after the force deadline: $detail"
+}
 """
     env["CORTEX_RELEASE_STOP_TIMEOUT"] = str(force_after_seconds)
-    run(["powershell.exe", "-NoProfile", "-Command", script], timeout=force_after_seconds + 30, env=env)
+    # The script waits up to force_after_seconds, then 10s after the force stop, then re-checks for up to
+    # 15s more, so the wrapper's own bound sits well above that sum.
+    run(["powershell.exe", "-NoProfile", "-Command", script], timeout=force_after_seconds + 60, env=env)
 
 
 def launch_app(path: Path) -> None:
