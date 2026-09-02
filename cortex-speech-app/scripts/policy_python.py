@@ -16,7 +16,13 @@ APP_ROOT = Path(__file__).resolve().parents[1]
 LOCK_PATH = Path(__file__).resolve().with_name("policy_requirements.lock")
 ENV_ROOT = APP_ROOT / ".policy-python"
 STAMP_PATH = ENV_ROOT / "cortex-policy-environment.json"
-SUPPORTED_PYTHON = {(3, 11), (3, 12)}
+# ONE minor, the one CI runs (setup-python 3.12 in every job of ci.yml). Until 2026-09-02 this set
+# also admitted 3.11, the workstation's venv was 3.11.15, and the difference hid a production defect
+# for days: 3.12 fills `st_dev` from FILE_ID_INFO while the owner-proof identity guards compared a
+# 32-bit serial, so every guard refused every honest file — on CI only. A gate that passes here on
+# one interpreter and fails there on another is not the same gate. `setup_policy_python.py` refuses to
+# build the environment from any other minor and names the exact invocation.
+SUPPORTED_PYTHON = {(3, 12)}
 PINNED_DISTRIBUTIONS = {
     "cffi": "2.0.0",
     "click": "8.4.1",
