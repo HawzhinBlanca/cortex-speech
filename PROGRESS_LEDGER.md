@@ -12734,3 +12734,41 @@ Verified: `models::tests` (3 targeted), `e2e_pipeline` on both trees, `test_priv
 31/31 on Python 3.11 and 3.12 under an 8.3 TEMP, hygiene / layering / runtime-panic policies,
 `cargo clippy --all-targets -D warnings` clean. The unbounded clean-worktree bins + integration run
 (the earlier one hit a 14-minute bound after 26 of 43 targets) is recorded in the next entry.
+
+## 2026-09-02 — Test isolation debt: the suite no longer reads the shell's cloud keys, tests no longer drain each other's rate buckets, and a blank key variable no longer disables the stored key
+
+Two of the four safe debt items the owner listed, taken as soon as PR #73 landed, plus the
+production footgun the first one exposed on the way.
+
+- **Cloud keys from the ambient environment.** `ApiKeys::load` overlays the process environment over
+  `secrets.env`, so a shell that exports `GEMINI_API_KEY` or `OPENROUTER_API_KEY` handed every test
+  binary a live key: the `import_flow` tests that assert "no Gemini key in scope" went red, and a
+  cloud path that reached the network would have done so for real (recorded 2026-09-01 as "the suite
+  is offline only because this box has it unset"). A root `.cargo/config.toml` now sets both names
+  to a BLANK value with `force = true`; cargo applies `[env]` to build scripts, `cargo run` and
+  every test binary (measured on a lib and an integration test in a scratch crate). The file sits at
+  the repository root because cargo discovers config from the current directory upward and cargo
+  runs from three cwds here (root Makefile, `cortex-speech-app/` on CI, `src-tauri/`). Pinned by
+  `test_credential_loader_policy.py`, wired into its `main()`. Measured before/after with
+  `GEMINI_API_KEY=x` exported: the two guarded tests fail on the unpatched tree and pass after.
+- **The blank values then erased every key a test had stored** — 7 failures in the first full run.
+  The overlay treated a blank variable as "remove the stored key", although the store's own rule
+  since ae4ccd0a is that blank values count as unset. In production that meant a stray
+  `GEMINI_API_KEY=` in a shell profile silently disabled the app's stored key, and the `#[ignore]`
+  live test would have skipped. The overlay is now a pure `overlay_environment`: a non-blank
+  variable wins, a blank one is unset and neither overrides nor clears. Deterministic unit test
+  through an injected lookup, no process-env mutation; bite-proof with the guard removed.
+- **Cross-test rate-limiter drain.** `STRICT_RATE_LIMITER` is process-global and keyed by command
+  name with burst 5, and every `#[test]` runs on its own thread, so a second test on an already-tested
+  command inherited a drained bucket and failed with `RATE_LIMITED` depending on scheduling (the
+  export test on the 4-core runner, 2026-09-02). Under `cfg(test)` the bucket key now carries the
+  calling thread's id: each test keeps the full fence for its own calls and none can drain another's.
+  Production code never compiles that branch. Proven with a rate-0 (no refill) probe limiter: a
+  thread that has spent its three tokens sees a sibling thread get three fresh ones and a fourth
+  refusal of its own, and stays refused itself — deterministic, no timing window. Bite-proof: with
+  the four scoping lines removed the proof fails at "a fresh bucket, then its own limit".
+
+Recorded, not changed: `src-tauri/.cargo/config.toml` sets `+crt-static` for MSVC, and by cargo's
+cwd-based discovery CI's `cortex-speech-app/`-rooted cargo runs never see it, so the workstation and
+the runner link with different CRT flags. Moving it to the root would change CI's link inputs; that
+is a separate, deliberate change.
