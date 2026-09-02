@@ -12918,3 +12918,24 @@ another is not the same gate.
   is matched against every `python-version:` in `ci.yml` so the two cannot drift apart silently.
 - This workstation's `.policy-python` was rebuilt from `Python312\python.exe`; the earlier dual-run
   habit (3.11 and 3.12 for every touched gate) becomes unnecessary because only 3.12 exists.
+## 2026-09-02 — Regression fixed: the root cargo config from PR #74 made the owner-proof helper build refuse
+
+PR #74 put the cloud-key `[env]` blanking in a repository-root `.cargo/config.toml`. Measured this evening
+while withdrawing PR #78: `prepare_owner_proof_inputs._require_exact_cargo_configuration` walks
+`src-tauri/` and EVERY parent and refuses the helper build when any `.cargo/config(.toml)` other than the
+registered `src-tauri/.cargo/config.toml` exists — "an alternate Cargo configuration could influence the
+owner-proof helper build" — and the registered file's sha256 is bound into
+`owner_proof_input_contract.v1.json`. Owner-proof input preparation was therefore refusing on the release
+workstation from 13:24Z until this fix, while every CI run stayed green: the policy test mocks `lexists`
+and the real proof never runs on a runner. Confirmed by calling the real function on this box: refused
+with the root file present, accepted without it.
+
+- The root `.cargo/config.toml` is gone. Isolation now lives in two places: `ci.yml` blanks both key
+  names in its top-level `env` (a blank value counts as unset in the loader), and `ApiKeys::load` skips
+  the process-environment overlay under `cfg(test)` — the library test binary never sees an exported
+  key; tests that exercise the overlay call `overlay_environment` with an injected lookup.
+- Measured with `GEMINI_API_KEY=x` exported: the two guarded `import_flow` tests and the store tests pass
+  (21/21); with the `cfg(not(test))` attribute removed the guarded test fails — the bite.
+- `test_credential_loader_policy.py` now pins the absence of any cargo config outside `src-tauri/.cargo`,
+  the blank names in `ci.yml`, and the `cfg` skip in the loader, citing the proof function.
+- The CRT-parity idea (PR #78, withdrawn) collides with the same authority rule and is recorded as open.

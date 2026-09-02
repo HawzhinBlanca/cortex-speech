@@ -62,6 +62,15 @@ impl ApiKeys {
         crate::atomic_file::recover_interrupted_replace(&path)
             .map_err(|e| format!("recover interrupted secrets-file replacement: {e}"))?;
         let mut map = parse_env_file(&path)?;
+        // The process environment is layered over the store in production. The library TEST binary
+        // never reads it: a shell that exports a key would otherwise hand every test a live one --
+        // the import_flow tests assert none is in scope and go red, and a cloud path would upload
+        // for real. Tests that exercise the overlay itself call `overlay_environment` with an
+        // injected lookup. A cargo `[env]` table could have blanked the names instead, but the
+        // owner-proof helper build refuses any `.cargo/config.toml` other than the registered
+        // src-tauri one, whose hash is bound into the tracked contract (measured 2026-09-02: a root
+        // config broke proof preparation on the release workstation). CI blanks both names in ci.yml.
+        #[cfg(not(test))]
         overlay_environment(&mut map, |name| std::env::var(name).ok());
         Ok(Self { gemini: map.remove("GEMINI_API_KEY"), openrouter: map.remove("OPENROUTER_API_KEY") })
     }

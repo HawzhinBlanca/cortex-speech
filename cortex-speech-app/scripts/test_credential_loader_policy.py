@@ -16,9 +16,11 @@ Scope: Rust sources and tests, excluding api_keys.rs (the real loader) and dpapi
 uses). A mention of the filename in a message or doc comment is fine — this looks for actual parsing.
 
 Added 2026-09-02: the loader also overlays the PROCESS ENVIRONMENT, so a shell that exports a key
-would hand it to every test binary. The root `.cargo/config.toml` blanks both key names for every
-cargo-launched process, and a blank variable counts as unset in the loader (it neither overrides
-nor clears a stored key); the third test pins the config, `api_keys::tests` pins the rule.
+would hand it to every test binary. Isolation lives in two places -- ci.yml blanks both names at the
+top level (a blank variable counts as unset in the loader: it neither overrides nor clears a stored
+key), and the library test binary skips the overlay under cfg(test). It must NOT live in a cargo
+config outside src-tauri: the owner-proof helper build refuses any such file. The third test pins
+all three facts; `api_keys::tests` pins the blank-is-unset rule.
 """
 
 from __future__ import annotations
@@ -78,30 +80,50 @@ def test_the_live_key_test_uses_the_production_loader() -> None:
     assert "strip_prefix(&format!(\"{name}=\"))" not in text, "the hand-parser is back"
 
 
-def test_cargo_blanks_cloud_keys_for_every_test_binary() -> None:
-    """An exported key must never reach a test binary: red suite at best, a real upload at worst.
+PROOF_REGISTERED_CONFIG = REPO_ROOT / "cortex-speech-app" / "src-tauri" / ".cargo" / "config.toml"
+WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+LOADER = SRC / "src" / "api_keys.rs"
 
-    `ApiKeys::load` overlays the environment over secrets.env. cargo applies `[env]` to every process
-    it launches, test binaries included, and a BLANK value counts as unset in the loader. The file
-    must be at the repository root: cargo discovers config from the current directory upward, and
-    cargo is run from the root Makefile, from cortex-speech-app/ (CI) and from src-tauri/.
+
+def test_no_cargo_config_outside_the_registered_one_and_ci_blanks_cloud_keys() -> None:
+    """Test isolation from ambient keys must never come from a cargo config outside src-tauri.
+
+    prepare_owner_proof_inputs._require_exact_cargo_configuration walks src-tauri and EVERY parent
+    and refuses the helper build when any .cargo/config(.toml) other than the registered one exists;
+    the registered file's sha256 is bound into owner_proof_input_contract.v1.json. Measured
+    2026-09-02: a root .cargo/config.toml (PR #74) made proof preparation refuse on the release
+    workstation for five hours while every CI run stayed green. Isolation therefore lives in ci.yml
+    (both names blank at the top level; a blank value counts as unset in the loader) and in the
+    library test binary never reading the process environment.
     """
-    path = REPO_ROOT / ".cargo" / "config.toml"
-    if not path.is_file():
-        raise AssertionError(f"{path} is missing — every cargo-launched test binary sees the ambient keys")
-    text = path.read_text(encoding="utf-8")
-    assert "[env]" in text, "the [env] table is gone"
+    strays = [
+        str(path.relative_to(REPO_ROOT))
+        for base in (REPO_ROOT, REPO_ROOT / "cortex-speech-app")
+        for name in ("config", "config.toml")
+        for path in [base / ".cargo" / name]
+        if path.exists()
+    ]
+    assert not strays, (
+        "a cargo config outside src-tauri/.cargo makes the owner-proof helper build refuse "
+        "('an alternate Cargo configuration could influence the owner-proof helper build'):\n"
+        + "\n".join(f"- {s}" for s in strays)
+    )
+    assert PROOF_REGISTERED_CONFIG.is_file(), "the registered src-tauri/.cargo/config.toml is missing"
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    top_env = workflow.split("\njobs:", 1)[0]
     for name in ("GEMINI_API_KEY", "OPENROUTER_API_KEY"):
-        assert f'{name} = {{ value = "", force = true }}' in text, (
-            f"{name} must be blanked with force = true; without force an exported value wins, and a "
-            "non-empty value would be read as a key"
-        )
+        assert f'{name}: ""' in top_env, f"ci.yml must blank {name} in its top-level env so no runner secret reaches a test binary"
+    loader = LOADER.read_text(encoding="utf-8")
+    assert "#[cfg(not(test))]\n        overlay_environment(&mut map, |name| std::env::var(name).ok());" in loader, (
+        "ApiKeys::load must skip the process-environment overlay under cfg(test); the library test "
+        "binary must never see an exported key"
+    )
 
 
 def main() -> None:
     test_no_rust_file_parses_secrets_env_itself()
     test_the_live_key_test_uses_the_production_loader()
-    test_cargo_blanks_cloud_keys_for_every_test_binary()
+    test_no_cargo_config_outside_the_registered_one_and_ci_blanks_cloud_keys()
     print("credential loader policy passed")
 
 
