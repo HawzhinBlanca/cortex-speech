@@ -2891,6 +2891,120 @@ mod tests {
     /// decision on a clip the reviewer just heard, decided and undid was refused 428 "play the whole
     /// clip first". The reviewer is punished for using Undo, seconds after listening.
     #[test]
+    fn an_undone_decision_never_reaches_an_export_and_a_redecision_exports_only_its_own_text() {
+        // The learning flywheel's entry condition, proven at the SERVING path of the export rather
+        // than at the writer: only an ACTIVE, unreversed human decision may hand text to a dataset.
+        // Decision -> export -> exact Undo -> export -> redecision -> export on one connection; then
+        // that connection is DROPPED and the restart and lost-response legs run on a fresh connection
+        // to the same file with fresh in-memory couch state. That models a restart at the database
+        // and session layer -- not a separate OS process -- and the claim below is exactly that.
+        // Before 2026-09-02 the undo restore and the export filter were each proven alone; the first
+        // version of this test (d517f24d) reopened the file but still replayed through the original
+        // handle, which proved persistence of one export and nothing about replay -- caught by an
+        // independent audit the same day.
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = "دەقی ئەسڵی";
+        let first = "ڕاستکراوەی یەکەم";
+        let second = "ڕاستکراوەی دووەم";
+        let export_from = |db: &Database, label: &str| -> (String, u64) {
+            let out = tmp.path().join(format!("{label}.json"));
+            crate::export::export_dataset(db, &out, &crate::settings::ExportFormat::Json).expect(label);
+            let body = std::fs::read_to_string(&out).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let verified = parsed["metadata"]["verified_segments"].as_u64().unwrap_or(0);
+            (body, verified)
+        };
+        let events_in = |db: &Database| -> i64 {
+            db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap()
+        };
+
+        // Everything on the FIRST connection lives in this block. It returns only what the fresh
+        // connection needs; the handle and every closure over it are dropped at the closing brace.
+        let (db_path, redecision, events_after_redecision) = {
+            let (db, db_path) = test_db(tmp.path());
+            db.insert_segment(&seg("fw1", raw)).unwrap();
+            let state = state();
+            let decide = |text: &str| {
+                let body = serde_json::json!({
+                    "id": "fw1", "action": "edit", "text": text,
+                    "heardMs": 1_500, "clipDurationMs": 1_500,
+                });
+                api_decision(&db, body.to_string().as_bytes(), "Sara", &state).0
+            };
+
+            let (before, verified) = export_from(&db, "before");
+            assert!(before.contains(raw) && !before.contains(first), "untouched: the champion's raw text serves");
+            assert_eq!(verified, 0);
+
+            assert_eq!(decide(first), 200);
+            let (decided, verified) = export_from(&db, "decided");
+            assert!(decided.contains(first), "an active human decision is what the export serves");
+            assert_eq!(verified, 1, "and it counts as verified");
+
+            assert_eq!(api_undo(&db, "Sara", &state).0, 200, "exact undo");
+            let (undone, verified) = export_from(&db, "undone");
+            assert!(
+                !undone.contains(first),
+                "an undone decision's text must be absent from the export, in every field"
+            );
+            assert!(undone.contains(raw), "the pre-decision text is served again");
+            assert_eq!(verified, 0, "an undone decision no longer counts as verified");
+
+            // The redecision carries a durable operation id so the lost-response leg can replay it
+            // byte for byte, exactly as a client that never saw the reply would.
+            let redecision = serde_json::json!({
+                "operationId": "fe11fe11-fe11-4fe1-8fe1-fe11fe11fe11",
+                "id": "fw1", "action": "edit", "text": second, "reviewer": "Sara",
+                "rowVersion": db.segment_row_stamp("fw1").unwrap().unwrap(),
+                "heardMs": 1_500, "clipDurationMs": 1_500,
+            });
+            assert_eq!(
+                api_decision(&db, redecision.to_string().as_bytes(), "Sara", &state).0,
+                200,
+                "redecision after undo"
+            );
+            let (redecided, verified) = export_from(&db, "redecided");
+            assert!(redecided.contains(second), "the live decision exports");
+            assert!(!redecided.contains(first), "the undone text stays gone after a redecision");
+            assert_eq!(verified, 1);
+            (db_path, redecision, events_in(&db))
+        };
+
+        // Restart at the database and session layer: a NEW connection to the same file and fresh
+        // in-memory couch state (no leases, no undo memory). The first handle no longer exists, so
+        // nothing below can be answered from it.
+        let reopened = Database::open(&db_path).unwrap();
+        let restarted_state = self::state();
+        let (restarted, verified) = export_from(&reopened, "restart");
+        assert!(
+            restarted.contains(second) && !restarted.contains(first),
+            "the live decision survives a database restart"
+        );
+        assert_eq!(verified, 1);
+        assert_eq!(
+            events_in(&reopened),
+            events_after_redecision,
+            "the event trail is on disk, not in the dropped connection"
+        );
+
+        // Lost response through the fresh connection: the client never saw the redecision's reply
+        // and retries the SAME operation after the restart. The replay must be a side-effect-free
+        // duplicate -- acknowledged from the durable receipt, no second event, the export unchanged.
+        let (code, _, response, ..) =
+            api_decision(&reopened, redecision.to_string().as_bytes(), "Sara", &restarted_state);
+        assert_eq!(code, 200, "a replay through a fresh connection is accepted");
+        let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(
+            response["duplicate"], true,
+            "a replayed operation is acknowledged from the durable receipt, never re-applied"
+        );
+        assert_eq!(events_in(&reopened), events_after_redecision, "a replay writes no second event");
+        let (replayed, verified) = export_from(&reopened, "replayed");
+        assert!(replayed.contains(second) && !replayed.contains(first), "the export is unchanged by a replay");
+        assert_eq!(verified, 1);
+    }
+
+    #[test]
     fn undo_then_redecide_does_not_demand_a_second_listen() {
         let tmp = tempfile::tempdir().unwrap();
         let (db, _) = test_db(tmp.path());
