@@ -253,13 +253,14 @@ mod state_command_surface_tests {
         let app = managed_app_state(tmp.path());
 
         let json = tmp.path().join("dataset.json");
-        // The refusal goes FIRST. `export_dataset` sits behind STRICT_RATE_LIMITER, a process-global
-        // token bucket keyed by command name with burst 5 and refill 10/s. This test issues six
-        // command-level calls; with the refusal last, the sixth needed a refilled token and whether
-        // one had accrued depended on how fast the five empty-library exports ran -- measured 2026-09-02
-        // on a 4-core runner: `RATE_LIMITED` where `INVALID_OUTPUT_PATH` was asserted. Refusing first
-        // spends token 1 on a full bucket, and the five format exports then consume exactly the burst,
-        // so nothing here depends on elapsed time.
+        // `export_dataset` sits behind STRICT_RATE_LIMITER: a process-global token bucket keyed by
+        // command name, burst 5, refilled at 10/s by wall clock. This test makes SIX command-level
+        // calls (one refusal + five formats), so the sixth always needs a refilled token, and whether
+        // one had accrued depended on how long the five empty-library exports took -- measured
+        // 2026-09-02: `RATE_LIMITED` on a 4-core runner and in a clean worktree at four threads, and
+        // then here too once the refusal moved first. The refusal goes first on a full bucket, and
+        // before the sixth call the test waits one refill period explicitly (see below), which is the
+        // limiter's own contract rather than a guess about how fast the machine is.
         let refused =
             block_on(export_dataset(unusable_destination(tmp.path(), "out.json"), "json".into(), app.state()))
                 .expect_err("a destination whose parent does not exist is refused");
@@ -289,6 +290,10 @@ mod state_command_surface_tests {
         let parquet_bytes = std::fs::read(&parquet).unwrap();
         assert_eq!(&parquet_bytes[..4], b"PAR1", "a real Parquet file opens with the PAR1 magic");
         assert_eq!(&parquet_bytes[parquet_bytes.len() - 4..], b"PAR1", "and closes with it");
+
+        // Sixth call: the bucket has spent its burst of five above. Refill is 10 tokens/s by elapsed
+        // wall-clock time, so 120 ms guarantees at least one token however loaded the machine is.
+        std::thread::sleep(std::time::Duration::from_millis(120));
 
         // Case-insensitive match plus the `_ => Json` arm: an unknown format is not an error, it is JSON.
         let fallback = tmp.path().join("fallback.bin");
