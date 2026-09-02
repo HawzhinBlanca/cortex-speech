@@ -12799,7 +12799,9 @@ undo's write-back parameter swapped to the decision's own text (`db/decisions.rs
 proof fails at "an undone decision's text must be absent from the export, in every field"; file
 restored hash-identical.
 
-Not covered here, recorded honestly: link rotation (no rotation helper exists in the couch tests;
-a decision's eligibility does not reference session tokens, but that is reasoning, not a
-measurement) and lost-response replay into an export (the exactly-once couch proofs cover the
-decision and pay side; the export side would be a second test on the same shape).
+Lost-response replay is covered in the same test: the redecision carries a durable operation id and
+is replayed byte for byte against a fresh state after the restart leg; the replay answers
+duplicate, writes no second review event, and the export still serves only the live text with one
+verified row. Not covered, recorded honestly: link rotation (no rotation helper exists in the couch
+tests; a decision's eligibility does not reference session tokens, but that is reasoning, not a
+measurement).

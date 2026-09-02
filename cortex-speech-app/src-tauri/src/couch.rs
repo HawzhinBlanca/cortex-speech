@@ -2935,7 +2935,20 @@ mod tests {
         assert!(undone.contains(raw), "the pre-decision text is served again");
         assert_eq!(verified, 0, "an undone decision no longer counts as verified");
 
-        assert_eq!(decide(second), 200, "redecision after undo");
+        // The redecision carries a durable operation id so the lost-response leg below can replay it
+        // byte for byte, exactly as a client that never saw the reply would.
+        let operation_id = "fe11fe11-fe11-4fe1-8fe1-fe11fe11fe11";
+        let redecision = serde_json::json!({
+            "operationId": operation_id,
+            "id": "fw1", "action": "edit", "text": second, "reviewer": "Sara",
+            "rowVersion": db.segment_row_stamp("fw1").unwrap().unwrap(),
+            "heardMs": 1_500, "clipDurationMs": 1_500,
+        });
+        assert_eq!(
+            api_decision(&db, redecision.to_string().as_bytes(), "Sara", &state).0,
+            200,
+            "redecision after undo"
+        );
         let (redecided, verified) = export("redecided");
         assert!(redecided.contains(second), "the live decision exports");
         assert!(!redecided.contains(first), "the undone text stays gone after a redecision");
@@ -2948,6 +2961,23 @@ mod tests {
         crate::export::export_dataset(&reopened, &out, &crate::settings::ExportFormat::Json).unwrap();
         let body = std::fs::read_to_string(&out).unwrap();
         assert!(body.contains(second) && !body.contains(first), "the live decision survives a database restart");
+
+        // Lost response: the client never saw the redecision's reply and retries the SAME operation
+        // after a restart. The replay must be a side-effect-free duplicate -- no second event, the
+        // export unchanged, and the undone text still gone.
+        let events = || -> i64 {
+            db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap()
+        };
+        let events_before = events();
+        let restarted_state = self::state();
+        let (code, _, response, ..) = api_decision(&db, redecision.to_string().as_bytes(), "Sara", &restarted_state);
+        assert_eq!(code, 200);
+        let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["duplicate"], true, "a replayed operation is acknowledged, never re-applied");
+        assert_eq!(events(), events_before, "a replay writes no second event");
+        let (replayed, verified) = export("replayed");
+        assert!(replayed.contains(second) && !replayed.contains(first), "the export is unchanged by a replay");
+        assert_eq!(verified, 1);
     }
 
     #[test]
