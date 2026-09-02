@@ -12848,3 +12848,36 @@ was under test; this workstation restarts several times a day.
 
 Couch module 129/0, clippy clean, hygiene / layering / all-policies-execute green, pin green on 3.11
 and 3.12; full library in the same commit's verification.
+
+## 2026-09-02 — Champion reboot supervision: designed, tested, and left for the owner to register
+
+After the 00:06 reboot every reviewer link came back and the OmniASR-7B champion stayed dark on 8799
+until a person started it. The reviewer line has a watchdog; the champion had nothing, and nothing
+reported that. Registering a scheduled task is privileged boot configuration, so this change
+delivers the supervisor and its verification without registering anything.
+
+- `scripts/ops/cortex-champion-supervisor.ps1` mirrors the reviewer watchdog's registration shape:
+  at-logon bound to the exact interactive principal plus a 5-minute clock trigger,
+  `-StartWhenAvailable`, `-MultipleInstances IgnoreNew`, no execution time limit (a launch loads
+  ~17 GB per GPU), battery flags on. A pass runs the repo's idempotent, identity-bound
+  `start_7b_server.ps1` (READY without touching a champion that already serves the exact pointer).
+  `-DryRun` prints the plan for either mode and exits before any side effect; `-Register` is the
+  owner's action. Exercised here in both dry-run modes: plan printed, `CortexChampionSupervisor`
+  confirmed absent afterwards.
+- `scripts/check_champion_supervision.py` is read-only and answers two questions separately: is the
+  task registered/enabled/StartWhenAvailable with an at-logon trigger, and does the champion answer
+  the app's own identity-bound probe as `omniasr-7b-legacy-c348ade8a816`. Exit 2 with an explicit
+  OWNER ACTION line when the task is missing, 1 when the champion is not serving, 0 when both hold.
+  On the live box now: task absent (exit 2), champion ready with the locked identity. Not wired into
+  the required gate set — that is the owner's decision once the task exists.
+- `test_champion_supervision_policy.py` pins the registration shape, the checker's read-only
+  vocabulary (no Register/Start/Stop/schtasks-change/starter/nvidia-smi), the verdict fixtures, and
+  runs both dry-runs asserting the plan and that every dry-run branch exits before a side effect.
+- Also fixed on the way: `check_supervision_live.py` told the operator to register the reviewer
+  watchdog with `scripts/ops/install-watchdog.ps1`, which does not exist; the real command is
+  `scripts/ops/cortex-watchdog.ps1 -Register`, which the same file already names elsewhere.
+
+Owner action (visible, not synthesized): run `scripts/ops/cortex-champion-supervisor.ps1 -Register`
+in an interactive session on the release workstation, then `check_champion_supervision.py` must
+exit 0. The GPU clock lock (`nvidia-smi -lgc 1500,2055`, admin, resets on reboot) remains a separate
+owner action; nothing here touches clocks.
