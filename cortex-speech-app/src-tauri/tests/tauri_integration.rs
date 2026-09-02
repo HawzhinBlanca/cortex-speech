@@ -3,8 +3,15 @@
 mod fixtures;
 
 use assert_cmd::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+/// assert_cmd's `.timeout()` KILLS the child when the budget runs out and, on Windows, reports the
+/// kill as a plain exit code 1 with empty stdout and stderr -- indistinguishable from a real
+/// `CORTEX_INTEGRATION_FAIL` exit. Measured 2026-09-02 on the hosted Windows runner (PR #77): the
+/// gate went red on "code=1, stdout=\"\", stderr=\"\"" after exactly 120.05 s, on a Rust tree
+/// identical to a green main. Name the budget so the next such failure explains itself.
+const EXE_BUDGET: Duration = Duration::from_secs(120);
 
 #[test]
 fn tauri_integration_import_export_validate() {
@@ -24,20 +31,34 @@ fn tauri_integration_import_export_validate() {
         // it — measured 124 stale dirs / 84 MB, and this test leaks one PER ATTEMPT, up to 3 a run.
         let data_dir = TempDir::new().expect("tempdir");
 
+        let started = Instant::now();
         let output = Command::cargo_bin("cortex-speech-app")
             .expect("binary built")
             .env("CORTEX_INTEGRATION_TEST", "1")
             .env("CORTEX_INTEGRATION_FIXTURE", fixture_dir.path())
             .env("CORTEX_APP_DATA_DIR", data_dir.path())
             .env("RUST_LOG", "error")
-            .timeout(Duration::from_secs(120))
-            .assert()
-            .success()
-            .get_output()
-            .stdout
-            .clone();
-
-        last = String::from_utf8_lossy(&output).to_string();
+            .timeout(EXE_BUDGET)
+            .output()
+            .expect("spawn the real binary");
+        let elapsed = started.elapsed();
+        if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let verdict = if elapsed >= EXE_BUDGET - Duration::from_secs(2) {
+                format!(
+                    "the exe was KILLED at the {}s budget after {:.1}s: a startup or runtime stall on this \
+                     machine, not a pipeline verdict (a real pipeline failure prints CORTEX_INTEGRATION_FAIL \
+                     and exits within seconds)",
+                    EXE_BUDGET.as_secs(),
+                    elapsed.as_secs_f64()
+                )
+            } else {
+                format!("the exe exited {:?} after {:.1}s", output.status.code(), elapsed.as_secs_f64())
+            };
+            panic!("{verdict}\nstdout={stdout:?}\nstderr={stderr:?}");
+        }
+        last = String::from_utf8_lossy(&output.stdout).to_string();
         if last.contains("CORTEX_INTEGRATION_OK") {
             return; // real import -> export -> validate pipeline success
         }
