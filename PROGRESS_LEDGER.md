@@ -12881,3 +12881,40 @@ Owner action (visible, not synthesized): run `scripts/ops/cortex-champion-superv
 in an interactive session on the release workstation, then `check_champion_supervision.py` must
 exit 0. The GPU clock lock (`nvidia-smi -lgc 1500,2055`, admin, resets on reboot) remains a separate
 owner action; nothing here touches clocks.
+
+## 2026-09-02 — Windows link parity: the MSVC +crt-static flag moves to the root cargo config
+
+cargo discovers `.cargo/config.toml` from the CURRENT DIRECTORY upward, never from the manifest.
+`src-tauri/.cargo/config.toml` set `+crt-static` for MSVC (sherpa-onnx's prebuilt libraries use the
+static CRT); the release workstation runs cargo from `src-tauri/` and got it, CI runs cargo from
+`cortex-speech-app/` with `--manifest-path` and never did. The runner and the workstation therefore
+linked with different CRT flags for as long as that file existed — recorded as a divergence on
+2026-09-02 (PR #74) and moved deliberately here, as its own change with its own CI run.
+
+- The section now sits in the root `.cargo/config.toml` next to the test-isolation `[env]` table;
+  the nested file is gone. Every cwd in use (root Makefile, `cortex-speech-app/`, `src-tauri/`) walks
+  up to the root, and so do the other three crates under the tree (src-tauri/fuzz, the vendored
+  tiny_http fork, scripts/updater-signature-verifier): a static CRT for each is the same choice.
+- Pinned by `test_cargo_config_policy.py`: the root config carries the target section and the exact
+  flag, and no nested `.cargo/config.toml` may shadow it.
+- The proof of parity is the Windows Release Gate itself linking with the flag for the first time;
+  the rustflags change also invalidates the runner's Rust cache once.
+
+## 2026-09-02 — The policy interpreter is pinned to the one minor CI runs
+
+`policy_python.py` admitted `{3.11, 3.12}`. CI installs 3.12 in every job; this workstation's
+`.policy-python` was built from a 3.11 `python` on PATH (another agent's venv). The difference hid a
+production defect for days: 3.12 fills `st_dev` from FILE_ID_INFO while the owner-proof identity
+guards compared a 32-bit serial, so every guard refused every honest file — on CI only, invisible
+here (layer 3 of the Windows Release Gate RCA). A gate that passes on one interpreter and fails on
+another is not the same gate.
+
+- `SUPPORTED_PYTHON = {(3, 12)}`. `validate_environment` now refuses a 3.11 venv the same way it
+  refused 3.13; the launcher identity records `python: 3.12`.
+- `setup_policy_python.py` refuses to BUILD the environment from any other base interpreter, before
+  creating anything, and names the exact invocation (`py -3.12 setup_policy_python.py` on Windows).
+  Building first and refusing later would leave a 3.11 venv whose every result is untrusted.
+- `test_policy_python_environment.py`: 3.11 and 3.13 refused, 3.12 accepted, and the admitted minor
+  is matched against every `python-version:` in `ci.yml` so the two cannot drift apart silently.
+- This workstation's `.policy-python` was rebuilt from `Python312\python.exe`; the earlier dual-run
+  habit (3.11 and 3.12 for every touched gate) becomes unnecessary because only 3.12 exists.

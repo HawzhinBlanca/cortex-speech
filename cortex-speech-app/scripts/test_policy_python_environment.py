@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import importlib.metadata
 
 from policy_python import (
@@ -54,15 +57,27 @@ def test_version_drift_is_refused() -> None:
 
 def test_unreviewed_python_minor_is_refused() -> None:
     pins = parse_lock()
-    try:
-        validate_environment(version_getter=pins.__getitem__, version_info=(3, 13))
-    except PolicyEnvironmentError as error:
-        assert "outside the locked policy interpreter set" in str(error)
-    else:
-        raise AssertionError("an unreviewed Python minor must fail closed")
+    for minor in (11, 13):
+        try:
+            validate_environment(version_getter=pins.__getitem__, version_info=(3, minor))
+        except PolicyEnvironmentError as error:
+            assert "outside the locked policy interpreter set" in str(error)
+        else:
+            raise AssertionError(f"Python 3.{minor} must fail closed: only CI's 3.12 is the locked interpreter")
+
+
+def test_the_locked_minor_is_exactly_what_ci_runs() -> None:
+    """3.12 is the only admitted minor, and it is the one every ci.yml job installs."""
+    pins = parse_lock()
+    identity = validate_environment(version_getter=pins.__getitem__, version_info=(3, 12))
+    assert identity["python"] == "3.12"
+    workflow = (Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    declared = set(re.findall(r"python-version:\s*'?\"?(3\.\d+)", workflow))
+    assert declared == {"3.12"}, f"ci.yml installs {sorted(declared)}, the lock admits only 3.12"
 
 
 def main() -> None:
+    test_the_locked_minor_is_exactly_what_ci_runs()
     test_lock_is_exact_and_environment_is_current()
     test_missing_distribution_is_refused()
     test_version_drift_is_refused()
