@@ -24,6 +24,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Test isolation from the ambient environment. ApiKeys::load layers the process environment over
+  # secrets.env, and a BLANK value counts as unset; blanking both names here guarantees no runner
+  # secret can ever reach a test binary. This lives in the workflow, not in a .cargo/config.toml:
+  # the owner-proof helper build refuses any cargo config other than the registered
+  # src-tauri/.cargo/config.toml (2026-09-02, a root config broke proof preparation for five hours).
+  GEMINI_API_KEY: ""
+  OPENROUTER_API_KEY: ""
 
 jobs:
   governance-gate:
