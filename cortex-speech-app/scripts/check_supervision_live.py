@@ -67,7 +67,7 @@ def evaluate_supervision(
     if watchdog_state is None:
         problems.append(
             f"{WATCHDOG_TASK} scheduled task is not registered — nothing will restart the app when it "
-            f"exits, and it exits (5 times in the last week). Register it with scripts/ops/install-watchdog.ps1."
+            f"exits, and it exits (5 times in the last week). Register it with scripts/ops/cortex-watchdog.ps1 -Register."
         )
     elif watchdog_state.strip().lower().startswith("disabled"):
         problems.append(
