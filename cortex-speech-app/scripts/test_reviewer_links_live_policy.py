@@ -620,6 +620,13 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
 
         class Redirect(Quiet):
             def do_POST(self):
+                # Drain the request body BEFORE answering. A server that closes with unread request
+                # bytes sends RST, and RST discards whatever the client has not read yet: on a fast
+                # box the client already holds the status line, on a loaded runner the reset lands
+                # first and the probe honestly reports a transport failure as status None
+                # (measured 2026-09-02 on the Windows runner: "None != 302"; the macOS Errno 54 of
+                # 2026-09-01 was the same defect one step later, at the body read).
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 self.send_response(302)
                 self.send_header("Location", f"http://127.0.0.1:{sink.server_port}/sink")
                 self.end_headers()

@@ -12768,6 +12768,13 @@ production footgun the first one exposed on the way.
   refusal of its own, and stays refused itself — deterministic, no timing window. Bite-proof: with
   the four scoping lines removed the proof fails at "a fresh bucket, then its own limit".
 
+- **Runner-only red on the first CI run of this PR, fixed in the fixture.** `test_probe_redirect_is_not_followed`
+  failed "None != 302" on the Windows runner while green here 6/6: the redirect fixture answered 302
+  without reading the request body, so the server closed with unread bytes and sent RST, which
+  discards the client's unread response on a slow box. The 2026-09-01 macOS Errno 54 was the same
+  defect one step later. The fixture now drains the body first; the probe and the assertion are
+  unchanged.
+
 Recorded, not changed: `src-tauri/.cargo/config.toml` sets `+crt-static` for MSVC, and by cargo's
 cwd-based discovery CI's `cortex-speech-app/`-rooted cargo runs never see it, so the workstation and
 the runner link with different CRT flags. Moving it to the root would change CI's link inputs; that
