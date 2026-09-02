@@ -12939,3 +12939,14 @@ with the root file present, accepted without it.
 - `test_credential_loader_policy.py` now pins the absence of any cargo config outside `src-tauri/.cargo`,
   the blank names in `ci.yml`, and the `cfg` skip in the loader, citing the proof function.
 - The CRT-parity idea (PR #78, withdrawn) collides with the same authority rule and is recorded as open.
+
+## 2026-09-02 — The real-exe integration test names a timeout kill instead of reporting code=1
+
+assert_cmd's `.timeout()` KILLS the child when the budget runs out and, on Windows, reports the kill
+as exit code 1 with empty stdout and stderr — indistinguishable from a genuine `CORTEX_INTEGRATION_FAIL`
+exit. Measured on PR #77's first Windows run: `tauri_integration_import_export_validate` went red
+with `code=1, stdout="", stderr=""` after exactly 120.05 s on a Rust tree identical to a green
+main (15.6 s locally); a re-run passed. The test now measures elapsed time and, when the budget was
+reached, panics with "the exe was KILLED at the 120s budget after N s: a startup or runtime stall on
+this machine, not a pipeline verdict"; a real non-zero exit still fails fast with its code and output.
+Bite-proof: with the budget set to 2 s the exe is killed and the panic names the kill and the budget.
