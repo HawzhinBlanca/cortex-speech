@@ -8,6 +8,11 @@ import { reloadApp } from '../../src/lib/reloadBoundary';
 import { setLocale } from '../../src/lib/i18n';
 import { notifications } from '../../src/lib/stores/notificationStore';
 import { segments } from '../../src/lib/stores/segmentStore';
+// Two desktop-tools cases render the whole dashboard through jsdom. Measured 2026-09-02 on the hosted
+// Windows runner (PR #80, run 33672342596): both timed out at vitest's default 5 s while the runner's
+// environment setup alone took 157 s; locally the pair completes in about a second. A per-case budget,
+// not a global one: only these renders are that heavy, and a stuck test must still fail.
+const DESKTOP_RENDER_BUDGET_MS = 20_000;
 
 vi.mock('../../src/lib/fileDialogs', () => ({
   chooseDirectory: vi.fn(),
@@ -254,7 +259,7 @@ describe('StatsDashboard desktop evidence orchestration', () => {
     });
   });
 
-  it('runs relink, export, backup, import, compact, and snapshot-list workflows with exact arguments', async () => {
+  it('runs relink, export, backup, import, compact, and snapshot-list workflows with exact arguments', { timeout: DESKTOP_RENDER_BUDGET_MS }, async () => {
     await renderDesktop();
 
     await fireEvent.click(screen.getByTestId('relink-audio-btn'));

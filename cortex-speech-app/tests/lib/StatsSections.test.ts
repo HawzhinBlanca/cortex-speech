@@ -18,6 +18,11 @@ import StatsReadinessSection from '../../src/lib/StatsReadinessSection.svelte';
 import StatsRuntimeEvidence from '../../src/lib/StatsRuntimeEvidence.svelte';
 import StatsToolsSection from '../../src/lib/StatsToolsSection.svelte';
 import type { DatasetStats } from '../../src/lib/types';
+// Two desktop-tools cases render the whole dashboard through jsdom. Measured 2026-09-02 on the hosted
+// Windows runner (PR #80, run 33672342596): both timed out at vitest's default 5 s while the runner's
+// environment setup alone took 157 s; locally the pair completes in about a second. A per-case budget,
+// not a global one: only these renders are that heavy, and a stuck test must still fail.
+const DESKTOP_RENDER_BUDGET_MS = 20_000;
 
 function stats(overrides: Partial<DatasetStats> = {}): DatasetStats {
   return {
@@ -427,7 +432,7 @@ describe('StatsToolsSection explicit owner tools', () => {
     expect(screen.getByTestId('build-sha')).toHaveTextContent('abcdef123456');
   });
 
-  it('preserves opaque snapshot names and forwards nullable segment authority on restore', async () => {
+  it('preserves opaque snapshot names and forwards nullable segment authority on restore', { timeout: DESKTOP_RENDER_BUDGET_MS }, async () => {
     const snapshots: SnapshotInfo[] = [
       {
         name: 'opaque-owner-snapshot-a',
