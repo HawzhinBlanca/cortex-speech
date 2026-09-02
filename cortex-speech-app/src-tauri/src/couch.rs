@@ -2891,6 +2891,66 @@ mod tests {
     /// decision on a clip the reviewer just heard, decided and undid was refused 428 "play the whole
     /// clip first". The reviewer is punished for using Undo, seconds after listening.
     #[test]
+    fn an_undone_decision_never_reaches_an_export_and_a_redecision_exports_only_its_own_text() {
+        // The learning flywheel's entry condition, proven at the SERVING path of the export rather
+        // than at the writer: only an ACTIVE, unreversed human decision may hand text to a dataset.
+        // Decision -> export -> exact Undo -> export -> redecision -> export, one database, the
+        // paid phone path. Before 2026-09-02 the undo restore and the export filter were each
+        // proven alone; nothing proved the pair end to end.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        let raw = "دەقی ئەسڵی";
+        db.insert_segment(&seg("fw1", raw)).unwrap();
+        let state = state();
+        let first = "ڕاستکراوەی یەکەم";
+        let second = "ڕاستکراوەی دووەم";
+        let export = |label: &str| -> (String, u64) {
+            let out = tmp.path().join(format!("{label}.json"));
+            crate::export::export_dataset(&db, &out, &crate::settings::ExportFormat::Json).expect(label);
+            let body = std::fs::read_to_string(&out).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let verified = parsed["metadata"]["verified_segments"].as_u64().unwrap_or(0);
+            (body, verified)
+        };
+        let decide = |text: &str| {
+            let body = serde_json::json!({
+                "id": "fw1", "action": "edit", "text": text,
+                "heardMs": 1_500, "clipDurationMs": 1_500,
+            });
+            api_decision(&db, body.to_string().as_bytes(), "Sara", &state).0
+        };
+
+        let (before, verified) = export("before");
+        assert!(before.contains(raw) && !before.contains(first), "untouched: the champion's raw text serves");
+        assert_eq!(verified, 0);
+
+        assert_eq!(decide(first), 200);
+        let (decided, verified) = export("decided");
+        assert!(decided.contains(first), "an active human decision is what the export serves");
+        assert_eq!(verified, 1, "and it counts as verified");
+
+        assert_eq!(api_undo(&db, "Sara", &state).0, 200, "exact undo");
+        let (undone, verified) = export("undone");
+        assert!(!undone.contains(first), "an undone decision's text must be absent from the export, in every field");
+        assert!(undone.contains(raw), "the pre-decision text is served again");
+        assert_eq!(verified, 0, "an undone decision no longer counts as verified");
+
+        assert_eq!(decide(second), 200, "redecision after undo");
+        let (redecided, verified) = export("redecided");
+        assert!(redecided.contains(second), "the live decision exports");
+        assert!(!redecided.contains(first), "the undone text stays gone after a redecision");
+        assert_eq!(verified, 1);
+
+        // Restart: a fresh connection to the same file must serve the same answer -- nothing above
+        // may live only in connection state or in a cache.
+        let reopened = Database::open(&db_path).unwrap();
+        let out = tmp.path().join("restart.json");
+        crate::export::export_dataset(&reopened, &out, &crate::settings::ExportFormat::Json).unwrap();
+        let body = std::fs::read_to_string(&out).unwrap();
+        assert!(body.contains(second) && !body.contains(first), "the live decision survives a database restart");
+    }
+
+    #[test]
     fn undo_then_redecide_does_not_demand_a_second_listen() {
         let tmp = tempfile::tempdir().unwrap();
         let (db, _) = test_db(tmp.path());

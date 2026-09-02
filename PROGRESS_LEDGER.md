@@ -12779,3 +12779,27 @@ Recorded, not changed: `src-tauri/.cargo/config.toml` sets `+crt-static` for MSV
 cwd-based discovery CI's `cortex-speech-app/`-rooted cargo runs never see it, so the workstation and
 the runner link with different CRT flags. Moving it to the root would change CI's link inputs; that
 is a separate, deliberate change.
+
+## 2026-09-02 — Flywheel proof: an undone decision never reaches an export, a redecision exports only its own text, and both survive a database restart
+
+The owner's flywheel rule is that only active, unreversed human decisions may hand text to a
+training or evaluation bundle. Mapping the rule against the code found every exclusion class
+already enforced — rejects and placeholders by the shared export filter, revoked rights explicitly,
+hidden QC proven never to touch the corpus, unresolved conflicts by campaign scoping, payment errors
+empty by construction because pay and decision share one `BEGIN IMMEDIATE` writer — with one gap in
+the PROOFS rather than the behaviour: the undo restore and the export filter were each tested alone,
+and nothing proved the pair end to end.
+
+`couch::tests::an_undone_decision_never_reaches_an_export_and_a_redecision_exports_only_its_own_text`
+now drives the paid phone path on one database: decision → export contains the text and counts one
+verified row; exact undo → export contains it in no field, serves the champion's raw text again and
+counts zero; redecision → only the new text exports; reopen the same file → the fresh connection
+serves the same answer. Behaviour was already correct (green on first run). Bite-proof: with the
+undo's write-back parameter swapped to the decision's own text (`db/decisions.rs`, one token), the
+proof fails at "an undone decision's text must be absent from the export, in every field"; file
+restored hash-identical.
+
+Not covered here, recorded honestly: link rotation (no rotation helper exists in the couch tests;
+a decision's eligibility does not reference session tokens, but that is reasoning, not a
+measurement) and lost-response replay into an export (the exactly-once couch proofs cover the
+decision and pay side; the export side would be a second test on the same shape).
