@@ -1190,6 +1190,39 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// A temp dir addressed by its CANONICAL path. `tempfile::tempdir()` returns whatever TEMP names,
+    /// and on a hosted Windows runner that is an 8.3 short path under the runner's profile. The
+    /// identity locks under test compare the handle's final path against the requested one and refuse
+    /// an alias -- deliberately; that guard is the point -- so a short-named fixture reads as "resolved
+    /// through an alias" and seven tests failed on the runner (measured 2026-09-02, reproduced here with
+    /// TEMP pointed at the short form: 19 passed / 7 failed). Resolving the fixture once keeps the guard
+    /// untouched; `normalized_path` already strips the verbatim prefix `canonicalize` adds.
+    struct ResolvedTempDir {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl ResolvedTempDir {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let canonical = fs::canonicalize(dir.path()).unwrap();
+            // Keep the LONG form but drop the verbatim `\\?\` prefix canonicalize adds on Windows: a
+            // verbatim path is what the alias guard accepts, but it also switches off lexical `..`
+            // handling, which absolute_lexical_refuses_empty_and_parent_traversal relies on. The
+            // plain long path satisfies both -- normalized_path treats the two forms as identical.
+            let text = canonical.to_string_lossy();
+            let path = match text.strip_prefix(r"\\?\") {
+                Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+                _ => canonical,
+            };
+            Self { _dir: dir, path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
     #[test]
     fn windows_verbatim_prefixes_have_the_same_comparison_identity() {
         assert_eq!(normalized_path(Path::new(r"\\?\C:\proof-root\owner")), "c:/proof-root/owner");
@@ -1198,7 +1231,7 @@ mod tests {
 
     #[test]
     fn migrate_uses_real_schema_path_and_preserves_empty_authority() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = ResolvedTempDir::new();
         let staging = temporary.path().join(format!("{STAGING_PREFIX}fixture"));
         let authorities = staging.join("db-authorities");
         let derived = staging.join("db-derived");
@@ -1226,7 +1259,7 @@ mod tests {
 
     #[test]
     fn migrate_refuses_snapshot_and_non_staging_targets() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = ResolvedTempDir::new();
         let snapshots = temporary.path().join("snapshots");
         fs::create_dir_all(&snapshots).unwrap();
         let source = snapshots.join("copy.db");
@@ -1240,7 +1273,7 @@ mod tests {
 
     #[test]
     fn migrate_refuses_a_hash_bound_but_schema_drifted_source() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = ResolvedTempDir::new();
         let staging = temporary.path().join(format!("{STAGING_PREFIX}drift"));
         let authorities = staging.join("db-authorities");
         let derived = staging.join("db-derived");
@@ -1264,7 +1297,7 @@ mod tests {
 
     #[test]
     fn migrate_refuses_hardlinked_source_and_preexisting_output() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = ResolvedTempDir::new();
         let staging = temporary.path().join(format!("{STAGING_PREFIX}identity"));
         let authorities = staging.join("db-authorities");
         let derived = staging.join("db-derived");
@@ -1303,7 +1336,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn retained_windows_handles_deny_namespace_swaps_and_output_writers() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = ResolvedTempDir::new();
         let staging = temporary.path().join(format!("{STAGING_PREFIX}locks"));
         let authorities = staging.join("db-authorities");
         let derived = staging.join("db-derived");
@@ -1373,14 +1406,14 @@ mod tests {
         let relative = absolute_lexical(Path::new("proof-fixture.db")).unwrap();
         assert!(relative.is_absolute());
         assert!(relative.ends_with("proof-fixture.db"));
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = ResolvedTempDir::new();
         let traversal = temporary.path().join("..").join("elsewhere.db");
         assert!(absolute_lexical(&traversal).unwrap_err().contains("parent traversal is not permitted"));
     }
 
     #[test]
     fn canonical_comparison_and_containment_handle_missing_tails() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = ResolvedTempDir::new();
         let root = temporary.path();
         let missing_child = root.join("not-yet").join("leaf.db");
         let comparable = canonical_comparison_path(&missing_child).unwrap();
@@ -1400,7 +1433,7 @@ mod tests {
 
     #[test]
     fn reject_links_requires_existing_plain_paths() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = ResolvedTempDir::new();
         assert!(reject_links_and_reparse_points(&temporary.path().join("missing").join("anywhere.db"))
             .unwrap_err()
             .contains("does not exist"));
@@ -1412,7 +1445,7 @@ mod tests {
 
     #[test]
     fn snapshot_pinned_and_live_appdata_paths_are_refused() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = ResolvedTempDir::new();
         for reserved in ["snapshots", "pinned", "snapshot_2026-01-01"] {
             let error = reject_live_and_snapshot_paths(&temporary.path().join(reserved).join("copy.db")).unwrap_err();
             assert!(error.contains("immutable recovery authority"), "{reserved}: {error}");
@@ -1430,7 +1463,7 @@ mod tests {
     #[test]
     fn sidecar_suffixes_are_appended_and_detected() {
         assert_eq!(sidecar(Path::new("a.db"), "-wal"), PathBuf::from("a.db-wal"));
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = ResolvedTempDir::new();
         let db = temporary.path().join("single.db");
         fs::write(&db, b"fixture").unwrap();
         assert!(reject_sqlite_sidecars(&db).is_ok());
@@ -1441,7 +1474,7 @@ mod tests {
 
     #[test]
     fn identity_locks_refuse_directories_and_missing_files() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = ResolvedTempDir::new();
         let directory = temporary.path().join("actually-a-directory");
         fs::create_dir(&directory).unwrap();
         assert!(LockedPath::existing(&directory, false).is_err());
@@ -1538,7 +1571,7 @@ mod tests {
 
     #[test]
     fn inspect_path_proves_single_file_read_only_authority() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = ResolvedTempDir::new();
         let path = single_file_current_db(temporary.path());
         let before_hash = sha256_file(&path).unwrap();
 
@@ -1588,7 +1621,7 @@ mod tests {
 
     #[test]
     fn cli_inspect_binds_schema_campaign_and_hash() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = ResolvedTempDir::new();
         let path = single_file_current_db(temporary.path());
         let path_text = path.to_string_lossy().to_string();
         let current = migrations::max_supported_version();
@@ -1637,7 +1670,7 @@ mod tests {
 
     #[test]
     fn migrate_refuses_malformed_hash_and_foreign_target_schema() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = ResolvedTempDir::new();
         let (staging, authorities, derived) = staged_layout(temporary.path(), "contract");
         let source = authorities.join("source.db");
         let output = derived.join("result.work.db");
@@ -1654,7 +1687,7 @@ mod tests {
 
     #[test]
     fn migrate_refuses_unowned_or_incomplete_staging_roots() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = ResolvedTempDir::new();
         let unowned = temporary.path().join("plain-workspace");
         fs::create_dir_all(unowned.join("db-authorities")).unwrap();
         fs::create_dir_all(unowned.join("db-derived")).unwrap();
@@ -1685,7 +1718,7 @@ mod tests {
 
     #[test]
     fn migrate_refuses_sources_and_outputs_outside_their_directories() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = ResolvedTempDir::new();
         let (staging, authorities, derived) = staged_layout(temporary.path(), "placement");
         let stray_source = staging.join("stray.db");
         fs::write(&stray_source, b"fixture").unwrap();
@@ -1709,7 +1742,7 @@ mod tests {
 
     #[test]
     fn migrate_refuses_hash_and_source_schema_drift() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = ResolvedTempDir::new();
         let (staging, authorities, derived) = staged_layout(temporary.path(), "authority");
         let source = authorities.join("source.db");
         let output = derived.join("result.work.db");
