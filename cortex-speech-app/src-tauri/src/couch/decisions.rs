@@ -666,7 +666,8 @@ pub(super) fn api_pool_decision(
 
     {
         let mut guard = lock_state(state);
-        if guard.holder(&parsed.id, Instant::now()).is_some_and(|who| who != reviewer) {
+        let now = guard.now();
+        if guard.holder(&parsed.id, now).is_some_and(|who| who != reviewer) {
             return err_reply(409, "another reviewer is working on this clip");
         }
         if !guard.in_flight_operations.insert(operation_id.to_string()) {
@@ -1081,7 +1082,8 @@ pub(super) fn api_decision_authenticated(
         // If policy changed after this reviewer was served the clip, release only THEIR lease so it
         // can immediately return to an eligible reviewer. Never disturb somebody else's live work.
         let mut guard = lock_state(state);
-        if guard.holder(&parsed.id, Instant::now()).is_some_and(|who| who == reviewer) {
+        let now = guard.now();
+        if guard.holder(&parsed.id, now).is_some_and(|who| who == reviewer) {
             guard.leases.remove(&parsed.id);
         }
         guard.served_work.remove(&(parsed.id.clone(), reviewer.to_string()));
@@ -1147,7 +1149,8 @@ pub(super) fn api_decision_authenticated(
     }
     if pilot_policy.is_some() && expected_key.is_none() {
         let mut guard = lock_state(state);
-        if !guard.holder(&parsed.id, Instant::now()).is_some_and(|who| who == reviewer) {
+        let now = guard.now();
+        if !guard.holder(&parsed.id, now).is_some_and(|who| who == reviewer) {
             return err_reply(409, "controlled review pilot requires this work to be served first — reload the queue");
         }
     }
@@ -1347,7 +1350,8 @@ pub(super) fn api_decision_authenticated(
             let mut guard = lock_state(state);
             // Only OUR OWN lease. A clip another reviewer currently holds is not ours to hand back —
             // that would free their in-progress work out from under them.
-            if guard.holder(&parsed.id, Instant::now()).is_some_and(|who| who == reviewer) {
+            let now = guard.now();
+            if guard.holder(&parsed.id, now).is_some_and(|who| who == reviewer) {
                 guard.leases.remove(&parsed.id);
             }
             guard.served_work.remove(&(parsed.id.clone(), reviewer.to_string()));
@@ -1473,8 +1477,8 @@ pub(super) fn api_decision_authenticated(
     // It sits after validation so a REJECTED request (bad action, placeholder text, missing row) cannot
     // leave a 15-minute lease on a clip it never decided, locking other reviewers out of it.
     {
-        let now = Instant::now();
         let mut guard = lock_state(state);
+        let now = guard.now();
         if guard.holder(&parsed.id, now).is_some_and(|who| who != reviewer) {
             return err_reply(409, "another reviewer is working on this clip");
         }
@@ -1622,7 +1626,8 @@ pub(super) fn api_independent_undo(
     remember_independent_undo(state, reviewer, &entry.operation_id, &entry.seg_id, entry.decision_id);
     {
         let mut guard = lock_state(state);
-        guard.leases.insert(id.clone(), (reviewer.to_string(), Instant::now()));
+        let now = guard.now();
+        guard.leases.insert(id.clone(), (reviewer.to_string(), now));
     }
     let row_version = db
         .get_segment_by_id_with_revision(&id)
@@ -1668,7 +1673,8 @@ pub(super) fn api_pool_undo(
     remember_pool_undo(state, reviewer, &target.decision_operation_id, &id, target.decision_id);
     {
         let mut guard = lock_state(state);
-        guard.leases.insert(id.clone(), (reviewer.to_string(), Instant::now()));
+        let now = guard.now();
+        guard.leases.insert(id.clone(), (reviewer.to_string(), now));
         guard.served_work.insert((id.clone(), reviewer.to_string()));
     }
     let row_version = db
@@ -1818,7 +1824,7 @@ pub(super) fn api_undo_with_body(db: &Database, body: &[u8], reviewer: &str, sta
     retain_phone_undo_token(state, reviewer, insertion_index, entry);
     {
         let mut guard = lock_state(state);
-        let now = Instant::now();
+        let now = guard.now();
         let current = guard.holder(&id, now).map(str::to_string);
         match current {
             Some(other) if other != reviewer => {
