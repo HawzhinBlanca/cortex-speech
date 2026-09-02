@@ -12670,3 +12670,33 @@ the candidate did not have to face because its own tests never reached that path
 Honest gap carried forward: this workstation bundles the CTC-300M/1B pair, so the clean-checkout
 arms of the conditional tests were not exercised here; those arms are the candidate's own
 assertions, unmodified, and CI's clean runner is where they get their first real execution.
+
+---
+
+## 2026-09-02 — The Rust suite finally ran on the Windows runner; five CI-only failures, one a real bug
+
+With the models-dir fix in place the Windows job cleared policy, architecture, lint, fmt and
+clippy and the Rust suite RAN TO COMPLETION on the runner for the first time on this branch:
+2551 passed, 5 failed. All five pass on this workstation, all five are honest.
+
+- **A real ordering bug** in `stores/review_write.rs`: the single-flight technical-audio probe
+  published its result and notified waiters BEFORE removing its registry slot, so on a 4-core runner
+  a woken waiter returned and observed the slot still occupied ("a crashed probe must still free its
+  slot"). On 64 cores the worker won the race every time. Slot release and publication now happen
+  under one registry lock, slot first; a follower either finds the flight and is notified, or finds
+  it gone with the answer already published.
+- **The process-global rate limiter**, recorded yesterday as timing-dependent: the export test
+  issued six `export_dataset` calls against a burst of five, and on the runner the sixth got
+  `RATE_LIMITED` where `INVALID_OUTPUT_PATH` was asserted. The refusal now goes first; the five
+  format exports consume exactly the burst.
+- **Three `models::tests` assumed this workstation's tree.** A clean checkout ships only what
+  fetch-models writes — the VAD and the ONNX Runtime — while this box also bundles the denoiser,
+  CAM++ and the CTC pair. Tests that demanded "the repository fixture must ship the bundled
+  denoiser and CAM++" were true here and false there; exactly the "clean-checkout arms never
+  exercised" gap the integration lane flagged. Every such assertion is now conditioned on what the
+  bundled tree actually ships, with the VAD as the sibling guaranteed everywhere.
+
+Proof of the absent arms cannot come from this tree — the CTC-bearing candidate always wins
+selection and no seam hides it — so a fresh `git worktree` holding exactly the runner's three
+artifacts is the reproduction: the old tests fail there as on CI; the new ones are being run there
+now at the runner's parallelism.

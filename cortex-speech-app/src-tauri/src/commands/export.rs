@@ -253,6 +253,17 @@ mod state_command_surface_tests {
         let app = managed_app_state(tmp.path());
 
         let json = tmp.path().join("dataset.json");
+        // The refusal goes FIRST. `export_dataset` sits behind STRICT_RATE_LIMITER, a process-global
+        // token bucket keyed by command name with burst 5 and refill 10/s. This test issues six
+        // command-level calls; with the refusal last, the sixth needed a refilled token and whether
+        // one had accrued depended on how fast the five empty-library exports ran -- measured 2026-09-02
+        // on a 4-core runner: `RATE_LIMITED` where `INVALID_OUTPUT_PATH` was asserted. Refusing first
+        // spends token 1 on a full bucket, and the five format exports then consume exactly the burst,
+        // so nothing here depends on elapsed time.
+        let refused =
+            block_on(export_dataset(unusable_destination(tmp.path(), "out.json"), "json".into(), app.state()))
+                .expect_err("a destination whose parent does not exist is refused");
+        expect_refusal(&refused, "INVALID_OUTPUT_PATH");
         block_on(export_dataset(json.to_string_lossy().into_owned(), "json".into(), app.state()))
             .expect("json export of an empty library");
         let parsed: serde_json::Value = serde_json::from_slice(&std::fs::read(&json).unwrap()).expect("valid JSON");
@@ -286,11 +297,6 @@ mod state_command_surface_tests {
         let fallback_value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&fallback).unwrap()).expect("the fallback wrote JSON");
         assert!(fallback_value.get("segments").is_some(), "the fallback is the JSON table, not an empty file");
-
-        let refused =
-            block_on(export_dataset(unusable_destination(tmp.path(), "out.json"), "json".into(), app.state()))
-                .expect_err("a destination whose parent does not exist is refused");
-        expect_refusal(&refused, "INVALID_OUTPUT_PATH");
     }
 
     /// `TranscriptFormat::from_str_lossy` is the human-facing sibling mapping, with txt as the

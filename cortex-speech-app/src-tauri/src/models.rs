@@ -2470,7 +2470,14 @@ mod tests {
             !missing.contains(&"Silero VAD v4"),
             "the bundled VAD resolves per file past the user pair: {missing:?}"
         );
-        assert!(!missing.contains(&"AI Audio Denoiser"), "the bundled denoiser resolves per file: {missing:?}");
+        // A clean checkout ships only what fetch-models writes (VAD + ONNX Runtime); this workstation
+        // also bundles the denoiser. Assert the per-file rule against the tree that is actually there.
+        let has_denoiser = model_file_meets_min_size(&bundled_models_dir(), DENOISER_MODEL, 400_000);
+        assert_eq!(
+            !missing.contains(&"AI Audio Denoiser"),
+            has_denoiser,
+            "the denoiser follows the bundled tree per file: {missing:?}"
+        );
         assert!(missing.contains(&"CAM++ Speaker Embedding"), "a truncated user copy reads as missing: {missing:?}");
         assert_eq!(missing.contains(&"Meta OmniASR CTC 1B (model)"), !has_1b, "1B follows the tree: {missing:?}");
 
@@ -2534,31 +2541,48 @@ mod tests {
 
     #[test]
     fn support_model_presence_resolves_per_file_after_a_user_ctc_download() {
-        assert!(
-            model_file_meets_min_size(&bundled_models_dir(), DENOISER_MODEL, 400_000)
-                && model_file_meets_min_size(&bundled_models_dir(), CAMPP_MODEL, 10_000_000),
-            "repository fixture must ship the bundled denoiser and CAM++ support models"
-        );
+        // A clean checkout ships only what fetch-models writes -- the VAD and the ONNX Runtime -- while
+        // this workstation also bundles the denoiser and CAM++. This test used to DEMAND the latter
+        // ("repository fixture must ship the bundled denoiser and CAM++"), which is only true here:
+        // measured 2026-09-02, it failed on the Windows runner. Prove the per-file rule on whatever the
+        // tree actually ships, with the VAD as the sibling that is guaranteed to be bundled everywhere.
+        let bundled = bundled_models_dir();
+        let ships = |filename: &str, floor: u64| model_file_meets_min_size(&bundled, filename, floor);
+        assert!(ships("silero_vad_v4.onnx", 1_000_000), "fetch-models always ships the VAD");
+        let has_denoiser = ships(DENOISER_MODEL, 400_000);
+        let has_campp = ships(CAMPP_MODEL, 10_000_000);
+
         let tmp = tempfile::tempdir().expect("tempdir");
         let (_user_dir, manager) = user_dir_that_wins_resolution(tmp.path());
 
         // Round-26: downloading OmniASR into the user dir flips resolved_dir there and USED TO orphan
-        // every bundled-only sibling. Per-file resolution must still find the denoiser.
-        assert!(manager.denoiser_present(), "the bundled denoiser must still resolve after a user CTC download");
+        // every bundled-only sibling. Per-file resolution must still find each one the tree ships,
+        // and must report -- never invent -- the ones it does not.
+        assert_eq!(manager.denoiser_present(), has_denoiser, "the denoiser follows the bundled tree");
+        let missing: Vec<&str> = manager.missing_production_models().iter().map(|m| m.filename).collect();
         assert!(
-            manager.missing_production_models().is_empty(),
-            "every shipped support model resolves per file: {:?}",
-            manager.missing_production_models().iter().map(|m| m.filename).collect::<Vec<_>>()
+            !missing.contains(&"silero_vad_v4.onnx"),
+            "the bundled VAD must resolve past the user pair: {missing:?}"
         );
-        assert!(manager.downloadable_missing_production_models().is_empty());
+        assert_eq!(missing.contains(&DENOISER_MODEL), !has_denoiser, "{missing:?}");
+        assert_eq!(missing.contains(&CAMPP_MODEL), !has_campp, "{missing:?}");
+        if has_denoiser && has_campp {
+            assert!(missing.is_empty(), "every shipped support model resolves per file: {missing:?}");
+            assert!(manager.downloadable_missing_production_models().is_empty());
+        }
 
         let production = manager.production_status();
         assert_eq!(production.len(), PRODUCTION_RUNTIME_MODEL_FILENAMES.len());
         for row in &production {
-            assert!(row.downloaded, "{} should resolve from the bundled tree", row.filename);
-            assert!(row.exists);
-            assert_eq!(row.source, ModelArtifactSourceV1::Bundled, "{}", row.filename);
-            assert!(row.size_bytes.unwrap_or(0) >= row.min_size_bytes, "{}", row.filename);
+            if ships(&row.filename, row.min_size_bytes) {
+                assert!(row.downloaded, "{} should resolve from the bundled tree", row.filename);
+                assert!(row.exists, "{}", row.filename);
+                assert_eq!(row.source, ModelArtifactSourceV1::Bundled, "{}", row.filename);
+                assert!(row.size_bytes.unwrap_or(0) >= row.min_size_bytes, "{}", row.filename);
+            } else {
+                assert!(!row.downloaded, "{} is not shipped here and must not read as present", row.filename);
+                assert_eq!(row.source, ModelArtifactSourceV1::Missing, "{}", row.filename);
+            }
         }
     }
 
@@ -2600,13 +2624,29 @@ mod tests {
         assert_eq!(installed["downloadable"], false, "the 300M archive hash was never pinned");
         assert_eq!(installed["path"], serde_json::json!(user_dir.join(OMNIASR_CTC_300M_MODEL)));
 
+        // The "bundled" leg is proven on the VAD, which fetch-models writes on EVERY tree; the denoiser
+        // leg follows whether this tree ships it (this workstation does, a clean checkout does not --
+        // measured 2026-09-02 on the Windows runner).
+        let vad = row("silero_vad_v4.onnx");
+        assert_eq!(vad["downloaded"], true, "a bundled-only sibling must not be orphaned by the user pair");
+        assert_eq!(vad["exists"], true);
+        assert_eq!(vad["source"], "bundled");
+        let vad_path = PathBuf::from(vad["path"].as_str().expect("vad path"));
+        assert!(!vad_path.starts_with(&user_dir), "{vad_path:?}");
+        assert_eq!(vad_path, manager.resolve_root_for("silero_vad_v4.onnx").join("silero_vad_v4.onnx"));
+
         let bundled = row(DENOISER_MODEL);
-        assert_eq!(bundled["downloaded"], true, "a bundled-only sibling must not be orphaned by the user pair");
-        assert_eq!(bundled["exists"], true);
-        assert_eq!(bundled["source"], "bundled");
-        let bundled_path = PathBuf::from(bundled["path"].as_str().expect("denoiser path"));
-        assert!(!bundled_path.starts_with(&user_dir), "{bundled_path:?}");
-        assert_eq!(bundled_path, manager.resolve_root_for(DENOISER_MODEL).join(DENOISER_MODEL));
+        if model_file_meets_min_size(&bundled_models_dir(), DENOISER_MODEL, 400_000) {
+            assert_eq!(bundled["downloaded"], true, "the shipped denoiser must not be orphaned by the user pair");
+            assert_eq!(bundled["exists"], true);
+            assert_eq!(bundled["source"], "bundled");
+            let bundled_path = PathBuf::from(bundled["path"].as_str().expect("denoiser path"));
+            assert!(!bundled_path.starts_with(&user_dir), "{bundled_path:?}");
+            assert_eq!(bundled_path, manager.resolve_root_for(DENOISER_MODEL).join(DENOISER_MODEL));
+        } else {
+            assert_eq!(bundled["downloaded"], false, "an unshipped denoiser must read missing, never bundled");
+            assert_eq!(bundled["source"], "missing");
+        }
 
         let truncated = row(CAMPP_MODEL);
         assert_eq!(truncated["downloaded"], false);

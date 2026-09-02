@@ -132,14 +132,24 @@ where
                     observation: TechnicalAudioProbeObservation::Inconclusive,
                     source_blake3: None,
                 });
+            // Free the slot and publish the answer under ONE registry lock, slot first. The old order --
+            // publish, notify, then take the registry and remove -- let a woken waiter return while
+            // this thread had not yet reached the remove: `active` still held the flight, so the
+            // caller observed an occupied slot after receiving its evidence, and a claim arriving in
+            // that window would have been refused ProbeBusy for a probe that was already finished.
+            // Measured 2026-09-02 on a 4-core runner (a_panicking_probe_is_contained_as_inconclusive_
+            // and_frees_its_slot: "a crashed probe must still free its slot"); on 64 cores the worker
+            // won the race. Holding the registry while publishing keeps the two atomic to every other
+            // registry reader: a follower either finds the flight (and is notified) or finds it gone
+            // with the result already published. Lock order registry -> state matches every caller.
             {
+                let mut registry = lock_probe_registry();
+                if registry.active.get(&worker_key).is_some_and(|active| Arc::ptr_eq(active, &worker_flight)) {
+                    registry.active.remove(&worker_key);
+                }
                 let mut state = worker_flight.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 state.result = Some(evidence);
                 worker_flight.complete.notify_all();
-            }
-            let mut registry = lock_probe_registry();
-            if registry.active.get(&worker_key).is_some_and(|active| Arc::ptr_eq(active, &worker_flight)) {
-                registry.active.remove(&worker_key);
             }
         }) {
             let mut registry = lock_probe_registry();
