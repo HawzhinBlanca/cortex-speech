@@ -14,6 +14,11 @@ format". `ApiKeys::load` handles both encodings and is the only thing that shoul
 
 Scope: Rust sources and tests, excluding api_keys.rs (the real loader) and dpapi.rs (the codec it
 uses). A mention of the filename in a message or doc comment is fine — this looks for actual parsing.
+
+Added 2026-09-02: the loader also overlays the PROCESS ENVIRONMENT, so a shell that exports a key
+would hand it to every test binary. The root `.cargo/config.toml` blanks both key names for every
+cargo-launched process, and a blank variable counts as unset in the loader (it neither overrides
+nor clears a stored key); the third test pins the config, `api_keys::tests` pins the rule.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ import re
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src-tauri"
+REPO_ROOT = Path(__file__).resolve().parents[2]
 # The loader and the codec it calls are the ONE place allowed to know the file's shape.
 EXEMPT = {"api_keys.rs", "dpapi.rs"}
 
@@ -72,9 +78,30 @@ def test_the_live_key_test_uses_the_production_loader() -> None:
     assert "strip_prefix(&format!(\"{name}=\"))" not in text, "the hand-parser is back"
 
 
+def test_cargo_blanks_cloud_keys_for_every_test_binary() -> None:
+    """An exported key must never reach a test binary: red suite at best, a real upload at worst.
+
+    `ApiKeys::load` overlays the environment over secrets.env. cargo applies `[env]` to every process
+    it launches, test binaries included, and a BLANK value counts as unset in the loader. The file
+    must be at the repository root: cargo discovers config from the current directory upward, and
+    cargo is run from the root Makefile, from cortex-speech-app/ (CI) and from src-tauri/.
+    """
+    path = REPO_ROOT / ".cargo" / "config.toml"
+    if not path.is_file():
+        raise AssertionError(f"{path} is missing — every cargo-launched test binary sees the ambient keys")
+    text = path.read_text(encoding="utf-8")
+    assert "[env]" in text, "the [env] table is gone"
+    for name in ("GEMINI_API_KEY", "OPENROUTER_API_KEY"):
+        assert f'{name} = {{ value = "", force = true }}' in text, (
+            f"{name} must be blanked with force = true; without force an exported value wins, and a "
+            "non-empty value would be read as a key"
+        )
+
+
 def main() -> None:
     test_no_rust_file_parses_secrets_env_itself()
     test_the_live_key_test_uses_the_production_loader()
+    test_cargo_blanks_cloud_keys_for_every_test_binary()
     print("credential loader policy passed")
 
 

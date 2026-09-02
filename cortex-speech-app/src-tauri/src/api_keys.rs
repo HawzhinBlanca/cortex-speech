@@ -50,7 +50,8 @@ impl std::fmt::Debug for ApiKeys {
 }
 
 impl ApiKeys {
-    /// Load keys from `{data_dir}/secrets.env`, with environment variables taking precedence.
+    /// Load keys from `{data_dir}/secrets.env`, with environment variables taking precedence; a
+    /// BLANK variable counts as unset and leaves the stored key alone (see `overlay_environment`).
     ///
     /// A genuinely missing file yields all-`None`; recovery, read, and decryption failures are
     /// returned. Treating those failures as "unset" would make a crash-stranded replacement backup
@@ -61,16 +62,7 @@ impl ApiKeys {
         crate::atomic_file::recover_interrupted_replace(&path)
             .map_err(|e| format!("recover interrupted secrets-file replacement: {e}"))?;
         let mut map = parse_env_file(&path)?;
-        for name in KEY_NAMES {
-            if let Ok(value) = std::env::var(name) {
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    map.remove(name);
-                } else {
-                    map.insert(name.to_string(), trimmed.to_string());
-                }
-            }
-        }
+        overlay_environment(&mut map, |name| std::env::var(name).ok());
         Ok(Self { gemini: map.remove("GEMINI_API_KEY"), openrouter: map.remove("OPENROUTER_API_KEY") })
     }
 
@@ -186,6 +178,24 @@ fn validate_key_value(name: &str, value: &str) -> Result<String, String> {
         return Err("API key contains whitespace or control characters — paste the key exactly".to_string());
     }
     Ok(value.to_string())
+}
+
+/// Lay the process environment over the parsed store. A present, non-blank variable wins; a BLANK
+/// one counts as unset -- the same rule the store's own `NAME=` template lines follow -- so it
+/// neither overrides nor clears a stored key. Until 2026-09-02 a blank variable REMOVED the stored
+/// key: a stray `GEMINI_API_KEY=` in a shell profile silently disabled the app's key, and the test
+/// isolation in the root `.cargo/config.toml` (which blanks both names for every cargo-launched
+/// process) erased every store a test had built. `lookup` is injected so the rule is testable
+/// without mutating the process environment under parallel tests.
+fn overlay_environment(map: &mut HashMap<String, String>, lookup: impl Fn(&str) -> Option<String>) {
+    for name in KEY_NAMES {
+        let Some(value) = lookup(name) else { continue };
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        map.insert(name.to_string(), trimmed.to_string());
+    }
 }
 
 /// Parse a minimal `.env` file: `KEY=VALUE` per line; `#` comments and blank lines ignored;
@@ -344,6 +354,29 @@ mod tests {
         let loaded = ApiKeys::load(&dir).unwrap();
         assert_eq!(loaded.gemini, None);
         assert_eq!(loaded.openrouter.as_deref(), Some("new-router"));
+    }
+
+    #[test]
+    fn a_blank_environment_value_is_unset_and_never_clears_the_store() {
+        let stored = || HashMap::from([("GEMINI_API_KEY".to_string(), "AIzaStored".to_string())]);
+        let gemini = |map: &HashMap<String, String>| map.get("GEMINI_API_KEY").cloned();
+
+        let mut map = stored();
+        overlay_environment(&mut map, |_| Some(String::new()));
+        assert_eq!(gemini(&map).as_deref(), Some("AIzaStored"), "blank counts as unset, not as a removal");
+
+        let mut map = stored();
+        overlay_environment(&mut map, |_| Some("   ".to_string()));
+        assert_eq!(gemini(&map).as_deref(), Some("AIzaStored"), "whitespace is blank");
+
+        let mut map = stored();
+        overlay_environment(&mut map, |_| None);
+        assert_eq!(gemini(&map).as_deref(), Some("AIzaStored"), "absent leaves the store alone");
+
+        let mut map = stored();
+        overlay_environment(&mut map, |name| (name == "GEMINI_API_KEY").then(|| " AIzaEnv ".to_string()));
+        assert_eq!(gemini(&map).as_deref(), Some("AIzaEnv"), "a real value overrides, trimmed");
+        assert!(!map.contains_key("OPENROUTER_API_KEY"), "only names the lookup answers are touched");
     }
 
     #[test]

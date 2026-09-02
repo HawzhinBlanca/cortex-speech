@@ -86,6 +86,16 @@ impl GlobalRateLimiter {
             tracing::warn!("Recovering poisoned rate limiter lock");
             poisoned.into_inner()
         });
+        // In the library test binary every #[test] runs on its own thread while these limiters stay
+        // process-global, so a second test on an already-tested command inherited a drained bucket
+        // and failed with RATE_LIMITED depending on scheduling (measured 2026-09-01/02: the export
+        // test on a 4-core runner). Under cfg(test) the bucket is scoped to the calling thread: each
+        // test keeps the full fence for its own calls and none can drain another's. Production code
+        // never sees this branch.
+        #[cfg(test)]
+        let scoped = format!("{key}@{:?}", std::thread::current().id());
+        #[cfg(test)]
+        let key = scoped.as_str();
         limiter.check(key)
     }
 }
@@ -96,6 +106,24 @@ pub static STRICT_RATE_LIMITER: GlobalRateLimiter = GlobalRateLimiter::new_with_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_buckets_are_scoped_per_thread_under_test() {
+        // rate 0: no refill, so nothing here depends on scheduling. Three tokens per bucket.
+        static PROBE: GlobalRateLimiter = GlobalRateLimiter::new_with_burst(0, 3);
+        for _ in 0..3 {
+            PROBE.check("cmd").expect("this thread's own burst");
+        }
+        assert!(PROBE.check("cmd").is_err(), "this thread's burst is spent");
+
+        // Another thread stands in for another #[test]: it must start with a full bucket for the
+        // same command, and spending it must not touch ours.
+        let other = std::thread::spawn(|| (0..4).map(|_| PROBE.check("cmd").is_ok()).collect::<Vec<_>>())
+            .join()
+            .expect("probe thread");
+        assert_eq!(other, vec![true, true, true, false], "a fresh bucket, then its own limit");
+        assert!(PROBE.check("cmd").is_err(), "the other thread's bucket was not ours");
+    }
 
     #[test]
     fn rate_limiter_allows_up_to_burst() {
