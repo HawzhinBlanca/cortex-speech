@@ -12950,3 +12950,13 @@ main (15.6 s locally); a re-run passed. The test now measures elapsed time and, 
 reached, panics with "the exe was KILLED at the 120s budget after N s: a startup or runtime stall on
 this machine, not a pipeline verdict"; a real non-zero exit still fails fast with its code and output.
 Bite-proof: with the budget set to 2 s the exe is killed and the panic names the kill and the budget.
+
+## 2026-09-03 — Two desktop-tools vitest cases get an explicit, measured budget
+
+PR #80's first Windows run went red in Frontend tests: `StatsDashboardDesktop.test.ts` "runs relink, export,
+backup, import, compact, and snapshot-list workflows" and `StatsSections.test.ts` "preserves opaque snapshot
+names" timed out at vitest's default 5 s on a runner whose environment setup alone took 157 s (1006 other
+cases passed; a re-run was green). Locally the two files complete 21 cases in about a second of test time.
+Both cases render the whole desktop dashboard through jsdom; they now carry a per-case budget of 20 s
+(`DESKTOP_RENDER_BUDGET_MS`), not a global raise: only these renders are that heavy, and a stuck test must
+still fail. Bite-proof: with the budget set to 1 ms both cases fail with "Test timed out in 1ms"; restored.
