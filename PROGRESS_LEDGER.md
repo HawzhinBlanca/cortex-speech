@@ -12800,8 +12800,20 @@ proof fails at "an undone decision's text must be absent from the export, in eve
 restored hash-identical.
 
 Lost-response replay is covered in the same test: the redecision carries a durable operation id and
-is replayed byte for byte against a fresh state after the restart leg; the replay answers
-duplicate, writes no second review event, and the export still serves only the live text with one
-verified row. Not covered, recorded honestly: link rotation (no rotation helper exists in the couch
-tests; a decision's eligibility does not reference session tokens, but that is reasoning, not a
-measurement).
+is replayed byte for byte after the restart leg; the replay answers duplicate, writes no second
+review event, and the export still serves only the live text with one verified row.
+
+**Corrected the same day after an independent Codex audit.** The first version (d517f24d) opened a
+second connection for the restart export but still ran the replay, the event count and the final
+export through the ORIGINAL handle, so it proved persistence of one export and nothing about replay
+through a fresh connection. Now every first-connection step lives in a block that returns only the
+path, the replay body and the on-disk event count; the handle and every closure over it are dropped
+at the brace, and the restart export, event count, replay and final export all run on
+`Database::open` plus fresh in-memory couch state. The claim is narrowed to a restart at the
+database and session layer, not a separate OS process. Bite-proof: blinding the durable receipt
+reader alone did NOT bite -- the replay was still recognised by the row-state repeat check (same
+reviewer, action and text on the stored segment), a second on-disk layer; blinding both, the replay
+through the fresh connection is refused with 409 where 200 is asserted. Both files restored
+hash-identical. Not covered, recorded honestly: link rotation (no rotation helper exists in the
+couch tests; a decision's eligibility does not reference session tokens, but that is reasoning, not
+a measurement).
