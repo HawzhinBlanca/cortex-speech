@@ -12881,3 +12881,21 @@ Owner action (visible, not synthesized): run `scripts/ops/cortex-champion-superv
 in an interactive session on the release workstation, then `check_champion_supervision.py` must
 exit 0. The GPU clock lock (`nvidia-smi -lgc 1500,2055`, admin, resets on reboot) remains a separate
 owner action; nothing here touches clocks.
+
+## 2026-09-02 — Windows link parity: the MSVC +crt-static flag moves to the root cargo config
+
+cargo discovers `.cargo/config.toml` from the CURRENT DIRECTORY upward, never from the manifest.
+`src-tauri/.cargo/config.toml` set `+crt-static` for MSVC (sherpa-onnx's prebuilt libraries use the
+static CRT); the release workstation runs cargo from `src-tauri/` and got it, CI runs cargo from
+`cortex-speech-app/` with `--manifest-path` and never did. The runner and the workstation therefore
+linked with different CRT flags for as long as that file existed — recorded as a divergence on
+2026-09-02 (PR #74) and moved deliberately here, as its own change with its own CI run.
+
+- The section now sits in the root `.cargo/config.toml` next to the test-isolation `[env]` table;
+  the nested file is gone. Every cwd in use (root Makefile, `cortex-speech-app/`, `src-tauri/`) walks
+  up to the root, and so do the other three crates under the tree (src-tauri/fuzz, the vendored
+  tiny_http fork, scripts/updater-signature-verifier): a static CRT for each is the same choice.
+- Pinned by `test_cargo_config_policy.py`: the root config carries the target section and the exact
+  flag, and no nested `.cargo/config.toml` may shadow it.
+- The proof of parity is the Windows Release Gate itself linking with the flag for the first time;
+  the rustflags change also invalidates the runner's Rust cache once.

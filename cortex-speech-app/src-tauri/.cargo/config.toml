@@ -1,3 +1,0 @@
-# sherpa-onnx prebuilt libs use static CRT (/MT) on Windows; match that for the Rust crate.
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]

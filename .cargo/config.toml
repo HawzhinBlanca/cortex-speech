@@ -16,3 +16,17 @@
 [env]
 GEMINI_API_KEY = { value = "", force = true }
 OPENROUTER_API_KEY = { value = "", force = true }
+
+# Windows link parity between this workstation and CI (2026-09-02).
+#
+# sherpa-onnx's prebuilt libraries use the static CRT (/MT) on Windows, so the Rust crate links with
+# +crt-static to match. This section lived in src-tauri/.cargo/config.toml, and cargo discovers
+# config from the CURRENT DIRECTORY upward, never from the manifest: the release workstation runs
+# cargo from src-tauri/ and got the flag, CI runs it from cortex-speech-app/ with --manifest-path and
+# never did. The runner and the workstation therefore linked with different CRT flags for as long
+# as that file existed. Here every cwd in use (root Makefile, cortex-speech-app/, src-tauri/) sees it.
+# Being at the root it now also reaches the other crates under this tree (src-tauri/fuzz, the
+# vendored tiny_http fork, scripts/updater-signature-verifier): a static CRT for each of them is the
+# same, deliberate choice.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
