@@ -98,11 +98,25 @@ fn bundled_model_dir_candidates() -> Vec<PathBuf> {
 }
 
 fn select_bundled_models_dir(candidates: Vec<PathBuf>) -> PathBuf {
-    let fallback = candidates.first().cloned().unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("models"));
-    candidates
-        .into_iter()
+    if let Some(with_asr) = candidates
+        .iter()
         .find(|candidate| omniasr_ctc_300m_present_in(candidate) || omniasr_ctc_1b_present_in(candidate))
-        .unwrap_or(fallback)
+    {
+        return with_asr.clone();
+    }
+    // No candidate holds a runtime ASR pair. Since the CTC pair became OPTIONAL in the standard
+    // fetch/build paths this is the SHIPPED shape of a clean checkout, not an edge case -- and the
+    // old fallback returned the FIRST candidate whether or not it existed. Under `cargo test` that
+    // is `<exe dir>/models` inside target/, which does not exist, so `active_models_dir()` pointed
+    // at nothing, `init_ort_dylib_path()` could not find onnxruntime.dll beneath it, and `ort`
+    // (load-dynamic) fell through to the system loader -- which blocks forever rather than failing.
+    // Measured 2026-09-01: the Windows Release Gate's Rust tests hung for 2h39m on four VAD tests
+    // until the 180-minute job cap. Prefer the first candidate that actually exists, so the runtime
+    // bundled beneath it can be found; only then the compiled-in manifest models dir.
+    if let Some(existing) = candidates.iter().find(|candidate| candidate.is_dir()) {
+        return existing.clone();
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("models")
 }
 
 fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -2106,11 +2120,29 @@ mod tests {
         // No candidates at all: the compiled-in manifest models dir is the last resort.
         assert_eq!(select_bundled_models_dir(Vec::new()), Path::new(env!("CARGO_MANIFEST_DIR")).join("models"));
 
-        // Candidates exist but none holds a runtime ASR pair: the FIRST keeps priority.
+        // Candidates named but none EXISTS and none holds a runtime ASR pair: the manifest models dir,
+        // never a path that is not there. This pin used to assert the FIRST candidate "keeps priority"
+        // with two paths that were never created -- which is exactly the shape that hung CI for 2h39m
+        // (see select_bundled_models_dir), so the pin was enforcing the bug and is inverted here.
         let tmp = tempfile::tempdir().expect("tempdir");
         let first = tmp.path().join("first");
         let second = tmp.path().join("second");
-        assert_eq!(select_bundled_models_dir(vec![first.clone(), second]), first);
+        assert_eq!(
+            select_bundled_models_dir(vec![first.clone(), second.clone()]),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("models")
+        );
+
+        // The clean-runner shape, reproduced in-process: a nonexistent exe-relative candidate first,
+        // then an existing bundled dir that holds the VAD and the nested ONNX runtime but NO CTC pair
+        // (CTC is optional in the standard fetch). The existing dir must win, or the runtime beneath
+        // it is unfindable and `ort` blocks forever.
+        let exe_models = tmp.path().join("exe").join("models");
+        let bundled = tmp.path().join("src-tauri").join("models");
+        std::fs::create_dir_all(bundled.join("onnxruntime.dll")).expect("bundled dir");
+        std::fs::write(bundled.join("silero_vad_v4.onnx"), b"vad").expect("vad");
+        std::fs::write(bundled.join("onnxruntime.dll").join("onnxruntime.dll"), b"ort").expect("ort");
+        assert_eq!(select_bundled_models_dir(vec![exe_models.clone(), bundled.clone()]), bundled);
+        assert!(!exe_models.exists(), "the fixture's exe-relative candidate must stay absent, as under cargo test");
     }
 
     #[test]

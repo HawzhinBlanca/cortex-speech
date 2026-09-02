@@ -1164,6 +1164,13 @@ pub fn voice_activity_detection(
                 // session is cached below), so it's a one-time 2 MB hash, not per-call.
                 crate::models::verify_model_path_runtime(&model_path, "silero_vad_v4.onnx")
                     .map_err(|e| AppError::Onnx(format!("VAD model integrity: {e}")))?;
+                // Fail FAST if the ONNX Runtime library cannot be loaded, exactly as the ASR session
+                // site above already does. This was the ONE Session::builder() site without the probe:
+                // with the runtime unfindable, `ort` (load-dynamic) blocks forever inside the system
+                // loader, and on 2026-09-01 four VAD tests did precisely that on the Windows Release
+                // Gate for 2h39m until the 180-minute job cap -- printing nothing. The probe turns
+                // that into a 45 s failure that names the missing library and the remedy.
+                crate::models::ensure_ort_runtime_loadable().map_err(AppError::Onnx)?;
                 let mut builder =
                     Session::builder().map_err(|e| AppError::Onnx(format!("VAD session builder: {e}")))?;
                 let session = builder
