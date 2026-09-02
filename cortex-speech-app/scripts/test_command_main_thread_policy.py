@@ -5,13 +5,14 @@ Tauri runs SYNC `#[tauri::command]`s on the main/UI thread; a slow one there fre
 off the main thread) and offload their blocking body via `run_blocking`/`spawn_blocking`.
 
 This is a RATCHET: the list grows as the migration proceeds, and a command may only be added once it
-is genuinely async. Regressing any listed command back to sync fails the gate.
+is genuinely async. Regressing any listed command back to sync fails the gate. A deliberately retired
+IPC leaves the list only when a separate release-surface policy proves that command remains absent.
 
 READ THIS BEFORE DELETING ANY COMMAND NAMED BELOW (iteration 233). A dead-code audit found 17 IPC
 commands with no frontend `invoke(...)` caller and proposed cutting all of them — ~597 lines. That was
 WRONG for 11 of the 17, and this file is why: the lists here PIN command names, and the gate asserts each
-one exists and is async. Deleting such a command either fails this gate or, worse, gets "fixed" by
-trimming the list — which silently shrinks a ratchet that exists precisely to never shrink.
+one exists and is async. Deleting such a command either fails this gate or must be paired with an
+explicit source-absence contract. Trimming the list without that proof silently weakens the ratchet.
 
 So "no frontend caller" does NOT mean "dead" in this repo. A command can be load-bearing for a gate, for
 `test_ui_thread_blocking_audit.py`'s freezer worklist, or as the sole caller of real logic. Before cutting
@@ -36,8 +37,9 @@ COMMANDS_RS = REPO_ROOT / "src-tauri" / "src" / "commands.rs"
 # lives, or it would silently stop checking it the moment it moved, which is a vacuous pass.
 COMMANDS_DIR = REPO_ROOT / "src-tauri" / "src" / "commands"
 
-# Slow commands proven moved OFF the main thread. GROW this list as the migration continues; never
-# shrink it (that would be a UI-freeze regression).
+# Slow commands proven moved OFF the main thread. Grow this list as the migration continues. A command
+# leaves it only when the command itself is deliberately removed from the shipped IPC surface (with an
+# explicit absence policy), never merely to silence a main-thread regression.
 ASYNC_SLOW_COMMANDS = [
     "open_audio_file",  # non-blocking native picker (crash fix f01ab66)
     "import_directory",  # non-blocking native folder picker (crash fix f01ab66)
@@ -59,23 +61,25 @@ ASYNC_SLOW_COMMANDS = [
     "relink_audio",
     "db_vacuum",
     "merge_dataset_json",
-    # Eval / quality / calibration compute over the whole dataset + a model-integrity hash.
+    "assign_speakers_v1",
+    "rename_speaker_v1",
+    # A single history action can restore/delete tens of thousands of full segment snapshots. Both
+    # paths are typed async commands and execute their transaction on spawn_blocking.
+    "undo",
+    "redo",
+    # Eval / quality / calibration compute over the whole dataset.
     "get_dataset_certificate",
     "run_gold_eval",
     "get_label_quality_lift",
     "validate_dataset_cmd",
     "get_dataset_quality",
-    "verify_finetuned_model_integrity",
     # Active-learning compute + pipeline-clone ASR/decode reads (audio decode + ONNX inference).
     "get_active_learning_queue",
     "get_waveform",
-    "transcribe_segment_constrained",
     "rediarize_segments",
     "run_gold_eval_asr",
-    "run_gold_eval_local",
     # Per-segment ASR/alignment (decode + ONNX/WSL inference, some with a brief db write).
     "transcribe_segment",
-    "transcribe_segment_finetuned",
     "align_segment",
     "check_audio",
     # Jury gate + gold imports + model-checkpoint hash (audio reads / DB writes / multi-GB SHA-256).
@@ -100,13 +104,9 @@ ASYNC_SLOW_COMMANDS = [
     # Audio-duration watchdog: probe thread + 30s recv_timeout — the whole watchdog now runs on the
     # blocking pool so the recv no longer blocks the UI thread (bound preserved).
     "get_audio_duration",
-    # Model downloads: multi-hundred-MB blocking HTTP fetch (single + download-all loop) — moved to
-    # run_blocking so the model panel doesn't freeze for the whole download.
-    "models_download",
+    # Model downloads: the retained support-asset download-all command is a multi-hundred-MB blocking
+    # HTTP fetch, so it remains off the main thread. The old single-model ASR IPC is retired.
     "models_download_all",
-    # Cloud STT: the blocking ElevenLabs Scribe upload+POST moved to run_blocking; the consent + key +
-    # DB-membership gates stay EAGER on the caller thread (never offload before the privacy check).
-    "transcribe_audio_with_scribe",
     # T2 Gemini audio judge: eager consent/key checks + a brief-locked DB gather, then the N-sample
     # cloud round-trip runs on run_blocking; the verdict write re-locks briefly after the await.
     "run_t2_for_segment",
@@ -114,9 +114,6 @@ ASYNC_SLOW_COMMANDS = [
     # connection, shared-handle fallback) so neither the UI thread nor the global db Mutex is held
     # across the cloud round-trips.
     "run_jury_pipeline",
-    # Scribe vote batch: per-segment decode/slice + ElevenLabs POST loop on run_blocking; consent/key
-    # gates + the to-vote gather stay eager; per-insert brief db_arc lock inside the task.
-    "add_scribe_votes",
     # DPO preference-pair upload: the ~120s blocking outbound HTTP POST moved to run_blocking on a
     # separate WAL connection; the cloud-LLM consent gate stays EAGER (never offload before opt-in).
     "run_dpo_update",
@@ -143,6 +140,34 @@ RUN_BLOCKING_COMMANDS = [
     "get_active_learning_queue",
 ]
 
+# Query-only segment commands migrated behind the bounded SegmentQueryStore. They still run their
+# work on the blocking pool, but must no longer regain the raw serialized-writer handle.
+QUERY_STORE_COMMANDS = {
+    "get_segments",
+    "get_segments_suspect_first",
+    "search_segments",
+    "get_audio_health",
+    "get_active_learning_queue",
+}
+
+# Durable export commands whose blocking body is owned by the Tauri-free JobStore. They must not
+# regain either the raw writer handle or direct job-lifecycle authority at the IPC boundary.
+JOB_STORE_COMMANDS = {
+    "export_dataset",
+    "export_transcript",
+    "export_huggingface_dataset",
+    "export_dataset_bundle",
+    "export_audio",
+    "export_gold_eval_set",
+    "export_finetune_pack",
+}
+
+# Mutating commands that must hold explicit restore-generation mutation authority for the complete
+# read/compare/write operation. `db_arc().lock()` only waits out an already-pending restore; it does
+# not make a later restore reservation observe the in-flight mutation. These commands therefore
+# receive the DatabaseRuntime capability and must enter mutation admission before taking its writer.
+MUTATION_RUNTIME_COMMANDS = {"relink_audio", "db_vacuum", "merge_dataset_json"}
+
 
 def source() -> str:
     """The whole command surface: commands.rs + every extracted slice under src/commands/."""
@@ -156,6 +181,12 @@ def source() -> str:
     if "#[tauri::command]" not in text:
         raise AssertionError("no #[tauri::command] found in the command surface — this gate would pass vacuously")
     return text
+
+
+def command_body(src: str, name: str) -> str:
+    start = src.index(f"pub async fn {name}(")
+    end = src.find("\n#[tauri::command]", start + len(name))
+    return src[start:] if end < 0 else src[start:end]
 
 
 def test_listed_slow_commands_are_async() -> None:
@@ -182,14 +213,33 @@ def test_off_main_thread_helper_exists_and_is_used() -> None:
 
 
 def test_migrated_exports_do_not_hold_lock_db_across_the_await() -> None:
-    # The blocking body must clone the Arc handle (db_arc) and lock INSIDE the task — never take a
-    # `lock_db()` guard and carry it across the await (a non-Send guard across await won't compile,
-    # but this pins the intended pattern so a future edit doesn't reintroduce a main-thread lock).
+    # Write-capable commands clone the restore-gated Arc handle and lock INSIDE the task. Migrated
+    # query commands clone SegmentQueryStore instead. Neither may carry a lock_db() guard across await.
     src = source()
     for name in RUN_BLOCKING_COMMANDS:
-        start = src.index(f"pub async fn {name}(")
-        body = src[start : start + 1200]
-        if "state.db_arc()" not in body:
+        body = command_body(src, name)
+        if "state.lock_db()" in body:
+            raise AssertionError(f"`{name}` must not carry state.lock_db() into a blocking task")
+        if name in QUERY_STORE_COMMANDS:
+            if "state.segment_queries()" not in body:
+                raise AssertionError(f"`{name}` must obtain its bounded SegmentQueryStore before the blocking task")
+            if "state.db_arc()" in body:
+                raise AssertionError(f"`{name}` query path regained the raw serialized-writer handle")
+        elif name in JOB_STORE_COMMANDS:
+            if "state.job_store()" not in body:
+                raise AssertionError(f"`{name}` must obtain its tracked JobStore before the blocking task")
+            if "state.db_arc()" in body or ".run_tracked(" in body:
+                raise AssertionError(f"`{name}` regained raw database or job-lifecycle authority")
+        elif name in MUTATION_RUNTIME_COMMANDS:
+            if "state.db_runtime()" not in body:
+                raise AssertionError(f"`{name}` must obtain restore-aware mutation authority via state.db_runtime()")
+            if "begin_mutation()" not in body or "lock_after_mutation(" not in body:
+                raise AssertionError(
+                    f"`{name}` must hold mutation admission before taking the serialized writer"
+                )
+            if "state.db_arc()" in body:
+                raise AssertionError(f"`{name}` must not fall back to the weaker raw DB lock path")
+        elif "state.db_arc()" not in body:
             raise AssertionError(f"`{name}` must obtain the DB via state.db_arc() for the blocking task")
 
 

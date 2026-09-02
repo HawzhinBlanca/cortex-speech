@@ -25,6 +25,7 @@ import sys
 from pathlib import Path
 
 TOL = 1e-6
+JIWER_VERSION = "4.0.0"
 VECTORS = Path(__file__).resolve().parent / "crossval_vectors.json"
 
 # Windows consoles default to cp1252 and crash on Sorani output; force UTF-8.
@@ -48,8 +49,15 @@ def main() -> int:
     try:
         import importlib.metadata as _md
         ver = _md.version("jiwer")
-    except Exception:
-        ver = "?"
+    except Exception as error:
+        print(f"FAIL: cannot prove jiwer distribution identity: {error}", file=sys.stderr)
+        return 2
+    if ver != JIWER_VERSION:
+        print(
+            f"FAIL: jiwer version drift: observed {ver}, expected exactly {JIWER_VERSION}",
+            file=sys.stderr,
+        )
+        return 2
 
     rows = json.loads(VECTORS.read_text(encoding="utf-8"))
     print(f"jiwer {ver} | {len(rows)} vectors | tol={TOL:g}")

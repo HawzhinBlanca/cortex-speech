@@ -28,7 +28,7 @@ describe('hasRealTranscript', () => {
     expect(hasRealTranscript(seg({ rawTranscript: 'n/a' }))).toBe(false);
   });
 
-  it('is true when ANY field carries real content (never under-counts a good clip)', () => {
+  it('is true when the authoritative transcript carries real content', () => {
     expect(hasRealTranscript(seg({ rawTranscript: 'کوردی' }))).toBe(true);
     // A placeholder raw but a real human annotation is still real content.
     expect(
@@ -36,7 +36,18 @@ describe('hasRealTranscript', () => {
         seg({ rawTranscript: '[Pending WSL 7B ASR]', annotatedTranscript: 'کوردی' }),
       ),
     ).toBe(true);
-    expect(hasRealTranscript(seg({ rawTranscript: '', normalizedTranscript: 'سڵاو' }))).toBe(true);
+  });
+
+  it('does not promote normalized or unowned jury evidence into shippable truth', () => {
+    expect(hasRealTranscript(seg({ rawTranscript: '', normalizedTranscript: 'سڵاو' }))).toBe(false);
+    expect(hasRealTranscript(seg({ rawTranscript: '', verdictTranscript: 'machine jury' }))).toBe(
+      false,
+    );
+    expect(
+      hasRealTranscript(
+        seg({ rawTranscript: '', verdictTranscript: 'human truth', humanDecision: 'edit' }),
+      ),
+    ).toBe(true);
   });
 
   it('a batch-verified placeholder is NOT a good verified clip (verified but no real content)', () => {
@@ -50,6 +61,7 @@ describe('hasRealTranscript', () => {
 describe('effectiveTranscript', () => {
   const base = {
     rawTranscript: 'raw',
+    normalizedTranscript: null,
     annotatedTranscript: null,
     verdictTranscript: null,
     humanDecision: null,
@@ -80,11 +92,22 @@ describe('effectiveTranscript', () => {
     ).toBe('annotated');
   });
 
-  it('falls back through annotated then verbatim raw — machine text never surfaces (VERBATIM LAW)', () => {
+  it('falls back through annotation directly to immutable champion raw', () => {
     expect(effectiveTranscript({ ...base, annotatedTranscript: 'annotated' })).toBe('annotated');
-    // An undecided machine verdict is evidence, not the transcript: the champion's verbatim raw wins.
+    expect(effectiveTranscript({ ...base, normalizedTranscript: 'machine evidence' })).toBe('raw');
+    // An undecided jury verdict is not the versioned derived pipeline final.
     expect(effectiveTranscript({ ...base, verdictTranscript: 'machine' })).toBe('raw');
     expect(effectiveTranscript(base)).toBe('raw');
+  });
+
+  it('never lets later machine text reinterpret a legacy human accept', () => {
+    expect(
+      effectiveTranscript({
+        ...base,
+        normalizedTranscript: 'later machine final',
+        humanDecision: 'accept',
+      }),
+    ).toBe('raw');
   });
 
   it('treats whitespace-only fields as absent rather than selecting them', () => {

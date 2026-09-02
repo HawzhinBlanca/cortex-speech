@@ -237,6 +237,16 @@ impl SupervisionState {
         self.warmup_until = Some(now.saturating_add(self.warmup));
     }
 
+    /// A [`Decision::Restart`] whose start FAILED instantly at `now`. `tick` has already committed the
+    /// attempt and armed the warm-up grace — but that grace is sized for a successfully spawned ~30 GB
+    /// load, not for a process that never existed. Drop it and charge the failure now, so a deterministic
+    /// spawn error (absent champion.json, unresolvable cortex_7b_server.py — measured 2026-08-18) uses the
+    /// real backoff/breaker math instead of burning a full warm-up window per attempt.
+    pub fn on_start_failed(&mut self, now: Duration) {
+        self.warmup_until = None;
+        self.sup.on_failure(now);
+    }
+
     /// One supervision tick. `healthy` = did the health probe just succeed, observed at `now`.
     /// Returns the action for the caller (Restart ⇒ start the engine now).
     pub fn tick(&mut self, healthy: bool, now: Duration) -> Decision {

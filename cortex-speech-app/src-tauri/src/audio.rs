@@ -1164,6 +1164,13 @@ pub fn voice_activity_detection(
                 // session is cached below), so it's a one-time 2 MB hash, not per-call.
                 crate::models::verify_model_path_runtime(&model_path, "silero_vad_v4.onnx")
                     .map_err(|e| AppError::Onnx(format!("VAD model integrity: {e}")))?;
+                // Fail FAST if the ONNX Runtime library cannot be loaded, exactly as the ASR session
+                // site above already does. This was the ONE Session::builder() site without the probe:
+                // with the runtime unfindable, `ort` (load-dynamic) blocks forever inside the system
+                // loader, and on 2026-09-01 four VAD tests did precisely that on the Windows Release
+                // Gate for 2h39m until the 180-minute job cap -- printing nothing. The probe turns
+                // that into a 45 s failure that names the missing library and the remedy.
+                crate::models::ensure_ort_runtime_loadable().map_err(AppError::Onnx)?;
                 let mut builder =
                     Session::builder().map_err(|e| AppError::Onnx(format!("VAD session builder: {e}")))?;
                 let session = builder
@@ -1456,6 +1463,37 @@ mod tests {
         assert!(err.is_err(), "a failing callback must abort the decode");
 
         assert!(decode_pcm_windows(dir.path().join("missing.wav"), 500, |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn non_16khz_window_resampling_is_not_a_whole_buffer_identity_protocol() {
+        // Characterization for import identity: the FIR and sinc resamplers need neighboring source
+        // samples. Splitting a 44.1 kHz source resets that context at every boundary, so concatenated
+        // canonical windows are intentionally NOT byte-identical to one whole-buffer resample. Import,
+        // retry and later source verification must therefore all choose one fixed window protocol;
+        // switching based on review chunk settings turns unchanged audio into a false replacement.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("route-change-44k.wav");
+        write_tone_wav(&path, 44_100, 2.0, 1);
+
+        let (whole_rate, whole_pcm) = decode_to_pcm(&path).expect("whole-buffer decode");
+        let whole_hash = crate::fingerprint::AudioFingerprint::content_hash(&whole_pcm, whole_rate);
+
+        let mut windowed = crate::fingerprint::StreamingIdentity::new();
+        let mut windows = 0usize;
+        decode_pcm_windows(&path, 500, |window| {
+            windows += 1;
+            windowed.push(&window.pcm, window.sample_rate);
+            Ok(())
+        })
+        .expect("windowed decode");
+        let windowed_hash = windowed.finish().content;
+
+        assert!(windows > 1, "fixture must cross a resampling boundary");
+        assert_ne!(
+            whole_hash, windowed_hash,
+            "a route-sensitive identity test must expose the 44.1 kHz boundary-state difference"
+        );
     }
 
     #[test]
@@ -2192,6 +2230,195 @@ mod tests {
         let mut cache = lock_vad_cache();
         *cache = None;
         assert!(cache.is_none(), "a poisoned lock must still be usable, and a write through it must land");
+    }
+
+    // The duration arithmetic both metadata paths share. A zero/negative rate must report 0 rather
+    // than divide, and the count is PER CHANNEL — a stereo clip is not half as long as a mono one.
+    #[test]
+    fn frames_to_duration_ms_is_total_and_channel_independent() {
+        assert_eq!(frames_to_duration_ms(16_000, 16_000.0), 1_000);
+        assert_eq!(frames_to_duration_ms(0, 16_000.0), 0, "an empty track is 0 ms, not an error");
+        assert_eq!(frames_to_duration_ms(48_000, 48_000.0), 1_000, "1 s stays 1 s at any rate");
+        // A corrupt header reporting rate 0 (or a negative one) must not divide by zero.
+        assert_eq!(frames_to_duration_ms(16_000, 0.0), 0, "a zero sample rate reports 0 ms");
+        assert_eq!(frames_to_duration_ms(16_000, -44_100.0), 0, "a negative sample rate reports 0 ms");
+    }
+
+    // The decode FALLBACK arm: a container that declares no usable frame count (VBR MP3 without a
+    // Xing header, streamed OGG/WebM) must be measured by decoding it, not reported as 0 ms — a 0 ms
+    // clip looks empty to every importer downstream.
+    #[test]
+    fn duration_fallback_decodes_when_the_container_declares_no_frame_count() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wav = dir.path().join("fallback.wav");
+        write_tone_wav(&wav, 16_000, 0.5, 1);
+
+        let declared = duration_ms_with_decode_fallback(&wav, Some(8_000), 16_000.0).unwrap();
+        assert_eq!(declared, 500, "a declared frame count is trusted as-is");
+
+        for absent in [None, Some(0)] {
+            let measured = duration_ms_with_decode_fallback(&wav, absent, 16_000.0).unwrap();
+            assert!(
+                (measured - 500).abs() <= 20,
+                "a missing/zero frame count must be MEASURED by decoding, got {measured} ms for {absent:?}"
+            );
+        }
+        clear_pcm_cache();
+    }
+
+    // The waveform decimator's degenerate inputs. The review page asks for a fixed number of points
+    // regardless of clip length, so both "no points wanted" and "more points than samples" arrive.
+    #[test]
+    fn compute_waveform_handles_degenerate_point_counts() {
+        let pcm: Vec<i16> = (0..10).map(|i| i * 1000).collect();
+        assert!(compute_waveform(&pcm, 0).is_empty(), "zero points asked for is zero points returned");
+        assert!(compute_waveform(&[], 0).is_empty(), "both degenerate at once");
+        // More points than samples: chunk_size floors to 1, so one point per sample and no more.
+        let over = compute_waveform(&pcm, 100);
+        assert_eq!(over.len(), pcm.len(), "cannot invent more points than there are samples");
+        assert!(over.iter().all(|v| v.is_finite() && *v >= 0.0), "RMS points are finite and non-negative: {over:?}");
+    }
+
+    // is_silent's threshold, both sides. 50 is the cutoff; the boundary is where a rounding change
+    // would silently start dropping (or keeping) real quiet speech.
+    #[test]
+    fn is_silent_boundary_and_empty_buffer() {
+        assert!(is_silent(&[]), "an empty buffer has no loud sample — `all` on empty is true");
+        assert!(is_silent(&[49, -49]), "49 is below the threshold");
+        assert!(!is_silent(&[50]), "50 is the first non-silent magnitude");
+        assert!(!is_silent(&[-50]), "the threshold is on magnitude, not sign");
+        assert!(!is_silent(&[0, 0, 0, 900, 0]), "one loud sample makes the buffer non-silent");
+    }
+
+    // The retry classifier's remaining message arms. Getting this wrong either doubles latency on a
+    // permanent failure or gives up on a decode that would have succeeded on a second try.
+    #[test]
+    fn transient_decode_classifier_covers_every_message_arm() {
+        use crate::error::AppError;
+        let decode = |msg: &str| AppError::Audio(AudioError::Decode(msg.to_string()));
+        for msg in [
+            "Audio decode timed out after 30s",
+            "Decode TIMEOUT while probing",
+            "Audio decode worker thread disconnected",
+            "the worker thread went away",
+            "resource temporarily unavailable",
+        ] {
+            assert!(is_transient_decode_error(&decode(msg)), "{msg} should retry");
+        }
+        assert!(
+            !is_transient_decode_error(&decode("Cannot probe format: unsupported")),
+            "a bad container is permanent"
+        );
+        assert!(!is_transient_decode_error(&decode("File is empty: clip.wav")), "an empty file is permanent");
+
+        use std::io::{Error as IoError, ErrorKind};
+        assert!(is_transient_decode_error(&AppError::Io(IoError::from(ErrorKind::WouldBlock))), "WouldBlock retries");
+        // A non-Decode audio error is not a transient decode error either.
+        assert!(!is_transient_decode_error(&AppError::Audio(AudioError::NoTracks("x.wav".into()))));
+    }
+
+    // The anti-aliasing pre-filter, at both ends of its cutoff clamp. Unity DC gain is the property
+    // the resampler depends on: a filter that changed the level would change every clip's measured
+    // rms_db/snr_db, which gate clip tiers.
+    #[test]
+    fn lowpass_fir_clamps_its_cutoff_and_keeps_unity_dc_gain() {
+        let constant = vec![0.5f32; 256];
+        // cutoff_hz far ABOVE Nyquist clamps to 0.499; cutoff_hz of 0 (and a negative) clamps to 1e-4.
+        for cutoff in [1_000_000.0, 0.0, -5_000.0] {
+            let out = lowpass_fir(&constant, 16_000.0, cutoff);
+            assert_eq!(out.len(), constant.len(), "the filter is same-length");
+            assert!(
+                out.iter().all(|v| (v - 0.5).abs() < 1e-3),
+                "DC must pass at unity gain for cutoff {cutoff}, got {:?}",
+                &out[..4]
+            );
+        }
+        // At the clamped-low cutoff a Nyquist-rate alternation must be crushed, proving the kernel is
+        // a real low-pass and not an identity.
+        let alternating: Vec<f32> = (0..256).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let filtered = lowpass_fir(&alternating, 16_000.0, 0.0);
+        let mid = &filtered[64..192];
+        assert!(
+            mid.iter().all(|v| v.abs() < 0.05),
+            "a 0.5 cycles/sample tone must be attenuated by the low-pass, got max {:?}",
+            mid.iter().fold(0.0f32, |a, b| a.max(b.abs()))
+        );
+    }
+
+    // The energy fallback's segmentation arms that the "short word survives" test does not reach:
+    // pure silence, a burst too short to keep, and speech still running when the buffer ends.
+    #[test]
+    fn energy_vad_fallback_segmentation_edges() {
+        let sr = 16_000u32;
+        let ms = |m: usize| m * sr as usize / 1000;
+
+        // Pure silence: nothing crosses the adaptive threshold, so the fallback returns the whole
+        // buffer as one region rather than an empty plan (which would drop the clip entirely).
+        let silence = vec![0i16; ms(1000)];
+        assert_eq!(vad_energy_fallback(&silence, sr, 0.5).unwrap(), vec![(0, silence.len())]);
+
+        // A burst below the ~90 ms floor is discarded, and with nothing else kept the whole buffer is
+        // returned — the same honest "no usable VAD" answer, not a spurious 40 ms segment.
+        let mut too_short = vec![0i16; ms(400)];
+        too_short.extend(std::iter::repeat_n(8000i16, ms(40)));
+        too_short.extend(std::iter::repeat_n(0i16, ms(400)));
+        assert_eq!(
+            vad_energy_fallback(&too_short, sr, 0.5).unwrap(),
+            vec![(0, too_short.len())],
+            "a sub-floor burst must not become its own segment"
+        );
+
+        // Speech that is still going when the buffer ends must be closed at the buffer end, not lost
+        // because the loop never saw a falling edge.
+        let mut runs_to_end = vec![0i16; ms(400)];
+        runs_to_end.extend(std::iter::repeat_n(8000i16, ms(300)));
+        let tail = vad_energy_fallback(&runs_to_end, sr, 0.5).unwrap();
+        assert_eq!(tail.len(), 1, "one open-ended region: {tail:?}");
+        assert_eq!(tail[0].1, runs_to_end.len(), "the open region ends at the buffer end");
+        assert!(tail[0].0 >= ms(300), "and starts on the burst, not at 0: {tail:?}");
+    }
+
+    // normalize_pcm_rms runs before denoise and ASR on every clip. Its empty-buffer guard and its
+    // peak limiter are the two arms the level test does not reach — and the limiter is what stops a
+    // gain-up from clipping a loud clip into distortion the acoustic model then transcribes badly.
+    #[test]
+    fn normalize_pcm_rms_guards_an_empty_buffer_and_limits_the_peak() {
+        let mut empty: Vec<f32> = Vec::new();
+        normalize_pcm_rms(&mut empty, -20.0);
+        assert!(empty.is_empty(), "an empty buffer is returned untouched, not divided by zero");
+
+        // Already far above the target: the gain is < 1, but the samples that would still land past
+        // full scale are clamped to the +/-0.99 limit rather than wrapping or clipping hard.
+        let mut hot = vec![0.9f32, -0.9, 0.9, -0.9];
+        normalize_pcm_rms(&mut hot, 0.0);
+        assert!(hot.iter().all(|v| v.abs() <= 0.99), "every sample is inside the limiter: {hot:?}");
+        assert!(hot.iter().all(|v| v.is_finite()), "and none of them is NaN/inf");
+        assert!(hot[0] > 0.0 && hot[1] < 0.0, "the limiter must not invert the waveform: {hot:?}");
+    }
+
+    // The resampler's empty-input short circuit, on the path where the rates actually DIFFER — the
+    // identity path returns early for a different reason, so it never proves this one.
+    #[test]
+    fn resampling_nothing_at_a_new_rate_is_still_nothing() {
+        assert!(resample(&[], 44_100, 16_000).is_empty(), "downsampling an empty buffer yields nothing");
+        assert!(resample(&[], 8_000, 16_000).is_empty(), "upsampling one does too");
+        let (rate, pcm) = ensure_pcm_16khz(44_100, Vec::new()).unwrap();
+        assert_eq!(rate, TARGET_SAMPLE_RATE, "the rate is still normalised for an empty clip");
+        assert!(pcm.is_empty(), "and no samples are invented");
+    }
+
+    // The persisted VAD provenance token. It is written to the `vad_backend` column and reported in
+    // the export, so a renamed variant would silently rewrite the dataset's provenance vocabulary.
+    #[test]
+    fn vad_backend_tokens_are_stable_and_no_audio_claims_no_backend() {
+        assert_eq!(VadBackend::Silero.as_str(), "silero");
+        assert_eq!(VadBackend::Energy.as_str(), "energy");
+        assert_eq!(VadBackend::None.as_str(), "none");
+
+        // An empty buffer never runs a backend, so it must not claim one.
+        let (regions, backend) = voice_activity_detection(&[], TARGET_SAMPLE_RATE, 0.5).unwrap();
+        assert!(regions.is_empty(), "no audio means no regions");
+        assert_eq!(backend, VadBackend::None, "no VAD ran, so none may be named");
     }
 }
 

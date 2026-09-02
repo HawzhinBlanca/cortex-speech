@@ -1,21 +1,27 @@
 //! Batch review-action IPC commands — slice 3 of the Week-4 `commands.rs` decomposition.
 //!
-//! Behaviour and command NAMES are unchanged: `commands.rs` re-exports this module
+//! Command names remain stable while unsafe legacy batch verification fails closed: `commands.rs` re-exports this module
 //! (`pub use batch::*;`), so `lib.rs`'s invoke_handler still names `commands::batch_verify` and the
 //! frontend's `invoke('batch_verify')` is untouched. Same functions, only relocated.
 //!
-//! Each spawns a worker thread and returns immediately (the audit's OFFLOADED_HIGH set) so a
-//! whole-library batch never blocks the UI; progress + per-item failures stream via `emit_or_log`.
-//! (batch_transcribe stays in commands.rs for now — it is coupled to the jury `with_jury_db` helper.)
+//! Long-running normalization runs behind the durable batch journal and streams progress. Speaker
+//! assignment remains a generated async, all-or-nothing store operation.
 
-use super::{emit_or_log, STRICT_RATE_LIMITER};
-use crate::db::SpeechSegment;
+use super::{
+    batch_start_commit_error, canonical_batch_config_sha256, canonical_batch_operation_id, durable_batch_outcome,
+    emit_or_log, new_batch_executor_identity, validate_batch_segment_ids, DurableBatchWorkerGuard, STRICT_RATE_LIMITER,
+};
+use crate::db::{BatchItemCommitOutcomeV1, BatchTerminalIntentV1};
+use crate::ipc_contract::{
+    AssignSpeakersRequestV1, AssignedSpeakersV1, BatchOperationV1, BatchStartStatusV1, BatchStartedV1, CommandErrorV1,
+    SuggestedActionV1,
+};
+use crate::stores::SpeakerAssignmentError;
 use crate::validation::input as validate;
 use crate::AppState;
 use lru::LruCache;
-use rayon::prelude::*;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex};
 use tauri::{Manager, State};
 
 /// Process-wide normalizer memoizer: normalization is pure per (config, text), so identical
@@ -44,204 +50,216 @@ fn normalize_cached(cache_key: String, compute: impl FnOnce() -> String) -> Stri
 #[tauri::command]
 pub fn batch_verify(
     ids: Vec<String>,
-    verified: bool,
-    state: State<'_, AppState>,
-    app: tauri::AppHandle,
+    _verified: bool,
+    _state: State<'_, AppState>,
+    _app: tauri::AppHandle,
 ) -> Result<serde_json::Value, String> {
     STRICT_RATE_LIMITER.check("batch_verify")?;
     for id in &ids {
         validate::validate_identifier(id)?;
     }
+    Err(
+        "legacy batch verify/unverify is disabled; use the review decision flow so every human verdict has immutable evidence"
+            .into(),
+    )
+}
 
-    let total = ids.len();
-    state.try_start_batch()?;
-
-    let cancel = state.ensure_cancel_token()?;
-    let app_clone = app.clone();
-
-    std::thread::spawn(move || {
-        struct BatchGuard {
-            app: tauri::AppHandle,
+fn public_speaker_assignment_error(error: SpeakerAssignmentError) -> CommandErrorV1 {
+    match error {
+        SpeakerAssignmentError::Invalid => CommandErrorV1::new(
+            "INVALID_SPEAKER_ASSIGNMENT",
+            "The batch speaker assignment is invalid and was not applied.",
+            false,
+        ),
+        SpeakerAssignmentError::Stale => CommandErrorV1::new(
+            "STALE_SEGMENT_SELECTION",
+            "The selected segment set changed. Reload the library before assigning a speaker.",
+            false,
+        )
+        .suggested(SuggestedActionV1::ReloadClip),
+        SpeakerAssignmentError::Busy => {
+            CommandErrorV1::new("DATABASE_BUSY", "The workspace is busy. Retry the speaker assignment.", true)
+                .suggested(SuggestedActionV1::Retry)
         }
-        impl Drop for BatchGuard {
-            fn drop(&mut self) {
-                if let Some(app_state) = self.app.try_state::<AppState>() {
-                    app_state.finish_batch();
-                }
+        SpeakerAssignmentError::Application => CommandErrorV1::new(
+            "SPEAKER_ASSIGNMENT_FAILED",
+            "The speaker assignment could not be saved. Open Health before retrying.",
+            false,
+        )
+        .suggested(SuggestedActionV1::OpenHealth),
+    }
+}
+
+/// One generated, bounded and all-or-nothing speaker assignment. SQLite and exact history work run
+/// on the blocking pool; the restore-admission token remains live through session persistence.
+#[tauri::command]
+#[specta::specta]
+pub async fn assign_speakers_v1(
+    request: AssignSpeakersRequestV1,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<AssignedSpeakersV1, CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("assign_speakers_v1").map_err(|_| {
+        CommandErrorV1::new("RATE_LIMITED", "Too many speaker assignment requests. Retry in a moment.", true)
+            .suggested(SuggestedActionV1::Retry)
+    })?;
+    if request.ids.is_empty() || request.ids.len() > 100_000 {
+        return Err(CommandErrorV1::new(
+            "INVALID_SPEAKER_ASSIGNMENT",
+            "Assign a speaker to between one and 100,000 unique segments.",
+            false,
+        ));
+    }
+    let mut unique_ids = std::collections::HashSet::with_capacity(request.ids.len());
+    for id in &request.ids {
+        validate::validate_identifier(id)
+            .map_err(|_| CommandErrorV1::new("INVALID_SEGMENT_ID", "A selected segment identity is invalid.", false))?;
+        if !unique_ids.insert(id.as_str()) {
+            return Err(CommandErrorV1::new(
+                "INVALID_SPEAKER_ASSIGNMENT",
+                "The speaker assignment contains a duplicate segment identity.",
+                false,
+            ));
+        }
+    }
+    if let Some(speaker_id) = request.target_speaker_id.as_deref() {
+        validate::validate_speaker_label(speaker_id)
+            .map_err(|_| CommandErrorV1::new("INVALID_SPEAKER_ID", "The speaker label is invalid.", false))?;
+    }
+
+    let requested_count = request.ids.len();
+    let target_speaker_id = request.target_speaker_id;
+    let segment_writes = state.segment_writes();
+    let worker_app = app.clone();
+    let (assigned, _mutation) = tokio::task::spawn_blocking(move || {
+        let result = segment_writes.assign_speaker_batch_v1(&request.ids, target_speaker_id.as_deref())?;
+        if result.0.changed_count > 0 {
+            if let Some(app_state) = worker_app.try_state::<AppState>() {
+                app_state.session_auto_save();
             }
         }
-        let _guard = BatchGuard { app: app_clone.clone() };
+        Ok::<_, crate::stores::SpeakerAssignmentError>(result)
+    })
+    .await
+    .map_err(|_| {
+        CommandErrorV1::new(
+            "SPEAKER_ASSIGNMENT_FAILED",
+            "The speaker assignment worker stopped unexpectedly. Retry the operation.",
+            true,
+        )
+        .suggested(SuggestedActionV1::Retry)
+    })?
+    .map_err(public_speaker_assignment_error)?;
+    Ok(AssignedSpeakersV1 {
+        requested_count,
+        changed_count: assigned.changed_count,
+        unchanged_count: assigned.requested_count - assigned.changed_count,
+    })
+}
 
-        emit_or_log(
-            &app_clone,
-            "batch-progress",
-            serde_json::json!({ "type": "started", "total": total, "operation": "verify" }),
-        );
+fn batch_normalize_start_error(error: &str) -> CommandErrorV1 {
+    if error.contains("BATCH_ADMISSION_CANCELLED") {
+        return batch_start_commit_error(crate::BatchStartCommitError::Cancelled);
+    }
+    if error.contains(crate::database_runtime::RESTORE_IN_PROGRESS_MSG) {
+        return CommandErrorV1::new(
+            "RESTORE_IN_PROGRESS",
+            "A database restore is in progress. Wait for it to finish, then retry.",
+            true,
+        )
+        .suggested(SuggestedActionV1::Retry);
+    }
+    if error.contains("restore generation changed") {
+        return CommandErrorV1::new(
+            "RESTORE_GENERATION_CHANGED",
+            "The database changed during batch preparation. Retry from the current workspace.",
+            true,
+        )
+        .suggested(SuggestedActionV1::Retry);
+    }
+    if error.contains("already in progress") || error.contains("one_live_batch") {
+        return CommandErrorV1::new("BATCH_ALREADY_RUNNING", "Another batch operation is already running.", true)
+            .suggested(SuggestedActionV1::Retry);
+    }
+    if error.contains("does not exist") {
+        return CommandErrorV1::new(
+            "BATCH_SEGMENT_MISSING",
+            "A selected segment no longer exists. Reload the library before retrying.",
+            false,
+        )
+        .suggested(SuggestedActionV1::ReloadClip);
+    }
+    CommandErrorV1::new(
+        "BATCH_ADMISSION_FAILED",
+        "The normalization batch could not be admitted durably. Open Health before retrying.",
+        false,
+    )
+    .suggested(SuggestedActionV1::OpenHealth)
+}
 
-        // One targeted UPDATE per segment — no read-modify-write cycle.
-        let mut succeeded = 0u32;
-        let mut failed = 0u32;
-        let mut cancelled = false;
-
-        for (i, id) in ids.iter().enumerate() {
-            if cancel.is_cancelled() {
-                cancelled = true;
-                break;
-            }
-            let update_ok = if let Some(app_state) = app_clone.try_state::<AppState>() {
-                match app_state.lock_db().update_verified(id, verified) {
-                    Ok(updated) => updated,
-                    Err(error) => {
-                        tracing::error!("Batch verify DB update failed for {id}: {error}");
-                        false
-                    }
-                }
-            } else {
-                false
-            };
-
-            if update_ok {
-                succeeded += 1;
-            } else {
-                failed += 1;
-            }
-
-            emit_or_log(
-                &app_clone,
-                "batch-progress",
-                serde_json::json!({
-                    "type": "progress", "current": i + 1, "total": total,
-                    "file": id,
-                    "status": if verified { "verifying" } else { "unverifying" },
-                    "operation": "verify"
-                }),
-            );
-        }
-
-        emit_or_log(
-            &app_clone,
-            "batch-progress",
-            serde_json::json!({
-                "type": "completed", "total": total,
-                "succeeded": succeeded, "failed": failed,
-                "cancelled": cancelled, "operation": "verify"
-            }),
-        );
-    });
-
-    Ok(serde_json::json!({ "status": "started" }))
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchNormalizationConfigV1 {
+    schema: u8,
+    protocol: &'static str,
+    build_git_sha: &'static str,
+    normalize_numbers: bool,
+    verbalize_numbers: bool,
+    normalize_hamza: bool,
+    remove_diacritics: bool,
+    normalizer_version: &'static str,
 }
 
 #[tauri::command]
-pub fn batch_assign_speaker(
+#[specta::specta]
+pub async fn batch_normalize(
     ids: Vec<String>,
-    speaker_id: String,
-    state: State<'_, AppState>,
+    operation_id: String,
     app: tauri::AppHandle,
-) -> Result<serde_json::Value, String> {
-    STRICT_RATE_LIMITER.check("batch_assign_speaker")?;
-    for id in &ids {
-        validate::validate_identifier(id)?;
-    }
-    if !speaker_id.is_empty() {
-        validate::validate_text(&speaker_id, 256, "Speaker ID")?;
-    }
-
-    let total = ids.len();
-    state.try_start_batch()?;
-
-    let cancel = state.ensure_cancel_token()?;
-    let app_clone = app.clone();
-    let speaker_id_clone = speaker_id.clone();
-
-    std::thread::spawn(move || {
-        struct BatchGuard {
-            app: tauri::AppHandle,
-        }
-        impl Drop for BatchGuard {
-            fn drop(&mut self) {
-                if let Some(app_state) = self.app.try_state::<AppState>() {
-                    app_state.finish_batch();
-                }
-            }
-        }
-        let _guard = BatchGuard { app: app_clone.clone() };
-
-        emit_or_log(
-            &app_clone,
-            "batch-progress",
-            serde_json::json!({ "type": "started", "total": total, "operation": "assign_speaker" }),
-        );
-
-        // One targeted UPDATE per segment — avoids full read-modify-write cycle.
-        let mut succeeded = 0u32;
-        let mut failed = 0u32;
-        let mut cancelled = false;
-        let spk: Option<&str> = if speaker_id_clone.is_empty() { None } else { Some(&speaker_id_clone) };
-
-        for (i, id) in ids.iter().enumerate() {
-            if cancel.is_cancelled() {
-                cancelled = true;
-                break;
-            }
-            let update_ok = if let Some(app_state) = app_clone.try_state::<AppState>() {
-                match app_state.lock_db().update_speaker_id(id, spk) {
-                    Ok(updated) => updated,
-                    Err(error) => {
-                        tracing::error!("Batch speaker assignment DB update failed for {id}: {error}");
-                        false
-                    }
-                }
-            } else {
-                false
-            };
-
-            if update_ok {
-                succeeded += 1;
-            } else {
-                failed += 1;
-            }
-
-            emit_or_log(
-                &app_clone,
-                "batch-progress",
-                serde_json::json!({
-                    "type": "progress", "current": i + 1, "total": total,
-                    "file": id, "status": "assigning speaker",
-                    "operation": "assign_speaker"
-                }),
-            );
-        }
-
-        emit_or_log(
-            &app_clone,
-            "batch-progress",
-            serde_json::json!({
-                "type": "completed", "total": total,
-                "succeeded": succeeded, "failed": failed,
-                "cancelled": cancelled, "operation": "assign_speaker"
-            }),
-        );
-    });
-
-    Ok(serde_json::json!({ "status": "started" }))
+) -> Result<BatchStartedV1, CommandErrorV1> {
+    tokio::task::spawn_blocking(move || batch_normalize_blocking(ids, operation_id, app)).await.map_err(|error| {
+        tracing::error!(%error, "Normalization admission worker stopped unexpectedly");
+        CommandErrorV1::new(
+            "BATCH_START_WORKER_FAILED",
+            "The normalization batch could not be started. Retry; if it continues, open Health.",
+            true,
+        )
+        .suggested(SuggestedActionV1::OpenHealth)
+    })?
 }
 
-#[tauri::command]
-pub fn batch_normalize(
+fn batch_normalize_blocking(
     ids: Vec<String>,
-    state: State<'_, AppState>,
+    operation_id: String,
     app: tauri::AppHandle,
-) -> Result<serde_json::Value, String> {
-    STRICT_RATE_LIMITER.check("batch_normalize")?;
-    for id in &ids {
-        validate::validate_identifier(id)?;
+) -> Result<BatchStartedV1, CommandErrorV1> {
+    let state = app.state::<AppState>();
+    let operation = crate::BatchOperation::Normalize;
+    let operation_id = canonical_batch_operation_id(&operation_id).map_err(|_| {
+        CommandErrorV1::new("INVALID_BATCH_OPERATION_ID", "The batch operation identity is invalid.", false)
+    })?;
+    if STRICT_RATE_LIMITER.check("batch_normalize").is_err() {
+        state.remember_batch_rejection(&operation_id, operation);
+        return Err(CommandErrorV1::new("RATE_LIMITED", "Too many batch requests. Wait a moment, then retry.", true)
+            .suggested(SuggestedActionV1::Retry));
+    }
+    if let Err(error) = validate_batch_segment_ids(&ids) {
+        state.remember_batch_rejection(&operation_id, operation);
+        tracing::warn!(%error, "Rejected invalid normalization batch selection");
+        return Err(CommandErrorV1::new(
+            "INVALID_BATCH_SELECTION",
+            "Select between one and 100,000 unique segments before normalizing.",
+            false,
+        ));
     }
 
     let total = ids.len();
-    state.try_start_batch()?;
-
-    let cancel = state.ensure_cancel_token()?;
+    let cancel = state
+        .try_start_batch_for_run(&operation_id, operation, total)
+        .map_err(|error| batch_normalize_start_error(&error))?;
+    let mut claimed_start = crate::ClaimedBatchStart::new(&state, &operation_id, operation);
+    let restore_generation =
+        crate::database_runtime::capture_restore_generation().map_err(|error| batch_normalize_start_error(&error))?;
     let settings = state.lock_settings().clone();
     let config = crate::normalizer::NormalizationConfig {
         normalize_numbers: settings.auto_normalize,
@@ -249,142 +267,243 @@ pub fn batch_normalize(
         normalize_hamza: true,
         remove_diacritics: false,
     };
-    let normalizer = Arc::new(crate::normalizer::SoraniNormalizer::with_config(config));
-    let app_clone = app.clone();
-
-    std::thread::spawn(move || {
-        struct BatchGuard {
-            app: tauri::AppHandle,
-        }
-        impl Drop for BatchGuard {
-            fn drop(&mut self) {
-                if let Some(app_state) = self.app.try_state::<AppState>() {
-                    app_state.finish_batch();
+    let config_sha256 = canonical_batch_config_sha256(&BatchNormalizationConfigV1 {
+        schema: 1,
+        protocol: "durable-batch-normalize-v1",
+        build_git_sha: crate::GIT_SHA,
+        normalize_numbers: config.normalize_numbers,
+        verbalize_numbers: config.verbalize_numbers,
+        normalize_hamza: config.normalize_hamza,
+        remove_diacritics: config.remove_diacritics,
+        normalizer_version: crate::normalizer::NORMALIZER_VERSION,
+    })
+    .map_err(|error| batch_normalize_start_error(&error))?;
+    let normalizer = crate::normalizer::SoraniNormalizer::with_config(config);
+    let executor = new_batch_executor_identity();
+    // Allocate every captured owner before durable admission. Once the journal exists, the unified
+    // guard below is the sole authority that may reopen the process-local batch gate.
+    let worker_app = app.clone();
+    let worker_operation_id = operation_id.clone();
+    let admission_commit =
+        state.commit_batch_start(&operation_id, operation, &cancel).map_err(batch_start_commit_error)?;
+    drop(admission_commit);
+    let (lease, admitted) = state
+        .batch_store()
+        .admit(crate::stores::BatchAdmissionV1 {
+            operation_id: &operation_id,
+            kind: crate::db::BatchJobKindV1::Normalize,
+            segment_ids: &ids,
+            config_sha256: &config_sha256,
+            executor,
+            cancel: cancel.as_atomic(),
+            restore_generation,
+        })
+        .map_err(|error| batch_normalize_start_error(&error.to_string()))?;
+    let mut worker = DurableBatchWorkerGuard::new(worker_app.clone(), worker_operation_id.clone(), operation, lease);
+    if !state.mark_batch_durable_admitted(&operation_id, operation) {
+        tracing::error!(%operation_id, "Normalization durable-admission phase lost exact start authority");
+        claimed_start.disarm();
+        worker
+            .finish(BatchTerminalIntentV1::Failed { code: "BATCH_START_AUTHORITY_LOST".into() })
+            .map_err(|error| batch_normalize_start_error(&error.to_string()))?;
+        drop(worker);
+        return Err(batch_start_commit_error(crate::BatchStartCommitError::AuthorityLost));
+    }
+    // From here the unified guard owns both journal and process-gate settlement.
+    claimed_start.disarm();
+    if usize::try_from(admitted.total).ok() != Some(total) {
+        tracing::error!(expected = total, admitted = admitted.total, "Durable normalization admission count mismatch");
+        worker
+            .finish(BatchTerminalIntentV1::Failed { code: "BATCH_EVIDENCE_INVALID".into() })
+            .map_err(|error| batch_normalize_start_error(&error.to_string()))?;
+        drop(worker);
+        return Err(CommandErrorV1::new(
+            "BATCH_EVIDENCE_INVALID",
+            "The admitted batch evidence is inconsistent. Open Health before retrying.",
+            false,
+        )
+        .suggested(SuggestedActionV1::OpenHealth));
+    }
+    let start_commit = match state.commit_batch_start(&operation_id, operation, &cancel) {
+        Ok(commit) => commit,
+        Err(error) => {
+            let intent = match error {
+                crate::BatchStartCommitError::Cancelled => {
+                    BatchTerminalIntentV1::Cancelled { code: "BATCH_CANCELLED".into() }
                 }
-            }
+                crate::BatchStartCommitError::AuthorityLost => {
+                    BatchTerminalIntentV1::Failed { code: "BATCH_START_AUTHORITY_LOST".into() }
+                }
+            };
+            worker.finish(intent).map_err(|settle_error| {
+                tracing::error!(%operation_id, %settle_error, "Admitted normalization could not settle before worker spawn");
+                batch_normalize_start_error(&settle_error.to_string())
+            })?;
+            drop(worker);
+            return Err(batch_start_commit_error(error));
         }
-        let _guard = BatchGuard { app: app_clone.clone() };
+    };
+
+    // Do not hold the cancel-slot mutex while `spawn` consumes the closure: on an OS refusal the
+    // captured guard drops synchronously and must be free to clear that same slot without deadlock.
+    drop(start_commit);
+    let app_clone = worker_app;
+    let spawn = std::thread::Builder::new().name("cortex-batch-normalize".into()).spawn(move || {
+        worker.mark_worker_entered();
 
         emit_or_log(
             &app_clone,
             "batch-progress",
             serde_json::json!({
-                "type": "started", "total": total, "operation": "normalize"
+                "type": "started", "total": total, "operation": "normalize",
+                "operationId": worker_operation_id.as_str()
             }),
         );
-
-        let mut prefetch_failed_ids: Vec<String> = Vec::new();
-        let segments: Vec<SpeechSegment> = if let Some(app_state) = app_clone.try_state::<AppState>() {
-            let db = app_state.lock_db();
-            let mut found = Vec::new();
-            for id in &ids {
-                match db.get_segment_by_id(id) {
-                    Ok(Some(seg)) => found.push(seg),
-                    Ok(None) => {
-                        tracing::warn!("Batch normalize segment not found during prefetch: {id}");
-                        prefetch_failed_ids.push(id.clone());
-                    }
-                    Err(error) => {
-                        tracing::error!("Batch normalize DB prefetch failed for {id}: {error}");
-                        prefetch_failed_ids.push(id.clone());
-                    }
-                }
-            }
-            found
-        } else {
-            tracing::error!("Batch normalize app state unavailable during prefetch");
-            prefetch_failed_ids.extend(ids.iter().cloned());
-            Vec::new()
-        };
-
-        // Fold the result-affecting config flags into the cache key. NORMALIZER_CACHE is a
-        // never-cleared process-global static, so keying on raw text alone replayed the FIRST
-        // config's normalization for the same text after the user toggled auto_normalize /
-        // verbalize_numbers (digit handling differs), persisting the wrong normalized_transcript.
-        let (auto_norm, verbalize) = (settings.auto_normalize, settings.verbalize_numbers);
-        let results: Vec<(String, String)> = segments
-            .par_iter()
-            .map(|seg| {
-                let cache_key = format!("{}|{}|{}", auto_norm as u8, verbalize as u8, seg.raw_transcript);
-                let normalized = normalize_cached(cache_key, || normalizer.normalize(&seg.raw_transcript));
-                (seg.id.clone(), normalized)
-            })
-            .collect();
-
-        let mut succeeded = 0u32;
-        let mut failed = prefetch_failed_ids.len() as u32;
-        let mut cancelled = false;
-
-        for (i, id) in prefetch_failed_ids.iter().enumerate() {
-            emit_or_log(
-                &app_clone,
-                "batch-progress",
-                serde_json::json!({
-                    "type": "progress", "current": i + 1, "total": total,
-                    "file": id, "status": "failed", "operation": "normalize"
-                }),
-            );
-        }
-
-        for (i, (id, normalized)) in results.iter().enumerate() {
+        let mut terminal_intent = BatchTerminalIntentV1::Succeeded;
+        let mut page_cursor = None;
+        'pages: loop {
             if cancel.is_cancelled() {
-                cancelled = true;
+                terminal_intent = BatchTerminalIntentV1::Cancelled { code: "BATCH_CANCELLED".into() };
                 break;
             }
-
-            let update_ok = if let Some(app_state) = app_clone.try_state::<AppState>() {
-                // Targeted single-column update — writes ONLY normalized_transcript, never the whole
-                // row. The old read-modify-write (get_segment_by_id -> set -> insert_segment whole-row
-                // upsert) could clobber a concurrent write to this segment (e.g. a background aligner /
-                // 7B pass on the pipeline's own connection) that landed between the re-read and the
-                // upsert. annotated_transcript / verdict are untouched, matching the CRITICAL note this
-                // replaces. Sibling batch commands (verify, assign_speaker) already use this pattern.
-                let db = app_state.lock_db();
-                match db.update_normalized_transcript(id, normalized) {
-                    Ok(true) => true,
-                    Ok(false) => {
-                        // The row no longer exists (deleted between prefetch and persist).
-                        tracing::warn!("Batch normalize segment disappeared before update: {id}");
-                        false
+            let page = match worker.lease().and_then(|lease| lease.pending_page(page_cursor)) {
+                Ok(items) => items,
+                Err(error) => {
+                    tracing::error!(%error, "Durable normalization work page could not be read");
+                    terminal_intent = BatchTerminalIntentV1::Failed { code: "BATCH_EVIDENCE_INVALID".into() };
+                    break;
+                }
+            };
+            if page.is_empty() {
+                break;
+            }
+            for item in page {
+                if cancel.is_cancelled() {
+                    terminal_intent = BatchTerminalIntentV1::Cancelled { code: "BATCH_CANCELLED".into() };
+                    break 'pages;
+                }
+                let cache_key = format!("{config_sha256}|{}", item.before.segment.raw_transcript);
+                let normalized =
+                    normalize_cached(cache_key, || normalizer.normalize(&item.before.segment.raw_transcript));
+                if cancel.is_cancelled() {
+                    terminal_intent = BatchTerminalIntentV1::Cancelled { code: "BATCH_CANCELLED".into() };
+                    break 'pages;
+                }
+                match worker.lease().and_then(|lease| {
+                    lease.commit_normalization(item.ordinal, &normalized, crate::normalizer::NORMALIZER_VERSION)
+                }) {
+                    Ok(
+                        BatchItemCommitOutcomeV1::Applied { .. }
+                        | BatchItemCommitOutcomeV1::AlreadyApplied { .. }
+                        | BatchItemCommitOutcomeV1::Skipped { .. },
+                    ) => {}
+                    Ok(BatchItemCommitOutcomeV1::Failed { code }) => {
+                        terminal_intent = BatchTerminalIntentV1::Failed { code };
+                        break 'pages;
+                    }
+                    Ok(BatchItemCommitOutcomeV1::AlreadyTerminal { state, code }) => {
+                        if matches!(state, crate::db::BatchItemStateV1::Failed | crate::db::BatchItemStateV1::Abandoned)
+                        {
+                            terminal_intent = BatchTerminalIntentV1::Failed {
+                                code: code.unwrap_or_else(|| "BATCH_NORMALIZATION_FAILED".into()),
+                            };
+                            break 'pages;
+                        }
+                        if state == crate::db::BatchItemStateV1::Pending {
+                            terminal_intent = BatchTerminalIntentV1::Failed { code: "BATCH_EVIDENCE_INVALID".into() };
+                            break 'pages;
+                        }
                     }
                     Err(error) => {
-                        tracing::error!("Batch normalize DB update failed for {id}: {error}");
-                        false
+                        tracing::error!(segment_id = %item.segment_id, %error, "Durable normalization item failed");
+                        terminal_intent = BatchTerminalIntentV1::Failed { code: "BATCH_NORMALIZATION_FAILED".into() };
+                        break 'pages;
                     }
                 }
-            } else {
-                tracing::error!("Batch normalize app state unavailable before update for {id}");
-                false
-            };
-
-            if update_ok {
-                succeeded += 1;
-            } else {
-                failed += 1;
+                page_cursor = Some(item.ordinal);
+                emit_or_log(
+                    &app_clone,
+                    "batch-progress",
+                    serde_json::json!({
+                        "type": "progress", "current": item.ordinal + 1, "total": total,
+                        "status": "normalizing", "operation": "normalize",
+                        "operationId": worker_operation_id.as_str()
+                    }),
+                );
             }
-
-            emit_or_log(
-                &app_clone,
-                "batch-progress",
-                serde_json::json!({
-                    "type": "progress", "current": prefetch_failed_ids.len() + i + 1, "total": total,
-                    "file": id, "status": "normalizing", "operation": "normalize"
-                }),
-            );
         }
 
+        let terminal = match worker.finish(terminal_intent) {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::error!(%error, "Normalization batch could not publish terminal evidence");
+                return;
+            }
+        };
+        let outcome = match durable_batch_outcome(&terminal) {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => {
+                tracing::error!("Normalization terminalization returned a non-terminal status");
+                return;
+            }
+            Err(error) => {
+                tracing::error!(%error, "Normalization terminal evidence is outside the public contract");
+                return;
+            }
+        };
+        if let Some(app_state) = app_clone.try_state::<AppState>() {
+            if !app_state.record_batch_outcome(
+                worker_operation_id.as_str(),
+                crate::BatchOperation::Normalize,
+                outcome.clone(),
+            ) {
+                tracing::error!("Durable normalization outcome was not accepted by the liveness tracker");
+            }
+        }
+        let event_type =
+            if matches!(outcome.disposition, crate::BatchRunDisposition::Halted | crate::BatchRunDisposition::Panicked)
+            {
+                "halted"
+            } else {
+                "completed"
+            };
         emit_or_log(
             &app_clone,
             "batch-progress",
             serde_json::json!({
-                "type": "completed", "total": total,
-                "succeeded": succeeded, "failed": failed,
-                "cancelled": cancelled, "operation": "normalize"
+                "type": event_type,
+                "total": outcome.total,
+                "succeeded": outcome.succeeded,
+                "failed": outcome.failed,
+                "skipped": outcome.skipped,
+                "abandoned": outcome.abandoned,
+                "cancelled": outcome.cancelled,
+                "operation": "normalize",
+                "operationId": worker_operation_id.as_str(),
+                "error": outcome.error_code.as_ref().map(|code| serde_json::json!({
+                    "schema": 1, "code": code, "message": "The normalization batch stopped safely.",
+                    "retryable": true
+                })),
             }),
         );
     });
 
-    Ok(serde_json::json!({ "status": "started" }))
+    match spawn {
+        Ok(_) => Ok(BatchStartedV1 {
+            status: BatchStartStatusV1::Started,
+            operation_id: operation_id.clone(),
+            operation: BatchOperationV1::Normalize,
+        }),
+        Err(error) => {
+            tracing::error!(%error, "OS refused the durable normalization worker");
+            Err(CommandErrorV1::new(
+                "BATCH_WORKER_START_FAILED",
+                "The normalization worker could not start. No pending segment was changed.",
+                true,
+            )
+            .suggested(SuggestedActionV1::Retry))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -404,5 +523,114 @@ mod normalizer_cache_tests {
         let value = normalize_cached("poison-recovery-key".to_string(), || "recovered".to_string());
         assert_eq!(value, "recovered");
         assert_eq!(normalize_cached("poison-recovery-key".to_string(), || "stale".to_string()), "recovered");
+    }
+}
+
+#[cfg(test)]
+mod admission_contract_tests {
+    use super::*;
+
+    #[test]
+    fn speaker_assignment_store_errors_map_to_the_exact_public_contract() {
+        let invalid = public_speaker_assignment_error(SpeakerAssignmentError::Invalid);
+        assert_eq!(invalid.code, "INVALID_SPEAKER_ASSIGNMENT");
+        assert!(!invalid.retryable);
+        assert_eq!(invalid.suggested_action, None);
+
+        let stale = public_speaker_assignment_error(SpeakerAssignmentError::Stale);
+        assert_eq!(stale.code, "STALE_SEGMENT_SELECTION");
+        assert!(!stale.retryable);
+        assert_eq!(stale.suggested_action, Some(SuggestedActionV1::ReloadClip));
+
+        let busy = public_speaker_assignment_error(SpeakerAssignmentError::Busy);
+        assert_eq!(busy.code, "DATABASE_BUSY");
+        assert!(busy.retryable, "a busy workspace is transient and must invite a retry");
+        assert_eq!(busy.suggested_action, Some(SuggestedActionV1::Retry));
+
+        let application = public_speaker_assignment_error(SpeakerAssignmentError::Application);
+        assert_eq!(application.code, "SPEAKER_ASSIGNMENT_FAILED");
+        assert!(!application.retryable);
+        assert_eq!(application.suggested_action, Some(SuggestedActionV1::OpenHealth));
+    }
+
+    #[test]
+    fn normalization_admission_failures_classify_to_actionable_public_codes() {
+        let cases: [(&str, &str, bool, Option<SuggestedActionV1>); 7] = [
+            ("BATCH_ADMISSION_CANCELLED: stop pressed", "BATCH_START_CANCELLED", true, Some(SuggestedActionV1::Retry)),
+            (
+                crate::database_runtime::RESTORE_IN_PROGRESS_MSG,
+                "RESTORE_IN_PROGRESS",
+                true,
+                Some(SuggestedActionV1::Retry),
+            ),
+            (
+                "restore generation changed during admission",
+                "RESTORE_GENERATION_CHANGED",
+                true,
+                Some(SuggestedActionV1::Retry),
+            ),
+            ("a normalize batch is already in progress", "BATCH_ALREADY_RUNNING", true, Some(SuggestedActionV1::Retry)),
+            (
+                "UNIQUE constraint failed: index 'one_live_batch'",
+                "BATCH_ALREADY_RUNNING",
+                true,
+                Some(SuggestedActionV1::Retry),
+            ),
+            ("segment 'seg-9' does not exist", "BATCH_SEGMENT_MISSING", false, Some(SuggestedActionV1::ReloadClip)),
+            ("disk I/O error", "BATCH_ADMISSION_FAILED", false, Some(SuggestedActionV1::OpenHealth)),
+        ];
+        for (raw, code, retryable, suggested) in cases {
+            let error = batch_normalize_start_error(raw);
+            assert_eq!(error.code, code, "raw admission error: {raw}");
+            assert_eq!(error.retryable, retryable, "raw admission error: {raw}");
+            assert_eq!(error.suggested_action, suggested, "raw admission error: {raw}");
+        }
+    }
+
+    #[test]
+    fn cancellation_outranks_every_other_admission_classification() {
+        // A cancelled admission can surface journal detail that ALSO matches later patterns. The
+        // owner pressed Stop, so the public error must say cancelled — never missing-segment.
+        let error = batch_normalize_start_error("BATCH_ADMISSION_CANCELLED: row does not exist, already in progress");
+        assert_eq!(error.code, "BATCH_START_CANCELLED");
+        assert!(error.retryable);
+    }
+
+    fn test_config(verbalize_numbers: bool) -> BatchNormalizationConfigV1 {
+        BatchNormalizationConfigV1 {
+            schema: 1,
+            protocol: "durable-batch-normalize-v1",
+            build_git_sha: "test-sha",
+            normalize_numbers: true,
+            verbalize_numbers,
+            normalize_hamza: true,
+            remove_diacritics: false,
+            normalizer_version: "v-test",
+        }
+    }
+
+    #[test]
+    fn normalization_config_identity_is_deterministic_and_knob_sensitive() {
+        let first = canonical_batch_config_sha256(&test_config(false)).expect("config serializes");
+        let second = canonical_batch_config_sha256(&test_config(false)).expect("config serializes");
+        let flipped = canonical_batch_config_sha256(&test_config(true)).expect("config serializes");
+        assert_eq!(first, second, "identical normalization configs must share one durable identity");
+        assert_ne!(first, flipped, "flipping a normalization knob must change the durable config identity");
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "sha must be lowercase hex");
+    }
+
+    #[test]
+    fn normalization_config_wire_shape_is_the_pinned_sha_preimage() {
+        // canonical_batch_config_sha256 hashes these exact serialized bytes into the durable batch
+        // journal. A silent field rename or reorder would orphan every journaled config_sha256, so
+        // the preimage is pinned byte-for-byte.
+        let json = serde_json::to_string(&test_config(false)).expect("config serializes");
+        assert_eq!(
+            json,
+            "{\"schema\":1,\"protocol\":\"durable-batch-normalize-v1\",\"buildGitSha\":\"test-sha\",\
+             \"normalizeNumbers\":true,\"verbalizeNumbers\":false,\"normalizeHamza\":true,\
+             \"removeDiacritics\":false,\"normalizerVersion\":\"v-test\"}"
+        );
     }
 }

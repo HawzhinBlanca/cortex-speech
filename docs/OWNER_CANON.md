@@ -7,12 +7,17 @@ alter, weaken, or "improve" a canon item — however good the idea looks — unl
 phrase is the defect this file exists to stop. `scripts/test_owner_canon_pins.py` fails the sweep
 if a checkable pin drifts from what is written here.
 
-## Models (owner rule 2026-08-06, CRUCIAL)
-- The Sorani-adapted **OmniASR-7B champion** and the embedded **fine-tuned MMS-1B** are fixed
-  infrastructure. Never propose replacing them. Qwen3-ASR and Voxtral were evaluated and KILLED
-  (no ckb support). Only same-family OmniASR v2 300M/1B fallback benchmarking is allowed.
-- Cloud ASR/judge for ckb is STRICTLY **Gemini 2.5 Pro**; ElevenLabs Scribe is the only other
-  approved cloud STT. Never suggest Qwen for Kurdish.
+## Models (owner rules 2026-08-06 through 2026-08-21, CRUCIAL)
+- The Sorani-adapted **OmniASR-7B champion** is the sole main, default and production ASR for dataset
+  drafting and review. Qwen3-ASR and Voxtral were evaluated and KILLED (no ckb support).
+- OmniASR 300M/1B and fine-tuned MMS may remain explicit optional diagnostics or benchmarks. They are
+  not release prerequisites, are never selected automatically, and are never fallbacks for WSL7B.
+- **ElevenLabs Scribe is not a dependency or production feature.** Its client, commands, key, consent,
+  and UI are removed from the shipped app. Historical provenance labels remain readable only so old
+  rows stay honest. Gemini 2.5 Pro remains the only
+  approved cloud judge when cloud judging is explicitly enabled; it is not an ASR fallback.
+- Selecting WSL7B does not grant permission to seize busy GPUs: champion lifecycle supervision is off
+  by factory default and is enabled explicitly only when this app should own the server.
 - The champion drafts EVERY clip when `asr_model_size = WSL7B`; any per-clip failure is a HARD STOP,
   never a silent fallback. Enforced: `test_champion_supremacy_policy.py`, `batch_transcribe` halt.
 
@@ -32,8 +37,37 @@ if a checkable pin drifts from what is written here.
 - Spot checks: 1 in `SPOT_CHECK_EVERY = 8` served clips is a trap with a known answer; the phone must
   NEVER serve a spot check its own answer key (`review_text` stays annotated ▸ raw — pinned by
   `the_phone_never_serves_a_spot_check_its_own_answer_key`). `verdict_transcript` is the answer key.
-- Reviewers are paid on DISTINCT clips' audio duration (`reviewed_audio_ms`), never on event rows.
-- Max 8 named reviewers; per-reviewer tokens; Stop revokes durably.
+- **Review compensation canon revision 2 (owner change 2026-08-21, prospective).** Immutable policy id:
+  `review-iqd-v1-2026-08-21`. The rate is **18,000 IQD per full-equivalent audio hour**. A valid,
+  playback-evidenced durable semantic action earns: `edit = 100%`, unchanged `accept = 10%`, valid
+  `reject = 10%`, and `skip = 0%`. An event-row string alone is not payable provenance.
+- Activity, correction, and money are separate facts: `reviewed_audio_ms` is activity, not money;
+  the corrected-audio projection counts retained human edits only; the exact weighted balance is
+  `SUM(review_compensation_ledger.delta_micro_iqd)` under the immutable policy. Neither a paid reject nor a paid unchanged accept becomes
+  corrected dataset audio.
+- External payout references allocate contiguous ledger ranges through immutable
+  `review_compensation_settlements` rows. The same credit range cannot be settled twice; a later
+  signed reversal remains visible as outstanding adjustment rather than rewriting paid history.
+- The policy is **prospective** from its recorded deployment cutoff. Earlier events are not silently
+  repriced. Every new credit snapshots its policy, rate, weight, duration, canonical work identity,
+  decision identity and idempotency key; undo/redecision appends an explicit reversal or adjustment.
+  Retries and duplicate segment rows may never mint a second credit for the same reviewer/work item.
+- **Current campaign scope (owner change 2026-08-21):** add the 6,922 final Lamo ids to the existing
+  1,352-id focus, yielding an exact 8,274-id union. This is additive, not replacement. Activation does
+  not authorize serving: stale-release, provenance, playback, dialect and hidden-check gates remain
+  fail closed, and the focus file is changed only through a validated atomic tool, never by hand.
+- **Consensus review canon (owner, 2026-08-29 — "THIS MAKE CANON").** A sentence is decided by **any
+  two DIFFERENT reviewers**, never by a named role. No reviewer is designated "first pass" or "second
+  pass": a reviewer opens their link, is served an audio, corrects it, and any other reviewer may take
+  the next one. Two different reviewers agreeing resolves the clip; when the first two disagree a
+  **third** reviewer is served it. Work distributes naturally rather than being assigned — if one
+  reviewer judges ten clips, their second opinions may come from several different people (two from
+  one reviewer, two from another, and so on). The independence requirement is enforced PER CLIP (the
+  same person may never be two of its opinions), never per person, so throughput scales with however
+  many reviewers are working. This supersedes the sequential single-reviewer campaign model for
+  deciding sentences.
+- Max 10 named reviewers (owner "change canon: raise max reviewers 8 → 10", 2026-08-31 — was 8);
+  per-reviewer tokens; Stop revokes durably.
 - Dialect routing: **KBHP = Hawleri** (all 32 episodes, owner-confirmed). The organized corpus tree
   declares dialect by folder (`Kurdish Corpora\<dialect>\`). Unmapped sources FAIL CLOSED for
   restricted reviewers. WHO may judge WHAT lives in `<data_dir>/reviewer_dialects.json` — names stay

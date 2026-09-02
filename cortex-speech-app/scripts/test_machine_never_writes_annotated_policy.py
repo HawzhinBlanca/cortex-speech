@@ -10,8 +10,8 @@ draft sat invisible in ``raw_transcript``. The data was cleaned and a live-DB ga
      not touch ``annotated_transcript`` at all — it used to seed it with the LLM-refined machine
      paraphrase via ``COALESCE(annotated_transcript, ?8)``, which then outranked every later
      champion re-draft forever.
-  2. No Svelte handler may assign machine ASR output into ``annotatedTranscript`` — the desktop
-     re-transcribe buttons (champion, constrained, finetuned, Scribe, ReviewMode) all did.
+  2. No frontend handler may assign machine ASR output into ``annotatedTranscript`` — the remaining
+     production re-transcribe paths are the workstation segment service and ReviewMode.
 
 Static source checks: sandbox-safe, no DB required.
 """
@@ -19,6 +19,8 @@ Static source checks: sandbox-safe, no DB required.
 import re
 import sys
 from pathlib import Path
+
+from _db_policy_util import database_surface
 
 APP = Path(__file__).resolve().parents[1]
 
@@ -40,8 +42,7 @@ def rust_function_body(source: str, name: str) -> str:
 
 
 def js_function_body(source: str, name: str) -> str:
-    # `async function handleTranscribe(` must not also swallow `handleTranscribeFinetuned` —
-    # anchor on the opening parenthesis.
+    # Anchor on the opening parenthesis so similarly prefixed helpers cannot widen the match.
     match = re.search(rf"(?:async\s+)?function\s+{re.escape(name)}\s*\(", source)
     if match is None:
         raise AssertionError(f"function {name} not found — the policy target was renamed; update this test")
@@ -52,7 +53,7 @@ def main() -> int:
     failures = []
 
     # 1. The batch persist path must never mention the human-only column.
-    db_rs = (APP / "src-tauri" / "src" / "db.rs").read_text(encoding="utf-8")
+    db_rs = database_surface(APP / "src-tauri" / "src")
     body = rust_function_body(db_rs, "update_batch_transcription_if_unreviewed")
     if "annotated" in body:
         failures.append(
@@ -60,16 +61,11 @@ def main() -> int:
             "the batch path must write ONLY the ASR-derived columns (raw/normalized/confidence)"
         )
 
-    # 2. The five machine re-transcribe handlers must not mention annotatedTranscript AT ALL.
+    # 2. The two champion re-transcribe handlers must not mention annotatedTranscript AT ALL.
     #    Human writers (submit/save/draft paths persisting the reviewer's editText) stay legal —
     #    provenance is per-function, so the check is function-scoped, not line-scoped.
     machine_handlers = {
-        APP / "src" / "App.svelte": [
-            "handleTranscribe",
-            "handleTranscribeConstrained",
-            "handleTranscribeFinetuned",
-            "handleTranscribeScribe",
-        ],
+        APP / "src" / "lib" / "workstationSegmentActions.ts": ["transcribe"],
         APP / "src" / "lib" / "ReviewMode.svelte": ["doRetranscribe"],
     }
     for path, names in machine_handlers.items():
@@ -83,11 +79,15 @@ def main() -> int:
                     "must write raw/normalized only; the human-only field is off limits"
                 )
 
-    # 3. Belt-and-braces net for NEW handlers: the tell-tale machine shape anywhere in a .svelte.
+    # 3. Belt-and-braces net for NEW handlers: the tell-tale machine shape anywhere in shipped
+    #    frontend source. Tests are evidence fixtures, not production writers.
     forbidden = re.compile(r"annotatedTranscript\s*[:=]\s*result\.\w+")
-    for svelte in sorted((APP / "src").rglob("*.svelte")):
-        rel = svelte.relative_to(APP)
-        for n, line in enumerate(svelte.read_text(encoding="utf-8").splitlines(), 1):
+    sources = sorted((APP / "src").rglob("*.svelte")) + sorted((APP / "src").rglob("*.ts"))
+    for source_path in sources:
+        if source_path.name.endswith((".test.ts", ".spec.ts")):
+            continue
+        rel = source_path.relative_to(APP)
+        for n, line in enumerate(source_path.read_text(encoding="utf-8").splitlines(), 1):
             if forbidden.search(line):
                 failures.append(f"{rel}:{n}: machine result assigned into annotatedTranscript: {line.strip()}")
 

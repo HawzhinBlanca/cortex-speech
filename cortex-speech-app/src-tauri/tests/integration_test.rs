@@ -1,6 +1,6 @@
 use cortex_speech_app_lib::db::Database;
 use cortex_speech_app_lib::diff;
-use cortex_speech_app_lib::history::{Command, HistoryManager};
+use cortex_speech_app_lib::history::{Command, HistoryAction, HistoryManager};
 use cortex_speech_app_lib::normalizer::SoraniNormalizer;
 use tempfile::NamedTempFile;
 
@@ -100,7 +100,7 @@ fn test_undo_redo_integration() {
     // Undo
     let desc = history.undo(&db).unwrap();
     assert!(desc.is_some());
-    assert_eq!(desc.unwrap(), "Update segment");
+    assert_eq!(desc.unwrap(), HistoryAction::UpdateSegment);
 
     let restored = db.get_segment_by_id("integ1").unwrap().unwrap();
     assert_eq!(restored.raw_transcript, "original");

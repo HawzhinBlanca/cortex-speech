@@ -1,4 +1,6 @@
-export const ckb: Record<string, string> = {
+import type { TranslationKey } from './en';
+
+export const ckb = {
   import: 'زیادکردنی بوخچە',
   export: 'هەناردەکردن',
   settings: 'ڕێکخستنەکان',
@@ -6,24 +8,10 @@ export const ckb: Record<string, string> = {
   open: 'زیادکردنی فایل',
   openFile: 'زیادکردنی فایل',
   transcribe: 'نووسینەوە',
-  'scribe.transcribe': 'سکرایب (هەور)',
-  'scribe.transcribeTitle': 'دووبارە نووسینەوەی ئەم بەشە بە ElevenLabs Scribe (STTی هەور)',
-  'scribe.vote': '+ دەنگی سکرایب',
-  'scribe.voteTitle': 'زیادکردنی دەنگێکی سەربەخۆی ElevenLabs Scribe بۆ ئەم بەشە',
-  'scribe.voteAdded':
-    'دەنگی سکرایب زیادکرا. دادگاییەکە دووبارە جێبەجێ بکە بۆ تێکەڵکردنی لە کۆدەنگدا.',
-  'scribe.voteExists': 'ئەم بەشە پێشتر دەنگی سکرایبی هەیە.',
-  'scribe.voteFailed': 'زیادکردنی دەنگی سکرایب سەرکەوتوو نەبوو',
   diagnostics: 'دەستنیشانکردن',
   // See en.ts: a per-session counter, not corpus coverage. Composed from vocabulary already in this
   // file; flagged for owner review.
   'stats.fingerprints': 'پەنجەمۆری دەنگ (ئەم دانیشتنە)',
-  transcribeConstrained: 'تەنها کوردی',
-  transcribeConstrainedTitle:
-    'نووسینەوە بە دیکۆدی بەربەستکراوی پیتی کوردی (دەرئەنجامی کوردی دەستەبەر دەکات)',
-  transcribeFinetuned: 'مۆدێلی ڕاهێنراو',
-  transcribeFinetunedTitle:
-    'نووسینەوە بە مۆدێلی ڕاهێنراوی کوردی (٪٢١٫٠ هەڵەی پیت [٪١٩٫٩–٪٢٢٫٠]، N=900 پارچەی زێڕین، پێوانەکراو ٢٠٢٦-٠٦-٢٥)',
   transcribing: 'نووسینەوە...',
   verify: 'پشتڕاستکردن',
   unverify: 'لابردنی پشتڕاستکردن',
@@ -43,6 +31,7 @@ export const ckb: Record<string, string> = {
   cancel: 'هەڵوەشاندنەوە',
   confirm: 'دڵنیاکردنەوە',
   loading: 'بارکردن...',
+  'workspace.loadFailed': 'بارکردنی ئەم شوێنەی کار سەرکەوتوو نەبوو.',
   noData: 'هیچ داتایەک نییە',
   error: 'هەڵە',
   processing: 'پرۆسێسکردن',
@@ -90,7 +79,7 @@ export const ckb: Record<string, string> = {
   threads: 'تڕێدەکان',
   gpuAcceleration: 'خێراکردنی GPU (CUDA)',
   gpuAccelerationNote:
-    'تەنها کاردانەوەی لەسەر ئەنجینە یەدەگەکانی CTCی ناوخۆیی هەیە — لەم بنیادەدا لەسەر CPU کار دەکەن. شایانی OmniASR-7B هەمیشە GPU بەکاردەهێنێت لە ڕێگەی WSL.',
+    'تەنها بۆ ئەنجینە تاقیکردنەوەییەکانی CTCیە. نووسینەوەی بەرهەمهێنان تەنها بە OmniASR-7B Champion لەسەر GPUی WSL ئەنجام دەدرێت؛ ئەم ڕێکخستنە هیچ ئەنجینێکی یەدەگ چالاک ناکات.',
   vadThreshold: 'ئاستی VAD',
   minSegment: 'کەمترین بەش',
   maxSegment: 'زۆرترین بەش',
@@ -125,6 +114,8 @@ export const ckb: Record<string, string> = {
   'review.progress': 'پارچەی {n} لە {total}',
   'review.reviewedCount': '{done} لە {total} پێداچوونەوەکراو',
   'review.editHint': 'گوێ بگرە، ئەگەر پێویست بوو دەقەکە ڕاست بکەرەوە',
+  'review.mustListen':
+    'پاشەکەوت نەکرا: سەرەتا گوێ لە هەموو پارچەکە بگرە. بڕیاردان لەسەر دەنگێک کە کەس گوێی لێ نەگرتووە، تەنیا مەزەندەیە.',
   'review.listen': 'گوێ بگرە و بیدۆزەرەوە',
   'review.listenHint':
     'کلیک لە وشەیەک بکە بۆ گوێگرتنی تەنها ئەو وشەیە؛ دوو جار کلیک (یان F2) بۆ ڕاستکردنەوەی لە شوێنی خۆیدا. وشە ڕەنگکراوەکان دڵنیایی کەمترن — یەکەم جار ئەوانە بپشکنە.',
@@ -132,7 +123,6 @@ export const ckb: Record<string, string> = {
   'review.wordChipHint': 'کلیک بۆ گوێگرتن · دوو جار کلیک بۆ دەستکاری',
   'review.playWordAria': 'لێدانی وشەی {word}',
   'review.aligningWords': 'ڕێکخستنی وشەکان لەگەڵ دەنگ…',
-  'review.playingWordsOnly': 'تەنها وشەکان لێدەدرێن ({sec}چ)',
   'review.playingWholeClip': 'هەموو پارچەکە لێدەدرێت ({sec}چ)',
   'review.consensusDraft': 'ڕەشنووسی هاوبەش',
   'review.consensusAgree': '{n} مۆدێل · {pct}% هاوڕان',
@@ -146,9 +136,6 @@ export const ckb: Record<string, string> = {
   'review.retranscribeChampion': 'OmniASR-7B',
   'review.retranscribeChampionTitle':
     'دووبارە نووسینەوەی ئەم پارچەیە بە OmniASR-7B Champion (پێویستی بە سێرڤەری ٧B هەیە کارا بێت).',
-  'review.retranscribeFinetuned': 'MMS-1B ڕاهێنراو',
-  'review.retranscribeFinetunedTitle':
-    'دووبارە نووسینەوەی ئەم پارچەیە بە MMS-1B ڕاهێنراوی ناوەکی (CPU، هەمیشە بەردەستە).',
   'review.retranscribing': 'دووبارە نووسینەوە...',
   'review.retranscribed': 'دووبارە نووسرایەوە.',
   'review.retranscribeFailed': 'دووبارە نووسینەوە سەرکەوتوو نەبوو',
@@ -168,6 +155,11 @@ export const ckb: Record<string, string> = {
     'پێداچوونەوەی بەشێکی گەڕان: {n} لە {m} پارچە — گەڕانەکە پاک بکەرەوە بۆ پێداچوونەوەی هەموو.',
   'review.searchScopeEmpty':
     'هیچ پارچەیەک لەگەڵ گەڕانی ئێستا ناگونجێت — پاکی بکەرەوە بۆ پێداچوونەوەی هەموو.',
+  // See en.ts. Composed from vocabulary already in this file; no speaker name appears.
+  'review.focusScope':
+    'پێداچوونەوەی پارچەکانی یەک دەنگ: {n} لە {m} — بەشی تری کتێبخانە لەم ڕیزەدا نییە.',
+  'review.focusScopeEmpty':
+    'هەموو پارچەکانی ئەم دەنگە پێداچوونەوەیان بۆ کرا — بەشی تری کتێبخانە هێشتا چاوەڕوانە.',
   // See en.ts: the point is that a flat strip here means UNREADABLE, not quiet. Composed from
   // vocabulary already in this file; flagged for owner review.
   'review.waveformFailed':
@@ -175,16 +167,81 @@ export const ckb: Record<string, string> = {
   // See en.ts: this is a REFUSAL — nothing was saved. Composed from vocabulary already in this
   // file; flagged for owner review.
   'review.cannotDecideWithoutAudio':
-    'دەنگی ئەم پارچەیە لێ نەدرا، بۆیە هیچ بڕیارێک بۆی پاشەکەوت نەکرا. بازی بدە، یان دەنگەکە ڕاست بکەرەوە و دووبارە باری بکە.',
+    'دەنگی ئەم پارچەیە لێ نەدرا، بۆیە هیچ بڕیارێک بۆی پاشەکەوت نەکرا. بڕۆ بۆ پارچەی دواتر بێ تۆمارکردنی بڕیار، یان دەنگەکە ڕاست بکەرەوە و دووبارە باری بکە.',
+  'review.unusable.title': 'چارەسەری کێشەی دەنگ',
+  'review.unusable.help':
+    'سەرەتا دووبارە هەوڵ بدەرەوە. ئەگەر ئەم پارچەیە بەڕاستی بەکارنەهێنراوە، هۆکاری تەکنیکیی ورد هەڵبژێرە. ئەمە هیچ بڕیارێکی دەقی مرۆیی تۆمار ناکات و وانیشانادات کە گوێی لێ گیراوە.',
+  'review.unusable.reasonLabel': 'هۆکاری تەکنیکی',
+  'review.unusable.reasonPlaceholder': 'هۆکارێک هەڵبژێرە…',
+  'review.unusable.reason.decodeFailed': 'دیکۆدکردنی دەنگ سەرکەوتوو نەبوو',
+  'review.unusable.reason.missingFile': 'فایلە سەرچاوەکە ونە',
+  'review.unusable.reason.permissionDenied': 'مۆڵەتی دەستگەیشتن بە فایل ڕەتکرایەوە',
+  'review.unusable.reason.corruptContainer': 'قاڵبی فایلە دەنگییەکە تێکچووە',
+  'review.unusable.mark': 'نیشانکردن وەک بەکارهێنان‌نەکراوی تەکنیکی',
+  'review.unusable.marking': 'تۆمار دەکرێت…',
+  'review.unusable.marked':
+    'وەک بەکارهێنان‌نەکراوی تەکنیکی نیشانکرا و لە هەناردە دەرکرا. هیچ بڕیارێکی دەقی مرۆیی تۆمار نەکرا.',
+  'review.unusable.markFailed': 'نەتوانرا ئەم پارچەیە وەک بەکارهێنان‌نەکراوی تەکنیکی نیشان بکرێت',
+  'review.unusable.markFailedHint':
+    'پارچەکە، ڕەشنووسەکە و فۆکەسەکە هەروا مانەوە. تەندروستی شوێنکار بپشکنە و هەمان کردار دووبارە بکەرەوە.',
+  'review.unusable.markFailedWithError':
+    'نەتوانرا ئەم پارچەیە وەک بەکارهێنان‌نەکراوی تەکنیکی نیشان بکرێت: {err}. پارچەکە و ڕەشنووسەکە هەروا مانەوە.',
+  'review.unusable.invalidResponse':
+    'نەتوانرا دۆخی تەکنیکیی پاشەکەوتکراو پشتڕاست بکرێتەوە. پارچەکە نەچووە پێشەوە؛ پێش بڕیاردان ڕیزەکە نوێ بکەرەوە.',
+  'review.unusable.authorityMissing':
+    'نەتوانرا وەشانی ئەم پارچەیە پشتڕاست بکرێتەوە. پێش نیشانکردنی وەک بەکارهێنان‌نەکراو ڕیزەکە نوێ بکەرەوە.',
   'review.undoFailed': 'گەڕاندنەوە سەرکەوتوو نەبوو',
-  'review.undoLast': 'گەڕاندنەوەی پێداچوونەوە',
+  'review.undoLast': 'گەڕاندنەوەی دوا کرداری پێداچوونەوە',
+  'review.retryUndoStatus': 'دووبارە پشکنینی دۆخی گەڕاندنەوە',
+  'review.retryExactUndo': 'دووبارە هەمان گەڕاندنەوە',
+  'review.reloadAfterUndo': 'نوێکردنەوە دوای گەڕاندنەوە',
+  'review.reconcileSavedDecision': 'یەکلاییکردنەوەی بڕیاری پاشەکەوتکراو',
+  'review.undoErrorCode': 'کۆدی دۆخی گەڕاندنەوە: {code}',
+  'review.undoDisabledEdited': 'پێش گەڕاندنەوە، ڕاستکردنەوەی ئێستا پاشەکەوت بکە یان فڕێی بدە.',
+  'review.undoDisabled.processing': 'چاوەڕێی تەواوبوونی نووسینەوە یان ڕێکخستنی ئێستا بکە.',
+  'review.undoDisabled.loading': 'مێژووی گەڕاندنەوە هێشتا بار دەکرێت؛ پێش بڕیارێکی نوێ چاوەڕێ بکە.',
+  'review.undoDisabled.failed':
+    'مێژووی گەڕاندنەوە نەخوێندرایەوە؛ پێش بڕیارێکی نوێ دوگمەی گەڕاندنەوە بەکاربهێنە بۆ هەوڵدانەوە.',
+  'review.undoDisabled.blocked':
+    'دواترین کرداری پێداچوونەوەی سەر مێز ناتوانرێت بە پارێزراوی بگەڕێندرێتەوە.',
+  'review.undoDisabled.none': 'هیچ کرداری پێداچوونەوەی تۆمارکراو نییە بۆ گەڕاندنەوە.',
+  'review.undoDisabled.reconciling':
+    'هەوڵی گەڕاندنەوە هێشتا یەکلایی دەکرێتەوە؛ هێشتا هیچ بڕیارێکی نوێ پاشەکەوت ناکرێت.',
+  'review.undoDisabled.projectionStale':
+    'گەڕاندنەوە گەیشتە بنکەدراوە، بەڵام پێش بڕیارێکی تر ئەم ڕووکارە دەبێت نوێ بکرێتەوە.',
+  'review.undoDisabled.legacyHistory':
+    'دواترین کردار پێش گەڕاندنەوەی بەردەوامی سەر مێز تۆمارکراوە و لێرە ناگەڕێندرێتەوە.',
+  'review.undoDisabled.latestDecisionUndone':
+    'دواترین بڕیار پێشتر گەڕێندراوەتەوە؛ پێش گەڕاندنەوەی تر بڕیارێکی نوێ پاشەکەوت بکە.',
+  'review.undoDisabled.flagShadowed':
+    'دواترین نیشان چیتر لەگەڵ ڕاستیی ئێستای پارچەکە یەک نییە، بۆیە گەڕاندنەوە بە پارێزراوی ڕاگیراوە.',
+  'review.undoDisabled.latestFlagUndone':
+    'دواترین نیشان پێشتر گەڕێندراوەتەوە؛ پێش گەڕاندنەوەی تر بڕیارێکی نوێ پاشەکەوت بکە.',
+  'review.undoDisabled.decisionShadowed':
+    'دواترین بڕیار چیتر لەگەڵ ڕاستیی ئێستای پارچەکە یەک نییە، بۆیە گەڕاندنەوە بە پارێزراوی ڕاگیراوە.',
+  'review.undoStatusRetryFailed':
+    'مێژووی گەڕاندنەوە هێشتا بەردەست نییە؛ تەندروستی بنکەدراوە بپشکنە و دووبارە گەڕاندنەوە بەکاربهێنە.',
+  'review.undoUncertain':
+    'ئەنجامی گەڕاندنەوە دڵنیانەکراوە؛ بڕیارە نوێکان ڕاگیراون. هەمان گەڕاندنەوە دووبارە بکە بۆ یەکلاییکردنەوە.',
+  'review.undoProjectionReloadRequired':
+    'گەڕاندنەوە گەیشتە ئەنجامی کۆتایی، بەڵام ڕووکارەکە بە سەرچاوەی ڕەسەن نوێ نەکرایەوە؛ دووبارە گەڕاندنەوە بەکاربهێنە.',
+  'review.truthProjectionReloadRequired':
+    'لەوانەیە پاشەکەوتەکە جێگیر بووبێت، بەڵام هەموو ڕووکارە کراوەکان بە داتای ڕەسەنی بنکەدراوە نوێ نەکرانەوە؛ بڕیاری نوێ ڕاگیراوە و گەڕاندنەوە بەکاربهێنە بۆ یەکلاییکردنەوە.',
+  'review.truthProjectionRecovered':
+    'بڕیارە پاشەکەوتکراوەکە و هەموو ڕووکارە کراوەکان ئێستا لەگەڵ ڕاستی بنکەدراوە یەکن.',
+  'review.truthWriteUncertainRestart':
+    'دوای دوو هەوڵی یەکسان ئەنجامی پاشەکەوتکردن دڵنیانەکراوە. هەموو بڕیارەکانی دواتر ڕاگیراون. Cortex دووبارە دەستپێبکەوە بۆ کردنەوە لە ڕاستی بنکەدراوە؛ ڕەشنووسەکەت پارێزراوە.',
+  'review.undoAppliedAuthorityUnavailable':
+    'گەڕاندنەوە یەکلایی بووەوە و داتا نوێکرایەوە، بەڵام مێژووی گەڕاندنەوە نوێ نەکرایەوە؛ پێش بڕیارێکی تر دووبارە هەوڵ بدە.',
+  'review.undoRestoredOutsideScope':
+    'بڕیارەکە گەڕێندرایەوە؛ پارچە گەڕێندراوەکە لە دەرەوەی پاڵاوتنی ئێستای پێداچوونەوەیە.',
   'review.retranscribeVerifiedTitle': 'دەقی پشتڕاستکراو بگۆڕدرێت؟',
   'review.retranscribeVerifiedMessage':
     'ئەم کلیپە لەلایەن مرۆڤەوە پشتڕاستکراوەتەوە. دووبارە نووسینەوە دەقە پێداچووەکەت دەگۆڕێت بە ڕەشنووسی ئامێری و کلیپەکە دەکاتەوە. دەتوانیت بە گەڕاندنەوەی پێداچوونەوە بیگەڕێنیتەوە.',
   'review.retranscribeVerifiedConfirm': 'هەر دووبارە بنووسەرەوە',
   'review.undoLastTitle':
-    'دوا کلیپی پاشەکەوتکراو بکەرەوە (بڕیارەکەی دەسڕێتەوە بۆ ڕاستکردنەوە). کورتبڕ: Backspace',
-  'review.cloudCheck': '🔍 پشکنینی Gemini',
+    'دوا بڕیار یان نیشانی پێداچوونەوە بگەڕێنەرەوە کاتێک بنکەدراوە پشتڕاستی دەکاتەوە هێشتا نوێترینە. کورتبڕ: Backspace',
+  'review.cloudCheck': 'پشکنینی Gemini',
   'review.cloudChecking': 'چاوەڕوانی Gemini…',
   'review.cloudCheckTitle':
     'Gemini 2.5 Pro گوێ لە کلیپەکە دەگرێت و ڕەشنووسەکە وشە بە وشە پشکنین دەکات — لەگەڵ وشە دووبارەکان. بڕیار هی تۆیە.',
@@ -194,9 +251,43 @@ export const ckb: Record<string, string> = {
   'review.cloudCheckFailed': 'پشکنینی هەور سەرکەوتوو نەبوو',
   'review.replay': 'دووبارە لێدان',
   'review.acceptAsIs': 'دروستە',
+  'review.acceptDisabledEdited':
+    'پێش پەسەندکردن، ڕاستکردنەوەکە پاشەکەوت بکە یان بە ئاشکرا فڕێی بدە.',
+  'review.rejectDisabledEdited':
+    'پێش نیشانکردنی کلیپەکە وەک خراپ یان بەکارنەهاتوو، ڕاستکردنەوەکە پاشەکەوت بکە یان بیگەڕێنەوە.',
+  'review.transcriptNotReady': 'دەقی ئەم کلیپە هێشتا بۆ بڕیاری پێداچوونەوە ئامادە نییە.',
+  'review.eligibilityUnavailable':
+    'شیاوی پێداچوونەوەکە نەسەلمێنرا؛ پێش بڕیاردان ڕیزبەندییەکە نوێ بکەرەوە.',
+  'review.closeDraftFailed': 'داخستن وەستا — ڕەشنووسی پێداچوونەوە بە سەلامەتی پاشەکەوت نەکراوە',
+  'review.closeDraftFailedHint': 'بیرگە و تەندروستی شوێنکار بپشکنە، پاشان دووبارە دایبخە.',
+  'review.closeFailed': 'پەنجەرەکە داخرا نەبوو',
+  'review.closeFailedHint': 'دووبارە هەوڵی داخستن بدە؛ ئەگەر وەڵام نادات Task Manager بەکاربهێنە.',
   'review.saveNext': 'پاشەکەوت و دواتر',
   'review.prev': 'گەڕانەوە',
   'review.reset': 'بنەڕەت',
+  'review.resetConfirmTitle': 'دەستکارییەکەت بە دەقی بنەڕەت بگۆڕدرێت؟',
+  'review.resetConfirmMessage':
+    'ئەمە دەستکارییە ئێستاکەت و ڕەشنووسی پارێزراوی دەسڕێتەوە. ئەم ڕێکخستنەوەیە ناگەڕێتەوە.',
+  'review.resetConfirmAction': 'دەقی بنەڕەت بەکاربهێنە',
+  'review.draftSaving': 'ڕەشنووسی گەڕاندنەوە پاشەکەوت دەکرێت…',
+  'review.draftRecovered': 'ڕەشنووسە پاشەکەوتنەکراوەکەت لەم ئامێرەوە گەڕێندرایەوە.',
+  'review.draftSaveFailed': 'ڕەشنووسی گەڕاندنەوە پاشەکەوت نەکرا',
+  'review.draftSaveFailedHint':
+    'دەقەکەت هێشتا کراوەیە، بەڵام بۆ تێکچوون پارێزراو نییە. پێش داخستن دووبارە هەوڵبدە.',
+  'review.draftLoadFailed': 'ڕەشنووسی گەڕاندنەوە بارنەکرا',
+  'review.draftLoadFailedHint':
+    'دەقی ئێستای ڕاژە پیشان دراوە. بۆ دووبارە هەوڵدان کلیپەکە نوێ بکەرەوە.',
+  'review.draftConflictTitle': 'ڕەشنووسی پاشەکەوتکراو پێویستی بە بڕیاری تۆیە',
+  'review.draftConflictHint':
+    'کلیپەکە دوای پاشەکەوتکردنی ئەم ڕەشنووسە گۆڕاوە. هیچ شتێک خۆکارانە تێکەڵ نەکرا. هەردوو وەشانەکە بەراورد بکە و خۆت هەڵبژێرە.',
+  'review.serverTruth': 'دەقی ئێستای ڕاژە',
+  'review.localDraft': 'ڕەشنووسی ناوخۆیی پاشەکەوتکراو',
+  'review.useLocalDraft': 'ڕەشنووسی پاشەکەوتکراو بەکاربهێنە',
+  'review.discardLocalDraft': 'ڕەشنووسی پاشەکەوتکراو فڕێبدە',
+  'review.discardDraftConfirmTitle': 'ئەم ڕەشنووسە پاشەکەوتکراوە فڕێبدرێت؟',
+  'review.discardDraftConfirmMessage':
+    'ئەمە ڕەشنووسی ناوخۆیی پاشەکەوتکراو بە هەمیشەیی دەسڕێتەوە و دەقی ئێستای ڕاژە دەپارێزێت. ئەم کردارە ناگەڕێتەوە.',
+  'review.draftDiscardFailed': 'ڕەشنووسی پاشەکەوتکراو فڕێنەدرا.',
   'review.kbdHint':
     'کلیلەکان: A پەسەندکردن · E دەستکاری · X خراپ · Space لێدان/وەستان · R دووبارە · N/P دواتر/پێشتر · Backspace گەڕاندنەوە · Ctrl+Enter پاشەکەوت و دواتر',
   'review.actionsLabel': 'کردارەکانی پێداچوونەوە',
@@ -206,7 +297,7 @@ export const ckb: Record<string, string> = {
   'review.suspectFirstFailed': 'نەتوانرا ڕیزبەندی گومانلێکراوەکان بارببێت',
   'review.allDone': 'هەموو پارچەکان پێداچوونەوەیان بۆ کرا!',
   'review.allDoneHint': 'هەموو پارچەکان پشتڕاستکران. دەنگی زیاتر هاوردە بکە بۆ بەردەوامبوون.',
-  'review.completeTitle': '✓ هەموو {n} پارچەکە پێداچوونەوەیان بۆ کرا',
+  'review.completeTitle': 'هەموو {n} پارچەکە پێداچوونەوەیان بۆ کرا',
   'review.completeHint':
     'دەقەکانت پشتڕاستکراون. داتاسێتەکە هەناردە بکە، یان بگەڕێوە بۆ پشکنینەوەی هەر پارچەیەک.',
   'review.exportDataset': 'هەناردەی داتاسێت',
@@ -242,50 +333,107 @@ export const ckb: Record<string, string> = {
   'inbox.loadErrorTitle': 'بارکردنی ڕیزی پێداچوونەوە سەرکەوتوو نەبوو',
   'inbox.queue': 'ڕیز ({n})',
   'inbox.segmentQueue': 'ڕیزی پارچەکان',
+  'inbox.queueItem': 'پارچەی {position} لە {total}: {id}',
+  'inbox.queueItemReviewed': 'پارچەی {position} لە {total}: {id}، پێداچوونەوەی بۆ کراوە',
+  'inbox.reviewed': 'پێداچوونەوەکراو',
+  'inbox.activeItem': 'پارچەی چالاک {position} لە {total}',
+  'inbox.pagination.loaded': '{loaded} لە {total} ڕیزی پلەبەرزکراو بارکرا',
+  'inbox.pagination.loadMore': 'زیاتر باربکە',
+  'inbox.pagination.loadingMore': 'زیاتر بار دەکرێت…',
+  'inbox.pagination.evicted':
+    '{count} ڕیزی پێشوو بۆ سنووردارکردنی بیرگە لابران. بۆ بینینەوەیان لە سەرەتاوە باربکەرەوە.',
+  'inbox.pagination.reloadStart': 'بارکردنەوە لە سەرەتاوە',
+  'inbox.durationSeconds': '{seconds} چرکە',
+  'inbox.audioPlayback': 'لێدانی دەنگ',
+  'inbox.audioFallback': 'دەنگ',
+  'inbox.noAudio': 'دەنگ بەردەست نییە',
   'inbox.hypotheses': 'مەزەندەکانی دەقکردن',
   'inbox.juryProposes': 'جووری پێشنیار دەکات',
   'inbox.rationale': 'هۆکار و بەڵگەی جووری',
   'inbox.evidenceReasoning': 'بەڵگە و هۆکار',
-  'inbox.editLabel': 'دەستکاری دەق (Ctrl+Enter بۆ پاشەکەوت، Esc بۆ هەڵوەشاندنەوە):',
-  'inbox.saveEdit': 'پاشەکەوتی دەستکاری (Ctrl+↵)',
-  'inbox.cancelEdit': 'هەڵوەشاندنەوە (Esc)',
+  'inbox.editLabel': 'دەستکاری دەق (Ctrl+Enter بۆ پاشەکەوت، Esc بۆ هێشتنەوەی ڕەشنووس):',
+  'inbox.saveEdit': 'پاشەکەوتی دەستکاری (Ctrl+Enter)',
+  'inbox.cancelEdit': 'هێشتنەوەی ڕەشنووس (Esc)',
+  'inbox.draft.retry': 'هەوڵدانەوەی گەڕاندنەوەی ڕەشنووس',
   'inbox.accept': 'پەسەند',
   'inbox.acceptTitle': 'پەسەند (a)',
   'inbox.edit': 'دەستکاری',
   'inbox.editTitle': 'دەستکاری (e)',
   'inbox.reject': 'ڕەتکردنەوە',
   'inbox.rejectTitle': 'ڕەتکردنەوە (x)',
-  'inbox.skip': 'تێپەڕاندن',
-  'inbox.skipTitle': 'تێپەڕاندن (s)',
+  'inbox.skip': 'دواتر — بێ بڕیار',
+  'inbox.skipTitle': 'بڕۆ بۆ پارچەی دواتر بێ تۆمارکردنی بڕیار (s)',
   'inbox.flag': 'نیشانکردن',
   'inbox.flagTitle': 'نیشانکردن بۆ خولی دووەم (f)',
-  'inbox.undoTitle': 'گەڕانەوە (⌫)',
+  'inbox.undoTitle': 'گەڕانەوە (Backspace)',
   'inbox.reviewActions': 'کردارەکانی پێداچوونەوە',
+  'inbox.disabled.juryRunning': 'زنجیرەی جووری هەر ئێستا بەڕێوەدەچێت.',
+  'inbox.disabled.saving': 'گۆڕانکارییەک هێشتا پاشەکەوت دەکرێت؛ چاوەڕێی تەواوبوونی بکە.',
+  'inbox.disabled.noNext': 'هیچ پارچەیەکی دواتر لەم ڕیزەدا نییە.',
+  'inbox.disabled.alreadyReviewed': 'ئەم پارچەیە پێشتر بڕیاری پێداچوونەوەی تۆمارکراوی هەیە.',
+  'inbox.disabled.alreadyFlagged':
+    'ئەم پارچەیە پێشتر نیشانەی تۆمارکراوی خولی دووەمی هەیە؛ پێش نیشانکردنەوە، هەمان نیشانە بە وردی بگەڕێنەوە.',
+  'inbox.disabled.notEligible':
+    'ئەم پارچەیە هێشتا شایستەی بڕیاری پێداچوونەوە نییە؛ دوای ئامادەبوونی دەقەکە ڕیزەکە نوێ بکەرەوە.',
+  'inbox.disabled.audioUnavailable': 'دەنگ بەردەست نییە؛ پێش بڕیاردان دووبارە هەوڵی لێدان بدە.',
+  'inbox.disabled.editInProgress':
+    'پێش هەڵبژاردنی کردارێکی تر، ڕاستکردنەوەکە پاشەکەوت بکە یان هەڵیوەشێنەوە.',
+  'inbox.disabled.emptyEdit': 'پێش پاشەکەوتکردنی ڕاستکردنەوەکە دەق بنووسە.',
+  'inbox.disabled.staleEdit': 'ئەم ڕاستکردنەوەیە هی پارچەیەکی ترە و ناتوانرێت پاشەکەوت بکرێت.',
+  'inbox.disabled.noUndo': 'هیچ کرداری تۆمارکراو نییە بۆ گەڕاندنەوە.',
+  'inbox.disabled.draftLoading': 'گەڕاندنەوەی ڕەشنووس هێشتا بار دەکرێت؛ پێش بڕیاردان چاوەڕێ بکە.',
+  'inbox.disabled.draftUnavailable':
+    'ڕەشنووسی گەڕاندنەوە نەخوێندرایەوە؛ پێش بڕیاردان دووبارە هەوڵ بدە.',
+  'inbox.disabled.draftConflict':
+    'ڕەشنووسێکی پاشەکەوتکراو هی وەشانێکی کۆنترە؛ پێش بڕیاردان یەکلایی بکەرەوە.',
+  'inbox.disabled.draftPending': 'پێش بڕیاردان ڕاستکردنەوە پاشەکەوتکراوەکە بکەرەوە و تۆماری بکە.',
+  'inbox.error.juryNoResult': 'زنجیرەی جووری هیچ ئەنجامێکی نەگەڕاندەوە.',
+  'inbox.error.unknown': 'هەڵەیەکی نەناسراوی پێداچوونەوە ڕوویدا.',
+  'inbox.error.playbackReceiptMismatch':
+    'بەڵگەی گوێگرتن هی پارچە یان وەشانی ترە؛ نوێی بکەرەوە و دووبارە گوێ بگرە.',
+  'inbox.error.commitIdentityMismatch':
+    'وەڵامی بڕیارە پاشەکەوتکراوەکە لەگەڵ ئەم پارچەیە یەک نەبووەوە؛ ڕیزەکە نوێ دەکرێتەوە.',
+  'inbox.error.draftIdentityMismatch':
+    'وەڵامی ڕەشنووسی گەڕاندنەوە لەگەڵ ئەم پارچە و وەشانە یەک نەبووەوە.',
+  'inbox.error.undoFlagConflict':
+    'پارچەکە دوای نیشانکردن گۆڕاوە؛ گەڕاندنەوە بێ هیچ گۆڕانکارییەک ڕەتکرایەوە.',
+  'inbox.error.undoDecisionConflict':
+    'پارچەکە دوای بڕیارەکە گۆڕاوە؛ گەڕاندنەوە بێ هیچ گۆڕانکارییەک ڕەتکرایەوە.',
   // See en.ts: agreement is not trustworthiness when the audio is bad. Flagged for owner review.
   'inbox.band.poorAudio': 'دەنگی خراپ — ڕێککەوتنی {pct}% لێرەدا مانای متمانەپێکراوی نییە',
   'inbox.band.unknown': 'دڵنیایی نەزانراو',
-  'inbox.band.veryConfident': 'AI زۆر دڵنیایە ({pct}%) — تەماشایەکی خێرا 👀',
-  'inbox.band.fairlySure': 'AI تا ڕادەیەک دڵنیایە ({pct}%) — گوێگرتنێکی خێرا 👂',
-  'inbox.band.unsure': 'AI دڵنیا نییە ({pct}%) — بە وردی گوێ بگرە ⚠',
-  'inbox.band.low': 'دڵنیایی AI کەمە ({pct}%) — پێداچوونەوەی وردی پێویستە 🔴',
-  'inbox.status.running': '⏳ بەڕێوەبردنی زنجیرەی جووری…',
-  'inbox.status.noUnverified': 'ℹ️ هیچ پارچەیەکی پشتڕاستنەکراو نییە بۆ جووری.',
+  'inbox.band.veryConfident': 'AI زۆر دڵنیایە ({pct}%) — تەماشایەکی خێرا',
+  'inbox.band.fairlySure': 'AI تا ڕادەیەک دڵنیایە ({pct}%) — گوێگرتنێکی خێرا',
+  'inbox.band.unsure': 'AI دڵنیا نییە ({pct}%) — بە وردی گوێ بگرە',
+  'inbox.band.low': 'دڵنیایی AI کەمە ({pct}%) — پێداچوونەوەی وردی پێویستە',
+  'inbox.status.running': 'بەڕێوەبردنی زنجیرەی جووری…',
+  'inbox.status.noUnverified': 'هیچ پارچەیەکی پشتڕاستنەکراو نییە بۆ جووری.',
   'inbox.status.juryFinished':
-    '⚡ جووری تەواوبوو! T0 پەسەندکراو: {t0}، T1 تۆمارکراو: {t1}، T2 تۆمارکراو: {t2}، پلەبەرزکراو: {esc}',
-  'inbox.status.juryFailed': '❌ زنجیرەی جووری سەرکەوتوو نەبوو: {err}',
+    'جووری تەواوبوو. T0 پەسەندکراو: {t0}، T1 تۆمارکراو: {t1}، T2 تۆمارکراو: {t2}، پلەبەرزکراو: {esc}',
+  'inbox.status.juryFailed': 'زنجیرەی جووری سەرکەوتوو نەبوو: {err}',
   'inbox.status.loadFailed': 'بارکردنی ڕیز سەرکەوتوو نەبوو: {err}',
-  'inbox.status.accepted': '✅ پەسەندکرا',
+  'inbox.status.loadMoreFailed': 'بارکردنی ڕیزە پلەبەرزکراوە زیاترەکان سەرکەوتوو نەبوو: {err}',
+  'inbox.status.accepted': 'پەسەندکرا',
   'inbox.status.acceptFailed': 'پەسەندکردن سەرکەوتوو نەبوو: {err}',
   'inbox.status.autonomySet': 'ئاستی خۆکاری کرا بە {level}',
   'inbox.status.autonomyFailed': 'گۆڕینی ئاستی خۆکاری سەرکەوتوو نەبوو: {err}',
-  'inbox.status.edited': '✏️ دەستکاریکرا',
+  'inbox.status.edited': 'دەستکاریکرا',
   'inbox.status.editFailed': 'پاشەکەوتی دەستکاری سەرکەوتوو نەبوو: {err}',
-  'inbox.status.rejected': '❌ ڕەتکرایەوە',
+  'inbox.status.draftKept': 'ڕاستکردنەوەکە وەک ڕەشنووسی گەڕاندنەوە هێڵرایەوە.',
+  'inbox.status.draftChangedDuringSave':
+    'ڕاستکردنەوەکە لە کاتی پاشەکەوتکردنی ڕەشنووسی گەڕاندنەوە گۆڕا؛ دەقە نوێیەکە بپشکنە و دووبارە پاشەکەوتی بکە.',
+  'inbox.status.rejected': 'ڕەتکرایەوە',
   'inbox.status.rejectFailed': 'ڕەتکردنەوە سەرکەوتوو نەبوو: {err}',
-  'inbox.status.skipped': '⏭ تێپەڕێنرا',
-  'inbox.status.flagged': '🚩 نیشانکرا بۆ خولی دووەم',
+  'inbox.status.skipped': 'هیچ بڕیارێک بۆ ئەم پارچەیە تۆمار نەکرا.',
+  'inbox.status.finishEditBeforeNavigation':
+    'پێش گۆڕینی پارچە، ڕاستکردنەوەکە پاشەکەوت بکە یان هەڵیوەشێنەوە.',
+  'inbox.status.flagged': 'نیشانکرا بۆ خولی دووەم',
   'inbox.status.flagFailed': 'نیشانکردن سەرکەوتوو نەبوو: {err}',
-  'inbox.status.undone': '↩ گەڕێندرایەوە',
+  'inbox.status.flagInvalidResponse':
+    'وەڵامی نیشانکردن پشتڕاست نەکرایەوە؛ ڕیزی پلەبەرزکراوەکان نوێ دەکرێتەوە.',
+  'inbox.status.undone': 'گەڕێندرایەوە',
+  'inbox.status.undoRestoredOutsideScope':
+    'گەڕێندرایەوە؛ پارچە گەڕێندراوەکە لە دەرەوەی ڕیزی پلەبەرزکراوەکانە.',
   'inbox.status.undoFailed': 'گەڕاندنەوە سەرکەوتوو نەبوو: {err}',
   focusSearch: 'گەڕان',
   openSettings: 'کردنەوەی ڕێکخستنەکان',
@@ -301,6 +449,7 @@ export const ckb: Record<string, string> = {
   kurdish: 'کوردی',
   english: 'English',
   localeToggle: 'گۆڕینی زمان',
+  localeLoadFailed: 'پاکێجی زمان بار نەکرا. زمانی ئێستات پارێزرا.',
   models: 'مۆدێلی AI',
   'models.downloadAll': 'داگرتنی هەموو',
   'models.notDownloaded': 'داگردراو نییە',
@@ -326,8 +475,8 @@ export const ckb: Record<string, string> = {
   searchPlaceholder: 'گەڕان لە دەق، فایل، قسەکەر...',
   clearSearch: 'پاککردنەوەی گەڕان',
   searchFailed: 'گەڕان سەرکەوتوو نەبوو',
-  filterVerified: '✓ پشتڕاستکراو',
-  filterPending: '○ چاوەڕوان',
+  filterVerified: 'پشتڕاستکراو',
+  filterPending: 'چاوەڕوان',
   sortBy: 'ڕیزکردن بەپێی',
   sortNewest: 'نوێترین',
   sortOldest: 'کۆنترین',
@@ -391,11 +540,23 @@ export const ckb: Record<string, string> = {
   'diff.removed': 'سڕاوە',
   'diff.changed': 'گۆڕدراو',
   ready: 'ئامادە',
-  'import.interrupted': 'هاوردەکردنی {dir} پچڕا ({done}/{total} فایل تەواو). بەردەوامی پێبدە؟',
+  'import.interrupted': 'هاوردەکردنێک پچڕا ({done}/{total} فایل تەواو). بەردەوامی پێبدە؟',
   'import.resume': 'بەردەوامبوون',
-  'import.discard': 'پشتگوێخستن',
+  'import.discard': 'تۆماری گەڕاندنەوە بسڕەوە',
+  'import.discardConfirmTitle': 'تۆماری گەڕاندنەوەی هاوردەکردنی پچڕاو بسڕدرێتەوە؟',
+  'import.discardConfirmMessage':
+    'ئەمە تەنها تۆماری گەڕاندنەوە دەسڕێتەوە. پارچە هاوردەکراوەکان لە کتێبخانەدا دەمێننەوە، بەڵام ناتوانرێت ئەم هاوردەکردنە پچڕاوە بەردەوام بکرێت.',
+  'import.discardConfirmAction': 'تۆماری گەڕاندنەوە بسڕەوە',
   'import.resumeStarted': 'بەردەوامبوون لە هاوردەکردن — فایلە تەواوبووەکان تێدەپەڕێنرێن.',
   'import.resumeFailed': 'نەتوانرا هاوردەکردن بەردەوام بێت',
+  'import.discardFailed': 'نەتوانرا تۆماری گەڕاندنەوەی هاوردەکردنە پچڕاوەکە بسڕدرێتەوە',
+  'import.recoveryBusy': 'کرداری چاککردنەوەی هاوردەکردنی ئێستا تەواو دەکرێت.',
+  'import.recoveryChecking': 'دۆخی دەسەڵاتداری چاککردنەوەی هاوردەکردن پشکنین دەکرێت.',
+  'import.workspaceBusy': 'پێش چاککردنەوەی هاوردەکردن کردارەکەی ئێستای شوێنکار تەواو بکە.',
+  'import.recoveryCheckFailed': 'نەتوانرا پشکنین بۆ هاوردەکردنێکی پچڕاو بکرێت',
+  'import.recoveryAuthorityUnknown':
+    'دۆخی چاککردنەوەی هاوردەکردن نەخوێندرایەوە. تا پشکنینەکە سەرکەوتوو نەبێت کردارەکانی چاککردنەوە ناچالاکن.',
+  'import.retryRecoveryCheck': 'دووبارە پشکنینی چاککردنەوە بکە',
   importComplete: 'هاوردەکردن تەواو بوو',
   importFailed: 'هاوردەکردن سەرکەوتوو نەبوو',
   eventListenersFailed: 'دەستپێکردنی گوێگرەکان سەرکەوتوو نەبوو',
@@ -474,8 +635,11 @@ export const ckb: Record<string, string> = {
   'errors.openModelsSettings': 'کردنەوەی ڕێکخستنەکان ← مۆدێلەکان',
   'errors.transcriptionFailed': 'نووسین سەرکەوتوو نەبوو',
   'errors.verifyFailed': 'پشتڕاستکردن سەرکەوتوو نەبوو',
+  'errors.unknown':
+    'هەڵەیەکی چاوەڕواننەکراو ڕوویدا. دووبارە هەوڵ بدەوە یان تەندروستی شوێنکار بپشکنە.',
   'openFile.imported': 'فایل هاوردە کرا',
   'openFile.multiChunk': '{count} بەش لە فایلەوە هاوردە کرا',
+  'openFile.choosing': 'فایلێکی دەنگ هەڵبژێرە…',
   'openFile.failed': 'کردنەوەی فایل سەرکەوتوو نەبوو',
   validateDataset: 'پشکنینی داتاسێت',
   'stats.title': 'ئامارەکانی داتاسێت',
@@ -501,8 +665,6 @@ export const ckb: Record<string, string> = {
   'stats.relinking': 'دووبارە دەبەسترێتەوە…',
   'stats.relinkDone': '{n} فایل دووبارە بەسترایەوە؛ {m} هێشتا نەماون.',
   'stats.relinkFailed': 'دووبارە بەستنەوە سەرکەوتوو نەبوو',
-  'settings.cloudSttConsent':
-    'ئامرازە دەستییە هەڵبژاردەییەکانی ElevenLabs Scribe. کاتێک چالاک بێت، تەنها کردارەکانی دووبارەنووسینەوە و دەنگدان بۆ پارچەی هەڵبژێردراو پیشان دەدرێن؛ هێنانەکان هەر تەنها شەمپیۆنی OmniASR-7B بەکاردەهێنن. بەکارهێنانی کردارێک تەنها دەنگی ئەو پارچەیە بۆ ElevenLabs دەنێرێت. پێویستی بە کلیلی ElevenLabs هەیە لە secrets.env. ئەگەر پێویستت نییە، ناچالاکی بهێڵەرەوە.',
   'settings.cloudLlmConsent':
     'تێدەگەم کە Gemini دەقی نووسینەوە دەنێرێت بۆ Google. بۆ کاری داتاسێتی بە تەواوی ئۆفلاین ئەمە ناچالاک بهێڵەرەوە.',
   'settings.juryT2ConsentLead': 'تێدەگەم',
@@ -512,8 +674,86 @@ export const ckb: Record<string, string> = {
   'events.importSuccess': '{n} فایل بە سەرکەوتوویی پرۆسێس کرا',
   'events.importFailed': 'هێنان سەرکەوتوو نەبوو',
   'events.importFailedDetail': 'هەڵەی پایپلاین ببینە بۆ وردەکاری',
+  'import.startAbortedBusy': 'هاوردەکردن دەستی پێنەکرد چونکە کردارێکی تر دەستی پێکرد.',
+  'import.responseLostStatus': 'وەڵامی هاوردەکردن پچڕا — جێبەجێکردنە پەسەندکراوەکە دەپشکنرێت…',
+  'import.responseLost': 'وەڵامی هاوردەکردن پچڕا',
+  'import.responseLostRunningDetail':
+    'پشتەوە پشتڕاستی دەکاتەوە کە هەمان هاوردەکردن هێشتا کار دەکات. Cortex بە چالاکی هێشتییەوە و خۆکارانە یەکدەخاتەوە.',
+  'import.responseLostUncertainDetail':
+    'Cortex هێشتا ناتوانێت بسەلمێنێت کە هەمان هاوردەکردن دەستی پێکردووە؛ بۆیە تا پشکنینەوەی داهاتوو هاوردەکردنی نوێ ڕادەگیرێت.',
+  'import.settledRecovered': 'کاری هاوردەکردن تەواو بوو؛ کتێبخانەکە لە دۆخی بەردەوام نوێ کرایەوە.',
+  'batch.responseLostStatus': 'وەڵامی کاری کۆمەڵ پچڕا — دۆخی کردارە پەسەندکراوەکە دەپشکنرێت…',
+  'batch.responseLost': 'وەڵامی کاری کۆمەڵ پچڕا',
+  'batch.responseLostRunningDetail':
+    'پشتەوە پشتڕاستی دەکاتەوە کە هەمان کاری کۆمەڵ هێشتا کار دەکات. Cortex چالاکی هێشتووەتەوە و خۆکارانە یەکی دەخاتەوە.',
+  'batch.responseLostUncertainDetail':
+    'Cortex هێشتا ناتوانێت بسەلمێنێت کە هەمان کاری کۆمەڵ دەستی پێکردووە؛ بۆیە تا پشکنینەوەی داهاتوو کاری نوێ ڕادەگیرێت.',
+  'batch.settledRecovered': 'کاری کۆمەڵ وەستا؛ کتێبخانەکە لە دۆخی بەردەوام نوێ کرایەوە.',
+  'batch.adoptionChecking': 'کاری کۆمەڵی بەردەوام دەپشکنرێت…',
+  'batch.adoptionRunning': 'دووبارە بە کاری کۆمەڵی چالاکی {n} پارچەوە پەیوەست بوو.',
+  'batch.startCancelled': 'دەستپێکردنی کاری کۆمەڵ پێش دەستپێکردنی کار هەڵوەشێنرایەوە.',
+  'batch.startCancelledDetail':
+    'هیچ کارێکی کۆمەڵ پەسەند نەکرا. کاتێک ئامادە بوویت دووبارە هەوڵ بدەوە.',
+  'batch.startAuthorityLost': 'دەستپێکردنی کاری کۆمەڵ بە سەلامەتی پشتڕاست نەکرایەوە.',
+  'batch.startAuthorityLostDetail':
+    'هیچ کارێکی کۆمەڵ پەسەند نەکرا. Cortex دووبارە بکەرەوە و ئەگەر دووبارە بووەوە پشکنینە بەردەستەکان ببینە.',
+  'batch.restoreGenerationChanged': 'شوێنکار پێش دەستپێکردنی کاری کۆمەڵ گۆڕا.',
+  'batch.restoreGenerationChangedDetail':
+    'هیچ کارێکی کۆمەڵ پەسەند نەکرا. دوای تەواوبوونی گەڕاندنەوە یان چاککردنەوەی ئێستا دووبارە هەوڵ بدەوە.',
+  'batch.adoptionUnavailable': 'دۆخی کاری کۆمەڵی چالاک پشتڕاست نەکرایەوە',
+  'batch.adoptionUnavailableDetail':
+    'Cortex کاری کۆمەڵی نوێی داخستووە و خۆکارانە دووبارە هەوڵ دەداتەوە. تەنها دوای وەڵامدانەوەی پشتەوە ئێستا دووبارە هەوڵ بدەوە.',
+  'batch.adoptionMalformed': 'دۆخی کاری کۆمەڵی چالاک نادروستە',
+  'batch.adoptionMalformedDetail':
+    'Cortex ڕەتیکردەوە کە گومان لە کاری چالاک بکات. کاری کۆمەڵی نوێ داخراو دەمێنێتەوە؛ پشکنینەوەکە دووبارە بکەرەوە یان دوای پشکنینی تەندروستی شوێنکار دەستپێبکەرەوە.',
+  'batch.acknowledgementPending':
+    'ئەنجامی کاری کۆمەڵ پشتڕاست کرایەوە — وەرگرتنی بەردەوام دەپشکنرێت…',
+  'batch.acknowledgementFailed': 'پشتڕاستکردنەوەی وەرگرتنی ئەنجامی کاری کۆمەڵ هێشتا چاوەڕوانە',
+  'batch.acknowledgementFailedDetail':
+    'ئەنجامی ورد چارەسەر کرا، بەڵام وەرگرتنی بەردەوام پشتڕاست نەکرایەوە. Cortex کاری کۆمەڵی نوێی داخستووە و بە سەلامەتی هەمان ناسنامەی کردار دووبارە دەکاتەوە.',
+  'batch.outcomeUnavailable': 'کاری کۆمەڵ وەستا، بەڵام هێشتا ئەنجامەکەی پشتڕاست نەکراوەتەوە',
+  'batch.outcomeUnavailableDetail':
+    'Cortex شوێنکارەکە داخراو دەهێڵێتەوە و پشکنینی دۆخی کۆتایی ورد دووبارە دەکاتەوە. وا مەزانە کردارەکە تەواو بووە.',
+  'batch.eventOutcomeMismatch': 'ڕووداوی کاری کۆمەڵ لەگەڵ دۆخی بەردەوام ناگونجێت',
+  'batch.eventOutcomeMismatchDetail':
+    'Cortex ڕووداوەکەی پشتگوێ خست و ئەنجامی وردی هەڵگیراوی پشتەوەی بەکار هێنا. پێش بڵاوکردنەوە دەبێت ئەم ناگونجانییە بپشکنرێت.',
+  'import.recoveryBlocksNew': 'سەرەتا گەڕاندنەوەی هاوردەکردنی پچڕاو چارەسەر بکە',
+  'import.recoveryBlocksNewJournalDetail':
+    'پێش دەستپێکردنی هاوردەکردنێکی تر، تۆماری گەڕاندنەوەی دیار دووبارە دەست پێ بکە یان بیسڕەوە.',
+  'import.recoveryBlocksNewUnknownDetail':
+    'Cortex هێشتا ناتوانێت دۆخی گەڕاندنەوە بسەلمێنێت. پێش هاوردەکردن دووبارە پشکنینی بکە.',
   'events.refreshFailed': 'نوێکردنەوەی پارچەکان سەرکەوتوو نەبوو',
   'events.batchCancelled': 'کرداری کۆمەڵ هەڵوەشێنرایەوە',
+  'events.batchHalt.championUnavailable':
+    'چامپیۆنی ورد بەردەست نییە. تەندروستی بکەرەوە و تەنها دوای ئامادەبوونی دووبارە هەوڵ بدەوە.',
+  'events.batchHalt.championIdentityMismatch':
+    'مۆدێلی کارا چامپیۆنی تۆمارکراو نییە. هیچ پارچەیەکی تر نەنووسرایەوە.',
+  'events.batchHalt.modelIdentityChanged':
+    'ناسنامەی مۆدێل لە ناو کاری کۆمەڵدا گۆڕا. پارچە ماوەکان دەستکاری نەکران.',
+  'events.batchHalt.sourceChanged':
+    'سەرچاوەیەک دوای هاوردەکردن گۆڕاوە. پێش نووسینەوە دووبارە باری بکەرەوە یان هاوردەی بکە.',
+  'events.batchHalt.audioDecodeFailed':
+    'سەرچاوەیەکی دەنگ نەکرایەوە. کردارە کۆمەڵەکە پێش بەردەوامبوون وەستا.',
+  'events.batchHalt.segmentMissing':
+    'پارچەیەکی داواکراو چیتر بوونی نییە. پێش دووبارە هەوڵدان کتێبخانەکە نوێ بکەرەوە.',
+  'events.batchHalt.writeFailed':
+    'دەقێک بەردەوام تۆمار نەکرا. کردارە کۆمەڵەکە وەستا و نابێت بە تەواو هەژمار بکرێت.',
+  'events.batchHalt.normalizationFailed':
+    'ئاساییکردن بەردەوام تۆمار نەکرا. کاری کۆمەڵ پێش بەردەوامبوون وەستا.',
+  'events.batchHalt.refinementFailed':
+    'باشترکردنی دەق شکستی هێنا. کردارە کۆمەڵەکە پێش بەردەوامبوون وەستا.',
+  'events.batchHalt.juryFailed':
+    'دادوەری دوای نووسین شکستی هێنا. ڕەشنووس هەبێتیش، جێبەجێکردنەکە تەواو نییە.',
+  'events.batchHalt.workerStartFailed':
+    'کاری کۆمەڵ پەسەند کرا، بەڵام کارکەری ناوخۆیی دەستی پێنەکرد. هیچ کارێکی بێتۆمار بەردەوام نەبوو.',
+  'events.batchHalt.processInterrupted':
+    'پرۆسەی پێشووی دەسکتۆپ ئەم کاری کۆمەڵەی پچڕاند. بڕگە جێبەجێکراوەکان پارێزران و ماوەکان بەجێهێڵران.',
+  'events.batchHalt.evidenceInvalid':
+    'بەڵگەی بەردەوامی کاری کۆمەڵ لە پشکنین دەرنەچوو. پێش کاری کۆمەڵی تر تەندروستی شوێنکار بپشکنە.',
+  'events.batchHalt.generic':
+    'نووسینەوەی کۆمەڵ بە سەلامەتی وەستا. پێش دووبارە هەوڵدان تەندروستی شوێنکار بپشکنە.',
+  'events.batchHalt.workerPanicked':
+    'وۆرکەری بنەڕەتی کاری کۆمەڵ بە شێوەیەکی چاوەڕواننەکراو وەستا. ئەنجامە پایەدارەکان نوێ کرانەوە، بەڵام کردارەکە بە پاکی تەواو نەبوو.',
   'events.batchTranscribePartial': 'نووسینەوەی کۆمەڵ: {ok} سەرکەوتوو، {failed} شکستی هێنا',
   'events.batchVerifyPartial': 'پشتڕاستکردنەوەی کۆمەڵ: {ok} سەرکەوتوو، {failed} شکستی هێنا',
   'events.batchSpeakerPartial': 'دیاریکردنی قسەکەری کۆمەڵ: {ok} سەرکەوتوو، {failed} شکستی هێنا',
@@ -523,7 +763,12 @@ export const ckb: Record<string, string> = {
   'events.speakerAssigned': 'قسەکەر بۆ {n} پارچە دیاریکرا',
   'events.normalized': '{n} پارچە ئاسایی کرا',
   'events.batchRefreshFailed': 'نوێکردنەوە دوای کرداری کۆمەڵ سەرکەوتوو نەبوو',
+  'events.unknownFile': 'فایلی نەناسراو',
   'events.processingError': 'هەڵە لە پرۆسێسکردنی {file}',
+  'events.processingErrorDetail':
+    'پرۆسەکە بە سەلامەتی وەستا. دووبارە هەوڵ بدەوە؛ ئەگەر بەردەوام بوو تەندروستی بکەرەوە.',
+  'events.enrichmentErrorDetail':
+    'هاوردەکردنەکە پاشەکەوت بوو، بەڵام دەوڵەمەندکردنی ئارەزوومەندانە تەواو نەبوو. دەتوانیت پارچە پاشەکەوتکراوەکان پێداچوونەوە بکەیت؛ ئەگەر دووبارە بوو تەندروستی بکەرەوە.',
   'events.pipelineStarted': 'پایپلاین دەستی پێکرد',
   'events.wslPartial': 'کۆمەڵی WSL 7B: {ok} نووسرایەوە، {failed} شکستی هێنا',
   'events.wslDone': 'کۆمەڵی WSL 7B تەواو بوو: {n} نووسرایەوە',
@@ -590,9 +835,7 @@ export const ckb: Record<string, string> = {
   'db.quarantineAcknowledged':
     '{count} فایلی کەرەنتینکراو ئەرشیف کرا بۆ فۆڵدەری quarantine - سڕینەوەی وێنە کۆنەکان دەستی پێکردەوە',
   'db.quarantineAcknowledgeFailed': 'نەتوانرا فایلە کەرەنتینکراوەکان ئەرشیف بکرێن',
-  'stats.verifyModel': 'پشکنینی تەواوەتی مۆدێل',
-  'stats.verifyModelOk': 'تەواوەتی مۆدێل پشتڕاستکرایەوە — چێکسەمەکان یەکدەگرنەوە.',
-  'stats.verifyModelFailed': 'پشکنینی تەواوەتی مۆدێل سەرکەوتوو نەبوو',
+  'db.quarantineCheckFailed': 'نەتوانرا دۆخی کەرەنتینی بنکەدراوە بپشکنرێت',
   'stats.buildSha': 'بنیاد',
   'stats.qualityTitle': 'جۆری داتاسێت',
   'stats.emptyTranscripts': 'نووسینەوەی بەتاڵ',
@@ -642,6 +885,21 @@ export const ckb: Record<string, string> = {
   'agentReport.none': 'نییە',
   'agentReport.loadFailed': 'بارکردنی ڕاپۆرتی ئەیجێنت سەرکەوتوو نەبوو',
   'agentReport.stageLoadFailed': 'بارکردنی تۆماری قۆناغی ئەیجێنت سەرکەوتوو نەبوو',
+  'agentReport.unknown': 'نەناسراو',
+  'agentReport.unknownDate': 'بەرواری نەناسراو',
+  'agentReport.blockerCount': '{count} ڕێگر',
+  'agentReport.runFailedDetail':
+    'ئەم جارە بە سەلامەتی وەستا. بۆ وردەکارییەکانی پشکنین تەندروستی یان لۆگە ناوخۆییەکان بکەرەوە.',
+  'agentReport.check.sourceReference': 'سەرچاوەکانی تەواوی فایل',
+  'agentReport.check.primaryAsr': 'ASR ـی سەرەکی',
+  'agentReport.check.hypothesisCoverage': 'داپۆشینی پێشبینیی چەند مۆدێل',
+  'agentReport.check.readinessSnapshot': 'وێنەی ئامادەیی',
+  'agentReport.stage.sourceReference': 'سەرچاوەی نووسینەوە',
+  'agentReport.stage.audioChunking': 'پارچەکردنی دەنگ',
+  'agentReport.stage.multiModelHypotheses': 'پێشبینیی چەند مۆدێل',
+  'agentReport.stage.juryAdjudication': 'بڕیاری جووری',
+  'agentReport.stage.datasetPromotion': 'بەرزکردنەوەی داتاسێت',
+  'agentReport.stage.agentReport': 'ڕاپۆرتی ئەیجێنت',
   'shortcuts.none': 'هیچ کورتکراوەیەک تۆمار نەکراوە',
   'notifications.loadSegmentsFailed': 'بارکردنی بەشەکان سەرکەوتوو نەبوو',
   'notifications.undoInReview': 'بۆ گەڕاندنەوەی دوایین بڕیاری پێداچوونەوە، Backspace دابگرە',
@@ -660,6 +918,8 @@ export const ckb: Record<string, string> = {
   'notifications.lastActionReapplied': 'دوایین کردار دووبارە جێبەجێکرا',
   'notifications.undoFailedDetail': 'گەڕاندنەوە سەرکەوتوو نەبوو: {error}',
   'notifications.redoFailedDetail': 'دووبارەکردنەوە سەرکەوتوو نەبوو: {error}',
+  'notifications.undoFailed': 'گەڕاندنەوە سەرکەوتوو نەبوو',
+  'notifications.redoFailed': 'دووبارەکردنەوە سەرکەوتوو نەبوو',
   'editor.noWordTimestamps':
     'هیچ کاتی وشە بەردەست نییە. کلیک لە ‹ڕیزکردن› بکە بۆ ڕیزکردنی دەق لەگەڵ دەنگ.',
   'notifications.transcriptionComplete': 'نووسین تەواو بوو',
@@ -702,9 +962,15 @@ export const ckb: Record<string, string> = {
   'models.completed': 'داگرتنی مۆدێلە پشتڕاستکراوەکان تەواو بوو',
   'models.downloadFailed': 'داگرتن سەرکەوتوو نەبوو',
   'models.downloading': 'داگرتن...',
+  'models.downloaded': 'داگیراوە',
+  'models.skippedMissingPins':
+    '{count} فایلی مۆدێلی پشتگیری کەمە و پێش داگرتنی خۆکار پێویستی بە checksumی پینکراو هەیە.',
+  'models.downloadSummary': '{downloaded} داگیرا، {failed} شکستی هێنا، {skipped} تێپەڕێنرا.',
+  'models.skippedUnavailable': '{count} فایلی مۆدێلی پشتگیری بەردەستنەبوو و تێپەڕێنرا.',
   // Speaker panel
   'speaker.title': 'بەڕێوەبردنی قسەکەر',
   'speaker.noneIdentified': 'هێشتا هیچ قسەکەرێک دیاری نەکراوە.',
+  'speaker.unassigned': 'دیاری نەکراو',
   'speaker.segmentsMinutes': '{count} بەش · {minutes} خولەک',
   'speaker.rename': 'گۆڕینی ناو',
   'speaker.newNamePlaceholder': 'ناوی نوێی قسەکەر...',
@@ -712,9 +978,11 @@ export const ckb: Record<string, string> = {
   'speaker.renameFailed': 'گۆڕینی ناو سەرکەوتوو نەبوو',
   'speaker.renameSuccess': '{n} بەش نوێکرایەوە',
   'speaker.mergeConfirm':
-    "ناوی '{source}' بگۆڕدرێت بۆ '{target}'؟ '{target}' پێشتر هەیە ({n} بەش) — ئەمە هەردوو قسەکەر تێکەڵ دەکات و ناگەڕێتەوە.",
+    "ناوی '{source}' بگۆڕدرێت بۆ '{target}'؟ '{target}' پێشتر هەیە ({n} بەش) — ئەمە هەردوو قسەکەر تێکەڵ دەکات. دوای پاشەکەوتکردن دەتوانیت بە گەڕاندنەوە هەڵیبوەشێنیتەوە.",
   // Audio player
   'audio.loadFailed': 'بارکردنی فایلی دەنگ سەرکەوتوو نەبوو',
+  'audio.proofFailed':
+    'دەستپێکردنی بەڵگەی گوێگرتن سەرکەوتوو نەبوو. کلیپەکە نوێ بکەرەوە و دووبارە هەوڵ بدە.',
   'audio.seek': 'گەڕان لە دەنگدا',
   'audio.controls': 'کۆنترۆڵەکانی لێدانی دەنگ',
   'audio.play': 'لێدان',
@@ -728,6 +996,7 @@ export const ckb: Record<string, string> = {
   // Command palette
   'cmdk.noMatches': 'هیچ فەرمانێکی گونجاو نییە',
   'cmdk.title': 'پانێڵی فەرمانەکان',
+  'header.moreActions': 'کردارە زیاترەکان',
   'cmdk.search': 'گەڕان بەدوای فەرمانەکاندا…',
   'cmdk.navigate': 'گەڕان',
   'cmdk.run': 'جێبەجێکردن',
@@ -743,6 +1012,8 @@ export const ckb: Record<string, string> = {
     'بنەمای دڵنیایی: هیوریستیک. ئەنجنی ناوخۆیی هیچ ئەگەرێکی تۆکن دەرناهێنێت، بۆیە پشتڕاستکردنەوە پشت بە خاڵی دەنگی (CTC) دەبەستێت، نەک دڵنیاییەکی پێوانەکراو — وەک ئاماژە مامەڵەی لەگەڵ بکە.',
   'stats.conformalNoConfidence':
     'ئەم ئەنجنە هیچ دڵنیاییەک بۆ هەر پارچەیەک دەرناهێنێت، بۆیە هیچ پارچەیەک پشتڕاست ناکرێتەوە و هیچ سنوورێکی مەترسی ناپێوردرێت. پێداچوونەوەی پارچەی زیاتر ئەمە ناگۆڕێت.',
+  'stats.conformalUncalibrated':
+    'دۆخی کالیبرەنەکراو. بۆ چالاککردنی سنووری مەترسیی ئاماری، لانیکەم ١٠ پارچە پشتڕاست بکەرەوە.',
   'stats.certifiedSegments': 'بەشە بڕوانامەدارەکان',
   // Waveform
   'waveform.timelineZoom': 'زووم کردنی هێڵی کات',
@@ -753,6 +1024,7 @@ export const ckb: Record<string, string> = {
   'wsl.completed': 'بە سەرکەوتوویی تەواو بوو',
   'wsl.failed': 'پرۆسێس شکستی هێنا',
   'wsl.cancelled': 'هەڵوەشێندرایەوە',
+  'wsl.completedCounts': '{completed} تەواوبوو؛ {failed} شکستی هێنا',
   'wsl.limitFiles': 'سنووری فایلەکان (بەتاڵ بیهێڵە بۆ هەموو)',
   'wsl.limitSegments': 'سنووری بەش بۆ هەر فایلێک (بەتاڵ بیهێڵە بۆ هەموو)',
   'wsl.dryRun': 'جێبەجێکردنی وشک (نووسین لە داتابەیس نییە)',
@@ -774,6 +1046,8 @@ export const ckb: Record<string, string> = {
   'settings.couchStart': 'دەستپێکردن',
   'settings.couchWifiUrl': 'هەمان وایفای:',
   'settings.couchTailscaleUrl': 'لە هەر شوێنێکەوە (Tailscale — تەنیا ئامێرەکانی خۆت، کۆدکراو):',
+  'settings.couchFunnelUrl':
+    'لە هەر ڕایەڵەیەکەوە (Tailscale Funnel — ناونیشانی گشتی، پێویستی بە ئەپ نییە):',
   'settings.couchTlsFingerprint': 'پەنجەمۆری SHA-256ی بڕوانامەی TLS',
   'settings.couchTlsFingerprintHint':
     'لە یەکەم پەیوەندیدا دڵنیابە کە پەنجەمۆری بڕوانامەکە لە مۆبایلەکەت لەگەڵ ئەم بەهایەی کۆمپیوتەرە متمانەپێکراوەکە یەکسانە.',
@@ -795,6 +1069,17 @@ export const ckb: Record<string, string> = {
   'settings.couchRevoke': 'هەڵوەشاندنەوە',
   'settings.couchThroughput':
     'پێداچوونەوەکراو لەم کتێبخانەیەدا (پارچە · ناوەندی چرکە بۆ هەر پارچەیەک)',
+  // Reviewer-pay card (2026-08-30). New Sorani, NOT natively reviewed — on the owner's read list.
+  'settings.payTitle': 'پارەی پێداچوونەوەران',
+  'settings.payOutstanding': 'ماوە',
+  'settings.payEarned': 'بەدەستهێنراو',
+  'settings.paySettled': 'دراوە',
+  'settings.payReference': 'ژمارەی پارەدان (وەسڵ، ناردن…)',
+  'settings.payRecord': 'تۆمارکردنی پارەدان',
+  'settings.payRecorded': 'پارەدان تۆمارکرا: {amount} دینار بۆ {reviewer}',
+  'settings.payFailed': 'تۆمارکردنی پارەدان سەرکەوتوو نەبوو — هیچ تۆمار نەکرا',
+  'settings.payLoadFailed': 'باڵانسی پێداچوونەوەران بار نەکرا',
+  'settings.payNone': 'هێشتا هیچ پێداچوونەوەرێک پارەی بەدەست نەهێناوە.',
   'settings.couchSpotChecks': 'پشکنینی نمونەیی (تێبینیکراو / دراو · هەڵە بەراورد بە وەڵامی زانراو)',
   'settings.couchSpotChecksHint':
     'هەندێک پارچە لە ڕیزی هەر پێداچوونەوەرێکدا پێشتر وەڵامی پشتڕاستکراویان هەیە و بە ڕەشنووسی هەڵەوە پیشان دەدرێن. ئەو کەسەی گوێ دەگرێت ڕاستیان دەکاتەوە. ژمارەی یەکەمی نزم واتە لەوانەیە بەبێ گوێگرتن پەسەند بکات.',
@@ -802,9 +1087,6 @@ export const ckb: Record<string, string> = {
   'settings.couchReviewersPlaceholder': 'وەک: سارا، هێمن — بەتاڵی بهێڵەرەوە بۆ تەنیا خۆت',
   'settings.couchReviewersHint':
     'هەر ناوێک بەستەری تایبەتی خۆی وەردەگرێت، و هەر بڕیارێک بە ناوی ئەو کەسەوە تۆمار دەکرێت. پارچەی جیاواز بۆ هەر پێداچوونەوەرێک دەنێردرێت، بۆیە دوو کەس هەرگیز لە هەمان کاتدا پێداچوونەوە بۆ هەمان پارچە ناکەن.',
-  'settings.useFinetuned': 'مۆدێلی ڕاهێنراو بەکاربهێنە',
-  'settings.useFinetunedHint':
-    'باشترین وردی کوردیی ناوخۆیی (٪٢١٫٠ هەڵەی پیت [٪١٩٫٩–٪٢٢٫٠]، N=900 پارچەی زێڕین، پێوانەکراو ٢٠٢٦-٠٦-٢٥) — لەسەر CPU، بێ ڕێکخستن. سەروپۆشی ئەندازیارەکەی خوارەوە دەکات.',
   'settings.externalAsrScript': 'سکریپتی دابینکەری ASR ی دەرەکی',
   'settings.localApiEndpoint': 'ئەندپۆینتی API ی ناوخۆیی',
   'settings.modelName': 'ناوی مۆدێل',
@@ -815,7 +1097,7 @@ export const ckb: Record<string, string> = {
   'settings.geminiModel': 'مۆدێلی Gemini',
   'settings.llmEngine': 'بزوێنەری LLM',
   'settings.aiTab': 'پاشپرۆسەی AI',
-  'settings.juryTab': '📬 جووریی گوێگرتن',
+  'settings.juryTab': 'جووریی گوێگرتن',
   'settings.aiTitle': 'نووسینەوەی دوو-قۆناغی (ڕاستکەرەوەی LLM)',
   'settings.aiDescription':
     'بە شێوەی بنەڕەتی LLMێکی ناوخۆیی بەکاربهێنە. دابینکەرە هەورییەکان بە هەڵبژاردن چالاک دەکرێن و دەقی نووسینەوە بۆ دابینکەرەکە دەنێرن.',
@@ -823,7 +1105,7 @@ export const ckb: Record<string, string> = {
     'تەنیا بۆ دابینکەری WSL 7B پێویستە. ڕێڕەوێک بەکاربهێنە کە لە ناو WSLدا دەبینرێت.',
   'settings.llmDisabledOption': 'ناچالاک (خێراترین)',
   'settings.llmLocalOption': 'API ی ناوخۆیی (بۆ نموونە LM Studio یان Ollama)',
-  'settings.llmCloudOption': 'Google Gemini 3.1 Pro (هەوری)',
+  'settings.llmCloudOption': 'Google Gemini 2.5 Pro (هەوری)',
   'settings.localEndpointHint': 'دەبێت ئەندپۆینتێکی /v1/chat/completions هاوتا لەگەڵ OpenAI بێت.',
   'settings.quickSelect': 'هەڵبژاردنی خێرا:',
   'settings.apiKeySaved': 'کلیل پاشەکەوت کراوە',
@@ -835,10 +1117,10 @@ export const ckb: Record<string, string> = {
   'settings.apiKeySavedToast': 'کلیلی {provider} لە secrets.env پاشەکەوت کرا',
   'settings.apiKeyClearedToast': 'کلیلی {provider} سڕایەوە',
   'settings.apiKeySaveFailedToast': 'پاشەکەوتکردنی کلیلی {provider} سەرکەوتوو نەبوو',
-  'settings.geminiProRecommended': 'Gemini 2.5 Pro (پێشنیارکراو)',
-  'settings.geminiFlash': 'Gemini 2.5 Flash',
+  'settings.modelFixedByPolicy': 'بەپێی سیاسەتی خاوەنەکە جێگیرە',
+  'settings.advisoryModelName': 'Gemini 2.5 Pro',
   'settings.systemPromptHint': 'ئەو ڕێنماییانەی بۆ پرۆسەکردنی نووسینەوە دەنێردرێن بۆ LLM.',
-  'settings.juryTitle': '📬 جووریی گوێگرتن',
+  'settings.juryTitle': 'جووریی گوێگرتن',
   'settings.juryDescription':
     'جووری پارچەکان لە کۆدەنگی IRT (T0) بۆ شیکردنەوەی دەق (T1)، پێداچوونەوەی دەنگ بە Gemini (T2)، پاشان بۆ سندوقی مرۆڤ ڕێڕەو دەکات. قۆناغە هەورییەکان دەنگ بۆ Google دەنێرن و پێویستیان بە ڕەزامەندی هەیە.',
   'settings.autonomyHint':
@@ -847,10 +1129,8 @@ export const ckb: Record<string, string> = {
   'settings.juryT1ThresholdHint':
     'پارچەکانی خوار ئەم خاڵە کۆکراوەی فەرهەنگ و ئاڵۆزی (perplexity) بۆ T2 پلەبەرز دەکرێن. بۆ کەمکردنەوەی داواکارییە هەورییەکان سنوورەکە بەرز بکەرەوە.',
   'settings.juryModelLabel': 'مۆدێلی Gemini (دادوەری دەنگی T2)',
-  'settings.modelProRecommended': '2.5 Pro (پێشنیارکراو)',
-  'settings.modelFlashFaster': '2.5 Flash (خێراتر)',
-  'settings.sourceModelsBoth': '2.5 Pro + Flash',
-  'settings.sourceModelsProOnly': 'تەنیا 2.5 Pro',
+  'settings.sourceReferenceFixedHint':
+    'سەرچاوەی ڕاوێژکاری هەمان مۆدێلی جێگیر بەکاردەهێنێت؛ نووسینەوەی بەرهەم هەر OmniASR-7B ـە.',
   'settings.selfConsistencyLabel': 'N ی خۆ-هاوڕایی',
   'settings.selfConsistencyHint':
     'دەنگ بۆ هەر پارچەیەک؛ ٣ واتە دەنگی زۆرینە. ژمارەی زیاتر متمانەپێکراوی زیاد دەکات، بەڵام داواکاری API ی زیاتر بەکاردەهێنێت.',
@@ -861,11 +1141,149 @@ export const ckb: Record<string, string> = {
   'settings.juryConnection': 'پەیوەندی دادوەر',
   'settings.juryConnectionGemini': 'ڕاستەوخۆی Google (کلیلی API ی Gemini)',
   'settings.juryConnectionOpenRouter': 'OpenRouter (هەمان Gemini 2.5 Pro؛ کلیلی OpenRouter)',
-  'settings.juryPolicyLead': 'سیاسەتی دادوەری ASR ی هەوری:',
+  'settings.juryPolicyLead': 'سیاسەتی دادوەری ڕاوێژکاری هەوری:',
   'settings.juryPolicyModel': 'تەنیا Gemini 2.5 Pro',
   'settings.juryPolicyDetail':
     '— تەنیا مۆدێلی هەوریی پشتڕاستکراوەیە کە بۆ سۆرانی بەکاردێت (Qwen و هاوشێوەکانی نا). OpenRouter بە کلیلی خۆی و سنووری بەکارهێنانی خۆی دەگات بە هەمان مۆدێل.',
   'settings.openRouterApiKey': 'کلیلی API ی OpenRouter',
   'settings.openRouterKeyHint':
     'بە ناوخۆیی لە secrets.env (فۆڵدەری داتای ئەپ) پاشەکەوت دەکرێت؛ هەرگیز تۆمار ناکرێت، دووبارە پیشان نادرێت و تەنیا بۆ OpenRouter دەنێردرێت. بۆ سڕینەوەی کلیل، خانەیەکی بەتاڵ پاشەکەوت بکە.',
-};
+  'diagnostics.title': 'پشکنین — شوێنکەوتنی کردارەکان',
+  'diagnostics.refresh': 'نوێکردنەوە',
+  'diagnostics.clear': 'پاککردنەوە',
+  'diagnostics.desktopRequired': 'پشکنینەکان پێویستیان بە بەرنامەی سەر مێز هەیە.',
+  'diagnostics.loading': 'پشکنینەکان بار دەکرێن…',
+  'diagnostics.spansRecorded': 'شوێنکەوتن تۆمار کراوە',
+  'diagnostics.failures': 'شکستهێنانەکان',
+  'diagnostics.averageDuration': 'ناوەندی ماوە',
+  'diagnostics.totalDuration': 'کۆی ماوە',
+  'diagnostics.empty':
+    'هێشتا هیچ کردارێک شوێنکەوتن نەکراوە. نووسینەوە یان هاوردەکردنێک جێبەجێ بکە بۆ پڕکردنەوەی کاتەکان.',
+  'diagnostics.succeeded': 'سەرکەوتوو',
+  'diagnostics.failed': 'سەرکەوتوو نەبوو',
+  'diagnostics.loadFailed': 'بارکردنی پشکنینەکان سەرکەوتوو نەبوو',
+  'diagnostics.clearFailed': 'پاککردنەوەی پشکنینەکان سەرکەوتوو نەبوو',
+  'modelRegistry.title': 'مۆدێلە تۆمارکراوەکان',
+  'modelRegistry.loading': 'تۆماری مۆدێلەکان بار دەکرێت…',
+  'modelRegistry.empty':
+    'هێشتا هیچ مۆدێلێک تۆمار نەکراوە. کاندیدێکی هاوردەکراوی OmniASR-7B لێرە لەگەڵ مۆڵەت و پوختەی پشکنینی خاڵی پاشەکەوت پیشان دەدرێت تا سەرچاوەکەی بتوانرێت بپشکنرێت.',
+  'modelRegistry.champion': 'پاڵەوان',
+  'modelRegistry.licenseLabel': 'مۆڵەت',
+  'modelRegistry.shaLabel': 'SHA',
+  'modelRegistry.cancelImport': 'هەڵوەشاندنەوەی هاوردەکردن',
+  'modelRegistry.importCheckpoint': 'هاوردەکردنی خاڵی پاشەکەوت',
+  'modelRegistry.idLabel': 'ناسنامەی مۆدێل',
+  'modelRegistry.idPlaceholder': 'ناسنامە (بۆ نموونە omniasr-7b-challenger)',
+  'modelRegistry.sourceLabel': 'سەرچاوەی مۆدێل',
+  'modelRegistry.sourcePlaceholder': 'سەرچاوە (بۆ نموونە fine-tune)',
+  'modelRegistry.licenseFieldLabel': 'مۆڵەتی مۆدێل',
+  'modelRegistry.licensePlaceholder': 'مۆڵەت (بۆ نموونە CC-BY-NC-4.0)',
+  'modelRegistry.modelCardLabel': 'ناوی کارتی مۆدێل (ئارەزوومەندانە)',
+  'modelRegistry.modelCardPlaceholder': 'ناوی کارتی مۆدێل (ئارەزوومەندانە)',
+  'modelRegistry.chooseFile': 'فایل هەڵبژێرە…',
+  'modelRegistry.checkpointSelected': 'خاڵی پاشەکەوت هەڵبژێردرا',
+  'modelRegistry.noCheckpointSelected': 'هیچ خاڵی پاشەکەوتێک هەڵنەبژێردراوە',
+  'modelRegistry.importing': 'هاوردە دەکرێت…',
+  'modelRegistry.importAsCandidate': 'وەک کاندید هاوردەی بکە',
+  'modelRegistry.selectCheckpoint': 'خاڵێکی پاشەکەوتی مۆدێل هەڵبژێرە',
+  'modelRegistry.importedCandidate': 'خاڵی پاشەکەوتی “{id}” وەک کاندید هاوردە کرا.',
+  'modelRegistry.loadFailed': 'بارکردنی تۆماری مۆدێلەکان سەرکەوتوو نەبوو',
+  'modelRegistry.importFailed': 'هاوردەکردنی خاڵی پاشەکەوت سەرکەوتوو نەبوو',
+  'refinery.evalComplete': 'هەڵسەنگاندنی Honest-CER تەواو بوو: CER {cer} (N={n}).',
+  'refinery.evalFailed': 'هەڵسەنگاندنی Honest-CER سەرکەوتوو نەبوو',
+  'refinery.scorecardFailed': 'دروستکردنی کارتی نمرە سەرکەوتوو نەبوو',
+  'refinery.selectVerifiedAudio': 'فایلێکی دەنگی پشتڕاستکراو هەڵبژێرە',
+  'refinery.goldCreated': '{count} پارچەی زێڕین لە فایلەکە دروست کرا.',
+  'refinery.goldCreateFailed': 'دروستکردنی پارچەی زێڕین لە فایلەکە سەرکەوتوو نەبوو',
+  'refinery.loadFailed': 'بارکردنی داتای پاڵاوتن سەرکەوتوو نەبوو: {error}',
+  workspaces: 'شوێنەکانی کار',
+  'merge.jsonPlaceholder': '[{"id": "...", "rawTranscript": "..." }, ...]',
+  'merge.jsonInputLabel': 'JSONی داتاسێت',
+  'history.undoneAction': 'دوایین کردار گەڕێندرایەوە',
+  'history.redoneAction': 'کردارەکە دووبارە کرایەوە',
+  'history.undoShortcut': 'گەڕاندنەوە (Ctrl+Z)',
+  'history.redoShortcut': 'دووبارەکردنەوە (Ctrl+Shift+Z)',
+  'history.nothingToUndo': 'هیچ کردارێک نییە بۆ گەڕاندنەوە.',
+  'history.nothingToRedo': 'هیچ کردارێک نییە بۆ دووبارەکردنەوە.',
+  'history.processing': 'چاوەڕێ بکە تا کرداری ئێستای مێژوو تەواو دەبێت.',
+  'history.action.updateSegment': 'نوێکردنەوەی پارچە',
+  'history.action.deleteSegments': 'سڕینەوەی پارچەکان',
+  'history.action.batchTranscribe': 'نووسینەوەی کۆمەڵ',
+  'history.action.batchNormalize': 'ئاساییکردنی کۆمەڵ',
+  'history.action.speakerAssignment': 'دیاریکردنی قسەکەر',
+  'history.action.unknown': 'کرداری پێشوو',
+  'waveform.zoomSlider': 'زوومی شەپۆلی دەنگ',
+  'waveform.audioTimeline': 'هێڵی کاتی شەپۆلی دەنگ',
+  'waveform.position': '{current} چرکە لە {duration} چرکە',
+  'wsl.title': 'نووسینەوەی ناوخۆیی بە {model} لە WSL',
+  'wsl.description':
+    'نووسینەوەی ناوخۆیی و ورد لەسەر GPU جێبەجێ بکە. ئەم پرۆسەیە لە ناو WSL (Ubuntu) کار دەکات و دەقی پارچەکان ڕاستەوخۆ لە بنکەدراوە نوێ دەکاتەوە.',
+  'wsl.closeDisabled': 'پێش داخستن نووسینەوەکە هەڵبوەشێنەوە یان چاوەڕێ بکە تا تەواو دەبێت.',
+  'wsl.limitFilesPlaceholder': 'بۆ نموونە، ٥',
+  'wsl.limitSegmentsPlaceholder': 'بۆ نموونە، ٢٠',
+  'wsl.logStarting': 'دەستپێکردنی نووسینەوەی کۆمەڵی پارچە چاوەڕوانەکان بە Meta OmniASR 7B…',
+  'wsl.logOptionFiles': 'زۆرترین فایل {count}',
+  'wsl.logOptionSegments': 'زۆرترین پارچە {count}',
+  'wsl.logOptionDryRun': 'جێبەجێکردنی وشک (بێ نووسین)',
+  'wsl.logOptionTestOne': 'تاقیکردنەوەی یەک پارچە',
+  'wsl.logOptions': 'هەڵبژاردەکان: {options}',
+  'wsl.logAllPending': 'هەموو پارچە چاوەڕوانەکان',
+  'wsl.logStartFailed': 'دەستپێکردنی پاڵاوتن سەرکەوتوو نەبوو',
+  'wsl.logCancelling': 'پرۆسەکە بەپێی داواکاری تۆ هەڵدەوەشێندرێتەوە…',
+  'wsl.logCancelFailed': 'هەڵوەشاندنەوە سەرکەوتوو نەبوو',
+  'settings.couchWorking': 'کاردەکات…',
+  'settings.aiAudioCleanup': 'پاککردنەوەی دەنگ بە AI (لابردنی ژاوەژاو پێش ASR)',
+  'settings.exportJson': 'JSON (مانیفێستی شێوازی COCO)',
+  'settings.exportJsonl': 'JSONL (هەر پارچەیەک لە هێڵێکدا)',
+  'stats.decisionThreshold': 'سنووری بڕیار (τ)',
+  'stats.targetErrorBound': 'سنووری هەڵەی ئامانج (CER):',
+  'stats.confidenceLevel': 'ئاستی متمانە:',
+  'stats.expectedErrorBound': 'سنووری هەڵەی چاوەڕوانکراو:',
+  'stats.uncalibratedTargetTitle':
+    'کالیبرە نەکراوە — ئەمە ئامانجی داواکراوە، نەک سنوورێکی پێوانەکراو',
+  'stats.uncalibratedValue': 'بەردەست نییە (کالیبرە نەکراوە)',
+  'agentReport.byteCount': '{count} بایت',
+  'agentReport.hashValue': 'پوختە {hash}',
+  'agentReport.status.notRequired': 'پێویست نییە',
+  'agentReport.status.ready': 'ئامادە',
+  'agentReport.status.completed': 'تەواوبوو',
+  'agentReport.status.skipped': 'تێپەڕێندرا',
+  'agentReport.status.failed': 'سەرکەوتوو نەبوو',
+  'agentReport.status.running': 'کاردەکات',
+  'agentReport.status.degraded': 'لاوازبووە',
+  'agentReport.status.needsReview': 'پێویستی بە پێداچوونەوەیە',
+  'agentReport.status.blocked': 'گیراوە',
+  'agentReport.status.unprocessed': 'پرۆسێس نەکراوە',
+  'agentReport.jury': 'جووری',
+  'agentReport.automatic': 'خۆکار',
+  'agentReport.review': 'پێداچوونەوە',
+  'agentReport.open': 'کراوە',
+  'refinery.ariaLabel': 'پێوانەکانی پاڵاوتن',
+  'refinery.title': 'پاڵاوتنی ناکۆکی',
+  'refinery.loading': 'پێوانەکانی پاڵاوتن بار دەکرێن…',
+  'refinery.liftTitle': 'باشبوونی جۆری نیشانە: لە ASRی خاو بۆ دوای جووری',
+  'refinery.liftSelfReferential':
+    'ناتوانرێت بپێورێت — دەقی پاش جووری کە بۆ پارچەی بڕیارلێدراو پاشەکەوت کراوە هەمان وەڵامی مرۆڤە؛ بۆیە ئەم پێوانەیە وەڵامەکە بە خۆی بەراورد دەکات و تەنها سفر پیشان دەدات. ئەمە هیچ شتێک لەسەر وردیی جووری ناسەلمێنێت. بۆ پێوانەکردنی جووری، بڕیارەکەی دەبێت جیا لە وەڵامی مرۆڤ تۆمار بکرێت؛ ئەم کتێبخانەیە هێشتا وای ناکات.',
+  'refinery.rawAsrCer': 'CERی ASRی خاو',
+  'refinery.postJuryCer': 'CERی دوای جووری',
+  'refinery.cerLift': 'باشبوونی CER',
+  'refinery.liftEvidence': 'N={n} پارچەی پشتڕاستکراو؛ CIی ٩٥٪ [{low}، {high}]',
+  'refinery.selfReferentialRows':
+    '{self} لە {total} وەک خۆی پەسەند کراوە؛ بۆیە ئەو ڕیزانە جووری بە بەرهەمی خۆی بەراورد دەکەن.',
+  'refinery.noMeasuredLift':
+    'هێشتا باشبوونێکی پێوانەکراو نییە — پێویستی بە پارچەی پشتڕاستکراوی مرۆڤ و بڕیاری جووریی جیاواز هەیە.',
+  'refinery.runEvaluation': 'هەڵسەنگاندن جێبەجێ بکە',
+  'refinery.running': 'جێبەجێ دەکرێت…',
+  'refinery.runHonestCer': 'هەڵسەنگاندنی ڕاستگۆیانەی CER جێبەجێ بکە',
+  'refinery.importing': 'هاوردە دەکرێت…',
+  'refinery.importGold': 'داتای زێڕین لە فایل هاوردە بکە…',
+  'refinery.lastEval': 'دوایین هەڵسەنگاندن: CER {cer}؛ WER {wer}؛ N={n}',
+  'refinery.buildScorecard': 'کارتی نمرە دروست بکە',
+  'refinery.evaluationRuns': 'هەڵسەنگاندنە جێبەجێکراوەکان',
+  'refinery.noEvalRuns': 'هێشتا هەڵسەنگاندنێک جێبەجێ نەکراوە. هەڵسەنگاندنی زێڕین جێبەجێ بکە.',
+  'refinery.model': 'مۆدێل',
+  'refinery.when': 'کات',
+  'refinery.escalationTrend': 'ڕەوتی ڕێژەی پلەبەرزکردن',
+  'refinery.noEscalationHistory': 'هێشتا مێژووی پلەبەرزکردن نییە.',
+  'refinery.trendPoint': '{date}: {rate} پلەبەرزکرا؛ {escalated} لە {total} پارچە.',
+} satisfies Record<TranslationKey, string>;

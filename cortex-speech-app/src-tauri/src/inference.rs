@@ -73,6 +73,21 @@ impl Default for InferenceMetrics {
 
 pub static INFERENCE_METRICS: LazyLock<InferenceMetrics> = LazyLock::new(InferenceMetrics::new);
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferenceKindStats {
+    pub calls: u64,
+    pub failures: u64,
+    pub p50_ms: f64,
+    pub p99_ms: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferenceStatsSnapshot {
+    pub vad: InferenceKindStats,
+    pub asr: InferenceKindStats,
+    pub model_load_ms: f64,
+}
+
 pub struct InferenceTimer {
     start: Instant,
     kind: &'static str,
@@ -109,7 +124,7 @@ impl InferenceTimer {
     }
 }
 
-pub fn get_inference_stats() -> serde_json::Value {
+pub fn get_inference_stats() -> InferenceStatsSnapshot {
     let vad_latencies = InferenceMetrics::snapshot_latencies(&INFERENCE_METRICS.vad_latencies, "vad");
     let asr_latencies = InferenceMetrics::snapshot_latencies(&INFERENCE_METRICS.asr_latencies, "asr");
 
@@ -119,21 +134,21 @@ pub fn get_inference_stats() -> serde_json::Value {
     let asr_p99 = percentile(&asr_latencies, 99.0);
     let model_load = INFERENCE_METRICS.model_load_time_ms();
 
-    serde_json::json!({
-        "vad": {
-            "calls": INFERENCE_METRICS.vad_calls.load(std::sync::atomic::Ordering::Relaxed),
-            "failures": INFERENCE_METRICS.vad_failures.load(std::sync::atomic::Ordering::Relaxed),
-            "p50_ms": vad_p50,
-            "p99_ms": vad_p99,
+    InferenceStatsSnapshot {
+        vad: InferenceKindStats {
+            calls: INFERENCE_METRICS.vad_calls.load(std::sync::atomic::Ordering::Relaxed),
+            failures: INFERENCE_METRICS.vad_failures.load(std::sync::atomic::Ordering::Relaxed),
+            p50_ms: vad_p50,
+            p99_ms: vad_p99,
         },
-        "asr": {
-            "calls": INFERENCE_METRICS.asr_calls.load(std::sync::atomic::Ordering::Relaxed),
-            "failures": INFERENCE_METRICS.asr_failures.load(std::sync::atomic::Ordering::Relaxed),
-            "p50_ms": asr_p50,
-            "p99_ms": asr_p99,
+        asr: InferenceKindStats {
+            calls: INFERENCE_METRICS.asr_calls.load(std::sync::atomic::Ordering::Relaxed),
+            failures: INFERENCE_METRICS.asr_failures.load(std::sync::atomic::Ordering::Relaxed),
+            p50_ms: asr_p50,
+            p99_ms: asr_p99,
         },
-        "model_load_ms": model_load,
-    })
+        model_load_ms: model_load,
+    }
 }
 
 fn percentile(data: &[f64], p: f64) -> f64 {

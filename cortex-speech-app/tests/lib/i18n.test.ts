@@ -2,33 +2,63 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, it, expect } from 'vitest';
 import { get } from 'svelte/store';
-import { t, locale } from '../../src/lib/i18n';
+import {
+  autonomyLabelKey,
+  autonomyValues,
+  isTranslationKey,
+  setLocale,
+  t,
+  locale,
+  type TranslationKey,
+} from '../../src/lib/i18n';
 import { en } from '../../src/lib/i18n/en';
 import { ckb } from '../../src/lib/i18n/ckb';
 
-describe('i18n English fallback', () => {
-  it('renders the English string for keys missing in the ckb dictionary', () => {
-    locale.set('ckb');
-    const translate = get(t);
-    const enOnly = Object.keys(en).filter((k) => !(k in ckb));
-    for (const key of enOnly) {
-      expect(translate(key)).toBe(en[key]);
-    }
+describe('i18n exact locale contract', () => {
+  it('keeps English and Sorani in exact, non-vacuous key parity', () => {
+    expect(Object.keys(en).length).toBeGreaterThan(800);
+    expect(Object.keys(ckb).sort()).toEqual(Object.keys(en).sort());
   });
 
-  it('never shows a raw key string under the ckb locale for any known en key', () => {
+  it('resolves every typed key in Sorani without an English/key fallback', () => {
     locale.set('ckb');
     const translate = get(t);
-    for (const key of Object.keys(en)) {
-      expect(translate(key)).not.toBe(key);
+    for (const key of Object.keys(en) as Array<keyof typeof en>) {
+      expect(ckb[key]).toBeTruthy();
+      expect(translate(key)).toBe(ckb[key]);
     }
   });
 
   it('still substitutes params on a fallen-back string', () => {
     locale.set('ckb');
     const translate = get(t);
-    // openFile.multiChunk uses a {count} param and exists in en.
+    // openFile.multiChunk uses a {count} param in both exact-parity dictionaries.
     expect(translate('openFile.multiChunk', { count: '3' })).toContain('3');
+  });
+
+  it('publishes only complete locale dictionaries through the asynchronous switch boundary', async () => {
+    await expect(setLocale('en')).resolves.toBe(true);
+    expect(get(locale)).toBe('en');
+    expect(get(t)('localeToggle')).toBe(en.localeToggle);
+
+    await expect(setLocale('ckb')).resolves.toBe(true);
+    expect(get(locale)).toBe('ckb');
+    expect(get(t)('localeToggle')).toBe(ckb.localeToggle);
+  });
+
+  it('narrows only keys actually owned by the canonical dictionary', () => {
+    expect(isTranslationKey('inbox.autonomy.observe')).toBe(true);
+    expect(isTranslationKey('inbox.autonomy.owner_supplied_unknown')).toBe(false);
+    expect(isTranslationKey('__proto__')).toBe(false);
+  });
+
+  it('keeps every autonomy value bound to a real bilingual key', () => {
+    for (const value of autonomyValues) {
+      const key = autonomyLabelKey(value);
+      expect(isTranslationKey(key)).toBe(true);
+      expect(en[key]).toBeTruthy();
+      expect(ckb[key]).toBeTruthy();
+    }
   });
 });
 
@@ -41,12 +71,18 @@ describe('signal-anomaly screen is honestly labeled (audit P1 #7 / honesty law)'
     expect(en['validation.tab.signalAnomaly'].toLowerCase()).toContain('anomaly');
     expect(en['validation.signalAnomaly.description'].toLowerCase()).toContain('not a trained');
     // The per-segment verdict/score no longer assert "out of distribution".
-    expect(en['validation.signalAnomaly.isSignalAnomaly'].toLowerCase()).not.toContain('distribution');
+    expect(en['validation.signalAnomaly.isSignalAnomaly'].toLowerCase()).not.toContain(
+      'distribution',
+    );
     expect(en['validation.signalAnomaly.score'].toLowerCase()).not.toContain('ood');
   });
 
   it('the ckb dictionary carries every ood label (no silent English fallback for this surface)', () => {
-    const signalAnomalyKeys = Object.keys(en).filter((k) => k.startsWith('validation.signalAnomaly.') || k === 'validation.tab.signalAnomaly');
+    const signalAnomalyKeys: TranslationKey[] = Object.keys(en).filter(
+      (key): key is TranslationKey =>
+        isTranslationKey(key) &&
+        (key.startsWith('validation.signalAnomaly.') || key === 'validation.tab.signalAnomaly'),
+    );
     expect(signalAnomalyKeys.length).toBeGreaterThan(4);
     for (const key of signalAnomalyKeys) {
       expect(ckb[key], `ckb missing ${key}`).toBeTruthy();
@@ -62,7 +98,9 @@ describe('signal-anomaly screen is honestly labeled (audit P1 #7 / honesty law)'
     // vitest runs from the app root; resolve the component relative to it (import.meta.url is not a
     // file: scheme under vite).
     const panel = readFileSync(resolve(process.cwd(), 'src/lib/ValidationPanel.svelte'), 'utf-8');
-    expect(panel, 'the "(not just OOD flagged)" checkbox must be localized').not.toContain('OOD flagged');
+    expect(panel, 'the "(not just OOD flagged)" checkbox must be localized').not.toContain(
+      'OOD flagged',
+    );
     expect(panel, 'the per-segment "OOD: {score}" label must be localized').not.toMatch(/>\s*OOD:/);
   });
 });

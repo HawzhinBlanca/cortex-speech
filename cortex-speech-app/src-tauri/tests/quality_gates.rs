@@ -40,6 +40,22 @@ fn setup_db_with_audio() -> (Database, TempDir, PathBuf) {
     let db_path = tmp.path().join("quality.db");
     let db = Database::open(db_path.to_str().unwrap()).unwrap();
     db.initialize().unwrap();
+    // These fixtures intentionally exercise the historical annotated-row quality metric, not the
+    // schema-v60 human-decision write boundary. Author them only on the exact legacy schema where
+    // whole-row review fields were legal; production schemas remain fail-closed.
+    //
+    // Derived from the live catalog, never a second hand-written number: the target is BELOW
+    // schema v60, and the exact rollback list follows whatever the head currently is. The old
+    // literal [68..60] went stale the day v69 landed — every --all-targets run (and therefore the
+    // branch-instrumented coverage phase) red while --lib stayed green (caught 2026-08-31 by the
+    // first real coverage prerequisite).
+    let expected: Vec<i64> = cortex_speech_app_lib::migrations::MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version > 59)
+        .rev()
+        .map(|migration| migration.version)
+        .collect();
+    assert_eq!(cortex_speech_app_lib::migrations::rollback(&db, expected.len()).unwrap(), expected);
     (db, tmp, audio_dir)
 }
 

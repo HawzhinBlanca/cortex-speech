@@ -1,6 +1,11 @@
 import { test, expect } from './fixtures';
 import { AxeBuilder } from '@axe-core/playwright';
 import type { Page } from '@playwright/test';
+import {
+  openHeaderOverflow,
+  openSettingsFromHeader,
+  switchLocaleFromHeader,
+} from './helpers/header';
 
 // WCAG 2.2 Level AA tag set (axe-core has no `wcag22a` tag; AAA is out of scope).
 const WCAG_AA = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'];
@@ -10,7 +15,7 @@ async function violations(page: Page) {
   // On failure, print the offending nodes so the violation is diagnosable from the log alone.
   for (const v of results.violations) {
     for (const n of v.nodes) {
-      console.log(
+      console.error(
         `[axe] ${v.id}: ${n.target.join(' ')} — ${n.failureSummary?.split('\n')[1] ?? ''}`,
       );
     }
@@ -56,6 +61,7 @@ async function openAdvanced(page: Page) {
 test.describe('axe-core WCAG 2.2 AA gate (M3.6)', () => {
   test('App root has zero a11y violations (en)', async ({ page }) => {
     await page.goto('/');
+    await openHeaderOverflow(page);
     await expect(page.getByLabel('Open settings')).toBeVisible();
     // The conformal panel loads async; wait for it so axe analyzes the settled view
     // (and actually covers that panel) instead of racing its mid-render state.
@@ -66,7 +72,7 @@ test.describe('axe-core WCAG 2.2 AA gate (M3.6)', () => {
 
   test('App root has zero a11y violations (ckb / RTL)', async ({ page }) => {
     await page.goto('/');
-    await page.getByLabel('Switch language').click();
+    await switchLocaleFromHeader(page);
     await expect(page.locator('html')).toHaveAttribute('lang', 'ckb');
     await openAdvanced(page);
     await expect(page.getByTestId('conformal-cert')).toBeVisible(SETTLE);
@@ -75,7 +81,7 @@ test.describe('axe-core WCAG 2.2 AA gate (M3.6)', () => {
 
   test('Settings dialog has zero a11y violations', async ({ page }) => {
     await page.goto('/');
-    await page.getByLabel('Open settings').click();
+    await openSettingsFromHeader(page);
     const dialog = page.locator('role=dialog');
     await expect(dialog).toBeVisible();
     expect(await violations(page)).toEqual([]);
@@ -95,6 +101,7 @@ test.describe('axe-core WCAG 2.2 AA gate (M3.6)', () => {
 
   test('Command palette has zero a11y violations and a named active option', async ({ page }) => {
     await page.goto('/');
+    await expect(page.getByRole('button', { name: 'Command palette' })).toBeVisible();
     await page.keyboard.press('Control+K');
     const dialog = page.getByRole('dialog', { name: 'Command palette' });
     await expect(dialog).toBeVisible();

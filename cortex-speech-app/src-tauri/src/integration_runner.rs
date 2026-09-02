@@ -15,9 +15,35 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
+struct IntegrationImportGuard {
+    app: tauri::AppHandle,
+}
+
+impl Drop for IntegrationImportGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.app.try_state::<AppState>() {
+            state.finish_import();
+        }
+    }
+}
+
 pub fn run(app: &tauri::AppHandle) -> Result<(), String> {
+    // The environment-gated real-binary paths bypass the renderer commands, so they must claim the
+    // same import admission gate explicitly. In particular, an unavailable startup dedup index must
+    // stop these diagnostics before their direct ProcessingPipeline calls can decode or journal data.
+    {
+        let state = app.state::<AppState>();
+        state.try_start_import()?;
+    }
+    let _import_guard = IntegrationImportGuard { app: app.clone() };
+
+    // These env-gated diagnostics are registered in the real desktop lifecycle and write through
+    // ProcessingPipeline's dedicated connections. Bind their entire import -> adjudicate -> report
+    // -> export lifetime to one database generation, not only the moments they happen to hold a DB
+    // mutex. The guard lives on this OS thread, so async caller cancellation cannot detach it.
+    let mutation = crate::database_runtime::begin_mutation()?;
     if std::env::var("CORTEX_AUDIOBOOK_PIPELINE").ok().as_deref() == Some("1") {
-        return run_audiobook_pipeline(app);
+        return run_audiobook_pipeline(app, &mutation);
     }
 
     let fixture =
@@ -34,7 +60,8 @@ pub fn run(app: &tauri::AppHandle) -> Result<(), String> {
     }
 
     let state = app.state::<AppState>();
-    let db = state.lock_db();
+    let runtime = state.db_runtime();
+    let db = runtime.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| poisoned.into_inner());
     let segments = db.get_segments(None).map_err(|e| e.to_string())?;
     let count = segments.len();
     if count == 0 {
@@ -154,7 +181,10 @@ fn record_audiobook_report(
     .map_err(|e| e.to_string())
 }
 
-fn run_audiobook_pipeline(app: &tauri::AppHandle) -> Result<(), String> {
+fn run_audiobook_pipeline(
+    app: &tauri::AppHandle,
+    mutation: &crate::database_runtime::MutationGuard<'_>,
+) -> Result<(), String> {
     let mp3 = std::env::var("CORTEX_AUDIOBOOK_MP3").map_err(|_| "CORTEX_AUDIOBOOK_MP3 not set".to_string())?;
     let mp3_path = Path::new(&mp3);
     if !mp3_path.is_file() {
@@ -195,7 +225,8 @@ fn run_audiobook_pipeline(app: &tauri::AppHandle) -> Result<(), String> {
         let state = app.state::<AppState>();
         let settings = state.lock_settings().clone();
         let agentic_readiness = audiobook_agentic_readiness_snapshot(&state, &settings);
-        let db = state.lock_db();
+        let runtime = state.db_runtime();
+        let db = runtime.lock_after_mutation(mutation).unwrap_or_else(|poisoned| poisoned.into_inner());
         let detail = format!("audiobook import failed: {error}");
         persist_agent_stage_events(&db, &agent_run_id, "audiobook", &captured_stage_events)?;
         crate::runs::record_agent_stage_event(
@@ -227,7 +258,8 @@ fn run_audiobook_pipeline(app: &tauri::AppHandle) -> Result<(), String> {
         let state = app.state::<AppState>();
         let settings = state.lock_settings().clone();
         let agentic_readiness = audiobook_agentic_readiness_snapshot(&state, &settings);
-        let db = state.lock_db();
+        let runtime = state.db_runtime();
+        let db = runtime.lock_after_mutation(mutation).unwrap_or_else(|poisoned| poisoned.into_inner());
         persist_agent_stage_events(&db, &agent_run_id, "audiobook", &captured_stage_events)?;
         let segments = db.get_segments(None).map_err(|e| e.to_string())?;
         let count = segments.len();

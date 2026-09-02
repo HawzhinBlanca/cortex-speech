@@ -142,12 +142,17 @@
   <div class="tags">
     <span class="tag">Tauri 2 · Svelte 5 · Rust</span>
     <span class="tag">7B GPU champion (WSL)</span>
-    <span class="tag">7.03% CER on FLEURS-ckb</span>
+    <span class="tag">Historical 7.03% CER · duplicated N=922 · non-primary</span>
     <span class="tag">100% local by default</span>
   </div>
 </div>
 
 <div class="wrap">
+
+  <div class="note privacy">
+    <h4>Runtime canon — 2026-08-22</h4>
+    <p>Production transcription is OmniASR-7B Champion only. ElevenLabs Scribe is retired and is not a runtime, key, setting, or fallback. The only consent-gated advisory cloud model is fixed to <b>Gemini 2.5 Pro</b>; it never replaces production ASR.</p>
+  </div>
 
   <!-- ======================= LEGEND ======================= -->
   <div class="legend">
@@ -226,9 +231,8 @@
     <div class="layer">
       <div class="lname">Cloud (optional) <small>Off unless you opt in</small></div>
       <div class="chips">
-        <span class="chip mono">ElevenLabs Scribe v1 (STT)</span>
-        <span class="chip mono">Google Gemini 2.5 Pro / Flash</span>
-        <span class="chip">Each needs an explicit toggle + an API key</span>
+        <span class="chip mono">Google Gemini 2.5 Pro (advisory only)</span>
+        <span class="chip">Requires an explicit toggle + an API key</span>
       </div>
     </div>
   </div>
@@ -292,8 +296,8 @@
       <circle class="node-c" cx="430" cy="140" r="24"/>
       <text class="ov-letter" x="430" y="146" text-anchor="middle">C</text>
       <text class="ov-wsl" x="430" y="184" text-anchor="middle">OmniASR-7B ★</text>
-      <text class="ov-local" x="430" y="203" text-anchor="middle">CTC fallback</text>
-      <text class="ov-small" x="430" y="221" text-anchor="middle">default engine</text>
+      <text class="ov-local" x="430" y="203" text-anchor="middle">no fallback</text>
+      <text class="ov-small" x="430" y="221" text-anchor="middle">production champion</text>
 
       <!-- D Refine -->
       <text class="ov-phase" x="610" y="92" text-anchor="middle">Refine</text>
@@ -379,9 +383,9 @@
     </div>
     <div class="steps">
       <div class="step">
-        <h4><span class="sid">5</span> First-pass ASR — engine ladder <span class="fn">build_segments_from_pcm</span></h4>
-        <p>Each chunk gets a first-draft transcript from a priority ladder: the <b>fine-tuned Kurdish MMS</b> model if enabled → a cache hit → the local <b>OmniASR CTC</b> model. If the 7B champion is the primary engine, a placeholder <code>[Pending WSL 7B ASR]</code> is written and filled in at step 8.</p>
-        <div class="uses"><span class="u">fine-tuned MMS-CTC (finetuned-mms-ckb)</span><span class="u">OmniASR-CTC 300M/1B (sherpa-onnx)</span><span class="u">TranscriptCache</span></div>
+        <h4><span class="sid">5</span> Stage champion transcription <span class="fn">build_segments_from_pcm</span></h4>
+        <p>Every production chunk is staged for the <b>OmniASR-7B Champion</b>. The smaller CTC and MMS ASR implementations are diagnostic-only: import, batch transcription, and re-transcription never substitute them when the champion is unavailable.</p>
+        <div class="uses"><span class="u">OmniASR-7B Champion route</span><span class="u">fail-hard readiness gate</span><span class="u">no engine downgrade</span></div>
       </div>
       <div class="step">
         <h4><span class="sid">6</span> Sorani text normalization <span class="fn">normalizer::SoraniNormalizer</span></h4>
@@ -419,9 +423,9 @@
         <div class="uses"><span class="u">SubstitutionMemory + phonetic key</span><span class="u">correction_memory table</span><span class="u">g2p-gated firing</span></div>
       </div>
       <div class="step">
-        <h4><span class="sid">11</span> Multi-model hypothesis population <span class="fn">populate_hypotheses</span></h4>
-        <p>To create <b>independent voters</b> for the jury, each segment is transcribed by several architecturally-different engines and every result is stored. Agreement between diverse models is what makes consensus meaningful.</p>
-        <div class="uses"><span class="u">OmniASR-CTC 300M</span><span class="u">OmniASR-CTC 1B</span><span class="u">fine-tuned MMS-CTC</span><span class="u">WSL 7B</span></div>
+        <h4><span class="sid">11</span> Record transcript provenance <span class="fn">populate_hypotheses</span></h4>
+        <p>The champion draft and its exact model identity are stored as hypothesis evidence for review and export. Production does not run the smaller diagnostic ASR engines as extra voters; any historical hypotheses remain labelled provenance, not selectable fallbacks.</p>
+        <div class="uses"><span class="u">OmniASR-7B Champion</span><span class="u">model-version identity</span><span class="u">historical provenance</span></div>
       </div>
     </div>
   </div>
@@ -520,7 +524,7 @@
         <tr>
           <td class="name">OmniASR-7B Champion — base<span class="mono">omniASR-LLM-7B-v2.pt</span></td>
           <td><span class="badge b-wsl">WSL</span></td>
-          <td class="role"><b>The default engine.</b> Meta OmniASR 7B decoder; base of the champion. Measured <b>7.03% CER / 32.93% WER</b> on FLEURS ckb (N=922) — best of all engines.</td>
+          <td class="role"><b>The default engine.</b> Meta OmniASR 7B decoder; base of the champion. Historical duplicated-row experiment: <b>7.03% CER / 32.93% WER</b> on FLEURS ckb (N=922 rows / 348 distinct clips). <b>HISTORICAL — DUPLICATION-WEIGHTED — NON-PRIMARY.</b> No current accuracy headline is authorized until the clean N=348 scorecard is regenerated and attested.</td>
           <td>fairseq2 <code>.pt</code>, bf16 on GPU<br><b>~30 GB</b></td>
         </tr>
         <tr>
@@ -544,19 +548,19 @@
         <tr>
           <td class="name">Stock OmniASR-CTC-300M<span class="mono">sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-int8-2025-11-12</span></td>
           <td><span class="badge b-local">Local</span></td>
-          <td class="role"><b>Bundled offline engine.</b> Meta Omnilingual CTC 300M — lowest fallback tier and the engine used for the app's real-audio scorecard (11.34% CER).</td>
+          <td class="role"><b>Diagnostic-only ASR.</b> Retained for explicit offline benchmarks and provenance; never selected by production import, batch transcription, or re-transcription.</td>
           <td>int8 ONNX via sherpa-onnx<br><b>&gt;50 MB</b></td>
         </tr>
         <tr>
           <td class="name">Fine-tuned MMS-CTC-1B<span class="mono">finetuned-mms-ckb (base facebook/mms-1b-all)</span></td>
           <td><span class="badge b-local">Local</span></td>
-          <td class="role">Offline fallback ASR + the acoustic model for word alignment + a jury voter. 9.32% CER (fp32) on FLEURS-922.</td>
+          <td class="role">Word-alignment acoustic model. Its ASR path is diagnostic-only and is never a production transcription fallback or re-transcribe option.</td>
           <td>int8 ONNX via <code>ort</code><br><b>~970 MB</b> (optional)</td>
         </tr>
         <tr>
           <td class="name">Stock OmniASR-CTC-1B<span class="mono">sherpa-onnx-omnilingual-asr-1600-languages-1B-ctc-int8-2025-11-12</span></td>
           <td><span class="badge b-local">Local</span></td>
-          <td class="role">Optional larger sibling of the 300M engine; selectable and used as an extra jury voter.</td>
+          <td class="role">Diagnostic-only larger CTC engine for explicit offline benchmarks; not selectable in the production app and never used as a fallback.</td>
           <td>int8 ONNX via sherpa-onnx<br><b>~688 MB</b> (optional)</td>
         </tr>
         <tr>
@@ -584,15 +588,9 @@
           <td>OpenAI-compatible local endpoint</td>
         </tr>
         <tr>
-          <td class="name">ElevenLabs Scribe v1<span class="mono">model id scribe_v1 · language_code kur</span></td>
+          <td class="name">Google Gemini 2.5 Pro<span class="mono">gemini-2.5-pro</span></td>
           <td><span class="badge b-cloud">Cloud</span></td>
-          <td class="role">Cloud speech-to-text — an alternate transcriber / extra independent jury vote. <b>Off by default; uploads audio only if you opt in + add a key.</b></td>
-          <td>REST API (multipart)<br>api.elevenlabs.io</td>
-        </tr>
-        <tr>
-          <td class="name">Google Gemini 2.5 Pro / Flash<span class="mono">gemini-2.5-pro · gemini-2.5-flash</span></td>
-          <td><span class="badge b-cloud">Cloud</span></td>
-          <td class="role">Cloud LLM — the T2 audio listener (step 17), debate judge (step 18), and optional refiner / source-reference generator. <b>Off by default.</b></td>
+          <td class="role">Fixed advisory cloud model — the T2 audio listener (step 17), debate judge (step 18), and optional refiner / source-reference generator. <b>Off by default; never an ASR fallback.</b></td>
           <td>REST API (generateContent)<br>generativelanguage.googleapis.com</td>
         </tr>
         <tr>
@@ -607,7 +605,7 @@
 
   <div class="note privacy">
     <h4>🔒 A note on the 7B champion and your privacy</h4>
-    <p>The champion is a <b>warm GPU server on your own machine</b>, bound to <code>127.0.0.1:8799</code> inside WSL's private network. The Windows app drives it as a <b>subprocess over stdin/stdout</b> — never a network socket reachable from outside. Your audio never leaves the device on the default path. If the server is down, the app <b>asks</b> you (retry vs. offline model) — it never silently substitutes a weaker engine. (The <code>cortex_7b_server.py</code> file is machine-specific and lives outside the repo.)</p>
+    <p>The champion is a <b>warm GPU server on your own machine</b>, bound to <code>127.0.0.1:8799</code> inside WSL's private network. Your audio never leaves the device on the default path. If the server is down, transcription stops and offers only a champion repair/retry path — it never substitutes a smaller or cloud engine. (The <code>cortex_7b_server.py</code> file is machine-specific and lives outside the repo.)</p>
   </div>
 
   <!-- ======================= 4. PRIVACY ======================= -->
@@ -618,12 +616,6 @@
     <table>
       <thead><tr><th>Path</th><th>What it sends</th><th>When (default)</th><th>Destination</th></tr></thead>
       <tbody>
-        <tr>
-          <td class="name">ElevenLabs Scribe STT</td>
-          <td>Segment / file <b>audio</b></td>
-          <td><code>cloud_stt_opt_in = false</code> + key required</td>
-          <td>api.elevenlabs.io</td>
-        </tr>
         <tr>
           <td class="name">Gemini — LLM refine</td>
           <td>Transcript <b>text</b></td>
@@ -676,15 +668,12 @@
       <li>Open a single audio file</li>
       <li>Batch-import a whole folder</li>
       <li>Resume an interrupted import after a crash</li>
-      <li>Cloud STT import via Scribe (opt-in)</li>
       <li>Merge a pasted CORTEX dataset JSON</li>
     </ul></div>
     <div class="fcard"><div class="cat">Transcription</div><ul>
-      <li>OmniASR-7B champion (default)</li>
-      <li>Fine-tuned MMS-1B (always-available CPU)</li>
-      <li>Scribe cloud re-transcribe (per segment)</li>
-      <li>Kurdish-only constrained decode</li>
-      <li>Batch transcribe empty/selected/filtered</li>
+      <li>OmniASR-7B Champion (only production engine)</li>
+      <li>Fail-hard champion readiness; no model downgrade</li>
+      <li>Champion batch transcribe empty/selected/filtered</li>
       <li>Local 7B batch job with live console</li>
       <li>Sorani normalization + digit verbalization</li>
       <li>Word-to-audio alignment &amp; timestamps</li>
@@ -724,7 +713,6 @@
       <li>WER/CER quality gates</li>
       <li>Validation / curation panel</li>
       <li>Jury pipeline T0→T1→T2 + debate</li>
-      <li>Add independent Scribe jury vote</li>
       <li>Consensus refinery</li>
       <li>DPO preference update</li>
       <li>Escalation-rate trend</li>
@@ -771,16 +759,16 @@
   <div class="key">
     <div class="item"><b>It's a pipeline, not one model.</b><p>Audio → decode → Silero VAD cuts it into speech chunks → clean/denoise → transcribe → the 7B champion fills in the final text. Six phases, not a single black box.</p></div>
     <div class="item"><b>The default brain runs entirely on your machine.</b><p>The 7B champion is a GPU server inside WSL, driven as a subprocess. On the default path, audio never leaves your device.</p></div>
-    <div class="item"><b>Multiple independent AIs transcribe, then vote.</b><p>Several engines each produce a transcript; an IRT consensus fuses them and a T0→T1→T2→debate jury resolves disagreements — escalating only genuinely hard clips to a human. The 7B alone measures <b>7.03% CER</b>, state of the art for Kurdish.</p></div>
+    <div class="item"><b>One champion transcribes; advisory checks never replace it.</b><p>OmniASR-7B produces the production draft. Optional consent-gated Gemini 2.5 Pro review can advise on hard clips, and the human decision remains final.</p></div>
     <div class="item"><b>It fails loud, never silently downgrades.</b><p>If the champion is down, the app asks you what to do; a failed forced-7B import rolls back rather than storing blank text. Human-verified corrections are never overwritten by later machine passes.</p></div>
-    <div class="item"><b>Every cloud feature is off by default and gated twice.</b><p>Scribe, Gemini, and the T2 listener each need both an explicit opt-in flag and an API key. Even the LLM refiner defaults to a local Ollama model, not a cloud one.</p></div>
+    <div class="item"><b>Every cloud feature is off by default and gated twice.</b><p>The fixed Gemini 2.5 Pro advisory path needs both explicit opt-in and an API key. It is never a transcription fallback.</p></div>
   </div>
 
 </div>
 
 <footer>
   <div class="metrics">
-    <div class="metric"><b>7.03%</b><span>Champion CER · FLEURS-ckb</span></div>
+    <div class="metric"><b>Historical</b><span>7.03% CER · duplicated N=922 · non-primary</span></div>
     <div class="metric"><b>13</b><span>AI models available</span></div>
     <div class="metric"><b>~80</b><span>User-facing features</span></div>
     <div class="metric"><b>10</b><span>Export formats</span></div>

@@ -32,6 +32,49 @@ describe('notificationStore', () => {
     expect(state[0].type).toBe('error');
   });
 
+  it('fails closed on backend prose while retaining typed recovery metadata', () => {
+    notifications.error('Save failed', {
+      cause: {
+        schema: 1,
+        code: 'WRITE_FAILED',
+        message: 'SQL failed at C:\\private\\library.db',
+        retryable: true,
+        suggestedAction: 'retry',
+        operationId: '018f6e4a-2d71-4c66-8e4b-9d3c4b7e5a10',
+      },
+    });
+    const notification = get(notifications)[0];
+    expect(notification.detail).toBe('WRITE_FAILED · 018f6e4a-2d71-4c66-8e4b-9d3c4b7e5a10');
+    expect(notification.retryable).toBe(true);
+    expect(notification.suggestedAction).toBe('retry');
+    expect(JSON.stringify(notification)).not.toMatch(/SQL|private|library\.db/);
+
+    notifications.clear();
+    notifications.error('Save failed', { detail: 'stack: C:\\private\\library.db' });
+    expect(get(notifications)[0].detail).toBeUndefined();
+  });
+
+  it('uses localized public detail while preserving non-rendered start recovery metadata', () => {
+    notifications.error('Batch start could not be verified safely.', {
+      cause: {
+        schema: 1,
+        code: 'BATCH_START_AUTHORITY_LOST',
+        message: 'private backend path C:\\owner\\library.db',
+        retryable: false,
+        suggestedAction: 'openHealth',
+      },
+      publicDetail: 'No batch work was admitted. Restart Cortex if this repeats.',
+    });
+
+    const notification = get(notifications)[0];
+    expect(notification.detail).toBe('No batch work was admitted. Restart Cortex if this repeats.');
+    expect(notification.retryable).toBe(false);
+    expect(notification.suggestedAction).toBe('openHealth');
+    expect(JSON.stringify(notification)).not.toMatch(
+      /BATCH_START_AUTHORITY_LOST|private|library\.db/,
+    );
+  });
+
   it('adds warning notification', () => {
     notifications.warning('warning!');
     const state = get(notifications);

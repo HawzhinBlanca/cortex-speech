@@ -125,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let memories: Vec<SourcedMemory> = conn
         .prepare(
             "SELECT wrong_token, human_token, slot_key, phonetic_key, confidence, hit_count, source_segment
-             FROM correction_memory",
+             FROM effective_correction_memory_v60",
         )?
         .query_map([], |r| {
             Ok(SourcedMemory {

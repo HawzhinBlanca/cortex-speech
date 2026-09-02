@@ -1,5 +1,11 @@
 # Roadmap to #1 — deep audit, brutal rating, and the plan to the highest reliable/professional grade
 
+> [!WARNING]
+> **Historical audit/roadmap, not current runtime direction.** Owner canon now pins production to the
+> OmniASR-7B WSL champion and removes Scribe; any older item below proposing Scribe, cloud STT, stock
+> CTC/MMS production use, or an offline fallback is rejected. Preserve its dated findings as audit
+> provenance only. See [`OWNER_CANON.md`](OWNER_CANON.md).
+
 **Date:** 2026-07-24 · **Branch:** codex/newbranch · **Method:** a 12-agent adversarial Workflow
 (9 subsystem auditors + 3 web-research agents), every HIGH/MED finding put through independent
 refutation, then the **top findings hand-verified against source by the orchestrator** (agent

@@ -1,4 +1,4 @@
-export const en: Record<string, string> = {
+export const en = {
   import: 'Add folder',
   export: 'Export',
   settings: 'Settings',
@@ -6,19 +6,6 @@ export const en: Record<string, string> = {
   open: 'Add file',
   openFile: 'Add file',
   transcribe: 'Transcribe',
-  transcribeConstrained: 'Kurdish-only',
-  transcribeConstrainedTitle:
-    'Transcribe with constrained Kurdish-script decode (guarantees Kurdish output)',
-  transcribeFinetuned: 'Fine-tuned',
-  transcribeFinetunedTitle:
-    'Transcribe with the fine-tuned Kurdish model (21.0% CER [19.9-22.0], N=900 gold clips, measured 2026-06-25)',
-  'scribe.transcribe': 'Scribe (cloud)',
-  'scribe.transcribeTitle': 'Re-transcribe this segment with ElevenLabs Scribe (cloud STT)',
-  'scribe.vote': '+ Scribe vote',
-  'scribe.voteTitle': 'Add an independent ElevenLabs Scribe jury vote for this segment',
-  'scribe.voteAdded': 'Scribe vote added. Re-run the jury to fold it into consensus.',
-  'scribe.voteExists': 'This segment already has a Scribe vote.',
-  'scribe.voteFailed': 'Failed to add the Scribe vote',
   transcribing: 'Transcribing...',
   verify: 'Verify',
   unverify: 'Unverify',
@@ -38,6 +25,7 @@ export const en: Record<string, string> = {
   cancel: 'Cancel',
   confirm: 'Confirm',
   loading: 'Loading...',
+  'workspace.loadFailed': 'This workspace could not be loaded.',
   noData: 'No data',
   error: 'Error',
   processing: 'Processing',
@@ -86,7 +74,7 @@ export const en: Record<string, string> = {
   threads: 'Threads',
   gpuAcceleration: 'GPU acceleration (CUDA)',
   gpuAccelerationNote:
-    'Affects the local CTC fallback engines only — they run on CPU in this build. The OmniASR-7B champion always uses the GPU via WSL.',
+    'Applies only to explicit diagnostic CTC runtimes. Production transcription is fixed to the OmniASR-7B Champion on the WSL GPU; this setting cannot create a fallback.',
   vadThreshold: 'VAD Threshold',
   minSegment: 'Min segment',
   maxSegment: 'Max segment',
@@ -121,6 +109,8 @@ export const en: Record<string, string> = {
   'review.progress': 'Clip {n} of {total}',
   'review.reviewedCount': '{done} of {total} reviewed',
   'review.editHint': 'Listen, then fix the text if needed',
+  'review.mustListen':
+    'Not saved: play the whole clip first. A verdict on audio nobody heard is a guess.',
   'review.listen': 'Listen & locate',
   'review.listenHint':
     'Tap a word to hear just that word; double-tap (or F2) to fix it in place. Coloured words are lower-confidence — check those first.',
@@ -128,7 +118,6 @@ export const en: Record<string, string> = {
   'review.wordChipHint': 'tap to hear · double-tap to edit',
   'review.playWordAria': 'Play word {word}',
   'review.aligningWords': 'Aligning words to audio…',
-  'review.playingWordsOnly': 'Play hears the words only ({sec}s)',
   'review.playingWholeClip': 'Play hears the whole clip ({sec}s)',
   'review.consensusDraft': 'Consensus draft',
   'review.consensusAgree': '{n} models · {pct}% agree',
@@ -142,9 +131,6 @@ export const en: Record<string, string> = {
   'review.retranscribeChampion': 'OmniASR-7B',
   'review.retranscribeChampionTitle':
     'Re-transcribe this clip with the OmniASR-7B Champion (needs the 7B server running).',
-  'review.retranscribeFinetuned': 'Fine-tuned MMS-1B',
-  'review.retranscribeFinetunedTitle':
-    'Re-transcribe this clip with the embedded fine-tuned MMS-1B (CPU, always available).',
   'review.retranscribing': 'Re-transcribing…',
   'review.retranscribed': 'Re-transcribed.',
   'review.retranscribeFailed': 'Re-transcription failed',
@@ -165,21 +151,93 @@ export const en: Record<string, string> = {
   'review.searchScope':
     'Reviewing a search subset: {n} of {m} clips — clear the search to review everything.',
   'review.searchScopeEmpty': 'No clips match the current search — clear it to review everything.',
+  // The voice focus is a SUBSET like a search is, and the reviewer has to see that they are on one:
+  // its queue emptying means this speaker's clips are done, never that the library is. No speaker
+  // NAME appears here — that lives only in the owner's data-dir file (voice_focus.rs).
+  'review.focusScope':
+    "Reviewing one speaker's clips: {n} of {m} — the rest of the library is not in this queue.",
+  'review.focusScopeEmpty':
+    "This speaker's clips are all reviewed — the rest of the library is still waiting.",
   'review.waveformFailed':
     "Couldn't read this clip's audio — the waveform is unavailable, not silent.",
   // Refusal, not a warning: the decision was NOT recorded. A verdict on audio nobody could hear is
   // indistinguishable from a real listen once it is in the corpus (audit find 2026-08-17).
   'review.cannotDecideWithoutAudio':
-    "This clip's audio could not be played, so no decision can be saved for it. Skip it, or fix the audio and reload.",
+    "This clip's audio could not be played, so no decision can be saved for it. Move to the next clip without recording a decision, or fix the audio and reload.",
+  'review.unusable.title': 'Audio recovery',
+  'review.unusable.help':
+    'Retry first. If this clip is genuinely unusable, choose the exact technical reason. This records no transcript decision and does not pretend playback occurred.',
+  'review.unusable.reasonLabel': 'Technical reason',
+  'review.unusable.reasonPlaceholder': 'Choose a reason…',
+  'review.unusable.reason.decodeFailed': 'Audio decoding failed',
+  'review.unusable.reason.missingFile': 'Source file is missing',
+  'review.unusable.reason.permissionDenied': 'File access was denied',
+  'review.unusable.reason.corruptContainer': 'Audio container is corrupt',
+  'review.unusable.mark': 'Mark technically unusable',
+  'review.unusable.marking': 'Recording…',
+  'review.unusable.marked':
+    'Marked technically unusable and excluded from export. No transcript decision was recorded.',
+  'review.unusable.markFailed': 'Could not mark this clip technically unusable',
+  'review.unusable.markFailedHint':
+    'The clip, draft and focus were retained. Check workspace health, then retry the same action.',
+  'review.unusable.markFailedWithError':
+    'Could not mark this clip technically unusable: {err}. The clip and draft were retained.',
+  'review.unusable.invalidResponse':
+    'The saved technical disposition could not be verified. The clip was not advanced; reload the queue before deciding.',
+  'review.unusable.authorityMissing':
+    'This clip’s revision could not be verified. Reload the queue before marking it unusable.',
   'review.undoFailed': 'Undo failed',
-  'review.undoLast': 'Undo review',
+  'review.undoLast': 'Undo last review action',
+  'review.retryUndoStatus': 'Retry Undo status',
+  'review.retryExactUndo': 'Retry same Undo',
+  'review.reloadAfterUndo': 'Reload after Undo',
+  'review.reconcileSavedDecision': 'Reconcile saved decision',
+  'review.undoErrorCode': 'Undo status code: {code}',
+  'review.undoDisabledEdited': 'Save or discard the current correction before using Undo.',
+  'review.undoDisabled.processing': 'Wait for the current transcription or alignment to finish.',
+  'review.undoDisabled.loading':
+    'Undo history is still loading. Wait before making another review decision.',
+  'review.undoDisabled.failed':
+    'Undo history could not be read. Use Undo to retry before making another review decision.',
+  'review.undoDisabled.blocked': 'The latest desktop review action cannot be undone safely.',
+  'review.undoDisabled.none': 'There is no committed desktop review action to undo.',
+  'review.undoDisabled.reconciling':
+    'An Undo attempt is still being reconciled. No new review decision can be saved yet.',
+  'review.undoDisabled.projectionStale':
+    'Undo reached the database, but this view must reload before another decision can be saved.',
+  'review.undoDisabled.legacyHistory':
+    'The latest review action predates durable desktop Undo and cannot be undone here.',
+  'review.undoDisabled.latestDecisionUndone':
+    'The latest review decision has already been undone. Save a new decision before using Undo again.',
+  'review.undoDisabled.flagShadowed':
+    'The latest flag no longer matches current segment truth, so Undo is blocked safely.',
+  'review.undoDisabled.latestFlagUndone':
+    'The latest flag has already been undone. Save a new decision before using Undo again.',
+  'review.undoDisabled.decisionShadowed':
+    'The latest decision no longer matches current segment truth, so Undo is blocked safely.',
+  'review.undoStatusRetryFailed':
+    'Undo history is still unavailable. Check database health, then use Undo to retry.',
+  'review.undoUncertain':
+    'The Undo result is uncertain. New decisions are blocked; use Undo again to reconcile the same operation.',
+  'review.undoProjectionReloadRequired':
+    'Undo reached a terminal result, but this view did not reload authoritatively. New decisions stay blocked; use Undo to retry the reload.',
+  'review.truthProjectionReloadRequired':
+    'The save may be durable, but every open view could not be reloaded authoritatively. New decisions stay blocked; use Undo to retry reconciliation.',
+  'review.truthProjectionRecovered':
+    'The saved decision and every open view are now reconciled with database truth.',
+  'review.truthWriteUncertainRestart':
+    'The save result is uncertain after two exact attempts. All further decisions are blocked. Restart Cortex to reopen from database truth; your draft is retained.',
+  'review.undoAppliedAuthorityUnavailable':
+    'Undo was reconciled and the data reloaded, but Undo history could not be refreshed. Use Undo to retry before saving another decision.',
+  'review.undoRestoredOutsideScope':
+    'Decision undone. The restored clip is outside the current review filter.',
   'review.retranscribeVerifiedTitle': 'Replace a verified transcript?',
   'review.retranscribeVerifiedMessage':
     'This clip is human-verified. Re-transcribing replaces your reviewed text with a fresh machine draft and reopens the clip. You can restore it with Undo review.',
   'review.retranscribeVerifiedConfirm': 'Re-transcribe anyway',
   'review.undoLastTitle':
-    'Reopen the last clip you saved (clears its decision so you can correct and re-save it). Shortcut: Backspace',
-  'review.cloudCheck': '🔍 Gemini check',
+    'Undo the most recent review decision or flag when the database proves it is still current. Shortcut: Backspace',
+  'review.cloudCheck': 'Gemini check',
   'review.cloudChecking': 'Asking Gemini…',
   'review.cloudCheckTitle':
     'Gemini 2.5 Pro listens to this clip and checks the draft verbatim — including repeated words the local ASR often drops. Advisory: you still decide.',
@@ -189,9 +247,43 @@ export const en: Record<string, string> = {
   'review.cloudCheckFailed': 'Cloud check failed',
   'review.replay': 'Replay',
   'review.acceptAsIs': 'Looks good',
+  'review.acceptDisabledEdited': 'Save the correction or explicitly discard it before accepting.',
+  'review.rejectDisabledEdited':
+    'Save the correction or reset it before marking this clip unusable or bad.',
+  'review.transcriptNotReady': 'This clip’s transcript is not ready for a review decision.',
+  'review.eligibilityUnavailable':
+    'Review eligibility could not be verified. Reload the queue before deciding.',
+  'review.closeDraftFailed': 'Close paused — the review draft is not safely stored',
+  'review.closeDraftFailedHint': 'Check storage and workspace health, then close again.',
+  'review.closeFailed': 'The window could not close',
+  'review.closeFailedHint':
+    'Retry closing or use Windows Task Manager if the window is unresponsive.',
   'review.saveNext': 'Save & next',
   'review.prev': 'Back',
   'review.reset': 'Original',
+  'review.resetConfirmTitle': 'Replace your correction with the original?',
+  'review.resetConfirmMessage':
+    'This removes the current correction and its crash-safe draft. This reset cannot be undone.',
+  'review.resetConfirmAction': 'Use original',
+  'review.draftSaving': 'Saving recovery draft…',
+  'review.draftRecovered': 'Recovered your unsaved draft from this workstation.',
+  'review.draftSaveFailed': 'Recovery draft not saved',
+  'review.draftSaveFailedHint':
+    'Your text remains open, but it is not yet crash-safe. Retry before closing.',
+  'review.draftLoadFailed': 'Recovery draft not loaded',
+  'review.draftLoadFailedHint':
+    'The current server transcript is shown. Reload the clip to retry draft recovery.',
+  'review.draftConflictTitle': 'Saved draft needs your decision',
+  'review.draftConflictHint':
+    'The clip changed after this local draft was saved. Nothing was merged automatically. Compare both versions and choose explicitly.',
+  'review.serverTruth': 'Current server transcript',
+  'review.localDraft': 'Saved local draft',
+  'review.useLocalDraft': 'Use saved draft',
+  'review.discardLocalDraft': 'Discard saved draft',
+  'review.discardDraftConfirmTitle': 'Discard this saved draft?',
+  'review.discardDraftConfirmMessage':
+    'This permanently deletes the saved local draft and keeps the current server transcript. This cannot be undone.',
+  'review.draftDiscardFailed': 'The saved draft could not be discarded.',
   'review.kbdHint':
     'Keys: A accept · E edit · X mark bad · Space play/pause · R replay · N/P next/prev · Backspace undo · Ctrl+Enter save & next',
   'review.actionsLabel': 'Review actions',
@@ -201,7 +293,7 @@ export const en: Record<string, string> = {
   'review.suspectFirstFailed': 'Could not load the suspect-first order',
   'review.allDone': 'All clips reviewed!',
   'review.allDoneHint': 'Every clip has been verified. Import more audio to continue.',
-  'review.completeTitle': '✓ All {n} clips reviewed',
+  'review.completeTitle': 'All {n} clips reviewed',
   'review.completeHint':
     'Your transcripts are verified. Export the dataset, or go back to re-check any clip.',
   'review.exportDataset': 'Export dataset',
@@ -237,49 +329,106 @@ export const en: Record<string, string> = {
   'inbox.loadErrorTitle': 'Could not load the review queue',
   'inbox.queue': 'Queue ({n})',
   'inbox.segmentQueue': 'Segment queue',
+  'inbox.queueItem': 'Segment {position} of {total}: {id}',
+  'inbox.queueItemReviewed': 'Segment {position} of {total}: {id}, reviewed',
+  'inbox.reviewed': 'Reviewed',
+  'inbox.activeItem': 'Active segment {position} of {total}',
+  'inbox.pagination.loaded': '{loaded} of {total} escalation rows loaded',
+  'inbox.pagination.loadMore': 'Load more',
+  'inbox.pagination.loadingMore': 'Loading more…',
+  'inbox.pagination.evicted':
+    '{count} earlier rows were released to keep memory bounded. Reload from the start to revisit them.',
+  'inbox.pagination.reloadStart': 'Reload from start',
+  'inbox.durationSeconds': '{seconds} seconds',
+  'inbox.audioPlayback': 'Audio playback',
+  'inbox.audioFallback': 'Audio',
+  'inbox.noAudio': 'No audio available',
   'inbox.hypotheses': 'Transcription hypotheses',
   'inbox.juryProposes': 'Jury proposes',
   'inbox.rationale': 'Jury Rationale & Evidence',
   'inbox.evidenceReasoning': 'Evidence & reasoning',
-  'inbox.editLabel': 'Edit transcript (Ctrl+Enter to save, Esc to cancel):',
-  'inbox.saveEdit': 'Save edit (Ctrl+↵)',
-  'inbox.cancelEdit': 'Cancel (Esc)',
+  'inbox.editLabel': 'Edit transcript (Ctrl+Enter to save, Esc to keep the draft):',
+  'inbox.saveEdit': 'Save edit (Ctrl+Enter)',
+  'inbox.cancelEdit': 'Keep draft (Esc)',
+  'inbox.draft.retry': 'Retry draft recovery',
   'inbox.accept': 'Accept',
   'inbox.acceptTitle': 'Accept (a)',
   'inbox.edit': 'Edit',
   'inbox.editTitle': 'Edit (e)',
   'inbox.reject': 'Reject',
   'inbox.rejectTitle': 'Reject (x)',
-  'inbox.skip': 'Skip',
-  'inbox.skipTitle': 'Skip (s)',
+  'inbox.skip': 'Next — no decision',
+  'inbox.skipTitle': 'Move to the next clip without recording a decision (s)',
   'inbox.flag': 'Flag',
   'inbox.flagTitle': 'Flag for second pass (f)',
-  'inbox.undoTitle': 'Undo (⌫)',
+  'inbox.undoTitle': 'Undo (Backspace)',
   'inbox.reviewActions': 'Review actions',
+  'inbox.disabled.juryRunning': 'The jury pipeline is already running.',
+  'inbox.disabled.saving': 'A review change is still being saved. Wait for it to finish.',
+  'inbox.disabled.noNext': 'There is no next clip in this queue.',
+  'inbox.disabled.alreadyReviewed': 'This segment already has a committed review decision.',
+  'inbox.disabled.alreadyFlagged':
+    'This segment already has a saved second-pass flag. Undo that exact flag before flagging it again.',
+  'inbox.disabled.notEligible':
+    'This segment is not eligible for a review decision. Reload the queue after its transcript is ready.',
+  'inbox.disabled.audioUnavailable': 'Audio is unavailable. Retry playback before deciding.',
+  'inbox.disabled.editInProgress':
+    'Save or cancel the current correction before choosing another action.',
+  'inbox.disabled.emptyEdit': 'Enter a transcript before saving the correction.',
+  'inbox.disabled.staleEdit': 'This correction belongs to a different segment and cannot be saved.',
+  'inbox.disabled.noUndo': 'There is no committed action to undo.',
+  'inbox.disabled.draftLoading': 'Draft recovery is still loading. Wait before deciding.',
+  'inbox.disabled.draftUnavailable':
+    'The recovery draft could not be read. Retry draft recovery before deciding.',
+  'inbox.disabled.draftConflict':
+    'A saved draft belongs to an older segment revision. Resolve it before deciding.',
+  'inbox.disabled.draftPending': 'Resume and commit the saved correction before deciding.',
+  'inbox.error.juryNoResult': 'The jury pipeline returned no result.',
+  'inbox.error.unknown': 'An unknown review error occurred.',
+  'inbox.error.playbackReceiptMismatch':
+    'Playback proof belongs to a different segment or revision. Reload and listen again.',
+  'inbox.error.commitIdentityMismatch':
+    'The saved decision response did not match this segment. The queue is being reloaded.',
+  'inbox.error.draftIdentityMismatch':
+    'The recovery draft response did not match this segment and revision.',
+  'inbox.error.undoFlagConflict':
+    'The segment changed after this flag; undo was refused without changing it.',
+  'inbox.error.undoDecisionConflict':
+    'The segment changed after this decision; undo was refused without changing it.',
   'inbox.band.poorAudio': 'Noisy audio — {pct}% model agreement is not reliability here',
   'inbox.band.unknown': 'Unknown confidence',
-  'inbox.band.veryConfident': 'AI is very confident ({pct}%) — quick glance 👀',
-  'inbox.band.fairlySure': 'AI is fairly sure ({pct}%) — quick listen 👂',
-  'inbox.band.unsure': 'AI is unsure ({pct}%) — listen carefully ⚠',
-  'inbox.band.low': 'AI has low confidence ({pct}%) — careful review needed 🔴',
-  'inbox.status.running': '⏳ Running Jury Pipeline…',
-  'inbox.status.noUnverified': 'ℹ️ No unverified segments to run jury on.',
+  'inbox.band.veryConfident': 'AI is very confident ({pct}%) — quick glance',
+  'inbox.band.fairlySure': 'AI is fairly sure ({pct}%) — quick listen',
+  'inbox.band.unsure': 'AI is unsure ({pct}%) — listen carefully',
+  'inbox.band.low': 'AI has low confidence ({pct}%) — careful review needed',
+  'inbox.status.running': 'Running Jury Pipeline…',
+  'inbox.status.noUnverified': 'No unverified segments to run jury on.',
   'inbox.status.juryFinished':
-    '⚡ Jury finished! T0 accepted: {t0}, T1 committed: {t1}, T2 committed: {t2}, Escalated: {esc}',
-  'inbox.status.juryFailed': '❌ Jury pipeline failed: {err}',
+    'Jury finished. T0 accepted: {t0}, T1 committed: {t1}, T2 committed: {t2}, Escalated: {esc}',
+  'inbox.status.juryFailed': 'Jury pipeline failed: {err}',
   'inbox.status.loadFailed': 'Failed to load queue: {err}',
-  'inbox.status.accepted': '✅ Accepted',
+  'inbox.status.loadMoreFailed': 'Failed to load more escalation rows: {err}',
+  'inbox.status.accepted': 'Accepted',
   'inbox.status.acceptFailed': 'Failed to accept: {err}',
   'inbox.status.autonomySet': 'Autonomy set to {level}',
   'inbox.status.autonomyFailed': 'Failed to change autonomy: {err}',
-  'inbox.status.edited': '✏️ Edited',
+  'inbox.status.edited': 'Edited',
   'inbox.status.editFailed': 'Failed to save edit: {err}',
-  'inbox.status.rejected': '❌ Rejected',
+  'inbox.status.draftKept': 'Correction kept as a recovery draft.',
+  'inbox.status.draftChangedDuringSave':
+    'The correction changed while its recovery draft was being saved. Review the latest text and save again.',
+  'inbox.status.rejected': 'Rejected',
   'inbox.status.rejectFailed': 'Failed to reject: {err}',
-  'inbox.status.skipped': '⏭ Skipped',
-  'inbox.status.flagged': '🚩 Flagged for second pass',
+  'inbox.status.skipped': 'No decision was recorded for this clip.',
+  'inbox.status.finishEditBeforeNavigation':
+    'Save or cancel the current correction before changing segments.',
+  'inbox.status.flagged': 'Flagged for second pass',
   'inbox.status.flagFailed': 'Failed to flag: {err}',
-  'inbox.status.undone': '↩ Undone',
+  'inbox.status.flagInvalidResponse':
+    'The flag response could not be verified. The escalation queue is being reloaded.',
+  'inbox.status.undone': 'Undone',
+  'inbox.status.undoRestoredOutsideScope':
+    'Undone. The restored clip is outside the escalation queue.',
   'inbox.status.undoFailed': 'Failed to undo: {err}',
   focusSearch: 'Focus search',
   openSettings: 'Open settings',
@@ -295,6 +444,7 @@ export const en: Record<string, string> = {
   kurdish: 'کوردی',
   english: 'English',
   localeToggle: 'Switch language',
+  localeLoadFailed: 'The language pack could not be loaded. Your current language was kept.',
   models: 'AI Models',
   'models.downloadAll': 'Download All',
   'models.notDownloaded': 'Not downloaded',
@@ -320,8 +470,8 @@ export const en: Record<string, string> = {
   searchPlaceholder: 'Search transcripts, files, speakers...',
   clearSearch: 'Clear search',
   searchFailed: 'Search failed',
-  filterVerified: '✓ Verified',
-  filterPending: '○ Pending',
+  filterVerified: 'Verified',
+  filterPending: 'Pending',
   sortBy: 'Sort by',
   sortNewest: 'Newest',
   sortOldest: 'Oldest',
@@ -386,12 +536,23 @@ export const en: Record<string, string> = {
   'diff.removed': 'removed',
   'diff.changed': 'changed',
   ready: 'Ready',
-  'import.interrupted':
-    'An import of {dir} was interrupted ({done}/{total} files done). Resume it?',
+  'import.interrupted': 'An import was interrupted ({done}/{total} files done). Resume it?',
   'import.resume': 'Resume',
-  'import.discard': 'Discard',
+  'import.discard': 'Delete recovery record',
+  'import.discardConfirmTitle': 'Delete interrupted-import recovery?',
+  'import.discardConfirmMessage':
+    'This deletes only the recovery record. Imported clips stay in the library, but this interrupted import can no longer be resumed.',
+  'import.discardConfirmAction': 'Delete recovery record',
   'import.resumeStarted': 'Resuming import — already-done files are skipped.',
   'import.resumeFailed': 'Could not resume the import',
+  'import.discardFailed': 'Could not discard the interrupted import',
+  'import.recoveryBusy': 'Finishing the current import recovery action.',
+  'import.recoveryChecking': 'Checking the authoritative import recovery state.',
+  'import.workspaceBusy': 'Finish the current workspace operation before recovering an import.',
+  'import.recoveryCheckFailed': 'Could not check for an interrupted import',
+  'import.recoveryAuthorityUnknown':
+    'Import recovery state could not be read. Recovery actions are disabled until the check succeeds.',
+  'import.retryRecoveryCheck': 'Retry recovery check',
   importComplete: 'Import complete',
   importFailed: 'Import failed',
   eventListenersFailed: 'Failed to start event listeners',
@@ -470,8 +631,10 @@ export const en: Record<string, string> = {
   'errors.openModelsSettings': 'Open Settings → Models',
   'errors.transcriptionFailed': 'Transcription failed',
   'errors.verifyFailed': 'Verification failed',
+  'errors.unknown': 'An unexpected error occurred. Retry the action or check workspace health.',
   'openFile.imported': 'File imported',
   'openFile.multiChunk': 'Imported {count} segments from file',
+  'openFile.choosing': 'Choose an audio file…',
   'openFile.failed': 'Failed to open file',
   validateDataset: 'Validate dataset',
   'stats.title': 'Dataset Statistics',
@@ -498,8 +661,6 @@ export const en: Record<string, string> = {
   'stats.relinking': 'Relinking…',
   'stats.relinkDone': 'Relinked {n} file(s); {m} still missing.',
   'stats.relinkFailed': 'Relink failed',
-  'settings.cloudSttConsent':
-    'Optional manual ElevenLabs Scribe tools. When on, per-segment Scribe re-transcribe and vote actions are shown; imports still use only the OmniASR-7B champion. Using an action sends only that selected clip to ElevenLabs. Requires an ElevenLabs key in secrets.env. Leave this off if you do not need it.',
   'settings.cloudLlmConsent':
     'I understand Gemini sends transcript text to Google. Keep this disabled for fully offline dataset work.',
   'settings.juryT2ConsentLead': 'I understand',
@@ -509,8 +670,86 @@ export const en: Record<string, string> = {
   'events.importSuccess': 'Successfully processed {n} file(s)',
   'events.importFailed': 'Import failed',
   'events.importFailedDetail': 'See pipeline error for details',
+  'import.startAbortedBusy': 'Import did not start because another operation began.',
+  'import.responseLostStatus': 'Import response lost — verifying the accepted run…',
+  'import.responseLost': 'The import response was interrupted',
+  'import.responseLostRunningDetail':
+    'The backend confirms this exact import is still running. Cortex kept it active and will reconcile it automatically.',
+  'import.responseLostUncertainDetail':
+    'Cortex cannot yet prove whether this exact import started, so new imports remain blocked while it checks again.',
+  'import.settledRecovered':
+    'Import worker finished; the library was refreshed from durable state.',
+  'batch.responseLostStatus': 'Batch response lost — verifying the accepted operation…',
+  'batch.responseLost': 'The batch response was interrupted',
+  'batch.responseLostRunningDetail':
+    'The backend confirms this exact batch is still running. Cortex kept it active and will reconcile it automatically.',
+  'batch.responseLostUncertainDetail':
+    'Cortex cannot yet prove whether this exact batch started, so new work remains blocked while it checks again.',
+  'batch.settledRecovered':
+    'The batch worker stopped; the library was refreshed from durable state.',
+  'batch.adoptionChecking': 'Checking for durable batch work…',
+  'batch.adoptionRunning': 'Reconnected to an active batch of {n} clips.',
+  'batch.startCancelled': 'Batch start was cancelled before work began.',
+  'batch.startCancelledDetail': 'No batch work was admitted. Retry when you are ready.',
+  'batch.startAuthorityLost': 'Batch start could not be verified safely.',
+  'batch.startAuthorityLostDetail':
+    'No batch work was admitted. Restart Cortex and inspect the existing diagnostics if this repeats.',
+  'batch.restoreGenerationChanged': 'The workspace changed before the batch could start.',
+  'batch.restoreGenerationChangedDetail':
+    'No batch work was admitted. Retry after the current restore or recovery operation finishes.',
+  'batch.adoptionUnavailable': 'Active batch state could not be verified',
+  'batch.adoptionUnavailableDetail':
+    'Cortex kept new batch work locked and will retry automatically. Retry now only after the desktop backend is responsive.',
+  'batch.adoptionMalformed': 'Active batch state is invalid',
+  'batch.adoptionMalformedDetail':
+    'Cortex refused to guess which batch is active. New batch work remains locked; retry the check or restart after checking workspace health.',
+  'batch.acknowledgementPending': 'Batch result verified — confirming durable receipt…',
+  'batch.acknowledgementFailed': 'Batch result acknowledgement is still pending',
+  'batch.acknowledgementFailedDetail':
+    'The exact outcome was handled, but durable acknowledgement was not confirmed. Cortex kept new batch work locked and will retry the same operation ID safely.',
+  'batch.outcomeUnavailable': 'The batch stopped, but its result cannot yet be verified',
+  'batch.outcomeUnavailableDetail':
+    'Cortex is keeping the workstation locked while it retries the exact terminal-status check. Do not assume the batch completed.',
+  'batch.eventOutcomeMismatch': 'Batch event disagreed with durable status',
+  'batch.eventOutcomeMismatchDetail':
+    'Cortex ignored the event and used the exact retained backend result. This inconsistency must be investigated before release.',
+  'import.recoveryBlocksNew': 'Resolve interrupted-import recovery first',
+  'import.recoveryBlocksNewJournalDetail':
+    'Resume or delete the visible recovery record before starting another import.',
+  'import.recoveryBlocksNewUnknownDetail':
+    'Cortex cannot yet verify recovery state. Retry the recovery check before importing.',
   'events.refreshFailed': 'Failed to refresh segments',
   'events.batchCancelled': 'Batch operation cancelled',
+  'events.batchHalt.championUnavailable':
+    'The exact champion is unavailable. Open Health and retry only after it is ready.',
+  'events.batchHalt.championIdentityMismatch':
+    'The running model is not the registered champion. No further clips were transcribed.',
+  'events.batchHalt.modelIdentityChanged':
+    'The model identity changed during the batch. Remaining clips were left untouched.',
+  'events.batchHalt.sourceChanged':
+    'A source changed after import. Reload or re-import it before transcribing.',
+  'events.batchHalt.audioDecodeFailed':
+    'An audio source could not be decoded. The batch stopped before continuing.',
+  'events.batchHalt.segmentMissing':
+    'A requested segment no longer exists. Refresh the library before retrying.',
+  'events.batchHalt.writeFailed':
+    'A transcript could not be saved durably. The batch stopped and must not be treated as complete.',
+  'events.batchHalt.normalizationFailed':
+    'Normalization could not be committed durably. The batch stopped before continuing.',
+  'events.batchHalt.refinementFailed':
+    'Transcript refinement failed. The batch stopped before continuing.',
+  'events.batchHalt.juryFailed':
+    'Post-transcription adjudication failed. Drafts may exist, but the run is not complete.',
+  'events.batchHalt.workerStartFailed':
+    'The batch was admitted, but its native worker could not start. No untracked work was continued.',
+  'events.batchHalt.processInterrupted':
+    'A previous desktop process interrupted this batch. Applied items were preserved and remaining items were abandoned.',
+  'events.batchHalt.evidenceInvalid':
+    'Durable batch evidence failed validation. Check workspace health before starting another batch.',
+  'events.batchHalt.generic':
+    'Batch transcription stopped safely. Check workspace health before retrying.',
+  'events.batchHalt.workerPanicked':
+    'The native batch worker stopped unexpectedly. Durable results were refreshed, but the batch did not complete cleanly.',
   'events.batchTranscribePartial': 'Batch transcribe: {ok} OK, {failed} failed',
   'events.batchVerifyPartial': 'Batch verify: {ok} OK, {failed} failed',
   'events.batchSpeakerPartial': 'Batch speaker assign: {ok} OK, {failed} failed',
@@ -520,7 +759,11 @@ export const en: Record<string, string> = {
   'events.speakerAssigned': 'Assigned speaker on {n} segment(s)',
   'events.normalized': 'Normalized {n} segment(s)',
   'events.batchRefreshFailed': 'Failed to refresh after batch operation',
+  'events.unknownFile': 'unknown file',
   'events.processingError': 'Error processing {file}',
+  'events.processingErrorDetail': 'Processing stopped safely. Retry; open Health if it continues.',
+  'events.enrichmentErrorDetail':
+    'The import is saved, but optional enrichment could not finish. You can review the saved clips; open Health if this repeats.',
   'events.pipelineStarted': 'Pipeline started',
   'events.wslPartial': 'WSL 7B batch: {ok} transcribed, {failed} failed',
   'events.wslDone': 'WSL 7B batch complete: {n} transcribed',
@@ -586,9 +829,7 @@ export const en: Record<string, string> = {
   'db.quarantineAcknowledged':
     '{count} quarantined file(s) archived to the quarantine folder - snapshot pruning resumed',
   'db.quarantineAcknowledgeFailed': 'Could not archive the quarantined files',
-  'stats.verifyModel': 'Verify model integrity',
-  'stats.verifyModelOk': 'Model integrity verified — checksums match.',
-  'stats.verifyModelFailed': 'Model integrity check failed',
+  'db.quarantineCheckFailed': 'Could not check database quarantine state',
   'stats.buildSha': 'Build',
   // Audit 2026-08-05 #4 read "Audio fingerprints: 0" beside "Total segments: 144" and concluded
   // legacy data was never backfilled. It is not a corpus statistic at all — the fingerprint map is
@@ -643,6 +884,21 @@ export const en: Record<string, string> = {
   'agentReport.none': 'none',
   'agentReport.loadFailed': 'Failed to load agent report',
   'agentReport.stageLoadFailed': 'Failed to load agent stage log',
+  'agentReport.unknown': 'Unknown',
+  'agentReport.unknownDate': 'Unknown date',
+  'agentReport.blockerCount': '{count} blocker(s)',
+  'agentReport.runFailedDetail':
+    'This run stopped safely. Open Health or the native logs for diagnostic details.',
+  'agentReport.check.sourceReference': 'Whole-file source references',
+  'agentReport.check.primaryAsr': 'Primary ASR',
+  'agentReport.check.hypothesisCoverage': 'Multi-model hypothesis coverage',
+  'agentReport.check.readinessSnapshot': 'Readiness snapshot',
+  'agentReport.stage.sourceReference': 'Source reference',
+  'agentReport.stage.audioChunking': 'Audio chunking',
+  'agentReport.stage.multiModelHypotheses': 'Multi-model hypotheses',
+  'agentReport.stage.juryAdjudication': 'Jury adjudication',
+  'agentReport.stage.datasetPromotion': 'Dataset promotion',
+  'agentReport.stage.agentReport': 'Agent report',
   'shortcuts.none': 'No shortcuts registered',
   'notifications.loadSegmentsFailed': 'Failed to load segments',
   'notifications.undoInReview': 'Press Backspace to undo the last review decision',
@@ -661,6 +917,8 @@ export const en: Record<string, string> = {
   'notifications.lastActionReapplied': 'Last action reapplied',
   'notifications.undoFailedDetail': 'Undo failed: {error}',
   'notifications.redoFailedDetail': 'Redo failed: {error}',
+  'notifications.undoFailed': 'Undo failed',
+  'notifications.redoFailed': 'Redo failed',
   'editor.noWordTimestamps':
     "No word timestamps available. Click 'Align' to align the text with audio.",
   'notifications.transcriptionComplete': 'Transcription complete',
@@ -703,9 +961,15 @@ export const en: Record<string, string> = {
   'models.completed': 'Verified model downloads completed',
   'models.downloadFailed': 'Download failed',
   'models.downloading': 'Downloading...',
+  'models.downloaded': 'Downloaded',
+  'models.skippedMissingPins':
+    '{count} missing support model files require a pinned checksum before automatic download.',
+  'models.downloadSummary': '{downloaded} downloaded, {failed} failed, {skipped} skipped.',
+  'models.skippedUnavailable': '{count} unavailable support model files were skipped.',
   // Speaker panel
   'speaker.title': 'Speaker Management',
   'speaker.noneIdentified': 'No speakers identified yet.',
+  'speaker.unassigned': 'Unassigned',
   'speaker.segmentsMinutes': '{count} segments · {minutes} min',
   'speaker.rename': 'Rename',
   'speaker.newNamePlaceholder': 'New speaker name...',
@@ -713,9 +977,10 @@ export const en: Record<string, string> = {
   'speaker.renameFailed': 'Rename failed',
   'speaker.renameSuccess': 'Updated {n} segments',
   'speaker.mergeConfirm':
-    "Rename '{source}' to '{target}'? '{target}' already exists ({n} segments) — this MERGES both speakers into one and cannot be undone.",
+    "Rename '{source}' to '{target}'? '{target}' already exists ({n} segments) — this MERGES both speakers into one. You can reverse the exact merge with Undo after saving.",
   // Audio player
   'audio.loadFailed': 'Failed to load audio file',
+  'audio.proofFailed': 'Playback proof could not start. Reload the clip and try again.',
   'audio.seek': 'Seek audio',
   'audio.controls': 'Audio player controls',
   'audio.play': 'Play',
@@ -729,6 +994,7 @@ export const en: Record<string, string> = {
   // Command palette
   'cmdk.noMatches': 'No matching commands',
   'cmdk.title': 'Command palette',
+  'header.moreActions': 'More actions',
   'cmdk.search': 'Search commands…',
   'cmdk.navigate': 'navigate',
   'cmdk.run': 'run',
@@ -744,6 +1010,8 @@ export const en: Record<string, string> = {
     'Confidence basis: heuristic. The local engine emits no token posteriors, so certification reflects the acoustic (CTC) score, not a calibrated confidence — treat as indicative.',
   'stats.conformalNoConfidence':
     'This engine returns no per-clip confidence, so nothing here can be certified and no risk bound can be calculated. Reviewing more clips will not change that.',
+  'stats.conformalUncalibrated':
+    'Uncalibrated fallback. Verify at least 10 segments to enable statistical risk bounds.',
   'stats.certifiedSegments': 'Certified Segments',
   // Waveform
   'waveform.timelineZoom': 'Timeline Zoom',
@@ -754,6 +1022,7 @@ export const en: Record<string, string> = {
   'wsl.completed': 'Completed Successfully',
   'wsl.failed': 'Process Failed',
   'wsl.cancelled': 'Cancelled',
+  'wsl.completedCounts': '{completed} completed; {failed} failed',
   'wsl.limitFiles': 'Limit Files (Leave blank for all)',
   'wsl.limitSegments': 'Limit Segments per file (Leave blank for all)',
   'wsl.dryRun': 'Dry Run (No database writes)',
@@ -773,6 +1042,7 @@ export const en: Record<string, string> = {
   'settings.couchStart': 'Start',
   'settings.couchWifiUrl': 'Same Wi-Fi:',
   'settings.couchTailscaleUrl': 'From anywhere (Tailscale — your devices only, encrypted):',
+  'settings.couchFunnelUrl': 'From any network (Tailscale Funnel — public address, no app needed):',
   'settings.couchTlsFingerprint': 'TLS certificate SHA-256 fingerprint',
   'settings.couchTlsFingerprintHint':
     'On first connection, verify the certificate fingerprint shown by your phone matches this trusted desktop value before accepting it.',
@@ -790,14 +1060,21 @@ export const en: Record<string, string> = {
     'Clips answered by two reviewers, ready for scripts/agreement_kappa.py. Run that script on this file to get the kappa — it is not estimated here.',
   'settings.couchRevoke': 'Revoke',
   'settings.couchThroughput': 'Reviewed this library (clips · median seconds per clip)',
+  'settings.payTitle': 'Reviewer pay',
+  'settings.payOutstanding': 'Due',
+  'settings.payEarned': 'Earned',
+  'settings.paySettled': 'Paid',
+  'settings.payReference': 'Payout reference (receipt no., transfer id…)',
+  'settings.payRecord': 'Record payout',
+  'settings.payRecorded': 'Payout recorded: {amount} IQD for {reviewer}',
+  'settings.payFailed': 'Recording the payout failed — nothing was recorded',
+  'settings.payLoadFailed': 'Reviewer balances could not be loaded',
+  'settings.payNone': 'No reviewer has earned pay yet.',
   'settings.couchSpotChecks': 'Spot checks (noticed / given · error vs the known answer)',
   'settings.couchSpotChecksHint':
     'Some clips in each reviewer’s queue already have a verified answer and are shown with the wrong draft. A reviewer who listens corrects them. A low first number means they may be accepting without listening.',
   'settings.couchReviewersHint':
     'Each name gets its own private link, and every decision is stored under that name. Reviewers are handed different clips, so two people never review the same one at the same time.',
-  'settings.useFinetuned': 'Use fine-tuned model',
-  'settings.useFinetunedHint':
-    'Best local Sorani accuracy (21.0% CER [19.9-22.0], N=900 gold clips, measured 2026-06-25) — runs on CPU, no setup. Overrides the engine below.',
   'settings.externalAsrScript': 'External ASR Provider Script',
   'settings.localApiEndpoint': 'Local API Endpoint',
   'settings.modelName': 'Model Name',
@@ -808,7 +1085,7 @@ export const en: Record<string, string> = {
   'settings.geminiModel': 'Gemini Model',
   'settings.llmEngine': 'LLM Engine',
   'settings.aiTab': 'AI Post-Processing',
-  'settings.juryTab': '📬 Listening Jury',
+  'settings.juryTab': 'Listening Jury',
   'settings.aiTitle': 'Dual-Pass Transcription (LLM Refiner)',
   'settings.aiDescription':
     'Use a local LLM by default. Cloud providers are opt-in and send transcript text to the provider.',
@@ -816,7 +1093,7 @@ export const en: Record<string, string> = {
     'Required only for the WSL 7B provider. Use a path visible inside WSL.',
   'settings.llmDisabledOption': 'Disabled (fastest)',
   'settings.llmLocalOption': 'Local API (for example, LM Studio or Ollama)',
-  'settings.llmCloudOption': 'Google Gemini 3.1 Pro (cloud)',
+  'settings.llmCloudOption': 'Google Gemini 2.5 Pro (cloud)',
   'settings.localEndpointHint': 'Must be an OpenAI-compatible /v1/chat/completions endpoint.',
   'settings.quickSelect': 'Quick select:',
   'settings.apiKeySaved': 'key saved',
@@ -828,10 +1105,10 @@ export const en: Record<string, string> = {
   'settings.apiKeySavedToast': '{provider} key saved to secrets.env',
   'settings.apiKeyClearedToast': '{provider} key cleared',
   'settings.apiKeySaveFailedToast': 'Failed to save {provider} key',
-  'settings.geminiProRecommended': 'Gemini 2.5 Pro (recommended)',
-  'settings.geminiFlash': 'Gemini 2.5 Flash',
+  'settings.modelFixedByPolicy': 'fixed by owner policy',
+  'settings.advisoryModelName': 'Gemini 2.5 Pro',
   'settings.systemPromptHint': 'Instructions sent to the LLM to process the transcription.',
-  'settings.juryTitle': '📬 Listening Jury',
+  'settings.juryTitle': 'Listening Jury',
   'settings.juryDescription':
     'The Jury routes segments from IRT consensus (T0) to text analysis (T1), Gemini audio review (T2), then the human inbox. Cloud tiers send audio to Google and require opt-in.',
   'settings.autonomyHint':
@@ -840,10 +1117,8 @@ export const en: Record<string, string> = {
   'settings.juryT1ThresholdHint':
     'Segments below this combined lexicon and perplexity score escalate to T2. Raise it to reduce cloud calls.',
   'settings.juryModelLabel': 'Gemini model (T2 audio judge)',
-  'settings.modelProRecommended': '2.5 Pro (recommended)',
-  'settings.modelFlashFaster': '2.5 Flash (faster)',
-  'settings.sourceModelsBoth': '2.5 Pro + Flash',
-  'settings.sourceModelsProOnly': '2.5 Pro only',
+  'settings.sourceReferenceFixedHint':
+    'Advisory source references use this same fixed model; production transcription remains OmniASR-7B.',
   'settings.selfConsistencyLabel': 'Self-consistency N',
   'settings.selfConsistencyHint':
     'Votes per segment. 3 is a majority vote. Higher values improve reliability but use more API calls.',
@@ -854,11 +1129,151 @@ export const en: Record<string, string> = {
   'settings.juryConnection': 'Judge connection',
   'settings.juryConnectionGemini': 'Google direct (Gemini API key)',
   'settings.juryConnectionOpenRouter': 'OpenRouter (same Gemini 2.5 Pro; OpenRouter key)',
-  'settings.juryPolicyLead': 'Cloud ASR judge policy:',
+  'settings.juryPolicyLead': 'Advisory cloud judge policy:',
   'settings.juryPolicyModel': 'Gemini 2.5 Pro only',
   'settings.juryPolicyDetail':
     '— the only cloud model verified usable for Sorani (Qwen and similar models are not). OpenRouter reaches the same model with its own key and quota.',
   'settings.openRouterApiKey': 'OpenRouter API key',
   'settings.openRouterKeyHint':
     'Stored locally in secrets.env (the app data folder), never logged or shown again, and sent only to OpenRouter. Save an empty field to remove the key.',
-};
+  'diagnostics.title': 'Diagnostics — operation tracing',
+  'diagnostics.refresh': 'Refresh',
+  'diagnostics.clear': 'Clear',
+  'diagnostics.desktopRequired': 'Diagnostics require the desktop runtime.',
+  'diagnostics.loading': 'Loading diagnostics…',
+  'diagnostics.spansRecorded': 'spans recorded',
+  'diagnostics.failures': 'failures',
+  'diagnostics.averageDuration': 'average duration',
+  'diagnostics.totalDuration': 'total duration',
+  'diagnostics.empty':
+    'No operations have been traced yet. Run a transcription or import to populate timings.',
+  'diagnostics.succeeded': 'Succeeded',
+  'diagnostics.failed': 'Failed',
+  'diagnostics.loadFailed': 'Failed to load diagnostics',
+  'diagnostics.clearFailed': 'Failed to clear diagnostics',
+  'modelRegistry.title': 'Registered models',
+  'modelRegistry.loading': 'Loading model registry…',
+  'modelRegistry.empty':
+    'No models are registered yet. An imported OmniASR-7B candidate appears here with its license and checkpoint checksum so its provenance stays auditable.',
+  'modelRegistry.champion': 'Champion',
+  'modelRegistry.licenseLabel': 'license',
+  'modelRegistry.shaLabel': 'SHA',
+  'modelRegistry.cancelImport': 'Cancel import',
+  'modelRegistry.importCheckpoint': 'Import checkpoint',
+  'modelRegistry.idLabel': 'Model ID',
+  'modelRegistry.idPlaceholder': 'ID (for example, omniasr-7b-challenger)',
+  'modelRegistry.sourceLabel': 'Model source',
+  'modelRegistry.sourcePlaceholder': 'Source (for example, fine-tune)',
+  'modelRegistry.licenseFieldLabel': 'Model license',
+  'modelRegistry.licensePlaceholder': 'License (for example, CC-BY-NC-4.0)',
+  'modelRegistry.modelCardLabel': 'Model card name (optional)',
+  'modelRegistry.modelCardPlaceholder': 'Model card name (optional)',
+  'modelRegistry.chooseFile': 'Choose file…',
+  'modelRegistry.checkpointSelected': 'Checkpoint selected',
+  'modelRegistry.noCheckpointSelected': 'No checkpoint selected',
+  'modelRegistry.importing': 'Importing…',
+  'modelRegistry.importAsCandidate': 'Import as candidate',
+  'modelRegistry.selectCheckpoint': 'Select a model checkpoint',
+  'modelRegistry.importedCandidate': 'Imported checkpoint “{id}” as a candidate.',
+  'modelRegistry.loadFailed': 'Failed to load the model registry',
+  'modelRegistry.importFailed': 'Failed to import checkpoint',
+  'refinery.evalComplete': 'Honest-CER evaluation complete: CER {cer} (N={n}).',
+  'refinery.evalFailed': 'Honest-CER evaluation failed',
+  'refinery.scorecardFailed': 'Building the scorecard failed',
+  'refinery.selectVerifiedAudio': 'Select a verified audio file',
+  'refinery.goldCreated': 'Created {count} gold segment(s) from the file.',
+  'refinery.goldCreateFailed': 'Creating gold segments from the file failed',
+  'refinery.loadFailed': 'Failed to load refinery data: {error}',
+  workspaces: 'Workspaces',
+  'merge.jsonPlaceholder': '[{"id": "...", "rawTranscript": "..." }, ...]',
+  'merge.jsonInputLabel': 'Dataset JSON',
+  'history.undoneAction': 'Undid the last action',
+  'history.redoneAction': 'Redid the action',
+  'history.undoShortcut': 'Undo (Ctrl+Z)',
+  'history.redoShortcut': 'Redo (Ctrl+Shift+Z)',
+  'history.nothingToUndo': 'There is no action to undo.',
+  'history.nothingToRedo': 'There is no action to redo.',
+  'history.processing': 'Wait for the current history action to finish.',
+  'history.action.updateSegment': 'Update segment',
+  'history.action.deleteSegments': 'Delete segments',
+  'history.action.batchTranscribe': 'Batch transcription',
+  'history.action.batchNormalize': 'Batch normalization',
+  'history.action.speakerAssignment': 'Speaker assignment',
+  'history.action.unknown': 'Previous action',
+  'waveform.zoomSlider': 'Waveform zoom',
+  'waveform.audioTimeline': 'Audio waveform timeline',
+  'waveform.position': '{current} seconds of {duration} seconds',
+  'wsl.title': '{model} local transcription (WSL)',
+  'wsl.description':
+    'Run high-accuracy offline transcription on the GPU. This process runs inside WSL (Ubuntu) and updates segment transcripts directly in the database.',
+  'wsl.closeDisabled': 'Cancel the running transcription or wait for it to finish before closing.',
+  'wsl.limitFilesPlaceholder': 'For example, 5',
+  'wsl.limitSegmentsPlaceholder': 'For example, 20',
+  'wsl.logStarting': 'Starting Meta OmniASR 7B batch transcription of pending segments…',
+  'wsl.logOptionFiles': 'files at most {count}',
+  'wsl.logOptionSegments': 'segments at most {count}',
+  'wsl.logOptionDryRun': 'dry run (no writes)',
+  'wsl.logOptionTestOne': 'test one (single segment)',
+  'wsl.logOptions': 'Options: {options}',
+  'wsl.logAllPending': 'all pending segments',
+  'wsl.logStartFailed': 'Failed to start refinement',
+  'wsl.logCancelling': 'Cancelling the process at your request…',
+  'wsl.logCancelFailed': 'Cancellation failed',
+  'settings.couchWorking': 'Working…',
+  'settings.aiAudioCleanup': 'AI audio cleanup (denoise before ASR)',
+  'settings.exportJson': 'JSON (COCO-style manifest)',
+  'settings.exportJsonl': 'JSONL (one segment per line)',
+  'stats.decisionThreshold': 'Decision threshold (τ)',
+  'stats.targetErrorBound': 'Target error bound (CER):',
+  'stats.confidenceLevel': 'Confidence level:',
+  'stats.expectedErrorBound': 'Expected error bound:',
+  'stats.uncalibratedTargetTitle':
+    'Uncalibrated — this is the requested target, not a measured bound',
+  'stats.uncalibratedValue': 'not available (uncalibrated)',
+  'agentReport.byteCount': '{count} bytes',
+  'agentReport.hashValue': 'hash {hash}',
+  'agentReport.status.notRequired': 'Not required',
+  'agentReport.status.ready': 'Ready',
+  'agentReport.status.completed': 'Completed',
+  'agentReport.status.skipped': 'Skipped',
+  'agentReport.status.failed': 'Failed',
+  'agentReport.status.running': 'Running',
+  'agentReport.status.degraded': 'Degraded',
+  'agentReport.status.needsReview': 'Needs review',
+  'agentReport.status.blocked': 'Blocked',
+  'agentReport.status.unprocessed': 'Unprocessed',
+  'agentReport.jury': 'Jury',
+  'agentReport.automatic': 'Automatic',
+  'agentReport.review': 'Review',
+  'agentReport.open': 'Open',
+  'refinery.ariaLabel': 'Refinery metrics',
+  'refinery.title': 'Disagreement Refinery',
+  'refinery.loading': 'Loading refinery metrics…',
+  'refinery.liftTitle': 'Label-quality lift: raw ASR to post-jury',
+  'refinery.liftSelfReferential':
+    'Not measurable — the stored post-jury text for a decided clip is the human answer, so this compares that answer with itself and can only report zero. It is not a statement about jury accuracy. Measuring the jury requires its verdict to be recorded separately from the human answer, which this library does not yet do.',
+  'refinery.rawAsrCer': 'Raw ASR CER',
+  'refinery.postJuryCer': 'Post-jury CER',
+  'refinery.cerLift': 'CER lift',
+  'refinery.liftEvidence': 'N={n} verified segments; 95% CI [{low}, {high}]',
+  'refinery.selfReferentialRows':
+    '{self} of {total} were accepted verbatim, so those rows score the jury against its own output.',
+  'refinery.noMeasuredLift':
+    'No measured lift yet — human-verified segments with a separately stored jury verdict are required.',
+  'refinery.runEvaluation': 'Run evaluation',
+  'refinery.running': 'Running…',
+  'refinery.runHonestCer': 'Run honest-CER evaluation',
+  'refinery.importing': 'Importing…',
+  'refinery.importGold': 'Import gold from file…',
+  'refinery.lastEval': 'Last evaluation: CER {cer}; WER {wer}; N={n}',
+  'refinery.buildScorecard': 'Build scorecard',
+  'refinery.evaluationRuns': 'Evaluation runs',
+  'refinery.noEvalRuns': 'No evaluation runs yet. Run the gold evaluation to populate this list.',
+  'refinery.model': 'Model',
+  'refinery.when': 'When',
+  'refinery.escalationTrend': 'Escalation-rate trend',
+  'refinery.noEscalationHistory': 'No escalation history yet.',
+  'refinery.trendPoint': '{date}: {rate} escalated; {escalated} of {total} segments.',
+} as const;
+
+export type TranslationKey = keyof typeof en;

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { fade, scale } from 'svelte/transition';
   import { focusTrap } from './actions/focusTrap';
+  import { t } from './i18n';
 
   type Size = 'sm' | 'md' | 'lg' | 'xl' | 'full';
 
@@ -46,7 +47,7 @@
 {#if open}
   <!-- Backdrop -->
   <div
-    class="fixed inset-0 z-[100] flex items-center justify-center p-4 sm:p-6 glass"
+    class="modal-backdrop fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto p-4 sm:p-6 glass"
     role="presentation"
     onclick={(e) => {
       if (e.target === e.currentTarget) onClose();
@@ -55,7 +56,7 @@
   >
     <!-- Dialog -->
     <div
-      class="card relative flex max-h-[88vh] w-full flex-col overflow-hidden shadow-lift {widths[
+      class="modal-dialog card relative flex max-h-[88vh] w-full flex-col overflow-hidden shadow-lift {widths[
         size
       ]}"
       role="dialog"
@@ -78,29 +79,19 @@
               <p id="modal-desc" class="mt-0.5 text-xs text-muted">{description}</p>
             {/if}
           </div>
-          <button class="icon-btn -me-1" aria-label="Close dialog" onclick={onClose}>
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-            >
-              <path d="M18 6 6 18M6 6l12 12" />
-            </svg>
+          <button class="btn-ghost -me-1 text-xs" aria-label={$t('close')} onclick={onClose}>
+            {$t('close')}
           </button>
         </header>
       {/if}
 
-      <div class="min-h-0 flex-1 overflow-auto">
+      <div class="modal-body min-h-0 flex-1 overflow-auto">
         {@render children?.()}
       </div>
 
       {#if footer}
         <footer
-          class="flex shrink-0 items-center justify-end gap-2 border-t border-line px-5 py-3.5"
+          class="flex min-w-0 shrink-0 flex-wrap items-center justify-end gap-2 border-t border-line px-5 py-3.5"
         >
           {@render footer()}
         </footer>
@@ -108,3 +99,27 @@
     </div>
   </div>
 {/if}
+
+<style>
+  /* At 400% zoom a 720px-tall window can expose only 180 CSS pixels. In that geometry a fixed
+     header and footer used to squeeze the message to zero height. Let the complete dialog become
+     one scrollable document instead, so its explanation and every action remain reachable. */
+  @media (max-height: 360px) {
+    .modal-backdrop {
+      align-items: flex-start;
+      padding-block: 0.25rem;
+    }
+
+    .modal-dialog {
+      flex: none;
+      max-height: none;
+      overflow: visible;
+      margin-block: 0;
+    }
+
+    .modal-body {
+      flex: none;
+      overflow: visible;
+    }
+  }
+</style>

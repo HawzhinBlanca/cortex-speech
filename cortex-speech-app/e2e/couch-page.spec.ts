@@ -15,6 +15,49 @@ const PAGE = pathToFileURL(resolve(process.cwd(), 'src-tauri/assets/couch.html')
 
 const WCAG_AA = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'];
 
+const OUTBOX_OPERATION_PREFIX = 'cortex.couch.outbox.operation.';
+
+type CouchOutboxSubmission = {
+  operationId: string;
+  id: string;
+  action: string;
+  text: string;
+  reviewer?: string;
+  [key: string]: unknown;
+};
+
+/** Read the physical v2 operation records, not the retired aggregate-array compatibility key. */
+async function readOperationOutbox(
+  page: import('@playwright/test').Page,
+): Promise<CouchOutboxSubmission[]> {
+  return page.evaluate(`
+    (() => Object.keys(localStorage)
+      .filter((key) => key.startsWith('${OUTBOX_OPERATION_PREFIX}'))
+      .sort()
+      .map((key) => {
+        const record = JSON.parse(localStorage.getItem(key));
+        if (!record || record.version !== 1 || !record.submission) {
+          throw new Error('expected a version-1 operation outbox record');
+        }
+        return record.submission;
+      }))()
+  `);
+}
+
+async function operationOutboxCount(page: import('@playwright/test').Page): Promise<number> {
+  return (await readOperationOutbox(page)).length;
+}
+
+/** Seed through the page's real writer so fixtures exercise validation, wrapping and readback. */
+async function seedOperationOutbox(
+  page: import('@playwright/test').Page,
+  submissions: CouchOutboxSubmission[],
+): Promise<void> {
+  await page.evaluate(
+    `(${JSON.stringify(submissions)}).forEach((submission) => queueSubmission(submission))`,
+  );
+}
+
 /** Put the page into its REVIEWING state — the state a reviewer actually spends their session in.
  *
  * Evaluated as a STRING, not an arrow function. The page's state lives in top-level `let` bindings,
@@ -24,14 +67,70 @@ const WCAG_AA = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'];
 async function showAClip(page: import('@playwright/test').Page) {
   await page.evaluate(`
     queue = [
-      { id: 's1', text: 'ئەمە دەقێکی نموونەیی کوردییە بۆ پێداچوونەوە', durationMs: 4200, speakerId: 'spk_01' },
-      { id: 's2', text: 'دەقی دووەم', durationMs: 3100, speakerId: null },
+      { id: 's1', text: 'ئەمە دەقێکی نموونەیی کوردییە بۆ پێداچوونەوە', durationMs: 4200, speakerId: 'spk_01', rowVersion: '1', pilotAfterReviewEventId: null },
+      { id: 's2', text: 'دەقی دووەم', durationMs: 3100, speakerId: null, rowVersion: '2', pilotAfterReviewEventId: null },
     ];
     i = 0;
     document.getElementById('err').hidden = true;
     show();
   `);
   await expect(page.locator('#card')).toBeVisible();
+}
+
+/**
+ * Give a non-playback-focused test one already-finalized policy-4 authority for the visible clip.
+ * The playback protocol itself has dedicated transition and HTTP tests; queue, outbox and recovery
+ * tests must still cross the production verdict guard instead of relying on the retired policy-3
+ * client-duration fixture.
+ */
+async function authorizeCurrentClipForNonPlaybackTest(page: import('@playwright/test').Page) {
+  await page.evaluate(`
+    (() => {
+      if (!window.__cortexNonPlaybackFetchInstalled) {
+        const originalFetch = window.fetch.bind(window);
+        window.fetch = async (input, init) => {
+          const url = String(input);
+          if (url.includes('/api/playback/start')) {
+            const request = JSON.parse(String(init && init.body || '{}'));
+            const segment = queue.find((item) => item.id === request.id);
+            if (!segment) return new Response('unknown test segment', { status: 404 });
+            return new Response(JSON.stringify({
+              playbackContractVersion: 4,
+              clientAttemptId: request.clientAttemptId,
+              playbackReceiptId: crypto.randomUUID(),
+              segmentId: segment.id,
+              segmentRevision: segment.rowVersion,
+              clipDurationMs: segment.durationMs,
+            }), { status: 200, headers: { 'content-type': 'application/json' } });
+          }
+          if (url.includes('/api/playback/finalize')) {
+            const request = JSON.parse(String(init && init.body || '{}'));
+            const segment = queue[i];
+            return new Response(JSON.stringify({
+              playbackContractVersion: 4,
+              playbackReceiptId: request.playbackReceiptId,
+              segmentId: segment.id,
+              segmentRevision: segment.rowVersion,
+              uniquePlayedMs: segment.durationMs,
+              clipDurationMs: segment.durationMs,
+              coverageRatio: 1,
+            }), { status: 200, headers: { 'content-type': 'application/json' } });
+          }
+          return originalFetch(input, init);
+        };
+        window.__cortexNonPlaybackFetchInstalled = true;
+      }
+      const segment = queue[i];
+      if (!segment) throw new Error('cannot authorize playback without a visible test clip');
+      playbackAttempt = {
+        identity: playbackIdentity(segment),
+        clientAttemptId: crypto.randomUUID(),
+        playbackReceiptId: crypto.randomUUID(),
+        finalized: true,
+      };
+      resetPlaybackTraversalCoverage(playbackIdentity(segment));
+    })()
+  `);
 }
 
 test.describe('Couch Review phone page', () => {
@@ -121,6 +220,22 @@ test.describe('Couch Review phone page', () => {
         // A dropped request is a TypeError from fetch — no status — which is exactly how the page
         // tells "never arrived" (retry) from "the server refused" (do not retry).
         if (net.fail) throw new TypeError('Failed to fetch');
+        // A REAL queue payload, because the flush below depends on it. This stub used to answer
+        // `{"ok":true}` to every URL including /api/queue, so the reload never learned who it was —
+        // and the page then correctly refuses to flush stamped work under a cookie it cannot name.
+        // The assertion read that as "the outbox never drained" and this gate, on the data-loss path
+        // it was written to protect, had been failing rather than checking anything.
+        if (url.includes('/api/queue')) {
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              reviewer: 'Sara',
+              items: [],
+              heldByOthers: 0,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
         return new Response('{"ok":true}', {
           status: 200,
           headers: { 'content-type': 'application/json' },
@@ -132,29 +247,50 @@ test.describe('Couch Review phone page', () => {
 
     // The network drops, then the reviewer saves.
     await page.evaluate(`window.__net.fail = true`);
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
 
     // Their decision is HELD, not lost — and they are moved on rather than stranded on a dead clip.
-    const queued = await page.evaluate(
-      `JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]')`,
-    );
+    const queued = await readOperationOutbox(page);
     expect(queued).toHaveLength(1);
-    expect((queued as Array<{ id: string }>)[0].id).toBe('s1');
+    expect(queued[0]).toMatchObject({ id: 's1', action: 'accept' });
+    expect(queued[0].operationId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+    await expect
+      .poll(async () => page.evaluate(`localStorage.getItem('cortex.couch.outbox')`))
+      .toBeNull();
     await expect(page.locator('#text')).toHaveValue('دەقی دووەم', { timeout: 5000 });
 
     // Network returns; the next load flushes it. Replay is safe only because the SERVER answers an
     // identical re-submit as already-recorded (couch.rs is_repeat_of_stored_decision).
     await page.evaluate(`window.__net.fail = false`);
     await page.reload();
-    await page.waitForFunction(
-      `JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length === 0`,
-      null,
-      {
-        timeout: 5000,
-      },
-    );
+    await expect.poll(async () => operationOutboxCount(page), { timeout: 5000 }).toBe(0);
     const calls = (await page.evaluate(`window.__net.calls`)) as string[];
     expect(calls.some((c) => c.includes('/api/decision') && c.includes('s1'))).toBe(true);
+  });
+
+  test('outbox readback uses the same undefined-property semantics as JSON storage and wire', async ({
+    page,
+  }) => {
+    const operationId = '00000000-0000-4000-8000-000000000001';
+    await page.evaluate(`queueSubmission({
+      operationId: '${operationId}',
+      id: 'json-shape',
+      action: 'skip',
+      text: 'پارچە',
+      reviewer: 'Sara',
+      rowVersion: '1',
+      pilotAfterReviewEventId: undefined,
+      heardMs: 0,
+      clipDurationMs: 1000,
+    })`);
+
+    const queued = await readOperationOutbox(page);
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({ operationId, id: 'json-shape', action: 'skip' });
+    expect(queued[0]).not.toHaveProperty('pilotAfterReviewEventId');
   });
 
   test('a submit the server REFUSES is dropped, not retried forever', async ({ page }) => {
@@ -173,12 +309,9 @@ test.describe('Couch Review phone page', () => {
     });
     await page.goto(PAGE);
     await showAClip(page);
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(0);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(0);
   });
 
   test('draining a batch fetches the next one instead of claiming the corpus is finished', async ({
@@ -194,20 +327,46 @@ test.describe('Couch Review phone page', () => {
     await page.addInitScript(() => {
       (window as unknown as { __q: { fetches: number } }).__q = { fetches: 0 };
       const batches = [
-        [{ id: 'a1', text: 'یەکەم', durationMs: 1000, speakerId: null }],
-        [{ id: 'b1', text: 'دووەم', durationMs: 1000, speakerId: null }],
+        [
+          {
+            id: 'a1',
+            text: 'یەکەم',
+            durationMs: 1000,
+            speakerId: null,
+            rowVersion: '1',
+            pilotAfterReviewEventId: null,
+          },
+        ],
+        [
+          {
+            id: 'b1',
+            text: 'دووەم',
+            durationMs: 1000,
+            speakerId: null,
+            rowVersion: '2',
+            pilotAfterReviewEventId: null,
+          },
+        ],
         [],
       ];
-      window.fetch = async (input: RequestInfo | URL) => {
+      window.fetch = async (input: RequestInfo | URL, _init?: RequestInit) => {
         const url = String(input);
         if (url.includes('/api/queue')) {
           const st = (window as unknown as { __q: { fetches: number } }).__q;
           const items = batches[Math.min(st.fetches, batches.length - 1)];
           st.fetches += 1;
-          return new Response(JSON.stringify({ reviewer: 'Sara', items, heldByOthers: 0 }), {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-          });
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              reviewer: 'Sara',
+              items,
+              heldByOthers: 0,
+            }),
+            {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            },
+          );
         }
         return new Response('{"ok":true}', {
           status: 200,
@@ -219,11 +378,13 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#text')).toHaveValue('یەکەم', { timeout: 5000 });
 
     // Draining batch 1 must go BACK to the server, not declare victory.
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
     await expect(page.locator('#text')).toHaveValue('دووەم', { timeout: 5000 });
     await expect(page.locator('#done')).toBeHidden();
 
     // Only a fetch that genuinely comes back empty may draw the finished state.
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
     await expect(page.locator('#done')).toBeVisible({ timeout: 5000 });
     await expect(page.locator('#done')).toContainText('هەموو پارچەکان');
@@ -252,8 +413,18 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
-              items: [{ id: 'x1', text: 'دەقی سەرەتایی', durationMs: 1000, speakerId: null }],
+              items: [
+                {
+                  id: 'x1',
+                  text: 'دەقی سەرەتایی',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+              ],
               heldByOthers: 0,
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
@@ -274,29 +445,23 @@ test.describe('Couch Review phone page', () => {
 
     // Offline: type a correction and save. It is QUEUED, and must not be called "Saved".
     await page.locator('#text').fill('ڕاستکراوەی سارا');
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#save').click();
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(1);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(1);
     await expect(page.locator('#toast')).toHaveText(
       'لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت',
     );
-    const queued = (await page.evaluate(
-      `JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]')[0]`,
-    )) as { reviewer?: string; text: string };
+    const [queued] = await readOperationOutbox(page);
     expect(queued.reviewer).toBe('Sara'); // stamped, so it can never be replayed under another name
     expect(queued.text).toBe('ڕاستکراوەی سارا');
+    expect(queued.operationId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
 
     // Back online, the server refuses it. Driven by the 'online' event rather than a reload:
     // addInitScript re-runs on every navigation and would reset __net.offline back to true.
     await page.evaluate(`window.__net.offline = false; dispatchEvent(new Event('online'))`);
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(0);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(0);
 
     // The decision is dropped — correct — but the WORK is kept and the reviewer is told.
     expect(await page.evaluate(`sessionStorage.getItem('cortex.couch.draft.x1')`)).toBe(
@@ -324,10 +489,18 @@ test.describe('Couch Review phone page', () => {
           });
         }
         if (url.includes('/api/queue')) {
-          return new Response(JSON.stringify({ reviewer: 'Hemn', items: [], heldByOthers: 0 }), {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-          });
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              reviewer: 'Hemn',
+              items: [],
+              heldByOthers: 0,
+            }),
+            {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            },
+          );
         }
         return new Response('{"ok":true}', {
           status: 200,
@@ -340,22 +513,38 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#who')).toHaveText(' · Hemn');
     // Seeded AFTER load so addInitScript cannot wipe it, and flushed via the 'online' event, which is
     // exactly how a reconnecting phone triggers it.
-    await page.evaluate(`
-      localStorage.setItem('cortex.couch.outbox', JSON.stringify([
-        { id: 'sara1', action: 'edit', text: 'هی سارا', reviewer: 'Sara' },
-        { id: 'hemn1', action: 'edit', text: 'هی هێمن', reviewer: 'Hemn' },
-      ]));
-      dispatchEvent(new Event('online'));
-    `);
+    await seedOperationOutbox(page, [
+      {
+        operationId: '00000000-0000-4000-8000-000000000011',
+        id: 'sara1',
+        action: 'edit',
+        text: 'هی سارا',
+        reviewer: 'Sara',
+        rowVersion: '1',
+        pilotAfterReviewEventId: null,
+        heardMs: 1000,
+        clipDurationMs: 1000,
+      },
+      {
+        operationId: '00000000-0000-4000-8000-000000000012',
+        id: 'hemn1',
+        action: 'edit',
+        text: 'هی هێمن',
+        reviewer: 'Hemn',
+        rowVersion: '2',
+        pilotAfterReviewEventId: null,
+        heardMs: 1000,
+        clipDurationMs: 1000,
+      },
+    ]);
+    await page.evaluate(`dispatchEvent(new Event('online'))`);
     await expect.poll(async () => page.evaluate(`window.__sent.length`)).toBe(1);
 
     const sent = (await page.evaluate(`window.__sent`)) as string[];
     expect(sent[0]).toContain('hemn1');
     expect(sent.join(' ')).not.toContain('sara1');
     // Sara's decision is still waiting for Sara — held, not sent, and not thrown away either.
-    const left = (await page.evaluate(
-      `JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]')`,
-    )) as Array<{ id: string }>;
+    const left = await readOperationOutbox(page);
     expect(left.map((q) => q.id)).toEqual(['sara1']);
   });
 
@@ -371,12 +560,31 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           const st = (window as unknown as { __q: { n: number } }).__q;
           const items =
-            st.n === 0 ? [{ id: 'z1', text: 'تاکە پارچە', durationMs: 1000, speakerId: null }] : [];
+            st.n === 0
+              ? [
+                  {
+                    id: 'z1',
+                    text: 'تاکە پارچە',
+                    durationMs: 1000,
+                    speakerId: null,
+                    rowVersion: '1',
+                    pilotAfterReviewEventId: null,
+                  },
+                ]
+              : [];
           st.n += 1;
-          return new Response(JSON.stringify({ reviewer: 'Sara', items, heldByOthers: 0 }), {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-          });
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              reviewer: 'Sara',
+              items,
+              heldByOthers: 0,
+            }),
+            {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            },
+          );
         }
         return new Response('{"ok":true}', {
           status: 200,
@@ -391,6 +599,7 @@ test.describe('Couch Review phone page', () => {
     // durationMs the fixture serves — so the exact-match keeps guarding the count against off-by-one.
     await expect(page.locator('#progress')).toHaveText('پارچەی 1 لە 1 (1s)');
 
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
     await expect(page.locator('#done')).toBeVisible({ timeout: 5000 });
 
@@ -416,12 +625,31 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           const st = (window as unknown as { __q: { n: number } }).__q;
           const items =
-            st.n === 0 ? [{ id: 'w1', text: 'کۆتا پارچە', durationMs: 1000, speakerId: null }] : [];
+            st.n === 0
+              ? [
+                  {
+                    id: 'w1',
+                    text: 'کۆتا پارچە',
+                    durationMs: 1000,
+                    speakerId: null,
+                    rowVersion: '1',
+                    pilotAfterReviewEventId: null,
+                  },
+                ]
+              : [];
           st.n += 1;
-          return new Response(JSON.stringify({ reviewer: 'Sara', items, heldByOthers: 0 }), {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-          });
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              reviewer: 'Sara',
+              items,
+              heldByOthers: 0,
+            }),
+            {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            },
+          );
         }
         if (url.includes('/api/decision')) throw new TypeError('Failed to fetch'); // offline
         return new Response('{"ok":true}', {
@@ -432,6 +660,7 @@ test.describe('Couch Review phone page', () => {
     });
     await page.goto(PAGE);
     await expect(page.locator('#text')).toHaveValue('کۆتا پارچە', { timeout: 5000 });
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
 
     await expect(page.locator('#done')).toBeVisible({ timeout: 5000 });
@@ -454,10 +683,25 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
-                { id: 'broken', text: 'پارچەی تێکچوو', durationMs: 1000, speakerId: null },
-                { id: 'fine', text: 'پارچەی باش', durationMs: 1000, speakerId: null },
+                {
+                  id: 'broken',
+                  text: 'پارچەی تێکچوو',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+                {
+                  id: 'fine',
+                  text: 'پارچەی باش',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '2',
+                  pilotAfterReviewEventId: null,
+                },
               ],
               heldByOthers: 0,
             }),
@@ -515,8 +759,18 @@ test.describe('Couch Review phone page', () => {
           await new Promise((r) => setTimeout(r, 1500)); // a slow round trip
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
-              items: [{ id: 'p1', text: 'دەق', durationMs: 1000, speakerId: null }],
+              items: [
+                {
+                  id: 'p1',
+                  text: 'دەق',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+              ],
               heldByOthers: 0,
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
@@ -545,15 +799,30 @@ test.describe('Couch Review phone page', () => {
     // left stranded on the clip, at exactly the moment they were working fastest.
     await page.addInitScript(() => {
       (window as unknown as { __throttle: boolean }).__throttle = true;
-      window.fetch = async (input: RequestInfo | URL) => {
+      window.fetch = async (input: RequestInfo | URL, _init?: RequestInit) => {
         const url = String(input);
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
-                { id: 't1', text: 'یەکەم', durationMs: 1000, speakerId: null },
-                { id: 't2', text: 'دووەم', durationMs: 1000, speakerId: null },
+                {
+                  id: 't1',
+                  text: 'یەکەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+                {
+                  id: 't2',
+                  text: 'دووەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '2',
+                  pilotAfterReviewEventId: null,
+                },
               ],
               heldByOthers: 0,
             }),
@@ -575,13 +844,10 @@ test.describe('Couch Review phone page', () => {
     await page.goto(PAGE);
     await expect(page.locator('#text')).toHaveValue('یەکەم', { timeout: 5000 });
 
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
     // HELD in the outbox, and the reviewer is moved on rather than stranded re-submitting.
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(1);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(1);
     await expect(page.locator('#text')).toHaveValue('دووەم');
     // Not reported as saved — it is queued, which is the truth.
     await expect(page.locator('#toast')).toHaveText(
@@ -592,11 +858,7 @@ test.describe('Couch Review phone page', () => {
 
     // The limiter refills; the held decision lands on the next flush.
     await page.evaluate(`window.__throttle = false; dispatchEvent(new Event('online'))`);
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(0);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(0);
     await expect(page.locator('#err')).toBeHidden();
   });
 
@@ -613,8 +875,18 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
-              items: [{ id: 'g1', text: 'پارچە', durationMs: 1000, speakerId: null }],
+              items: [
+                {
+                  id: 'g1',
+                  text: 'پارچە',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+              ],
               heldByOthers: 0,
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
@@ -638,21 +910,78 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#text')).toHaveValue('پارچە', { timeout: 5000 });
 
     // Seed a refusal through the real flush path, then confirm the banner is up.
-    await page.evaluate(`
-      localStorage.setItem('cortex.couch.outbox', JSON.stringify([{ id: 'g1', action: 'edit', text: 'x', reviewer: 'Sara' }]));
-      dispatchEvent(new Event('online'));
-    `);
+    await seedOperationOutbox(page, [
+      {
+        operationId: '00000000-0000-4000-8000-000000000021',
+        id: 'g1',
+        action: 'edit',
+        text: 'x',
+        reviewer: 'Sara',
+        rowVersion: '1',
+        pilotAfterReviewEventId: null,
+        heardMs: 1000,
+        clipDurationMs: 1000,
+      },
+    ]);
+    await page.evaluate(`dispatchEvent(new Event('online'))`);
     await expect(page.locator('#err')).toBeVisible();
     await expect(page.locator('#err')).toContainText('1 بڕیار');
 
     // The reviewer goes back and re-reviews that same clip, and this time it lands.
     await page.evaluate(`window.__refuse = false`);
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
 
     await expect
       .poll(async () => page.evaluate(`localStorage.getItem('cortex.couch.refused')`))
       .toBeNull();
     await expect(page.locator('#err')).toBeHidden();
+  });
+
+  test('a new tab re-scopes shared refusal warnings after the server names its reviewer', async ({
+    page,
+  }) => {
+    // localStorage is per-ORIGIN, so everyone who opens a link on the same phone shares this store —
+    // and an unscoped banner told the next reviewer that work "could not be saved" which was never
+    // theirs (2026-08-20 hunt). `refusedMine()` is the fix; nothing on this line tested it.
+    await page.addInitScript(() => {
+      window.fetch = async (input: RequestInfo | URL) => {
+        if (String(input).includes('/api/queue')) {
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              reviewer: 'Reviewer-Two',
+              items: [],
+              heldByOthers: 0,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#who')).toContainText('Reviewer-Two');
+    await page.evaluate(`
+      localStorage.setItem('cortex.couch.refused', JSON.stringify([
+        { id: 'one-only', by: 'Reviewer-One' }
+      ]));
+      sessionStorage.clear();
+    `);
+
+    // sessionStorage.clear() models a new tab on the same phone: local recovery data is shared, tab
+    // identity is not. The other reviewer's warning must not be attributed to this one — and must not
+    // be discarded either, because it is still the only record that their work did not land.
+    await page.reload();
+    await expect(page.locator('#who')).toContainText('Reviewer-Two');
+    await expect(page.locator('#err')).toBeHidden();
+    const refused = (await page.evaluate(
+      `JSON.parse(localStorage.getItem('cortex.couch.refused') || '[]')`,
+    )) as Array<{ id: string; by: string | null }>;
+    expect(refused).toContainEqual(expect.objectContaining({ id: 'one-only', by: 'Reviewer-One' }));
   });
 
   test('retracting a refusal must not swallow the link-expired notice', async ({ page }) => {
@@ -664,8 +993,18 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
-              items: [{ id: 'h1', text: 'پارچە', durationMs: 1000, speakerId: null }],
+              items: [
+                {
+                  id: 'h1',
+                  text: 'پارچە',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+              ],
               heldByOthers: 0,
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
@@ -686,6 +1025,7 @@ test.describe('Couch Review phone page', () => {
       document.getElementById('err').hidden = false;
       document.getElementById('err').textContent = STRINGS[locale].linkExpired;
     `);
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
 
     // The refusal is retracted from storage, but the link notice stays up.
@@ -714,8 +1054,18 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
-              items: [{ id: 'k1', text: 'پارچە', durationMs: 1000, speakerId: null }],
+              items: [
+                {
+                  id: 'k1',
+                  text: 'پارچە',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+              ],
               heldByOthers: 0,
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
@@ -738,22 +1088,15 @@ test.describe('Couch Review phone page', () => {
     await page.goto(PAGE);
     await expect(page.locator('#text')).toHaveValue('پارچە', { timeout: 5000 });
 
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(1);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(1);
 
     // The throttle clears. NOTHING else happens: no reload, no online event, no batch drain.
     await page.evaluate(`window.__throttle = false`);
     await page.clock.runFor(31_000);
 
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(0);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(0);
     const sent = (await page.evaluate(`window.__sent`)) as string[];
     expect(sent.join(' ')).toContain('k1');
   });
@@ -769,10 +1112,18 @@ test.describe('Couch Review phone page', () => {
       window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         if (url.includes('/api/queue')) {
-          return new Response(JSON.stringify({ reviewer: 'Sara', items: [], heldByOthers: 0 }), {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-          });
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              reviewer: 'Sara',
+              items: [],
+              heldByOthers: 0,
+            }),
+            {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            },
+          );
         }
         if (url.includes('/api/decision')) {
           (window as unknown as { __posts: string[] }).__posts.push(String(init?.body ?? ''));
@@ -792,19 +1143,27 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#done')).toBeVisible({ timeout: 5000 });
 
     // One queued decision, then every flush trigger fired at once while the first is still in flight.
+    await seedOperationOutbox(page, [
+      {
+        operationId: '00000000-0000-4000-8000-000000000031',
+        id: 'x9',
+        action: 'edit',
+        text: 'y',
+        reviewer: 'Sara',
+        rowVersion: '1',
+        pilotAfterReviewEventId: null,
+        heardMs: 1000,
+        clipDurationMs: 1000,
+      },
+    ]);
     await page.evaluate(`
-      localStorage.setItem('cortex.couch.outbox', JSON.stringify([{ id: 'x9', action: 'edit', text: 'y', reviewer: 'Sara' }]));
       window.__posts = [];
       dispatchEvent(new Event('online'));
       dispatchEvent(new Event('online'));
       dispatchEvent(new Event('online'));
       void load();
     `);
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(0);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(0);
 
     const posts = (await page.evaluate(`window.__posts`)) as string[];
     const forX9 = posts.filter((b) => b.includes('x9'));
@@ -838,12 +1197,9 @@ test.describe('Couch Review phone page', () => {
 
     // Offline: the decision is held.
     await page.evaluate(`localStorage.setItem('__netmode', 'offline')`);
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(1);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(1);
 
     // Back online, but the owner restarted the server meanwhile — the token is dead.
     await page.evaluate(`localStorage.setItem('__netmode', 'expired')`);
@@ -853,9 +1209,7 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#err')).toBeVisible();
     await expect(page.locator('#err')).toContainText('بەسەرچووە');
     // ...and their unsent decision is STILL THERE, waiting for a working link.
-    expect(
-      await page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-    ).toBe(1);
+    expect(await operationOutboxCount(page)).toBe(1);
   });
 
   test('a decision made after the link dies is HELD, not just toasted away', async ({ page }) => {
@@ -878,17 +1232,12 @@ test.describe('Couch Review phone page', () => {
     });
     await page.goto(PAGE);
     await showAClip(page);
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
 
     // The verdict is held for the next working link...
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(1);
-    const held = (await page.evaluate(
-      `JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]')`,
-    )) as Array<{ id: string; action: string }>;
+    await expect.poll(async () => operationOutboxCount(page)).toBe(1);
+    const held = await readOperationOutbox(page);
     expect(held[0]).toMatchObject({ id: 's1', action: 'accept' });
 
     // ...the reviewer is told why, persistently rather than in a toast that vanishes...
@@ -990,8 +1339,18 @@ test.describe('Couch Review phone page', () => {
           if (!up) return new Response('unauthorized', { status: 401 }); // no cookie was ever minted
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
-              items: [{ id: 'c1', text: 'پارچە', durationMs: 1000, speakerId: null }],
+              items: [
+                {
+                  id: 'c1',
+                  text: 'پارچە',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+              ],
               heldByOthers: 0,
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
@@ -1101,10 +1460,25 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
-                { id: 'q1', text: 'یەکەم', durationMs: 1000, speakerId: null },
-                { id: 'q2', text: 'دووەم', durationMs: 1000, speakerId: null },
+                {
+                  id: 'q1',
+                  text: 'یەکەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+                {
+                  id: 'q2',
+                  text: 'دووەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '2',
+                  pilotAfterReviewEventId: null,
+                },
               ],
               heldByOthers: 0,
               pendingTotal: 407, // a real backlog behind a 2-clip batch
@@ -1124,6 +1498,7 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#progress')).toContainText('407');
     await expect(page.locator('#progress')).not.toContainText('لە 2');
     // And the position advances within it rather than restarting at every batch boundary.
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
     await expect(page.locator('#progress')).toContainText('2');
     await expect(page.locator('#progress')).toContainText('407');
@@ -1141,8 +1516,18 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
-              items: [{ id: 'q1', text: 'یەکەم', durationMs: 1000, speakerId: null }],
+              items: [
+                {
+                  id: 'q1',
+                  text: 'یەکەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+              ],
               heldByOthers: 0,
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
@@ -1186,8 +1571,18 @@ test.describe('Couch Review phone page', () => {
           });
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
-              items: [{ id: 'r1', text: 'پارچە', durationMs: 1000, speakerId: null }],
+              items: [
+                {
+                  id: 'r1',
+                  text: 'پارچە',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+              ],
               heldByOthers: 0,
               pendingTotal: 1,
             }),
@@ -1239,18 +1634,68 @@ test.describe('Couch Review phone page', () => {
         w.__plays.push(this.getAttribute('src') || '');
         return Promise.resolve();
       };
-      window.fetch = async (input: RequestInfo | URL) => {
+      window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
-                { id: 'one', text: 'یەکەم', durationMs: 1000, speakerId: null },
-                { id: 'two', text: 'دووەم', durationMs: 1000, speakerId: null },
+                {
+                  id: 'one',
+                  text: 'یەکەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+                {
+                  id: 'two',
+                  text: 'دووەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '2',
+                  pilotAfterReviewEventId: null,
+                },
               ],
               heldByOthers: 0,
               pendingTotal: 2,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        if (url.includes('/api/playback/start')) {
+          const body = JSON.parse(String(init?.body ?? '{}')) as {
+            id: 'one' | 'two';
+            rowVersion: string;
+            clientAttemptId: string;
+          };
+          const playbackReceiptId =
+            body.id === 'one'
+              ? '11111111-1111-4111-8111-111111111111'
+              : '22222222-2222-4222-8222-222222222222';
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              clientAttemptId: body.clientAttemptId,
+              playbackReceiptId,
+              segmentId: body.id,
+              segmentRevision: Number(body.rowVersion),
+              clipDurationMs: 1000,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        if (url.includes('/api/playback/finalize')) {
+          const body = JSON.parse(String(init?.body ?? '{}')) as { playbackReceiptId: string };
+          const first = body.playbackReceiptId.startsWith('11111111');
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              playbackReceiptId: body.playbackReceiptId,
+              segmentId: first ? 'one' : 'two',
+              segmentRevision: first ? 1 : 2,
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
           );
@@ -1288,10 +1733,25 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
-                { id: 'one', text: 'یەکەم', durationMs: 1000, speakerId: null },
-                { id: 'two', text: 'دووەم', durationMs: 1000, speakerId: null },
+                {
+                  id: 'one',
+                  text: 'یەکەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+                {
+                  id: 'two',
+                  text: 'دووەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '2',
+                  pilotAfterReviewEventId: null,
+                },
               ],
               heldByOthers: 0,
               pendingTotal: 2,
@@ -1571,7 +2031,7 @@ test.describe('Couch Review phone page', () => {
       const results = await new AxeBuilder({ page }).withTags(WCAG_AA).analyze();
       for (const v of results.violations) {
         for (const n of v.nodes) {
-          console.log(
+          console.error(
             `[axe:${scheme}] ${v.id}: ${n.target.join(' ')} — ${n.failureSummary?.split('\n')[1] ?? ''}`,
           );
         }

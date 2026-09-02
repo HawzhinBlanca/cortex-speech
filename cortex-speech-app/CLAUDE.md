@@ -15,22 +15,23 @@ changes: if it is in the canon, the discussion is over.
 Cortex Speech is an **offline-first desktop app** (Tauri v2 + Svelte 5 + Rust) for
 **Central Kurdish (Sorani)** speech transcription, transcript curation, and dataset export.
 
-- Local ASR: **Meta OmniASR CTC** via **sherpa-onnx** + **Silero VAD** (no cloud needed).
-- Optional, **consent-gated** cloud: ElevenLabs Scribe (STT) and OpenRouter (LLM refine, reaches Gemini-class models).
-- **Cloud-ASR policy (owner, strict):** the ONLY approved cloud ASR/judge for Central Kurdish is
-  **Gemini 2.5 Pro** (`gemini-2.5-pro` direct or `google/gemini-2.5-pro` via OpenRouter); ElevenLabs
-  **Scribe** is the only other approved cloud STT. **Never use or suggest Qwen-family ASR for ckb** —
+- Production ASR: pinned **OmniASR-7B + Kurdish LoRA** WSL service; unavailable means a hard stop.
+- Optional, **consent-gated** cloud: Gemini 2.5 Pro/OpenRouter for advisory judging or refinement only.
+- **Cloud-audio policy (owner, strict):** There is no shipped cloud-ASR drafting path. Gemini 2.5 Pro
+  (`gemini-2.5-pro` direct or `google/gemini-2.5-pro` via OpenRouter) may be used only as the
+  consent-gated advisory audio judge; it is never a draft fallback. ElevenLabs Scribe is removed
+  from the shipped runtime/UI. **Never use or suggest
+  Qwen-family ASR for ckb** —
   it has no Sorani support (measured). Any new cloud judge requires a measured ckb CER on the frozen
   gold set before it may be configured.
-- Storage: SQLite + FTS5 search. ~102 Tauri IPC commands. EN/CKB (RTL) localized UI.
+- Storage: SQLite + FTS5 search. Tauri IPC backend. EN/CKB (RTL) localized UI.
 - Workflow: import -> VAD chunk -> ASR -> (optional refine) -> review/annotate -> validate -> verify -> export (JSON/JSONL/CSV/Parquet/HuggingFace/WAV).
 
 ## Model lock (owner rule, 2026-08-06 — CRUCIAL)
 
-**Never change the AI models.** The Sorani-adapted **OmniASR-7B champion** and the embedded
-**fine-tuned MMS-1B** are fixed infrastructure. Do NOT propose replacing either because a newer model
-exists — small, Kurdish-ADAPTED models do Sorani well, while the headline general models do not
-support `ckb` at all.
+**Never change the production AI model.** The Sorani-adapted **OmniASR-7B champion** is fixed
+infrastructure. Do NOT propose replacing it because a newer model exists. Smaller/MMS models are
+offline diagnostics only; they are not production alternatives.
 
 Verified by the owner 2026-08-06 and explicitly killed: **Qwen3-ASR** (30 languages, Kurdish not among
 them) and **Voxtral Transcribe 2** (13 languages, Kurdish not among them). A swap also invalidates
@@ -38,28 +39,26 @@ every measured CER on the frozen eval set, so it is never a cheap experiment.
 
 Exactly two things are permitted, and nothing else without the owner raising it first:
 
-1. Benchmarking Meta **OmniASR v2's 300M/1B CTC variants** as faster LOCAL FALLBACKS — same family,
-   not a replacement for the champion.
+1. Benchmarking Meta **OmniASR v2's 300M/1B CTC variants** in explicit offline diagnostics — same
+   family, never a production fallback or replacement for the champion.
 2. Keeping **VibeVoice/BitNet** on a research watchlist; there is no published `ckb` evidence yet.
 
-Cloud judge/STT is locked separately: Gemini 2.5 Pro only, plus ElevenLabs Scribe for STT (see the
-cloud-ASR policy above).
+Cloud judging is locked separately: Gemini 2.5 Pro only (see the policy above).
 
 ## The champion is not optional — and failure is a HARD STOP (owner rule, 2026-08-11)
 
 Two rules, one purpose: never let the app quietly produce a worse result than it claims.
 
-**1. The champion drafts everything.** When `asr_model_size = WSL7B`, the **OmniASR-7B champion**
-transcribes EVERY clip. Nothing may divert it to a smaller model — not `use_finetuned_asr`, not a
-decode error, not a busy server. The smaller engines (fine-tuned MMS, CTC-300M/1B) are **explicit
-optional extras**: the owner may select one deliberately, and they may serve as *hypotheses* for the
-jury. They are never an automatic substitute.
+**1. The champion drafts everything.** The **OmniASR-7B champion** transcribes EVERY production clip.
+Nothing may divert it to a smaller model — not stale settings, `use_finetuned_asr`, a decode error,
+or a busy server. Fine-tuned MMS and CTC-300M/1B remain offline diagnostic/evaluation engines only.
 
 *Why this is a rule:* measured 2026-08-10, a 494-clip review queue was drafted **494/494 by
 `finetuned-mms-ckb`** while `asr_model_size` said WSL7B and the champion sat up and idle on both GPUs.
-No UI, DB field or gate said so; the owner found it by reading the transcripts. Measured gap on
-identical FLEURS ckb clips: **7.03% CER vs 9.32%** — and the app runs the int8 build, whose own
-baseline is 21.00%.
+No UI, DB field or gate said so; the owner found it by reading the transcripts. Historical
+duplication-weighted experiments showed that the engines were materially different, but those
+figures are not current model evidence. The operational lesson does not depend on an accuracy claim:
+silent substitution destroys provenance and must hard-stop.
 
 **2. Stop on the first failure. Never degrade, never continue.** If any stage fails for any clip —
 ASR, refinement, alignment, decode — the run **halts** and reports the cause. Do not skip the clip,
@@ -95,6 +94,31 @@ This project's entire credibility rests on real, never fabricated, results.
   law** — machine code never writes it; `scripts/check_review_serving_provenance.py` (verify-10 gate
   `review-serving-provenance`) enforces both invariants on the live database every sweep.
 
+### Auditor discipline — measure before you assert (added 2026-08-25, after a real failure)
+
+The honesty law above governs numbers. This governs CLAIMS, and it was written because an audit
+session reported four things as fact that measurement then contradicted.
+
+- **A claim about LIVE impact requires a live query FIRST.** "Reviewers are unpaid" needs its
+  `SELECT COUNT(*)` before the sentence exists. That session published "playback-evidenced review
+  work mints zero pay" as an active loss; the two decision tables held **0 rows**. The defect was
+  real, the harm was not.
+- **A failure observed under non-canonical flags is NOT a finding.** Use the repo's exact gate
+  commands (`scripts/verify_10.py`, the Makefile targets). Deviating for speed is fine —
+  `CARGO_TARGET_DIR=<scratch>` dodges the running app's DLL lock — but any failure that deviation
+  produces is void until reproduced canonically. Measured: a scratch target dir hides
+  `scripts/cortex_7b_client.py` from `resolve_wsl_7b_client`, which walks up from `current_exe()`,
+  manufacturing 5 `pipeline::tests` failures that look pre-existing. `cargo test` in the NORMAL
+  `target/` works even with the app running; the DLL lock only bites release artifacts.
+- **A baseline must vary the SUSPECTED CAUSE, not just the code.** Stashing the diff while keeping
+  the same flag is a fake control: it reproduces the artifact and reads as proof. This is the
+  write-path/serving-path law pointed at the auditor — checking your own reasoning is not verification.
+- **Report the defect, not a culprit.** Findings name the file, the commit and the fix. They do not
+  name the person, and never the owner: he ordered the audit and reviews everyone's work.
+- **A pin can enforce the bug.** Before fixing a defect, grep `scripts/test_*.py` for the symbol or
+  string you are changing — `test_rust_runtime_panic_policy.py` once listed the lockfile-deleting
+  call as REQUIRED. Invert the pin in the same commit; never weaken it.
+
 ## Environment realities (read before acting)
 
 The app targets **Windows**; the Cowork sandbox is **Linux with node/npm/python3 only — no Rust toolchain**.
@@ -120,7 +144,7 @@ After a run, present results **both** ways so the user can approve 100%:
 
 ## Privacy + consent (hard guardrails)
 
-- Default is **fully offline**. Cloud LLM and cloud STT are **off by default** and require explicit opt-in (`cloud_llm_opt_in`, `cloud_stt_opt_in`, `jury_cloud_opt_in`). `settings.effective_llm_mode()` downgrades cloud -> none when not opted in; `pipeline.rs` enforces it in both `llm_refinement_permitted()` and `build_refiner()`. **Never** send audio/transcript to a provider without acknowledged consent, and never make cloud load-bearing in the default path.
+- Default is **fully offline**. There is no shipped cloud-ASR path. Optional cloud LLM refinement and Gemini advisory judging are **off by default** and require explicit opt-in (`cloud_llm_opt_in`, `jury_cloud_opt_in`). `settings.effective_llm_mode()` downgrades cloud -> none when not opted in; `pipeline.rs` enforces it in both `llm_refinement_permitted()` and `build_refiner()`. **Never** send audio/transcript to a provider without acknowledged consent, and never make cloud load-bearing in the default path.
 - Treat **voice as biometric** (GDPR Art. 9): enforce consent + license + attribution before any publish/train/redistribute step.
 - **Owner's rights declaration (2026-08-14, standing and FINAL).** Every audio and voice recording the
   owner supplies carries **full permission and total authority**, including **public use**. All
@@ -169,7 +193,7 @@ Run the relevant gates and paste the real output. A fix without a regression gat
 ## Key map
 
 - Backend: `src-tauri/src/` — `commands.rs` (IPC), `pipeline.rs`, `asr.rs`, `audio.rs`, `db.rs`, `normalizer.rs`, `eval.rs`, `models.rs`, `settings.rs`, `jury/`, `export*.rs`.
-- Frontend: `src/App.svelte` (shell) + `src/lib/*.svelte` (`AudioPlayer`, `ReviewMode`, `ReviewInbox`, `ValidationPanel`, `DiffView`, `StatsDashboard`, ...).
+- Frontend: `src/App.svelte` (bounded composition root), `src/Workstation.svelte` (legacy runtime orchestration pending further strangler extraction), and `src/lib/*.svelte` (`AudioPlayer`, `ReviewMode`, `ReviewInbox`, `ValidationPanel`, `DiffView`, `StatsDashboard`, ...).
 - Docs: `../AGENT_CHARTER.md` (repo root), `ROAD_TO_10.md`, `docs/REAL_READINESS_PLAN.md`, `docs/HARDENING_PLAN_10.md`, `docs/COWORK_PIPELINE_PROMPT.md`.
 - Scripts: `scripts/*.py` (dataset build/review + policy gates), `e2e_real_app.cjs` (real-app driver).
 

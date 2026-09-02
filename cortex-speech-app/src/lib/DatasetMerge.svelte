@@ -28,7 +28,7 @@
       showDatasetMerge.set(false);
       segments.load();
     } catch (e) {
-      notifications.error($t('merge.failed'), { detail: String(e) });
+      notifications.error($t('merge.failed'), { cause: e });
     } finally {
       merging = false;
     }
@@ -44,6 +44,8 @@
   class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
   role="dialog"
   aria-modal="true"
+  aria-labelledby="dataset-merge-title"
+  aria-describedby="dataset-merge-description"
   tabindex="-1"
   use:focusTrap
   onkeydown={(e) => {
@@ -55,14 +57,19 @@
 >
   <div class="card w-full max-w-2xl shadow-2xl flex flex-col max-h-[80vh]">
     <header class="flex items-center justify-between p-4 border-b border-cortex-800/50">
-      <h2 class="text-sm font-bold text-cortex-200 uppercase tracking-widest">
+      <h2
+        id="dataset-merge-title"
+        class="text-sm font-bold text-cortex-200 uppercase tracking-widest"
+      >
         {$t('merge.title')}
       </h2>
-      <button class="text-cortex-500 hover:text-cortex-300" onclick={close}>✕</button>
+      <button class="text-cortex-500 hover:text-cortex-300 text-xs" onclick={close}>
+        {$t('close')}
+      </button>
     </header>
 
     <div class="flex-1 p-4 space-y-4 flex flex-col overflow-hidden">
-      <p class="text-xs text-cortex-400">
+      <p id="dataset-merge-description" class="text-xs text-cortex-400">
         {$t('merge.bodyHint')}
       </p>
 
@@ -72,7 +79,8 @@
            own tokens. -->
       <textarea
         class="flex-1 bg-cortex-900 border border-cortex-800 rounded-lg p-3 text-[10px] font-mono text-cortex-300 focus:outline-none focus:border-cortex-600 resize-none"
-        placeholder={'[{"id": "...", "rawTranscript": "..." }, ...]'}
+        placeholder={$t('merge.jsonPlaceholder')}
+        aria-label={$t('merge.jsonInputLabel')}
         bind:value={jsonContent}
         spellcheck="false"
         dir="ltr"

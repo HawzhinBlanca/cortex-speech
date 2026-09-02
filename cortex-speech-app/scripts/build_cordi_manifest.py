@@ -4,7 +4,8 @@
 Writes `<clip_path>\\t<reference>` TSVs — the format `scorecard_7b.py` and `scorecard_finetuned.py`
 already consume — so the CER, the seed-42 bootstrap CI and the normalization are the SAME code that
 produced every other measured number in this repo. Inventing a second CER path here would make the
-dialect numbers non-comparable with the 7.03% headline, which is the whole point of measuring them.
+dialect numbers non-comparable with the historical duplication-weighted FLEURS archive, which is the
+whole point of measuring them.
 
 CORDI ships one `.ogg` per utterance and labels DIALECT per film (not per utterance), so the label is
 joined from `metadata.tsv` by film id.

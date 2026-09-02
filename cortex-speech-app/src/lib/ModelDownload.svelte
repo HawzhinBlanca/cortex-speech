@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { listen, type Event } from '@tauri-apps/api/event';
+  import { subscribeDesktopEvent, type DesktopEvent as Event } from './events';
   import { modelsStatus, modelsDownloadAll } from './commands';
   import { notifications } from './stores/notificationStore';
   import { isTauriRuntime } from './runtime';
@@ -21,49 +21,44 @@
   const tauriAvailable = isTauriRuntime();
 
   async function loadStatus() {
-    if (!tauriAvailable) {
-      models = [];
-      loading = false;
-      return;
-    }
     loading = true;
     try {
       models = await modelsStatus();
     } catch (e: unknown) {
-      notifications.error($t('models.checkFailed'), { detail: String(e) });
+      notifications.error($t('models.checkFailed'), { cause: e });
     } finally {
       loading = false;
     }
   }
 
   async function downloadAll() {
-    if (!tauriAvailable) {
-      notifications.info($t('desktopRuntimeRequired'));
-      return;
-    }
     downloading = true;
     modelProgress = {};
     try {
       const result = await modelsDownloadAll();
       if (result.total === 0 && result.skipped > 0) {
         notifications.info($t('models.noneAvailable'), {
-          detail: `${result.skipped} missing optional model files require a pinned checksum before automatic download.`,
+          detail: $t('models.skippedMissingPins', { count: String(result.skipped) }),
         });
       } else if (result.failed > 0) {
         notifications.warning($t('models.completedWithFailures'), {
-          detail: `${result.downloaded} downloaded, ${result.failed} failed, ${result.skipped} skipped.`,
+          publicDetail: $t('models.downloadSummary', {
+            downloaded: String(result.downloaded),
+            failed: String(result.failed),
+            skipped: String(result.skipped),
+          }),
         });
       } else {
         notifications.success($t('models.completed'), {
           detail:
             result.skipped > 0
-              ? `${result.skipped} unavailable model files were skipped.`
+              ? $t('models.skippedUnavailable', { count: String(result.skipped) })
               : undefined,
         });
       }
       await loadStatus();
     } catch (e: unknown) {
-      notifications.error($t('models.downloadFailed'), { detail: String(e) });
+      notifications.error($t('models.downloadFailed'), { cause: e });
     } finally {
       downloading = false;
       overallProgress = { current: 0, total: 0, status: '' };
@@ -77,7 +72,7 @@
     }
     loadStatus();
 
-    const unlisten = listen<ModelDownloadProgress>(
+    const unlisten = subscribeDesktopEvent<ModelDownloadProgress>(
       'model-download-progress',
       (event: Event<ModelDownloadProgress>) => {
         const payload = event.payload;
@@ -92,10 +87,10 @@
           }
         } else if (payload.type === 'completed') {
           downloading = false;
-          // Refresh the per-model status so the ✓ / size column reflects the just-finished download.
+          // Refresh the per-model status so the availability/size column reflects the finished download.
           // The awaited downloadAll() path also refreshes, but if the backend signals completion via
-          // THIS event (before/after that await resolves) the row would otherwise stay stale (○ / "Not
-          // downloaded") until the panel is reopened. loadStatus() is a read; safe to call again here.
+          // THIS event (before/after that await resolves) the row would otherwise stay stale as
+          // unavailable until the panel is reopened. loadStatus() is a read; safe to call again here.
           loadStatus();
         }
       },
@@ -146,15 +141,13 @@
         class="flex flex-col gap-1.5 p-2 bg-cortex-900/50 rounded border border-transparent hover:border-cortex-800/50 transition-colors"
       >
         <div class="flex items-center gap-2 text-xs">
-          {#if model.downloaded}
-            <span class="text-emerald-400">✓</span>
-          {:else}
-            <span class="text-cortex-500">○</span>
-          {/if}
-          <span class="flex-1 text-cortex-300">{model.name}</span>
+          <span class={model.downloaded ? 'text-emerald-400' : 'text-cortex-500'}>
+            {model.downloaded ? $t('models.downloaded') : $t('models.notDownloaded')}
+          </span>
+          <bdi dir="ltr" class="flex-1 text-cortex-300">{model.name}</bdi>
           <span class="text-cortex-500 text-[10px]">
-            {#if model.size_bytes}
-              {(model.size_bytes / 1048576).toFixed(1)} MB
+            {#if model.sizeBytes}
+              {(model.sizeBytes / 1048576).toFixed(1)} MB
             {:else}
               {$t('models.notDownloaded')}
             {/if}

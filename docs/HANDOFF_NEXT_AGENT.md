@@ -102,7 +102,8 @@ NOT-BUILT.
 (5 targets) into nightly — still open (windows-msvc cannot link ASAN; Linux-CI leg).
 
 **WS5 — accuracy levers (optional, lowest priority):** KenLM shallow fusion + pseudo-labeling. The
-champion is already measured best (7.03% CER FLEURS-ckb), so this is upside, not ship-critical.
+historical duplication-weighted run reported 7.03% CER on FLEURS-ckb, but it is not current champion
+attestation or a defensible SOTA claim; accuracy work remains outside product certification.
 
 **WS7 — codebase health:** reconcile the separate CORTEX workspace checkout (branch
 `goal-9.5-upgrades`) FIRST; then pagination/overlap-stitch/engine-pool/ENOSPC; a11y trap; IPC
@@ -113,11 +114,12 @@ round-trip tests for the ~102 commands; docs; dependabot bumps.
 23 tiered gates, honest verdict (RED / INCOMPLETE / GREEN-PERSONAL-USE), with owner-descoped and
 owner-gated legs always printed.
 
-**Current gate status lives in [STATUS.md](STATUS.md) — generated, never hand-written.** This
+**Gate-status authority is documented in [STATUS.md](STATUS.md).** The current status itself lives
+inside the immutable, hash-validated proof bundle; this tracked page never embeds a commit verdict. This
 paragraph used to restate the last run's tally here, and it went stale the moment any leg flipped
 (it claimed `egress-runtime` and `refinery-lift` were NOT-BUILT for weeks after both shipped).
-Regenerate with `python scripts/verify_10.py --status-md docs/STATUS.md`; the verdict there is
-computed by the same code path that sets the exit code, so the two can never disagree.
+Run `python scripts/verify_10.py`; its proof-local `STATUS.md` is computed by the same code path that
+sets the exit code and is covered by the manifest artifact inventory.
 
 `--static` preserves the CI contract (ci.yml / release.yml call it that way) — never change that.
 

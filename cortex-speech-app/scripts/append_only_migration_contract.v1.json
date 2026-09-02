@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "source": "src-tauri/src/migrations/mod.rs",
+  "normalization": "utf8-lf",
+  "algorithm": "sha256",
+  "migrations": [
+    {
+      "version": 66,
+      "description": "Add non-authoritative crash-safe desktop review drafts",
+      "sourceBlockSha256": "2f06a16934aed36dbd7558685434f097f7408f774fe8c5f3dd7e3e65b65c35ec"
+    },
+    {
+      "version": 67,
+      "description": "Bind desktop playback evidence to server-issued grants and exact interval unions",
+      "sourceBlockSha256": "d980f97f5d58ab662b627bfb1ed31e0c42de6e9ca858f246d12eaf6511a40658"
+    },
+    {
+      "version": 68,
+      "description": "Add exact crash-safe batch operation item authority",
+      "sourceBlockSha256": "c0bf9d8ebc4a8e8221b63a205693f9c4350159a7db3276572e8433d1a98818a6"
+    },
+    {
+      "version": 69,
+      "description": "Add exact global desktop review action order for restart-safe Undo",
+      "sourceBlockSha256": "23c04628748c09175f1307299be3b697ce77ea1c14589551ae3e7d1281a6441d"
+    }
+  ]
+}

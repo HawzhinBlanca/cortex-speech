@@ -3,6 +3,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from policy_python import PolicyEnvironmentError, validate_environment
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
@@ -47,6 +49,16 @@ def remove_pycache() -> None:
 
 
 def main() -> int:
+    try:
+        environment = validate_environment()
+    except PolicyEnvironmentError as error:
+        print(f"Python policy environment FAILED: {error}", file=sys.stderr, flush=True)
+        return 2
+    print(
+        "Python policy environment verified: "
+        f"Python {environment['python']}, lock {str(environment['lockSha256'])[:12]}",
+        flush=True,
+    )
     python_files = sorted(SCRIPTS_DIR.glob("*.py"), key=lambda path: path.name.lower())
     test_files = [path for path in python_files if path.name.startswith("test_")]
 

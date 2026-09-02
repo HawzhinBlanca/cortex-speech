@@ -39,6 +39,28 @@ const SOURCE_DIALECTS: &[(&str, &str)] = &[
     // The original corpus's pre-recovery location. Nothing lives here now (the 1,031 clips were
     // relinked into the tree above), kept so a clip restored from an old snapshot still maps.
     ("SoraniVoice_PC_", SORANI),
+    // A prepared single-speaker TTS set living OUTSIDE the organized tree, so the folder rule above
+    // cannot route it. OWNER-CONFIRMED Sorani, 2026-08-21 ("Lamo is not hawleri, he is sorani"),
+    // which also matches the `ZAR` prefix: the set is cut from the ZarPodcast material, which the
+    // owner filed under `Kurdish Corpora\sorani\`. Mapped explicitly because an
+    // UNMAPPED source is not a neutral state — `reviewer_may_judge` fails closed, so every restricted
+    // reviewer is served nothing from it and the clips sit unreviewable with no error anywhere
+    // (measured 2026-08-17, when 535 pending Sorani clips did exactly that to five reviewers).
+    // Matched on the `ZAR_Lamo` prefix, not on one folder name, so the curated cuts of this set
+    // (`ZAR_Lamo_15H_Gold_TTS`, and whatever the next selection pass is called) are routed the day
+    // they appear. The alternative is remembering to add a line per folder, and forgetting means the
+    // clips are transcribed and then served to NOBODY — silently, because unmapped fails closed.
+    (r"ZAR_Lamo", SORANI),
+    // The prepared Kawa single-speaker set declares `"dialect": "Sorani-Hawleri"` in its own
+    // `kawa_harvest_report.json`. Keep the exact output-folder mapping so Sorani-only reviewers are
+    // never handed it after the voice-organized pool imports the final WAVs.
+    (r"Kawa_TTS_Dataset", HAWLERI),
+    // The owner's authoritative dataset registry records the prepared Halwest voice as
+    // "Standard Sorani" at this exact source folder (Obsidian Brain / Projects /
+    // Kurdish Sorani Dataset.md, updated 2026-08-23). The local harvest report proves the speaker
+    // and folder but omits dialect, so bind the precise owner-registered folder rather than infer
+    // from the speaker name or filename.
+    (r"Halwest_TTS_Dataset", SORANI),
 ];
 
 /// The dialect of the recording this clip was cut from, or `None` when the source is not mapped.
@@ -47,12 +69,20 @@ pub fn dialect_of(audio_path: &str) -> Option<&'static str> {
     // reached us through a URL, an import manifest or a test may use '/', and a dialect that depends
     // on which slash a caller happened to use is the silent mislabel this module exists to prevent.
     let normalized = audio_path.replace('/', "\\");
-    let name = Path::new(&normalized).file_name().and_then(|n| n.to_str()).unwrap_or(&normalized).to_string();
+    // Windows paths are case-insensitive. Treating their spelling as case-sensitive made the same
+    // recording routable or unroutable depending only on how a drive/folder name was cased by the
+    // importer. The configured fragments are ASCII, so ASCII folding is both sufficient and avoids
+    // changing any non-ASCII corpus-name bytes.
+    let folded = normalized.to_ascii_lowercase();
+    let name = Path::new(&folded).file_name().and_then(|n| n.to_str()).unwrap_or(&folded).to_string();
     // Filename first (it identifies the recording), then the full path (for corpora distinguished by
     // the folder they were imported from rather than by their file names).
     SOURCE_DIALECTS
         .iter()
-        .find(|(frag, _)| name.contains(frag) || normalized.contains(frag))
+        .find(|(frag, _)| {
+            let fragment = frag.to_ascii_lowercase();
+            name.contains(&fragment) || folded.contains(&fragment)
+        })
         .map(|(_, dialect)| *dialect)
 }
 
@@ -61,7 +91,7 @@ pub fn dialect_of(audio_path: &str) -> Option<&'static str> {
 pub fn reviewer_may_judge(allowed: Option<&[String]>, audio_path: &str) -> bool {
     let Some(allowed) = allowed else { return true };
     match dialect_of(audio_path) {
-        Some(d) => allowed.iter().any(|a| a == d),
+        Some(d) => allowed.iter().any(|a| a.trim().eq_ignore_ascii_case(d)),
         // Unmapped source + a restricted reviewer = refuse. Fail closed.
         None => false,
     }
@@ -73,49 +103,107 @@ pub fn reviewer_may_judge(allowed: Option<&[String]>, audio_path: &str) -> bool 
 /// { "Rubar": ["hawleri", "sorani"], "Roza": ["sorani"] }
 /// ```
 ///
-/// A missing file, or a reviewer absent from it, means UNRESTRICTED — so adding this file cannot
+/// A MISSING file, or a reviewer absent from it, means UNRESTRICTED — so adding this file cannot
 /// silently take work away from someone who was already reviewing.
 ///
-/// Parsed ENTRY BY ENTRY, not as one strict map, and that is the whole point. Deserializing straight
-/// into `HashMap<String, Vec<String>>` makes the file all-or-nothing: ONE value that is not an array
-/// of strings fails the parse, and the fallback is "unrestricted", so the entire protection silently
-/// switches off while the file still looks correct to anyone reading it.
+/// A file that EXISTS but cannot be honoured is `Err`, and the caller must serve NOTHING
+/// (owner instruction 2026-08-20 — present-but-broken policy files fail CLOSED). The old contract
+/// failed open — "not even JSON" meant every reviewer unrestricted — which is the 2026-08-16
+/// incident's failure mode wearing a different trigger: the protection off while the file sits on
+/// disk looking like it is on. A stopped queue is noticed in minutes; 13 wrong-dialect decisions
+/// were noticed in days.
 ///
-/// MEASURED 2026-08-16: that is exactly what happened. The file shipped with a `"_comment"` key —
-/// written to tell the owner how to edit it — whose value is a STRING. Every reviewer was therefore
-/// unrestricted from the moment the roster was installed, including the three who do not speak
-/// Hawleri and whose 13 wrong-dialect decisions are the reason this module exists. A helpful comment
-/// turned the safety feature off.
-///
-/// So: a value that is an array of strings is a roster entry, anything else is skipped and logged,
-/// and a reviewer only ever ends up restricted by a line that actually says so.
-pub fn load_roster(data_dir: &Path) -> HashMap<String, Vec<String>> {
+/// Within a file that IS JSON, entries are still judged one by one:
+///   * a value that is an array of strings is a roster entry;
+///   * a key starting with `_` is a comment and is skipped — MEASURED 2026-08-16, the file shipped
+///     with a `"_comment"` string, and parsing the whole map strictly would have made a helpful
+///     comment fatal (then: silently fail open; now: needlessly stop the line);
+///   * any OTHER non-list value is `Err`. It is a typo'd RESTRICTION — `"Roza": "sorani"` — and
+///     skipping it quietly un-restricts exactly the reviewer the line was written to restrict.
+pub fn load_roster(data_dir: &Path) -> Result<HashMap<String, Vec<String>>, String> {
     let path = data_dir.join("reviewer_dialects.json");
-    let Ok(text) = std::fs::read_to_string(&path) else { return HashMap::new() };
-    let parsed: HashMap<String, serde_json::Value> = match serde_json::from_str(&text) {
-        Ok(map) => map,
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
         Err(e) => {
-            // Still unrestricted, but this one really is unusable: the file is not even JSON.
             tracing::error!(
-                "reviewer_dialects.json is not valid JSON ({e}) — every reviewer is unrestricted until it is fixed"
+                "reviewer_dialects.json exists but is unreadable ({e}) — queues serve NOTHING until it is fixed"
             );
-            return HashMap::new();
+            return Err(format!("reviewer_dialects.json is unreadable: {e}"));
         }
     };
+    parse_roster_text(&text)
+}
+
+/// Strict, non-mutating parser shared by live serving and snapshot promotion/preflight.
+pub(crate) fn parse_roster_text(text: &str) -> Result<HashMap<String, Vec<String>>, String> {
+    let parsed: HashMap<String, serde_json::Value> = serde_json::from_str(text).map_err(|e| {
+        tracing::error!("reviewer_dialects.json is not valid JSON ({e}) — queues serve NOTHING until it is fixed");
+        format!("reviewer_dialects.json is not valid JSON: {e}")
+    })?;
     let mut roster: HashMap<String, Vec<String>> = HashMap::new();
     for (name, value) in parsed {
+        if name.starts_with('_') {
+            tracing::info!("reviewer_dialects.json: ignoring comment key \"{name}\"");
+            continue;
+        }
         let dialects: Option<Vec<String>> =
             value.as_array().and_then(|items| items.iter().map(|v| v.as_str().map(str::to_string)).collect());
         match dialects {
             Some(dialects) => {
-                roster.insert(name, dialects);
+                if dialects.is_empty() {
+                    tracing::error!(
+                        "reviewer_dialects.json: \"{name}\" has no dialects — queues serve NOTHING until it is fixed"
+                    );
+                    return Err(format!("entry \"{name}\" must name at least one dialect"));
+                }
+                let mut normalized_dialects = Vec::with_capacity(dialects.len());
+                for dialect in dialects {
+                    let normalized = dialect.trim().to_ascii_lowercase();
+                    if !matches!(normalized.as_str(), HAWLERI | SORANI | BADINI) {
+                        tracing::error!(
+                            "reviewer_dialects.json: \"{name}\" contains unknown dialect \"{dialect}\" — queues serve NOTHING until it is fixed"
+                        );
+                        return Err(format!(
+                            "entry \"{name}\" contains unknown dialect \"{dialect}\" (allowed: {HAWLERI}, {SORANI}, {BADINI})"
+                        ));
+                    }
+                    if !normalized_dialects.contains(&normalized) {
+                        normalized_dialects.push(normalized);
+                    }
+                }
+                // Two keys that are the same NAME under the session layer's matching (see
+                // `allowed_for`) are a broken file: which restriction binds would depend on hash
+                // iteration order, and one of them was certainly a typo of the other.
+                if let Some(existing) = roster.keys().find(|k| k.trim().eq_ignore_ascii_case(name.trim())) {
+                    tracing::error!(
+                        "reviewer_dialects.json: \"{name}\" and \"{existing}\" name the same reviewer — queues serve NOTHING until it is fixed"
+                    );
+                    return Err(format!("\"{name}\" and \"{existing}\" name the same reviewer"));
+                }
+                roster.insert(name, normalized_dialects);
             }
-            // A comment key, or a typo. Named in the log so a REAL entry that was meant to restrict
-            // somebody cannot be skipped quietly.
-            None => tracing::info!("reviewer_dialects.json: ignoring \"{name}\" (not a list of dialect names)"),
+            None => {
+                tracing::error!(
+                    "reviewer_dialects.json: \"{name}\" is not a list of dialect names — queues serve NOTHING until it is fixed"
+                );
+                return Err(format!("entry \"{name}\" is not a list of dialect names (prefix comment keys with _)"));
+            }
         }
     }
-    roster
+    Ok(roster)
+}
+
+/// The roster entry for `reviewer`, matched the way the SESSION layer matches names: trimmed and
+/// ASCII-case-insensitive (`normalize_reviewers` treats "roza" and "Roza" as the same person).
+///
+/// 2026-08-20 hunt: the lookup was an exact `HashMap::get`, so a roster key differing from the live
+/// session name by case or a stray space LOADED cleanly and bound NOBODY — the reviewer it named
+/// was served unrestricted, which is the 2026-08-16 wrong-dialect incident reproduced through a
+/// typo'd KEY instead of a typo'd value. The two layers must agree on what "the same name" means.
+pub fn allowed_for<'r>(roster: &'r HashMap<String, Vec<String>>, reviewer: &str) -> Option<&'r Vec<String>> {
+    let want = reviewer.trim();
+    roster.iter().find(|(name, _)| name.trim().eq_ignore_ascii_case(want)).map(|(_, dialects)| dialects)
 }
 
 #[cfg(test)]
@@ -143,7 +231,16 @@ mod tests {
         // nothing else. With a roster in place they get nothing rather than the wrong dialect.
         let sorani_only = vec![SORANI.to_string()];
         assert!(!reviewer_may_judge(Some(&sorani_only), r"D:\x\KBHP-EP07.wav"));
+        assert!(!reviewer_may_judge(Some(&sorani_only), r"D:\Kawa_TTS_Dataset\wavs\kawa_0001.wav"));
         assert!(reviewer_may_judge(Some(&sorani_only), r"C:\x\SoraniVoice_PC_\clip.wav"));
+    }
+
+    #[test]
+    fn owner_registered_halwest_folder_is_sorani() {
+        let path = r"D:\Halwest_TTS_Dataset\wavs\halwest_000001.wav";
+        assert_eq!(dialect_of(path), Some(SORANI));
+        assert!(reviewer_may_judge(Some(&[SORANI.to_string()]), path));
+        assert!(!reviewer_may_judge(Some(&[HAWLERI.to_string()]), path));
     }
 
     #[test]
@@ -187,6 +284,13 @@ mod tests {
     }
 
     #[test]
+    fn windows_path_casing_cannot_change_the_dialect() {
+        assert_eq!(dialect_of(r"d:\KURDISH CORPORA\SORANI\zarpodcast\clip.wav"), Some(SORANI));
+        assert_eq!(dialect_of(r"d:\kurdish corpora\SORANI-HAWLERI\kbhp\ep1.wav"), Some(HAWLERI));
+        assert_eq!(dialect_of(r"d:\sets\zar_lamo_15h_gold_tts\clip.wav"), Some(SORANI));
+    }
+
+    #[test]
     fn a_comment_key_does_not_switch_the_whole_roster_off() {
         // THE INCIDENT, 2026-08-16. The roster file shipped with a "_comment" string explaining how
         // to edit it. Parsed as one strict HashMap<String, Vec<String>> that is a hard error, and the
@@ -199,7 +303,7 @@ mod tests {
             r#"{ "_comment": "how to edit this file", "Roza": ["sorani"], "Rubar": ["hawleri", "sorani"] }"#,
         )
         .unwrap();
-        let roster = load_roster(dir.path());
+        let roster = load_roster(dir.path()).expect("an _-prefixed comment must not break the file");
         assert_eq!(roster.get("Roza"), Some(&vec![SORANI.to_string()]), "a real entry must still bind");
         assert_eq!(roster.len(), 2, "the comment is skipped, the two reviewers are kept: {roster:?}");
         assert!(
@@ -209,10 +313,70 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_is_not_json_at_all_leaves_everyone_unrestricted_rather_than_stranded() {
-        // The other direction, and it stays deliberate: an unusable file must not empty every queue.
+    fn a_file_that_is_not_json_at_all_fails_closed_not_open() {
+        // Owner instruction 2026-08-20. A broken file used to mean "everyone unrestricted" — the
+        // 2026-08-16 incident's outcome by another road. Present-but-unusable now stops the queue
+        // loudly instead of switching the guard off quietly.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("reviewer_dialects.json"), "{ not json").unwrap();
-        assert!(load_roster(dir.path()).is_empty());
+        assert!(load_roster(dir.path()).is_err(), "a broken roster must stop the line, not unrestrict it");
+    }
+
+    #[test]
+    fn a_missing_file_is_still_unrestricted() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_roster(dir.path()), Ok(HashMap::new()), "no file = the behaviour before the roster existed");
+    }
+
+    #[test]
+    fn a_roster_key_binds_its_reviewer_across_case_and_whitespace() {
+        // 2026-08-20 hunt: the session layer treats "roza" and "Roza" as the SAME person, but the
+        // roster lookup was an exact HashMap::get — so a key typed in the wrong case loaded cleanly
+        // and bound nobody, serving its reviewer the full queue. The 2026-08-16 incident, back
+        // through a typo'd KEY.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("reviewer_dialects.json"), r#"{ "roza ": ["sorani"] }"#).unwrap();
+        let roster = load_roster(dir.path()).unwrap();
+        let allowed = allowed_for(&roster, "Roza").expect("'roza ' must bind the live reviewer 'Roza'");
+        assert_eq!(allowed, &vec![SORANI.to_string()]);
+        assert!(allowed_for(&roster, "Rubar").is_none(), "and nobody else");
+    }
+
+    #[test]
+    fn two_keys_naming_the_same_reviewer_fail_closed() {
+        // Which restriction would bind depends on hash iteration order — one is certainly a typo of
+        // the other, and a file that cannot say what it means must stop the line, not guess.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("reviewer_dialects.json"), r#"{ "Roza": ["sorani"], "roza": ["hawleri"] }"#)
+            .unwrap();
+        assert!(load_roster(dir.path()).is_err(), "case-colliding keys are one broken file");
+    }
+
+    #[test]
+    fn a_typoed_restriction_fails_closed_instead_of_unrestricting_its_reviewer() {
+        // `"Roza": "sorani"` is a line somebody wrote to RESTRICT Roza. Skip-and-log honoured the
+        // file while silently un-restricting exactly her — the one reviewer the line was about.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("reviewer_dialects.json"), r#"{ "Roza": "sorani" }"#).unwrap();
+        let err = load_roster(dir.path()).expect_err("a typo'd entry must stop the line");
+        assert!(err.contains("Roza"), "the error names the broken entry: {err}");
+    }
+
+    #[test]
+    fn roster_dialects_are_normalized_and_unknown_or_empty_values_fail_closed() {
+        let normalized_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            normalized_dir.path().join("reviewer_dialects.json"),
+            r#"{ "Roza": [" Sorani ", "SORANI", "Hawleri"] }"#,
+        )
+        .unwrap();
+        let roster = load_roster(normalized_dir.path()).unwrap();
+        assert_eq!(roster.get("Roza"), Some(&vec![SORANI.to_string(), HAWLERI.to_string()]));
+
+        for invalid in [r#"{ "Roza": ["soranii"] }"#, r#"{ "Roza": [] }"#] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("reviewer_dialects.json"), invalid).unwrap();
+            assert!(load_roster(dir.path()).is_err(), "invalid roster entry must stop the line: {invalid}");
+        }
     }
 }

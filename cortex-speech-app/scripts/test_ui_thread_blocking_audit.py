@@ -54,11 +54,6 @@ FREEZERS: dict[str, tuple[str, str]] = {
     # now in test_command_main_thread_policy.py's ASYNC_SLOW_COMMANDS ratchet. With this, the only
     # remaining freezer is start_champion_engine (a detached powershell spawn whose freeze is just
     # process-creation latency).
-    # MIGRATED 2026-07-16: transcribe_audio_with_scribe — blocking Scribe POST moved to run_blocking
-    # (consent/key/DB gates stay eager); in the ASYNC ratchet.
-    # MIGRATED 2026-07-16: add_scribe_votes — the decode+POST loop moved to run_blocking (consent/key
-    # gates + gather stay eager; per-insert brief db_arc lock); in the ASYNC ratchet. With this, every
-    # UI-WIRED freezer from the original 13 is off the main thread — the 3 below are unwired/dead/MED.
     # MIGRATED 2026-07-16: models_download + models_download_all — blocking HTTP download moved to
     # run_blocking; in the ASYNC ratchet.
     # Subprocess spawns / WSL probes that block the caller.
@@ -86,8 +81,6 @@ OFFLOADED_HIGH = [
     "import_audio_file",
     "resume_interrupted_import",
     "batch_transcribe",
-    "batch_verify",
-    "batch_assign_speaker",
     "batch_normalize",
     "run_wsl_refinement",
     # Detached subprocess launcher: spawns powershell (CREATE_NO_WINDOW, stdio null) and returns without

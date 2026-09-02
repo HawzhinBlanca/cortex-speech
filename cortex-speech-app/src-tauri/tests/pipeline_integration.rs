@@ -1,7 +1,7 @@
 mod fixtures;
 
 use cortex_speech_app_lib::cache::TranscriptCache;
-use cortex_speech_app_lib::db::Database;
+use cortex_speech_app_lib::db::{Database, SpeechSegment};
 use cortex_speech_app_lib::fingerprint::AudioFingerprint;
 use cortex_speech_app_lib::models::ModelManager;
 use cortex_speech_app_lib::normalizer::SoraniNormalizer;
@@ -105,7 +105,7 @@ fn test_import_directory_with_wav_files() {
 }
 
 #[test]
-fn test_full_pipeline_import_to_delete() {
+fn test_full_pipeline_import_update_search_and_delete_boundaries() {
     let _crash_breadcrumb = fixtures::crash_breadcrumb("pipeline_integration", "test_full_pipeline_import_to_delete");
     let dir = TempDir::new().unwrap();
 
@@ -127,26 +127,42 @@ fn test_full_pipeline_import_to_delete() {
     let seg_440 = segments.iter().find(|s| s.audio_path.contains("step1")).unwrap();
     let seg_660 = segments.iter().find(|s| s.audio_path.contains("step2")).unwrap();
 
-    // Update phase: modify a transcript
+    // Machine update phase: the generic whole-row boundary may refresh a draft, but it must not
+    // relabel that draft as human verified at schema v60+.
     let mut updated = seg_440.clone();
     updated.raw_transcript = "manually edited transcript".to_string();
-    updated.verified = true;
     db.insert_segment(&updated).unwrap();
 
     let fetched = db.get_segment_by_id(&seg_440.id).unwrap().unwrap();
     assert_eq!(fetched.raw_transcript, "manually edited transcript");
-    assert!(fetched.verified);
+    assert!(!fetched.verified, "a generic machine update must not manufacture human verification");
 
     // Search phase: find the updated segment
     let results = db.search_segments("manually").unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, seg_440.id);
 
-    // Delete phase: remove one segment
+    // This segment has only a machine draft: no human decision, campaign binding, or other durable
+    // review authority exists, so ordinary library cleanup remains allowed.
     db.delete_segment(&seg_660.id).unwrap();
+    assert!(db.get_segment_by_id(&seg_660.id).unwrap().is_none());
+
+    // A genuinely authority-free scratch row remains deletable; the guard is precise, not a blanket
+    // ban on segment cleanup.
+    let disposable = SpeechSegment {
+        id: "authority-free-delete".to_string(),
+        audio_path: "authority-free-delete.wav".to_string(),
+        raw_transcript: "machine draft".to_string(),
+        duration_ms: 1_000,
+        ..SpeechSegment::default()
+    };
+    db.insert_segment(&disposable).unwrap();
+    db.delete_segment(&disposable.id).unwrap();
+    assert!(db.get_segment_by_id(&disposable.id).unwrap().is_none());
+
     let remaining = db.get_segments(None).unwrap();
     assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].id, seg_440.id);
+    assert!(remaining.iter().any(|segment| segment.id == seg_440.id));
 }
 
 #[test]
@@ -162,6 +178,9 @@ fn test_import_directory_empty() {
     let db = Database::open(&db_path).unwrap();
     let segments = db.get_segments(None).unwrap();
     assert_eq!(segments.len(), 0, "No files should produce no segments");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let jobs: i64 = conn.query_row("SELECT COUNT(*) FROM import_jobs", [], |row| row.get(0)).unwrap();
+    assert_eq!(jobs, 0, "an empty folder must not create a fake recovery-journal generation");
 }
 
 #[test]

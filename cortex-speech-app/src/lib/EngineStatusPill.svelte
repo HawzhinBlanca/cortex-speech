@@ -35,7 +35,7 @@
       await api.startChampionEngine();
     } catch (e) {
       state = 'offline';
-      notifications.error($t('engine.startFailed'), { detail: String(e) });
+      notifications.error($t('engine.startFailed'), { cause: e });
     }
   }
 

@@ -32,6 +32,12 @@ impl CancellationToken {
         Self { cancelled: self.cancelled.clone() }
     }
 
+    /// True only for handles backed by the exact same cancellation flag. This lets an operation
+    /// clear its own slot without erasing a newer operation's token after an async boundary.
+    pub(crate) fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cancelled, &other.cancelled)
+    }
+
     /// The raw cancellation flag, for lower-level APIs (e.g. the WSL subprocess poller) that take an
     /// `&AtomicBool` directly rather than a `CancellationToken` — so an in-flight external call can be
     /// killed the instant Cancel is pressed, not only between calls.

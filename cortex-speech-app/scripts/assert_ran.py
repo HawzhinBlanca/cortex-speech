@@ -35,10 +35,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import re
-import shlex
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 # Both harnesses print a machine-readable summary. Counting PASSED specifically (not "total") is
 # deliberate: a run where everything was filtered out reports 0 passed, which is the case being caught.
@@ -62,13 +64,27 @@ def main() -> int:
         print("assert_ran: no command given", file=sys.stderr)
         return 2
 
-    # Re-quote rather than " ".join(cmd): the outer shell has already stripped the quotes verify_10
-    # wrote, so a path containing a space would be split into two arguments here and the command would
-    # run against something that does not exist -- while still, infuriatingly, exiting 0 on some tools.
-    # list2cmdline is the Windows quoting rule; shlex.join is the POSIX one.
-    line = subprocess.list2cmdline(cmd) if sys.platform == "win32" else shlex.join(cmd)
-    # shell=True so `npm`/`cargo` shims resolve exactly as they do for the bare leg.
-    r = subprocess.run(line, shell=True, capture_output=True, text=True, errors="replace")
+    executable = shutil.which(cmd[0])
+    if executable is None:
+        print(f"assert_ran: executable not found: {cmd[0]}", file=sys.stderr)
+        return 127
+
+    argv = [executable, *cmd[1:]]
+    if sys.platform == "win32" and Path(executable).suffix.casefold() in {".bat", ".cmd"}:
+        # CreateProcess cannot execute a batch shim directly. Invoke the OS command processor as an
+        # explicit argv substep instead of asking Python for an implicit shell. This keeps the
+        # verifier's process identity and process-tree containment observable while still supporting
+        # npm.cmd on stock Windows installations.
+        command_processor = os.environ.get("COMSPEC") or shutil.which("cmd.exe")
+        if not command_processor:
+            print("assert_ran: Windows command processor not found", file=sys.stderr)
+            return 127
+        # Use the original command token after `which` has proved exactly what it resolves to. A
+        # fully qualified path beginning with a quote has surprising `/s /c` stripping semantics;
+        # the PATH-resolved token avoids that ambiguity while still refusing an absent shim above.
+        argv = [command_processor, "/d", "/s", "/c", subprocess.list2cmdline(cmd)]
+
+    r = subprocess.run(argv, shell=False, capture_output=True, text=True, errors="replace")
     sys.stdout.write(r.stdout)
     sys.stderr.write(r.stderr)
 

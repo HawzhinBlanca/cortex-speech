@@ -19,8 +19,11 @@ test_real_data_runner_policy.py guards the recursive-delete guards in the e2e ha
 import re
 from pathlib import Path
 
+from _pipeline_policy_util import pipeline_surface
+
 APP_ROOT = Path(__file__).resolve().parents[1]
 PIPELINE = APP_ROOT / "src-tauri" / "src" / "pipeline.rs"
+PIPELINE_SURFACE = pipeline_surface(APP_ROOT / "src-tauri" / "src")
 ALIGNER = APP_ROOT / "src-tauri" / "src" / "aligner.rs"
 
 
@@ -35,7 +38,7 @@ def _background_block(text: str) -> str:
 
 
 def test_background_alignment_uses_the_real_aligner() -> None:
-    block = _background_block(PIPELINE.read_text(encoding="utf-8"))
+    block = _background_block(PIPELINE_SURFACE)
 
     if "crate::aligner::align(" in block:
         raise AssertionError(
@@ -58,7 +61,7 @@ def test_background_alignment_uses_the_real_aligner() -> None:
 
 
 def test_background_alignment_persists_the_reported_quality() -> None:
-    block = _background_block(PIPELINE.read_text(encoding="utf-8"))
+    block = _background_block(PIPELINE_SURFACE)
     if re.search(r"AlignmentQuality::\w+\.as_db_str\(\)", block):
         raise AssertionError(
             "background alignment persists a HARDCODED AlignmentQuality. It must persist the quality "
@@ -68,6 +71,21 @@ def test_background_alignment_persists_the_reported_quality() -> None:
     if "quality.as_db_str()" not in block:
         raise AssertionError("background alignment must persist quality.as_db_str() from the aligner")
     print("[OK]  background alignment persists the quality the aligner reported")
+
+
+def test_background_alignment_is_serialized_and_revision_guarded() -> None:
+    block = _background_block(PIPELINE_SURFACE)
+    if "import_writes.update_alignment_if_unchanged(" not in block:
+        raise AssertionError(
+            "background alignment must persist through ImportWriteStore with the source alignment "
+            "as a compare-and-swap guard"
+        )
+    for forbidden in ("Database::open(", "db.update_segment_alignment("):
+        if forbidden in block:
+            raise AssertionError(f"background alignment regained an unguarded raw writer: {forbidden}")
+    if "canonical alignment changed during inference" not in block:
+        raise AssertionError("a stale background alignment must be reported rather than silently clobbered")
+    print("[OK]  background alignment uses serialized revision-CAS persistence")
 
 
 def test_no_fallback_only_free_aligner_helpers() -> None:
@@ -87,6 +105,7 @@ def test_no_fallback_only_free_aligner_helpers() -> None:
 def main() -> None:
     test_background_alignment_uses_the_real_aligner()
     test_background_alignment_persists_the_reported_quality()
+    test_background_alignment_is_serialized_and_revision_guarded()
     test_no_fallback_only_free_aligner_helpers()
     print("background alignment policy regression passed")
 

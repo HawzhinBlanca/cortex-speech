@@ -117,7 +117,7 @@ fn streaming_decoder_matches_the_direct_decoder_on_real_long_audio() {
 
 #[test]
 #[ignore]
-fn audiobook_mp3_fingerprint_reimport_not_duplicate() {
+fn audiobook_mp3_fingerprint_reimport_is_idempotency_conflict() {
     use cortex_speech_app_lib::fingerprint::AudioFingerprint;
 
     let path = match audiobook_path() {
@@ -142,9 +142,10 @@ fn audiobook_mp3_fingerprint_reimport_not_duplicate() {
         !fp.check_duplicate(&pcm[..pcm.len().min(160_000)], 16000, Some(&path)),
         "first import window should not be duplicate"
     );
-    fp.register(&pcm[..pcm.len().min(160_000)], 16000, Some(&path));
+    fp.check_and_register(&pcm[..pcm.len().min(160_000)], 16000, Some(&path))
+        .expect("the first audiobook identity must be admitted exactly once");
 
     let is_dup = fp.check_duplicate(&pcm[..pcm.len().min(160_000)], 16000, Some(&path));
     eprintln!("[audiobook_smoke] re-import duplicate={is_dup}");
-    assert!(!is_dup, "re-importing the same audiobook must not be rejected as duplicate");
+    assert!(is_dup, "the exact same audiobook must be adopted by import recovery, never minted again");
 }

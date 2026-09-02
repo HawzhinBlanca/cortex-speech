@@ -4,7 +4,11 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
+import difflib
+import random
+import sqlite3
+from unittest import mock
+from pathlib import Path, PureWindowsPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -12,10 +16,68 @@ from check_dataset_duplicates import (  # noqa: E402
     audio_says_duplicate,
     confirm_groups_with_audio,
     duplicate_groups,
+    load_audit_rows,
 )
 
 TEXT = "ئەم ڕستەیە بەشێکی تەواوی گفتوگۆکەیە و درێژییەکەی بەسە"
 ALIGN = '{"source_start_ms": 132945, "source_end_ms": 140740}'
+
+
+def _pool_scope_database() -> sqlite3.Connection:
+    connection = sqlite3.connect(":memory:")
+    connection.executescript(
+        """
+        CREATE TABLE speech_segments(
+            id TEXT PRIMARY KEY, audio_path TEXT, alignment_json TEXT,
+            raw_transcript TEXT, verified INTEGER
+        );
+        CREATE TABLE review_pool_registry(
+            singleton_key INTEGER PRIMARY KEY, pool_id TEXT, focus_segment_count INTEGER
+        );
+        CREATE TABLE review_pool_members(
+            pool_id TEXT, segment_id TEXT, raw_transcript TEXT,
+            source_start_ms INTEGER, source_end_ms INTEGER
+        );
+        CREATE TABLE review_pool_dedup_manifests(
+            pool_id TEXT, source_focus_segment_count INTEGER, canonical_count INTEGER,
+            excluded_count INTEGER, unconfirmed_risk_count INTEGER
+        );
+        CREATE TABLE review_pool_duplicate_exclusions(pool_id TEXT, segment_id TEXT);
+        INSERT INTO review_pool_registry VALUES(1, 'pool', 3);
+        INSERT INTO speech_segments VALUES
+            ('canonical', 'one.wav', '{}', 'same', 0),
+            ('excluded', 'two.wav', '{}', 'same', 0),
+            ('unique', 'three.wav', '{}', 'different', 0);
+        INSERT INTO review_pool_members VALUES
+            ('pool', 'canonical', 'same', 0, 1000),
+            ('pool', 'excluded', 'same', 0, 1000),
+            ('pool', 'unique', 'different', 1000, 2000);
+        INSERT INTO review_pool_dedup_manifests VALUES('pool', 3, 2, 1, 0);
+        INSERT INTO review_pool_duplicate_exclusions VALUES('pool', 'excluded');
+        """
+    )
+    return connection
+
+
+def test_active_pool_duplicate_audit_uses_only_verified_canonical_overlay() -> None:
+    connection = _pool_scope_database()
+    rows, scope = load_audit_rows(connection)
+    connection.close()
+    assert [row[0] for row in rows] == ["canonical", "unique"]
+    assert "canonical review pool" in scope and "2 clips" in scope
+
+
+def test_active_pool_duplicate_audit_fails_closed_on_exclusion_count_drift() -> None:
+    connection = _pool_scope_database()
+    connection.execute("DELETE FROM review_pool_duplicate_exclusions")
+    try:
+        load_audit_rows(connection)
+    except ValueError as error:
+        assert "inconsistent dedup authority" in str(error)
+    else:
+        raise AssertionError("dedup exclusion drift was accepted")
+    finally:
+        connection.close()
 
 
 def test_the_real_find_same_offset_and_text_in_two_files_is_one_group() -> None:
@@ -90,6 +152,81 @@ def test_offsets_within_the_encoder_padding_bucket_still_match() -> None:
         ("b", r"D:\x\two.flac", near, TEXT, 0),
     ]
     assert len(duplicate_groups(rows)) == 1
+
+
+def test_transitive_offset_cluster_does_not_compare_pairs_more_than_500ms_apart() -> None:
+    # 0 -> 400 -> 800 ms is one connected cluster, but the endpoints are not at the same source
+    # position. The old all-pairs flush compared them anyway and could manufacture a false duplicate.
+    near_but_not_exact = TEXT.replace("درێژییەکەی", "درێژییەکی")
+    unrelated = "ئەم دەقە ناوەڕۆکێکی جیاوازی هەیە و تەنها بۆ پڕکردنەوەی تاقیکردنەوەکەیە"
+    rows = [
+        ("a", r"D:\x\one.flac", '{"source_start_ms": 0}', TEXT, 0),
+        ("bridge", r"D:\x\bridge.flac", '{"source_start_ms": 400}', unrelated, 0),
+        ("c", r"D:\x\three.flac", '{"source_start_ms": 800}', near_but_not_exact, 0),
+    ]
+    assert duplicate_groups(rows) == []
+
+
+def test_vectorized_rule_b_keeps_the_exact_matcher_semantics() -> None:
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        print("    (skipped: numpy absent — large live clusters fail closed rather than scan forever)")
+        return
+
+    drifted = TEXT.replace("تەواوی", "تەڵاوی")
+    different = "ئەمە دەقێکی جیاواز و درێژە کە نابێت وەک دووبارە ناسێنرێت لە تاقیکردنەوەدا"
+    rows = [
+        ("a", r"D:\x\one.flac", ALIGN, TEXT, 0),
+        ("b", r"D:\x\two.flac", ALIGN, drifted, 0),
+        ("c", r"D:\x\three.flac", ALIGN, different, 0),
+    ]
+    with mock.patch("check_dataset_duplicates.RULE_B_VECTOR_THRESHOLD", 2):
+        groups = duplicate_groups(rows)
+    assert groups == [[("a", "one.flac"), ("b", "two.flac")]], groups
+
+
+def test_vectorized_prefilters_never_drop_a_90_percent_sequence_match() -> None:
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        print("    (skipped: numpy absent — large live clusters fail closed rather than scan forever)")
+        return
+
+    rng = random.Random(20260824)
+    alphabet = "ابتپجچحخدرڕزژسشعغفقکگلمنهوەیێ "
+    rows = []
+    expected = set()
+    for index in range(40):
+        original = "".join(rng.choice(alphabet) for _ in range(rng.randint(40, 90)))
+        changed = list(original)
+        # Two substitutions keep these fixtures safely above the production 90% predicate while
+        # exercising character and four-gram bounds rather than exact-text Rule A.
+        for position in rng.sample(range(len(changed)), 2):
+            replacement = rng.choice(alphabet)
+            while replacement == changed[position]:
+                replacement = rng.choice(alphabet)
+            changed[position] = replacement
+        changed = "".join(changed)
+        assert difflib.SequenceMatcher(None, original, changed).ratio() >= 0.90
+        left, right = f"left-{index}", f"right-{index}"
+        rows.extend(
+            [
+                (left, rf"D:\x\left-{index}.wav", ALIGN, original, 0),
+                (right, rf"D:\x\right-{index}.wav", ALIGN, changed, 0),
+            ]
+        )
+        expected.add(frozenset((left, right)))
+
+    with mock.patch("check_dataset_duplicates.RULE_B_VECTOR_THRESHOLD", 2):
+        groups = duplicate_groups(rows)
+    actual_pairs = {
+        frozenset((group[i][0], group[j][0]))
+        for group in groups
+        for i in range(len(group))
+        for j in range(i + 1, len(group))
+    }
+    assert expected <= actual_pairs, (len(expected), len(actual_pairs))
 
 
 # ── RULE C: the audio decides (2026-08-18) ──────────────────────────────────────────────────────
@@ -184,6 +321,35 @@ def test_unreadable_audio_is_never_declared_clean() -> None:
     confirmed, unconfirmed, repeats = confirm_groups_with_audio(groups, rows)
     assert not confirmed and not repeats, (confirmed, repeats)
     assert len(unconfirmed) == 1, unconfirmed
+
+
+def test_audio_confirmation_ignores_same_file_pairs_and_splits_true_components() -> None:
+    rows = [
+        ("a1", r"D:\x\one.wav", ALIGN, TEXT, 0),
+        ("a2", r"D:\x\one.wav", ALIGN, TEXT, 0),
+        ("b", r"D:\x\two.wav", ALIGN, TEXT, 0),
+        ("c", r"D:\x\three.wav", ALIGN, TEXT, 0),
+    ]
+    group = [[("a1", "one.wav"), ("a2", "one.wav"), ("b", "two.wav"), ("c", "three.wav")]]
+
+    def verdict(left, right, left_rate, right_rate):
+        assert left_rate == right_rate == 16_000
+        names = frozenset((left, right))
+        if names == frozenset(("one.wav", "two.wav")):
+            return True
+        return False
+
+    with mock.patch(
+        "check_dataset_duplicates._clip_pcm",
+        # PureWindowsPath: the fixture rows carry Windows drive paths; plain Path leaves the
+        # backslashes unsplit on POSIX and the verdict below never matches its basenames.
+        side_effect=lambda path, _: (PureWindowsPath(path).name, 16_000),
+    ):
+        with mock.patch("check_dataset_duplicates.audio_says_duplicate", side_effect=verdict) as audio:
+            confirmed, unconfirmed, repeats = confirm_groups_with_audio(group, rows)
+    assert confirmed == [[("a1", "one.wav"), ("a2", "one.wav"), ("b", "two.wav")]], confirmed
+    assert not unconfirmed and not repeats
+    assert audio.call_count == 5  # six total pairs minus the one same-file pair
 
 
 def main() -> int:

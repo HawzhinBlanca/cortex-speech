@@ -34,9 +34,16 @@ describe('DiffView runtime behavior', () => {
     await waitFor(() => expect(invokeMock).not.toHaveBeenCalled());
   });
 
-  it('falls back to the local diff if the Tauri command rejects', async () => {
+  it('surfaces an authoritative typed desktop refusal without retrying the diff locally', async () => {
     window.__TAURI__ = {};
-    invokeMock.mockRejectedValueOnce(new Error('diff backend unavailable'));
+    invokeMock.mockRejectedValueOnce({
+      schema: 1,
+      code: 'DIFF_TOO_COMPLEX',
+      message: 'private backend text must not render',
+      retryable: false,
+      suggestedAction: null,
+      operationId: null,
+    });
 
     render(DiffView, {
       props: {
@@ -45,11 +52,12 @@ describe('DiffView runtime behavior', () => {
       },
     });
 
-    expect(await screen.findByText('hello \u2192 goodbye')).toBeInTheDocument();
+    expect(await screen.findByText(/DIFF_TOO_COMPLEX/)).toBeInTheDocument();
     expect(invokeMock).toHaveBeenCalledWith('compute_diff', {
       raw: 'hello world',
       annotated: 'goodbye world',
     });
-    expect(screen.queryByText(/diff backend unavailable/)).not.toBeInTheDocument();
+    expect(screen.queryByText('hello \u2192 goodbye')).not.toBeInTheDocument();
+    expect(screen.queryByText(/private backend text/)).not.toBeInTheDocument();
   });
 });

@@ -34,6 +34,11 @@ CKB_TS = APP / "src" / "lib" / "i18n" / "ckb.ts"
 # Phone strings whose Sorani is NEW and has NOT had a native review. Owner-gated: this list is the
 # acknowledgement. Adding a key here is a deliberate act; growing it silently is not possible.
 UNREVIEWED_SORANI = {
+    # The playback refusal (2026-08-19). Shown when a verdict is rejected because the clip was not
+    # played far enough — the one refusal a reviewer can fix themselves, so the wording has to be
+    # unambiguous in Sorani or it reads as the app being broken. NOT natively reviewed: on the
+    # owner's read list.
+    "mustListen",
     "heldByOthers",
     "linkExpired",
     "loadingMore",
@@ -47,9 +52,24 @@ UNREVIEWED_SORANI = {
     # one reads well: reviewers are paid per hour of audio reviewed, so this is the number they will
     # check against their own count.
     "audioDone",
+    # Phone decision undo. Until the desktop's undo became the ATOMIC last-action undo (fb16b2e8),
+    # this was the desktop's own `review.undoLast` string and carried its native review; the two
+    # features then genuinely diverged (desktop = whole-command history undo, phone = one decision),
+    # so the page keeps the short decision-undo phrasing under its own key rather than tracking a
+    # desktop string that now describes a different feature.
+    "undo",
+    # Reviewer compensation accounting: REMOVED 2026-08-28 on owner instruction. The phone showed
+    # lifetime earned, externally paid, still due, and a reconciliation warning; reviewers now see a
+    # single quiet coin count and nothing else, so the money cannot distract them mid-task. That
+    # badge is a bare grouped integer with no words, so it needs no string and no Sorani review —
+    # which is why five keys left this list rather than moving elsewhere in it. The amounts remain
+    # fully recorded in the compensation ledger and the API still sends them; only the screen changed.
     # Dialect routing (owner instruction 2026-08-16): shown to a reviewer restricted to a dialect
     # that currently has no clips. New Sorani, NOT natively reviewed — on the owner's read list.
     "noDialectWork",
+    # Flexible pool completion is reviewer-specific, never a claim that the corpus or an assigned
+    # task is complete. New Sorani, NOT natively reviewed — on the owner's read list.
+    "poolDone",
     # v47 speaker-change badge. New Sorani, NOT yet natively reviewed — it goes on the owner's list
     # with the other seven.
     "speakerChange",
@@ -176,7 +196,14 @@ def test_no_raw_server_english_is_shown_to_the_reviewer() -> None:
         # is not shown to anyone.
         if "e.message" in line
         and not line.lstrip().startswith("//")
-        and ("t(" in line or "textContent" in line or "toast(" in line or "showErr(" in line)
+        # `t(` as a CALL, not a substring: `/was made by/.test(e.message)` is routing LOGIC (the
+        # attribution-409 hold, 2026-08-20), renders nothing, and must not trip a rendering gate.
+        and (
+            re.search(r"(?<![A-Za-z0-9_.])t\(", line) is not None
+            or "textContent" in line
+            or "toast(" in line
+            or "showErr(" in line
+        )
     ]
     assert not offenders, (
         "raw English server text is being rendered to the reviewer:\n"

@@ -152,10 +152,18 @@ def main() -> None:
     assert "export_huggingface_writes_machine_ready_rows_with_matching_ready_agentic_report" in export, (
         "HF export needs a positive regression for covered machine-ready rows"
     )
-    assert "canonical_training_text(&grade.transcript)" in export, (
-        "exports must write the CANONICALIZED rubric-selected training transcript (grade.transcript), "
-        "so JSON/JSONL/CSV/Parquet/HF all emit byte-identical training text and no mixed orthography "
-        "re-enters the corpus"
+    assert "canonical_training_text(&grade.transcript)" not in export, (
+        "primary training labels must preserve the exact rubric-selected Verbatim-Law transcript; "
+        "normalization is allowed only as separately labeled evidence or a comparison key"
+    )
+    assert "training_transcript: report.transcript" in export, (
+        "JSON/JSONL primary training labels must use the exact rubric-selected transcript"
+    )
+    assert "let hf_transcript = csv_safe_cell(&grade.transcript)" in export, (
+        "Hugging Face metadata must use the exact rubric-selected transcript"
+    )
+    assert "export_primary_training_labels_preserve_exact_verbatim_codepoints" in export, (
+        "all primary export formats need an exact-codepoint Verbatim-Law regression"
     )
     assert "training_grade_summary.json" in export_bundle, "bundle must include grade summary artifact"
     assert "training_grade_details.json" in export_bundle, "bundle must include per-segment grade details"

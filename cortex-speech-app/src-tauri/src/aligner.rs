@@ -997,4 +997,116 @@ mod tests {
         assert_eq!(forward_backward_ctc_score(&[], 3, &[1], 0), -20.0, "empty logits");
         assert_eq!(ctc_align(&[], 3, &[1], 0), (Vec::new(), f32::NEG_INFINITY), "empty logits");
     }
+
+    // Both provenance labels are persisted verbatim into `alignment_quality`. Asserting only the
+    // heuristic token (as the fallback test does) leaves the one that CLAIMS real forced alignment
+    // free to drift, which is the half that matters for dataset honesty.
+    #[test]
+    fn alignment_quality_db_tokens_are_stable() {
+        assert_eq!(AlignmentQuality::CtcForced.as_db_str(), "ctc_forced");
+        assert_eq!(AlignmentQuality::EnergyHeuristic.as_db_str(), "energy_heuristic");
+        assert_ne!(AlignmentQuality::CtcForced, AlignmentQuality::EnergyHeuristic);
+    }
+
+    // The defense-in-depth bound inside the log-softmax. Callers guard blank_idx, but a corrupt model
+    // whose token index exceeds its own vocab dim must read as impossible, never index out of bounds
+    // and abort the alignment worker.
+    #[test]
+    fn get_log_prob_treats_an_out_of_vocab_token_as_impossible() {
+        let logits = vec![0.0f32, 10.0, 0.0, 0.0, 10.0, 0.0];
+        assert_eq!(get_log_prob(&logits, 3, 0, 3), f32::NEG_INFINITY, "token == vocab_size is out of range");
+        assert_eq!(get_log_prob(&logits, 3, 1, 99), f32::NEG_INFINITY, "and so is anything past it");
+        // The in-range answer is a real log-softmax: the dominant column is near log(1) = 0.
+        let dominant = get_log_prob(&logits, 3, 0, 1);
+        assert!(dominant < 0.0 && dominant > -0.01, "the emitting token's log prob is ~0, got {dominant}");
+        assert!(get_log_prob(&logits, 3, 0, 0) < dominant, "a non-emitting token is less likely");
+    }
+
+    // Per-word confidence comes from this frame certainty, and it feeds the review UI's low-confidence
+    // highlight. Its two degenerate arms must return the low default rather than panic or read past
+    // the emission buffer.
+    #[test]
+    fn frame_max_prob_is_total_on_a_short_or_degenerate_row() {
+        let logits = vec![0.0f32, 10.0, 0.0, 0.0];
+        assert!(frame_max_prob(&logits, 0, 4) > 0.9, "a dominant logit gives near-certainty");
+        assert_eq!(frame_max_prob(&logits, 9, 4), 0.0, "a frame past the buffer is not certainty, it is 0");
+        assert_eq!(frame_max_prob(&logits, 1, 4), 0.0, "a row that would overrun the tail is 0 too");
+        // An all-(-inf) row makes every exp() a NaN, so the sum is not > 0 and the low default applies.
+        assert_eq!(frame_max_prob(&[f32::NEG_INFINITY; 3], 0, 3), 0.0, "a degenerate row scores 0, not NaN");
+    }
+
+    // A word whose characters REPEAT ("aa") is the CTC case that needs the mandatory blank between the
+    // two identical tokens: the state machine must refuse the two-state skip when the target either
+    // side of it is the same character. Every existing alignment test uses distinct characters, so
+    // this transition is otherwise never exercised.
+    #[test]
+    fn repeated_characters_align_through_the_mandatory_blank() {
+        let tokens: Vec<String> = ["<pad>", "a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        #[rustfmt::skip]
+        let logits = vec![
+            0.0, 10.0, 0.0, 0.0, // f0 -> a
+            10.0, 0.0, 0.0, 0.0, // f1 -> blank (mandatory separator)
+            0.0, 10.0, 0.0, 0.0, // f2 -> a
+            10.0, 0.0, 0.0, 0.0, // f3 -> blank
+        ];
+        let out = ctc_logits_to_word_timestamps(&logits, 4, 4, &tokens, 0, "aa", 0.02).expect("alignment");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].word, "aa");
+        assert!(out[0].start <= 0.01, "the word starts on the first 'a', got {}", out[0].start);
+        assert!(
+            out[0].end > out[0].start && out[0].end <= 4.0 * 0.02 + 1e-9,
+            "and ends after the second 'a', inside the clip: {:?}",
+            out[0]
+        );
+
+        // A logits buffer shorter than num_frames x vocab is a truncated/corrupt emission matrix and
+        // must degrade, not read past the end.
+        assert!(
+            ctc_logits_to_word_timestamps(&logits[..8], 4, 4, &tokens, 0, "aa", 0.02).is_none(),
+            "a short emission buffer degrades to the energy heuristic"
+        );
+    }
+
+    // fallback_align's own degenerate inputs. These arrive for real: align() routes empty text and
+    // empty audio straight here, and a corrupt header can present sample_rate 0.
+    #[test]
+    fn fallback_align_is_total_on_empty_text_audio_and_a_zero_sample_rate() {
+        let pcm = vec![0i16; 16_000];
+        assert!(fallback_align(&pcm, 16_000, "").is_empty(), "no words in, no timestamps out");
+        assert!(fallback_align(&pcm, 16_000, "   \n\t ").is_empty(), "whitespace-only text has no words");
+
+        // Empty audio: the span collapses, and the floor keeps it from becoming a zero-width word.
+        let no_audio = fallback_align(&[], 16_000, "یەک");
+        assert_eq!(no_audio.len(), 1);
+        assert!(no_audio[0].end > no_audio[0].start, "even with no audio a word has positive width");
+
+        // sample_rate 0 (corrupt header): speech_bounds_sec refuses to divide, so the words spread over
+        // the whole buffer treated as 1 Hz rather than panicking or collapsing.
+        let zero_rate = fallback_align(&[9000, -9000, 9000, -9000], 0, "یەک دوو");
+        assert_eq!(zero_rate.len(), 2);
+        assert_eq!(zero_rate[0].start, 0.0);
+        assert!((zero_rate[1].end - 4.0).abs() < 1e-9, "the span is the sample count, got {}", zero_rate[1].end);
+        assert!(zero_rate.iter().all(|w| w.confidence == 0.5), "the heuristic's confidence is its fixed 0.5");
+    }
+
+    // The energy trimmer that decides WHERE the fallback puts its words. Its two refusal arms — no
+    // audio, and audio with no energy at all — must return None so the caller spans the whole clip
+    // instead of dividing by a zero peak.
+    #[test]
+    fn speech_bounds_refuses_empty_silent_and_zero_rate_input() {
+        assert_eq!(speech_bounds_sec(&[], 16_000), None, "no samples, no bounds");
+        assert_eq!(speech_bounds_sec(&[0i16; 1600], 0), None, "a zero sample rate has no time axis");
+        assert_eq!(speech_bounds_sec(&[0i16; 16_000], 16_000), None, "a peak of zero has no speech to bound");
+
+        // A real burst in the middle IS bounded, and to the burst, not the clip.
+        let mut pcm = vec![0i16; 16_000];
+        for (i, s) in pcm.iter_mut().enumerate() {
+            if (8_000..12_000).contains(&i) {
+                *s = if i % 2 == 0 { 12_000 } else { -12_000 };
+            }
+        }
+        let (start, end) = speech_bounds_sec(&pcm, 16_000).expect("a burst has bounds");
+        assert!((0.45..=0.55).contains(&start), "start hugs the burst, got {start}");
+        assert!((0.70..=0.80).contains(&end), "end hugs the burst, got {end}");
+    }
 }

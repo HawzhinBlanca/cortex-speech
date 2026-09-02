@@ -19,7 +19,6 @@
 //!   cargo run --release --bin backfill_fingerprints
 //!   cargo run --release --bin backfill_fingerprints -- --apply
 
-use cortex_speech_app_lib::audio;
 use cortex_speech_app_lib::db::Database;
 use cortex_speech_app_lib::fingerprint::AudioFingerprint;
 use std::collections::BTreeMap;
@@ -34,6 +33,16 @@ fn main() -> Result<(), String> {
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("cortex-speech"));
+
+    // The apply pass decodes after its initial database read, then writes through the same external
+    // connection. Keep the complete pass on one generation by excluding the desktop process.
+    let _instance_lock = if apply {
+        Some(cortex_speech_app_lib::flock::InstanceLock::try_lock(&data_dir).map_err(|error| {
+            format!("Cannot apply fingerprint backfill while Cortex is running: {error}. Stop review and close the app first.")
+        })?)
+    } else {
+        None
+    };
 
     let db_path = data_dir.join("cortex-speech.db");
     println!("db    : {}", db_path.display());
@@ -99,15 +108,14 @@ fn main() -> Result<(), String> {
             missing += 1;
             continue;
         }
-        let (sample_rate, pcm) = match audio::decode_to_pcm(path) {
-            Ok(v) => v,
+        let identity = match AudioFingerprint::identify_canonical_file(std::path::Path::new(path)) {
+            Ok(identity) => identity,
             Err(e) => {
                 undecodable += 1;
                 eprintln!("  decode failed: {path} ({e})");
                 continue;
             }
         };
-        let identity = AudioFingerprint::identify(&pcm, sample_rate);
         if identity.spectral == 0 {
             // Digital silence or a sub-16ms clip. `register` refuses to store this bucket because every
             // later silent window would land in it; so does this.

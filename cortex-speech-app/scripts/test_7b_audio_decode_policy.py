@@ -49,8 +49,23 @@ def test_the_server_falls_back_to_ffmpeg_and_fails_loudly() -> None:
     assert "transcribe(audio_path" not in body.replace("def load_any(", ""), "loader must not transcribe"
 
     transcribe_body = src[end:end + 800]
-    assert "load_any(audio_path)" in transcribe_body, (
-        "transcribe() still calls torchaudio.load directly, so the fallback is dead code"
+    # 2026-08-20 (external review blocker #4): the loader now takes the requested WINDOW so the
+    # server decodes only the clip, never the whole source. transcribe() must pass it through.
+    assert "load_any(audio_path, start_ms, end_ms)" in transcribe_body, (
+        "transcribe() must decode via load_any WITH the clip window — a bare-path call decodes the whole source"
+    )
+    assert '"-ss"' in body and '"-t"' in body, (
+        "the ffmpeg call must SEEK to the requested window; decoding a 77-minute episode for a 9s clip "
+        "scales work with the source instead of the clip"
+    )
+    # 2026-08-20 (review): the seek must start EARLY and trim the excess. A decoder started mid-stream
+    # has no history — MEASURED on a 320 kbps MP3 master at a 42-minute offset, a bare seek made the
+    # first 10 ms of every clip as wrong as the signal was loud (0.0 dB) and 10-50 ms -5.4 dB, i.e. the
+    # word ONSET was garbage while everything from 50 ms on was bit-identical. With the pad the onset
+    # measures -381 dB against the exact whole-file slice: silence, as it should be.
+    assert "SEEK_PAD_MS" in src, "the padded-seek constant is gone — clip onsets go back to being decoder garbage"
+    assert "samples = samples[drop:]" in body, (
+        "the padded lead-in must be TRIMMED off; leaving it shifts every clip earlier by the pad"
     )
 
 

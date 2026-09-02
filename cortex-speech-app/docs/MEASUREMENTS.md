@@ -1,5 +1,12 @@
 # MEASUREMENTS — pinned accuracy records (never fabricated)
 
+> [!CAUTION]
+> **Historical measurement archive, not a current model attestation.** The 7.03% result below was
+> scored over 922 manifest rows containing only 348 distinct clips; it is duplication-weighted and
+> its confidence interval is not valid for 922 independent clips. Preserve it as provenance, but do
+> not use it as a current headline, SOTA claim, release metric, or integrated-line verdict. A clean
+> N=348 regeneration plus a hash-bound model attestation is required before any primary claim.
+
 Every number here is parsed verbatim from a real harness run, stamped with the git SHA, the manifest
 SHA-256 + row count, the model pins, and the exact command. New records are appended by
 `make measure-10` (scripts/run_measurements.py) or, when runs are orchestrated manually, by pasting
@@ -21,8 +28,8 @@ distinct clips; see duplication correction below).
 > applies `normalize_hamza`, `remove_diacritics` and `normalize_numbers` before comparing.
 >
 > Direction matters and is stated plainly: extra folding makes matching **more forgiving**, so
-> stock-300M's 11.34% is *flattered* relative to the strict basis. The champion's −4.3 pt lead is
-> therefore **understated**, not inflated — the headline is not puffed up by this defect.
+> stock-300M's 11.34% is *flattered* relative to the strict basis. That fact does not rehabilitate
+> the duplication-weighted comparison or authorize it as a current headline.
 >
 > What IS damaged: the MAPSSWE p-value pairing champion-7B against stock-300M (§ C1 below) is
 > computed across two different normalizations, so it measures the normalizers as well as the
@@ -58,7 +65,7 @@ distinct clips; see duplication correction below).
 > clips (`<id>.<n>.wav`, guarded by `test_frozen_eval_manifest_integrity.py`). A clean re-score on a
 > uniquely-rebuilt ~922-distinct set is owner-gated (needs the FLEURS download + the rig).
 
-### Results (verbatim harness headlines)
+### Results (verbatim historical harness output)
 
 | Engine (identical 922 clips) | micro CER | 95% CI | micro WER | 95% CI |
 |---|:--:|:--:|:--:|:--:|
@@ -139,10 +146,10 @@ baseline ci_low on both metrics (CER 7.55% < 12.02% ✓; WER 33.98% < 41.17% ✓
   was chosen — but "unlikely by construction" is not "verified", and only the latter licenses a SOTA
   claim. Until that manifest is available, every number here carries this caveat.
 - The CV22-ckb champion number (5.04% CER, 2026-07-09) predates this record and carries the same
-  caveat; **7.03% on FLEURS is the honest headline** because FLEURS is a public, citable test split,
-  not because its disjointness was proven.
+  caveat. Neither it nor the duplication-weighted FLEURS result is a current headline; public source
+  availability does not substitute for deduplication, disjointness evidence, and attestation.
 - FLEURS is read speech; no conversational Sorani number exists yet anywhere (that requires the
   app-gold set from the owner's review marathon — SHIP_FINAL_PLAN §B #37/#41).
 - Digit/punctuation normalization is the strict space-kept basis shared by all three engines here;
   a `CORTEX_CER_STRIP=1` "fair" basis exists in `scorecard_7b.py` but is deliberately NOT used for
-  the headline (owner methodology decision pending — SHIP_FINAL_PLAN §B #45).
+  the historical run (owner methodology decision pending — SHIP_FINAL_PLAN §B #45).

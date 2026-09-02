@@ -18,10 +18,16 @@ would then assert provenance it no longer checks.
 
 from pathlib import Path
 
+from _db_policy_util import database_surface
+
+from _pipeline_policy_util import pipeline_surface
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _read(relative_path: str) -> str:
+    if relative_path == "src-tauri/src/db.rs":
+        return database_surface(REPO_ROOT / "src-tauri" / "src")
     return (REPO_ROOT / relative_path).read_text(encoding="utf-8")
 
 
@@ -44,14 +50,24 @@ def test_the_schema_can_hold_a_processing_declaration() -> None:
 
 
 def test_the_import_records_it_without_being_asked() -> None:
-    pipeline = _read("src-tauri/src/pipeline.rs")
+    pipeline = pipeline_surface(REPO_ROOT / "src-tauri" / "src")
     if "crate::source_provenance::detect(path)" not in pipeline:
         raise AssertionError(
             "the import must detect processed source audio itself — a declaration that depends on "
             "someone remembering to run a command is not a guarantee"
         )
-    if "upsert_source_audio_provenance" not in pipeline:
-        raise AssertionError("the import must persist what it detected")
+    # Repointed 2026-08-30: the detected provenance no longer travels through a separate upsert —
+    # it is handed to the ImportWriteStore's ATOMIC publication calls, so segments and their source
+    # provenance commit in one serialized mutation and cannot drift apart.
+    for required in (
+        "import_writes.publish_segments_with_identity(&prepared, &identity, source_provenance",
+        "self.persist_segments(&import_writes, prepared, source_provenance",
+    ):
+        if required not in pipeline:
+            raise AssertionError(
+                "the import must persist what it detected through the serialized import store: "
+                f"missing {required!r}"
+            )
 
     detector = _read("src-tauri/src/source_provenance.rs")
     if "audio_is_processed" not in detector:

@@ -6,6 +6,11 @@
 **Stack:** Tauri v2 + Svelte 5 (runes) + Rust + SQLite/FTS5 · ~102 IPC commands · EN + CKB (RTL) i18n
 **Repo:** github.com/HawzhinBlanca/cortex-speech · `main @ 4787d81` · generated 2026-06-30
 
+> [!WARNING] Historical architecture snapshot
+> Commit facts remain for provenance, but retired runtime claims have been corrected. Current canon:
+> production ASR is OmniASR-7B Champion only; Scribe has no runtime/settings/key path; the only
+> consent-gated advisory cloud model is fixed to Gemini 2.5 Pro and is never an ASR fallback.
+
 ![Cortex Speech end-to-end architecture](cortex-e2e-architecture.svg)
 
 *Solid violet = OmniASR-7B Champion primary path (default). Dashed = cloud (opt-in, off by default).*
@@ -22,7 +27,7 @@ Cortex Speech turns raw long-form audio (podcasts, interviews, audiobooks) into 
 
 - **Offline-first** — local ASR + alignment + storage; no network needed.
 - **Honesty-first** — machine output is never shown as human-verified; every transcript carries engine provenance; metrics come only from real runs.
-- **Consent-gated cloud** — voice is biometric data (GDPR Art. 9); cloud STT/LLM require explicit opt-in.
+- **Consent-gated cloud** — voice is biometric data (GDPR Art. 9); the fixed Gemini 2.5 Pro advisory paths require explicit opt-in. There is no cloud ASR fallback.
 - **Human-in-the-loop** — a jury auto-adjudicates the easy cases and escalates the rest to a fast review UI; the human decision is final.
 
 ---
@@ -35,7 +40,7 @@ Import is dispatched from `import_audio_file` / `import_directory` (commands.rs)
 |---|---|---|
 | **Decode** | Audio → 16 kHz mono PCM. Short files decode whole; long files stream in 90 s windows. | `decode_to_pcm_with_timeout`, `decode_pcm_windows`, `should_stream_decode` |
 | **VAD chunk** | Silero VAD finds speech regions; merged/split/absorbed to honor min/max length (no mid-word cuts, no spanning long silences). | `voice_activity_detection`, `plan_speech_chunks` (chunking.rs) |
-| **ASR dispatch** | Each chunk transcribed by the active engine (default: 7B Champion). | `build_segments_from_pcm`, `transcribe` (pipeline.rs) |
+| **ASR dispatch** | Every production chunk is routed to the 7B Champion; unavailability is a hard stop, never a downgrade. | `build_segments_from_pcm`, `transcribe` (pipeline.rs) |
 | **Normalize** | Sorani normalization (numerals, hamza/y-k) → `normalized_transcript`; text stored NFC. | `SoraniNormalizer` (normalizer.rs) |
 | **Align (words)** | Forced alignment → per-word start/end for tap-a-word review. MMS-CTC, falls back to bundled aligner / energy heuristic. | `align_via_finetuned_mms`, `ctc_logits_to_word_timestamps` |
 | **Persist** | Segments + multi-model hypotheses written transactionally; FTS5 auto-syncs. | `persist_segments`, `insert_segments_batch` (db.rs) |
@@ -47,17 +52,16 @@ After persistence the jury runs on a **separate WAL DB connection** so adjudicat
 
 ## 3 · ASR engines
 
-Routing by `settings.asr_model_size` (default **WSL7B**) + `use_finetuned_asr` + consent flags.
+Production settings are hard-pinned to **WSL7B**. Smaller ASR implementations remain available only to explicit offline diagnostic tools and tests; they are not production settings, UI choices, import routes, or re-transcribe fallbacks.
 
 | Engine | model_id | Runtime | Role |
 |---|---|---|---|
 | **OmniASR-7B Champion** ★ | `omniasr-wsl-7b` | base omniASR-LLM-7B-v2 + LoRA, fairseq2+PEFT, ~31 GB, WSL GPU server `127.0.0.1:8799` | **Primary / default** — the owner's fine-tuned 7B; produces every import transcript |
-| OmniASR-CTC 300M | `omniasr-ctc-300m` | sherpa-onnx, ~50 MB | Bundled local fallback / default-downloadable |
-| OmniASR-CTC 1B | `omniasr-ctc-1b` | sherpa-onnx, ~500 MB | Larger base CTC (opt-in) |
-| Fine-tuned MMS-1B | `finetuned-mms-ckb` | Wav2Vec2-CTC via `ort`, ~970 MB, ~18.6% CER | Word alignment + opt-in per-clip re-transcribe |
-| ElevenLabs Scribe | `scribe-v1` | Cloud REST (opt-in) | Cloud STT / jury vote — only with `cloud_stt_opt_in` |
+| OmniASR-CTC 300M | `omniasr-ctc-300m` | sherpa-onnx, ~50 MB | Diagnostic-only ASR / historical provenance; never a production fallback |
+| OmniASR-CTC 1B | `omniasr-ctc-1b` | sherpa-onnx, ~500 MB | Diagnostic-only ASR / historical provenance; never a production fallback |
+| Fine-tuned MMS-1B | `finetuned-mms-ckb` | Wav2Vec2-CTC via `ort`, ~970 MB, ~18.6% CER | Word alignment; its ASR path is diagnostic-only |
 
-> **"Which model" answer:** there is no base-vs-fine-tuned-7B ambiguity. The OmniASR-7B Champion *is* the fine-tuned 7B (base + LoRA). The fine-tuned **MMS-1B** is a separate, smaller model used mainly for word-timing alignment. Out of the box, transcripts are 100% the 7B Champion.
+> **"Which model" answer:** there is no base-vs-fine-tuned-7B ambiguity. The OmniASR-7B Champion *is* the fine-tuned 7B (base + LoRA). The fine-tuned **MMS-1B** is a separate alignment model whose ASR implementation is diagnostic-only. Production transcripts and re-transcriptions are 100% the 7B Champion.
 
 The 7B request loop: the Rust pipeline spawns `wsl python3 cortex_7b_client.py --segment-id <id>` → the client reads the clip from the app DB → asks the warm `cortex_7b_server.py` on `:8799` (loads the 31 GB model once on the GPU) → returns `__RESULT__={"raw_transcript": …}`. The client fails loudly (non-zero exit, no result) on any infrastructure error, which the pipeline turns into a fail-hard cancel.
 
@@ -72,7 +76,7 @@ A multi-tier confidence router on its own DB connection:
 - **T2 — audio judge (opt-in):** a cloud model (Gemini) *listens* and adjudicates; gated by `jury_cloud_opt_in`. `jury/t2_listener.rs`.
 - **Escalation:** unresolved segments enter the **Review Inbox** ordered lowest-confidence-first; the **Autonomy Dial** (Observe → Propose → ActConfirm → ActAuto) sets unattended depth.
 
-> For this data the three Sorani ASR models agree only ~40–65% (the two CTC models are architecturally related, so their agreement is correlated and the gate vetoes it) — so the jury mostly escalates, which is why fast human review matters.
+> Historical multi-engine experiments remain available as provenance and diagnostic evidence. They do not describe current production routing: the champion supplies the production draft and the human decision is final.
 
 ---
 
@@ -83,7 +87,7 @@ A multi-tier confidence router on its own DB connection:
 **Review actions**
 - **Word-timing playback** — tap a word to hear it; karaoke highlight; playback bounded to the clip span.
 - **Model-provenance badge** — *"Draft by &lt;engine&gt; — machine draft, not human-verified"*, drawn from recorded hypotheses (never inferred).
-- **Re-transcribe this clip** — OmniASR-7B (server) or Fine-tuned MMS-1B (CPU); resets `verified=false`.
+- **Re-transcribe this clip** — OmniASR-7B Champion only; resets `verified=false`.
 - **Mark bad** — records a human *reject*: excluded from export, kept and reversible.
 
 **Learning flywheel** — decisions become `human_accept` / `human_edit` / `human_reject`; confirmed corrections feed `agent_examples` (few-shot retrieval); a LOOP-0 memory can auto-apply confirmed fixes (opt-in).
@@ -120,9 +124,8 @@ Honesty-gated dataset build with three guardrails:
 
 100% offline by default. Cloud only behind explicit, acknowledged opt-in:
 
-- `cloud_stt_opt_in` — ElevenLabs Scribe STT
-- `cloud_llm_opt_in` — OpenRouter / Gemini LLM refinement
-- `jury_cloud_opt_in` — the Gemini T2 audio judge
+- `cloud_llm_opt_in` — optional refinement through the fixed Gemini 2.5 Pro cloud model
+- `jury_cloud_opt_in` — the fixed Gemini 2.5 Pro advisory T2 audio judge
 
 `settings.effective_llm_mode()` downgrades cloud → none whenever the flag is off; the pipeline re-checks consent before building any refiner. API keys are never persisted in tracked files; voice is biometric data with consent + license enforced before any publish/train step.
 
@@ -136,7 +139,7 @@ Landed on `main`, verified by cargo fmt/clippy + **823** Rust tests, typecheck/l
 |---|---|
 | `48bde15` | Integrated a 68-commit hardening line into the branch (30 conflicts reconciled, combining both sides' intent). |
 | `1a9ae00` | **OmniASR-7B Champion forced as the default** + fail-hard import (cancel + rollback when the 7B server is down); sanitized client repo-tracked. |
-| `4787d81` | **Review feature:** per-clip re-transcribe (7B / MMS-1B), model-provenance badge, mark-bad — verified live on the real app. |
+| `4787d81` | **Historical review feature at that commit:** per-clip re-transcribe (7B / MMS-1B), model-provenance badge, mark-bad. Current production re-transcribe is champion-only. |
 
 ---
 

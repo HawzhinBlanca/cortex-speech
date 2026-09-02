@@ -16,7 +16,9 @@ FORBIDDEN_PATTERNS = [
 def test_batch_cli_entrypoints_do_not_panic_on_runtime_failures() -> None:
     offenders: list[str] = []
     for path in sorted(BIN_DIR.glob("*.rs")):
-        text = path.read_text(encoding="utf-8")
+        # Runtime entrypoints must be panic-free. Unit-test fixtures intentionally use expect/unwrap
+        # to make a failed assertion loud, and are not compiled into the shipped binary.
+        text = path.read_text(encoding="utf-8").split("#[cfg(test)]", 1)[0]
         for line_no, line in enumerate(text.splitlines(), start=1):
             for pattern, reason in FORBIDDEN_PATTERNS:
                 if pattern.search(line):

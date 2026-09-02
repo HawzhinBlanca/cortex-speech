@@ -8,6 +8,7 @@ from pathlib import Path
 from build_halwest_dataset import (
     OUT_DIR,
     SPEAKER_ID,
+    dataset_relpath,
     normalize_text,
     pair_sources,
     read_text,
@@ -47,7 +48,7 @@ def exact_transcript_sources() -> dict[str, str]:
     sources: dict[str, str] = {}
     for item in pair_sources():
         if item.transcript_status == "matched_by_basename" and read_text(item.transcript):
-            sources[item.audio.name] = str(item.transcript)
+            sources[item.audio.name] = dataset_relpath(item.transcript, OUT_DIR)
     return sources
 
 
@@ -69,7 +70,7 @@ def copy_gold_rows(rows: list[dict], exact_sources: dict[str, str]) -> list[dict
         dest = wav_dir / src.name
         shutil.copy2(src, dest)
         copied = dict(row)
-        copied["audio_filepath"] = str(dest)
+        copied["audio_filepath"] = dataset_relpath(dest, OUT_DIR)
         copied["source_transcript"] = exact_sources[source_name]
         copied["trust_tier"] = "gold_exact_basename_transcript"
         gold_rows.append(copied)
@@ -103,7 +104,7 @@ def write_gold_dataset(rows: list[dict]) -> dict:
                 "reference_rank": idx,
                 "id": row["id"],
                 "speaker": row["speaker"],
-                "reference_audio_file": str(dest),
+                "reference_audio_file": dataset_relpath(dest, OUT_DIR),
                 "source_audio": row["source_audio"],
                 "source_transcript": row["source_transcript"],
                 "duration_sec": row["duration"],
@@ -208,6 +209,18 @@ def write_cards(summary: dict, validation_rows: list[dict]) -> None:
     )
 
     gold_stats = summary["stats"]
+    split_lines = "\n".join(
+        f"- {name}: {stats.get('clip_count', 0)} clips, {stats.get('total_minutes', 0)} minutes"
+        for name, stats in summary["splits"].items()
+    )
+    train_only = not summary["splits"]["validation"] and not summary["splits"]["test"]
+    split_note = (
+        "**TRAIN ONLY** — fewer than three source recordings back this subset, so no audio can be\n"
+        "held out without putting the same recording on both sides. `validation` and `test` are\n"
+        "deliberately EMPTY; no score measured on this data is held-out."
+        if train_only
+        else "Whole source recordings go to exactly one split, so no recording appears on two sides."
+    )
     card = f"""# Halwest Gold TTS / Voice-Cloning Subset
 
 Speaker: `{SPEAKER_ID}`
@@ -223,6 +236,12 @@ This subset includes only source audio with a non-empty transcript file that mat
 - Sample rate: 24 kHz mono PCM WAV
 - Source coverage: {dict(summary['source_audio_minutes'])}
 - Reference clips: {summary['reference_clip_count']}
+
+## Splits
+
+{split_note}
+
+{split_lines}
 
 ## Files
 

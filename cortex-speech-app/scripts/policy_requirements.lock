@@ -1,0 +1,12 @@
+# Exact desktop/CI policy environment. Install with --no-deps so no package can float outside this
+# inventory. jiwer 4.0.0 is the metric authority named by docs/EVAL.md and the Rust cross-validation
+# fixtures; its direct runtime dependencies and Click's Windows dependency are pinned as well.
+click==8.4.1
+colorama==0.4.6
+cffi==2.0.0
+jiwer==4.0.0
+numpy==1.26.4
+pycparser==3.0
+RapidFuzz==3.14.5
+soundfile==0.14.0
+typing_extensions==4.15.0

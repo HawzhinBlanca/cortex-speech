@@ -1,4 +1,5 @@
 import { test, expect } from './fixtures';
+import { openHeaderOverflow } from './helpers/header';
 
 test.describe('Navigation and panel interaction', () => {
   test('sidebar toggle works with Shift+S', async ({ page }) => {
@@ -66,9 +67,11 @@ test.describe('Navigation and panel interaction', () => {
   test('search verification filter buttons exist', async ({ page }) => {
     await page.goto('/');
 
-    await expect(page.getByTestId('search-bar').getByRole('button', { name: 'All', exact: true })).toBeVisible();
-    await expect(page.getByRole('button', { name: '✓ Verified' })).toBeVisible();
-    await expect(page.getByRole('button', { name: '○ Pending' })).toBeVisible();
+    await expect(
+      page.getByTestId('search-bar').getByRole('button', { name: 'All', exact: true }),
+    ).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Verified', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Pending', exact: true })).toBeVisible();
   });
 
   test('sort dropdown has expected options', async ({ page }) => {
@@ -78,18 +81,28 @@ test.describe('Navigation and panel interaction', () => {
     await expect(select).toBeVisible();
 
     const options = await select.locator('option').allTextContents();
-    expect(options).toEqual(['Newest', 'Oldest', 'Duration', 'Verified', 'Confidence (Lowest First)', 'Active Learning (Boundary)']);
+    expect(options).toEqual([
+      'Newest',
+      'Oldest',
+      'Duration',
+      'Verified',
+      'Confidence (Lowest First)',
+      'Active Learning (Boundary)',
+    ]);
   });
 
   test('sidebar hidden button appears when sidebar is toggled off', async ({ page }) => {
     await page.goto('/');
+    const aside = page.locator('aside').first();
+    await expect(aside).toBeVisible();
 
     await page.keyboard.press('Shift+S');
 
+    await openHeaderOverflow(page);
     const showBtn = page.getByLabel('Show segments');
     await expect(showBtn).toBeVisible();
 
     await showBtn.click();
-    await expect(page.locator('aside').first()).toBeVisible();
+    await expect(aside).toBeVisible();
   });
 });

@@ -38,7 +38,7 @@ pub struct DatasetMetadata {
 }
 
 /// One recording's declaration that its audio is not the original, and how many clips it contributed.
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub struct ProcessedAudioNotice {
     pub audio_path: String,
     pub segments: usize,
@@ -73,12 +73,13 @@ pub(crate) fn processed_audio_notices(
         .filter_map(|(path, segments)| {
             let record = declared.get(path)?;
             Some(ProcessedAudioNotice {
-                audio_path: record.audio_path.clone(),
+                // Shared/public metadata never carries the curator's absolute filesystem layout.
+                audio_path: export_audio_ref(&record.audio_path).to_string(),
                 segments,
                 processing: record.processing.clone(),
                 separator_model: record.separator_model.clone(),
                 timeline_preserved: record.timeline_preserved,
-                manifest_path: record.manifest_path.clone(),
+                manifest_path: record.manifest_path.as_deref().map(export_audio_ref).map(str::to_string),
             })
         })
         .collect();
@@ -212,16 +213,19 @@ impl ExportSegmentRecord {
         let speaker_turn =
             segment.speaker_change_score.map(|s| (s as f32) < crate::diarization::SPEAKER_CHANGE_THRESHOLD);
         // Privacy: never publish the curator's absolute filesystem path — it embeds the
-        // OS username and drive layout. Emit only the basename, like the HF exporter.
+        // OS username and drive layout. Emit only the basename, like the HF exporter. Reviewer
+        // identity is operational/private attribution kept in the database; public/shared dataset
+        // rows need the decision provenance, not the worker's name.
         let mut sanitized = segment.clone();
         sanitized.audio_path = export_audio_ref(&segment.audio_path).to_string();
+        sanitized.reviewed_by = None;
         Self {
             segment: sanitized,
-            // Canonicalize the SHIPPED training text (fold ك/ک, ي/ی, heh forms, ZWNJ/tatweel; digits
-            // and diacritics untouched) exactly like the HF exporter, so JSON/JSONL/CSV/Parquet emit
-            // byte-identical training_transcript for a segment — mixed orthography must not re-enter the
-            // corpus and fragment the CTC label space through the flat exports.
-            training_transcript: crate::normalizer::canonical_training_text(&report.transcript),
+            // Verbatim Law: the primary training label is the exact stored authority selected by the
+            // grade (human verdict > annotation > champion raw). Orthographic normalization is useful
+            // as explicitly labeled derived evidence and as a dedup key, never as a replacement label
+            // that still claims the original transcript_source.
+            training_transcript: report.transcript,
             transcript_source: report.transcript_source,
             training_grade: report.grade,
             training_ready: report.training_ready,
@@ -250,12 +254,64 @@ pub(crate) fn export_audio_ref(audio_path: &str) -> &str {
     audio_path.rsplit(['/', '\\']).next().unwrap_or(audio_path)
 }
 
+/// Require the durable, canonical PCM identity that binds one segment's transcript/review authority
+/// to its source recording. A missing v51 identity is UNKNOWN, never permission to export whatever
+/// bytes happen to occupy the path today.
+pub(crate) fn required_segment_audio_content_hash(db: &Database, segment_id: &str, context: &str) -> AppResult<String> {
+    db.segment_audio_content_hash(segment_id)?.ok_or_else(|| {
+        AppError::Validation(format!(
+            "{context}: segment {segment_id} has no canonical audio-content authority; backfill/re-import it before exporting audio"
+        ))
+    })
+}
+
+/// Verify an already-decoded PCM buffer before any bytes derived from it are written. The caller
+/// writes from this same buffer, closing the path-level TOCTOU where a source could be replaced after
+/// a metadata/path check but before decode.
+pub(crate) fn require_decoded_segment_audio_identity(
+    db: &Database,
+    segment_id: &str,
+    pcm: &[i16],
+    sample_rate: u32,
+    context: &str,
+) -> AppResult<String> {
+    let actual = crate::fingerprint::AudioFingerprint::content_hash(pcm, sample_rate);
+    require_segment_audio_identity_hash(db, segment_id, &actual, context)?;
+    Ok(actual)
+}
+
+/// Compare a canonical PCM hash computed over the exact decode an exporter is about to consume.
+/// Split out so grouped/streaming exporters hash a source once while still checking every row's
+/// independently stored authority.
+pub(crate) fn require_segment_audio_identity_hash(
+    db: &Database,
+    segment_id: &str,
+    actual_content_hash: &str,
+    context: &str,
+) -> AppResult<()> {
+    let expected = required_segment_audio_content_hash(db, segment_id, context)?;
+    if expected != actual_content_hash {
+        return Err(AppError::Validation(format!(
+            "{context}: source audio for segment {segment_id} no longer matches its stored canonical PCM identity; refusing to pair current bytes with prior transcript/review authority"
+        )));
+    }
+    Ok(())
+}
+
+/// `unreadable_source_audio_counts_as_verified` exists for ONE caller: the `dropped_unavailable`
+/// tally, which must answer "would this row have been written had the audio been there?". Every other
+/// gate below reads only the grade and DB records, but the source-reference identity check opens and
+/// re-hashes the source file — so on an unmounted drive it refused every SILVER commit-evidence row,
+/// and those rows were then dropped WITHOUT being counted (dataset_infos.json reporting
+/// droppedUnavailableAudio = 0 while the export path promises the drop "is counted, not silent").
+/// The WRITE path always passes `false` and stays fail-closed.
 fn is_training_ready_for_huggingface_export(
     db: &Database,
     segment: &SpeechSegment,
     grade: &TrainingGradeReport,
     ready_agentic_segment_ids: &BTreeSet<String>,
     required_source_reference_models: &[String],
+    unreadable_source_audio_counts_as_verified: bool,
 ) -> AppResult<bool> {
     if !grade.training_ready {
         return Ok(false);
@@ -288,6 +344,7 @@ fn is_training_ready_for_huggingface_export(
                 db,
                 segment,
                 required_source_reference_models,
+                unreadable_source_audio_counts_as_verified,
             )?
         {
             return Ok(false);
@@ -311,6 +368,7 @@ fn source_reference_identity_verified_for_huggingface_export(
     db: &Database,
     segment: &SpeechSegment,
     required_source_reference_models: &[String],
+    unreadable_source_audio_counts_as_verified: bool,
 ) -> AppResult<bool> {
     let references = db.get_source_transcripts_for_audio(&segment.audio_path)?;
     if references.is_empty() {
@@ -322,7 +380,7 @@ fn source_reference_identity_verified_for_huggingface_export(
             return Ok(false);
         };
         if !crate::agentic::is_usable_source_reference_transcript(&reference.transcript_text)
-            || !source_reference_record_matches_current_audio(reference)
+            || !source_reference_record_matches_current_audio(reference, unreadable_source_audio_counts_as_verified)
         {
             return Ok(false);
         }
@@ -330,7 +388,12 @@ fn source_reference_identity_verified_for_huggingface_export(
     Ok(true)
 }
 
-fn source_reference_record_matches_current_audio(reference: &SourceTranscriptRecord) -> bool {
+fn source_reference_record_matches_current_audio(
+    reference: &SourceTranscriptRecord,
+    unreadable_source_audio_counts_as_verified: bool,
+) -> bool {
+    // A record with no stored identity at all is refused in BOTH modes: that is a property of the
+    // record, not of the audio, so the tally must skip it exactly as the write loop does.
     let Some(stored_hash) = reference.audio_content_hash.as_deref().map(str::trim).filter(|value| !value.is_empty())
     else {
         return false;
@@ -338,9 +401,12 @@ fn source_reference_record_matches_current_audio(reference: &SourceTranscriptRec
     let Some(stored_size) = reference.audio_size_bytes else {
         return false;
     };
-    let Ok(current_identity) = crate::pipeline::source_audio_identity(std::path::Path::new(&reference.audio_path))
-    else {
-        return false;
+    let current_identity = match crate::pipeline::source_audio_identity(std::path::Path::new(&reference.audio_path)) {
+        Ok(identity) => identity,
+        // Bytes that are not there cannot be compared. Writing: fail closed. COUNTING the rows an
+        // unavailable source cost us: the answer is "it would have been written" — otherwise the drive
+        // being unmounted is precisely what hides the loss it caused.
+        Err(_) => return unreadable_source_audio_counts_as_verified,
     };
     stored_hash == current_identity.content_hash && stored_size == current_identity.size_bytes
 }
@@ -376,7 +442,7 @@ fn ready_agentic_huggingface_segment_ids(db: &Database) -> AppResult<BTreeSet<St
 
 /// Remove every segment that must never leave this machine, whatever the caller is writing.
 ///
-/// TWO independent exclusions, because both were being missed one caller at a time:
+/// THREE independent exclusions, because each was being missed one caller at a time:
 ///
 /// 1. HELD-OUT GOLD (by audio_path OR content hash) — so a TRAINING export cannot leak the eval
 ///    set's reference transcripts and contaminate the very set the promotion gate measures against.
@@ -395,14 +461,73 @@ fn ready_agentic_huggingface_segment_ids(db: &Database) -> AppResult<BTreeSet<St
 ///    now, and it is true HERE rather than at five call sites, because a rule enforced per-caller is
 ///    a rule that gets missed by the sixth caller.
 ///
+/// 3. SPOT-CHECK ANSWER KEYS (`is_gold`) — hidden review traps with a known answer. `export_audio`
+///    was the only caller that refused them, so every tabular/HF/bundle export shipped the key.
+///
 /// The name says "unexportable", not "holdout", so it cannot quietly under-describe what it drops
 /// the next time a reason is added.
 pub(crate) fn exclude_unexportable_segments(
     db: &Database,
     segments: Vec<SpeechSegment>,
 ) -> AppResult<Vec<SpeechSegment>> {
+    exclude_unexportable_segments_with_holdout_policy(db, segments, true)
+}
+
+/// Apply every universal export exclusion while intentionally retaining eval holdouts.
+///
+/// Human-facing transcript/subtitle exports are not training artifacts, so the owner may export a
+/// holdout transcript. Revoked consent, rejects, technical-unusable rows, placeholders, and hidden
+/// review answer keys remain universal exclusions. Keeping this as a named wrapper prevents a caller
+/// from bypassing the shared rights gate merely because its holdout policy differs.
+pub(crate) fn exclude_unexportable_segments_including_holdouts(
+    db: &Database,
+    segments: Vec<SpeechSegment>,
+) -> AppResult<Vec<SpeechSegment>> {
+    exclude_unexportable_segments_with_holdout_policy(db, segments, false)
+}
+
+fn exclude_unexportable_segments_with_holdout_policy(
+    db: &Database,
+    segments: Vec<SpeechSegment>,
+    exclude_holdouts: bool,
+) -> AppResult<Vec<SpeechSegment>> {
+    // A registered review pool IS the authority on what may ship, and it is enforced HERE for the
+    // same reason as the withdrawal and human-rejected rules below: every export path already routes
+    // through this function, and a rule enforced per-caller is a rule the sixth caller misses.
+    //
+    // `export_dataset`, the HuggingFace training export and the production bundle all start from
+    // `db.get_segments(None)` — EVERY row in the library, curated or not. Measured on the live
+    // library on 2026-08-29, an export taken without this guard shipped 43,722 rows of which 23,405
+    // (54%, 54.8 h) were outside the pool, and ~22,700 of those carried a machine transcript with no
+    // human ever having heard the clip. The curated 43.8 h would have been the minority of its own
+    // dataset. `None` = no pool registered (the pre-pool corpus), which leaves scope exactly as it
+    // was before this guard existed.
+    let pool_scope = crate::review_pool::exportable_segment_ids(db).map_err(AppError::Validation)?;
+    // OWNER CANON 2026-08-29: "a sentence is decided by any two DIFFERENT reviewers". Membership
+    // says a clip is IN the corpus; it does not say anyone decided it. Without this second scope an
+    // export ships one reviewer's unconfirmed opinion as training truth -- measured on 2026-08-29,
+    // the fine-tune pack emitted 410 clips carrying exactly one review each, while the pool itself
+    // reported resolved=0. Two quality bars were in play and the weaker one was the one that
+    // shipped. Only a clip two distinct reviewers agreed on (or one the owner adjudicated) may
+    // leave. `NeedsThird` and `OwnerConflict` are unresolved disagreements and are held back.
+    let consensus = match pool_scope {
+        Some(_) => Some(crate::review_pool::consensus_resolved_segment_ids(db).map_err(AppError::Validation)?),
+        None => None,
+    };
     let mut kept = Vec::with_capacity(segments.len());
+    let mut in_pool = 0usize;
+    let mut undecided = 0usize;
     for seg in segments {
+        if pool_scope.as_ref().is_some_and(|scope| !scope.contains(&seg.id)) {
+            tracing::info!(segment_id = %seg.id, "export: dropping segment outside the active review pool");
+            continue;
+        }
+        in_pool += 1;
+        if consensus.as_ref().is_some_and(|resolved| !resolved.contains(&seg.id)) {
+            undecided += 1;
+            tracing::info!(segment_id = %seg.id, "export: dropping segment no two reviewers have decided");
+            continue;
+        }
         if db.rights_for_segment(&seg.id)?.is_revoked() {
             tracing::info!(segment_id = %seg.id, "export: dropping segment with withdrawn consent");
             continue;
@@ -416,13 +541,42 @@ pub(crate) fn exclude_unexportable_segments(
             tracing::info!(segment_id = %seg.id, "export: dropping human-rejected segment");
             continue;
         }
+        if let Some(reason) = crate::quality::technical_unusable_reason(&seg) {
+            tracing::info!(segment_id = %seg.id, reason, "export: dropping technically unusable segment");
+            continue;
+        }
         if crate::quality::is_effective_placeholder(&seg) {
             tracing::info!(segment_id = %seg.id, "export: dropping placeholder-only segment");
             continue;
         }
+        // An `is_gold` row is a hidden spot-check ANSWER KEY (owner canon: the phone must never be
+        // served its own answer key). `human_export_label` in export_audio refused those rows on its
+        // own — and only there, so every tabular/HF/bundle exporter shipped the key verbatim. Same
+        // shape as the withdrawal rule above: enforced at the root, not at whichever caller remembered.
+        // The holdout filter below does NOT cover this — it keys on the separate `gold_segments` table,
+        // and a flagged answer key need not be registered there.
+        if seg.is_gold {
+            tracing::info!(segment_id = %seg.id, "export: dropping is_gold answer-key segment");
+            continue;
+        }
         kept.push(seg);
     }
+    // An export that silently returns nothing reads as a broken button, not as a rule doing its job.
+    // When consensus is the ONLY reason the result is empty, say so with the count, so the operator
+    // learns "no clip has two reviewers yet" instead of filing a bug against the exporter. Guarded on
+    // `undecided > 0` and `in_pool > 0` so a genuinely empty library still exports empty as before.
+    if kept.is_empty() && undecided > 0 && in_pool > 0 {
+        return Err(AppError::Validation(format!(
+            "nothing is exportable yet: {undecided} of {in_pool} clips in the review pool are still \
+             waiting for a decision, and none has been decided. OWNER CANON: a sentence ships only \
+             once any two DIFFERENT reviewers have agreed on it. Get second opinions onto reviewed \
+             clips and export again."
+        )));
+    }
     let segments = kept;
+    if !exclude_holdouts {
+        return Ok(segments);
+    }
     let holdout = crate::jury::learning::holdout_content_hashes(db)?;
     let holdout_paths = crate::jury::learning::holdout_audio_paths(db)?;
     // All VAD chunks of one recording share a single audio_path. Memoize path -> held_out so a source
@@ -480,11 +634,7 @@ pub(crate) fn exclude_unexportable_segments(
 }
 
 pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportFormat) -> AppResult<()> {
-    // Telemetry (Week-1 "measure first"): real export wall-clock. The guard records on return; metadata
-    // carries the format so the owner can compare JSON/JSONL/CSV/Parquet costs via get_recent_spans /
-    // get_tracing_stats. Mirrors the asr.transcribe / decode / normalizer guards.
-    let _span = crate::telemetry::TRACER
-        .start_span("export.dataset", crate::telemetry::Tracer::metadata(vec![("format", format!("{format:?}"))]));
+    crate::review_campaign::require_export_unblocked(db, "dataset export")?;
     // Drop held-out gold segments BEFORE counting or writing any format, so the training tables
     // (JSON/JSONL/CSV/Parquet) — including the production bundle that delegates through here — never
     // publish the eval set's reference transcripts; closes the eval-on-train leak the HF export
@@ -522,11 +672,42 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
     if revoked_excluded > 0 {
         tracing::warn!("dataset export excluded {revoked_excluded} segment(s) whose consent was withdrawn");
     }
+
+    export_dataset_from_segments(db, path, format, &segments)
+}
+
+/// Write one tabular dataset format from an already-selected immutable row snapshot.
+///
+/// The production bundle deliberately calls this for all four formats with the SAME preflight
+/// snapshot. Calling [`export_dataset`] four times would query the live database four times, allowing
+/// a concurrent insert/re-accept/edit to enter only some files after rights/source checks had already
+/// run. This helper performs no row query and no policy selection; callers must pass the exact rows
+/// they intend to describe.
+pub(crate) fn export_dataset_from_segments(
+    db: &Database,
+    path: &std::path::Path,
+    format: &ExportFormat,
+    segments: &[SpeechSegment],
+) -> AppResult<()> {
+    let processed_audio = processed_audio_notices(db, segments)?;
+    export_dataset_from_snapshot(path, format, segments, &processed_audio)
+}
+
+pub(crate) fn export_dataset_from_snapshot(
+    path: &std::path::Path,
+    format: &ExportFormat,
+    segments: &[SpeechSegment],
+    processed_audio: &[ProcessedAudioNotice],
+) -> AppResult<()> {
+    // Telemetry (Week-1 "measure first"): real export wall-clock. The guard records on return; metadata
+    // carries the format so the owner can compare JSON/JSONL/CSV/Parquet costs via get_recent_spans /
+    // get_tracing_stats. Mirrors the asr.transcribe / decode / normalizer guards.
+    let _span = crate::telemetry::TRACER
+        .start_span("export.dataset", crate::telemetry::Tracer::metadata(vec![("format", format!("{format:?}"))]));
     let total_duration: i64 = segments.iter().map(|s| s.duration_ms).sum();
     let verified = segments.iter().filter(|s| s.verified).count();
     // Say which recordings were processed before import. Computed AFTER every exclusion above, so the
     // counts describe what this file actually contains.
-    let processed_audio = processed_audio_notices(db, &segments)?;
     if !processed_audio.is_empty() {
         let clips: usize = processed_audio.iter().map(|n| n.segments).sum();
         tracing::info!(
@@ -543,9 +724,9 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
         total_segments: segments.len(),
         total_duration_ms: total_duration,
         verified_segments: verified,
-        training_grade_summary: quality::training_grade_summary(&segments),
-        composition: compute_composition(&segments),
-        processed_audio,
+        training_grade_summary: quality::training_grade_summary(segments),
+        composition: compute_composition(segments),
+        processed_audio: processed_audio.to_vec(),
         exported_at: chrono::Utc::now().to_rfc3339(),
     };
 
@@ -554,10 +735,10 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
     }
 
     match format {
-        ExportFormat::Json => export_json(path, &metadata, &segments),
-        ExportFormat::Jsonl => export_jsonl(path, &segments),
-        ExportFormat::Csv => export_csv(path, &segments),
-        ExportFormat::Parquet => export_parquet(path, &segments),
+        ExportFormat::Json => export_json(path, &metadata, segments),
+        ExportFormat::Jsonl => export_jsonl(path, segments),
+        ExportFormat::Csv => export_csv(path, segments),
+        ExportFormat::Parquet => export_parquet(path, segments),
     }
 }
 
@@ -889,12 +1070,10 @@ pub(crate) fn write_sha256sums(dir: &std::path::Path) -> AppResult<()> {
 }
 
 /// Like `write_sha256sums` but covers ONLY the named files (relative to `dir`) instead of scanning the
-/// whole directory. `write_sha256sums`'s whole-dir scan is correct for exporters that stage into a CLEAN
-/// dir, but the audio export writes into a caller-chosen dir it does not stage: a re-export of a smaller
-/// selection leaves ORPHAN clips from a prior run, and a whole-dir manifest would then vouch for a stale
-/// clip that this export's metadata.csv omits — an integrity manifest asserting a file the dataset itself
-/// does not list (sibling of the bundle orphan-source fix). Pass the export's own file list so the
-/// manifest describes exactly this dataset. Missing entries are skipped; `SHA256SUMS` is never self-listed.
+/// whole directory. The reviewed-audio exporter passes the same explicit inventory to its staged-tree
+/// verifier and public result, so the command result, metadata and integrity manifest cannot drift.
+/// Missing entries are skipped here for compatibility with other callers; the reviewed-audio verifier
+/// immediately rejects any such omission before publication. `SHA256SUMS` is never self-listed.
 pub(crate) fn write_sha256sums_for(dir: &std::path::Path, rel_files: &[String]) -> AppResult<()> {
     let mut files: Vec<(String, String)> = Vec::new();
     for rel in rel_files {
@@ -946,6 +1125,7 @@ pub fn export_huggingface_dataset(
     dir: &std::path::Path,
     settings: &crate::settings::AppSettings,
 ) -> AppResult<()> {
+    crate::review_campaign::require_export_unblocked(db, "Hugging Face dataset export")?;
     // Telemetry (Week-1 "measure first"): real HuggingFace-export wall-clock (audio copy + shard writes).
     let _span = crate::telemetry::TRACER.start_span("export.huggingface", crate::telemetry::Tracer::metadata(vec![]));
     std::fs::create_dir_all(dir)?;
@@ -985,6 +1165,7 @@ pub fn export_huggingface_dataset(
                 &grade,
                 &ready_agentic_segment_ids,
                 &required_source_reference_models,
+                false,
             )?
         {
             has_exportable_row = true;
@@ -1140,8 +1321,15 @@ pub fn export_huggingface_dataset(
                 // pass the same training-ready + HF-export gate the write loop applies below. A source's
                 // non-training-ready REVIEW rows are skipped regardless of availability, so counting them
                 // here inflated droppedUnavailableAudio (dataset_infos.json) and mislabeled REVIEW rows as
-                // lost "training-ready" segments in the operator warnings. is_training_ready_for_huggingface_export
-                // reads only the grade + DB records, never the audio, so it is valid for an unavailable source.
+                // lost "training-ready" segments in the operator warnings.
+                //
+                // Every gate in is_training_ready_for_huggingface_export reads only the grade + DB records
+                // EXCEPT one: a SILVER row carrying source-reference commit evidence re-hashes its source
+                // audio to prove the stored identity still matches. On an unmounted drive that check cannot
+                // run, so it refused — and the rows the missing drive actually cost us went uncounted while
+                // dataset_infos.json reported droppedUnavailableAudio = 0. Pass `true` so an UNREADABLE
+                // source counts as "would have been written"; a readable-but-STALE identity still does not
+                // (this closure also runs for a present-but-undecodable source, where the hash succeeds).
                 let count_exportable = |segs: &[&SpeechSegment]| -> AppResult<usize> {
                     let mut n = 0usize;
                     for &seg in segs {
@@ -1152,6 +1340,7 @@ pub fn export_huggingface_dataset(
                             &grade,
                             &ready_agentic_segment_ids,
                             &required_source_reference_models,
+                            true,
                         )? {
                             n += 1;
                         }
@@ -1188,6 +1377,11 @@ pub fn export_huggingface_dataset(
                             continue;
                         }
                     };
+                    // Hash the exact in-memory decode used for every slice below. Path metadata or a
+                    // pre-decode hash leaves a replacement window; this buffer identity cannot drift
+                    // out from under the bytes written to the staged dataset generation.
+                    let current_content_hash =
+                        crate::fingerprint::AudioFingerprint::content_hash(&full_pcm, sample_rate);
 
                     for seg in segs {
                         let grade = quality::training_grade_for_segment(seg);
@@ -1206,13 +1400,20 @@ pub fn export_huggingface_dataset(
                             &grade,
                             &ready_agentic_segment_ids,
                             &required_source_reference_models,
+                            false,
                         )? {
                             tracing::warn!(
-                                    "Skipping segment {} in HF export: machine training-ready row is missing multi-model hypothesis coverage, ready agentic promotion coverage, or configured source-reference model coverage/current audio identity",
-                                    seg.id
-                                );
+                                "Skipping segment {} in HF export: machine training-ready row is missing multi-model hypothesis coverage, ready agentic promotion coverage, or configured source-reference model coverage/current audio identity",
+                                seg.id
+                            );
                             continue;
                         }
+                        require_segment_audio_identity_hash(
+                            db,
+                            &seg.id,
+                            &current_content_hash,
+                            "Hugging Face audio export",
+                        )?;
 
                         // Slice from the already-decoded PCM buffer. An out-of-range/degenerate
                         // alignment window skips the row instead of emitting the whole source file.
@@ -1244,15 +1445,13 @@ pub fn export_huggingface_dataset(
                         let verified_str = if seg.verified { "1" } else { "0" };
                         let training_ready_str = if grade.training_ready { "1" } else { "0" };
                         let reasons = grade.reasons.join("; ");
-                        // Canonical Sorani orthography for the shipped transcription (ك/ک, ي/ی, ه/ھ
-                        // unified — mixed codepoint variants inflate the CTC label space downstream),
-                        // then the formula-injection guard on every caller-influenced column. The clip
+                        // Preserve the exact grade-selected Verbatim-Law transcript, then apply the
+                        // formula-injection transport guard on every caller-influenced CSV column. The clip
                         // name is included: sanitized_clip_filename() maps '=', '+' and '@' to '_' but
                         // PRESERVES '-', which csv_safe_cell() itself treats as a formula lead, so a
                         // source stem beginning with '-' otherwise reached metadata.csv unguarded.
-                        let canonical_transcript = crate::normalizer::canonical_training_text(&grade.transcript);
                         let hf_filename = csv_safe_cell(filename.as_str());
-                        let hf_transcript = csv_safe_cell(&canonical_transcript);
+                        let hf_transcript = csv_safe_cell(&grade.transcript);
                         let hf_speaker = csv_safe_cell(seg.speaker_id.as_deref().unwrap_or(""));
                         let hf_reasons = csv_safe_cell(reasons.as_str());
 
@@ -1416,10 +1615,10 @@ This dataset was exported from Cortex Speech Processor.
 | **Total** | {} | {:.2} |
 
 ## Text Normalization Policy
-The `transcription` column is orthographically canonicalized for Sorani: Arabic-script codepoint
-variants are unified (Kaf ك→ک, Yeh ي→ی, Heh→ھ/ە forms; tatweel/ZWNJ folded) so each grapheme has
-one form across human-typed and ASR-produced text. Digits are preserved exactly as written (no
-number verbalization), and diacritics are left untouched.
+The `transcription` column preserves the exact stored Verbatim-Law authority selected for each row:
+human verdict, then human annotation, then champion raw. It is not silently orthographically
+normalized or rewritten. Consumers that need normalized Sorani must create and label that derived
+view explicitly; the source label and its codepoints remain recoverable unchanged.
 {composition_md}"#,
         settings.hf_license,
         settings.hf_license,
@@ -1600,9 +1799,8 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
                 let raw = csv_safe_cell(seg.raw_transcript.as_str());
                 let normalized = csv_safe_cell(seg.normalized_transcript.as_deref().unwrap_or(""));
                 let annotated = csv_safe_cell(seg.annotated_transcript.as_deref().unwrap_or(""));
-                // Canonicalize the shipped training column like the HF exporter (see ExportSegmentRecord).
-                let training_text = crate::normalizer::canonical_training_text(&grade.transcript);
-                let training = csv_safe_cell(&training_text);
+                // Preserve the exact grade-selected Verbatim-Law label in the primary training column.
+                let training = csv_safe_cell(&grade.transcript);
                 let speaker = csv_safe_cell(seg.speaker_id.as_deref().unwrap_or(""));
                 let reasons_cell = csv_safe_cell(reasons.as_str());
                 wtr.write_record([
@@ -1721,11 +1919,10 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
     let duration_ms: Int64Array = segments.iter().map(|s| Some(s.duration_ms)).collect();
     let speaker_id: StringArray = segments.iter().map(|s| s.speaker_id.as_deref()).collect();
     let verified: BooleanArray = segments.iter().map(|s| Some(s.verified)).collect();
-    // Canonicalize the shipped training column like the HF/JSON/CSV exporters so all four formats emit
-    // byte-identical training text for a segment (no mixed-orthography re-entry via Parquet).
-    let training_texts: Vec<String> =
-        grade_reports.iter().map(|report| crate::normalizer::canonical_training_text(&report.transcript)).collect();
-    let training_transcript: StringArray = training_texts.iter().map(|t| Some(t.as_str())).collect();
+    // Primary labels preserve the exact grade-selected Verbatim-Law authority. A consumer may derive
+    // a separately labeled normalized view, but Parquet must not rewrite the source transcript bytes.
+    let training_transcript: StringArray =
+        grade_reports.iter().map(|report| Some(report.transcript.as_str())).collect();
     let transcript_source: StringArray =
         grade_reports.iter().map(|report| Some(report.transcript_source.as_str())).collect();
     let training_grade: StringArray = grade_reports.iter().map(|report| Some(report.grade.as_str())).collect();
@@ -1780,3 +1977,67 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
 #[cfg(test)]
 #[path = "export_tests.rs"]
 mod tests;
+
+/// Regressions for the two shared-root export rules fixed in this file. A separate module from the
+/// `#[path]`-included `export_tests.rs` only so the fix and its gate stay in one file.
+#[cfg(test)]
+mod shared_exclusion_tests {
+    use super::*;
+
+    #[test]
+    fn an_is_gold_answer_key_is_excluded_at_the_shared_export_root() {
+        // The spot-check answer key was refused by export_audio's own `human_export_label` and by
+        // nothing else, so the tabular/HuggingFace/bundle exporters all shipped it. Enforced at the
+        // shared root now, which is the only place every exporter routes through.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        let keep = SpeechSegment {
+            id: "keep".to_string(),
+            audio_path: "/kept.wav".to_string(),
+            raw_transcript: "دەقی یەکەم".to_string(),
+            duration_ms: 1000,
+            ..SpeechSegment::default()
+        };
+        let answer_key = SpeechSegment {
+            id: "answer-key".to_string(),
+            audio_path: "/key.wav".to_string(),
+            raw_transcript: "وەڵامی نهێنی".to_string(),
+            duration_ms: 1000,
+            is_gold: true,
+            ..SpeechSegment::default()
+        };
+
+        let kept = exclude_unexportable_segments(&db, vec![keep, answer_key]).unwrap();
+        let ids: Vec<&str> = kept.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["keep"], "an is_gold answer key must never leave the app: {ids:?}");
+    }
+
+    #[test]
+    fn unreadable_source_audio_is_counted_as_would_have_been_written_but_never_written() {
+        // The dropped_unavailable tally asks "would this row have been written had the audio been
+        // there?". The identity check re-hashes the source file, so on an unmounted drive it refused —
+        // and dataset_infos.json then reported droppedUnavailableAudio = 0 while the export path
+        // promises the drop "is counted, not silent".
+        let missing = SourceTranscriptRecord {
+            audio_path: "/definitely/not/mounted/source.wav".to_string(),
+            model_id: "reference-model".to_string(),
+            audio_content_hash: Some("abc123".to_string()),
+            audio_size_bytes: Some(4096),
+            transcript_path: "/refs/source.txt".to_string(),
+            transcript_text: "دەقی سەرچاوە".to_string(),
+            created_at: None,
+        };
+        assert!(!source_reference_record_matches_current_audio(&missing, false), "the WRITE gate stays fail-closed");
+        assert!(
+            source_reference_record_matches_current_audio(&missing, true),
+            "the tally must count a row only an unreadable source blocked"
+        );
+
+        // A record with NO stored identity is refused in BOTH modes: that is a property of the record,
+        // not of the audio, so leniency must not smuggle it into the count either.
+        let legacy = SourceTranscriptRecord { audio_content_hash: None, audio_size_bytes: None, ..missing };
+        assert!(!source_reference_record_matches_current_audio(&legacy, false));
+        assert!(!source_reference_record_matches_current_audio(&legacy, true));
+    }
+}

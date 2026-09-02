@@ -1,8 +1,9 @@
 pub mod phonetic;
 
 use serde::{Deserialize, Serialize};
+use specta::Type;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
 pub enum DiffOp {
     Equal,
     Insert,
@@ -10,13 +11,13 @@ pub enum DiffOp {
     Replace,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct DiffChange {
     pub op: DiffOp,
     pub value: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct TextDiff {
     pub raw: String,
     pub annotated: String,
@@ -24,7 +25,7 @@ pub struct TextDiff {
     pub stats: DiffStats,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct DiffStats {
     pub added_words: usize,
     pub removed_words: usize,

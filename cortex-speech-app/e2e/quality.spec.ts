@@ -1,4 +1,5 @@
 import { test, expect } from './fixtures';
+import { openHeaderOverflow } from './helpers/header';
 
 test.describe('Dataset quality UI', () => {
   test.beforeEach(async ({ page }) => {
@@ -20,6 +21,7 @@ test.describe('Dataset quality UI', () => {
   });
 
   test('validation panel opens and shows summary', async ({ page }) => {
+    await openHeaderOverflow(page);
     await page.getByTestId('validate-btn').click();
     const panel = page.getByTestId('validation-panel');
     await expect(panel).toBeVisible();

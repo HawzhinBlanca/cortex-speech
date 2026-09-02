@@ -3,8 +3,8 @@
 Three times a Node probe has died with exit 3221226505 (0xC0000409 STATUS_STACK_BUFFER_OVERRUN)
 inside a full sweep and never in 103 standalone runs, always before it measured anything. The process
 that dies is node.exe — the harness — not the app under test. A leg that produced NO measurement is
-not evidence that the app failed its gate, so `run_gate` re-runs once on that signature and keeps a
-`<gate>.CRASH.<timestamp>.log` of the dead attempt so the occurrence stays counted.
+not evidence that the app failed its gate, so `run_gate` re-runs once on that signature, preserves
+both attempt logs, and reports PASS-AFTER-RETRY. That status cannot certify a release.
 
 The danger of any retry is that it turns a REAL regression green. These checks run `run_gate` for
 real and pin the boundary: an OS-termination is retried, an ordinary non-zero exit is NOT.
@@ -77,7 +77,11 @@ def test_os_termination_is_retried_once_and_leaves_evidence() -> None:
         encoding="ascii",
     )
     script = str(fixture)
-    before = {p.name for p in v.LOG_DIR.glob("retry-policy-crash.CRASH.*.log")} if v.LOG_DIR.exists() else set()
+    before = (
+        {p.name for p in v.LOG_DIR.glob("retry-policy-crash.attempt-1.*.log")}
+        if v.LOG_DIR.exists()
+        else set()
+    )
     status, _secs, detail = v.run_gate(
         "retry-policy-crash", "cmd", script, str(REPO_ROOT), None, timeout=60
     )
@@ -89,15 +93,17 @@ def test_os_termination_is_retried_once_and_leaves_evidence() -> None:
         raise AssertionError(
             f"an OS-terminated gate ran {runs} times, expected exactly 2 (one crash + one re-run)"
         )
-    if status != v.PASS:
-        raise AssertionError(f"the recovered leg reported {status!r}, expected PASS after a clean re-run")
+    if status != v.PASS_AFTER_RETRY:
+        raise AssertionError(
+            f"the recovered leg reported {status!r}, expected non-certifying PASS-AFTER-RETRY"
+        )
     if "re-ran once" not in detail:
         raise AssertionError(f"the re-run was not disclosed in the gate detail: {detail!r}")
 
-    after = {p.name for p in v.LOG_DIR.glob("retry-policy-crash.CRASH.*.log")}
+    after = {p.name for p in v.LOG_DIR.glob("retry-policy-crash.attempt-1.*.log")}
     if not (after - before):
         raise AssertionError(
-            "no CRASH log was kept for the OS-terminated attempt — the occurrence would become "
+            "no first-attempt log was kept for the OS-terminated attempt — the occurrence would become "
             "invisible as soon as the retry passed, which is exactly what must not happen"
         )
     for name in after - before:

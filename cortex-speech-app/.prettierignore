@@ -1,0 +1,2 @@
+# Deterministic Rust-generated contract; drift is checked by test_generated_ipc_bindings.py.
+src/lib/generated/

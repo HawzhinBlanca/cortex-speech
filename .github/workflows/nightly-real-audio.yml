@@ -78,13 +78,14 @@ jobs:
             cortex-speech-app/src-tauri/target
           key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('cortex-speech-app/src-tauri/Cargo.lock') }}
 
-      # Base models AND a built dist/ must exist before ANY cargo build in this job: build.rs ->
+      # Runtime support AND a built dist/ must exist before ANY cargo build in this job: build.rs ->
       # tauri-build validates bundle.resources (models/silero_vad_v4.onnx) and the crate's
       # tauri::generate_context! (compiled by the test binaries) requires build.frontendDist
       # ("../dist"). Same provisioning ci.yml uses (fixes the nightly "resource path
       # models/silero_vad_v4.onnx doesn't exist" failure - and the dist/ failure right behind it).
-      - name: Fetch + verify base models (bundle.resources)
-        run: npm run fetch-models
+      # This job is the explicit optional 300M diagnostic, unlike standard CI/release provisioning.
+      - name: Fetch runtime support + explicit optional 300M diagnostic
+        run: npm run fetch-models -- --include-optional-asr 300m
       - name: Install Node dependencies (for the frontend build below)
         run: npm ci
       - name: Build frontend (tauri generate_context needs ../dist)

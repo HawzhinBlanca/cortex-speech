@@ -11,7 +11,7 @@ insert_segment writes), hard-kill it, restart, and verify invariants:
                                              vanished or a resume regression silently UPSERT-clobbered
                                              one; note `id` is the PRIMARY KEY, so "duplicate rows" are
                                              schema-impossible and deliberately NOT claimed)
-  4. committed-but-unjournaled tail is bounded (≤1 per kill since the last verify — the only legal gap,
+  4. committed-but-unjournaled tail is bounded (at most 1 per kill since the last verify — the only legal gap,
                                              a kill landing between commit and journal append)
   5. row count never decreases              (restart never eats prior data)
 

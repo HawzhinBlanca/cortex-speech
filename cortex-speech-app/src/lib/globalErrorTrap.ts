@@ -5,7 +5,7 @@ import { formatUnknownError } from './errorText';
 
 /**
  * Extract a human-readable string from an unhandled promise-rejection reason (an Error, a bare string,
- * or an arbitrary object) — used as the toast detail.
+ * or an arbitrary object) for diagnostic logging and classification.
  */
 export function describeRejection(reason: unknown): string {
   return formatUnknownError(reason);
@@ -14,7 +14,7 @@ export function describeRejection(reason: unknown): string {
 /** Surface a fire-and-forget promise rejection as an error toast (never let it vanish). */
 export function notifyUnhandledRejection(reason: unknown): void {
   notifications.error(get(t)('notifications.unexpectedError'), {
-    detail: describeRejection(reason),
+    cause: reason,
   });
 }
 

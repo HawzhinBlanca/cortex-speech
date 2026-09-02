@@ -53,10 +53,10 @@ describe('computeLocalDiff', () => {
     expect(r.stats.added_words).toBe(3);
   });
 
-  it('guards oversized inputs without allocating an LCS table', () => {
+  it('refuses oversized inputs without allocating an LCS table or claiming 100% similarity', () => {
     const huge = Array.from({ length: 10_001 }, (_, idx) => `w${idx}`).join(' ');
-    const r = computeLocalDiff(huge, 'short text');
-    expect(r.changes).toHaveLength(0);
-    expect(r.stats.similarity).toBe(100);
+    expect(() => computeLocalDiff(huge, 'short text')).toThrow(
+      expect.objectContaining({ schema: 1, code: 'DIFF_TOO_LARGE' }),
+    );
   });
 });

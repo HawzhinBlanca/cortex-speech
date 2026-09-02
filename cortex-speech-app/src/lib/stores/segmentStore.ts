@@ -1,96 +1,289 @@
+import { tick } from 'svelte';
 import { writable, derived, get } from 'svelte/store';
 import type { SpeechSegment, WordTimestamp } from '../types';
 import * as api from '../commands';
 import { dedupeById } from '../dedupeById';
 import { notifications } from './notificationStore';
 import { t } from '../i18n';
+import { formatPublicErrorReference } from '../errorText';
+import { ProjectionEpoch } from '../projectionEpoch';
 
 // A bounded render window. More rows are appended only as the virtual list approaches its end.
 const PAGE_SIZE = 200;
+const MAX_RESIDENT_PAGES = 3;
+const MAX_RESIDENT_SEGMENTS = PAGE_SIZE * MAX_RESIDENT_PAGES;
 
 function createSegmentsStore() {
-  const { subscribe, set, update } = writable<SpeechSegment[]>([]);
+  const { subscribe, set: rawSet, update: rawUpdate } = writable<SpeechSegment[]>([]);
+  const projection = new ProjectionEpoch();
   let loadSeq = 0;
   let nextCursor: string | null = null;
   let loadingMore = false;
+  let activeFullLoad: Promise<number | null> | null = null;
+  const activeHydrations = new Map<string, Promise<SpeechSegment>>();
+  const hydratedSegmentIds = new Set<string>();
+  let hydrationTail: Promise<void> = Promise.resolve();
+  let hydrationGeneration = 0;
+  let projectionHealthy = true;
+
+  function retireHydrations() {
+    ++hydrationGeneration;
+    activeHydrations.clear();
+    hydrationTail = Promise.resolve();
+  }
+
+  function set(value: SpeechSegment[]) {
+    retireHydrations();
+    hydratedSegmentIds.clear();
+    ++loadSeq;
+    projection.mutate();
+    projectionHealthy = true;
+    rawSet(value);
+  }
+
+  function update(updater: (rows: SpeechSegment[]) => SpeechSegment[]) {
+    retireHydrations();
+    ++loadSeq;
+    projection.mutate();
+    projectionHealthy = true;
+    rawUpdate(updater);
+  }
+
+  function bumpLoadGeneration() {
+    retireHydrations();
+    hydratedSegmentIds.clear();
+    ++loadSeq;
+    projection.mutate();
+    projectionHealthy = true;
+  }
+
+  async function runLoadAttempt(): Promise<number | null> {
+    // A full reload is the recovery boundary for a wedged row read. Retire cached/coalesced
+    // hydrations immediately; late work is fenced by both this generation and the projection epoch.
+    retireHydrations();
+    hydratedSegmentIds.clear();
+    projectionHealthy = false;
+    const projectionEpoch = projection.begin();
+    const seq = ++loadSeq;
+    nextCursor = null;
+    loadingMore = false;
+    const sort = get(sortOrder);
+    const verified = get(filterVerified);
+    const query = get(searchQuery).trim() || null;
+    try {
+      const page = await api.getSegmentsPage({
+        verified,
+        query,
+        sort,
+        limit: PAGE_SIZE,
+        cursor: null,
+      });
+      if (seq !== loadSeq || !projection.isLatest(projectionEpoch)) {
+        return projection.settle(projectionEpoch, false);
+      }
+      rawSet(dedupeById(page.items));
+      // Search is part of the server-side page scope now. Never retain a legacy frozen result set
+      // across a reload, because it can hide newly matching rows or retain stale matches.
+      searchResults.set(null);
+      nextCursor = page.nextCursor;
+      libraryTotal.set(page.total);
+      libraryTruncated.set(nextCursor !== null);
+      await Promise.all([refreshConformalThreshold(), refreshSegmentStats()]);
+      // A newer load or local projection write may have superseded this run during metadata refresh.
+      if (seq !== loadSeq || !projection.isLatest(projectionEpoch)) {
+        return projection.settle(projectionEpoch, false);
+      }
+      libraryLoadError.set(null);
+      projectionHealthy = true;
+      return projection.settle(projectionEpoch, true);
+    } catch (error) {
+      if (seq !== loadSeq || !projection.isLatest(projectionEpoch)) {
+        return projection.settle(projectionEpoch, false);
+      }
+      console.error('Failed to load segments', error);
+      const message = formatPublicErrorReference(error) ?? get(t)('errors.unknown');
+      libraryLoadError.set(message);
+      notifications.error(get(t)('notifications.loadSegmentsFailed'), { cause: error });
+      projectionHealthy = false;
+      return projection.settle(projectionEpoch, false);
+    }
+  }
+
+  function loadAttempt(): Promise<number | null> {
+    const operation = runLoadAttempt();
+    activeFullLoad = operation;
+    void operation.then(
+      () => {
+        if (activeFullLoad === operation) activeFullLoad = null;
+      },
+      () => {
+        if (activeFullLoad === operation) activeFullLoad = null;
+      },
+    );
+    return operation;
+  }
+
+  function currentSegment(segmentId: string): SpeechSegment | null {
+    return get({ subscribe }).find((row) => row.id === segmentId) ?? null;
+  }
+
+  /**
+   * Replace a bounded page row with its complete backend projection. Duplicate requests for the
+   * same row share one Promise. A page reload that begins later owns the projection, so a late
+   * hydration can never put stale metadata back into the library.
+   */
+  function hydrate(segmentId: string): Promise<SpeechSegment> {
+    const existing = activeHydrations.get(segmentId);
+    if (existing) return existing;
+    const generation = hydrationGeneration;
+
+    const run = async (): Promise<SpeechSegment> => {
+      if (generation !== hydrationGeneration) {
+        const current = currentSegment(segmentId);
+        if (current) return current;
+        throw new Error('E_SEGMENT_HYDRATION_SUPERSEDED');
+      }
+      // A hydration triggered by publishing a page must not supersede any full load. Follow the
+      // active pointer until no page load remains; if a newer load starts meanwhile it becomes the
+      // authority and this row is hydrated only after that load settles.
+      while (activeFullLoad) {
+        const precedingLoad = activeFullLoad;
+        await precedingLoad;
+        if (activeFullLoad === precedingLoad) activeFullLoad = null;
+      }
+      // The await above is a retirement boundary: a newer reload may have completed and certified
+      // its projection while this queued hydration was asleep. Never mint an epoch for retired work.
+      if (generation !== hydrationGeneration) {
+        const current = currentSegment(segmentId);
+        if (current) return current;
+        throw new Error('E_SEGMENT_HYDRATION_SUPERSEDED');
+      }
+
+      const seq = loadSeq;
+      try {
+        const hydrated = await api.getSegment(segmentId);
+        if (generation !== hydrationGeneration || seq !== loadSeq) {
+          const current = currentSegment(segmentId);
+          if (current) return current;
+          throw new Error('E_SEGMENT_HYDRATION_SUPERSEDED');
+        }
+        // Pagination and row hydration are compatible additive mutations. Mint the receipt only at
+        // the synchronous apply point so a slow page fetch cannot retire an unrelated row fetch (or
+        // vice versa); full reloads remain fenced by loadSeq/hydrationGeneration above.
+        const projectionEpoch = projection.begin();
+        hydratedSegmentIds.add(segmentId);
+        rawUpdate((rows) => rows.map((row) => (row.id === segmentId ? hydrated : row)));
+        projection.settle(projectionEpoch, true);
+        return hydrated;
+      } catch (error) {
+        if (generation !== hydrationGeneration || seq !== loadSeq) {
+          const current = currentSegment(segmentId);
+          if (current) return current;
+          throw new Error('E_SEGMENT_HYDRATION_SUPERSEDED', { cause: error });
+        }
+        throw error;
+      }
+    };
+
+    // Different rows are deliberately serialized. Projection receipts attest a complete rendered
+    // state; parallel last-writer-wins hydrations would let one successful row retire another row
+    // that was still unresolved and could falsely certify a partial projection.
+    const operation = hydrationTail.then(run, run);
+    hydrationTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+
+    activeHydrations.set(segmentId, operation);
+    projectionHealthy = false;
+    void operation.then(
+      () => {
+        if (activeHydrations.get(segmentId) === operation) {
+          activeHydrations.delete(segmentId);
+          if (activeHydrations.size === 0) projectionHealthy = true;
+        }
+      },
+      () => {
+        if (activeHydrations.get(segmentId) === operation) {
+          activeHydrations.delete(segmentId);
+          projectionHealthy = false;
+        }
+      },
+    );
+    return operation;
+  }
+
+  async function load() {
+    return (await loadAttempt()) !== null;
+  }
+
+  async function reloadProjection(): Promise<number | null> {
+    const receipt = await loadAttempt();
+    if (receipt === null) return null;
+    const seq = loadSeq;
+
+    // Publishing a page can synchronously schedule component effects that request full rows. Let
+    // those effects register, then require every registered hydration to settle successfully before
+    // sealing one composite projection receipt for the undo/reconciliation barrier.
+    await tick();
+    while (activeHydrations.size > 0) {
+      const hydrationResults = await Promise.allSettled([...activeHydrations.values()]);
+      if (hydrationResults.some((result) => result.status === 'rejected')) return null;
+      if (loadSeq !== seq) return null;
+    }
+    return loadSeq === seq ? projection.receipt() : null;
+  }
+
+  function projectionReceipt(): number | null {
+    return projectionHealthy && activeHydrations.size === 0 ? projection.receipt() : null;
+  }
+
+  function isHydrated(segmentId: string): boolean {
+    return hydratedSegmentIds.has(segmentId);
+  }
+
+  async function loadMore() {
+    if (loadingMore || !nextCursor) return;
+    const seq = loadSeq;
+    const cursor = nextCursor;
+    const sort = get(sortOrder);
+    const verified = get(filterVerified);
+    const query = get(searchQuery).trim() || null;
+    loadingMore = true;
+    try {
+      const page = await api.getSegmentsPage({ verified, query, sort, limit: PAGE_SIZE, cursor });
+      if (seq !== loadSeq || cursor !== nextCursor) return;
+      const projectionEpoch = projection.begin();
+      rawUpdate((current) => {
+        const merged = dedupeById([...current, ...page.items]);
+        return merged.length > MAX_RESIDENT_SEGMENTS
+          ? merged.slice(merged.length - MAX_RESIDENT_SEGMENTS)
+          : merged;
+      });
+      nextCursor = page.nextCursor;
+      libraryTotal.set(page.total);
+      libraryTruncated.set(nextCursor !== null);
+      projection.settle(projectionEpoch, true);
+    } catch (error) {
+      if (seq === loadSeq) {
+        notifications.error(get(t)('notifications.loadSegmentsFailed'), { cause: error });
+      }
+    } finally {
+      if (seq === loadSeq) loadingMore = false;
+    }
+  }
+
   return {
     subscribe,
     set,
     update,
-    bumpLoadGeneration() {
-      loadSeq++;
-    },
-    async load() {
-      const seq = ++loadSeq;
-      nextCursor = null;
-      loadingMore = false;
-      const sort = get(sortOrder);
-      const verified = get(filterVerified);
-      const query = get(searchQuery).trim() || null;
-      try {
-        const page = await api.getSegmentsPage({
-          verified,
-          query,
-          sort,
-          limit: PAGE_SIZE,
-          cursor: null,
-        });
-        if (seq !== loadSeq) return;
-        set(dedupeById(page.items));
-        // Search is part of the server-side page scope now. Never retain a legacy frozen result set
-        // across a reload, because it can hide newly matching rows or retain stale matches.
-        searchResults.set(null);
-        nextCursor = page.nextCursor;
-        libraryTotal.set(page.total);
-        libraryTruncated.set(nextCursor !== null);
-        // Refresh corpus-wide metadata independently of the bounded list window.
-        await Promise.all([refreshConformalThreshold(), refreshSegmentStats()]);
-        // A newer load (or a write) may have superseded this run DURING the awaited threshold refresh —
-        // mirror the in-loop seq guard so a stale/older run cannot CLEAR a newer FAILED load's error
-        // (which would silently drop the failure back to a "looks fine" state — the F1 bug, in a race).
-        if (seq !== loadSeq) return;
-        // The load fully succeeded — clear any prior error state so the view leaves the error branch.
-        libraryLoadError.set(null);
-      } catch (e) {
-        console.error('Failed to load segments', e);
-        // P2.1 (audit F1): a DB/IPC read failure must NEVER render as an empty library. The store keeps
-        // its prior value (empty on FIRST load), so without this the empty-state showed "No segments
-        // loaded" — indistinguishable from a wiped library, in an app whose one law is honesty about
-        // data. Surface a distinct, PERSISTENT error the empty view reads (with a Retry), plus a toast
-        // for the case where a background reload fails while the user is on another view.
-        const msg = e instanceof Error ? e.message : String(e);
-        libraryLoadError.set(msg);
-        notifications.error(get(t)('notifications.loadSegmentsFailed'), { detail: msg });
-      }
-    },
-    async loadMore() {
-      if (loadingMore || !nextCursor) return;
-      const seq = loadSeq;
-      const cursor = nextCursor;
-      const sort = get(sortOrder);
-      const verified = get(filterVerified);
-      const query = get(searchQuery).trim() || null;
-      loadingMore = true;
-      try {
-        const page = await api.getSegmentsPage({ verified, query, sort, limit: PAGE_SIZE, cursor });
-        if (seq !== loadSeq) return;
-        update((current) => dedupeById([...current, ...page.items]));
-        nextCursor = page.nextCursor;
-        libraryTotal.set(page.total);
-        libraryTruncated.set(nextCursor !== null);
-      } catch (e) {
-        if (seq !== loadSeq) return;
-        const msg = e instanceof Error ? e.message : String(e);
-        notifications.error(get(t)('notifications.loadSegmentsFailed'), { detail: msg });
-      } finally {
-        if (seq === loadSeq) loadingMore = false;
-      }
-    },
-    async hydrate(segmentId: string): Promise<SpeechSegment> {
-      const hydrated = await api.getSegment(segmentId);
-      update((current) => current.map((row) => (row.id === segmentId ? hydrated : row)));
-      return hydrated;
-    },
+    bumpLoadGeneration,
+    load,
+    hydrate,
+    reloadProjection,
+    projectionReceipt,
+    isHydrated,
+    loadMore,
   };
 }
 

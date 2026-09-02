@@ -16,6 +16,7 @@
 //!     same transaction, so the one-champion invariant is never even momentarily tripped.
 
 use crate::db::Database;
+use crate::deployment::{DeploymentProvenance, VerifiedDeployment, VerifiedDeploymentRecord, OMNIASR_7B_FAMILY};
 use crate::error::{AppError, AppResult};
 use crate::scorecard::Scorecard;
 use rusqlite::{params, Row};
@@ -45,6 +46,15 @@ pub struct NewModelVersion {
     pub checkpoint_path: String,
     pub source: String,
     pub license: String,
+}
+
+/// The minimum identity required to prove that the process answering on the champion port is the
+/// exact registry row it claims to serve. Paths and display names are deliberately excluded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentIdentity {
+    pub model_version_id: String,
+    pub deployment_sha256: String,
 }
 
 /// Sources whose checkpoints originate OUTSIDE the trusted stock seed and therefore MUST carry
@@ -100,7 +110,7 @@ pub fn register_candidate(db: &Database, new: &NewModelVersion) -> AppResult<()>
 /// Promote a registered version to `champion`, atomically demoting the prior champion of the
 /// same family to `rolled_back`. The whole swap is one transaction so the one-champion-per-family
 /// invariant is never tripped, even momentarily.
-pub fn promote_to_champion(db: &Database, id: &str) -> AppResult<()> {
+pub(crate) fn promote_to_champion(db: &Database, id: &str) -> AppResult<()> {
     let conn = db.connection();
     let tx = conn.unchecked_transaction()?;
 
@@ -131,6 +141,11 @@ pub fn promote_to_champion(db: &Database, id: &str) -> AppResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn set_champion_for_test(db: &Database, id: &str) -> AppResult<()> {
+    promote_to_champion(db, id)
+}
+
 /// P5.2 (true-10 audit): mirror the registry's champions to `<data_dir>/champion.json` so external
 /// consumers — the WSL 7B server, whose adapter path was previously HARDCODED, making promotion a
 /// no-op at its final step — can resolve the current champion without reading the app database.
@@ -149,26 +164,185 @@ pub fn sync_champion_pointer(db: &Database, data_dir: &std::path::Path) -> AppRe
         families.insert(
             champion.family.clone(),
             serde_json::json!({
-                "id": champion.id,
-                "checkpointPath": champion.checkpoint_path,
-                "checkpointSha256": champion.checkpoint_sha256,
+                "modelVersionId": champion.id,
+                "deploymentManifestPath": champion.checkpoint_path,
+                "deploymentSha256": champion.checkpoint_sha256,
                 "source": champion.source,
                 "license": champion.license,
             }),
         );
     }
-    let payload = serde_json::json!({ "schema": 1, "champions": families });
+    let payload = serde_json::json!({ "schema": 2, "champions": families });
     let text = serde_json::to_string_pretty(&payload)
         .map_err(|e| AppError::Other(format!("champion pointer serialize: {e}")))?;
     let path = data_dir.join("champion.json");
+    crate::atomic_file::recover_interrupted_replace(&path).map_err(AppError::Io)?;
     // Skip the write when unchanged so the file's mtime stays meaningful for external watchers.
     if std::fs::read_to_string(&path).map(|old| old == text).unwrap_or(false) {
         return Ok(false);
     }
-    let tmp = data_dir.join("champion.json.tmp");
+    let tmp = data_dir.join(format!("champion.json.tmp-{}", std::process::id()));
     std::fs::write(&tmp, &text).map_err(AppError::Io)?;
-    std::fs::rename(&tmp, &path).map_err(AppError::Io)?;
+    crate::atomic_file::replace_file(&tmp, &path).map_err(AppError::Io)?;
     Ok(true)
+}
+
+/// Register a complete, locally verified deployment unit. New challengers must carry flywheel
+/// provenance; the transparent-but-unverifiable legacy form is reserved for the one-time incumbent
+/// bootstrap and can never enter through this path.
+pub fn register_verified_deployment(
+    db: &Database,
+    verified: &VerifiedDeployment,
+    source: &str,
+    license: &str,
+) -> AppResult<ModelVersion> {
+    register_verified_deployment_record(db, &verified.record(), source, license)
+}
+
+pub fn register_verified_deployment_record(
+    db: &Database,
+    verified: &VerifiedDeploymentRecord,
+    source: &str,
+    license: &str,
+) -> AppResult<ModelVersion> {
+    if !matches!(verified.manifest.provenance, DeploymentProvenance::Flywheel { .. }) {
+        return Err(AppError::Validation("legacy_bootstrap provenance cannot be registered as a challenger".into()));
+    }
+    let new = NewModelVersion {
+        id: verified.manifest.model_id.clone(),
+        family: verified.manifest.family.clone(),
+        model_card_name: Some(verified.manifest.model_card.clone()),
+        checkpoint_sha256: verified.deployment_sha256.clone(),
+        checkpoint_path: verified.manifest_path.clone(),
+        source: source.to_string(),
+        license: license.to_string(),
+    };
+    register_candidate(db, &new)?;
+    get_model_version(db, &new.id)?
+        .ok_or_else(|| AppError::Other(format!("registered deployment '{}' could not be read back", new.id)))
+}
+
+const LEGACY_BASE_SHA256: &str = "1b29a4045ddfbe9125e6c9d465d5bc29063eea256ace37c129742edc07aed17a";
+const LEGACY_ADAPTER_SHA256: &str = "c348ade8a8160319e7e6f070addb3c7b066b70716390e8f4ae548c7db7af3750";
+const LEGACY_ADAPTER_CONFIG_SHA256: &str = "4b870f13ec88f4ca19cc3bdded779ec03090077a82e0381412fb80cc420ce331";
+const LEGACY_TOKENIZER_SHA256: &str = "8aa11a1092142ef472537476ef6e76541123e2f0d789b79f3ebd119008240b1e";
+const LEGACY_MEASUREMENT_EVIDENCE_SHA256: &str = "14793b6f9c4f67c9a08989e54212be85b56ddda06036e6ffd69e8d0f76416f88";
+// Existing owner deployments were sealed before the historical N=922 evidence document gained its
+// explicit duplication-weighted/non-primary warning. The model bytes and measured run did not
+// change, so retain that one exact predecessor identity for upgrade compatibility; no arbitrary
+// evidence hash is accepted.
+const LEGACY_MEASUREMENT_EVIDENCE_SHA256_PRE_LABEL: &str =
+    "6133abb5684f1f9856c99b4765cfea66e084ba4acd72ece649e316c467fee68e";
+const LEGACY_MODEL_ID: &str = "omniasr-7b-legacy-c348ade8a816";
+
+/// One-time, atomic admission of the measured incumbent that predates flywheel lineage. Every
+/// behavior-determining byte is pinned to the measured live deployment, provenance explicitly says
+/// training is unverifiable, and the family must contain zero rows. This is not a general shortcut:
+/// future challengers can enter only through `register_verified_deployment_record`.
+pub fn bootstrap_verified_legacy_deployment(
+    db: &Database,
+    verified: &VerifiedDeploymentRecord,
+    license: &str,
+) -> AppResult<ModelVersion> {
+    let DeploymentProvenance::LegacyBootstrap { measurement_evidence_sha256, training_provenance } =
+        &verified.manifest.provenance
+    else {
+        return Err(AppError::Validation("legacy bootstrap requires explicit legacy_bootstrap provenance".into()));
+    };
+    let manifest = &verified.manifest;
+    if manifest.model_id != LEGACY_MODEL_ID
+        || manifest.base_checkpoint.id != "omniASR-LLM-7B-v2"
+        || manifest.base_checkpoint.sha256 != LEGACY_BASE_SHA256
+        || manifest.adapter.sha256 != LEGACY_ADAPTER_SHA256
+        || manifest.adapter_config.sha256 != LEGACY_ADAPTER_CONFIG_SHA256
+        || manifest.tokenizer.sha256 != LEGACY_TOKENIZER_SHA256
+        || !matches!(
+            measurement_evidence_sha256.as_str(),
+            LEGACY_MEASUREMENT_EVIDENCE_SHA256 | LEGACY_MEASUREMENT_EVIDENCE_SHA256_PRE_LABEL
+        )
+        || training_provenance != "unverifiable"
+    {
+        return Err(AppError::Validation(
+            "legacy deployment does not match the measured incumbent's complete pinned identity".into(),
+        ));
+    }
+    crate::validation::input::validate_identifier(license).map_err(AppError::Validation)?;
+    let conn = db.connection();
+    let tx = conn.unchecked_transaction()?;
+    let family_rows: i64 =
+        tx.query_row("SELECT COUNT(*) FROM model_versions WHERE family = ?1", params![OMNIASR_7B_FAMILY], |row| {
+            row.get(0)
+        })?;
+    if family_rows != 0 {
+        return Err(AppError::Validation(format!(
+            "legacy bootstrap is single-use and requires an empty family; found {family_rows} existing row(s)"
+        )));
+    }
+    tx.execute(
+        "INSERT INTO model_versions
+            (id, family, model_card_name, checkpoint_sha256, checkpoint_path, source, license, status, promoted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'meta-stock', ?6, 'champion', datetime('now'))",
+        params![
+            manifest.model_id,
+            manifest.family,
+            manifest.model_card,
+            verified.deployment_sha256,
+            verified.manifest_path,
+            license,
+        ],
+    )?;
+    tx.commit()?;
+    get_model_version(db, LEGACY_MODEL_ID)?.ok_or_else(|| {
+        AppError::Other("legacy champion was committed but could not be read back from the registry".into())
+    })
+}
+
+fn verify_registry_deployment(version: &ModelVersion) -> AppResult<VerifiedDeployment> {
+    if version.family != OMNIASR_7B_FAMILY {
+        return Err(AppError::Validation(format!(
+            "deployment verification is defined only for family '{OMNIASR_7B_FAMILY}', got '{}'",
+            version.family
+        )));
+    }
+    let verified = crate::deployment::verify_deployment_manifest(
+        std::path::Path::new(&version.checkpoint_path),
+        Some(&version.checkpoint_sha256),
+    )?;
+    if verified.manifest.model_id != version.id || verified.manifest.family != version.family {
+        return Err(AppError::Validation(format!(
+            "registry row '{}' does not match deployment manifest model/family identity",
+            version.id
+        )));
+    }
+    if version.model_card_name.as_deref() != Some(verified.manifest.model_card.as_str()) {
+        return Err(AppError::Validation(format!(
+            "registry row '{}' does not match deployment manifest model card",
+            version.id
+        )));
+    }
+    Ok(verified)
+}
+
+/// Is `model_id` a model of `family` in the registry?
+///
+/// Champion supremacy asks a question the per-row provenance filter cannot answer on its own: a row
+/// drafted BEFORE the owner selected WSL7B carries the weaker engine's id, and matching it per-row
+/// would surface that engine's hypotheses during champion review. This is the membership test that
+/// keeps such a row contributing NO auxiliary vote, exactly as the fixed-string filter used to.
+pub(crate) fn is_family_model(db: &Database, model_id: &str, family: &str) -> AppResult<bool> {
+    let found: i64 = db.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM model_versions WHERE id = ?1 AND family = ?2)",
+        rusqlite::params![model_id, family],
+        |row| row.get(0),
+    )?;
+    Ok(found != 0)
+}
+
+pub fn champion_identity(db: &Database, family: &str) -> AppResult<Option<DeploymentIdentity>> {
+    Ok(get_champion(db, family)?.map(|version| DeploymentIdentity {
+        model_version_id: version.id,
+        deployment_sha256: version.checkpoint_sha256,
+    }))
 }
 
 /// The current champion for a family, if one is crowned.
@@ -299,6 +473,12 @@ pub fn register_checkpoint(
     model_card_name: Option<String>,
     sha: String,
 ) -> AppResult<String> {
+    if family == OMNIASR_7B_FAMILY {
+        return Err(AppError::Validation(
+            "OmniASR-7B is a composite deployment (base + adapter + adapter config + tokenizer); import a verified deployment_manifest.json instead of a bare checkpoint"
+                .into(),
+        ));
+    }
     // The caller pre-hashes via `hash_checkpoint` and passes `sha` in, so the DB lock here covers only
     // the insert, not the (slow) file read — do NOT re-hash inline.
     register_candidate(
@@ -507,13 +687,15 @@ pub fn decide_promotion(challenger: &Scorecard, policy: &PromotionPolicy) -> Pro
     PromotionDecision { promote, reasons }
 }
 
-/// Evaluate the promotion gate for a challenger and, if it passes, atomically promote it over the
-/// current champion. `challenger_scorecard` must compare the challenger against the CURRENT champion
-/// (its `vs_baseline`), as produced by the gold-eval harness. Returns the explainable decision in
-/// both the promote and block cases.
+/// Evaluate the legacy in-process scorecard gate without mutating registry state.
+/// `challenger_scorecard` must compare the challenger against the CURRENT champion. Production
+/// promotion is a multi-system operation and may run only through the durable saga; keeping this
+/// helper decision-only prevents bypassing pointer, process identity, canary and rollback checks.
 ///
-/// First-champion bootstrap: if the family has no champion yet there is no baseline to beat, so the
-/// challenger is promoted unconditionally as the family's first champion.
+/// There is deliberately NO implicit first-champion shortcut. The measured incumbent is admitted
+/// once through [`bootstrap_verified_legacy_deployment`]; every flywheel challenger is then evaluated against
+/// that exact incumbent. Treating "registry empty" as a free pass lets a missing/corrupt registry
+/// crown an unevaluated model.
 pub fn gate_and_promote(
     db: &Database,
     challenger_id: &str,
@@ -534,6 +716,11 @@ pub fn gate_and_promote(
         )));
     }
 
+    let challenger_deployment = verify_registry_deployment(&challenger)?;
+    if !matches!(challenger_deployment.manifest.provenance, DeploymentProvenance::Flywheel { .. }) {
+        return Err(AppError::Validation("promotion gate accepts only a fully traced flywheel challenger".into()));
+    }
+
     // Distinguish "no champion exists" from "a champion exists" by the CHAMPION ROW itself — NOT by
     // whether its gold_cer is non-NULL. Keying on gold_cer would read a champion with a NULL gold_cer
     // as "no champion", letting the next challenger bypass the ENTIRE gate (a free promotion). The gate
@@ -541,13 +728,16 @@ pub fn gate_and_promote(
     // stored gold_cer value is not needed here at all.
     let decision = match get_champion(db, &challenger.family)? {
         None => PromotionDecision {
-            promote: true,
+            promote: false,
             reasons: vec![format!(
-                "no incumbent champion for family '{}' — promoted as the first champion",
+                "no incumbent champion for family '{}' — refusing an unpaired first promotion; bootstrap the measured incumbent explicitly",
                 challenger.family
             )],
         },
         Some(champion) => {
+            // Validate the incumbent deployment too. A scorecard pairing against a row whose bytes
+            // can no longer be reproduced is not trustworthy promotion evidence.
+            let _incumbent_deployment = verify_registry_deployment(&champion)?;
             // Safety-gate precondition #2 (round-24 hunt #12, the stale-baseline hole): the scorecard's
             // paired baseline MUST be the CURRENT champion. In a batch fan-out, two challengers B and C
             // are both scored against champion A; gating B promotes it and rolls A back. C's scorecard
@@ -567,9 +757,6 @@ pub fn gate_and_promote(
         }
     };
 
-    if decision.promote {
-        promote_to_champion(db, challenger_id)?;
-    }
     Ok(decision)
 }
 
@@ -595,6 +782,67 @@ mod tests {
         }
     }
 
+    fn register_test_flywheel(db: &Database, id: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = crate::deployment::tests::write_test_flywheel_manifest(dir.path(), id);
+        let verified = crate::deployment::verify_deployment_manifest(&manifest, None).unwrap();
+        register_verified_deployment(db, &verified, "cortex-finetuned", "Apache-2.0").unwrap();
+        dir
+    }
+
+    fn test_legacy_record() -> (tempfile::TempDir, VerifiedDeploymentRecord) {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = crate::deployment::tests::write_test_flywheel_manifest(dir.path(), "fixture");
+        let mut record = crate::deployment::verify_deployment_manifest(&manifest, None).unwrap().record();
+        record.manifest.model_id = LEGACY_MODEL_ID.into();
+        record.manifest.base_checkpoint.id = "omniASR-LLM-7B-v2".into();
+        record.manifest.base_checkpoint.sha256 = LEGACY_BASE_SHA256.into();
+        record.manifest.adapter.sha256 = LEGACY_ADAPTER_SHA256.into();
+        record.manifest.adapter_config.sha256 = LEGACY_ADAPTER_CONFIG_SHA256.into();
+        record.manifest.tokenizer.sha256 = LEGACY_TOKENIZER_SHA256.into();
+        record.manifest.provenance = DeploymentProvenance::LegacyBootstrap {
+            measurement_evidence_sha256: LEGACY_MEASUREMENT_EVIDENCE_SHA256.into(),
+            training_provenance: "unverifiable".into(),
+        };
+        (dir, record)
+    }
+
+    #[test]
+    fn legacy_bootstrap_is_exact_atomic_and_single_use() {
+        let db = open();
+        let (_dir, record) = test_legacy_record();
+        let champion = bootstrap_verified_legacy_deployment(&db, &record, "Apache-2.0").unwrap();
+        assert_eq!(champion.id, LEGACY_MODEL_ID);
+        assert_eq!(champion.status, "champion");
+        assert_eq!(list_model_versions(&db).unwrap().len(), 1);
+        assert!(bootstrap_verified_legacy_deployment(&db, &record, "Apache-2.0").is_err());
+        assert_eq!(list_model_versions(&db).unwrap().len(), 1, "a retry cannot duplicate or partially rewrite it");
+    }
+
+    #[test]
+    fn legacy_bootstrap_rejects_one_byte_identity_drift_without_writing() {
+        let db = open();
+        let (_dir, mut record) = test_legacy_record();
+        record.manifest.adapter_config.sha256 = "0".repeat(64);
+        assert!(bootstrap_verified_legacy_deployment(&db, &record, "Apache-2.0").is_err());
+        assert!(list_model_versions(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_bootstrap_accepts_only_the_exact_pre_label_evidence_identity_for_upgrade_compatibility() {
+        let db = open();
+        let (_dir, mut record) = test_legacy_record();
+        let DeploymentProvenance::LegacyBootstrap { measurement_evidence_sha256, .. } = &mut record.manifest.provenance
+        else {
+            panic!("legacy fixture lost its provenance kind");
+        };
+        *measurement_evidence_sha256 = LEGACY_MEASUREMENT_EVIDENCE_SHA256_PRE_LABEL.into();
+
+        let champion = bootstrap_verified_legacy_deployment(&db, &record, "Apache-2.0").unwrap();
+        assert_eq!(champion.id, LEGACY_MODEL_ID);
+        assert_eq!(list_model_versions(&db).unwrap().len(), 1);
+    }
+
     #[test]
     fn champion_pointer_mirrors_promotions_and_skips_unchanged_writes() {
         // P5.2: promotion must be resolvable OUTSIDE the app db — the WSL 7B server reads
@@ -606,7 +854,7 @@ mod tests {
         assert!(sync_champion_pointer(&db, tmp.path()).unwrap(), "first sync writes the file");
         let text = std::fs::read_to_string(tmp.path().join("champion.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["schema"], 1);
+        assert_eq!(v["schema"], 2);
         assert!(v["champions"].as_object().unwrap().is_empty());
 
         // Promote one -> the pointer carries id + sha + path for its family.
@@ -615,9 +863,9 @@ mod tests {
         assert!(sync_champion_pointer(&db, tmp.path()).unwrap(), "changed registry rewrites the file");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(tmp.path().join("champion.json")).unwrap()).unwrap();
-        assert_eq!(v["champions"]["omniasr-7b"]["id"], "m1");
-        assert_eq!(v["champions"]["omniasr-7b"]["checkpointSha256"], "abc123");
-        assert_eq!(v["champions"]["omniasr-7b"]["checkpointPath"], "/models/x.pt");
+        assert_eq!(v["champions"]["omniasr-7b"]["modelVersionId"], "m1");
+        assert_eq!(v["champions"]["omniasr-7b"]["deploymentSha256"], "abc123");
+        assert_eq!(v["champions"]["omniasr-7b"]["deploymentManifestPath"], "/models/x.pt");
 
         // Unchanged registry -> no rewrite (mtime stays meaningful for external watchers).
         assert!(!sync_champion_pointer(&db, tmp.path()).unwrap(), "unchanged content is not rewritten");
@@ -703,7 +951,7 @@ mod tests {
         let sha = import_checkpoint(
             &db,
             "u7b",
-            "omniasr-7b",
+            "omniasr-ctc-1b",
             ckpt.to_str().unwrap(),
             "user-finetuned",
             "Apache-2.0",
@@ -963,40 +1211,39 @@ mod tests {
     // --- gate_and_promote integration ---
 
     #[test]
-    fn gate_and_promote_crowns_first_champion_unconditionally() {
+    fn gate_and_promote_refuses_an_unpaired_first_challenger() {
         let db = open();
-        register_candidate(&db, &candidate("v1", "omniasr-7b", "user-finetuned", "sha")).unwrap();
-        // Even a weak scorecard with no baseline promotes when there is no incumbent to beat.
+        let _v1 = register_test_flywheel(&db, "v1");
         let mut card = ided(challenger_card(0.5, 0.5, 0.5, 0.5, false, 0.9), "v1", "");
         card.vs_baseline = None;
         let decision = gate_and_promote(&db, "v1", &card, &PromotionPolicy::default()).unwrap();
-        assert!(decision.promote, "the first model must become champion: {:?}", decision.reasons);
-        assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "v1");
+        assert!(!decision.promote, "a missing incumbent must never become a free promotion: {:?}", decision.reasons);
+        assert!(get_champion(&db, "omniasr-7b").unwrap().is_none());
     }
 
     #[test]
-    fn gate_and_promote_swaps_in_a_qualified_challenger() {
+    fn gate_and_promote_is_decision_only_for_a_qualified_challenger() {
         let db = open();
         // Incumbent champion with a recorded gold CER.
-        register_candidate(&db, &candidate("champ", "omniasr-7b", "meta-stock", "shaA")).unwrap();
+        let _champ = register_test_flywheel(&db, "champ");
         record_eval_result(&db, "champ", 0.20, 0.10, 0.08, 0.12, None, "{}", None).unwrap();
         promote_to_champion(&db, "champ").unwrap();
         // Challenger that significantly beats WER and lowers CER (0.06 < 0.10).
-        register_candidate(&db, &candidate("chall", "omniasr-7b", "user-finetuned", "shaB")).unwrap();
+        let _chall = register_test_flywheel(&db, "chall");
         let card = ided(challenger_card(0.10, 0.06, 0.20, 0.10, true, 0.01), "chall", "champ");
         let decision = gate_and_promote(&db, "chall", &card, &PromotionPolicy::default()).unwrap();
-        assert!(decision.promote, "a qualified challenger must promote: {:?}", decision.reasons);
-        assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "chall");
-        assert_eq!(get_model_version(&db, "champ").unwrap().unwrap().status, "rolled_back");
+        assert!(decision.promote, "a qualified challenger must pass the gate: {:?}", decision.reasons);
+        assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "champ");
+        assert_eq!(get_model_version(&db, "chall").unwrap().unwrap().status, "candidate");
     }
 
     #[test]
     fn gate_and_promote_keeps_champion_when_challenger_regresses_cer() {
         let db = open();
-        register_candidate(&db, &candidate("champ", "omniasr-7b", "meta-stock", "shaA")).unwrap();
+        let _champ = register_test_flywheel(&db, "champ");
         record_eval_result(&db, "champ", 0.20, 0.10, 0.08, 0.12, None, "{}", None).unwrap();
         promote_to_champion(&db, "champ").unwrap();
-        register_candidate(&db, &candidate("chall", "omniasr-7b", "user-finetuned", "shaB")).unwrap();
+        let _chall = register_test_flywheel(&db, "chall");
         // Beats WER but regresses CER (0.15 > 0.10) -> blocked; the champion is untouched.
         let card = ided(challenger_card(0.10, 0.15, 0.20, 0.10, true, 0.01), "chall", "champ");
         let decision = gate_and_promote(&db, "chall", &card, &PromotionPolicy::default()).unwrap();
@@ -1012,14 +1259,14 @@ mod tests {
         // gold_cer used to bypass the ENTIRE gate (free promotion). gate_and_promote now keys on the
         // champion ROW, so even a NULL-gold_cer champion still forces the challenger through the gate.
         let db = open();
-        register_candidate(&db, &candidate("champ", "omniasr-7b", "meta-stock", "shaA")).unwrap();
+        let _champ = register_test_flywheel(&db, "champ");
         promote_to_champion(&db, "champ").unwrap(); // crowned WITHOUT record_eval_result -> gold_cer NULL
         assert!(
             champion_gold_cer(&db, "omniasr-7b").unwrap().is_none(),
             "precondition: the champion's gold_cer is NULL"
         );
 
-        register_candidate(&db, &candidate("chall", "omniasr-7b", "user-finetuned", "shaB")).unwrap();
+        let _chall = register_test_flywheel(&db, "chall");
         // A CER-regressing challenger (paired 0.15 > 0.10) must be BLOCKED, not free-promoted.
         let card = ided(challenger_card(0.10, 0.15, 0.20, 0.10, true, 0.01), "chall", "champ");
         let decision = gate_and_promote(&db, "chall", &card, &PromotionPolicy::default()).unwrap();
@@ -1046,27 +1293,31 @@ mod tests {
         // though it was never compared to B, the champion it would displace. The gate must refuse a
         // scorecard whose baseline is not the CURRENT champion.
         let db = open();
-        register_candidate(&db, &candidate("A", "omniasr-7b", "meta-stock", "shaA")).unwrap();
+        let _a = register_test_flywheel(&db, "A");
         record_eval_result(&db, "A", 0.20, 0.10, 0.08, 0.12, None, "{}", None).unwrap();
         promote_to_champion(&db, "A").unwrap();
 
-        // B beats A and is promoted; A is rolled back, B is champion.
-        register_candidate(&db, &candidate("B", "omniasr-7b", "user-finetuned", "shaB")).unwrap();
+        // B beats A. The decision is then handed to the saga; this test manually applies only the DB
+        // phase so it can exercise the stale-baseline precondition in isolation.
+        let _b = register_test_flywheel(&db, "B");
         let card_b = ided(challenger_card(0.10, 0.06, 0.20, 0.10, true, 0.01), "B", "A");
         assert!(gate_and_promote(&db, "B", &card_b, &PromotionPolicy::default()).unwrap().promote);
+        promote_to_champion(&db, "B").unwrap();
         assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "B");
 
         // C's scorecard is still paired against the now-STALE baseline A — must be REFUSED, and B stays.
-        register_candidate(&db, &candidate("C", "omniasr-7b", "user-finetuned", "shaC")).unwrap();
+        let _c = register_test_flywheel(&db, "C");
         let card_c = ided(challenger_card(0.09, 0.05, 0.20, 0.10, true, 0.01), "C", "A");
         let err = gate_and_promote(&db, "C", &card_c, &PromotionPolicy::default());
         assert!(err.is_err(), "a scorecard paired against a rolled-back baseline must be refused, not gated");
         assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "B", "the real champion is unchanged");
 
-        // Re-scored against the CURRENT champion B, C promotes normally.
+        // Re-scored against the CURRENT champion B, C passes the decision gate but remains a candidate
+        // until the durable saga performs all external side effects.
         let card_c_fresh = ided(challenger_card(0.09, 0.05, 0.10, 0.06, true, 0.01), "C", "B");
         assert!(gate_and_promote(&db, "C", &card_c_fresh, &PromotionPolicy::default()).unwrap().promote);
-        assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "C");
+        assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "B");
+        assert_eq!(get_model_version(&db, "C").unwrap().unwrap().status, "candidate");
     }
 
     #[test]

@@ -75,17 +75,77 @@ pub fn generate_whole_file_reference_transcript(
     api_key: &str,
     output_dir: &Path,
 ) -> Result<SourceTranscriptArtifact, String> {
-    let transcript = transcribe_audio_with_gemini(audio_path, model, api_key)?;
+    generate_whole_file_reference_transcript_from_input(audio_path, audio_path, model, api_key, output_dir)
+}
+
+/// Generate from a private immutable input while naming and binding all durable artifacts to the
+/// owner's original source path. The input path is deliberately absent from both the returned DTO
+/// and any propagated error so a UUID staging filename can never become persisted evidence or UI
+/// detail.
+pub(crate) fn generate_whole_file_reference_transcript_from_input(
+    audio_input_path: &Path,
+    source_path: &Path,
+    model: &str,
+    api_key: &str,
+    output_dir: &Path,
+) -> Result<SourceTranscriptArtifact, String> {
+    let transcript = generate_whole_file_reference_text_from_input(audio_input_path, source_path, model, api_key)?;
+    persist_whole_file_reference_transcript(source_path, model, &transcript, output_dir)
+}
+
+/// Generate only the in-memory text from an immutable private input. Durable artifacts are written
+/// separately, after the caller has re-verified both the snapshot and the original source and has
+/// explicitly removed the private input.
+pub(crate) fn generate_whole_file_reference_text_from_input(
+    audio_input_path: &Path,
+    source_path: &Path,
+    model: &str,
+    api_key: &str,
+) -> Result<String, String> {
+    let transcript = transcribe_audio_with_gemini(audio_input_path, model, api_key)
+        .map_err(|error| redact_private_audio_input(error, audio_input_path, source_path))?;
     if !is_usable_source_reference_transcript(&transcript) {
         return Err("Gemini returned an empty or unusable whole-file reference transcript".to_string());
     }
-    let transcript_path = write_reference_text_file(audio_path, model, &transcript, output_dir)?;
+
+    Ok(transcript)
+}
+
+pub(crate) fn persist_whole_file_reference_transcript(
+    source_path: &Path,
+    model: &str,
+    transcript: &str,
+    output_dir: &Path,
+) -> Result<SourceTranscriptArtifact, String> {
+    let transcript_path = write_reference_text_file(source_path, model, transcript, output_dir)?;
     Ok(SourceTranscriptArtifact {
-        audio_path: audio_path.to_string_lossy().to_string(),
+        audio_path: source_path.to_string_lossy().to_string(),
         model_id: model.to_string(),
         transcript_path: transcript_path.to_string_lossy().to_string(),
-        transcript_text: transcript,
+        transcript_text: transcript.to_string(),
     })
+}
+
+fn redact_private_audio_input(mut error: String, audio_input_path: &Path, source_path: &Path) -> String {
+    let source_display = source_path.to_string_lossy().to_string();
+    let source_name = source_path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| "source-audio".to_string());
+    let input_display = audio_input_path.to_string_lossy().to_string();
+    let mut substitutions = vec![
+        (input_display.clone(), source_display.clone()),
+        (input_display.replace('\\', "/"), source_display.replace('\\', "/")),
+    ];
+    if let Some(input_name) = audio_input_path.file_name().map(|value| value.to_string_lossy().to_string()) {
+        substitutions.push((input_name, source_name));
+    }
+    for (private_value, public_value) in substitutions {
+        if !private_value.is_empty() {
+            error = error.replace(&private_value, &public_value);
+        }
+    }
+    error
 }
 
 pub fn is_usable_source_reference_transcript(text: &str) -> bool {
@@ -470,9 +530,9 @@ fn write_reference_text_file(
 
 /// Decode the source file, extract ONLY this segment's audio window (via its alignment), and return
 /// it as in-memory WAV bytes. This is the single source of truth for "the audio of one segment" —
-/// any cloud egress (Gemini T2, ElevenLabs Scribe vote) must send this slice, NEVER the whole source
-/// file, or it both leaks/processes unrelated audio and (for Scribe) stores a whole-file transcript
-/// against a single segment. `decode_to_pcm` caches by content, so slicing many segments from one
+/// any cloud listener (Gemini T2) must send this slice, NEVER the whole source file, or it processes
+/// unrelated audio and stores a whole-file transcript against a single segment. `decode_to_pcm`
+/// caches by content, so slicing many segments from one
 /// source file decodes it once.
 pub fn segment_audio_as_wav_bytes(segment: &SpeechSegment) -> AppResult<Vec<u8>> {
     let path = Path::new(&segment.audio_path);
@@ -730,6 +790,24 @@ mod tests {
     }
 
     #[test]
+    fn private_source_reference_input_is_redacted_from_external_errors() {
+        let private =
+            Path::new(r"C:\owner\source_transcripts\.private_audio_staging\source-reference-private-uuid.wav");
+        let source = Path::new(r"D:\recordings\owner-source.wav");
+        let raw = format!(
+            "failed to read '{}'; retry source-reference-private-uuid.wav via {}",
+            private.display(),
+            private.to_string_lossy().replace('\\', "/")
+        );
+
+        let redacted = redact_private_audio_input(raw, private, source);
+
+        assert!(!redacted.contains(".private_audio_staging"));
+        assert!(!redacted.contains("source-reference-private-uuid.wav"));
+        assert!(redacted.contains("owner-source.wav"));
+    }
+
+    #[test]
     fn reference_file_name_is_stable_and_safe() {
         let tmp = TempDir::new().expect("tempdir");
         let audio = tmp.path().join("My Long Audio.wav");
@@ -807,8 +885,8 @@ mod tests {
             "one second 16-bit PCM WAV should be about 32 KB, got {decoded_len_estimate}"
         );
 
-        // Round-21 #1: the Scribe vote path must send the sliced SEGMENT window (1 s ≈ 32 KB), never
-        // the whole 2 s source file (≈ 64 KB). Assert the raw WAV bytes are the slice, not the source.
+        // A cloud listener must receive the sliced SEGMENT window (1 s ≈ 32 KB), never the whole 2 s
+        // source file (≈ 64 KB). Assert the raw WAV bytes are the slice, not the source.
         let bytes = segment_audio_as_wav_bytes(&segment).expect("encode segment bytes");
         assert!(bytes.starts_with(b"RIFF"), "raw WAV bytes start with the RIFF header");
         assert!(

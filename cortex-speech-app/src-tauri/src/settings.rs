@@ -1,4 +1,4 @@
-use crate::atomic_file::{remove_file_on_error, replace_file};
+use crate::atomic_file::{fsync_parent_dir_strict, remove_file_on_error, replace_file};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -89,14 +89,10 @@ pub struct AppSettings {
     pub llm_api_key_configured: bool,
     #[serde(default)]
     pub cloud_llm_opt_in: bool,
-    /// Consent gate for explicit per-segment ElevenLabs Scribe tools. Imports never consult this
-    /// setting and always use the configured primary ASR. An explicit Scribe action sends only the
-    /// selected clip to ElevenLabs' API. Off by default.
-    #[serde(default)]
-    pub cloud_stt_opt_in: bool,
     /// App-owned supervision of the champion 7B WSL server (engine_runtime): the app holds the server
     /// as an owned child and auto-restarts it per engine_supervisor's backoff/breaker policy, killing
-    /// it on app exit. OFF by default — enabling auto-loads a ~30 GB model server (owner decision).
+    /// it on app exit. OFF by default: selecting the champion must never unexpectedly allocate ~30 GB
+    /// of VRAM. The owner enables supervision explicitly when this app should own the server lifecycle.
     #[serde(default)]
     pub champion_supervision_enabled: bool,
     /// Second-directory backup (Week-2 storage durability): when set to an absolute directory (ideally
@@ -124,8 +120,8 @@ pub struct AppSettings {
     /// from secrets.env; still gated by `jury_cloud_opt_in`; falls back to direct Gemini if no
     /// OpenRouter key is present.
     ///
-    /// POLICY (owner decision 2026-07-14): the ONLY approved cloud ASR judge for Central Kurdish is
-    /// **Gemini 2.5 Pro** (ElevenLabs Scribe is the only other approved cloud STT). Qwen-family ASR is
+    /// POLICY (owner decision, reaffirmed 2026-08-22): the ONLY approved advisory cloud judge for
+    /// Central Kurdish is **Gemini 2.5 Pro**. Qwen-family ASR is
     /// measured-bad on Sorani (no ckb support — see PROGRESS_LEDGER 2026 sweep) — do NOT point
     /// `jury_model` at it. Any future judge model needs a measured ckb CER on the frozen gold set first.
     #[serde(default = "default_jury_provider")]
@@ -167,7 +163,19 @@ pub struct AppSettings {
     /// hardcoded-prior path (no persistence, no warm-start).
     #[serde(default)]
     pub irt_ability_learning_enabled: bool,
+
+    /// Process-local fail-closed authority. This is set only when startup had to return defaults but
+    /// could not prove that the owner's existing settings bytes were recoverable/readable/preserved.
+    /// It is deliberately absent from JSON and IPC: neither a stale file nor an untrusted legacy
+    /// payload may clear the block. Restart after repairing access reloads authoritative disk state.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub settings_write_blocked: bool,
 }
+
+pub const SETTINGS_WRITE_BLOCKED_CODE: &str = "SETTINGS_WRITE_BLOCKED";
+pub const SETTINGS_WRITE_BLOCKED_MESSAGE: &str =
+    "Settings are read-only because the existing settings file could not be recovered safely. Restart after repairing file access or use workspace recovery.";
 
 fn default_hf_train_ratio() -> f64 {
     0.8
@@ -242,17 +250,22 @@ fn default_multi_engine_hypotheses() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub enum LlmMode {
-    None,
+    /// The FACTORY default (2026-08-20 external review). It used to be `Local`, which coupled a
+    /// fresh install's champion imports to an unrelated local LLM endpoint: the owner's hard-stop
+    /// law (2026-08-11) correctly halts when a CONFIGURED refiner fails, so a machine with no LM
+    /// server running hard-stopped otherwise-successful 7B drafts out of the box. Refinement is an
+    /// explicit opt-in mode, never a default dependency of the champion path.
     #[default]
+    None,
     Local,
     Gemini,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
 pub enum AsrModelSize {
-    #[default]
     CTC300M,
     CTC1B,
+    #[default]
     WSL7B,
 }
 
@@ -298,14 +311,19 @@ pub enum AutonLevel {
     ActAuto,
 }
 
+/// Owner-approved cloud model. Cloud work is advisory and consent-gated; production ASR remains
+/// the local OmniASR-7B champion. Keep one canonical bare id in settings and add the provider
+/// namespace only at the OpenRouter transport boundary.
+pub const ADVISORY_CLOUD_MODEL: &str = "gemini-2.5-pro";
+
 fn default_jury_model() -> String {
-    "gemini-2.5-pro".to_string()
+    ADVISORY_CLOUD_MODEL.to_string()
 }
 fn default_jury_provider() -> String {
     "gemini".to_string()
 }
 fn default_source_reference_models() -> Vec<String> {
-    vec!["gemini-2.5-pro".to_string(), "gemini-2.5-flash".to_string()]
+    vec![ADVISORY_CLOUD_MODEL.to_string()]
 }
 fn default_jury_self_consistency_n() -> u32 {
     3
@@ -355,7 +373,8 @@ impl Default for AppSettings {
             llm_api_key: "".to_string(),
             llm_api_key_configured: false,
             cloud_llm_opt_in: false,
-            cloud_stt_opt_in: false,
+            // Engine selection and lifecycle ownership are separate. WSL7B remains the only default
+            // drafter, but a clean install must not seize busy GPUs merely because the UI starts.
             champion_supervision_enabled: false,
             backup_second_dir: String::new(),
             llm_system_prompt: default_llm_system_prompt(),
@@ -372,6 +391,7 @@ impl Default for AppSettings {
             use_finetuned_asr: false,
             ger_refinement_enabled: false,
             irt_ability_learning_enabled: false,
+            settings_write_blocked: false,
         }
     }
 }
@@ -433,6 +453,68 @@ pub fn validate_outbound_endpoint(endpoint: &str) -> Result<(), crate::error::Ap
 }
 
 impl AppSettings {
+    /// Normalize every persisted cloud-model selector to the one owner-approved advisory model.
+    /// This is intentionally separate from the ASR clamp: explicit offline diagnostic tools may
+    /// still load a smaller local ASR selection, but no settings consumer may select Flash or an
+    /// arbitrary cloud model through stale JSON, a restored snapshot, or a webview payload.
+    ///
+    /// Returns `true` when a value changed so `load()` can durably migrate legacy settings.
+    pub fn enforce_advisory_cloud_canon(&mut self) -> bool {
+        let mut changed = false;
+
+        if self.jury_model != ADVISORY_CLOUD_MODEL {
+            self.jury_model = ADVISORY_CLOUD_MODEL.to_string();
+            changed = true;
+        }
+
+        let canonical_sources = [ADVISORY_CLOUD_MODEL];
+        if self.source_reference_models.len() != canonical_sources.len()
+            || self.source_reference_models.iter().map(String::as_str).ne(canonical_sources)
+        {
+            self.source_reference_models = vec![ADVISORY_CLOUD_MODEL.to_string()];
+            changed = true;
+        }
+
+        // The same field stores a local model id in Local mode. Preserve that operator choice; only
+        // a cloud-Gemini selection is fixed to the approved model.
+        if self.llm_mode == LlmMode::Gemini && self.llm_model != ADVISORY_CLOUD_MODEL {
+            self.llm_model = ADVISORY_CLOUD_MODEL.to_string();
+            changed = true;
+        }
+
+        let provider = if self.jury_provider.eq_ignore_ascii_case("openrouter") { "openrouter" } else { "gemini" };
+        if self.jury_provider != provider {
+            self.jury_provider = provider.to_string();
+            changed = true;
+        }
+
+        changed
+    }
+
+    /// Clamp the interactive desktop to the owner-approved production ASR. Smaller and MMS engines
+    /// remain available to explicit offline diagnostic binaries/tests, but neither a stale settings
+    /// file nor an untrusted webview update may route production data through them.
+    pub fn enforce_desktop_asr_canon(&mut self) {
+        self.asr_model_size = AsrModelSize::WSL7B;
+        self.use_finetuned_asr = false;
+        self.multi_engine_hypotheses = false;
+    }
+
+    /// Apply every production routing invariant before validation, persistence, or use.
+    pub fn enforce_production_canon(&mut self) {
+        self.enforce_desktop_asr_canon();
+        self.enforce_advisory_cloud_canon();
+    }
+
+    /// Load settings for a production transcription entry point. `load()` intentionally preserves
+    /// diagnostic engine selections for standalone offline tools; production callers must use this
+    /// constructor so stale or hand-edited settings cannot route persisted data away from WSL7B.
+    pub fn load_production(path: &std::path::Path) -> Self {
+        let mut settings = Self::load(path);
+        settings.enforce_production_canon();
+        settings
+    }
+
     pub fn load(path: &std::path::Path) -> Self {
         // If a previous save was interrupted (a hard crash between replace_file's two renames on
         // Windows, or a rename+restore double-failure), the canonical file can be missing while a
@@ -442,11 +524,24 @@ impl AppSettings {
         // the file is present (the common case).
         match crate::atomic_file::recover_interrupted_replace(path) {
             Ok(true) => {
-                tracing::warn!("Recovered settings from an interrupted save at {}", path.display())
+                // Recovery is a rename, so the bytes are not durably authoritative until the
+                // containing directory accepts the metadata barrier. A failed barrier is not a
+                // reason to discard the recovered bytes; it is a reason to make this process's
+                // fallback/settings snapshot read-only until a clean restart can prove authority.
+                if let Err(e) = fsync_parent_dir_strict(path) {
+                    return Self::write_blocked_defaults(
+                        path,
+                        &format!("interrupted-save recovery metadata could not be persisted safely: {e}"),
+                    );
+                }
+                tracing::warn!("Recovered settings from an interrupted save at {}", path.display());
             }
             Ok(false) => {}
             Err(e) => {
-                tracing::warn!("Could not check for an interrupted settings save at {}: {e}", path.display())
+                return Self::write_blocked_defaults(
+                    path,
+                    &format!("interrupted-save recovery authority was unreadable: {e}"),
+                );
             }
         }
         match std::fs::read_to_string(path) {
@@ -458,15 +553,11 @@ impl AppSettings {
                 let parseable = s.strip_prefix('\u{feff}').unwrap_or(&s);
                 match serde_json::from_str::<AppSettings>(parseable) {
                     Ok(mut settings) => {
+                        let mut rewrite = settings.enforce_advisory_cloud_canon();
                         if !settings.llm_api_key.is_empty() {
                             settings.llm_api_key_configured = true;
                             settings.llm_api_key.clear();
-                            if let Err(e) = settings.save(path) {
-                                tracing::warn!(
-                                    "Failed to scrub plaintext LLM key from settings file at {}: {e}",
-                                    path.display()
-                                );
-                            }
+                            rewrite = true;
                         }
                         // A hand-edited file bypasses update_settings' validate() gate, so degenerate
                         // numeric knobs (min=max=0 → one chunk per PCM SAMPLE; num_asr_threads=0 → ONNX
@@ -474,6 +565,14 @@ impl AppSettings {
                         // would brick startup, and falling back to full defaults would silently drop
                         // consent flags and the output dir over one bad number.
                         settings.repair_out_of_range_numeric_knobs();
+                        if rewrite {
+                            if let Err(e) = settings.save(path) {
+                                tracing::warn!(
+                                    "Failed to persist canonical/scrubbed settings at {}: {e}",
+                                    path.display()
+                                );
+                            }
+                        }
                         settings
                     }
                     Err(e) => {
@@ -481,17 +580,49 @@ impl AppSettings {
                         // it BEFORE returning defaults so the next update_settings save cannot overwrite —
                         // and permanently destroy — the still-recoverable original.
                         tracing::warn!("Failed to parse settings file at {}: {}; using defaults", path.display(), e);
-                        Self::preserve_unparseable_settings(path);
-                        Self::default()
+                        match Self::preserve_unparseable_settings(path) {
+                            Ok(backup) => {
+                                tracing::warn!("Preserved unparseable settings as {}", backup.display());
+                                Self::default()
+                            }
+                            Err(preserve_error) => Self::write_blocked_defaults(
+                                path,
+                                &format!("unparseable bytes could not be preserved safely: {preserve_error}"),
+                            ),
+                        }
                     }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(e) => {
-                tracing::warn!("Failed to read settings file at {}: {}; using defaults", path.display(), e);
-                Self::default()
-            }
+            Err(e) => Self::write_blocked_defaults(path, &format!("settings bytes were unreadable: {e}")),
         }
+    }
+
+    fn write_blocked_defaults(path: &std::path::Path, reason: &str) -> Self {
+        tracing::error!(
+            path = %path.display(),
+            reason,
+            "Using safe runtime defaults with settings persistence blocked; existing bytes will not be overwritten"
+        );
+        Self { settings_write_blocked: true, ..Self::default() }
+    }
+
+    /// Strict, non-mutating recovery parser. Snapshot preflight must never call `load`: its normal
+    /// startup behavior repairs the source file, renames invalid bytes, and silently falls back to
+    /// defaults. Here malformed state is a hard error before any live database page can change.
+    pub(crate) fn parse_recovery_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let text = std::str::from_utf8(bytes).map_err(|error| format!("settings.json is not UTF-8: {error}"))?;
+        let parseable = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let mut settings: Self =
+            serde_json::from_str(parseable).map_err(|error| format!("settings.json is invalid: {error}"))?;
+        if !settings.llm_api_key.is_empty() {
+            settings.llm_api_key_configured = true;
+            settings.llm_api_key.clear();
+        }
+        settings.enforce_advisory_cloud_canon();
+        settings.repair_out_of_range_numeric_knobs();
+        settings.validate().map_err(|error| format!("settings.json is unsafe: {error}"))?;
+        Ok(settings)
     }
 
     /// Reset any out-of-range segment-duration / thread knob to its default, warning per field.
@@ -558,17 +689,26 @@ impl AppSettings {
         }
     }
 
-    /// Rename an unparseable settings file to `settings.json.corrupt-<epoch>` so a subsequent save of
-    /// the defaults can never clobber the owner's recoverable original. Best-effort.
-    fn preserve_unparseable_settings(path: &std::path::Path) {
+    /// Rename an unparseable settings file to a unique sibling and strictly persist that directory
+    /// entry before defaults become writable. Failure is load-bearing: the returned defaults carry a
+    /// process-local write block so no later save can overwrite the still-authoritative original.
+    fn preserve_unparseable_settings(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let mut backup = path.as_os_str().to_owned();
-        backup.push(format!(".corrupt-{ts}"));
+        backup.push(format!(".corrupt-{ts}-{}", uuid::Uuid::new_v4().simple()));
         let backup = std::path::PathBuf::from(backup);
-        match std::fs::rename(path, &backup) {
-            Ok(()) => tracing::warn!("Preserved unparseable settings as {}", backup.display()),
-            Err(e) => tracing::warn!("Could not preserve unparseable settings at {}: {e}", path.display()),
+        std::fs::rename(path, &backup)?;
+        fsync_parent_dir_strict(path)?;
+        Ok(backup)
+    }
+
+    pub fn require_writable(&self) -> Result<(), crate::error::AppError> {
+        if self.settings_write_blocked {
+            return Err(crate::error::AppError::Validation(format!(
+                "{SETTINGS_WRITE_BLOCKED_CODE}: {SETTINGS_WRITE_BLOCKED_MESSAGE}"
+            )));
         }
+        Ok(())
     }
 
     /// Validate frontend-supplied settings SERVER-SIDE before they take effect — the Rust
@@ -601,6 +741,26 @@ impl AppSettings {
         }
         if self.llm_model.len() > MAX_MODEL_LEN {
             return Err(AppError::Validation("LLM model name is too long".into()));
+        }
+        if self.jury_model != ADVISORY_CLOUD_MODEL {
+            return Err(AppError::Validation(format!(
+                "jury_model must be the owner-approved advisory model {ADVISORY_CLOUD_MODEL}"
+            )));
+        }
+        if self.source_reference_models.len() != 1 || self.source_reference_models[0] != ADVISORY_CLOUD_MODEL {
+            return Err(AppError::Validation(format!(
+                "source_reference_models must contain only {ADVISORY_CLOUD_MODEL}"
+            )));
+        }
+        if self.llm_mode == LlmMode::Gemini && self.llm_model != ADVISORY_CLOUD_MODEL {
+            return Err(AppError::Validation(format!(
+                "Gemini refinement must use the owner-approved advisory model {ADVISORY_CLOUD_MODEL}"
+            )));
+        }
+        if self.jury_provider != "gemini" && self.jury_provider != "openrouter" {
+            return Err(AppError::Validation(
+                "jury_provider must be gemini or openrouter (both route to Gemini 2.5 Pro)".into(),
+            ));
         }
         if self.llm_system_prompt.len() > MAX_PROMPT_LEN {
             return Err(AppError::Validation("LLM system prompt is too long".into()));
@@ -665,10 +825,14 @@ impl AppSettings {
     }
 
     pub fn save(&self, path: &std::path::Path) -> Result<(), crate::error::AppError> {
+        // Check before creating a parent or temporary file. A fallback snapshot whose original
+        // authority was unreadable must be observational only for this process lifetime.
+        self.require_writable()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut persisted = self.clone();
+        persisted.enforce_advisory_cloud_canon();
         if !persisted.llm_api_key.is_empty() {
             persisted.llm_api_key_configured = true;
         }
@@ -689,6 +853,7 @@ impl AppSettings {
 
     pub fn for_client_response(&self) -> Self {
         let mut settings = self.clone();
+        settings.enforce_advisory_cloud_canon();
         if !settings.llm_api_key.is_empty() {
             settings.llm_api_key_configured = true;
             settings.llm_api_key.clear();
@@ -756,29 +921,36 @@ impl AppSettings {
     }
 
     pub fn source_reference_models(&self) -> Vec<String> {
-        let mut models = Vec::new();
-        for model in &self.source_reference_models {
-            let trimmed = model.trim();
-            if !trimmed.is_empty() && !models.iter().any(|existing| existing == trimmed) {
-                models.push(trimmed.to_string());
-            }
-        }
-        if models.is_empty() {
-            let fallback = self.jury_model.trim();
-            if fallback.is_empty() {
-                models.push(default_jury_model());
-            } else {
-                models.push(fallback.to_string());
-            }
-        }
-        models
+        // Defense in depth for manually-constructed settings in diagnostic/tests: production source
+        // references can never be routed to a caller-supplied cloud model id.
+        vec![ADVISORY_CLOUD_MODEL.to_string()]
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// 2026-08-20 external review, blocker #7: the FACTORY default coupled a fresh install's
+    /// champion imports to an unrelated local LLM endpoint — the owner's hard-stop law (correctly)
+    /// halted otherwise-successful 7B drafts when that endpoint was absent. Refinement is opt-in.
+    #[test]
+    fn factory_refinement_default_is_none() {
+        assert_eq!(LlmMode::default(), LlmMode::None, "a fresh install must not depend on any LLM endpoint");
+        assert_eq!(AppSettings::default().llm_mode, LlmMode::None);
+    }
+
     use super::*;
     use std::path::Path;
+
+    #[cfg(target_os = "windows")]
+    fn open_with_windows_share_mode(path: &Path, share_mode: u32) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(share_mode)
+            .open(path)
+            .expect("open real Windows sharing-denial fixture")
+    }
 
     /// The external script string is EXECUTED, so it is a trust boundary — and the owner's real
     /// configured client must keep working, which is the half a validation most easily breaks.
@@ -816,6 +988,16 @@ mod tests {
     fn factory_default_is_the_finetuned_7b_champion_only() {
         let defaults = AppSettings::default();
         assert_eq!(defaults.asr_model_size, AsrModelSize::WSL7B);
+        assert_eq!(
+            AsrModelSize::default(),
+            AsrModelSize::WSL7B,
+            "low-level ASR configs must not implicitly downgrade to the 300M diagnostic model"
+        );
+        assert_eq!(
+            crate::asr::AsrLoadConfig::default().model_size,
+            AsrModelSize::WSL7B,
+            "KurdishAsrService::new inherits AsrLoadConfig::default and must therefore be champion-only"
+        );
         assert!(!defaults.multi_engine_hypotheses, "smaller-model hypotheses must be explicit opt-in");
     }
 
@@ -842,15 +1024,117 @@ mod tests {
         // owner's still-recoverable original.
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("settings.json");
-        std::fs::write(&path, "{ not valid json ").unwrap();
-        let _ = AppSettings::load(&path); // returns defaults
+        let original = b"{ not valid json ";
+        std::fs::write(&path, original).unwrap();
+        let loaded = AppSettings::load(&path); // returns defaults only after a durable quarantine
+        assert!(!loaded.settings_write_blocked, "a durably preserved original makes defaults writable");
         assert!(!path.exists(), "the unparseable file is moved aside, not left in place");
-        let preserved = std::fs::read_dir(dir.path())
+        let preserved: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
-            .count();
-        assert_eq!(preserved, 1, "the unparseable settings file is preserved as .corrupt-<ts>");
+            .collect();
+        assert_eq!(preserved.len(), 1, "the unparseable settings file is preserved exactly once");
+        assert_eq!(std::fs::read(preserved[0].path()).unwrap(), original, "quarantine must preserve exact bytes");
+    }
+
+    #[test]
+    fn settings_write_block_is_process_local_and_never_serialized() {
+        let blocked = AppSettings::write_blocked_defaults(Path::new("settings.json"), "injected preservation failure");
+        assert!(blocked.settings_write_blocked);
+        let refusal = blocked.require_writable().expect_err("unsafe fallback must be read-only").to_string();
+        assert!(refusal.contains(SETTINGS_WRITE_BLOCKED_CODE));
+
+        let json = serde_json::to_string(&blocked).expect("serialize blocked fallback");
+        assert!(!json.contains("settings_write_blocked"), "write authority must never cross JSON or IPC");
+        assert!(
+            !json.contains(SETTINGS_WRITE_BLOCKED_CODE),
+            "internal recovery state must not leak into settings bytes"
+        );
+        let round_trip: AppSettings = serde_json::from_str(&json).expect("deserialize public settings shape");
+        assert!(
+            !round_trip.settings_write_blocked,
+            "a file or legacy IPC payload cannot persist, assert, or clear process-local write authority"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_read_sharing_denial_returns_blocked_defaults_and_preserves_original_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        let authoritative = AppSettings { autoplay_segments: true, ..AppSettings::default() };
+        let original = serde_json::to_vec_pretty(&authoritative).unwrap();
+        std::fs::write(&path, &original).unwrap();
+
+        // A genuine share-mode denial: while this handle is open no second reader can acquire the
+        // file. load() must not turn an unreadable authority into ordinary writable defaults.
+        let denial = open_with_windows_share_mode(&path, 0);
+        let mut fallback = AppSettings::load(&path);
+        assert!(fallback.settings_write_blocked);
+        assert!(!fallback.autoplay_segments, "runtime remains on privacy-safe defaults");
+        drop(denial);
+
+        fallback.autoplay_segments = false;
+        let refusal = fallback.save(&path).expect_err("blocked fallback must never overwrite authority").to_string();
+        assert!(refusal.contains(SETTINGS_WRITE_BLOCKED_CODE));
+        assert_eq!(std::fs::read(&path).unwrap(), original, "the exact authoritative bytes must survive");
+        assert!(!path.with_extension("json.tmp").exists(), "refusal happens before a temp file is created");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_preservation_sharing_denial_blocks_all_later_saves_without_losing_original() {
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = b"{ invalid but still owner-recoverable json";
+        std::fs::write(&path, original).unwrap();
+
+        // Permit load() to open/read the file, but deliberately omit FILE_SHARE_DELETE. Windows
+        // therefore rejects the quarantine rename with a real sharing violation.
+        let deny_rename = open_with_windows_share_mode(&path, FILE_SHARE_READ | FILE_SHARE_WRITE);
+        let fallback = AppSettings::load(&path);
+        assert!(fallback.settings_write_blocked, "failed preservation must make fallback read-only");
+        drop(deny_rename);
+
+        let refusal =
+            fallback.save(&path).expect_err("block survives after the transient lock is released").to_string();
+        assert!(refusal.contains(SETTINGS_WRITE_BLOCKED_CODE));
+        assert_eq!(std::fs::read(&path).unwrap(), original, "the original invalid bytes must remain exact");
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".corrupt-")),
+            "a failed rename must not claim a quarantine exists"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_interrupted_recovery_sharing_denial_keeps_backup_and_blocks_new_settings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        let backup = dir.path().join("settings.json.replace-bak-locked");
+        let authoritative = AppSettings { jury_cloud_opt_in: true, ..AppSettings::default() };
+        let original = serde_json::to_vec_pretty(&authoritative).unwrap();
+        std::fs::write(&backup, &original).unwrap();
+
+        // Model the exact Windows crash-recovery state: canonical name absent, authoritative backup
+        // present, but another process temporarily holds it without rename/delete sharing.
+        let deny_recovery_rename = open_with_windows_share_mode(&backup, 0);
+        let fallback = AppSettings::load(&path);
+        assert!(fallback.settings_write_blocked, "unsafe interrupted-replace recovery must fail closed");
+        assert!(!fallback.jury_cloud_opt_in, "an unproven backup must never be published as live settings");
+        drop(deny_recovery_rename);
+
+        let refusal = fallback.save(&path).expect_err("blocked fallback cannot create a competing canonical file");
+        assert!(refusal.to_string().contains(SETTINGS_WRITE_BLOCKED_CODE));
+        assert!(!path.exists(), "a failed recovery must not invent a new canonical settings file");
+        assert_eq!(std::fs::read(&backup).unwrap(), original, "the exact interrupted-save backup must survive");
     }
 
     #[test]
@@ -870,40 +1154,53 @@ mod tests {
     }
 
     #[test]
-    fn cloud_stt_opt_in_persists_through_save_load_and_is_backward_compatible() {
-        // Backward-compat: a settings.json written before this field existed must still load, with
-        // the field defaulting to OFF (no surprise cloud STT calls for existing users).
-        let mut v = serde_json::to_value(AppSettings::default()).unwrap();
-        v.as_object_mut().unwrap().remove("cloud_stt_opt_in");
-        let legacy: AppSettings = serde_json::from_value(v).expect("legacy settings (no field) must load");
-        assert!(!legacy.cloud_stt_opt_in, "a missing field defaults to OFF");
-
-        // Restart-safety: the toggle must survive the REAL persistence path (atomic write + key
-        // scrub), not just a raw serde round-trip — otherwise it would silently reset every launch.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("settings.json");
-        AppSettings { cloud_stt_opt_in: true, ..AppSettings::default() }.save(&path).expect("save");
-        assert!(AppSettings::load(&path).cloud_stt_opt_in, "the Scribe toggle must survive save -> load");
-    }
-
-    #[test]
     fn load_recovers_settings_from_an_interrupted_save_backup() {
         // Post-crash state the round-15 atomic_file fix addresses: the canonical settings.json is
         // MISSING (the durable rename never completed), but a valid `.replace-bak-*` sibling still
-        // holds the user's real settings (cloud STT opted in). load() must promote that backup instead
+        // holds the user's real settings (cloud judging opted in). load() must promote that backup instead
         // of silently returning defaults — which would flip the consent opt-in OFF and drop the
         // configured key, with the recoverable data left orphaned on disk.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let backup = dir.path().join("settings.json.replace-bak-9999");
-        let real = AppSettings { cloud_stt_opt_in: true, ..AppSettings::default() };
+        let real = AppSettings { jury_cloud_opt_in: true, ..AppSettings::default() };
         std::fs::write(&backup, serde_json::to_string(&real).unwrap()).unwrap();
         assert!(!path.exists(), "the canonical file is missing (interrupted save)");
 
         let loaded = AppSettings::load(&path);
 
-        assert!(loaded.cloud_stt_opt_in, "consent opt-in must be recovered, not reverted to default OFF");
+        assert!(loaded.jury_cloud_opt_in, "consent opt-in must be recovered, not reverted to default OFF");
+        assert!(!loaded.settings_write_blocked, "a recovered file is writable only after its strict metadata barrier");
         assert!(path.exists(), "the backup must have been promoted to the canonical path");
+    }
+
+    #[test]
+    fn desktop_asr_canon_rejects_stale_or_injected_alternative_engines() {
+        let stale = AppSettings {
+            asr_model_size: AsrModelSize::CTC1B,
+            use_finetuned_asr: true,
+            multi_engine_hypotheses: true,
+            ..AppSettings::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        stale.save(&path).expect("persist stale diagnostic settings");
+        let before = std::fs::read(&path).expect("read stale settings");
+
+        let returned = AppSettings::load_production(&path).for_client_response();
+        assert_eq!(returned.asr_model_size, AsrModelSize::WSL7B);
+        assert!(!returned.use_finetuned_asr);
+        assert!(!returned.multi_engine_hypotheses);
+        assert_eq!(
+            std::fs::read(&path).expect("read settings after production load"),
+            before,
+            "the production clamp is an in-memory routing boundary, not a destructive settings rewrite"
+        );
+
+        let diagnostic = AppSettings::load(&path);
+        assert_eq!(diagnostic.asr_model_size, AsrModelSize::CTC1B);
+        assert!(diagnostic.use_finetuned_asr);
+        assert!(diagnostic.multi_engine_hypotheses);
     }
 
     #[test]
@@ -1338,29 +1635,76 @@ mod tests {
     }
 
     #[test]
-    fn source_reference_models_are_deduped_and_fall_back_to_jury_model() {
-        let settings = AppSettings {
-            jury_model: "gemini-custom".to_string(),
-            source_reference_models: vec![
-                " gemini-2.5-pro ".to_string(),
-                "".to_string(),
-                "gemini-2.5-pro".to_string(),
-                "gemini-2.5-flash".to_string(),
-            ],
+    fn cloud_model_canon_clamps_legacy_values_and_preserves_local_llm_ids() {
+        let mut settings = AppSettings {
+            llm_mode: LlmMode::Gemini,
+            llm_model: "gemini-2.5-flash".to_string(),
+            jury_model: "vendor/arbitrary-judge".to_string(),
+            jury_provider: "UNRECOGNIZED".to_string(),
+            source_reference_models: vec!["gemini-2.5-flash".to_string(), "other/model".to_string()],
             ..AppSettings::default()
         };
+        assert!(settings.enforce_advisory_cloud_canon());
+        assert_eq!(settings.llm_model, ADVISORY_CLOUD_MODEL);
+        assert_eq!(settings.jury_model, ADVISORY_CLOUD_MODEL);
+        assert_eq!(settings.jury_provider, "gemini");
+        assert_eq!(settings.source_reference_models, vec![ADVISORY_CLOUD_MODEL.to_string()]);
+        assert_eq!(settings.source_reference_models(), vec![ADVISORY_CLOUD_MODEL.to_string()]);
+        assert!(settings.validate().is_ok());
+        assert!(!settings.enforce_advisory_cloud_canon(), "the canonicalization must be idempotent");
 
-        assert_eq!(
-            settings.source_reference_models(),
-            vec!["gemini-2.5-pro".to_string(), "gemini-2.5-flash".to_string()]
-        );
-
-        let fallback = AppSettings {
-            jury_model: "gemini-custom".to_string(),
-            source_reference_models: Vec::new(),
+        let mut local = AppSettings {
+            llm_mode: LlmMode::Local,
+            llm_model: "owner-local-model:latest".to_string(),
             ..AppSettings::default()
         };
-        assert_eq!(fallback.source_reference_models(), vec!["gemini-custom".to_string()]);
+        local.enforce_advisory_cloud_canon();
+        assert_eq!(local.llm_model, "owner-local-model:latest", "local/offline LLM selection is unrelated");
+    }
+
+    #[test]
+    fn validation_rejects_noncanonical_cloud_model_ids_before_the_clamp() {
+        for invalid in [
+            AppSettings { jury_model: "gemini-2.5-flash".into(), ..AppSettings::default() },
+            AppSettings {
+                source_reference_models: vec!["gemini-2.5-pro".into(), "gemini-2.5-flash".into()],
+                ..AppSettings::default()
+            },
+            AppSettings { llm_mode: LlmMode::Gemini, llm_model: "gemini-2.5-flash".into(), ..AppSettings::default() },
+        ] {
+            assert!(
+                matches!(invalid.validate(), Err(crate::error::AppError::Validation(_))),
+                "a noncanonical persisted cloud selector must fail strict validation"
+            );
+        }
+    }
+
+    #[test]
+    fn load_durably_migrates_legacy_flash_and_arbitrary_cloud_ids() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("settings.json");
+        let legacy = AppSettings {
+            llm_mode: LlmMode::Gemini,
+            llm_model: "gemini-2.5-flash".into(),
+            jury_model: "other/cloud-judge".into(),
+            jury_provider: "something-else".into(),
+            source_reference_models: vec!["gemini-2.5-flash".into()],
+            ..AppSettings::default()
+        };
+        // Bypass save(), which correctly clamps every new write, to emulate a legacy/hand-edited file.
+        fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).expect("seed legacy settings");
+
+        let loaded = AppSettings::load(&path);
+        assert_eq!(loaded.llm_model, ADVISORY_CLOUD_MODEL);
+        assert_eq!(loaded.jury_model, ADVISORY_CLOUD_MODEL);
+        assert_eq!(loaded.source_reference_models, vec![ADVISORY_CLOUD_MODEL.to_string()]);
+        assert_eq!(loaded.jury_provider, "gemini");
+
+        let persisted: AppSettings = serde_json::from_slice(&fs::read(&path).expect("read migrated settings")).unwrap();
+        assert_eq!(persisted.llm_model, ADVISORY_CLOUD_MODEL);
+        assert_eq!(persisted.jury_model, ADVISORY_CLOUD_MODEL);
+        assert_eq!(persisted.source_reference_models, vec![ADVISORY_CLOUD_MODEL.to_string()]);
+        assert_eq!(persisted.jury_provider, "gemini");
     }
 
     fn backup_files_left(dir: &Path) -> bool {

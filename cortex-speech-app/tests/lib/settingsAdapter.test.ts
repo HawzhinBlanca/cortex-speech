@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { defaultSettings } from '../../src/lib/stores/settingsStore';
+import { ADVISORY_CLOUD_MODEL, defaultSettings } from '../../src/lib/stores/settingsStore';
 import {
   mapBackendToFrontend,
   mapFrontendToBackend,
@@ -52,10 +52,10 @@ describe('settingsAdapter', () => {
     expect(ui.maxSegmentSec).toBe(20);
     expect(ui.numThreads).toBe(8);
     expect(ui.exportFormat).toBe('jsonl');
-    expect(ui.asrModel).toBe('ctc-300m');
+    expect(ui.asrModel).toBe('wsl-7b');
     expect(ui.theme).toBe('dark');
     expect(ui.llmMode).toBe('None');
-    expect(ui.sourceReferenceModels).toEqual(['gemini-2.5-pro', 'gemini-2.5-flash']);
+    expect(ui.sourceReferenceModels).toEqual([ADVISORY_CLOUD_MODEL]);
   });
 
   it('round-trips frontend settings through backend', () => {
@@ -66,9 +66,8 @@ describe('settingsAdapter', () => {
       maxSegmentSec: 25,
       numThreads: 12,
       exportFormat: 'csv' as const,
-      asrModel: 'ctc-1b' as const,
       theme: 'light' as const,
-      sourceReferenceModels: ['gemini-2.5-pro', 'gemini-2.5-flash'],
+      sourceReferenceModels: [ADVISORY_CLOUD_MODEL],
     };
     const backend = mapFrontendToBackend(ui, sampleBackend);
     expect(backend.vad_threshold).toBe(0.35);
@@ -76,9 +75,10 @@ describe('settingsAdapter', () => {
     expect(backend.max_segment_duration_ms).toBe(25000);
     expect(backend.num_asr_threads).toBe(12);
     expect(backend.export_format).toBe('Csv');
-    expect(backend.asr_model_size).toBe('CTC1B');
+    expect(backend.asr_model_size).toBe('WSL7B');
+    expect(backend.use_finetuned_asr).toBe(false);
     expect(backend.theme).toBe('Light');
-    expect(backend.source_reference_models).toEqual(['gemini-2.5-pro', 'gemini-2.5-flash']);
+    expect(backend.source_reference_models).toEqual([ADVISORY_CLOUD_MODEL]);
     expect(backend.model_dir).toBe('models');
     expect(mapBackendToFrontend(backend)).toEqual(ui);
   });
@@ -93,6 +93,20 @@ describe('settingsAdapter', () => {
     expect(
       mapBackendToFrontend({ ...sampleBackend, asr_model_size: 'UnexpectedEngine' }).asrModel,
     ).toBe('wsl-7b');
+  });
+
+  it('clamps stale optional-engine settings at both renderer boundaries', () => {
+    const ui = mapBackendToFrontend({
+      ...sampleBackend,
+      asr_model_size: 'CTC1B',
+      use_finetuned_asr: true,
+    });
+    expect(ui.asrModel).toBe('wsl-7b');
+    expect(ui.useFinetuned).toBe(false);
+
+    const backend = mapFrontendToBackend({ ...ui, useFinetuned: true }, sampleBackend);
+    expect(backend.asr_model_size).toBe('WSL7B');
+    expect(backend.use_finetuned_asr).toBe(false);
   });
 
   // The 'Autoplay Segments' toggle used to be silently dropped on save (mapFrontendToBackend never

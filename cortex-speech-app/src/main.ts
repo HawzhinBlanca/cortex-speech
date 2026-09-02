@@ -2,6 +2,13 @@ import { mount } from 'svelte';
 import App from './App.svelte';
 import './app.css';
 import { installGlobalErrorTrap } from './lib/globalErrorTrap';
+import { get } from 'svelte/store';
+import { prepareInitialLocale, t } from './lib/i18n';
+import { notifications } from './lib/stores/notificationStore';
+import type { SpeechSegment } from './lib/types';
+import type { AgenticReadinessV1, BatchRunStatusResponseV1 } from './lib/generated/ipc';
+
+type DemoSpeechSegment = SpeechSegment & { confidence: number; snrDb: number };
 
 // P2.2 (audit F3): surface un-awaited promise rejections as a toast instead of letting them vanish.
 // Installed BEFORE mount so it covers the whole app lifetime. Idempotent.
@@ -14,15 +21,21 @@ installGlobalErrorTrap();
 // where window.__TAURI_INTERNALS__ already exists.
 // ---------------------------------------------------------------------------
 if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
-  // `_trend$` added 2026-08-05: `get_escalation_rate_trend` matched NOTHING here, so it fell through
-  // to the final `null` and RefineryPanel's `trend.length === 0` threw "Cannot read properties of null
-  // (reading 'length')" on every Insights load in dev preview. An ErrorBoundary caught it, which is
-  // why it never surfaced as a page error and was easy to miss — the panel just rendered a retry
-  // button. Commands that return a Vec must default to [], not null.
-  const listKinds =
-    /(^get_segments$|^list_|_reports$|_events$|_runs$|_history$|_trend$|^search_|_queue$|^get_speakers$)/;
-  const objKinds =
-    /(^get_settings$|^app_health$|^db_info$|^import_status$|readiness$|^models_status$|_info$|^get_stats$|^compute_stats$)/;
+  // These are deliberate preview fixtures, not regex catch-alls. A newly introduced command must
+  // choose and implement an explicit preview contract or fail loudly at the final branch below.
+  const emptyListCommands = new Set([
+    'get_active_learning_queue',
+    'get_escalation_queue',
+    'get_escalation_rate_trend',
+    'get_jobs',
+    'list_agent_import_reports',
+    'list_agent_stage_events',
+    'list_db_snapshots',
+    'list_eval_runs',
+    'list_model_versions',
+    'models_status',
+  ]);
+  const emptyObjectCommands = new Set(['app_health', 'db_info', 'get_settings', 'import_status']);
 
   // Sample Sorani dataset so the populated curate UI renders without a backend.
   const SAMPLE: Array<[string, number, string | null, boolean, number]> = [
@@ -59,7 +72,7 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     });
     return JSON.stringify({ words });
   };
-  let demoSegments = SAMPLE.map(([text, conf, spk, ver, dur], i) => ({
+  let demoSegments: DemoSpeechSegment[] = SAMPLE.map(([text, conf, spk, ver, dur], i) => ({
     id: `seg_${String(i + 1).padStart(3, '0')}`,
     createdAt: `2026-06-1${i % 9}T0${i % 8}:12:00Z`,
     audioPath: `fixtures/clip_${i + 1}.wav`,
@@ -82,6 +95,22 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     isGold: i === 0,
     alignmentQuality: ver ? 'ctc_forced' : null,
   }));
+  const demoReviewRevisions = new Map(demoSegments.map((segment) => [segment.id, 0]));
+  const demoReviewDrafts = new Map<
+    string,
+    { segmentId: string; baseRevision: number; text: string; updatedAt: string }
+  >();
+  const demoReviewOperations = new Map<
+    string,
+    {
+      segmentId: string;
+      committedRevision: number;
+      authoritativeTranscript: string;
+      decisionId: string;
+    }
+  >();
+  let demoBatchRun: BatchRunStatusResponseV1 | null = null;
+  const acknowledgedDemoBatches = new Set<string>();
   // Return detached rows just like IPC serialization does. The backing collection remains mutable so
   // review decisions survive subsequent reads during a browser-preview session.
   const sampleSegments = () => demoSegments.map((segment) => ({ ...segment }));
@@ -120,6 +149,180 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     // throwing while the app is already handling another update.
     if (cmd === 'plugin:event|listen') return args?.handler ?? 0;
     if (cmd.startsWith('plugin:')) return null;
+    if (cmd === 'get_active_batch_run') return demoBatchRun;
+    if (cmd === 'get_batch_run_status') {
+      const operationId = String(args?.operationId ?? '');
+      if (demoBatchRun?.operationId === operationId) return demoBatchRun;
+      return { operationId, operation: null, status: 'unknown', total: null, outcome: null };
+    }
+    if (cmd === 'acknowledge_batch_run') {
+      const operationId = String(args?.operationId ?? '');
+      if (acknowledgedDemoBatches.has(operationId)) return true;
+      if (demoBatchRun?.operationId !== operationId || demoBatchRun.status !== 'settled') {
+        return false;
+      }
+      acknowledgedDemoBatches.add(operationId);
+      demoBatchRun = null;
+      return true;
+    }
+    if (cmd === 'batch_transcribe' || cmd === 'batch_normalize') {
+      const ids = Array.isArray(args?.ids)
+        ? args.ids.filter((id): id is string => typeof id === 'string')
+        : [];
+      const operationId = String(args?.operationId ?? '');
+      const operation = cmd === 'batch_transcribe' ? 'transcribe' : 'normalize';
+      if (!operationId || ids.length === 0 || demoBatchRun) {
+        throw {
+          schema: 1,
+          code: 'BATCH_RUN_REJECTED',
+          message: 'The preview batch could not be admitted.',
+          retryable: true,
+          suggestedAction: 'retry',
+          operationId: operationId || null,
+        };
+      }
+      demoBatchRun = {
+        operationId,
+        operation,
+        status: 'settled',
+        total: ids.length,
+        outcome: {
+          disposition: 'completed',
+          total: ids.length,
+          succeeded: ids.length,
+          failed: 0,
+          skipped: 0,
+          abandoned: 0,
+          cancelled: false,
+          errorCode: null,
+        },
+      };
+      return { status: 'started', operationId, operation };
+    }
+    if (cmd === 'get_review_page_v1') {
+      const scope = args?.scope as { kind?: string; query?: string; focusId?: string } | undefined;
+      const query =
+        scope?.kind === 'search'
+          ? String(scope.query ?? '')
+              .trim()
+              .toLowerCase()
+          : '';
+      const items = sampleSegments()
+        .filter((segment) => {
+          if (scope?.kind === 'pending' && segment.verified) return false;
+          if (scope?.kind === 'escalation' && !segment.escalated) return false;
+          return (
+            !query ||
+            segment.rawTranscript.toLowerCase().includes(query) ||
+            segment.audioPath.toLowerCase().includes(query) ||
+            (segment.speakerId ?? '').toLowerCase().includes(query)
+          );
+        })
+        .map((segment) => ({
+          segment,
+          baseRevision: demoReviewRevisions.get(segment.id) ?? 0,
+          eligible: segment.rawTranscript.trim().length > 0,
+          disabledReason: segment.rawTranscript.trim().length > 0 ? null : 'TRANSCRIPT_NOT_READY',
+        }));
+      return {
+        items,
+        total: items.length,
+        nextCursor: null,
+        scopeLabel: scope?.kind ?? 'pending',
+        focusNarrowed: scope?.kind === 'voiceFocus',
+      };
+    }
+    if (cmd === 'get_review_draft_v1') {
+      return demoReviewDrafts.get(String(args?.segmentId ?? '')) ?? null;
+    }
+    if (cmd === 'save_review_draft_v1') {
+      const segmentId = String(args?.segmentId ?? '');
+      const baseRevision = Number(args?.baseRevision);
+      if (!demoReviewRevisions.has(segmentId)) {
+        throw new Error(`Unknown preview segment: ${segmentId}`);
+      }
+      if (demoReviewRevisions.get(segmentId) !== baseRevision) {
+        throw {
+          schema: 1,
+          code: 'STALE_REVIEW_DRAFT',
+          message: 'The preview segment changed. Reload it before saving this draft.',
+          retryable: false,
+          suggestedAction: 'reloadClip',
+          operationId: null,
+        };
+      }
+      const draft = {
+        segmentId,
+        baseRevision,
+        text: String(args?.text ?? ''),
+        updatedAt: new Date().toISOString(),
+      };
+      demoReviewDrafts.set(segmentId, draft);
+      return draft;
+    }
+    if (cmd === 'delete_review_draft_v1') {
+      const segmentId = String(args?.segmentId ?? '');
+      const baseRevision = Number(args?.baseRevision);
+      const draft = demoReviewDrafts.get(segmentId);
+      if (!draft || draft.baseRevision !== baseRevision) return false;
+      demoReviewDrafts.delete(segmentId);
+      return true;
+    }
+    if (cmd === 'commit_review_v1') {
+      const request = args?.request as
+        | {
+            operationId?: string;
+            segmentId?: string;
+            baseRevision?: number;
+            decision?: string;
+            transcript?: string | null;
+          }
+        | undefined;
+      const operationId = String(request?.operationId ?? '');
+      const replay = demoReviewOperations.get(operationId);
+      if (replay) return replay;
+      const segmentId = String(request?.segmentId ?? '');
+      const index = demoSegments.findIndex((segment) => segment.id === segmentId);
+      const currentRevision = demoReviewRevisions.get(segmentId);
+      if (index < 0 || currentRevision === undefined) {
+        throw new Error(`Unknown preview segment: ${segmentId}`);
+      }
+      if (request?.baseRevision !== currentRevision) {
+        throw {
+          schema: 1,
+          code: 'STALE_REVIEW_REVISION',
+          message: 'The preview segment changed. Reload it before committing.',
+          retryable: false,
+          suggestedAction: 'reloadClip',
+          operationId,
+        };
+      }
+      const authoritativeTranscript =
+        request.decision === 'edit'
+          ? String(request.transcript ?? '')
+          : demoSegments[index].rawTranscript;
+      const committedRevision = currentRevision + 1;
+      demoSegments[index] = {
+        ...demoSegments[index],
+        rawTranscript: authoritativeTranscript,
+        annotatedTranscript:
+          request.decision === 'accept' || request.decision === 'edit'
+            ? authoritativeTranscript
+            : null,
+        verified: request.decision === 'accept' || request.decision === 'edit',
+      };
+      demoReviewRevisions.set(segmentId, committedRevision);
+      const draft = demoReviewDrafts.get(segmentId);
+      if (draft?.baseRevision === currentRevision) demoReviewDrafts.delete(segmentId);
+      const committed = {
+        segmentId,
+        committedRevision,
+        authoritativeTranscript,
+        decisionId: `preview-${operationId}`,
+      };
+      demoReviewOperations.set(operationId, committed);
+      return committed;
+    }
     if (cmd === 'get_segments_page') {
       const q = String(args?.query ?? '')
         .trim()
@@ -141,16 +344,165 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
       if (!segment) throw new Error(`Segment '${id}' no longer exists`);
       return segment;
     }
-    if (cmd === 'update_segment_fields') {
-      const id = String(args?.segmentId ?? '');
-      const fields = args?.fields;
-      if (!fields || typeof fields !== 'object' || Array.isArray(fields)) {
-        throw new Error('update_segment_fields requires an object fields payload');
-      }
+    if (cmd === 'update_segment_metadata_v1') {
+      const request = args?.request as
+        | {
+            segmentId?: string;
+            changes?: Array<{
+              field?: 'speakerId' | 'alignmentJson';
+              expected?: string | null;
+              value?: string | null;
+            }>;
+          }
+        | undefined;
+      const id = String(request?.segmentId ?? '');
       const index = demoSegments.findIndex((segment) => segment.id === id);
-      if (index < 0) return false;
-      demoSegments[index] = { ...demoSegments[index], ...fields };
-      return true;
+      if (index < 0) {
+        throw {
+          schema: 1,
+          code: 'SEGMENT_NOT_FOUND',
+          message: 'The selected preview segment no longer exists.',
+          retryable: false,
+          suggestedAction: 'reloadClip',
+        };
+      }
+      const changes = request?.changes ?? [];
+      if (changes.length === 0) throw new Error('metadata changes cannot be empty');
+      const current = demoSegments[index];
+      for (const change of changes) {
+        const currentValue =
+          change.field === 'speakerId' ? current.speakerId : current.alignmentJson;
+        if (currentValue !== change.expected && currentValue !== change.value) {
+          throw {
+            schema: 1,
+            code: 'STALE_SEGMENT_METADATA',
+            message:
+              'This preview metadata changed. Reload it before choosing which value to keep.',
+            retryable: false,
+            suggestedAction: 'reloadClip',
+          };
+        }
+      }
+      let next = current;
+      for (const change of changes) {
+        next =
+          change.field === 'speakerId'
+            ? { ...next, speakerId: change.value ?? null }
+            : { ...next, alignmentJson: change.value ?? null };
+      }
+      demoSegments[index] = next;
+      return {
+        segmentId: id,
+        speakerId: next.speakerId,
+        alignmentJson: next.alignmentJson,
+        changed:
+          next.speakerId !== current.speakerId || next.alignmentJson !== current.alignmentJson,
+      };
+    }
+    if (cmd === 'delete_segments_v1') {
+      const ids = (args?.request as { ids?: string[] } | undefined)?.ids ?? [];
+      if (ids.length === 0 || new Set(ids).size !== ids.length) {
+        throw {
+          schema: 1,
+          code: 'INVALID_DELETE_REQUEST',
+          message: 'The preview deletion request is invalid.',
+          retryable: false,
+        };
+      }
+      const requested = new Set(ids);
+      const previousCount = demoSegments.length;
+      demoSegments = demoSegments.filter((segment) => !requested.has(segment.id));
+      return {
+        requestedCount: ids.length,
+        deletedCount: previousCount - demoSegments.length,
+      };
+    }
+    if (cmd === 'get_speaker_inventory_v1') {
+      const inventory = new Map<string | null, { segmentCount: number; durationMs: number }>();
+      for (const segment of demoSegments) {
+        const current = inventory.get(segment.speakerId) ?? { segmentCount: 0, durationMs: 0 };
+        current.segmentCount += 1;
+        current.durationMs += segment.durationMs;
+        inventory.set(segment.speakerId, current);
+      }
+      return Array.from(inventory, ([speakerId, totals]) => ({
+        speakerId,
+        segmentCount: totals.segmentCount,
+        totalDurationSeconds: totals.durationMs / 1000,
+      })).sort((left, right) => right.segmentCount - left.segmentCount);
+    }
+    if (cmd === 'rename_speaker_v1') {
+      const request = args?.request as
+        | {
+            sourceSpeakerId?: string | null;
+            targetSpeakerId?: string;
+            expectedSourceCount?: number;
+            expectedTargetCount?: number;
+          }
+        | undefined;
+      const sourceSpeakerId = request?.sourceSpeakerId ?? null;
+      const targetSpeakerId = String(request?.targetSpeakerId ?? '');
+      const sourceCount = demoSegments.filter(
+        (segment) => segment.speakerId === sourceSpeakerId,
+      ).length;
+      const targetCount = demoSegments.filter(
+        (segment) => segment.speakerId === targetSpeakerId,
+      ).length;
+      if (
+        !targetSpeakerId ||
+        sourceSpeakerId === targetSpeakerId ||
+        sourceCount !== request?.expectedSourceCount ||
+        targetCount !== request?.expectedTargetCount
+      ) {
+        throw {
+          schema: 1,
+          code: 'STALE_SPEAKER_INVENTORY',
+          message: 'The preview speaker inventory changed.',
+          retryable: false,
+        };
+      }
+      demoSegments = demoSegments.map((segment) =>
+        segment.speakerId === sourceSpeakerId
+          ? { ...segment, speakerId: targetSpeakerId }
+          : segment,
+      );
+      return {
+        sourceSpeakerId,
+        targetSpeakerId,
+        renamedCount: sourceCount,
+        targetCount: sourceCount + targetCount,
+        merged: targetCount > 0,
+      };
+    }
+    if (cmd === 'assign_speakers_v1') {
+      const request = args?.request as
+        { ids?: string[]; targetSpeakerId?: string | null } | undefined;
+      const ids = request?.ids ?? [];
+      if (ids.length === 0 || new Set(ids).size !== ids.length) {
+        throw {
+          schema: 1,
+          code: 'INVALID_SPEAKER_ASSIGNMENT',
+          message: 'The preview speaker assignment is invalid.',
+          retryable: false,
+        };
+      }
+      const requested = new Set(ids);
+      let changedCount = 0;
+      demoSegments = demoSegments.map((segment) => {
+        if (
+          !requested.has(segment.id) ||
+          segment.speakerId === (request?.targetSpeakerId ?? null)
+        ) {
+          return segment;
+        }
+        changedCount += 1;
+        return { ...segment, speakerId: request?.targetSpeakerId ?? null };
+      });
+      return {
+        requestedCount: ids.length,
+        changedCount,
+        unchangedCount: ids.length - changedCount,
+      };
     }
     // Same class: the readiness verdict and the accuracy card call these, and `{}` / `null` from the
     // catch-alls crashed the Insights panel on `.summary`. Mock the real shapes so dev preview shows
@@ -175,10 +527,114 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     }
     if (cmd === 'get_waveform') return sampleWaveform();
     if (cmd === 'get_audio_duration') return 6.2;
+    if (cmd === 'get_audio_health') {
+      return { totalFiles: sampleSegments().length, missingFiles: 0, missingPaths: [] };
+    }
+    if (cmd === 'register_media_asset' || cmd === 'register_review_media_asset') {
+      const audioPath = String(args?.audioPath ?? '');
+      return {
+        id: `preview-${audioPath}`,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      };
+    }
+    if (cmd === 'get_media_asset_url') {
+      return 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+    }
+    if (cmd === 'begin_desktop_playback_session_v1') {
+      const segmentId = String(args?.segmentId ?? '');
+      const expectedRevision = Number(args?.expectedRevision ?? 0);
+      return {
+        playbackReceiptId: crypto.randomUUID(),
+        segmentId,
+        segmentRevision: expectedRevision,
+        clipDurationMs: 6200,
+        expiresAtMs: Date.now() + 30 * 60_000,
+      };
+    }
+    if (cmd === 'finalize_desktop_playback_session_v1') {
+      const intervals = Array.isArray(args?.intervals)
+        ? (args.intervals as Array<{ startMs?: number; endMs?: number }>)
+        : [];
+      const uniquePlayedMs = intervals.reduce(
+        (total, interval) =>
+          total + Math.max(0, Number(interval.endMs ?? 0) - Number(interval.startMs ?? 0)),
+        0,
+      );
+      return {
+        playbackReceiptId: String(args?.playbackReceiptId ?? ''),
+        segmentId: 'dev-preview-segment',
+        segmentRevision: 0,
+        uniquePlayedMs,
+        clipDurationMs: 6200,
+        coverageRatio: Math.min(1, uniquePlayedMs / 6200),
+      };
+    }
     if (cmd === 'get_stats' || cmd === 'compute_stats' || cmd === 'get_dataset_stats')
       return sampleStats();
+    if (cmd === 'get_dataset_quality') {
+      const segs = sampleSegments();
+      return {
+        totalSegments: segs.length,
+        emptyTranscriptCount: segs.filter((segment) => !segment.rawTranscript.trim()).length,
+        lowConfidenceCount: segs.filter((segment) => segment.confidence < 0.5).length,
+        duplicateTranscriptGroups: 0,
+        duplicateTranscriptSegments: 0,
+        durationOutlierCount: 0,
+        medianDurationMs: 5600,
+        q1DurationMs: 4200,
+        q3DurationMs: 7200,
+        duplicateGroups: [],
+        durationOutliers: [],
+        annotatedSegmentCount: segs.filter((segment) => segment.annotatedTranscript).length,
+        meanWer: 0,
+        meanCer: 0,
+        segmentsAboveWerThreshold: 0,
+        segmentsAboveCerThreshold: 0,
+        qualityGatePassed: true,
+        werOutliers: [],
+      };
+    }
+    if (cmd === 'get_label_quality_lift') return null;
+    if (cmd === 'get_dataset_certificate') {
+      return {
+        targetError: 0.05,
+        confidenceLevel: 0.95,
+        threshold: 0.35,
+        totalCertified: 0,
+        certifiedSegmentIds: [],
+        expectedErrorBound: 0.05,
+        isCalibrated: false,
+      };
+    }
+    if (cmd === 'restore_session' || cmd === 'take_last_crash' || cmd === 'get_interrupted_import')
+      return null;
+    if (cmd === 'check_agentic_readiness') {
+      return {
+        status: 'ready',
+        ready: true,
+        sourceReferenceModels: [],
+        sourceReferenceModelCount: 0,
+        availableHypothesisModels: ['omniasr-wsl-7b'],
+        availableHypothesisModelCount: 1,
+        requiredHypothesisModels: 1,
+        checks: [
+          { code: 'source_reference', status: 'not_required' },
+          { code: 'primary_asr', status: 'ready' },
+          { code: 'hypothesis_coverage', status: 'not_required' },
+          { code: 'readiness_snapshot', status: 'ready' },
+        ],
+        checkCount: 4,
+      } satisfies AgenticReadinessV1;
+    }
+    if (cmd === 'save_session' || cmd === 'update_settings') return null;
+    if (cmd === 'get_history_status_v1') return { undoAction: null, redoAction: null };
+    if (cmd === 'undo' || cmd === 'redo') {
+      return { action: null, status: { undoAction: null, redoAction: null } };
+    }
+    if (cmd === 'get_configured_providers') return [];
+    if (cmd === 'couch_review_status') return { running: false, reviewers: [] };
+    if (cmd === 'spot_check_report' || cmd === 'reviewer_throughput') return [];
     if (cmd === 'count_segments' || cmd === 'get_segment_count') return SAMPLE.length;
-    if (cmd === 'get_speakers') return ['SPEAKER_00', 'SPEAKER_01', 'SPEAKER_02'];
     if (cmd === 'validate_dataset_cmd') {
       const segs = sampleSegments();
       const warnings = segs
@@ -210,9 +666,9 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
         summary: `${segs.length} segments checked · ${errors.length} error(s) · ${warnings.length} warning(s)`,
       };
     }
-    if (listKinds.test(cmd)) return [];
-    if (objKinds.test(cmd)) return {};
-    return null;
+    if (emptyListCommands.has(cmd)) return [];
+    if (emptyObjectCommands.has(cmd)) return {};
+    throw new Error(`Unknown development mock command: ${cmd}`);
   };
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
     invoke: (cmd: string, args?: Record<string, unknown>) => mockInvoke(cmd, args),
@@ -244,6 +700,8 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
   console.info('[cortex] dev Tauri mock installed — UI preview mode (no backend)');
 }
 
+const initialLocaleReady = await prepareInitialLocale();
 const app = mount(App, { target: document.getElementById('app')! });
+if (!initialLocaleReady) notifications.error(get(t)('localeLoadFailed'));
 
 export default app;

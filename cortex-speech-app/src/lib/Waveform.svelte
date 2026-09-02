@@ -1,18 +1,24 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { t } from './i18n';
+  import { drawWaveformCanvas, type WaveformRegion, type WaveformWord } from './waveformRenderer';
+
+  const isolate = (value: string | number): string =>
+    `${String.fromCodePoint(0x2068)}${String(value)}${String.fromCodePoint(0x2069)}`;
 
   interface Props {
     waveform: number[];
     currentTime?: number;
     duration?: number;
-    regions?: Array<{ start: number; end: number; color?: string }>;
+    regions?: WaveformRegion[];
     playing?: boolean;
     onSeek?: (time: number) => void;
     onRegionSelect?: (start: number, end: number) => void;
     color?: string;
     height?: number;
-    wordTimestamps?: Array<{ word: string; start: number; end: number }>;
+    wordTimestamps?: WaveformWord[];
+    disabled?: boolean;
+    disabledDescriptionId?: string;
   }
 
   let {
@@ -26,6 +32,8 @@
     color = '#6366f1', // Indigo-500 premium color
     height = 100,
     wordTimestamps = [],
+    disabled = false,
+    disabledDescriptionId,
   }: Props = $props();
 
   let canvas: HTMLCanvasElement;
@@ -38,11 +46,6 @@
   let selectionStart: number | null = null;
   let selectionEnd: number | null = null;
   let animationId = 0;
-
-  const barWidth = 2;
-  const barGap = 1;
-  const rulerHeight = 18;
-  const labelHeight = 18;
 
   onMount(() => {
     ctx = canvas.getContext('2d');
@@ -117,6 +120,14 @@
     }
   });
 
+  $effect(() => {
+    if (!disabled) return;
+    isDragging = false;
+    selectionStart = null;
+    selectionEnd = null;
+    hoverTime = null;
+  });
+
   // While PAUSED no animation loop runs, so a seek that changes currentTime (the AudioPlayer scrubber,
   // a word-chip seek, a programmatic jump) would leave the playhead frozen at the old position. Redraw
   // on currentTime change when not playing; during playback the rAF loop above already repaints, so the
@@ -131,136 +142,20 @@
 
   function draw() {
     if (!ctx) return;
-    const w = containerWidth * zoom;
-    const h = height;
-    ctx.clearRect(0, 0, w, h);
-
-    // Guard: prevent division by zero and NaN propagation
-    if (duration <= 0 || waveform.length === 0) return;
-
-    // Waveform Background
-    ctx.fillStyle = 'rgba(15, 23, 42, 0.4)'; // Slate-900 / 40%
-    ctx.fillRect(0, 0, w, h);
-
-    // Regions (Diarization tracks)
-    for (const region of regions) {
-      const x1 = (region.start / duration) * w;
-      const x2 = (region.end / duration) * w;
-      ctx.fillStyle = region.color || 'rgba(99, 102, 241, 0.1)';
-      ctx.fillRect(x1, rulerHeight, x2 - x1, h - rulerHeight - labelHeight);
-    }
-
-    // Selection range (Shift drag)
-    if (selectionStart !== null && selectionEnd !== null) {
-      const x1 = (selectionStart / duration) * w;
-      const x2 = (selectionEnd / duration) * w;
-      ctx.fillStyle = 'rgba(34, 211, 238, 0.15)'; // Cyan select highlight
-      ctx.fillRect(Math.min(x1, x2), rulerHeight, Math.abs(x2 - x1), h - rulerHeight - labelHeight);
-    }
-
-    // Waveform bars
-    const numBars = Math.floor(w / (barWidth + barGap));
-    const midY = rulerHeight + (h - rulerHeight - labelHeight) / 2;
-    const maxBarH = (h - rulerHeight - labelHeight) / 2 - 4;
-
-    ctx.fillStyle = color;
-    for (let i = 0; i < numBars; i++) {
-      // Map bar i to a FRACTIONAL slice of the fixed-length peak array so the peaks stretch across the
-      // FULL canvas width (upsampling when numBars > waveform.length — any zoom>1, or a card wider than
-      // ~waveform.length*barWidth px). The old `samplesPerBar = max(1, floor(len/numBars))` clamped to 1
-      // in that case, so bar i read sample i and all peaks crammed into the leftmost strip while the
-      // ruler ticks, word-grid labels, and the playhead all span the full width via (t/duration)*w —
-      // putting the waveform visibly out of registration with the playhead the reviewer reads.
-      const startIdx = Math.floor((i * waveform.length) / numBars);
-      const endIdx = Math.max(startIdx + 1, Math.floor(((i + 1) * waveform.length) / numBars));
-      let peak = 0;
-      for (let j = startIdx; j < Math.min(endIdx, waveform.length); j++) {
-        peak = Math.max(peak, Math.abs(waveform[j]));
-      }
-      peak = Math.min(peak, 1.0);
-      const barH = peak * maxBarH;
-      const x = i * (barWidth + barGap);
-      ctx.fillRect(x, midY - barH, barWidth, barH * 2);
-    }
-
-    // Timeline Ruler ticks
-    ctx.fillStyle = 'rgba(255,255,255,0.03)';
-    ctx.fillRect(0, 0, w, rulerHeight);
-
-    const timeStep = zoom > 6 ? 0.5 : zoom > 3 ? 1.0 : 5.0; // Seconds between ticks
-    ctx.fillStyle = '#64748b'; // Slate-500
-    ctx.font = '8px monospace';
-    ctx.textAlign = 'center';
-
-    let t = 0.0;
-    let tickCount = 0;
-    const maxTicks = 500;
-    while (t <= duration && tickCount++ < maxTicks) {
-      const tx = (t / duration) * w;
-      ctx.fillRect(tx - 0.5, 0, 1, rulerHeight - 4);
-      if (t % (timeStep * 2.0) === 0.0 || zoom > 3) {
-        ctx.fillText(`${t.toFixed(1)}s`, tx, rulerHeight - 5);
-      }
-      t += timeStep;
-    }
-
-    // Word Grid division ticks & Labels
-    const labelY = h - labelHeight;
-    ctx.fillStyle = 'rgba(255,255,255,0.03)';
-    ctx.fillRect(0, labelY, w, labelHeight);
-
-    if (wordTimestamps && wordTimestamps.length > 0) {
-      ctx.font = '9px monospace';
-      ctx.textAlign = 'center';
-      for (const word of wordTimestamps) {
-        const wx_start = (word.start / duration) * w;
-        const wx_end = (word.end / duration) * w;
-        const mid_x = (wx_start + wx_end) / 2;
-
-        // Draw vertical dividing grid line
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
-        ctx.fillRect(wx_start - 0.5, rulerHeight, 1, h - rulerHeight - labelHeight);
-
-        // Draw word label in bottom track if it fits
-        if (wx_end - wx_start > 14) {
-          ctx.fillStyle = '#94a3b8'; // Slate-400
-          const textWidth = ctx.measureText(word.word).width;
-          if (textWidth < wx_end - wx_start) {
-            ctx.fillText(word.word, mid_x, h - 6);
-          }
-        }
-      }
-    }
-
-    // Active Playhead indicator
-    if (duration > 0) {
-      const playheadX = (currentTime / duration) * w;
-      ctx.strokeStyle = '#f59e0b'; // Amber-500 neon playhead
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(playheadX, 0);
-      ctx.lineTo(playheadX, h);
-      ctx.stroke();
-
-      // Playhead bulb at top
-      ctx.fillStyle = '#f59e0b';
-      ctx.beginPath();
-      ctx.arc(playheadX, 3, 3, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    // Hover Scrub guide
-    if (hoverTime !== null && duration > 0) {
-      const hx = (hoverTime / duration) * w;
-      ctx.strokeStyle = 'rgba(255,255,255,0.15)';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([3, 3]);
-      ctx.beginPath();
-      ctx.moveTo(hx, 0);
-      ctx.lineTo(hx, h);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
+    drawWaveformCanvas(ctx, {
+      width: containerWidth * zoom,
+      height,
+      duration,
+      currentTime,
+      waveform,
+      regions,
+      words: wordTimestamps,
+      color,
+      zoom,
+      selectionStart,
+      selectionEnd,
+      hoverTime,
+    });
   }
 
   function getTimeFromEvent(e: MouseEvent | Touch): number {
@@ -271,6 +166,7 @@
   }
 
   function handlePointerDown(e: PointerEvent) {
+    if (disabled) return;
     isDragging = true;
     const t = getTimeFromEvent(e);
     if (e.shiftKey && onRegionSelect) {
@@ -283,6 +179,7 @@
   }
 
   function handlePointerMove(e: PointerEvent) {
+    if (disabled) return;
     const t = getTimeFromEvent(e);
     hoverTime = t;
     if (isDragging && selectionStart !== null) {
@@ -297,6 +194,12 @@
   }
 
   function handlePointerUp(_e: PointerEvent) {
+    if (disabled) {
+      isDragging = false;
+      selectionStart = null;
+      selectionEnd = null;
+      return;
+    }
     isDragging = false;
     if (selectionStart !== null && selectionEnd !== null && onRegionSelect) {
       const start = Math.min(selectionStart, selectionEnd);
@@ -316,7 +219,7 @@
   }
 
   function handleTimelineKeydown(e: KeyboardEvent) {
-    if (!onSeek || duration <= 0) return;
+    if (disabled || !onSeek || duration <= 0) return;
     const step = e.shiftKey ? 5 : 1;
     let next: number | null = null;
     switch (e.key) {
@@ -347,14 +250,6 @@
   <!-- Timeline Zoom Control bar -->
   <div class="flex items-center justify-between text-[10px] text-cortex-400 font-mono px-1">
     <div class="flex items-center gap-1.5">
-      <svg class="w-3 h-3 text-cortex-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          stroke-width="2"
-          d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM10 7v6m4-3H6"
-        />
-      </svg>
       <span>{$t('waveform.timelineZoom')}</span>
     </div>
     <div class="flex items-center gap-2">
@@ -365,7 +260,8 @@
         step="0.5"
         bind:value={zoom}
         class="w-32 h-1 bg-cortex-800 rounded-lg appearance-none cursor-pointer accent-indigo-500 focus:outline-none"
-        aria-label="Waveform zoom slider"
+        aria-label={$t('waveform.zoomSlider')}
+        dir="ltr"
       />
       <span class="w-8 text-end font-bold text-indigo-400">{zoom.toFixed(1)}x</span>
     </div>
@@ -381,12 +277,17 @@
       bind:this={canvas}
       class="block cursor-pointer select-none"
       role="slider"
-      aria-label="Audio waveform timeline"
+      aria-label={$t('waveform.audioTimeline')}
       aria-valuemin={0}
       aria-valuemax={duration}
       aria-valuenow={currentTime}
-      aria-valuetext={`${currentTime.toFixed(1)} seconds of ${duration.toFixed(1)} seconds`}
-      tabindex="0"
+      aria-valuetext={$t('waveform.position', {
+        current: isolate(currentTime.toFixed(1)),
+        duration: isolate(duration.toFixed(1)),
+      })}
+      aria-disabled={disabled}
+      aria-describedby={disabled ? disabledDescriptionId : undefined}
+      tabindex={disabled ? -1 : 0}
       onkeydown={handleTimelineKeydown}
       onpointerdown={handlePointerDown}
       onpointermove={handlePointerMove}

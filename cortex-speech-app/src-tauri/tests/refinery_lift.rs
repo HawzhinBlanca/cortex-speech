@@ -1,9 +1,15 @@
 //! refinery-lift — the WS4 charter gate: fixed-seed injected-error synthetic benchmark.
 //!
-//! Proves the Disagreement Refinery's T0 gate (IRT consensus + per-bucket conformal
-//! certification, the REAL shipped `jury::run_t0_gate` path — nothing reimplemented)
+//! Proves the Disagreement Refinery's T0 algorithm (IRT consensus + per-bucket conformal
+//! certification, the real compiled `jury::run_t0_gate` path — nothing reimplemented)
 //! delivers >=30% relative CER reduction over the raw local ASR at <=15% human
 //! escalation, on a fully offline, deterministic corpus.
+//!
+//! Scope boundary: schema 60+ deliberately disables machine verdict publication. This model-evidence
+//! benchmark therefore rolls its disposable database back to the last compatible schema (59) before
+//! seeding calibration truth and exercising the algorithm. It proves algorithmic lift only; it is not
+//! evidence that current product review truth may be machine-authored, and it is not an owner-product
+//! certification substitute.
 //!
 //! Design (honest by construction):
 //! - Every reference is built ONLY from words of the committed, human-verified FLEURS
@@ -201,14 +207,20 @@ fn insert_corpus(db: &Database, corpus: &[BenchSegment]) {
     conn.execute("RELEASE SAVEPOINT bench_hyps", []).expect("release");
 }
 
-/// The charter gate. Ignored in the default suite; run by scripts/verify_10.py as the
-/// dedicated refinery-lift leg (no models, no network — pure offline machinery).
+/// The model-evidence charter gate. Ignored in the default suite; run by scripts/verify_10.py as the
+/// dedicated algorithm-only refinery-lift leg (no models, no network — pure offline machinery).
 #[test]
 #[ignore]
 fn refinery_lift_injected_error_benchmark() {
     let tmp_db = NamedTempFile::new().expect("tmp db");
     let db = Database::open(tmp_db.path().to_str().expect("utf8 path")).expect("open db");
     db.initialize().expect("init db");
+    let rolled_back = cortex_speech_app_lib::migrations::rollback(&db, 9).expect("rollback disposable benchmark DB");
+    assert_eq!(
+        rolled_back,
+        vec![68, 67, 66, 65, 64, 63, 62, 61, 60],
+        "the algorithm benchmark must run at the exact last machine-verdict-compatible schema"
+    );
 
     let mut rng = XorShift64::new(SEED);
     let corpus = generate_corpus(&mut rng);

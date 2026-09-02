@@ -16,14 +16,17 @@ describe('parseActionableError', () => {
     }
   });
 
-  it('passes a real Error message through', () => {
+  it('does not expose a real Error message', () => {
     const out = parseActionableError(new Error('disk I/O error'));
-    expect(out.message).toContain('disk I/O error');
+    expect(out.message).toContain('unexpected error');
+    expect(out.message).not.toContain('disk I/O');
+    expect(out.detail).toBeUndefined();
   });
 
-  it('passes a plain string through', () => {
+  it('does not expose a plain backend string', () => {
     const out = parseActionableError('something specific failed');
-    expect(out.message).toBe('something specific failed');
+    expect(out.message).toContain('unexpected error');
+    expect(out.message).not.toContain('something specific');
   });
 
   it('stays actionable when coercion hooks throw', () => {
@@ -40,6 +43,23 @@ describe('parseActionableError', () => {
     );
 
     expect(() => parseActionableError(hostile)).not.toThrow();
-    expect(parseActionableError(hostile).message).toBe('Unknown error');
+    expect(parseActionableError(hostile).message).toContain('unexpected error');
+  });
+
+  it('retains typed code, operation ID and suggested action without the backend message', () => {
+    const out = parseActionableError({
+      schema: 1,
+      code: 'MODEL_UNAVAILABLE',
+      message: 'model missing at C:\\private\\models',
+      retryable: true,
+      suggestedAction: 'openModels',
+      operationId: '018f6e4a-2d71-4c66-8e4b-9d3c4b7e5a10',
+    });
+
+    expect(out.code).toBe('MODEL_UNAVAILABLE');
+    expect(out.operationId).toBe('018f6e4a-2d71-4c66-8e4b-9d3c4b7e5a10');
+    expect(out.suggestedAction).toBe('openModels');
+    expect(out.action?.handler).toBeTypeOf('function');
+    expect(out.detail).not.toContain('private');
   });
 });

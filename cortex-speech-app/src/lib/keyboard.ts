@@ -1,3 +1,5 @@
+import type { TranslationKey } from './i18n';
+
 export interface Shortcut {
   key: string;
   ctrl?: boolean;
@@ -5,7 +7,7 @@ export interface Shortcut {
   alt?: boolean;
   description: string;
   /** Optional i18n key used by visible shortcut surfaces; description remains a safe fallback. */
-  descriptionKey?: string;
+  descriptionKey?: TranslationKey;
   action: () => void;
   category: string;
   /**

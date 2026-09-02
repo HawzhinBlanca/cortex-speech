@@ -9,10 +9,12 @@ claims parity with. This gate pins the space-KEPT definition so the two scorecar
 drift apart again.
 """
 import sys
+from importlib import metadata
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCORECARD_7B = REPO_ROOT / "scripts" / "scorecard_7b.py"
+JIWER_VERSION = "4.0.0"
 
 
 def test_scorecard_7b_cer_keeps_whitespace_in_source() -> None:
@@ -27,7 +29,7 @@ def test_scorecard_7b_cer_keeps_whitespace_in_source() -> None:
     assert 'rc, hc = r.replace(" ", "")' not in src, "the old space-stripped CER path must stay removed"
 
 
-def test_space_kept_cer_matches_jiwer_when_available() -> None:
+def test_space_kept_cer_matches_pinned_jiwer() -> None:
     sys.path.insert(0, str(REPO_ROOT / "scripts"))
     from scorecard_7b import edit_distance, norm
 
@@ -39,9 +41,14 @@ def test_space_kept_cer_matches_jiwer_when_available() -> None:
 
     try:
         import jiwer
-    except ImportError:
-        print("  (jiwer not installed — skipped the numeric jiwer-equivalence check)")
-        return
+    except ImportError as error:
+        raise AssertionError(
+            "jiwer is mandatory proof authority; run `npm run setup:python-policies`"
+        ) from error
+    actual_version = metadata.version("jiwer")
+    assert actual_version == JIWER_VERSION, (
+        f"jiwer version drift: observed {actual_version}, expected exactly {JIWER_VERSION}"
+    )
     o = jiwer.process_characters(r, h)
     jiwer_dist = o.substitutions + o.deletions + o.insertions
     assert kept == jiwer_dist, (
@@ -52,7 +59,7 @@ def test_space_kept_cer_matches_jiwer_when_available() -> None:
 
 def main() -> int:
     test_scorecard_7b_cer_keeps_whitespace_in_source()
-    test_space_kept_cer_matches_jiwer_when_available()
+    test_space_kept_cer_matches_pinned_jiwer()
     print("scorecard CER-consistency policy regression passed")
     return 0
 

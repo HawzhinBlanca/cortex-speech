@@ -13,6 +13,35 @@ use crate::settings::{AppSettings, AsrModelSize};
 use std::path::Path;
 use std::sync::Arc;
 
+fn set_test_pcm_identity(db: &Database, segment_id: &str) {
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET audio_content_hash = ?2 WHERE id = ?1",
+            rusqlite::params![segment_id, blake3::hash(segment_id.as_bytes()).to_hex().to_string()],
+        )
+        .unwrap();
+}
+
+#[test]
+fn champion_eval_accepts_only_the_exact_registry_identity() {
+    let expected = crate::registry::DeploymentIdentity {
+        model_version_id: "champion-v1".into(),
+        deployment_sha256: "a".repeat(64),
+    };
+    let exact = super::Wsl7bResult {
+        raw_transcript: "draft".into(),
+        confidence: None,
+        model_version_id: expected.model_version_id.clone(),
+        deployment_sha256: expected.deployment_sha256.clone(),
+    };
+    assert!(super::require_exact_champion_result(&exact, &expected).is_ok());
+
+    let wrong_model = super::Wsl7bResult { model_version_id: "other".into(), ..exact.clone() };
+    assert!(super::require_exact_champion_result(&wrong_model, &expected).is_err());
+    let wrong_deployment = super::Wsl7bResult { deployment_sha256: "b".repeat(64), ..exact };
+    assert!(super::require_exact_champion_result(&wrong_deployment, &expected).is_err());
+}
+
 #[test]
 fn champion_selection_disables_auxiliary_models_even_for_legacy_true_setting() {
     let champion_with_legacy_flag =
@@ -142,59 +171,52 @@ fn resume_skips_persisted_but_unjournaled_file_to_avoid_duplicates() {
 
     // Fresh import (not resuming): never skip, even if the path somehow already has rows — a fresh
     // import of a previously-imported directory is a legitimate (separate) re-import, not a resume.
-    assert!(!resume_should_skip_file(false, false, false));
-    assert!(!resume_should_skip_file(false, false, true), "a fresh import must never skip on pre-existing rows");
+    assert!(!resume_should_skip_file(false, false));
+    assert!(!resume_should_skip_file(false, true), "a fresh import must never skip on pre-existing rows");
 
-    // Resuming, journal recorded the file: skip (pre-existing P3.2 behavior, preserved).
-    assert!(resume_should_skip_file(true, true, false));
+    // A stale journal entry with no authoritative rows is bookkeeping, not completion.
+    assert!(!resume_should_skip_file(true, false));
 
-    // Resuming, NOT journaled but segments already persisted: MUST skip. Before the fix this branch
-    // returned false and the in-flight file was reprocessed into duplicate segments.
+    // Resuming with rows that independently proved transcript + source authority: MUST skip. This
+    // includes the crash window where the rows committed but the journal did not.
     assert!(
-        resume_should_skip_file(true, false, true),
-        "resume must skip a persisted-but-unjournaled file, else duplicate segments on re-import"
+        resume_should_skip_file(true, true),
+        "resume must skip an authoritative persisted file, else duplicate segments on re-import"
     );
 
-    // Resuming, not journaled, no rows yet (a genuinely unprocessed file past the crash point): process it.
-    assert!(!resume_should_skip_file(true, false, false));
+    // Resuming with missing/placeholder/wrong-model/cloud/source-drift rows: process it.
+    assert!(!resume_should_skip_file(true, false));
 }
 
 #[test]
-fn segment_id_by_alignment_distinguishes_no_row_from_db_error() {
-    use super::resolve_segment_id_by_alignment;
-    // With the schema present: a matching (audio_path, alignment_json) resolves to its id.
-    let db = Database::open(":memory:").unwrap();
-    db.initialize().unwrap();
-    let seg = SpeechSegment {
-        id: "seg-a".into(),
-        audio_path: "/audio/a.wav".into(),
-        alignment_json: Some(r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":1}"#.into()),
-        ..Default::default()
+fn resume_authority_rejects_placeholder_wrong_model_cloud_and_blank_drafts() {
+    use super::resume_segment_has_authoritative_transcript;
+
+    let mut segment = SpeechSegment {
+        raw_transcript: "دەنگێکی ڕاستەقینە".into(),
+        model_version_id: Some("champion-v1".into()),
+        ..SpeechSegment::default()
     };
-    db.insert_segment(&seg).unwrap();
-    assert_eq!(
-        resolve_segment_id_by_alignment(
-            db.connection(),
-            "/audio/a.wav",
-            r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":1}"#,
-        )
-        .unwrap(),
-        Some("seg-a".to_string())
-    );
-    // No matching row is a legitimate None (caller falls through to "segment not found"), NOT an error.
-    assert_eq!(
-        resolve_segment_id_by_alignment(db.connection(), "/audio/a.wav", r#"{"nope":1}"#).unwrap(),
-        None,
-        "no matching row must be Ok(None), not an error"
-    );
-    // A REAL DB error (query against a connection with no speech_segments table) must PROPAGATE.
-    // Before the fix, .ok() collapsed it to None, so a locked/IO/corrupt read told the user to
-    // re-import an already-imported file and hid the fault. This is the regression assertion.
-    let bare = rusqlite::Connection::open_in_memory().unwrap();
-    assert!(
-        resolve_segment_id_by_alignment(&bare, "/audio/a.wav", "{}").is_err(),
-        "a real DB error must surface as Err, not masquerade as no-such-row None"
-    );
+    assert!(resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
+
+    segment.raw_transcript = "[Pending WSL 7B ASR]".into();
+    assert!(!resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
+    segment.raw_transcript = "   ".into();
+    assert!(!resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
+    segment.raw_transcript = "دەنگ".into();
+    segment.model_version_id = Some("wrong-model".into());
+    assert!(!resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
+    segment.model_version_id = Some("champion-v1".into());
+    segment.cloud_call = true;
+    assert!(!resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
+
+    // Durable human truth outranks the draft's machine provenance, including an explicit reject.
+    segment.human_decision = Some("edit".into());
+    segment.verdict_transcript = Some("دەقی مرۆڤ".into());
+    assert!(resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
+    segment.human_decision = Some("reject".into());
+    segment.verdict_transcript = None;
+    assert!(resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
 }
 
 #[test]
@@ -211,6 +233,7 @@ fn loop0_firing_respects_opt_in_and_fires_when_enabled() {
             ..Default::default()
         };
         db.insert_segment(&seg).unwrap();
+        set_test_pcm_identity(&db, id);
         db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).unwrap();
     }
     let input = "ئەو ساڵە باش بوو";
@@ -253,6 +276,7 @@ fn loop0_would_fire_is_the_shadow_signal_independent_of_the_toggle() {
             ..Default::default()
         };
         db.insert_segment(&seg).unwrap();
+        set_test_pcm_identity(&db, id);
         db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).unwrap();
     }
     let mems = db.load_correction_memories().unwrap();
@@ -278,7 +302,7 @@ fn build_refiner_routes_gemini_through_openrouter_when_key_present() {
     let settings = AppSettings { llm_mode: LlmMode::Gemini, cloud_llm_opt_in: true, ..AppSettings::default() };
     let (pipeline, dir) = test_pipeline_with_settings(settings);
     std::fs::write(dir.path().join("secrets.env"), "OPENROUTER_API_KEY=test-or-key\n").unwrap();
-    let refiner = pipeline.build_refiner().expect("a refiner should be built");
+    let refiner = pipeline.build_refiner().expect("API-key store should load").expect("a refiner should be built");
     assert!(
         refiner.endpoint.contains("openrouter.ai"),
         "Gemini mode + OpenRouter key should route through OpenRouter, got: {}",
@@ -303,7 +327,7 @@ fn build_refiner_none_mode_disables_refinement() {
     use crate::settings::LlmMode;
     let (pipeline, _dir) =
         test_pipeline_with_settings(AppSettings { llm_mode: LlmMode::None, ..AppSettings::default() });
-    assert!(pipeline.build_refiner().is_none());
+    assert!(pipeline.build_refiner().expect("API-key store should load").is_none());
 }
 
 #[test]
@@ -316,7 +340,10 @@ fn build_refiner_respects_cloud_opt_out() {
         ..AppSettings::default()
     });
     std::fs::write(dir.path().join("secrets.env"), "OPENROUTER_API_KEY=test-or-key\n").unwrap();
-    assert!(pipeline.build_refiner().is_none(), "cloud opt-out must disable refinement even with a key");
+    assert!(
+        pipeline.build_refiner().expect("API-key store should load").is_none(),
+        "cloud opt-out must disable refinement even with a key"
+    );
 }
 
 #[test]
@@ -332,9 +359,175 @@ fn cancelled_directory_import_clears_running_status() {
     let token = crate::cancel::CancellationToken::new();
     token.cancel(); // pre-cancel so the loop's first token.check()? returns Err before any decode
 
-    let res = pipeline.import_directory_with_agent_run_id(&import_dir, Some(token), None, None, |_evt| {});
+    let res = pipeline.import_directory_with_agent_run_id(&import_dir, Some(token), None, None, None, |_evt| {});
     assert!(res.is_err(), "a cancelled import returns Err");
     assert!(!pipeline.import_status().running, "running must be cleared after a cancelled import");
+}
+
+#[test]
+fn import_refuses_before_audio_work_when_the_durable_journal_cannot_start() {
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
+    let db = pipeline.open_db().unwrap();
+    db.initialize().unwrap();
+    db.connection()
+        .execute_batch(
+            "CREATE TRIGGER fail_import_journal
+             BEFORE INSERT ON import_jobs
+             BEGIN
+               SELECT RAISE(ABORT, 'injected import journal failure');
+             END;",
+        )
+        .unwrap();
+    let import_dir = dir.path().join("journal_fault");
+    std::fs::create_dir_all(&import_dir).unwrap();
+    std::fs::write(import_dir.join("would_decode.wav"), b"not-real-audio").unwrap();
+
+    let error = pipeline.import_directory(&import_dir, None, |_| {}).unwrap_err().to_string();
+
+    assert!(
+        error.contains("Could not create the durable import recovery journal"),
+        "the journal failure must be the terminal cause before decode: {error}"
+    );
+    assert!(!pipeline.import_status().running, "journal refusal must release the visible import state");
+    assert_eq!(db.segment_count().unwrap(), 0, "no segment may publish without a durable recovery journal");
+    let jobs: i64 = db.connection().query_row("SELECT COUNT(*) FROM import_jobs", [], |row| row.get(0)).unwrap();
+    assert_eq!(jobs, 0, "the failed journal transaction must not leave a partial generation");
+}
+
+#[test]
+fn resume_worker_refuses_an_unowned_journal_before_decode_and_preserves_the_successor() {
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
+    let db = pipeline.open_db().unwrap();
+    db.initialize().unwrap();
+    let crashed = db.begin_import_job("C:/recordings", 1).unwrap();
+    let successor = db.handoff_import_job_for_resume(&crashed).unwrap();
+
+    let import_dir = dir.path().join("resume_admission");
+    std::fs::create_dir_all(&import_dir).unwrap();
+    std::fs::write(import_dir.join("must-not-decode.wav"), b"not-real-audio").unwrap();
+    // The directory must match the claimed journal for a successful admission. Supplying a different,
+    // valid UUID models stale worker state and proves the durable check happens before audio decode.
+    let stale_job_id = uuid::Uuid::new_v4().to_string();
+    let resume_paths = std::collections::HashSet::new();
+    let error = pipeline
+        .import_directory_with_agent_run_id(&import_dir, None, None, Some(&resume_paths), Some(&stale_job_id), |_| {})
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("claimed durable resume journal"), "worker admission must be the terminal cause: {error}");
+    assert_eq!(db.segment_count().unwrap(), 0, "stale worker authority must fail before decode/publication");
+    let still_resumable = db.find_interrupted_import_job().unwrap().expect("claimed successor must survive refusal");
+    assert_eq!(still_resumable.id, successor);
+}
+
+#[test]
+fn resume_of_an_empty_or_moved_source_fails_without_consuming_the_successor_journal() {
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
+    let db = pipeline.open_db().unwrap();
+    db.initialize().unwrap();
+    let import_dir = dir.path().join("empty_resume");
+    std::fs::create_dir_all(&import_dir).unwrap();
+    let crashed = db.begin_import_job(&import_dir.to_string_lossy(), 2).unwrap();
+    let successor = db.handoff_import_job_for_resume(&crashed).unwrap();
+    let resume_paths = std::collections::HashSet::new();
+
+    let error = pipeline
+        .import_directory_with_agent_run_id(&import_dir, None, None, Some(&resume_paths), Some(&successor), |_| {})
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("journal was retained"), "empty resume must be loud and recoverable: {error}");
+    assert_eq!(db.find_interrupted_import_job().unwrap().unwrap().id, successor);
+}
+
+#[test]
+fn single_file_lost_response_adopts_exact_human_authority_and_refuses_later_source_drift() {
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
+    let db = pipeline.open_db().unwrap();
+    db.initialize().unwrap();
+    let source = dir.path().join("lost-response.wav");
+
+    let write_wav = |sample: i16| {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&source, spec).unwrap();
+        for _ in 0..16_000 {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+    };
+    write_wav(1_000);
+
+    let mut canonical = crate::fingerprint::StreamingIdentity::new();
+    crate::audio::decode_pcm_windows(&source, crate::audio::DECODE_WINDOW_MS, |window| {
+        canonical.push(&window.pcm, window.sample_rate);
+        Ok(())
+    })
+    .unwrap();
+    let identity = canonical.finish();
+    let machine = SpeechSegment {
+        id: "lost-response-authority".into(),
+        audio_path: source.to_string_lossy().into_owned(),
+        raw_transcript: "دەقی پشتڕاستکراو".into(),
+        duration_ms: 1_000,
+        alignment_json: Some(
+            crate::chunking::SegmentSourceMeta {
+                source_start_ms: 0,
+                source_end_ms: 1_000,
+                chunk_index: 0,
+                chunk_count: 1,
+            }
+            .to_alignment_json(),
+        ),
+        ..SpeechSegment::default()
+    };
+    db.insert_segment(&machine).unwrap();
+    db.set_audio_identity(&machine.audio_path, &identity).unwrap();
+    db.record_human_decision(&machine.id, "accept", None, None).unwrap();
+    let durable = db.get_segment_by_id(&machine.id).unwrap().unwrap();
+
+    // A fresh in-memory fingerprint index models a process restart or a lost IPC response. Durable
+    // human authority is sufficient even when no champion registry is available, and the retry must
+    // return the existing ID rather than entering engine preflight or minting another row.
+    let adopted = pipeline.process_single_file(&source, &db).expect("adopt exact durable result");
+    assert_eq!(adopted.iter().map(|segment| segment.id.as_str()).collect::<Vec<_>>(), [durable.id.as_str()]);
+    assert_eq!(db.segment_count().unwrap(), 1, "idempotent retry must not duplicate durable truth");
+
+    // Reusing the same filename for replacement bytes is not idempotency. It must hard-stop before
+    // deleting, re-transcribing or relabeling the incumbent human-owned row.
+    write_wav(2_000);
+    let error = pipeline
+        .process_single_file(&source, &db)
+        .expect_err("changed bytes at an existing source path must refuse adoption")
+        .to_string();
+    assert!(error.contains("current audio identity does not match"), "unexpected source-drift error: {error}");
+    assert_eq!(db.segment_count().unwrap(), 1);
+    let unchanged = db.get_segment_by_id(&durable.id).unwrap().unwrap();
+    assert_eq!(unchanged.raw_transcript, durable.raw_transcript);
+    assert_eq!(unchanged.human_decision, durable.human_decision);
+}
+
+#[test]
+fn cloned_pipeline_workers_share_one_lazy_runtime_and_refuse_database_identity_drift() {
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
+    let worker = pipeline.clone();
+    assert!(
+        Arc::ptr_eq(&pipeline.database_runtime, &worker.database_runtime),
+        "cloned batch workers must share one runtime slot"
+    );
+
+    let db = pipeline.open_db().unwrap();
+    db.initialize().unwrap();
+    pipeline.import_write_store(db.path()).unwrap();
+    assert!(worker.database_runtime.lock().unwrap().is_some(), "one worker must initialize the shared slot");
+
+    let other_path = dir.path().join("other.db").to_string_lossy().into_owned();
+    let error = worker.import_write_store(&other_path).err().expect("database identity drift must refuse");
+    assert!(error.to_string().contains("does not match"), "unexpected mismatch error: {error}");
 }
 
 #[test]
@@ -353,6 +546,7 @@ fn fire_loop0_if_enabled_method_uses_the_pipelines_own_db() {
                 ..Default::default()
             };
             db.insert_segment(&seg).unwrap();
+            set_test_pcm_identity(&db, id);
             db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).unwrap();
         }
     }
@@ -390,7 +584,7 @@ fn the_gemini_key_comes_from_the_encrypted_store_not_the_scrubbed_setting() {
     let data_dir = dir.path();
 
     // Nothing anywhere -> None, so the caller can say so instead of calling Gemini with "".
-    assert_eq!(pipeline.jury_cloud_api_key(), None, "no key anywhere must resolve to None");
+    assert_eq!(pipeline.jury_cloud_api_key().unwrap(), None, "no key anywhere must resolve to None");
 
     // A key in the ENCRYPTED store is found. Plaintext in secrets.env is a supported form
     // (parse_env_file reads both), which keeps this test independent of DPAPI availability.
@@ -403,7 +597,7 @@ fn the_gemini_key_comes_from_the_encrypted_store_not_the_scrubbed_setting() {
     std::fs::write(data_dir.join("secrets.env"), "GEMINI_API_KEY=AIzaFromTheStore\n").unwrap();
     let mut seen = None;
     for _ in 0..500 {
-        seen = pipeline.jury_cloud_api_key();
+        seen = pipeline.jury_cloud_api_key().expect("API-key store should load");
         if seen.is_some() {
             break;
         }
@@ -420,7 +614,7 @@ fn the_gemini_key_comes_from_the_encrypted_store_not_the_scrubbed_setting() {
     let typed = AppSettings { llm_api_key: "AIzaJustTyped".to_string(), ..AppSettings::default() };
     let (typed_pipeline, typed_dir) = test_pipeline_with_settings(typed);
     assert_eq!(
-        typed_pipeline.jury_cloud_api_key().as_deref(),
+        typed_pipeline.jury_cloud_api_key().unwrap().as_deref(),
         Some("AIzaJustTyped"),
         "a key typed in THIS session must still work before any reload scrubs it - refusing it would \
          be a surprising 'I just entered it' failure"
@@ -443,17 +637,303 @@ fn test_pipeline_with_settings(settings: AppSettings) -> (super::ProcessingPipel
     (pipeline, dir)
 }
 
+#[test]
+fn durable_batch_draft_requires_single_owner_and_exact_champion_identity() {
+    let settings = AppSettings { auto_normalize: true, verbalize_numbers: false, ..AppSettings::default() };
+    let (pipeline, _dir) = test_pipeline_with_settings(settings);
+    let draft = super::TranscriptionDraft {
+        raw_text: "دەقی 12".into(),
+        final_text: "دەقی 12".into(),
+        confidence: Some(0.91),
+        confidence_source: Some("external_provider".into()),
+        model_version_id: Some("champion-v1".into()),
+        deployment_sha256: Some("a".repeat(64)),
+        cloud_call: false,
+    };
+    let prepared = pipeline.prepare_batch_champion_draft(draft.clone()).expect("valid champion draft");
+    assert_eq!(prepared.raw_transcript, draft.raw_text);
+    assert_eq!(prepared.model_version_id, "champion-v1");
+    assert_eq!(prepared.deployment_sha256, "a".repeat(64));
+    assert!(prepared.normalized_transcript.is_some());
+    assert_eq!(prepared.normalizer_version.as_deref(), Some(crate::normalizer::NORMALIZER_VERSION));
+
+    let identity_free = super::TranscriptionDraft { deployment_sha256: None, ..draft.clone() };
+    assert!(pipeline.prepare_batch_champion_draft(identity_free).is_err());
+    let blank = super::TranscriptionDraft { raw_text: "   ".into(), ..draft.clone() };
+    assert!(pipeline.prepare_batch_champion_draft(blank).is_err());
+    let placeholder = super::TranscriptionDraft { raw_text: "[Pending WSL 7B ASR]".into(), ..draft };
+    assert!(pipeline.prepare_batch_champion_draft(placeholder).is_err());
+}
+
+#[test]
+fn durable_batch_and_bound_drafts_retain_refined_final_when_auto_normalize_is_disabled() {
+    let settings = AppSettings { auto_normalize: false, ..AppSettings::default() };
+    let (pipeline, _dir) = test_pipeline_with_settings(settings);
+    let draft = super::TranscriptionDraft {
+        raw_text: "دەقی خام".into(),
+        final_text: "دەقی کۆتایی".into(),
+        confidence: None,
+        confidence_source: Some("external_provider".into()),
+        model_version_id: Some("champion-v1".into()),
+        deployment_sha256: Some("b".repeat(64)),
+        cloud_call: true,
+    };
+    for prepared in [
+        pipeline.prepare_batch_champion_draft(draft.clone()).expect("durable batch champion draft"),
+        pipeline.prepare_bound_champion_draft(draft).expect("source-bound champion draft"),
+    ] {
+        assert_eq!(prepared.raw_transcript, "دەقی خام", "immutable champion raw must remain verbatim");
+        assert_eq!(prepared.normalized_transcript.as_deref(), Some("دەقی کۆتایی"));
+        assert_eq!(prepared.normalizer_version.as_deref(), Some(super::MACHINE_REVIEW_FINAL_VERSION));
+    }
+}
+
+#[test]
+fn champion_draft_avoids_a_fake_derived_value_when_raw_and_final_are_identical() {
+    let settings = AppSettings { auto_normalize: false, ..AppSettings::default() };
+    let (pipeline, _dir) = test_pipeline_with_settings(settings);
+    let prepared = pipeline
+        .prepare_bound_champion_draft(super::TranscriptionDraft {
+            raw_text: "دەقی یەکسان".into(),
+            final_text: "دەقی یەکسان".into(),
+            confidence: None,
+            confidence_source: Some("external_provider".into()),
+            model_version_id: Some("champion-v1".into()),
+            deployment_sha256: Some("c".repeat(64)),
+            cloud_call: false,
+        })
+        .expect("identity-bound champion draft");
+    assert!(prepared.normalized_transcript.is_none());
+    assert!(prepared.normalizer_version.is_none());
+}
+
+#[test]
+fn champion_draft_persists_normalized_final_with_the_real_normalizer_marker() {
+    let settings = AppSettings { auto_normalize: true, verbalize_numbers: true, ..AppSettings::default() };
+    let (pipeline, _dir) = test_pipeline_with_settings(settings);
+    let raw = "ساڵی ٥";
+    let prepared = pipeline
+        .prepare_bound_champion_draft(super::TranscriptionDraft {
+            raw_text: raw.into(),
+            final_text: raw.into(),
+            confidence: None,
+            confidence_source: Some("external_provider".into()),
+            model_version_id: Some("champion-v1".into()),
+            deployment_sha256: Some("d".repeat(64)),
+            cloud_call: false,
+        })
+        .expect("normalizing champion draft");
+    let derived = prepared.normalized_transcript.as_deref().expect("configured normalization is durable");
+    assert_ne!(derived, raw, "fixture must prove raw and normalized review text differ");
+    assert_eq!(prepared.raw_transcript, raw, "normalization must not rewrite the champion hypothesis");
+    assert_eq!(prepared.normalizer_version.as_deref(), Some(crate::normalizer::NORMALIZER_VERSION));
+}
+
+#[test]
+fn existing_transcription_binding_rejects_cross_segment_path_and_pcm_drift() {
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
+    let db_path = dir.path().join("db.sqlite");
+    let db = Database::open(db_path.to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    let write_wav = |path: &Path, sample: i16| {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for _ in 0..16_000 {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+    };
+    let wav_a = dir.path().join("a.wav");
+    let wav_b = dir.path().join("b.wav");
+    write_wav(&wav_a, 1_000);
+    write_wav(&wav_b, 2_000);
+    let hash_a = crate::export_bundle::current_canonical_pcm_blake3(&wav_a).unwrap();
+
+    let alignment = r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":1}"#;
+    let mut a = SpeechSegment {
+        id: "source-a".into(),
+        audio_path: wav_a.to_string_lossy().into_owned(),
+        duration_ms: 1_000,
+        alignment_json: Some(alignment.into()),
+        ..SpeechSegment::default()
+    };
+    a.raw_transcript = "incumbent".into();
+    db.insert_segment(&a).unwrap();
+    db.connection()
+        .execute("UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1", rusqlite::params![a.id, hash_a])
+        .unwrap();
+
+    let error = pipeline
+        .bind_existing_transcription_source("source-a", Some(wav_b.to_str().unwrap()), Some(alignment))
+        .expect_err("segment A paired with file B must fail before inference");
+    assert!(error.to_string().contains("E_TRANSCRIPTION_SOURCE_CHANGED"), "{error}");
+
+    // Replacing the bytes at A's path after import must be detected by decoded-PCM identity, even
+    // though the caller still supplies the same segment id, path and span.
+    write_wav(&wav_a, 3_000);
+    let error = pipeline
+        .bind_existing_transcription_source("source-a", Some(wav_a.to_str().unwrap()), Some(alignment))
+        .expect_err("same-path PCM replacement must fail closed");
+    assert!(error.to_string().contains("E_TRANSCRIPTION_SOURCE_CHANGED"), "{error}");
+}
+
+#[test]
+fn batch_transcription_binding_single_flights_one_shared_recording() {
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
+    let db_path = dir.path().join("db.sqlite");
+    let db = Database::open(db_path.to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+    let wav = dir.path().join("shared.wav");
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&wav, spec).unwrap();
+    for sample in 0..32_000 {
+        writer.write_sample::<i16>((sample % 257) as i16).unwrap();
+    }
+    writer.finalize().unwrap();
+    let content_hash = crate::export_bundle::current_canonical_pcm_blake3(&wav).unwrap();
+    let alignment = r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":2}"#;
+
+    for id in ["shared-a", "shared-b"] {
+        db.insert_segment(&SpeechSegment {
+            id: id.into(),
+            audio_path: wav.to_string_lossy().into_owned(),
+            raw_transcript: "incumbent".into(),
+            alignment_json: Some(alignment.into()),
+            duration_ms: 1_000,
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+                rusqlite::params![id, content_hash],
+            )
+            .unwrap();
+    }
+
+    let cache: super::TranscriptionSourceLeaseCache = Default::default();
+    let first = pipeline
+        .bind_existing_transcription_source_cached("shared-a", Some(wav.to_str().unwrap()), Some(alignment), &cache)
+        .unwrap();
+    let second = pipeline
+        .bind_existing_transcription_source_cached("shared-b", Some(wav.to_str().unwrap()), Some(alignment), &cache)
+        .unwrap();
+
+    assert_eq!(first._source_lease, second._source_lease, "both segments must hold the exact shared source lease");
+    let entries = cache.lock().unwrap();
+    assert_eq!(entries.len(), 1, "one recording/hash pair must have exactly one verifier cell");
+    assert!(entries.values().all(|entry| entry.get().is_some()), "the verifier cell must be initialized");
+}
+
+#[test]
+fn bound_and_import_draft_only_success_preserve_segment_and_hypothesis_rows() {
+    let settings = AppSettings {
+        asr_model_size: AsrModelSize::CTC300M,
+        use_finetuned_asr: false,
+        multi_engine_hypotheses: true,
+        ..AppSettings::default()
+    };
+    let (pipeline, dir) = test_pipeline_with_settings(settings);
+    let db_path = dir.path().join("db.sqlite");
+    let db = Database::open(db_path.to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    let wav = dir.path().join("bound-draft.wav");
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&wav, spec).unwrap();
+    for sample in 0..16_000 {
+        writer.write_sample::<i16>((sample % 503) as i16).unwrap();
+    }
+    writer.finalize().unwrap();
+
+    let segment_id = "bound-draft-only";
+    db.insert_segment(&SpeechSegment {
+        id: segment_id.into(),
+        audio_path: wav.to_string_lossy().into_owned(),
+        raw_transcript: "incumbent transcript".into(),
+        normalized_transcript: Some("incumbent normalized".into()),
+        duration_ms: 1_000,
+        confidence: Some(0.42),
+        confidence_source: Some("historical".into()),
+        model_version_id: Some("historical-model".into()),
+        ..SpeechSegment::default()
+    })
+    .unwrap();
+    let content_hash = crate::export_bundle::current_canonical_pcm_blake3(&wav).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+            rusqlite::params![segment_id, content_hash],
+        )
+        .unwrap();
+    insert_hypothesis(&db, segment_id, "historical-model", "durable prior vote");
+
+    let selected_model = pipeline.local_asr_model_id().to_string();
+    pipeline.cache.set(
+        &wav,
+        crate::cache::CacheEntry {
+            audio_hash: String::new(),
+            raw_transcript: "new isolated draft".into(),
+            normalized_transcript: None,
+            created_at: chrono::Utc::now(),
+            model_id: selected_model.clone(),
+        },
+    );
+
+    let source = pipeline
+        .bind_existing_transcription_source(segment_id, Some(wav.to_str().unwrap()), None)
+        .expect("bind exact source");
+    let segment_before = serde_json::to_value(db.get_segment_by_id(segment_id).unwrap()).unwrap();
+    let hypotheses_before = serde_json::to_value(db.get_hypotheses_for_segment(segment_id).unwrap()).unwrap();
+
+    let draft = pipeline.transcribe_bound_draft_only(&source, None).expect("draft from the exact bound source");
+
+    assert_eq!(draft.raw_text, "new isolated draft");
+    assert_eq!(draft.model_version_id.as_deref(), Some(selected_model.as_str()));
+    let import_draft = pipeline
+        .transcribe_import_draft_only(segment_id, wav.to_str().unwrap(), None, None)
+        .expect("an import id collision still produces only an isolated draft");
+    assert_eq!(import_draft.raw_text, "new isolated draft");
+    assert_eq!(import_draft.model_version_id.as_deref(), Some(selected_model.as_str()));
+    assert_eq!(
+        serde_json::to_value(db.get_segment_by_id(segment_id).unwrap()).unwrap(),
+        segment_before,
+        "neither bound nor import draft inference may mutate speech_segments"
+    );
+    assert_eq!(
+        serde_json::to_value(db.get_hypotheses_for_segment(segment_id).unwrap()).unwrap(),
+        hypotheses_before,
+        "neither bound nor import draft inference may attach hypotheses to a colliding id"
+    );
+}
+
 fn test_pipeline_for_status() -> (super::ProcessingPipeline, tempfile::TempDir) {
     test_pipeline_with_settings(AppSettings::default())
 }
 
 #[test]
-fn wsl_without_script_preserves_champion_identity_and_never_falls_back() {
+fn wsl_without_explicit_script_uses_bundled_champion_and_never_falls_back() {
     let settings = AppSettings { asr_model_size: AsrModelSize::WSL7B, ..AppSettings::default() };
     let (pipeline, _dir) = test_pipeline_with_settings(settings);
 
-    assert!(!pipeline.should_use_wsl_primary_asr());
-    assert!(pipeline.wsl7b_primary_unresolved());
+    assert!(pipeline.should_use_wsl_primary_asr());
+    assert!(!pipeline.wsl7b_primary_unresolved());
     assert_eq!(pipeline.selected_asr_model_size(), AsrModelSize::WSL7B);
     assert_eq!(pipeline.local_asr_model_id(), "omniasr-wsl-7b");
 }
@@ -529,6 +1009,34 @@ fn source_record_for_audio(
         transcript_text: transcript_text.to_string(),
         created_at: None,
     }
+}
+
+#[test]
+fn source_reference_refuses_same_path_audio_mutation_during_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let audio = dir.path().join("source.wav");
+    std::fs::write(&audio, b"audio-before-cloud-generation").unwrap();
+    let before = super::source_audio_identity(&audio).unwrap();
+
+    // Same path and even same byte length are insufficient identity. This models a recorder or
+    // synchronization process replacing the source while the remote transcript request is active.
+    std::fs::write(&audio, b"audio-after--cloud-generation").unwrap();
+    let error = super::source_reference::verified_post_generation_source_identity(&audio, Some(&before))
+        .expect_err("a transcript must not be bound to bytes that changed during generation");
+
+    assert!(error.to_string().contains("Audio source changed while generating"));
+}
+
+#[test]
+fn source_reference_refuses_post_generation_identity_without_a_pre_generation_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let audio = dir.path().join("source.wav");
+    std::fs::write(&audio, b"post-generation-audio").unwrap();
+
+    let error = super::source_reference::verified_post_generation_source_identity(&audio, None)
+        .expect_err("post-generation bytes alone cannot prove which bytes the cloud request read");
+
+    assert!(error.to_string().contains("Cannot establish audio identity before generating"));
 }
 
 #[test]
@@ -653,7 +1161,7 @@ fn service_locks_recover_poisoned_state() {
 // there is no cross-thread window buffer and no lock left to poison.
 
 #[test]
-fn wsl_primary_import_pass_is_inert_after_unconfigured_champion_preflight_refusal() {
+fn wsl_primary_import_pass_never_silently_skips_the_bundled_champion() {
     let settings = AppSettings { asr_model_size: AsrModelSize::WSL7B, ..AppSettings::default() };
     let (pipeline, dir) = test_pipeline_with_settings(settings);
     let db_path = dir.path().join("db.sqlite");
@@ -667,31 +1175,20 @@ fn wsl_primary_import_pass_is_inert_after_unconfigured_champion_preflight_refusa
         duration_ms: 1000,
         ..SpeechSegment::default()
     };
-    db.insert_segment(&segment).unwrap();
-
     let mut segments = vec![segment];
-    let updated = pipeline.run_primary_wsl_pass_for_import(&db, &mut segments, None).unwrap();
-
-    assert_eq!(updated, 0);
-    assert_eq!(segments[0].raw_transcript, "pre-existing transcript");
-    assert_eq!(segments[0].verdict, None);
-    assert!(!segments[0].escalated);
-    assert_eq!(segments[0].rationale, None);
-
-    let fresh = db.get_segments_by_ids(&["preflight-refused".to_string()]).unwrap().remove(0);
-    assert_eq!(fresh.raw_transcript, "pre-existing transcript");
-    assert_eq!(fresh.verdict, None);
-    assert!(!fresh.escalated);
-    assert_eq!(fresh.rationale, None);
+    let error = pipeline
+        .run_primary_wsl_pass_for_import(&mut segments, None)
+        .expect_err("a clean default must run the bundled champion path and fail hard on infrastructure errors");
+    assert!(error.to_string().contains("before any"));
+    assert!(db.get_segment_by_id("preflight-refused").unwrap().is_none());
 }
 
 #[test]
-fn wsl_primary_import_pass_cancels_and_rolls_back_on_infrastructure_failure() {
+fn wsl_primary_import_pass_leaves_no_rows_on_infrastructure_failure() {
     // The owner forces the 7B Champion: if the 7B path errors (server down / unreachable / hung —
     // here simulated by a missing audio file so transcribe() fails BEFORE spawning any subprocess),
-    // the WHOLE import is cancelled and every segment it just created is rolled back, rather than
-    // leaving a library of "[Pending WSL 7B ASR]" placeholders or silently downgrading. This locks
-    // in that fail-hard contract AND the cascade cleanup that leaves no orphaned hypothesis rows.
+    // the WHOLE file remains unpublished rather than depending on compensating deletion of partially
+    // drafted placeholder rows. This locks in the stronger fail-hard contract.
     let settings = AppSettings {
         asr_model_size: AsrModelSize::WSL7B,
         // Non-empty => should_use_wsl_primary_asr() is true so the pass actually runs (it Ok(0)-skips
@@ -703,7 +1200,18 @@ fn wsl_primary_import_pass_cancels_and_rolls_back_on_infrastructure_failure() {
     let db = Database::open(dir.path().join("db.sqlite").to_str().unwrap()).unwrap();
     db.initialize().unwrap();
 
-    // Two freshly-imported segments whose audio file does not exist => transcribe() fails hard
+    // One unrelated canonical row proves the failure does not delete pre-existing data.
+    let unrelated = SpeechSegment {
+        id: "unrelated".into(),
+        audio_path: "unrelated.wav".into(),
+        raw_transcript: "durable prior draft".into(),
+        duration_ms: 1000,
+        ..SpeechSegment::default()
+    };
+    db.insert_segment(&unrelated).unwrap();
+    insert_hypothesis(&db, "unrelated", "prior-model", "durable prior vote");
+
+    // Two in-memory segments whose audio file does not exist => transcribe() fails hard
     // (get_duration_ms on a missing path) on every attempt = an infrastructure failure, not a
     // reachable-but-silent clip.
     let missing_audio = dir.path().join("does-not-exist.wav").to_string_lossy().to_string();
@@ -716,37 +1224,33 @@ fn wsl_primary_import_pass_cancels_and_rolls_back_on_infrastructure_failure() {
             duration_ms: 1000,
             ..SpeechSegment::default()
         };
-        db.insert_segment(&seg).unwrap();
         segments.push(seg);
     }
-    // A stale hypothesis on the first segment must be cascade-deleted with it (no orphan rows).
-    insert_hypothesis(&db, "import-0", "omniasr-wsl-7b", "stale draft");
 
     let import_ids: Vec<String> = segments.iter().map(|s| s.id.clone()).collect();
-    let result = pipeline.run_primary_wsl_pass_for_import(&db, &mut segments, None);
+    let result = pipeline.run_primary_wsl_pass_for_import(&mut segments, None);
 
     // The import is cancelled (fail-hard), not silently downgraded to a weaker engine.
     let msg = result.expect_err("a 7B infrastructure failure must cancel the import").to_string();
-    assert!(msg.contains("rolled back"), "error must state the rollback: {msg}");
+    assert!(msg.contains("before any"), "error must state that publication never occurred: {msg}");
     assert!(msg.contains("7B server"), "error must name the 7B server: {msg}");
 
-    // Every segment the import created is gone, and the cascade removed the hypothesis with it.
+    // No staged segment ever entered the canonical tables; unrelated durable truth is untouched.
     assert!(
         db.get_segments_by_ids(&import_ids).unwrap().is_empty(),
-        "all import segments must be deleted after a fail-hard cancel"
+        "all failed-file segments must remain unpublished"
     );
-    assert!(
-        db.get_hypotheses_for_segment("import-0").unwrap().is_empty(),
-        "segment_hypotheses must cascade-delete with the rolled-back segment (no orphans)"
-    );
+    assert_eq!(db.get_segment_by_id("unrelated").unwrap().unwrap().raw_transcript, "durable prior draft");
+    assert_eq!(db.get_hypotheses_for_segment("unrelated").unwrap().len(), 1);
 }
 
 #[test]
 fn parses_wsl_segment_result_from_stdout_marker() {
-    let stdout = "loading model\n__RESULT__={\"raw_transcript\":\"دەقی دروست\",\"confidence\":0.94}\ndone\n";
-    let (text, confidence) = super::parse_wsl_segment_result(stdout).unwrap();
-    assert_eq!(text, "دەقی دروست");
-    assert_eq!(confidence, Some(0.94));
+    let stdout = "loading model\n__RESULT__={\"raw_transcript\":\"دەقی دروست\",\"confidence\":0.94,\"model_version_id\":\"challenger-1\",\"deployment_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}\ndone\n";
+    let result = super::parse_wsl_segment_result(stdout).unwrap();
+    assert_eq!(result.raw_transcript, "دەقی دروست");
+    assert_eq!(result.confidence, Some(0.94));
+    assert_eq!(result.model_version_id, "challenger-1");
 }
 
 #[test]
@@ -773,10 +1277,9 @@ fn refinement_guard_keeps_small_edits_and_rejects_hallucinations() {
 }
 
 #[test]
-fn wsl7b_without_script_is_unresolved_not_silently_downgraded() {
-    // F2: WSL 7B selected + empty script + fine-tuned engine off => the ONLY thing left is stock
-    // local CTC, which the owner never chose. The primary path must report "unresolved" so it
-    // fails loudly instead of silently transcribing with 300M.
+fn clean_default_resolves_the_bundled_wsl_client_without_manual_configuration() {
+    // The selected factory-default champion and its client must be a self-contained configuration.
+    // An explicit path remains an override, not a prerequisite for the app's own selected engine.
     let settings = AppSettings {
         asr_model_size: AsrModelSize::WSL7B,
         external_asr_script_path: String::new(),
@@ -784,18 +1287,8 @@ fn wsl7b_without_script_is_unresolved_not_silently_downgraded() {
         ..AppSettings::default()
     };
     let (pipeline, _dir) = test_pipeline_with_settings(settings);
-    assert!(pipeline.wsl7b_primary_unresolved(), "WSL7B + no script + no finetuned must be unresolved");
-    assert!(!pipeline.should_use_wsl_primary_asr(), "no script => not the WSL primary path");
-    let msg = super::ProcessingPipeline::primary_engine_unavailable_error().to_string();
-    assert!(
-        msg.contains(super::ASR_7B_UNAVAILABLE_TAG),
-        "error must carry the UI sentinel so the app offers retry-or-offline, not a dead-end: {msg}"
-    );
-    assert!(
-        msg.contains("offline model"),
-        "error must name the offline-model choice the owner can deliberately pick: {msg}"
-    );
-    assert!(msg.contains("silently downgrade"), "error must state the no-downgrade contract: {msg}");
+    assert!(!pipeline.wsl7b_primary_unresolved(), "the bundled client must resolve on a clean checkout/install");
+    assert!(pipeline.should_use_wsl_primary_asr(), "the clean default must enter the exact WSL champion path");
 }
 
 #[test]
@@ -812,15 +1305,82 @@ fn public_preflight_fails_immediately_when_default_champion_is_unconfigured() {
     assert!(error.to_string().contains(super::ASR_7B_UNAVAILABLE_TAG));
 }
 
+/// SKIP-ENV or FAIL, never a silent pass (2026-08-20 external review): the 7B leg's missing
+/// prerequisites early-returned as SUCCESS, so the "production gate" could go green on a machine
+/// where nothing about the champion was tested. Under CORTEX_REQUIRE_7B=1 (set by the verify sweep
+/// on the production machine) every skip is a hard failure.
+fn skip_7b_leg(reason: &str) {
+    if std::env::var("CORTEX_REQUIRE_7B").as_deref() == Ok("1") {
+        panic!("CORTEX_REQUIRE_7B=1 but the 7B leg cannot run: {reason}");
+    }
+    eprintln!("[7b-preflight] SKIP-ENV: {reason}");
+}
+
 #[test]
 #[ignore] // needs WSL + a running cortex_7b_server.py on 127.0.0.1:8799
 fn wsl_7b_preflight_passes_when_server_up() {
+    // The preflight verifies the champion's EXACT identity, not merely that a port answers: it reads
+    // the registry's champion row and compares it with what the live server reports. The test DB
+    // therefore has to be a real one — migrated, with the champion registered.
+    //
+    // Before this it was neither, and failed with "no such table: model_versions". That read like a
+    // champion problem and was a fixture problem, and for as long as it lasted the leg proved nothing
+    // about identity at all.
     let settings = AppSettings {
         asr_model_size: AsrModelSize::WSL7B,
         external_asr_script_path: "cortex_7b_client.py".to_string(),
         ..AppSettings::default()
     };
     let (pipeline, _dir) = test_pipeline_with_settings(settings);
+
+    let live = match crate::db::Database::open(&pipeline.db_path) {
+        Ok(db) => db,
+        Err(error) => {
+            skip_7b_leg(&format!("cannot open test db: {error}"));
+            return;
+        }
+    };
+    live.initialize().expect("the preflight reads the registry, so the schema must exist");
+
+    // Register the SAME champion the running server is serving; anything else and an exact-identity
+    // preflight SHOULD fail, which is the invariant under test.
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        skip_7b_leg("no APPDATA");
+        return;
+    };
+    let pointer = std::path::Path::new(&appdata).join("cortex-speech").join("champion.json");
+    let Ok(text) = std::fs::read_to_string(&pointer) else {
+        skip_7b_leg(&format!("no live champion.json at {}", pointer.display()));
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        skip_7b_leg("champion.json is not JSON");
+        return;
+    };
+    let Some(entry) = value.get("champions").and_then(|c| c.get("omniasr-7b")) else {
+        skip_7b_leg("no omniasr-7b champion registered live");
+        return;
+    };
+    let (Some(model_id), Some(sha), Some(path)) = (
+        entry.get("modelVersionId").and_then(|v| v.as_str()),
+        entry.get("deploymentSha256").and_then(|v| v.as_str()),
+        entry.get("deploymentManifestPath").and_then(|v| v.as_str()),
+    ) else {
+        skip_7b_leg("champion entry is incomplete");
+        return;
+    };
+    // Raw connection: the registry's writer is not public to tests, and this fixture only needs the
+    // one row the preflight will read back.
+    let raw = rusqlite::Connection::open(&pipeline.db_path).expect("open test db for registration");
+    raw
+        .execute(
+            "INSERT INTO model_versions (id, family, model_card_name, checkpoint_sha256, checkpoint_path,                                          source, license, status)              VALUES (?1, 'omniasr-7b', 'soranivoice_omniASR_LLM_7B_v2_local', ?2, ?3, 'user-finetuned',                      'owner-full-rights', 'champion')",
+            rusqlite::params![model_id, sha, path],
+        )
+        .expect("register the incumbent so the preflight has an identity to compare");
+    drop(raw);
+    drop(live);
+
     pipeline.wsl_7b_server_preflight().expect("preflight must pass when the 7B server is up");
 }
 
@@ -852,7 +1412,7 @@ fn configured_source_reference_failure_is_fatal_before_chunking() {
     let settings = AppSettings {
         jury_cloud_opt_in: true,
         llm_api_key: "test-key".to_string(),
-        source_reference_models: vec!["gemini-2.5-pro".to_string(), "gemini-2.5-flash".to_string()],
+        source_reference_models: vec!["gemini-2.5-pro".to_string()],
         ..AppSettings::default()
     };
     let (pipeline, dir) = test_pipeline_with_settings(settings);
@@ -866,17 +1426,16 @@ fn configured_source_reference_failure_is_fatal_before_chunking() {
         .expect_err("configured source reference failure must be fatal");
 
     let message = err.to_string();
-    assert!(message.contains("All whole-file reference transcript models failed"));
-    assert!(message.contains("gemini-2.5-pro"));
-    assert!(message.contains("gemini-2.5-flash"));
+    assert!(message.contains("Cannot establish audio identity before generating or reusing"));
+    assert!(!message.contains("gemini-2.5-flash"), "the retired Flash route must never be attempted: {message}");
 }
 
 #[test]
-fn partial_source_reference_failure_is_fatal_before_chunking() {
+fn stale_source_reference_failure_is_fatal_before_chunking() {
     let settings = AppSettings {
         jury_cloud_opt_in: true,
         llm_api_key: "test-key".to_string(),
-        source_reference_models: vec!["gemini-2.5-pro".to_string(), "gemini-2.5-flash".to_string()],
+        source_reference_models: vec!["gemini-2.5-pro".to_string()],
         ..AppSettings::default()
     };
     let (pipeline, dir) = test_pipeline_with_settings(settings);
@@ -902,10 +1461,8 @@ fn partial_source_reference_failure_is_fatal_before_chunking() {
         .expect_err("partial source reference failure must be fatal");
 
     let message = err.to_string();
-    assert!(message.contains("All whole-file reference transcript models failed before chunking"));
-    assert!(message.contains("incomplete source-reference evidence"));
-    assert!(message.contains("gemini-2.5-pro"));
-    assert!(message.contains("gemini-2.5-flash"));
+    assert!(message.contains("Cannot establish audio identity before generating or reusing"));
+    assert!(!message.contains("gemini-2.5-flash"), "the retired Flash route must never be attempted: {message}");
 }
 
 #[test]
@@ -1000,8 +1557,7 @@ fn empty_source_reference_file_is_not_reused() {
         .expect_err("empty saved reference file must not be reused");
 
     let message = err.to_string();
-    assert!(message.contains("All whole-file reference transcript models failed before chunking"));
-    assert!(message.contains("Cannot inspect audio file"));
+    assert!(message.contains("Cannot establish audio identity before generating or reusing"));
 }
 
 #[test]
@@ -1118,15 +1674,20 @@ fn empty_7b_result_is_legitimate_not_infra_failure() {
     // A reachable 7B server emitting a __RESULT__ line with an empty transcript (a silent/music
     // clip) must parse Ok(("", ..)) so the caller escalates only THAT segment — never Err, which
     // would roll back the whole import and leave the file permanently unimportable via the 7B.
-    let (text, conf) = super::parse_wsl_segment_result("__RESULT__={\"raw_transcript\": \"\", \"confidence\": null}")
+    let result = super::parse_wsl_segment_result("__RESULT__={\"raw_transcript\":\"\",\"confidence\":null,\"model_version_id\":\"challenger-1\",\"deployment_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}")
         .expect("an empty-but-present result is a legitimate outcome, not an infra failure");
-    assert_eq!(text, "");
-    assert_eq!(conf, None);
+    assert_eq!(result.raw_transcript, "");
+    assert_eq!(result.confidence, None);
 
     // A real transcript still parses.
-    let (text, _) = super::parse_wsl_segment_result("__RESULT__={\"raw_transcript\": \"ئەمە\", \"confidence\": 0.9}")
+    let result = super::parse_wsl_segment_result("__RESULT__={\"raw_transcript\":\"ئەمە\",\"confidence\":0.9,\"model_version_id\":\"challenger-1\",\"deployment_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}")
         .expect("a real transcript parses");
-    assert_eq!(text, "ئەمە");
+    assert_eq!(result.raw_transcript, "ئەمە");
+
+    assert!(
+        super::parse_wsl_segment_result("__RESULT__={\"raw_transcript\":\"ئەمە\",\"confidence\":0.9}").is_err(),
+        "a transcript without exact model/deployment identity is uncommittable"
+    );
 
     // NO __RESULT__ line at all is the real infrastructure failure -> Err.
     assert!(
@@ -1158,7 +1719,7 @@ fn pipeline_with(settings: AppSettings) -> super::ProcessingPipeline {
 }
 
 fn all_cloud_on() -> AppSettings {
-    AppSettings { cloud_llm_opt_in: true, cloud_stt_opt_in: true, jury_cloud_opt_in: true, ..AppSettings::default() }
+    AppSettings { cloud_llm_opt_in: true, jury_cloud_opt_in: true, ..AppSettings::default() }
 }
 
 #[test]
@@ -1171,17 +1732,13 @@ fn revoking_cloud_consent_reaches_an_import_already_in_flight() {
     let mut stored = pipeline_with(all_cloud_on());
     let in_flight = stored.clone(); // the worker's copy, taken BEFORE the user changes anything
 
-    assert!(in_flight.consent.cloud_stt(), "precondition: the clone starts with consent granted");
-
     // The user switches every cloud toggle OFF mid-import.
     let mut off = all_cloud_on();
     off.cloud_llm_opt_in = false;
-    off.cloud_stt_opt_in = false;
     off.jury_cloud_opt_in = false;
     stored.update_settings(off);
 
-    // The WORKER's clone must observe it. Before the fix all three of these still said "allowed".
-    assert!(!in_flight.consent.cloud_stt(), "cloud STT consent must reach the in-flight clone");
+    // The WORKER's clone must observe it.
     assert!(!in_flight.consent.cloud_llm(), "cloud LLM consent must reach the in-flight clone");
     assert!(!in_flight.consent.jury_cloud(), "jury cloud consent must reach the in-flight clone");
 }
@@ -1195,7 +1752,8 @@ fn granting_consent_mid_run_does_not_retroactively_enable_a_run_started_without_
     let in_flight = stored.clone();
     stored.update_settings(all_cloud_on());
 
-    assert!(!in_flight.consent.cloud_stt(), "a run begun without consent must stay offline");
+    assert!(!in_flight.consent.cloud_llm(), "a run begun without consent must stay offline");
+    assert!(!in_flight.consent.jury_cloud(), "a run begun without consent must stay offline");
 }
 
 #[test]
@@ -1230,21 +1788,17 @@ fn revocation_takes_effect_even_when_the_settings_save_fails() {
     // lock without a mutable borrow — update_settings needs &mut, a withdrawal does not.
     let stored = pipeline_with(all_cloud_on());
     let in_flight = stored.clone();
-    assert!(in_flight.consent.cloud_stt(), "precondition: consent granted");
-
     let mut off = all_cloud_on();
     off.cloud_llm_opt_in = false;
-    off.cloud_stt_opt_in = false;
     off.jury_cloud_opt_in = false;
     stored.revoke_consent_now(&off); // ... and then the save fails, so update_settings is NOT called.
 
-    assert!(!in_flight.consent.cloud_stt(), "a withdrawal must not wait for a successful disk write");
-    assert!(!in_flight.consent.cloud_llm());
+    assert!(!in_flight.consent.cloud_llm(), "a withdrawal must not wait for a successful disk write");
     assert!(!in_flight.consent.jury_cloud());
     // The divergence is one-directional: the SNAPSHOT still says opted-in (disk and get_settings
     // report the old value, and the user is shown the save error), while egress is off. Safer than
     // displayed — never the reverse.
-    assert!(stored.settings.cloud_stt_opt_in, "the un-saved snapshot legitimately still reads opted-in");
+    assert!(stored.settings.cloud_llm_opt_in, "the un-saved snapshot legitimately still reads opted-in");
 }
 
 #[test]
@@ -1254,8 +1808,7 @@ fn revoke_consent_now_never_grants() {
     // session and silently vanish on the next launch.
     let stored = pipeline_with(AppSettings::default()); // all cloud OFF
     stored.revoke_consent_now(&all_cloud_on());
-    assert!(!stored.consent.cloud_stt(), "revoke_consent_now must never turn consent ON");
-    assert!(!stored.consent.cloud_llm());
+    assert!(!stored.consent.cloud_llm(), "revoke_consent_now must never turn consent ON");
     assert!(!stored.consent.jury_cloud());
 }
 
@@ -1273,17 +1826,14 @@ fn revoke_consent_now_never_grants() {
 fn the_7b_gate_admits_exactly_its_permit_count_at_once() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // SAFETY: single-threaded at this point; the worker threads below start after it is set.
-    std::env::set_var("CORTEX_7B_CONCURRENCY", "2");
-    assert_eq!(super::wsl_7b_concurrency(), 2, "the env var must reach the gate");
-
+    let gate = super::Wsl7bGate::new();
     let in_flight = AtomicUsize::new(0);
     let peak = AtomicUsize::new(0);
 
     std::thread::scope(|scope| {
         for _ in 0..8 {
             scope.spawn(|| {
-                let _permit = super::WSL_7B_GATE.acquire();
+                let _permit = gate.acquire_with_limit(None, 2).expect("uncancelled acquire always yields a permit");
                 let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
                 // Long enough that every thread overlaps if the gate lets them.
@@ -1297,8 +1847,6 @@ fn the_7b_gate_admits_exactly_its_permit_count_at_once() {
     assert!(observed <= 2, "gate admitted {observed} at once, above its 2 permits — requests would queue and time out");
     assert_eq!(observed, 2, "gate never admitted 2 at once, so a second replica would sit idle");
     assert_eq!(in_flight.load(Ordering::SeqCst), 0, "every permit must be returned on drop");
-
-    std::env::remove_var("CORTEX_7B_CONCURRENCY");
 }
 
 /// An unusable CORTEX_7B_CONCURRENCY must fall back to 1 — the SAFE end. Over-admitting reintroduces
@@ -1313,4 +1861,635 @@ fn seven_b_concurrency_falls_back_to_one_for_every_unusable_value() {
     assert_eq!(super::parse_wsl_7b_concurrency(Some("9")), 1, "above the cap -> 1, never uncapped");
     assert_eq!(super::parse_wsl_7b_concurrency(Some("2")), 2);
     assert_eq!(super::parse_wsl_7b_concurrency(Some(" 4 ")), 4);
+}
+
+/// 2026-08-20 external review, blocker #4: the clip's source window is extracted WITHOUT decoding,
+/// mirroring the WSL client's rule exactly — absent = whole file, present-but-unusable = hard
+/// error (transcribing the whole source as if it were the clip stores a transcript of the wrong
+/// audio, which is worse than failing).
+#[test]
+fn wsl7b_source_range_mirrors_the_client_contract() {
+    use super::wsl7b_source_range;
+    assert_eq!(wsl7b_source_range(None).unwrap(), None, "no alignment: the file IS the clip");
+    assert_eq!(wsl7b_source_range(Some("  ")).unwrap(), None, "blank alignment is absent alignment");
+    assert_eq!(
+        wsl7b_source_range(Some(r#"{"source_start_ms": 1200, "source_end_ms": 4800, "words": []}"#)).unwrap(),
+        Some((1200, 4800))
+    );
+    assert!(wsl7b_source_range(Some(r#"{"words": []}"#)).is_err(), "a clobbered chunk must refuse, not widen");
+    assert!(wsl7b_source_range(Some("{ not json")).is_err());
+    assert!(
+        wsl7b_source_range(Some(r#"{"source_start_ms": 4800, "source_end_ms": 1200}"#)).is_err(),
+        "an inverted window would silently transcribe the whole source"
+    );
+}
+
+/// The direct transport must refuse a reachable but untrustworthy champion — byte-for-byte the WSL
+/// client's identity rules, now enforced in Rust because Rust is the caller.
+#[test]
+fn wsl7b_identity_validation_refuses_impostors() {
+    use super::wsl7b_validate_identity;
+    let sha = "a".repeat(64);
+    let good = serde_json::json!({
+        "protocol": "cortex-omniasr-adapter", "protocolVersion": 1, "family": "omniasr-7b",
+        "modelVersionId": "omniasr-7b-legacy-c348ade8a816", "deploymentSha256": sha,
+        "componentSha256": {"base": sha, "adapter": sha, "adapterConfig": sha, "tokenizer": sha},
+        "language": "ckb_Arab", "manifestSha256": sha,
+        "provenanceKind": "legacy_bootstrap", "worker": "gpu0", "transcript": "دەق"
+    });
+    let (model, dep) = wsl7b_validate_identity(&good).expect("a complete identity passes");
+    assert_eq!(model, "omniasr-7b-legacy-c348ade8a816");
+    assert_eq!(dep, sha);
+
+    for (field, value) in [
+        ("family", serde_json::json!("whisper-large")),
+        ("language", serde_json::json!("eng_Latn")),
+        ("deploymentSha256", serde_json::json!("not-a-sha")),
+        ("provenanceKind", serde_json::json!("mystery")),
+        ("protocolVersion", serde_json::json!(2)),
+    ] {
+        let mut bad = good.clone();
+        bad[field] = value;
+        assert!(wsl7b_validate_identity(&bad).is_err(), "{field} drift must be refused");
+    }
+    let mut missing_component = good.clone();
+    missing_component["componentSha256"] = serde_json::json!({"base": sha});
+    assert!(wsl7b_validate_identity(&missing_component).is_err(), "a partial component identity is no identity");
+}
+
+// ---- Wave-3 coverage: pipeline.rs root helpers, gating, error taxonomy ----
+
+#[test]
+fn resume_path_key_is_separator_and_case_insensitive() {
+    assert_eq!(super::resume_path_key("D:/Audio/File.WAV"), r"d:\audio\file.wav");
+    assert_eq!(super::resume_path_key(r"d:\audio\file.wav"), r"d:\audio\file.wav");
+    assert_eq!(
+        super::resume_path_key("D:/Audio/File.WAV"),
+        super::resume_path_key(r"D:\AUDIO\FILE.wav"),
+        "the same recording journaled under either separator/case must collide on one resume key"
+    );
+}
+
+#[test]
+fn transcription_config_digests_are_hex_stable_protocol_and_settings_bound() {
+    let (pipeline, _dir) = test_pipeline_with_settings(AppSettings::default());
+    let champion = pipeline.champion_transcription_config_sha256().unwrap();
+    let batch = pipeline.batch_transcription_config_sha256().unwrap();
+    assert_eq!(champion.len(), 64);
+    assert!(champion.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')), "digest must be lowercase hex");
+    assert_eq!(
+        champion,
+        pipeline.champion_transcription_config_sha256().unwrap(),
+        "the config identity must be deterministic for one unchanged pipeline"
+    );
+    assert_ne!(champion, batch, "a one-clip commit and the durable batch contract must never share a digest");
+
+    let (changed, _dir2) = test_pipeline_with_settings(AppSettings { vad_threshold: 0.9, ..AppSettings::default() });
+    assert_ne!(
+        changed.champion_transcription_config_sha256().unwrap(),
+        champion,
+        "a result-affecting setting change must change the stored config identity"
+    );
+}
+
+#[test]
+fn settings_snapshot_and_db_path_expose_the_exact_construction_values() {
+    let settings = AppSettings { vad_threshold: 0.66, ..AppSettings::default() };
+    let (pipeline, dir) = test_pipeline_with_settings(settings);
+    assert_eq!(pipeline.settings_snapshot().vad_threshold, 0.66);
+    assert_eq!(pipeline.db_path(), dir.path().join("db.sqlite").to_string_lossy().as_ref());
+}
+
+#[test]
+fn warmup_asr_skips_the_local_onnx_pool_when_the_champion_is_selected() {
+    // WSL7B selected: warm-up must return Ok without requiring (or loading) any local ONNX model —
+    // the champion runs out of process, and demanding local weights here would fail every clean
+    // champion-only install at startup.
+    let (pipeline, _dir) =
+        test_pipeline_with_settings(AppSettings { asr_model_size: AsrModelSize::WSL7B, ..AppSettings::default() });
+    assert_eq!(pipeline.warmup_asr(), Ok(()), "champion mode must not touch the local ONNX pool");
+}
+
+#[test]
+fn rediarize_refuses_when_disabled_and_noops_when_no_target_rows_exist() {
+    let (off, _off_dir) =
+        test_pipeline_with_settings(AppSettings { enable_diarization: false, ..AppSettings::default() });
+    let err = off.rediarize_segments(&["seg-1".to_string()]).expect_err("disabled setting must refuse");
+    assert!(err.to_string().contains("disabled"), "the refusal must name the setting, got: {err}");
+
+    let (on, _on_dir) = test_pipeline_with_settings(AppSettings { enable_diarization: true, ..AppSettings::default() });
+    on.open_db().unwrap().initialize().unwrap();
+    assert_eq!(
+        on.rediarize_segments(&["missing-a".to_string(), "missing-b".to_string()]).unwrap(),
+        0,
+        "unknown ids must resolve to zero updates without touching audio or ONNX"
+    );
+}
+
+#[test]
+fn batch_champion_draft_refusals_carry_their_exact_machine_codes() {
+    let (pipeline, _dir) = test_pipeline_with_settings(AppSettings::default());
+    let good = super::TranscriptionDraft {
+        raw_text: "دەقی ڕاست".into(),
+        final_text: "دەقی ڕاست".into(),
+        confidence: None,
+        confidence_source: None,
+        model_version_id: Some("champion-v1".into()),
+        deployment_sha256: Some("b".repeat(64)),
+        cloud_call: false,
+    };
+
+    let blank_final = super::TranscriptionDraft { final_text: "  ".into(), ..good.clone() };
+    let err = pipeline.prepare_batch_champion_draft(blank_final).expect_err("a blank final draft must refuse");
+    assert!(err.to_string().contains("E_BATCH_EMPTY_REFINED_DRAFT"), "wrong code: {err}");
+
+    let no_model = super::TranscriptionDraft { model_version_id: None, ..good.clone() };
+    let err = pipeline.prepare_batch_champion_draft(no_model).expect_err("an identity-free draft must refuse");
+    assert!(err.to_string().contains("E_BATCH_MODEL_IDENTITY_MISSING"), "wrong code: {err}");
+
+    let blank_raw = super::TranscriptionDraft { raw_text: String::new(), ..good.clone() };
+    let err = pipeline.prepare_batch_champion_draft(blank_raw).expect_err("an empty champion draft must refuse");
+    assert!(err.to_string().contains("E_BATCH_EMPTY_CHAMPION_DRAFT"), "wrong code: {err}");
+
+    // The one-clip bound commit routes through the SAME chokepoint, so its taxonomy cannot drift.
+    let prepared = pipeline.prepare_bound_champion_draft(good).expect("a complete draft passes");
+    assert_eq!(prepared.model_version_id, "champion-v1");
+}
+
+#[test]
+fn cloud_refinement_is_off_by_default_and_downgrades_without_explicit_opt_in() {
+    // Consent defaults OFF: selecting the cloud (Gemini) mode with UNTOUCHED default consent must
+    // build no refiner even with a provider key on disk. The downgrade — not an error — is the
+    // contract (settings.effective_llm_mode() Gemini -> None), so the default path stays offline.
+    let defaults = AppSettings::default();
+    assert!(!defaults.cloud_llm_opt_in, "cloud LLM consent must default off");
+    assert!(!defaults.jury_cloud_opt_in, "cloud jury consent must default off");
+
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings {
+        llm_mode: crate::settings::LlmMode::Gemini,
+        ..AppSettings::default()
+    });
+    std::fs::write(dir.path().join("secrets.env"), "OPENROUTER_API_KEY=test-or-key\n").unwrap();
+    assert!(
+        pipeline.build_refiner().expect("API-key store should load").is_none(),
+        "default (no opt-in) consent must downgrade the cloud refiner to none, even with a key present"
+    );
+    assert!(
+        !pipeline.llm_refinement_permitted(),
+        "no refinement stage may run under default consent when only a cloud mode is selected"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn wsl_child_kill_and_reap_leaves_no_zombie_and_tolerates_a_dead_child() {
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "ping", "-n", "30", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn long-running child");
+    super::kill_and_reap_wsl_child(&mut child, "test child");
+    assert!(
+        child.try_wait().expect("child status must be readable").is_some(),
+        "kill+reap must leave a fully reaped child, not a zombie"
+    );
+    // A second call on the already-dead child logs and returns — it must never panic, or a
+    // cancel racing a natural exit would take down the import worker.
+    super::kill_and_reap_wsl_child(&mut child, "already-dead test child");
+}
+
+#[test]
+fn wsl_pipe_reader_join_returns_bytes_and_swallows_a_panicked_reader() {
+    let ok = std::thread::spawn(|| vec![b'7', b'b']);
+    assert_eq!(super::join_wsl_pipe_reader(ok, "stdout"), vec![b'7', b'b']);
+
+    let panicked = std::thread::spawn(|| -> Vec<u8> { panic!("reader died") });
+    assert_eq!(
+        super::join_wsl_pipe_reader(panicked, "stderr"),
+        Vec::<u8>::new(),
+        "a panicked pipe reader must degrade to empty output, not poison the whole 7B call"
+    );
+}
+
+#[test]
+fn the_7b_gate_refuses_a_cancelled_caller_queued_behind_a_full_gate() {
+    use std::sync::atomic::AtomicBool;
+    let gate = super::Wsl7bGate::new();
+    let live = AtomicBool::new(false);
+    let cancelled = AtomicBool::new(true);
+
+    let held = gate.acquire_with_limit(Some(&live), 1).expect("the first caller takes the only permit");
+    assert!(
+        gate.acquire_with_limit(Some(&cancelled), 1).is_none(),
+        "a Cancel pressed while QUEUED must return without ever taking a permit"
+    );
+    drop(held);
+    assert!(gate.acquire_with_limit(Some(&live), 1).is_some(), "the queued refusal must not have leaked a permit");
+}
+
+#[test]
+fn gold_eval_refuses_diagnostic_engines_and_an_unregistered_champion() {
+    // Non-champion engine selected: the production gold eval must refuse outright.
+    let (local, _dir) =
+        test_pipeline_with_settings(AppSettings { asr_model_size: AsrModelSize::CTC300M, ..AppSettings::default() });
+    let error = local.run_gold_eval_asr().unwrap_err().to_string();
+    assert!(error.contains("requires the pinned OmniASR-7B champion"), "{error}");
+
+    // Champion selected but no registered content-addressed champion: preflight refuses before
+    // any eval row can be written.
+    let (champion, dir) =
+        test_pipeline_with_settings(AppSettings { asr_model_size: AsrModelSize::WSL7B, ..AppSettings::default() });
+    let db = Database::open(dir.path().join("db.sqlite").to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+    let error = champion.run_gold_eval_asr().unwrap_err().to_string();
+    assert!(error.contains(super::ASR_7B_UNAVAILABLE_TAG), "{error}");
+    assert!(error.contains("champion"), "{error}");
+}
+
+#[test]
+fn batch_champion_preflight_refuses_a_configured_diagnostic_engine() {
+    let (pipeline, _dir) =
+        test_pipeline_with_settings(AppSettings { asr_model_size: AsrModelSize::CTC1B, ..AppSettings::default() });
+    let error = pipeline.preflight_batch_champion().unwrap_err().to_string();
+    assert!(error.contains(super::ASR_7B_UNAVAILABLE_TAG), "{error}");
+    assert!(
+        error.contains("refusing the configured diagnostic engine"),
+        "durable batches must never run on a local diagnostic engine: {error}"
+    );
+}
+
+#[test]
+fn local_asr_model_id_names_the_exact_selected_engine() {
+    for (size, expected) in [
+        (AsrModelSize::CTC300M, "omniasr-ctc-300m"),
+        (AsrModelSize::CTC1B, "omniasr-ctc-1b"),
+        (AsrModelSize::WSL7B, "omniasr-wsl-7b"),
+    ] {
+        let (pipeline, _dir) =
+            test_pipeline_with_settings(AppSettings { asr_model_size: size, ..AppSettings::default() });
+        assert_eq!(pipeline.local_asr_model_id(), expected);
+    }
+}
+
+#[test]
+fn hypothesis_stage_blocks_when_nothing_persisted_or_the_database_cannot_answer() {
+    let (pipeline, dir) =
+        test_pipeline_with_settings(AppSettings { asr_model_size: AsrModelSize::CTC300M, ..AppSettings::default() });
+    let db = Database::open(dir.path().join("db.sqlite").to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    // No persisted segments at all: coverage cannot be verified, so the stage is blocked.
+    let stage = super::multi_model_hypothesis_stage(&db, &pipeline.settings_snapshot(), "empty.wav", &[]);
+    match stage {
+        super::PipelineEvent::AgentStage { stage, status, detail, .. } => {
+            assert_eq!(stage, "multi_model_hypotheses");
+            assert_eq!(status, "blocked");
+            assert!(detail.contains("No speech segments were persisted"), "{detail}");
+        }
+        other => panic!("expected an AgentStage event, got {other:?}"),
+    }
+
+    // A database that cannot answer the coverage question must be blocked too, never guessed.
+    let seg = test_segment("hyp-db-broken");
+    db.insert_segment(&seg).unwrap();
+    db.connection().execute_batch("ALTER TABLE segment_hypotheses RENAME TO segment_hypotheses_hidden;").unwrap();
+    let stage = super::multi_model_hypothesis_stage(&db, &pipeline.settings_snapshot(), "broken.wav", &[seg]);
+    match stage {
+        super::PipelineEvent::AgentStage { status, detail, .. } => {
+            assert_eq!(status, "blocked");
+            assert!(detail.contains("Failed to verify multi-model hypothesis coverage"), "{detail}");
+        }
+        other => panic!("expected an AgentStage event, got {other:?}"),
+    }
+}
+
+#[test]
+fn rediarize_skips_unreadable_sources_without_partial_writes() {
+    let (pipeline, dir) =
+        test_pipeline_with_settings(AppSettings { enable_diarization: true, ..AppSettings::default() });
+    let db = Database::open(dir.path().join("db.sqlite").to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    // One target names a path that no longer exists; the other exists but cannot decode. Both must
+    // be skipped without any speaker write and without failing the whole request.
+    let garbage = dir.path().join("garbage.wav");
+    std::fs::write(&garbage, b"not-real-audio").unwrap();
+    let mut missing_seg = test_segment("rediar-missing");
+    missing_seg.audio_path = dir.path().join("gone.wav").to_string_lossy().to_string();
+    let mut garbage_seg = test_segment("rediar-garbage");
+    garbage_seg.audio_path = garbage.to_string_lossy().to_string();
+    db.insert_segment(&missing_seg).unwrap();
+    db.insert_segment(&garbage_seg).unwrap();
+
+    let updated = pipeline
+        .rediarize_segments(&["rediar-missing".to_string(), "rediar-garbage".to_string()])
+        .expect("unreadable sources are skipped, not fatal");
+    assert_eq!(updated, 0);
+    assert_eq!(db.get_segment_by_id("rediar-missing").unwrap().unwrap().speaker_id, None);
+    assert_eq!(db.get_segment_by_id("rediar-garbage").unwrap().unwrap().speaker_id, None);
+}
+
+#[test]
+fn source_audio_identity_hashes_bytes_and_fails_closed_on_a_missing_file() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let file = dir.path().join("source.bin");
+    std::fs::write(&file, b"stable source bytes").unwrap();
+
+    let identity = super::source_audio_identity(&file).unwrap();
+    assert_eq!(identity.size_bytes, 19);
+    assert_eq!(identity.content_hash.len(), 64);
+    assert!(identity.content_hash.bytes().all(|b| b.is_ascii_hexdigit()));
+    let again = super::source_audio_identity(&file).unwrap();
+    assert_eq!(again.content_hash, identity.content_hash, "the identity must be content-deterministic");
+
+    assert!(super::source_audio_identity(&dir.path().join("absent.bin")).is_err());
+}
+
+#[test]
+fn loop0_firing_passes_through_blank_text_and_memoryless_libraries() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::open(dir.path().join("loop0.sqlite").to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    // Enabled but blank: nothing to correct, exact pass-through without a memory load.
+    assert_eq!(super::apply_loop0_firing(true, &db, "   "), "   ");
+    // Enabled with an empty correction library: the Ok(empty) arm returns the input untouched.
+    let text = "ئەو ساڵە باش بوو";
+    assert_eq!(super::apply_loop0_firing(true, &db, text), text);
+}
+
+#[test]
+fn wsl_result_parser_rejects_ambiguous_or_malformed_identity_payloads() {
+    let sha = "a".repeat(64);
+    let line = format!(
+        "__RESULT__={{\"raw_transcript\":\"دەق\",\"confidence\":0.5,\"model_version_id\":\"champ-1\",\"deployment_sha256\":\"{sha}\"}}"
+    );
+
+    // Two result lines make the model identity ambiguous.
+    let error = super::parse_wsl_segment_result(&format!("{line}\n{line}")).unwrap_err().to_string();
+    assert!(error.contains("multiple __RESULT__ lines"), "{error}");
+
+    // A path-metacharacter model id must be refused at the identifier boundary.
+    let bad_id = line.replace("champ-1", "champ/../1");
+    assert!(super::parse_wsl_segment_result(&bad_id).is_err());
+
+    // A non-canonical deployment digest is not an identity.
+    let bad_sha = line.replace(&sha, &"Z".repeat(64));
+    let error = super::parse_wsl_segment_result(&bad_sha).unwrap_err().to_string();
+    assert!(error.contains("canonical deployment SHA-256"), "{error}");
+
+    // An over-bound transcript must be refused before persistence.
+    let oversized = format!(
+        "__RESULT__={{\"raw_transcript\":\"{}\",\"confidence\":null,\"model_version_id\":\"champ-1\",\"deployment_sha256\":\"{sha}\"}}",
+        "x".repeat(100_001)
+    );
+    let error = super::parse_wsl_segment_result(&oversized).unwrap_err().to_string();
+    assert!(error.contains("100,000-byte"), "{error}");
+}
+
+#[test]
+fn wsl_result_parser_clamps_and_filters_confidence() {
+    let sha = "a".repeat(64);
+    let over = format!(
+        "__RESULT__={{\"raw_transcript\":\"دەق\",\"confidence\":1.5,\"model_version_id\":\"champ-1\",\"deployment_sha256\":\"{sha}\"}}"
+    );
+    assert_eq!(super::parse_wsl_segment_result(&over).unwrap().confidence, Some(1.0), "confidence clamps to [0,1]");
+    let negative = over.replace("1.5", "-0.25");
+    assert_eq!(super::parse_wsl_segment_result(&negative).unwrap().confidence, Some(0.0));
+    let null = over.replace("1.5", "null");
+    assert_eq!(super::parse_wsl_segment_result(&null).unwrap().confidence, None, "absent confidence stays absent");
+}
+
+// ---- Wave-4 coverage: the remaining refusal arms of the direct-transport identity contract ----
+
+fn complete_champion_identity_reply() -> serde_json::Value {
+    let sha = "a".repeat(64);
+    serde_json::json!({
+        "protocol": "cortex-omniasr-adapter", "protocolVersion": 1, "family": "omniasr-7b",
+        "modelVersionId": "omniasr-7b-legacy-c348ade8a816", "deploymentSha256": sha,
+        "componentSha256": {"base": sha, "adapter": sha, "adapterConfig": sha, "tokenizer": sha},
+        "language": "ckb_Arab", "manifestSha256": sha,
+        "provenanceKind": "legacy_bootstrap", "worker": "gpu0", "transcript": "دەق"
+    })
+}
+
+#[test]
+fn wsl7b_identity_validation_refuses_every_remaining_incomplete_field() {
+    use super::wsl7b_validate_identity;
+    let good = complete_champion_identity_reply();
+    assert!(wsl7b_validate_identity(&good).is_ok(), "the fixture must be a complete identity");
+
+    // Existing coverage moved protocolVersion only; the protocol NAME is the other half of the pair.
+    let mut foreign_protocol = good.clone();
+    foreign_protocol["protocol"] = serde_json::json!("cortex-whisper-adapter");
+    let error = wsl7b_validate_identity(&foreign_protocol).unwrap_err().to_string();
+    assert!(error.contains("deployment protocol"), "{error}");
+
+    // A blank or absent model id is no identity — never an empty-string model attribution.
+    for model in [serde_json::json!(""), serde_json::json!("   "), serde_json::Value::Null] {
+        let mut blank_model = good.clone();
+        blank_model["modelVersionId"] = model.clone();
+        let error = wsl7b_validate_identity(&blank_model).unwrap_err().to_string();
+        assert!(error.contains("no modelVersionId"), "{model} accepted: {error}");
+    }
+
+    // componentSha256 absent entirely, and present but not an object at all.
+    for components in [serde_json::Value::Null, serde_json::json!("all-four-digests"), serde_json::json!([])] {
+        let mut broken = good.clone();
+        broken["componentSha256"] = components.clone();
+        let error = wsl7b_validate_identity(&broken).unwrap_err().to_string();
+        assert!(error.contains("componentSha256"), "{components} accepted: {error}");
+    }
+
+    // All four component keys present, one of them not a digest: complete-LOOKING is not complete.
+    let mut non_hex_component = good.clone();
+    non_hex_component["componentSha256"]["tokenizer"] = serde_json::json!("Z".repeat(64));
+    let error = wsl7b_validate_identity(&non_hex_component).unwrap_err().to_string();
+    assert!(error.contains("componentSha256"), "{error}");
+
+    // The manifest digest is checked with the same canonical rule as the deployment digest.
+    let mut short_manifest = good.clone();
+    short_manifest["manifestSha256"] = serde_json::json!("a".repeat(63));
+    let error = wsl7b_validate_identity(&short_manifest).unwrap_err().to_string();
+    assert!(error.contains("manifestSha256"), "{error}");
+
+    // A worker that cannot name itself cannot be attributed.
+    for worker in [serde_json::json!("   "), serde_json::json!(""), serde_json::Value::Null] {
+        let mut anonymous = good.clone();
+        anonymous["worker"] = worker.clone();
+        let error = wsl7b_validate_identity(&anonymous).unwrap_err().to_string();
+        assert!(error.contains("worker identity"), "{worker} accepted: {error}");
+    }
+}
+
+#[test]
+fn wsl7b_source_range_refuses_negative_and_zero_width_windows() {
+    use super::wsl7b_source_range;
+    // `end > start` alone is not the contract: a negative start would ask the server for audio
+    // before the beginning of the file and get the wrong clip back.
+    assert!(
+        wsl7b_source_range(Some(r#"{"source_start_ms": -5, "source_end_ms": 1000}"#)).is_err(),
+        "a negative source offset is a clobbered chunk"
+    );
+    // A zero-width window is not a clip.
+    assert!(wsl7b_source_range(Some(r#"{"source_start_ms": 500, "source_end_ms": 500}"#)).is_err());
+    // Offsets that are not integers are not offsets.
+    assert!(wsl7b_source_range(Some(r#"{"source_start_ms": "0", "source_end_ms": 1000}"#)).is_err());
+    assert!(wsl7b_source_range(Some(r#"{"source_start_ms": 0.5, "source_end_ms": 1000}"#)).is_err());
+    // The exact accepted boundary: a zero start with a one-millisecond window.
+    assert_eq!(wsl7b_source_range(Some(r#"{"source_start_ms": 0, "source_end_ms": 1}"#)).unwrap(), Some((0, 1)));
+}
+
+#[test]
+fn wsl_client_resolution_honours_a_configured_path_and_ignores_a_dead_one() {
+    // A POSIX path is already INSIDE WSL, so the app cannot stat it: it is configuration, taken
+    // verbatim (trimmed), never probed.
+    assert_eq!(
+        super::resolve_wsl_7b_client(Some("  /home/ai/cortex_7b_client.py  ".to_string())).as_deref(),
+        Some("/home/ai/cortex_7b_client.py")
+    );
+
+    // A configured Windows path that really exists is accepted as-is.
+    let dir = tempfile::TempDir::new().unwrap();
+    let configured = dir.path().join("cortex_7b_client.py");
+    std::fs::write(&configured, b"# client").unwrap();
+    let configured_text = configured.to_string_lossy().into_owned();
+    assert_eq!(super::resolve_wsl_7b_client(Some(configured_text.clone())).as_deref(), Some(configured_text.as_str()));
+
+    // A stale configured path that no longer exists must NOT be returned. Falling through to the
+    // bundled/repo client is what keeps one bad setting from making the champion unresolvable.
+    let dead = dir.path().join("gone.py").to_string_lossy().into_owned();
+    let resolved = super::resolve_wsl_7b_client(Some(dead.clone()));
+    assert_ne!(resolved.as_deref(), Some(dead.as_str()), "a dead configured path is not a resolution");
+    assert!(resolved.is_some(), "the bundled/repo client remains the fallback");
+}
+
+#[test]
+fn hypothesis_stage_truncates_a_long_blocked_list_with_an_honest_remainder() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let mut segments = Vec::new();
+    for index in 0..7 {
+        let segment = test_segment(&format!("blocked-{index}"));
+        db.insert_segment(&segment).unwrap();
+        insert_hypothesis(&db, &segment.id, "omniasr-wsl-7b", "single model phrase");
+        segments.push(segment);
+    }
+
+    let settings = AppSettings { asr_model_size: AsrModelSize::CTC300M, ..AppSettings::default() };
+    let event = super::multi_model_hypothesis_stage(&db, &settings, "long.wav", &segments);
+
+    match event {
+        super::PipelineEvent::AgentStage { status, detail, current, total, .. } => {
+            assert_eq!(status, "blocked");
+            assert_eq!((current, total), (0, 7));
+            assert!(detail.contains("blocked-0") && detail.contains("blocked-4"), "the preview names five: {detail}");
+            assert!(!detail.contains("blocked-5"), "ids past the preview must be summarised, not listed: {detail}");
+            assert!(detail.contains("and 2 more"), "the remainder must be counted honestly: {detail}");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[test]
+fn resume_authority_reads_the_verdict_fallback_and_refuses_blank_human_text() {
+    use super::resume_segment_has_authoritative_transcript;
+
+    // No `human_decision` value at all, but a stored `verdict` of reject: still complete authority.
+    // Re-importing a rejected row would resurrect audio a human already discarded.
+    let mut segment = SpeechSegment {
+        raw_transcript: "[Pending WSL 7B ASR]".into(),
+        model_version_id: Some("not-the-champion".into()),
+        verdict: Some("HUMAN_REJECT".into()),
+        ..SpeechSegment::default()
+    };
+    assert!(resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
+
+    // A human decision whose captured text is blank or still a placeholder is NOT authority: the
+    // row has a decision but no transcript to adopt.
+    segment.verdict = Some("accept".into());
+    segment.human_decision = Some("edit".into());
+    for text in ["   ", "[Pending WSL 7B ASR]"] {
+        segment.verdict_transcript = Some(text.into());
+        assert!(
+            !resume_segment_has_authoritative_transcript(&segment, "champion-v1"),
+            "a human decision over {text:?} is not adoptable text"
+        );
+    }
+    segment.verdict_transcript = Some("دەقی مرۆڤی پەسەندکراو".into());
+    assert!(resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
+}
+
+#[test]
+fn primary_hypothesis_requires_a_named_model_and_falls_through_to_inference() {
+    use super::{reuse_primary_or_infer, PrimaryHypothesis};
+    use std::cell::Cell;
+
+    // A draft with no model id has no attributable provenance, so it can never be reused as one.
+    let unattributed =
+        SpeechSegment { raw_transcript: "دەقی بێ ناسنامە".into(), ..SpeechSegment::default() };
+    assert!(PrimaryHypothesis::from_segment(&unattributed).is_none(), "an unattributed draft is not a primary");
+
+    // With no primary at all, the caller's inference runs unconditionally.
+    let inferred = Cell::new(0usize);
+    let fresh = reuse_primary_or_infer(None, "omniasr-ctc-300m", || {
+        inferred.set(inferred.get() + 1);
+        Some(Ok::<_, &'static str>(("freshly inferred".to_string(), Some(0.5))))
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(fresh, ("freshly inferred".to_string(), Some(0.5)));
+    assert_eq!(inferred.get(), 1);
+
+    // An inference that declines to run at all stays declined — no fabricated empty hypothesis.
+    assert!(reuse_primary_or_infer(None, "omniasr-ctc-1b", || None::<Result<(String, Option<f64>), &'static str>>)
+        .is_none());
+}
+
+#[test]
+fn loop0_firing_is_best_effort_when_the_memory_view_cannot_be_read() {
+    // Contract: a memory-load failure logs and returns the transcript UNCHANGED. Failing the
+    // transcription here would discard a draft the champion already produced.
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    db.connection().execute("DROP VIEW effective_correction_memory_v60", []).unwrap();
+    assert!(db.load_correction_memories().is_err(), "the fault injection must actually break the load");
+
+    let text = "ئەو ساڵە باش بوو";
+    assert_eq!(super::apply_loop0_firing(true, &db, text), text, "a broken memory view must not lose the draft");
+    // Disabled short-circuits before any load, so the same broken database is irrelevant.
+    assert_eq!(super::apply_loop0_firing(false, &db, text), text);
+}
+
+#[test]
+fn batch_draft_refuses_placeholders_and_a_half_present_identity() {
+    // The remaining refusal arms of the publication chokepoint: a PLACEHOLDER (not merely blank) on
+    // either transcript side, and an identity that names the model but not the exact deployment
+    // bytes. Publishing either would attribute a non-transcript, or an unpinnable one, to the
+    // champion.
+    let (pipeline, _dir) = test_pipeline_with_settings(AppSettings::default());
+    let good = super::TranscriptionDraft {
+        raw_text: "دەقی ڕاست".into(),
+        final_text: "دەقی ڕاست".into(),
+        confidence: None,
+        confidence_source: None,
+        model_version_id: Some("champion-v1".into()),
+        deployment_sha256: Some("b".repeat(64)),
+        cloud_call: false,
+    };
+
+    let placeholder_raw = super::TranscriptionDraft { raw_text: "[Pending WSL 7B ASR]".into(), ..good.clone() };
+    let err = pipeline.prepare_batch_champion_draft(placeholder_raw).expect_err("a placeholder is not a transcript");
+    assert!(err.to_string().contains("E_BATCH_EMPTY_CHAMPION_DRAFT"), "wrong code: {err}");
+
+    let placeholder_final = super::TranscriptionDraft { final_text: "[Pending WSL 7B ASR]".into(), ..good.clone() };
+    let err = pipeline.prepare_batch_champion_draft(placeholder_final).expect_err("a placeholder final must refuse");
+    assert!(err.to_string().contains("E_BATCH_EMPTY_REFINED_DRAFT"), "wrong code: {err}");
+
+    let no_deployment = super::TranscriptionDraft { deployment_sha256: None, ..good };
+    let err = pipeline
+        .prepare_batch_champion_draft(no_deployment)
+        .expect_err("a model id without its deployment digest is half an identity");
+    assert!(err.to_string().contains("deployment identity is absent"), "wrong code: {err}");
 }

@@ -54,6 +54,8 @@ struct LearningRow {
     speaker_id: Option<String>,
     confidence: Option<f64>,
     agreement_score: Option<f64>,
+    effect_event_id: Option<i64>,
+    retained_human_text: Option<String>,
 }
 
 // ─── Export ──────────────────────────────────────────────────────────────────
@@ -63,6 +65,23 @@ struct LearningRow {
 /// Excludes examples linked to `is_gold = 1` segments so the permanent
 /// holdout is never used for training.
 pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
+    build_dpo_dataset_filtered(db, None)
+}
+
+/// Build preference pairs only for the immutable segment selection owned by a bundle snapshot.
+/// This prevents a revoked/private/unvalidated row elsewhere in the live library from hitchhiking in
+/// a production bundle whose tabular rows and rights gate never selected it.
+pub(crate) fn build_dpo_dataset_for_segment_ids(
+    db: &Database,
+    allowed_segment_ids: &BTreeSet<String>,
+) -> AppResult<DpoExportResult> {
+    build_dpo_dataset_filtered(db, Some(allowed_segment_ids))
+}
+
+fn build_dpo_dataset_filtered(
+    db: &Database,
+    allowed_segment_ids: Option<&BTreeSet<String>>,
+) -> AppResult<DpoExportResult> {
     // Holdout exclusion — never train on the permanent gold holdout (shared helpers). Hash catches
     // the same content at any path (when the file is present); path catches it fail-closed even when
     // the training file is gone.
@@ -82,10 +101,27 @@ pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
                 ss.duration_ms,
                 ss.speaker_id,
                 ss.confidence,
-                ss.agreement_score
+                ss.agreement_score,
+                ae.effect_event_id,
+                COALESCE(NULLIF(TRIM(ss.verdict_transcript), ''),
+                         NULLIF(TRIM(ss.annotated_transcript), '')) AS retained_human_text
          FROM agent_examples ae
          JOIN speech_segments ss ON ae.segment_id = ss.id
          WHERE ss.is_gold = 0 AND ae.verified_by_human = 1
+           AND ss.rights_revoked_at IS NULL
+           AND (
+                (ae.effect_event_id IS NOT NULL AND EXISTS (
+                     SELECT 1
+                       FROM effective_human_decision_effects_v60 effect
+                      WHERE effect.id = ae.effect_event_id
+                        AND effect.segment_id = ae.segment_id
+                        AND effect.action = 'edit'
+                ))
+                OR
+                (ae.effect_event_id IS NULL
+                 AND ss.verified = 1
+                 AND ss.human_decision = 'edit')
+           )
          ORDER BY ae.created_at DESC, ae.id ASC",
     )?;
 
@@ -104,14 +140,27 @@ pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
             speaker_id: row.get(10)?,
             confidence: row.get(11)?,
             agreement_score: row.get(12)?,
+            effect_event_id: row.get(13)?,
+            retained_human_text: row.get(14)?,
         })
     })?;
 
     let mut pairs: Vec<DpoPair> = Vec::new();
     for r in rows {
         let row = r?;
+        if allowed_segment_ids.is_some_and(|allowed| !allowed.contains(&row.segment_id)) {
+            continue;
+        }
+        if crate::quality::technical_unusable_reason_from_rationale(row.rationale.as_deref()).is_some() {
+            tracing::info!(segment_id = %row.segment_id, "Excluding technically unusable segment from DPO export");
+            continue;
+        }
         let wrong = row.wrong_transcript.trim();
         let fix = row.human_fix.trim();
+        if row.effect_event_id.is_none() && !super::legacy_human_fix_is_current(row.retained_human_text.as_deref(), fix)
+        {
+            continue;
+        }
         if wrong.is_empty() || fix.is_empty() || learning_text_key(wrong) == learning_text_key(fix) {
             continue;
         }
@@ -148,7 +197,11 @@ pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
         }
 
         let prompt = build_learning_prompt(db, &row)?;
-        pairs.push(DpoPair { prompt, chosen: fix.to_string(), rejected: wrong.to_string() });
+        // Eligibility/dedup intentionally inspect trimmed keys above, but the serialized training
+        // pair preserves the stored evidence byte-for-byte. In particular, `chosen` is the human's
+        // authoritative correction; silently trimming or canonicalizing it would manufacture a
+        // different label while still calling it human-approved.
+        pairs.push(DpoPair { prompt, chosen: row.human_fix, rejected: row.wrong_transcript });
     }
 
     let jsonl = pairs.iter().map(serde_json::to_string).collect::<Result<Vec<_>, _>>()?.join("\n");
@@ -198,22 +251,17 @@ pub(crate) fn holdout_audio_paths(db: &Database) -> AppResult<std::collections::
     Ok(paths)
 }
 
-/// Export the LOOP-2 language-model training corpus: the human-confirmed-correct Sorani text from
-/// reviewed (`human_decision` = accept|edit), non-gold segments — the curated correct text the
-/// flywheel has accumulated. Each line is canonicalized with the char-only normalizer (Kaf/Yeh/Heh
-/// folding, numbers preserved) so the LM's tokens match the ASR surface forms it will rescore, and
-/// any segment whose audio matches a holdout gold clip is excluded by content hash. Run
+/// Export the LOOP-2 language-model training corpus: the exact stored human-confirmed Sorani text
+/// from reviewed (`human_decision` = accept|edit), non-gold segments — the curated correct text the
+/// flywheel has accumulated. Verbatim Law forbids silently canonicalizing the primary label: any
+/// normalized/canonical form must be exported separately and explicitly identified as machine-
+/// derived evidence. Any segment whose audio matches a holdout gold clip is excluded by content
+/// hash. Run
 /// `kenlm lmplz` on these lines externally (the same prepare-here / train-externally pattern as the
 /// fine-tuned 7B).
 pub fn export_lm_corpus(db: &Database) -> AppResult<Vec<String>> {
     let holdout = holdout_content_hashes(db)?;
     let holdout_paths = holdout_audio_paths(db)?;
-    let normalizer = crate::normalizer::SoraniNormalizer::with_config(crate::normalizer::NormalizationConfig {
-        normalize_numbers: false,
-        verbalize_numbers: false,
-        normalize_hamza: true,
-        remove_diacritics: false,
-    });
 
     // Priority mirrors the codebase's canonical "text the human confirmed": the committed
     // verdict_transcript first, then the human's typed annotation, then the VERBATIM raw draft.
@@ -226,17 +274,23 @@ pub fn export_lm_corpus(db: &Database) -> AppResult<Vec<String>> {
     // (annotated ▸ raw) and quality.rs's training_transcript_with_source.
     let mut stmt = db.connection().prepare(
         "SELECT COALESCE(NULLIF(verdict_transcript, ''), NULLIF(annotated_transcript, ''), raw_transcript),
-                audio_path
+                audio_path, rationale
          FROM speech_segments
-         WHERE is_gold = 0 AND human_decision IN ('accept', 'edit')
+         WHERE is_gold = 0 AND rights_revoked_at IS NULL
+           AND human_decision IN ('accept', 'edit')
          ORDER BY created_at DESC",
     )?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
+    })?;
 
     let mut corpus = Vec::new();
     for row_res in rows {
-        let (text, audio_path) = row_res?;
+        let (text, audio_path, rationale) = row_res?;
         let Some(text) = text.filter(|t| !t.trim().is_empty()) else { continue };
+        if crate::quality::technical_unusable_reason_from_rationale(rationale.as_deref()).is_some() {
+            continue;
+        }
 
         // Never emit an ASR PLACEHOLDER ("[Pending WSL 7B ASR]", "[ASR unavailable: …]", "n/a") as
         // human-confirmed LM training text. The COALESCE can fall through to a raw placeholder on an
@@ -263,10 +317,10 @@ pub fn export_lm_corpus(db: &Database) -> AppResult<Vec<String>> {
             }
         }
 
-        let normalized = normalizer.normalize(&text);
-        if !normalized.trim().is_empty() {
-            corpus.push(normalized);
-        }
+        // Keep the primary LM label exactly as stored by the authoritative decision path. Checks
+        // above may inspect a trimmed view for emptiness/placeholders, but no transformation is
+        // permitted on the emitted value.
+        corpus.push(text);
     }
     Ok(corpus)
 }
@@ -522,24 +576,92 @@ fn json_f64(value: &serde_json::Value, key: &str) -> Option<f64> {
 
 use crate::normalizer::learning_text_key;
 
+/// Validate the DPO destination as a literal loopback HTTP(S) address.
+///
+/// This channel carries human correction pairs, not a generic LLM prompt. Arbitrary HTTPS is not an
+/// allow-list: it would let a compromised renderer choose its own exfiltration host. Hostnames are
+/// rejected too (including `localhost`) so DNS/hosts-file resolution cannot redirect a supposedly
+/// local submission. Userinfo, malformed ports, fragments, and non-loopback literals fail closed.
+fn validate_local_dpo_endpoint(endpoint: &str) -> AppResult<&str> {
+    use crate::error::AppError;
+
+    const MAX_ENDPOINT_LEN: usize = 2048;
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(AppError::Validation("DPO endpoint URL must not be empty".into()));
+    }
+    if endpoint.len() > MAX_ENDPOINT_LEN {
+        return Err(AppError::Validation("DPO endpoint URL is too long".into()));
+    }
+    if endpoint.contains('#') {
+        return Err(AppError::Validation("DPO endpoint must not contain a URL fragment".into()));
+    }
+
+    let lower = endpoint.to_ascii_lowercase();
+    let after_scheme = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .ok_or_else(|| AppError::Validation("DPO endpoint must use http:// or https://".into()))?;
+    let authority = after_scheme.split(['/', '?']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return Err(AppError::Validation(
+            "DPO endpoint must use a literal loopback address without credentials".into(),
+        ));
+    }
+
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let close = bracketed.find(']').ok_or_else(|| AppError::Validation("Malformed DPO IPv6 endpoint".into()))?;
+        let host = &bracketed[..close];
+        let suffix = &bracketed[close + 1..];
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(suffix.strip_prefix(':').ok_or_else(|| AppError::Validation("Malformed DPO IPv6 endpoint".into()))?)
+        };
+        (host, port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    if let Some(port) = port {
+        if port.parse::<u16>().ok().filter(|value| *value > 0).is_none() {
+            return Err(AppError::Validation("DPO endpoint has an invalid port".into()));
+        }
+    }
+    let address = host
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| AppError::Validation("DPO endpoint host must be a literal loopback IP address".into()))?;
+    if !address.is_loopback() {
+        return Err(AppError::Validation("DPO endpoint must target a literal loopback IP address".into()));
+    }
+    Ok(endpoint)
+}
+
 /// POST the DPO preference dataset to a local fine-tuning endpoint.
 pub fn run_dpo_update(db: &Database, endpoint: &str) -> AppResult<String> {
-    // Same outbound allow-list the settings LLM endpoint enforces — this is a parallel channel that
-    // POSTs private preference pairs, so it must not be repointable at an arbitrary/non-https host.
-    crate::settings::validate_outbound_endpoint(endpoint)?;
+    // Validate before building/serializing any private data. The dedicated agent follows zero
+    // redirects, and a non-2xx response is failure rather than an implied successful submission.
+    let endpoint = validate_local_dpo_endpoint(endpoint)?;
     let export = build_dpo_dataset(db)?;
 
     if export.pair_count == 0 {
         return Ok("No preference pairs to export.".into());
     }
 
-    let resp = crate::http::API_AGENT
+    let resp = crate::http::LOCAL_DPO_AGENT
         .post(endpoint)
         .set("Content-Type", "application/x-ndjson")
         .send_string(&export.jsonl)
         .map_err(|e| crate::error::AppError::Other(format!("DPO update POST failed: {e}")))?;
 
     let status = resp.status();
+    if !(200..300).contains(&status) {
+        return Err(crate::error::AppError::Other(format!(
+            "DPO update refused non-success HTTP status {status}; redirects are never followed"
+        )));
+    }
     Ok(format!("DPO update submitted: {} pairs → {} (HTTP {})", export.pair_count, endpoint, status))
 }
 
@@ -551,6 +673,18 @@ mod tests {
     use crate::db::{SegmentHypothesis, SourceTranscriptRecord, SpeechSegment};
     use rusqlite::params;
 
+    fn assert_rollback_to(db: &Database, target_version: i64) {
+        let head = crate::migrations::max_supported_version();
+        let expected = ((target_version + 1)..=head).rev().collect::<Vec<_>>();
+        assert_eq!(crate::migrations::rollback(db, expected.len()).unwrap(), expected);
+        assert_eq!(crate::migrations::get_current_version(db).unwrap(), target_version);
+    }
+
+    fn assert_upgrade_to_current(db: &Database, source_version: i64) {
+        let expected = ((source_version + 1)..=crate::migrations::max_supported_version()).collect::<Vec<_>>();
+        assert_eq!(crate::migrations::run_migrations(db).unwrap(), expected);
+    }
+
     fn open_mem_db() -> Database {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
@@ -559,18 +693,103 @@ mod tests {
 
     #[test]
     fn run_dpo_update_rejects_unsafe_endpoints_before_posting() {
-        // Hardening-audit MEDIUM (exfil channel): the DPO export must enforce the same outbound
-        // allow-list as the settings LLM endpoint, so it can't be repointed at an arbitrary host.
+        // DPO pairs contain private human corrections. Only a literal loopback destination is
+        // eligible; arbitrary HTTPS, DNS names, userinfo tricks, and remote HTTP fail before data is
+        // built or any network request is attempted.
         let db = open_mem_db();
-        assert!(
-            run_dpo_update(&db, "http://attacker.example.com/collect").is_err(),
-            "plain-http remote endpoint must be rejected up front"
-        );
-        assert!(run_dpo_update(&db, "").is_err(), "empty endpoint must be rejected");
+        for endpoint in [
+            "http://attacker.example.com/collect",
+            "https://attacker.example.com/collect",
+            "https://localhost:65535/ingest",
+            "http://localhost:65535/ingest",
+            "http://localhost@127.0.0.1:65535/ingest",
+            "http://192.0.2.10:65535/ingest",
+            "",
+        ] {
+            assert!(run_dpo_update(&db, endpoint).is_err(), "unsafe DPO endpoint passed: {endpoint:?}");
+        }
         // An allowed endpoint passes validation; with no preference pairs it's a clean no-op (no POST
         // is attempted, so no network is touched in the test).
-        let msg = run_dpo_update(&db, "https://localhost:65535/ingest").expect("valid endpoint passes validation");
+        let msg = run_dpo_update(&db, "http://127.0.0.1:65535/ingest").expect("literal loopback passes");
         assert!(msg.contains("No preference pairs"), "expected no-op export, got: {msg}");
+        let ipv6 = run_dpo_update(&db, "http://[::1]:65535/ingest").expect("literal IPv6 loopback passes");
+        assert!(ipv6.contains("No preference pairs"));
+    }
+
+    #[test]
+    fn run_dpo_update_refuses_a_loopback_redirect_without_following_it() {
+        use std::io::{Read, Write};
+
+        let db = open_mem_db();
+        db.insert_segment(&SpeechSegment {
+            id: "redirect-pair".into(),
+            audio_path: "/redirect-pair.wav".into(),
+            raw_transcript: "wrong".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "redirect-pair-example",
+            "redirect-pair",
+            "wrong",
+            "correct",
+            None,
+        );
+        assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 1, "fixture must exercise the POST");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept DPO request");
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            // Drain the complete request before replying. Closing a Windows socket with unread POST
+            // bytes sends an RST, which made this security proof intermittently observe a transport
+            // error instead of the deliberate 307. The test must prove redirect refusal, not merely
+            // that some network failure happened.
+            let mut request = Vec::new();
+            let (header_end, content_length) = loop {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).expect("read DPO request");
+                assert!(read > 0, "the fixture server received the complete POST headers");
+                request.extend_from_slice(&chunk[..read]);
+                assert!(request.len() <= 1024 * 1024, "fixture POST stays bounded");
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).expect("ASCII request headers");
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("numeric content length"))
+                    })
+                    .expect("send_string sets content-length");
+                break (header_end + 4, content_length);
+            };
+            while request.len() < header_end + content_length {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).expect("read DPO request body");
+                assert!(read > 0, "the fixture server received the complete POST body");
+                request.extend_from_slice(&chunk[..read]);
+                assert!(request.len() <= 1024 * 1024, "fixture POST stays bounded");
+            }
+            assert!(request.starts_with(b"POST /train HTTP/1.1\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://attacker.invalid/collect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("write redirect");
+        });
+
+        let error = run_dpo_update(&db, &format!("http://{address}/train")).expect_err("redirect must fail closed");
+        let message = error.to_string();
+        assert!(
+            message.contains("redirects are never followed"),
+            "failure must identify the redirect policy: {message}"
+        );
+        server.join().expect("fixture server exits");
     }
 
     #[test]
@@ -580,7 +799,17 @@ mod tests {
         let db = open_mem_db();
         let temp = tempfile::tempdir().unwrap();
         let audio = temp.path().join("gold.wav");
-        std::fs::write(&audio, b"gold audio bytes").unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: crate::audio::TARGET_SAMPLE_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&audio, spec).unwrap();
+        for sample in [0_i16, 1000, -1000, 500, -500] {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
 
         crate::eval::import_gold_segments(
             &db,
@@ -641,13 +870,14 @@ mod tests {
         })
         .unwrap();
         // A HUMAN correction — verified_by_human defaults to 1 (trainable).
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-                 VALUES ('h1', 'seg-1', 'wrong asr text', 'human verified fix')",
-                [],
-            )
-            .unwrap();
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "h1",
+            "seg-1",
+            "wrong asr text",
+            "human verified fix",
+            None,
+        );
         // A MODEL correction — captured as pseudo (verified_by_human=0, NOT trainable).
         db.record_model_correction("seg-1", "wrong asr text", "model proposed fix", "jury").unwrap();
 
@@ -657,6 +887,115 @@ mod tests {
         assert!(
             !result.jsonl.contains("model proposed fix"),
             "a model pseudo-label must never enter the DPO training set"
+        );
+    }
+
+    #[test]
+    fn dpo_legacy_example_requires_current_matching_verified_edit() {
+        let db = open_mem_db();
+        assert_rollback_to(&db, 59);
+        db.insert_segment(&SpeechSegment {
+            id: "legacy-dpo".into(),
+            audio_path: "/legacy-dpo.wav".into(),
+            raw_transcript: "wrong draft".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET verified = 1, human_decision = 'edit', annotated_transcript = 'Human   Fix'
+                  WHERE id = 'legacy-dpo'",
+                [],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
+                 VALUES ('legacy-dpo-row', 'legacy-dpo', 'wrong draft', 'human fix')",
+                [],
+            )
+            .unwrap();
+        assert_upgrade_to_current(&db, 59);
+
+        assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 1);
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET annotated_transcript = 'different correction'
+                  WHERE id = 'legacy-dpo'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 0);
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET annotated_transcript = ' HUMAN fix ', verified = 0
+                  WHERE id = 'legacy-dpo'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 0, "unverified legacy evidence must remain inactive");
+    }
+
+    #[test]
+    fn accept_memory_evidence_uses_the_authoritative_accepted_hypothesis() {
+        // Accepting an alternative stored ASR hypothesis is still an `accept`, but the accepted text can
+        // differ from annotated/raw. Memory evidence must be judged against what the human actually
+        // accepted; comparing the prior draft to itself would invert this Confirm into an Override.
+        let db = open_mem_db();
+        assert_rollback_to(&db, 59);
+        let original = "ئەو ساڵە باش بوو";
+        let accepted = "ئەو ساڵە خراپ بوو";
+        let memory = crate::corrections::extract_substitution_memories(original, accepted)
+            .into_iter()
+            .next()
+            .expect("one substitution memory");
+        db.connection()
+            .execute(
+                "INSERT INTO correction_memory
+                    (id, wrong_token, human_token, slot_key, phonetic_key,
+                     confidence, hit_count, confirm_count, override_count)
+                 VALUES ('accepted-hypothesis-memory', ?1, ?2, ?3, ?4, 0.5, 0, 0, 0)",
+                params![memory.wrong_token, memory.human_token, memory.slot_key, memory.phonetic_key],
+            )
+            .unwrap();
+        assert_upgrade_to_current(&db, 59);
+
+        db.insert_segment(&SpeechSegment {
+            id: "accepted-hypothesis-segment".into(),
+            audio_path: "/accepted-hypothesis.wav".into(),
+            raw_transcript: original.into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.insert_hypothesis(&SegmentHypothesis {
+            segment_id: "accepted-hypothesis-segment".into(),
+            model_id: "alternative-asr-hypothesis".into(),
+            transcript: accepted.into(),
+            confidence: Some(0.9),
+        })
+        .unwrap();
+
+        db.record_human_decision("accepted-hypothesis-segment", "accept", Some(accepted), None)
+            .expect("accept alternative stored hypothesis");
+        let (effective_action, confirm, override_delta): (String, i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT effect.action, contribution.confirm_delta, contribution.override_delta
+                   FROM human_decision_effect_events effect
+                   JOIN correction_memory_contributions contribution
+                     ON contribution.effect_event_id = effect.id
+                  WHERE effect.segment_id = 'accepted-hypothesis-segment'
+                    AND contribution.memory_id = 'accepted-hypothesis-memory'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(effective_action, "accept", "a stored ASR hypothesis must retain machine provenance");
+        assert_eq!(
+            (confirm, override_delta),
+            (1, 0),
+            "the memory moves the prior draft exactly toward the authoritative accepted text"
         );
     }
 
@@ -707,6 +1046,32 @@ mod tests {
     }
 
     #[test]
+    fn export_lm_corpus_preserves_the_exact_stored_human_label() {
+        // Arabic Kaf/Yeh, ASCII punctuation, repeated/edge whitespace: the old LM exporter silently
+        // folded and trimmed all of these while still presenting the result as the human label.
+        // Selection may inspect whitespace, but the emitted primary label must equal storage bytes.
+        let db = open_mem_db();
+        let exact_human_label = "  كوردى?   دەق  ";
+        db.insert_segment(&SpeechSegment {
+            id: "lm-verbatim-bytes".into(),
+            audio_path: "/missing-lm-verbatim.wav".into(),
+            raw_transcript: "champion raw".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET human_decision = 'edit', verdict_transcript = ?1
+                  WHERE id = 'lm-verbatim-bytes'",
+                [exact_human_label],
+            )
+            .unwrap();
+
+        assert_eq!(export_lm_corpus(&db).unwrap(), vec![exact_human_label.to_string()]);
+    }
+
+    #[test]
     fn build_dpo_dataset_includes_multi_agent_context() {
         let db = open_mem_db();
         let temp = tempfile::tempdir().expect("temp dir");
@@ -729,8 +1094,8 @@ mod tests {
             agreement_score: Some(0.77),
             ..SpeechSegment::default()
         };
-        db.insert_segment(&segment).expect("insert segment");
-        db.write_segment_verdict(
+        db.insert_legacy_segment_fixture(&segment).expect("insert segment");
+        db.write_legacy_machine_verdict_for_test(
             "seg-learning",
             "jury_accept",
             Some("agent wrong text"),
@@ -748,13 +1113,14 @@ mod tests {
         })
         .expect("insert hypothesis");
         insert_current_source_reference(&db, &audio_path_str, "gemini-2.5-pro", "source reference text");
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params!["ex-learning", "seg-learning", "agent wrong text", "human corrected text"],
-            )
-            .expect("insert learning example");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "ex-learning",
+            "seg-learning",
+            "agent wrong text",
+            "human corrected text",
+            None,
+        );
 
         let result = build_dpo_dataset(&db).expect("build dpo");
         assert_eq!(result.pair_count, 1);
@@ -781,18 +1147,14 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&segment).expect("insert segment");
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    "ex-private-path-learning",
-                    "seg-private-path-learning",
-                    "agent wrong text",
-                    "human corrected text"
-                ],
-            )
-            .expect("insert learning example");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "ex-private-path-learning",
+            "seg-private-path-learning",
+            "agent wrong text",
+            "human corrected text",
+            None,
+        );
 
         let result = build_dpo_dataset(&db).expect("build dpo");
         assert_eq!(result.pair_count, 1);
@@ -838,7 +1200,7 @@ mod tests {
             evidence_json: Some(evidence),
             ..SpeechSegment::default()
         };
-        db.insert_segment(&segment).expect("insert segment");
+        db.insert_legacy_segment_fixture(&segment).expect("insert segment");
         db.insert_hypothesis(&SegmentHypothesis {
             segment_id: "seg-stale-reference-learning".to_string(),
             model_id: "omniasr-wsl-7b".to_string(),
@@ -856,18 +1218,14 @@ mod tests {
             created_at: None,
         })
         .expect("insert stale source reference");
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    "ex-stale-reference-learning",
-                    "seg-stale-reference-learning",
-                    "agent wrong text",
-                    "human corrected text"
-                ],
-            )
-            .expect("insert learning example");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "ex-stale-reference-learning",
+            "seg-stale-reference-learning",
+            "agent wrong text",
+            "human corrected text",
+            None,
+        );
 
         let result = build_dpo_dataset(&db).expect("build dpo");
         assert_eq!(result.pair_count, 1);
@@ -926,8 +1284,8 @@ mod tests {
             agreement_score: Some(0.88),
             ..SpeechSegment::default()
         };
-        db.insert_segment(&segment).expect("insert segment");
-        db.write_segment_verdict(
+        db.insert_legacy_segment_fixture(&segment).expect("insert segment");
+        db.write_legacy_machine_verdict_for_test(
             "seg-reference-learning",
             "jury_accept",
             Some("agent wrong text"),
@@ -939,13 +1297,14 @@ mod tests {
         .expect("write verdict");
         insert_current_source_reference(&db, &audio_path_str, "gemini-2.5-pro", "source reference pro text");
         insert_current_source_reference(&db, &audio_path_str, "gemini-2.5-flash", "source reference flash text");
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params!["ex-reference-learning", "seg-reference-learning", "agent wrong text", "human corrected text"],
-            )
-            .expect("insert learning example");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "ex-reference-learning",
+            "seg-reference-learning",
+            "agent wrong text",
+            "human corrected text",
+            None,
+        );
 
         let result = build_dpo_dataset(&db).expect("build dpo");
         let pair: DpoPair = serde_json::from_str(result.jsonl.lines().next().expect("jsonl row")).expect("dpo pair");
@@ -970,17 +1329,46 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&segment).expect("insert segment");
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params!["ex-duplicate", "seg-duplicate", "same   text", "same text"],
-            )
-            .expect("insert learning example");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "ex-duplicate",
+            "seg-duplicate",
+            "same   text",
+            "same text",
+            None,
+        );
 
         let result = build_dpo_dataset(&db).expect("build dpo");
         assert_eq!(result.pair_count, 0);
         assert!(result.jsonl.is_empty());
+    }
+
+    #[test]
+    fn dpo_pair_preserves_exact_stored_human_and_machine_evidence() {
+        let db = open_mem_db();
+        db.insert_segment(&SpeechSegment {
+            id: "seg-verbatim-pair".into(),
+            audio_path: "/missing-verbatim-pair.wav".into(),
+            raw_transcript: "champion raw".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let exact_wrong = "  machine proposal  ";
+        let exact_human = "  كوردى?  ";
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "ex-verbatim-pair",
+            "seg-verbatim-pair",
+            exact_wrong,
+            exact_human,
+            None,
+        );
+
+        let result = build_dpo_dataset(&db).unwrap();
+        assert_eq!(result.pair_count, 1);
+        let pair: DpoPair = serde_json::from_str(&result.jsonl).unwrap();
+        assert_eq!(pair.chosen, exact_human, "the primary human label must remain byte-exact");
+        assert_eq!(pair.rejected, exact_wrong, "the paired machine evidence must remain byte-exact");
     }
 
     #[test]
@@ -1000,13 +1388,14 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&segment).expect("insert segment");
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params!["ex-holdout", "seg-holdout", "wrong text", "corrected text"],
-            )
-            .expect("insert example");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "ex-holdout",
+            "seg-holdout",
+            "wrong text",
+            "corrected text",
+            None,
+        );
 
         // 2. Insert into gold_segments with is_holdout = 1
         db.connection()
@@ -1050,13 +1439,14 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&segment).expect("insert segment");
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params!["ex-holdout", "seg-holdout", "wrong text", "corrected text"],
-            )
-            .expect("insert example");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "ex-holdout",
+            "seg-holdout",
+            "wrong text",
+            "corrected text",
+            None,
+        );
         db.connection()
             .execute(
                 "INSERT INTO gold_segments (id, audio_path, reference, is_holdout)
@@ -1094,12 +1484,7 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&seg).expect("insert segment");
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix) VALUES (?1, ?2, ?3, ?4)",
-                params!["ex-x", "seg-x", "wrong text", "corrected text"],
-            )
-            .expect("insert example");
+        super::super::insert_active_human_example_fixture(&db, "ex-x", "seg-x", "wrong text", "corrected text", None);
         assert_eq!(build_dpo_dataset(&db).expect("build").pair_count, 1, "readable clip is a valid pair");
 
         // Repoint the segment at a present-but-unhashable path (a directory): exists() is true but
@@ -1167,7 +1552,7 @@ mod tests {
             annotated_transcript: Some("کوردی ڕاست".to_string()), // the human's typed fix
             ..SpeechSegment::default()
         };
-        db.insert_segment(&seg).expect("insert");
+        db.insert_legacy_segment_fixture(&seg).expect("insert");
         db.connection()
             .execute("UPDATE speech_segments SET human_decision='accept' WHERE id='c-anno'", [])
             .expect("accept");
@@ -1213,11 +1598,84 @@ mod tests {
     }
 
     #[test]
-    fn undo_and_reject_retract_the_dpo_learning_pair() {
-        // Round-24 hunt #9: build_dpo_dataset / few-shot key only on verified_by_human=1, never on the
-        // segment's CURRENT decision, so a human edit later UNDONE or whose clip is later REJECTED used
-        // to keep training the model to prefer a retracted fix. clear_human_decision and the reject
-        // path now delete the agent_examples pair in the same transaction as the decision change.
+    fn technical_unusable_effect_excludes_dpo_and_lm_even_if_human_text_later_exists() {
+        let db = open_mem_db();
+        db.insert_segment(&SpeechSegment {
+            id: "technical-learning-exclusion".into(),
+            audio_path: "/missing-technical-learning.wav".into(),
+            raw_transcript: "دەقی هەڵە".into(),
+            duration_ms: 1_000,
+            ..Default::default()
+        })
+        .unwrap();
+        let revision = db.segment_review_revision("technical-learning-exclusion").unwrap().unwrap();
+        let source = db.technical_unusable_source_snapshot("technical-learning-exclusion").unwrap().unwrap();
+        db.mark_segment_technically_unusable_after_verified_failure(
+            "technical-learning-exclusion",
+            revision,
+            "decodeFailed",
+            &source.source_path_sha256,
+            source.audio_content_hash.as_deref(),
+            "00000000-0000-4000-8000-000000000925",
+        )
+        .unwrap();
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "technical-learning-example",
+            "technical-learning-exclusion",
+            "دەقی هەڵە",
+            "دەقی ڕاست",
+            None,
+        );
+
+        assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 0, "technical audio leaked into DPO export");
+        assert!(export_lm_corpus(&db).unwrap().is_empty(), "technical audio leaked into LM corpus");
+    }
+
+    #[test]
+    fn withdrawn_recording_rights_retract_dpo_and_lm_training_text() {
+        let db = open_mem_db();
+        let audio_path = "/withdrawn-learning.wav";
+        db.insert_segment(&SpeechSegment {
+            id: "withdrawn-learning".into(),
+            audio_path: audio_path.into(),
+            raw_transcript: "دەقی هەڵە".into(),
+            duration_ms: 1_000,
+            ..Default::default()
+        })
+        .unwrap();
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "withdrawn-learning-example",
+            "withdrawn-learning",
+            "دەقی هەڵە",
+            "دەقی ڕاست",
+            None,
+        );
+
+        assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 1, "fixture starts as one DPO pair");
+        assert!(
+            export_lm_corpus(&db).unwrap().iter().any(|line| line.contains("دەقی ڕاست")),
+            "fixture starts as one human-confirmed LM row"
+        );
+
+        assert_eq!(db.revoke_recording(audio_path).unwrap(), 1, "withdraw exactly this recording");
+        assert_eq!(
+            build_dpo_dataset(&db).unwrap().pair_count,
+            0,
+            "withdrawn human corrections must not remain in DPO material"
+        );
+        assert!(
+            export_lm_corpus(&db).unwrap().is_empty(),
+            "withdrawn human corrections must not remain in LM material"
+        );
+    }
+
+    #[test]
+    fn reversed_or_shadowed_edit_effect_retracts_the_dpo_pair_without_deleting_history() {
+        // Schema v60 makes human learning artifacts append-only. Their visibility follows the owning
+        // effect: reversing the edit or shadowing it with a later reject retracts learning without a
+        // broad DELETE from agent_examples.
         let db = open_mem_db();
         let seg = SpeechSegment {
             id: "s-retract".to_string(),
@@ -1227,19 +1685,41 @@ mod tests {
         };
         db.insert_segment(&seg).expect("insert");
 
-        // A human edit creates the learning pair -> one DPO pair.
-        db.record_human_decision("s-retract", "edit", Some("ئەو ڕاستە"), None).expect("edit");
+        let first_effect = super::super::insert_active_human_example_fixture(
+            &db,
+            "s-retract-example-1",
+            "s-retract",
+            "ئەو غەڵەتە",
+            "ئەو ڕاستە",
+            None,
+        );
         assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 1, "an edit produces a DPO pair");
 
-        // Undo retracts it.
-        db.clear_human_decision("s-retract").expect("undo");
+        db.connection()
+            .execute(
+                "INSERT INTO human_decision_effect_reversals(effect_event_id, operation_id)
+                 VALUES (?1, 'dpo-first-edit-undo')",
+                [first_effect],
+            )
+            .unwrap();
         assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 0, "undo must retract the learning pair");
 
-        // Re-edit, then REJECT the clip -> retracted again.
-        db.record_human_decision("s-retract", "edit", Some("ئەو ڕاستە"), None).expect("re-edit");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "s-retract-example-2",
+            "s-retract",
+            "ئەو غەڵەتە",
+            "ئەو ڕاستە",
+            None,
+        );
         assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 1, "re-edit re-creates the pair");
-        db.record_human_decision("s-retract", "reject", None, None).expect("reject");
+        super::super::insert_human_effect_fixture(&db, "s-retract", "reject", None);
         assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 0, "reject must retract the learning pair");
+        let physical_rows: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM agent_examples WHERE segment_id = 's-retract'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(physical_rows, 2, "effect projection must retract learning without deleting evidence history");
     }
 
     #[test]
@@ -1261,7 +1741,14 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&seg).expect("insert");
-        db.record_human_decision("seg-no-leak", "edit", Some(fix), None).expect("edit");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "seg-no-leak-example",
+            "seg-no-leak",
+            "raw asr text",
+            fix,
+            None,
+        );
 
         let result = build_dpo_dataset(&db).expect("build dpo");
         assert_eq!(result.pair_count, 1, "an edit produces one DPO pair");

@@ -1,5 +1,5 @@
-﻿//! A runnable demonstration of "the app learns from your corrections", using the REAL backend code
-//! the app runs (record_human_decision to capture, load_correction_memories + apply_memories to
+//! A runnable demonstration of "the app learns from your corrections", using the REAL backend code
+//! the app runs (finalize_human_review to capture, load_correction_memories + apply_memories to
 //! apply). No mocks. Run it with:
 //!
 //!   cargo test --test loop0_demo -- --nocapture
@@ -16,9 +16,17 @@ fn transcribe_one(db: &Database, id: &str, heard: &str) {
         id: id.to_string(),
         audio_path: format!("/clips/{id}.wav"),
         raw_transcript: heard.to_string(),
+        alignment_json: Some(r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":1}"#.into()),
+        duration_ms: 1_000,
         ..Default::default()
     })
     .expect("save segment");
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET audio_content_hash = ?2 WHERE id = ?1",
+            rusqlite::params![id, "a".repeat(64)],
+        )
+        .expect("bind canonical decoded-PCM BLAKE3 fixture identity");
 }
 
 #[test]
@@ -37,14 +45,14 @@ fn demo_app_learns_from_your_corrections() {
     println!("  App transcribed : {heard}");
     println!("  You corrected to: {correct}");
     transcribe_one(&db, "clip-1", heard);
-    db.record_human_decision("clip-1", "edit", Some(correct), None).expect("apply your correction");
+    db.finalize_human_review("clip-1", "edit", Some(correct), Some(1), None).expect("apply your correction");
     println!("  (the app quietly remembered: \"Ù¾Ø§Ø´\" here should be \"Ø¨Ø§Ø´\")\n");
 
     println!("SECOND CLIP â€” the same mistake happens again");
     println!("  App transcribed : {heard}");
     println!("  You corrected to: {correct}");
     transcribe_one(&db, "clip-2", heard);
-    db.record_human_decision("clip-2", "edit", Some(correct), None).expect("apply your correction");
+    db.finalize_human_review("clip-2", "edit", Some(correct), Some(2), None).expect("apply your correction");
     println!("  (you have now confirmed this fix twice -> the app trusts it enough to act on it)\n");
 
     // This is exactly what the app does on a new transcript when auto-correct is turned ON.

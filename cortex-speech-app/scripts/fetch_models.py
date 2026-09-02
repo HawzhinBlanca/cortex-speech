@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""Fetch + SHA-256-verify the ONNX models Cortex needs into src-tauri/models/.
+"""Fetch + SHA-256-verify Cortex runtime support assets into src-tauri/models/.
 
-Why: tauri.conf.json bundle.resources point at model files under src-tauri/models/, which are
-gitignored — so a fresh clone cannot `npm run tauri build` until they exist. Run this first
-(blocker #1, from-source build). The release INSTALLER already bundles these; this is for building
-from source.
+The standard fetch/build path provisions only the non-ASR assets required by the application
+(Silero VAD and ONNX Runtime). The production ASR is the externally pinned OmniASR-7B champion;
+smaller ASR models are never release prerequisites and are never fetched implicitly.
 
 The SHA-256 of every file is pinned and authoritative — a download that does not match its pin is
 rejected (no unverifiable artifact is ever placed), mirroring the in-app model manager's
 ensure_pinned_sha256 / verify_sha256 policy.
 
 Usage:
-  python scripts/fetch_models.py            # download any missing/mismatched files, verify, place
-  python scripts/fetch_models.py --check    # verify EXISTING local files against the pins (no network)
+  python scripts/fetch_models.py            # provision required runtime support only
+  python scripts/fetch_models.py --check    # verify required + any optional artifacts already present
+  python scripts/fetch_models.py --include-optional-asr 300m
+                                            # explicit diagnostic-only 300M provisioning
 
-Note: --check is fully offline and is the CI/dev integrity gate. The download path requires network
-to the pinned upstreams (sherpa-onnx / silero-vad / onnxruntime releases).
+``--check`` is fully offline. Optional ASR artifacts may be absent, but a partially present or
+hash-mismatched optional model is still an integrity failure. Downloads use pinned upstreams and
+are placed only after SHA-256 verification.
 """
 import argparse
 import hashlib
@@ -32,6 +34,10 @@ MODELS_DIR = APP_DIR / "src-tauri" / "models"
 OMNIASR_300M_ARCHIVE = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
     "sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-int8-2025-11-12.tar.bz2"
+)
+OMNIASR_1B_ARCHIVE = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+    "sherpa-onnx-omnilingual-asr-1600-languages-1B-ctc-int8-2025-11-12.tar.bz2"
 )
 SILERO_URL = "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
 # ort 2.0 (load-dynamic) does NOT bundle the runtime — the matching ONNX Runtime win-x64 build
@@ -60,14 +66,14 @@ ORT_LINUX_TGZ = (
     "https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-linux-x64-1.24.4.tgz"
 )
 
-# dest is relative to src-tauri/models/. sha256 is authoritative (matches the in-repo pins in
-# src-tauri/src/models.rs for the sherpa models). "member" matches an archive entry by suffix.
+# dest is relative to src-tauri/models/. sha256 is authoritative. "member" matches an archive entry
+# by suffix.
 #
 # "platforms" restricts an item to the given sys.platform values; an item WITHOUT the key is fetched
 # everywhere. The two Windows DLLs deliberately have no key: tauri.conf.json's bundle.resources lists
 # them, and tauri-build validates that list on EVERY platform, so gating them off would break the
 # Linux and macOS builds. Only the additive per-OS runtime is gated.
-ITEMS = [
+REQUIRED_ITEMS = [
     {
         "dest": "silero_vad_v4.onnx",
         "sha256": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3",
@@ -78,18 +84,6 @@ ITEMS = [
         # copy is ever missing. sha256 verification applies to BOTH sources identically.
         "vendor": "vendor/silero_vad_v4.onnx",
         "url": SILERO_URL,
-    },
-    {
-        "dest": "omniasr-ctc-300m/model.int8.onnx",
-        "sha256": "e7c4e54ee4c4c47829cc6667d5d00ed8ea7bef1dcfeef0fce766f77752a2726c",
-        "archive": OMNIASR_300M_ARCHIVE,
-        "member": "model.int8.onnx",
-    },
-    {
-        "dest": "omniasr-ctc-300m/tokens.txt",
-        "sha256": "a7a044c52cb29cbe8b0dc1953e92cefd4ca16b0ed968177b6beab21f9a7d0b31",
-        "archive": OMNIASR_300M_ARCHIVE,
-        "member": "tokens.txt",
     },
     {
         "dest": "onnxruntime.dll/onnxruntime.dll",
@@ -125,6 +119,51 @@ ITEMS = [
     # nothing currently exercises. Add it the day a macOS job actually runs inference.
 ]
 
+# Explicit diagnostics only. These pins remain useful for an owner-requested benchmark, but standard
+# fetch/check/build/release paths never require or download them. Keep each engine as one group so a
+# half-installed model is rejected rather than treated as a usable optional artifact.
+OPTIONAL_ASR_ITEMS = {
+    "300m": [
+        {
+            "dest": "omniasr-ctc-300m/model.int8.onnx",
+            "sha256": "e7c4e54ee4c4c47829cc6667d5d00ed8ea7bef1dcfeef0fce766f77752a2726c",
+            "archive": OMNIASR_300M_ARCHIVE,
+            "member": "model.int8.onnx",
+        },
+        {
+            "dest": "omniasr-ctc-300m/tokens.txt",
+            "sha256": "a7a044c52cb29cbe8b0dc1953e92cefd4ca16b0ed968177b6beab21f9a7d0b31",
+            "archive": OMNIASR_300M_ARCHIVE,
+            "member": "tokens.txt",
+        },
+    ],
+    "1b": [
+        {
+            "dest": "omniasr-ctc-1b/model.int8.onnx",
+            "sha256": "f7b74c964039162423b83e3fa950ce24810c9a635d9ff8468b5f4d142b7c1e8c",
+            "archive": OMNIASR_1B_ARCHIVE,
+            "member": "model.int8.onnx",
+        },
+        {
+            "dest": "omniasr-ctc-1b/tokens.txt",
+            "sha256": "a7a044c52cb29cbe8b0dc1953e92cefd4ca16b0ed968177b6beab21f9a7d0b31",
+            "archive": OMNIASR_1B_ARCHIVE,
+            "member": "tokens.txt",
+        },
+    ],
+    "mms": [
+        {
+            "dest": "finetuned-mms-ckb/model.onnx",
+            "sha256": "064d6ec2225500cf7d47d267402f50c7c7da4d29f34d0fb6a9cb77272aef5ae0",
+        },
+        {
+            "dest": "finetuned-mms-ckb/vocab.json",
+            "sha256": "31dcd5c4361451991bd8241eb99bdc822d2ef2d8a4906404884c2196aa8f3a41",
+        },
+    ],
+}
+NON_FETCHABLE_OPTIONAL_ASR = frozenset({"mms"})
+
 
 def applies_here(item: dict) -> bool:
     """Is this item wanted on the current platform? Items without "platforms" apply everywhere."""
@@ -143,16 +182,18 @@ def sha256_of_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def check() -> int:
+def _check_items(items: list[dict], *, missing_is_error: bool) -> int:
     failed = 0
-    for item in ITEMS:
+    for item in items:
         if not applies_here(item):
             print(f"  SKIP     {item['dest']} (not for {sys.platform})")
             continue
         dest = MODELS_DIR / item["dest"]
         if not dest.exists():
-            print(f"  MISSING  {item['dest']}")
-            failed += 1
+            label = "MISSING" if missing_is_error else "OPTIONAL"
+            print(f"  {label:<8} {item['dest']}")
+            if missing_is_error:
+                failed += 1
             continue
         actual = sha256_of(dest)
         if actual == item["sha256"]:
@@ -160,6 +201,21 @@ def check() -> int:
         else:
             print(f"  MISMATCH {item['dest']}\n           expected {item['sha256']}\n           actual   {actual}")
             failed += 1
+    return failed
+
+
+def check(optional_asr: frozenset[str] = frozenset()) -> int:
+    """Verify required assets and every selected or locally-present optional ASR group."""
+    failed = _check_items(REQUIRED_ITEMS, missing_is_error=True)
+    for name, items in OPTIONAL_ASR_ITEMS.items():
+        present = any((MODELS_DIR / item["dest"]).exists() for item in items if applies_here(item))
+        required = name in optional_asr or present
+        if not required:
+            print(f"  OPTIONAL {name} ASR not installed (not required)")
+            continue
+        # Once any member exists, require and hash the complete group. A valid model with missing
+        # tokens is not a healthy optional installation.
+        failed += _check_items(items, missing_is_error=True)
     return failed
 
 
@@ -185,10 +241,17 @@ def _extract_member(archive_bytes: bytes, url: str, member_suffix: str) -> bytes
     raise RuntimeError(f"member ending in {member_suffix!r} not found in {url}")
 
 
-def download() -> int:
+def download(optional_asr: frozenset[str] = frozenset()) -> int:
     archive_cache: dict[str, bytes] = {}
     failed = 0
-    for item in ITEMS:
+    selected_items = list(REQUIRED_ITEMS)
+    for name in sorted(optional_asr):
+        if name in NON_FETCHABLE_OPTIONAL_ASR:
+            print(f"  CHECK    optional {name} ASR is owner-supplied; verifying local pinned files")
+            failed += _check_items(OPTIONAL_ASR_ITEMS[name], missing_is_error=True)
+            continue
+        selected_items.extend(OPTIONAL_ASR_ITEMS[name])
+    for item in selected_items:
         if not applies_here(item):
             print(f"  SKIP     {item['dest']} (not for {sys.platform})")
             continue
@@ -221,19 +284,36 @@ def download() -> int:
         except Exception as e:  # noqa: BLE001
             print(f"  ERROR    {item['dest']}: {e}")
             failed += 1
+    # Standard provisioning does not fetch optional ASR. It still refuses to bless an optional
+    # artifact already on disk if the group is incomplete or any byte fails its pin.
+    for name, items in OPTIONAL_ASR_ITEMS.items():
+        if name in optional_asr:
+            continue
+        present = any((MODELS_DIR / item["dest"]).exists() for item in items if applies_here(item))
+        if present:
+            failed += _check_items(items, missing_is_error=True)
     return failed
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Fetch + verify Cortex ONNX models.")
+    ap = argparse.ArgumentParser(description="Fetch + verify Cortex runtime support assets.")
     ap.add_argument("--check", action="store_true", help="verify existing local files only (no network)")
+    ap.add_argument(
+        "--include-optional-asr",
+        action="append",
+        choices=sorted(OPTIONAL_ASR_ITEMS),
+        default=[],
+        metavar="ENGINE",
+        help="explicitly require/fetch a diagnostic ASR engine (standard release paths never use this)",
+    )
     args = ap.parse_args()
+    optional_asr = frozenset(args.include_optional_asr)
     print(f"models dir: {MODELS_DIR}")
-    failed = check() if args.check else download()
+    failed = check(optional_asr) if args.check else download(optional_asr)
     if failed:
         print(f"\n{failed} file(s) missing or failed verification.")
         return 1
-    print("\nAll model files present and SHA-256 verified.")
+    print("\nAll required assets and selected/present optional artifacts are SHA-256 verified.")
     return 0
 
 

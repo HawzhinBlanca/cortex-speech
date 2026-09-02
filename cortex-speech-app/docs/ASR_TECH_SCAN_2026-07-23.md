@@ -1,15 +1,21 @@
 # Central Kurdish ASR — Tech Scan, 2026-07-23
 
+> [!WARNING]
+> **Historical research snapshot, not a production runbook.** Later owner canon removed Scribe and
+> pinned all production drafting to the OmniASR-7B WSL champion. References below to approved cloud
+> ASR, stock-model fallbacks, or model swaps are superseded; retain them only as dated research
+> provenance. See [`../../docs/OWNER_CANON.md`](../../docs/OWNER_CANON.md).
+
 A brutally-honest, evidence-first scan of the *actual* mid-2026 state of Central Kurdish (Sorani, `ckb`)
 ASR, run to ground the Accuracy & Usefulness Loop ([ACCURACY_USEFULNESS_LOOP.md](ACCURACY_USEFULNESS_LOOP.md)).
 Five parallel researchers did real web searches + source fetches on 2026-07-23. **Every number here is
 someone else's claim with its source; nothing is a Cortex measurement.** Refresh this doc on the loop's
 research cadence and date the new file.
 
-> **One-line headline:** As of 2026-07-23, the app's champion (fine-tuned OmniASR-7B, **7.03% micro-CER
-> on FLEURS-ckb read speech**) appears to be **at or above the verifiable Sorani SOTA** — no 2026 release
-> credibly beats it on FLEURS-ckb. The real levers are not a new model; they are **data, an LM, a
-> literature-standard normalizer, and the review marathon** — almost all owner-gated to *run*.
+> **Superseded 2026-08-26:** this scan's former headline treated a duplication-weighted result
+> (922 rows / 348 distinct clips) as current evidence. It is retained below only as historical
+> research provenance. No current SOTA or release claim is authorized until a clean N=348 scorecard
+> and its model attestation are regenerated and verified on the integrated release line.
 
 ---
 

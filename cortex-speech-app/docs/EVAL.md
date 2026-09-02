@@ -3,9 +3,15 @@
 > **Real, measured numbers.** Produced by running the live OmniASR-CTC engine on human-transcribed
 > Kurdish audio and scoring against the verified references — no estimates, fully reproducible.
 
-## OmniASR-7B Champion (the DEFAULT engine)
+## OmniASR-7B Champion (current runtime; historical metric evidence below)
 
-### ⭐ Same-set three-engine scorecard — FLEURS ckb_IQ test, N=922 (2026-07-10)
+### HISTORICAL — DUPLICATION-WEIGHTED — NON-PRIMARY: FLEURS ckb_IQ, N=922 rows (2026-07-10)
+
+> [!CAUTION]
+> This section is retained for reproducibility only. Its 922 rows contain 348 distinct clips, so its
+> 7.03% CER and confidence interval are **not a current headline, release metric, or model
+> attestation**. The clean N=348 scorecard becomes primary only after it is regenerated and verified
+> on the integrated release line.
 
 The fair comparison this document demanded (boundary-aligned gold set, space-KEPT CER, identical clips
 + normalization for every engine) now exists — pinned record with SHAs + exact commands in
@@ -17,9 +23,10 @@ The fair comparison this document demanded (boundary-aligned gold set, space-KEP
 | Fine-tuned MMS-CTC-1B (HF fp32) | 9.32% | — (harness prints point estimate only) | — | `measure_finetuned_cer.py` |
 | Stock OmniASR-CTC-300M (int8) | 11.34% | [10.83%, 11.93%] | 50.01% | Rust `ckb_scorecard_on_gold` + `scorecard_stats.py` |
 
-The champion is the measured-best local engine on known-disjoint data: **−4.3 CER pts vs stock (38%
-relative), −2.3 pts vs the fine-tuned 1B (25% relative)**. Same-set context: ElevenLabs Scribe v1
-publishes **32.1% WER on FLEURS-ckb** — the champion's 32.93% [31.89, 33.98] is statistically on par.
+Within this historical duplicated-row experiment, the champion measured **−4.3 CER pts vs stock (38%
+relative), −2.3 pts vs the fine-tuned 1B (25% relative)**. Those comparisons are historical and
+non-primary. Same-set context recorded at the time: ElevenLabs Scribe v1 published **32.1% WER on
+FLEURS-ckb**; the duplicated-row champion result was 32.93% [31.89, 33.98].
 Honest caveats: **† the pinned N=922 is duplication-weighted** — the frozen manifest held 348 distinct
 FLEURS clips duplicated to 922 rows via a same-sentence-id filename collision (corrected 2026-07-23;
 committed manifest now deduped to 348, builder disambiguates same-id clips, a clean re-score is
@@ -27,8 +34,8 @@ owner-gated — see MEASUREMENTS.md). The point estimates were really run but th
 duplication. The default normalization counts digit verbalization (٥→پێنج) and Arabic→Latin digit
 form (١٠٠→100) as errors, penalizing the 7B's verbalization style — the true recognition gap vs Scribe
 is likely smaller/reversed but is NOT claimed until measured under an owner-approved fair basis; the
-CV22 5.04% (2026-07-09) stays caveated for unverified train/test disjointness — FLEURS 7.03% is the
-honest headline.
+CV22 5.04% (2026-07-09) stays caveated for unverified train/test disjointness. No current headline
+accuracy metric is authorized until a model attestation validates the clean N=348 regeneration.
 
 ### First real measurement — historical record (2026-07-02)
 
@@ -295,10 +302,12 @@ starting line.
 
 **Honest reading:** Both engines score ~60% on this set because the references are wrong. By inspection, the 7B output is coherent, correct Sorani. The set is **unusable for trustworthy CER measurement**, so NO numeric 7B-vs-stock comparison is drawn from it (the earlier "on-par with or slightly better than stock" numeric read was retracted 2026-07-09 — the two numbers used different CER bases; only the by-eye "coherent, correct Sorani" observation stands).
 
-**Implication (updated 2026-07-10):** This gap is now closed — the default 7B engine was MEASURED on a
-boundary-aligned, known-disjoint gold set: **FLEURS ckb_IQ test, N=922: micro CER 7.03% [6.53%, 7.55%],
-WER 32.93% [31.89%, 33.98%]** (same-set stock CTC-300M 11.34% [10.83%, 11.93%], fine-tuned MMS-1B 9.32%;
-pinned record in docs/MEASUREMENTS.md). The app still fails hard on unresolvable WSL 7B (F2); the
+**Historical implication (updated 2026-07-10; duplication-weighted and non-primary):** the default 7B
+engine was measured on **FLEURS ckb_IQ, N=922 rows / 348 distinct clips: micro CER 7.03%
+[6.53%, 7.55%], WER 32.93% [31.89%, 33.98%]** (same-set stock CTC-300M 11.34%
+[10.83%, 11.93%], fine-tuned MMS-1B 9.32%; pinned record in docs/MEASUREMENTS.md). This does not close
+the current model-evidence gate; it requires a clean N=348 regeneration and attestation. The app still
+fails hard on unresolvable WSL 7B (F2); the
 app-gold N≥300 conversational benchmark from the owner's verified corrections remains open (M3).
 
 This row is kept in the appendix (not deleted) as a warning: high CER numbers may reflect data issues, not model failure. Always audit your gold set for boundary integrity before trusting an accuracy claim.

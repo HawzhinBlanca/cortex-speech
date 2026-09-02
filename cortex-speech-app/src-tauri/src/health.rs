@@ -8,6 +8,21 @@ use std::sync::MutexGuard;
 use std::time::Instant;
 use sysinfo::System;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthSnapshot {
+    pub status: String,
+    pub db_size: i64,
+    pub uptime: u64,
+    pub segment_count: i64,
+    pub memory_mb: u64,
+    pub primary_asr_model: String,
+    pub missing_models: Vec<String>,
+    pub missing_optional_models: Vec<String>,
+    pub snapshot_last_success_epoch_secs: Option<u64>,
+    pub snapshot_consecutive_failures: usize,
+    pub free_disk_bytes: Option<u64>,
+}
+
 pub static INSTANT: LazyLock<Instant> = LazyLock::new(Instant::now);
 static SYS: LazyLock<Mutex<System>> = LazyLock::new(|| Mutex::new(System::new()));
 
@@ -59,30 +74,39 @@ pub fn health_check(
     model_mgr: &ModelManager,
     settings: &AppSettings,
     data_dir: Option<&std::path::Path>,
-) -> AppResult<serde_json::Value> {
+) -> AppResult<HealthSnapshot> {
     let info = db.info()?;
     let segment_count = info["segmentCount"].as_i64().unwrap_or(0);
     let db_size = info["sizeBytes"].as_i64().unwrap_or(0);
     let uptime = INSTANT.elapsed().as_secs();
     let missing_required = model_mgr.missing_required_model_names_for(&settings.asr_model_size);
-    let missing_optional = model_mgr.missing_optional_model_names();
+    let health_status = if missing_required.is_empty() { "ok" } else { "models_needed" }.to_string();
+    let missing_required = missing_required.into_iter().map(str::to_string).collect();
+    // The shipped health response must not advertise diagnostic ASR artifacts. Report only missing
+    // production support models not already covered by the required Silero list.
+    let missing_optional = model_mgr
+        .missing_production_models()
+        .into_iter()
+        .filter(|model| model.filename != "silero_vad_v4.onnx")
+        .map(|model| model.name.to_string())
+        .collect::<Vec<_>>();
     // True-10 audit: the auto-snapshot safety net could silently stop for months (warn-only in a
     // detached thread) and disk exhaustion was checked nowhere. Both are now health signals.
     let snapshot_health = crate::snapshot::snapshot_health();
     let free_disk_bytes = data_dir.and_then(free_disk_bytes_for);
-    Ok(serde_json::json!({
-        "status": if missing_required.is_empty() { "ok" } else { "models_needed" },
-        "db_size": db_size,
-        "uptime": uptime,
-        "segment_count": segment_count,
-        "memory_mb": current_memory_mb(),
-        "primary_asr_model": format!("{:?}", settings.asr_model_size),
-        "missing_models": missing_required,
-        "missing_optional_models": missing_optional,
-        "snapshot_last_success_epoch_secs": snapshot_health.last_success_epoch_secs,
-        "snapshot_consecutive_failures": snapshot_health.consecutive_failures,
-        "free_disk_bytes": free_disk_bytes,
-    }))
+    Ok(HealthSnapshot {
+        status: health_status,
+        db_size,
+        uptime,
+        segment_count,
+        memory_mb: current_memory_mb(),
+        primary_asr_model: format!("{:?}", settings.asr_model_size),
+        missing_models: missing_required,
+        missing_optional_models: missing_optional,
+        snapshot_last_success_epoch_secs: snapshot_health.last_success_epoch_secs,
+        snapshot_consecutive_failures: snapshot_health.consecutive_failures,
+        free_disk_bytes,
+    })
 }
 
 #[cfg(test)]

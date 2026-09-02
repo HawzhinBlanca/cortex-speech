@@ -2,7 +2,8 @@
 """P0.2 — the stale-exe guard (deep-audit F4).
 
 Proves, WITHOUT running the app, that the built release exe (a) is newer than every source file
-that feeds it and (b) was compiled from the current git HEAD. The SHA is recovered from a
+that feeds it, (b) carries the current git HEAD, and (c) has no uncommitted compiled inputs that
+the HEAD marker cannot identify. The SHA is recovered from a
 contiguous `CORTEX_BUILD_SHA:<sha>` marker baked into the binary's rodata by lib.rs
 (`GIT_SHA_MARKER`, forced in with `#[used]`), so no execution is needed.
 
@@ -16,12 +17,14 @@ Exit 0 = fresh and HEAD-matched. Exit 1 = stale, wrong-SHA, or exe missing.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parents[1]  # cortex-speech-app/
+REPO_ROOT = APP_ROOT.parent
 EXE_PATH = APP_ROOT / "src-tauri" / "target" / "release" / "cortex-speech-app.exe"
 
 # Source surfaces whose change must invalidate a stale exe. Frontend (src/**) matters because a
@@ -34,13 +37,41 @@ EXE_PATH = APP_ROOT / "src-tauri" / "target" / "release" / "cortex-speech-app.ex
 # reviewer-facing behaviour, its Sorani strings included — therefore stales the exe exactly as a .rs
 # edit does, and this gate could not see it. Caught live: couch.html sat 15 minutes newer than the
 # binary while the gate printed "newer than all sources".
-SOURCE_DIRS = ["src", "src-tauri/src", "src-tauri/assets", "src-tauri/migrations"]
+SOURCE_DIRS = [
+    "cortex-speech-app/src",
+    "cortex-speech-app/src-tauri/src",
+    "cortex-speech-app/src-tauri/assets",
+    "cortex-speech-app/src-tauri/capabilities",
+    "cortex-speech-app/src-tauri/migrations",
+    # This path dependency is compiled into the executable. It also owns the LAN review server's
+    # request/response deadlines, so omitting it could certify an exe built from older security code.
+    "cortex-speech-app/src-tauri/vendor/tiny_http_fork/src",
+]
 SOURCE_FILES = [
-    "src-tauri/build.rs",
-    "src-tauri/tauri.conf.json",
-    "src-tauri/Cargo.toml",
-    "package.json",
-    "index.html",
+    # Build configuration is source: each of these changes the SHIPPED artifact with no .rs/.svelte
+    # edit (dependency pins, compiler options, bundler config), and the hunt found commits touching
+    # only these being classified "non-source" — so a stale exe read as current at HEAD.
+    "cortex-speech-app/package-lock.json",
+    "cortex-speech-app/svelte.config.js",
+    "cortex-speech-app/vite.config.ts",
+    "cortex-speech-app/tsconfig.json",
+    "cortex-speech-app/src-tauri/build.rs",
+    "cortex-speech-app/src-tauri/tauri.conf.json",
+    "cortex-speech-app/src-tauri/Cargo.toml",
+    "cortex-speech-app/src-tauri/vendor/tiny_http_fork/Cargo.toml",
+    "cortex-speech-app/package.json",
+    "cortex-speech-app/index.html",
+    # review_pilot.rs embeds this exact 8,274-ID contract with include_str!; it is runtime code even
+    # though it lives at the app root rather than beneath src-tauri/src.
+    "cortex-speech-app/controlled_pilot_focus.json",
+    # Tauri's Windows config packages these exact runtime resources. The model binaries are
+    # hash-pinned by fetch_models --check; listing them here additionally prevents an installer made
+    # before a verified resource/client update from being certified as current.
+    "cortex-speech-app/scripts/cortex_7b_server.py",
+    "cortex-speech-app/scripts/cortex_7b_client.py",
+    "cortex-speech-app/src-tauri/models/silero_vad_v4.onnx",
+    "cortex-speech-app/src-tauri/models/onnxruntime.dll/onnxruntime.dll",
+    "cortex-speech-app/src-tauri/models/onnxruntime.dll/onnxruntime_providers_shared.dll",
     # Same class as the assets above: each of these changes the BINARY without any .rs edit.
     # Cargo.lock pins the exact dependency versions compiled in, so `cargo update` alone rebuilds a
     # different exe while Cargo.toml is untouched. capabilities/default.json is the Tauri v2 ACL that
@@ -48,11 +79,15 @@ SOURCE_FILES = [
     # Windows build, so tauri.windows.conf.json is as load-bearing as tauri.conf.json beside it.
     # .cargo/config.toml carries build flags that change codegen, and icon.ico is linked into the
     # binary's resources.
-    "src-tauri/Cargo.lock",
-    "src-tauri/capabilities/default.json",
-    "src-tauri/tauri.windows.conf.json",
-    "src-tauri/.cargo/config.toml",
-    "src-tauri/icons/icon.ico",
+    "cortex-speech-app/src-tauri/Cargo.lock",
+    "cortex-speech-app/src-tauri/tauri.windows.conf.json",
+    "cortex-speech-app/src-tauri/.cargo/config.toml",
+    "cortex-speech-app/src-tauri/icons/icon.png",
+    "cortex-speech-app/src-tauri/icons/icon.ico",
+    # The pinned compiler is part of the shipped binary's reproducibility contract and lives one
+    # level above APP_ROOT. Keeping every inventory entry repo-relative makes both mtime and git-diff
+    # checks cover it instead of silently treating a toolchain-only commit as documentation.
+    "rust-toolchain.toml",
 ]
 
 _SHA_MARKER = re.compile(rb"CORTEX_BUILD_SHA:([0-9a-fA-F]{7,40}|unknown)")
@@ -66,17 +101,17 @@ def extract_baked_sha(exe_bytes: bytes) -> str | None:
     return match.group(1).decode("ascii")
 
 
-def newest_source(app_root: Path, source_dirs: list[str], source_files: list[str]) -> tuple[float, Path | None]:
+def newest_source(source_root: Path, source_dirs: list[str], source_files: list[str]) -> tuple[float, Path | None]:
     """Return (newest mtime, file) across all tracked source surfaces."""
     newest_mtime = 0.0
     newest_file: Path | None = None
     candidates: list[Path] = []
     for rel in source_dirs:
-        base = app_root / rel
+        base = source_root / rel
         if base.exists():
             candidates.extend(p for p in base.rglob("*") if p.is_file())
     for rel in source_files:
-        p = app_root / rel
+        p = source_root / rel
         if p.is_file():
             candidates.append(p)
     for p in candidates:
@@ -96,6 +131,8 @@ def evaluate_freshness(
     newest_src_mtime: float,
     newest_src_file: str | None,
     stale_installers: list[tuple[str, float]] | None = None,
+    dirty_source_paths: list[str] | None = None,
+    source_status_available: bool = True,
 ) -> list[str]:
     """Pure decision core. Returns a list of problems; empty list means fresh + HEAD-matched."""
     problems: list[str] = []
@@ -107,8 +144,24 @@ def evaluate_freshness(
     # owner's to keep or discard.
     for name, mtime in stale_installers or []:
         problems.append(
-            f"STALE INSTALLER: {name} (mtime {mtime:.0f}) predates the built exe (mtime {exe_mtime:.0f}). "
+            f"STALE INSTALLER: {name} (mtime {mtime:.0f}) predates this checkout's newest source "
+            f"(mtime {newest_src_mtime:.0f}) — it would install an app built from older code. "
             f"Rebuild with `npm run tauri build`, or delete it so nothing can install an old version."
+        )
+
+    # A commit marker cannot identify uncommitted inputs. Timestamps can show that the exe is newer
+    # than the files currently on disk, but they cannot prove which dirty bytes the compiler read.
+    # Refuse the production claim until every compiled input belongs to an immutable commit.
+    if not source_status_available:
+        problems.append("could not inspect the current worktree for uncommitted compiled-source inputs")
+    elif dirty_source_paths:
+        shown = ", ".join(dirty_source_paths[:5])
+        remainder = len(dirty_source_paths) - 5
+        if remainder > 0:
+            shown += f", and {remainder} more"
+        problems.append(
+            "UNCOMMITTED COMPILED SOURCE: the exe cannot be certified as reproducibly at HEAD while "
+            f"these build inputs are dirty: {shown}. Commit/version the source, then rebuild."
         )
 
     if not exe_exists:
@@ -140,14 +193,26 @@ def evaluate_freshness(
 
 
 SOURCE_PREFIXES = [
-    "cortex-speech-app/src/",
-    "cortex-speech-app/src-tauri/src",
-    "cortex-speech-app/src-tauri/build.rs",
-    "cortex-speech-app/src-tauri/Cargo.toml",
-    "cortex-speech-app/src-tauri/tauri.conf.json",
-    "cortex-speech-app/package.json",
-    "cortex-speech-app/index.html",
+    *(f"{directory.rstrip('/')}/" for directory in SOURCE_DIRS),
+    *SOURCE_FILES,
 ]
+
+
+def worktree_source_changes(status_lines: list[str], source_prefixes: list[str]) -> list[str]:
+    """Compiled/build inputs named by porcelain status, including untracked files and renames."""
+    changes: set[str] = set()
+    for line in status_lines:
+        if not line.strip():
+            continue
+        payload = line[3:] if len(line) >= 3 else line.strip()
+        for raw_path in payload.split(" -> "):
+            path = raw_path.strip().strip('"').replace("\\", "/")
+            if any(
+                path.startswith(prefix) if prefix.endswith("/") else path == prefix
+                for prefix in source_prefixes
+            ):
+                changes.add(path)
+    return sorted(changes)
 
 
 def worktree_source_warnings(
@@ -165,7 +230,7 @@ def worktree_source_warnings(
     for path, status_lines in worktrees:
         if str(Path(path).resolve()) == current:
             continue  # the checkout being gated
-        dirty = [ln for ln in status_lines if ln.strip() and any(pfx in ln for pfx in source_prefixes)]
+        dirty = worktree_source_changes(status_lines, source_prefixes)
         if dirty:
             warnings.append(
                 f"sibling worktree {path} has {len(dirty)} uncommitted source change(s) not reflected in the built exe"
@@ -190,6 +255,21 @@ def _git_worktrees(app_root: Path) -> list[tuple[str, list[str]]]:
         except (subprocess.CalledProcessError, FileNotFoundError):
             continue
     return result
+
+
+def _git_status(app_root: Path) -> list[str] | None:
+    """Current checkout porcelain, or None when git cannot provide a trustworthy answer."""
+    try:
+        out = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=app_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return out.stdout.splitlines()
 
 
 def _git_head(app_root: Path) -> str | None:
@@ -227,26 +307,43 @@ def _source_changed_since(app_root: Path, baked_sha: str, source_dirs: list[str]
     return [line for line in out.stdout.splitlines() if line.strip()]
 
 
-BUNDLE_DIR = EXE_PATH.parent / "bundle"
 INSTALLER_GLOBS = ("msi/*.msi", "nsis/*-setup.exe")
 
 
-def find_stale_installers(exe_mtime: float) -> list[tuple[str, float]]:
-    """Bundled installers that predate the exe — i.e. would install an older app than this build."""
+def find_stale_installers(newest_src_mtime: float, exe_path: Path = EXE_PATH) -> list[tuple[str, float]]:
+    """Bundled installers that would install an app built from OLDER SOURCES than this checkout.
+
+    Measured against the newest SOURCE, not against the exe. Comparing installer-vs-exe asks the
+    wrong question: one `tauri build` writes the MSI, then patches the exe for NSIS, then writes the
+    setup exe, so a single build's own artifacts straddle its exe mtime (measured 2026-08-20: the MSI
+    of the very build being verified sat 336 s "behind" the exe it embeds). Answering that with a
+    time tolerance meant picking a window, and any window wide enough for a build (~6 min here) is
+    also wide enough to pass an installer from the PREVIOUS build — a gate with a build-sized hole.
+
+    The question that actually matters is the same one asked of the exe: does this artifact predate
+    the sources it claims to ship? That has an exact answer and needs no fudge factor. The incident
+    this gate exists for (2026-08-17, an installer four DAYS behind) is caught either way; a
+    same-build artifact 336 s "behind" its exe is still newer than every source and passes honestly.
+    """
     stale: list[tuple[str, float]] = []
+    bundle_dir = exe_path.parent / "bundle"
     for pattern in INSTALLER_GLOBS:
-        for path in sorted(BUNDLE_DIR.glob(pattern)):
+        for path in sorted(bundle_dir.glob(pattern)):
             mtime = path.stat().st_mtime
-            if mtime < exe_mtime:
+            if mtime < newest_src_mtime:
                 stale.append((path.name, mtime))
     return stale
 
 
 def main() -> int:
-    exe_exists = EXE_PATH.is_file()
-    exe_mtime = EXE_PATH.stat().st_mtime if exe_exists else 0.0
-    baked_sha = extract_baked_sha(EXE_PATH.read_bytes()) if exe_exists else None
-    head_sha = _git_head(APP_ROOT)
+    # The private-production controller deliberately builds outside the mutable repo target and
+    # activates a hash-pinned immutable release. verify_10 exports that validated path. Standalone
+    # developer use retains the historical repo target default.
+    exe_path = Path(os.environ.get("CORTEX_APP_EXE", str(EXE_PATH)))
+    exe_exists = exe_path.is_file()
+    exe_mtime = exe_path.stat().st_mtime if exe_exists else 0.0
+    baked_sha = extract_baked_sha(exe_path.read_bytes()) if exe_exists else None
+    head_sha = _git_head(REPO_ROOT)
 
     # Narrow the SHA-equality check to what matters: if HEAD advanced past the baked commit but no
     # SOURCE file changed (e.g. a docs/ledger commit), the exe still reflects the source — treat the
@@ -259,12 +356,14 @@ def main() -> int:
         and head_sha is not None
         and not (head_sha.startswith(baked_sha) or baked_sha.startswith(head_sha))
     ):
-        changed = _source_changed_since(APP_ROOT, baked_sha, SOURCE_DIRS, SOURCE_FILES)
+        changed = _source_changed_since(REPO_ROOT, baked_sha, SOURCE_DIRS, SOURCE_FILES)
         if changed is not None and len(changed) == 0:
             effective_head = baked_sha
             note = f"HEAD advanced to {head_sha[:12]}… via non-source commits; no source changed since the build."
 
-    newest_src_mtime, newest_src_file = newest_source(APP_ROOT, SOURCE_DIRS, SOURCE_FILES)
+    newest_src_mtime, newest_src_file = newest_source(REPO_ROOT, SOURCE_DIRS, SOURCE_FILES)
+    current_status = _git_status(REPO_ROOT)
+    dirty_sources = worktree_source_changes(current_status or [], SOURCE_PREFIXES)
 
     problems = evaluate_freshness(
         exe_exists=exe_exists,
@@ -272,8 +371,10 @@ def main() -> int:
         baked_sha=baked_sha,
         head_sha=effective_head,
         newest_src_mtime=newest_src_mtime,
-        newest_src_file=str(newest_src_file.relative_to(APP_ROOT)) if newest_src_file else None,
-        stale_installers=find_stale_installers(exe_mtime) if exe_exists else [],
+        newest_src_file=str(newest_src_file.relative_to(REPO_ROOT)) if newest_src_file else None,
+        stale_installers=find_stale_installers(newest_src_mtime, exe_path) if exe_exists else [],
+        dirty_source_paths=dirty_sources,
+        source_status_available=current_status is not None,
     )
     if note and not problems:
         print(f"note: {note}", flush=True)
@@ -286,11 +387,15 @@ def main() -> int:
 
     # Green means "the exe matches THIS checkout's HEAD" — but a sibling worktree may hold unshipped
     # source edits (the stale-exe-vs-worktree trap). Surface them loudly; non-fatal (WIP is legitimate).
-    wt_warnings = worktree_source_warnings(_git_worktrees(APP_ROOT), str(APP_ROOT.parent), SOURCE_PREFIXES)
+    wt_warnings = worktree_source_warnings(_git_worktrees(REPO_ROOT), str(REPO_ROOT), SOURCE_PREFIXES)
     for w in wt_warnings:
         print(f"  ! WARNING: {w}", flush=True)
 
-    print(f"EXE FRESHNESS GATE: OK (exe at HEAD {head_sha[:12]}…, newer than all sources)", flush=True)
+    print(
+        f"EXE FRESHNESS GATE: OK ({exe_path} at source-equivalent HEAD {head_sha[:12]}…, "
+        "newer than all compiled sources)",
+        flush=True,
+    )
     if wt_warnings:
         print(
             f"  (note: {len(wt_warnings)} sibling worktree(s) carry uncommitted source — commit + rebuild before shipping)",

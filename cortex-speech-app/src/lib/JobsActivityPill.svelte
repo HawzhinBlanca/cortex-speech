@@ -38,7 +38,9 @@
     jobs.find((j) => j.state === 'failed' || j.state === 'succeeded' || j.state === 'cancelled'),
   );
   const latestFailed = $derived(newestTerminal?.state === 'failed' ? newestTerminal : undefined);
-  const interrupted = $derived(latestFailed?.errorCode === 'INTERRUPTED');
+  const interrupted = $derived(
+    latestFailed?.errorCode === 'INTERRUPTED' || latestFailed?.errorCode === 'PROCESS_INTERRUPTED',
+  );
 
   // Show a pill only when there is running work or a recent failure worth flagging.
   const mode = $derived<'running' | 'interrupted' | 'failed' | 'none'>(

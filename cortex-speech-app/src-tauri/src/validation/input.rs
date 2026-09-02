@@ -97,6 +97,13 @@ pub fn validate_identifier(s: &str) -> Result<(), String> {
     if s.len() > 256 {
         return Err("Identifier too long (max 256 chars)".to_string());
     }
+    // The dot is allowed so ids may carry a file-like suffix, which also admits `.`, `..` and `....`
+    // — every one of them a path component, not an identifier. This gate is the app-wide id boundary
+    // (segment ids, operation ids, speaker ids), so a dot-only id is refused here rather than left as
+    // a traversal primitive for whichever caller eventually joins it onto a path.
+    if s.chars().all(|c| c == '.') {
+        return Err("Identifier must not consist only of dots".to_string());
+    }
     if !s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.') {
         return Err("Identifier must be alphanumeric (underscore, hyphen, dot allowed)".to_string());
     }
@@ -113,6 +120,23 @@ pub fn validate_text(s: &str, max_len: usize, field_name: &str) -> Result<(), St
     let chars = s.chars().count();
     if chars > max_len {
         return Err(format!("{field_name} too long (max {max_len} chars, got {chars})"));
+    }
+    Ok(())
+}
+
+/// Validate a human-visible speaker label. Unlike technical identifiers, names may contain spaces
+/// and Sorani punctuation; leading/trailing whitespace, control characters and empty labels remain
+/// forbidden so visually ambiguous groups cannot be created.
+pub fn validate_speaker_label(s: &str) -> Result<(), String> {
+    validate_text(s, 256, "Speaker label")?;
+    if s.is_empty() || s.trim().is_empty() {
+        return Err("Speaker label must not be empty".to_string());
+    }
+    if s != s.trim() {
+        return Err("Speaker label must not have leading or trailing whitespace".to_string());
+    }
+    if s.chars().any(char::is_control) {
+        return Err("Speaker label must not contain control characters".to_string());
     }
     Ok(())
 }
@@ -275,6 +299,17 @@ mod tests {
     }
 
     #[test]
+    fn dot_only_identifiers_are_rejected() {
+        // `.` and `..` passed the alphanumeric-plus-dot rule and are path components, not identifiers.
+        for evil in [".", "..", "....", "..."] {
+            assert!(validate_identifier(evil).is_err(), "a dot-only identifier must be rejected: {evil:?}");
+        }
+        // A dot inside a real id is still legal — that is what the dot was allowed for.
+        assert!(validate_identifier("clip.01.wav").is_ok());
+        assert!(validate_identifier(".hidden").is_ok());
+    }
+
+    #[test]
     fn alignment_schema_rejects_ranges_and_words_that_break_editor_math() {
         assert!(validate_alignment_json(
             r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":1,"words":[{"word":"x","start":0.0,"end":0.5,"confidence":0.9}]}"#
@@ -305,6 +340,15 @@ mod tests {
     fn test_validate_text() {
         assert!(validate_text("hello", 100, "test").is_ok());
         assert!(validate_text("hello", 3, "test").is_err());
+    }
+
+    #[test]
+    fn speaker_labels_allow_human_names_but_refuse_ambiguous_whitespace_and_controls() {
+        assert!(validate_speaker_label("Shara Karim").is_ok());
+        assert!(validate_speaker_label("شارە کریم").is_ok());
+        assert!(validate_speaker_label("").is_err());
+        assert!(validate_speaker_label(" speaker ").is_err());
+        assert!(validate_speaker_label("speaker\nother").is_err());
     }
 
     #[test]

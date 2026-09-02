@@ -23,10 +23,10 @@
 //! common case; true cross-talk needs an overlap-aware segmentation model (pyannote powerset).
 //!
 //! READ-ONLY BY DEFAULT. Opens the library with SQLITE_OPEN_READ_ONLY, so it is safe to run while the
-//! app is up. `--persist` additionally opens a SECOND, read-write connection at the end and stores each
-//! measured score in `speech_segments.speaker_change_score` (Migration v47) — which is what turns this
-//! from a console printout into a flag the phone reviewer actually sees before deciding. Run that form
-//! with the app stopped, so the library has one writer.
+//! app is up. `--persist` additionally takes the desktop's exclusive instance lock before reading,
+//! then opens a SECOND, read-write connection at the end and stores each measured score in
+//! `speech_segments.speaker_change_score` (Migration v47). The lock enforces one coherent generation
+//! and refuses the persistent form until the app is closed.
 //!
 //! Usage: speaker_change_probe [<db_path>] [--export <dir>] [--persist]
 
@@ -62,6 +62,14 @@ fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
     Some(dot / (na.sqrt() * nb.sqrt()))
 }
 
+/// The positional db path: the first argument that is neither a flag nor the value of `--export`.
+fn db_path_arg(args: &[String]) -> Option<String> {
+    args.iter()
+        .enumerate()
+        .find(|(i, a)| !(a.starts_with("--") || (*i > 0 && args[i - 1] == "--export")))
+        .map(|(_, a)| a.clone())
+}
+
 fn main() -> Result<(), String> {
     // Parsed together, because taking `args().nth(1)` as the db path swallows `--export` when it comes
     // first and then tries to open a database called "--export".
@@ -74,15 +82,20 @@ fn main() -> Result<(), String> {
     if let Some(wav) = args.iter().position(|a| a == "--replan").and_then(|i| args.get(i + 1).cloned()) {
         return replan_comparison(&wav);
     }
-    let db_path = args
-        .iter()
-        .enumerate()
-        .find(|(i, a)| !(a.starts_with("--") || (*i > 0 && args[i - 1] == "--export")))
-        .map(|(_, a)| a.clone())
-        .unwrap_or_else(|| {
-            let base = std::env::var("APPDATA").unwrap_or_default();
-            format!("{base}\\cortex-speech\\cortex-speech.db")
-        });
+    let db_path = db_path_arg(&args).unwrap_or_else(|| {
+        let base = std::env::var("APPDATA").unwrap_or_default();
+        format!("{base}\\cortex-speech\\cortex-speech.db")
+    });
+    let _instance_lock = if persist {
+        let path = std::path::Path::new(&db_path);
+        let data_dir =
+            path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+        Some(cortex_speech_app_lib::flock::InstanceLock::try_lock(data_dir).map_err(|error| {
+            format!("Cannot persist speaker-change scores while Cortex is running: {error}. Stop review and close the app first.")
+        })?)
+    } else {
+        None
+    };
     // Deliberately NOT `Database::open`: that opens read-write and runs `PRAGMA journal_mode=WAL`, which
     // is itself a write, and its `Connection::open` does not enable URI parsing — so a `file:…?mode=ro`
     // string would be taken as a literal filename and quietly create a stray empty database. Opening with
@@ -540,4 +553,162 @@ fn export_listening_set(dir: &str, sims: &[(String, f32, i64)], segments: &[SegR
         .map_err(|e| format!("write {}: {e}", path.display()))?;
     println!("\nexported {} clips + manifest.json to {}", manifest.len(), dir.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cortex_speech_app_lib::db::SpeechSegment;
+    use std::collections::HashSet;
+
+    #[test]
+    fn cosine_is_exact_on_aligned_and_orthogonal_vectors() {
+        assert_eq!(cosine(&[1.0, 0.0], &[1.0, 0.0]), Some(1.0));
+        assert_eq!(cosine(&[1.0, 0.0], &[0.0, 1.0]), Some(0.0));
+        assert_eq!(cosine(&[1.0, 0.0], &[-1.0, 0.0]), Some(-1.0));
+    }
+
+    #[test]
+    fn cosine_refuses_unusable_pairs_instead_of_guessing() {
+        assert_eq!(cosine(&[], &[]), None);
+        assert_eq!(cosine(&[1.0], &[1.0, 0.0]), None); // length mismatch
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), None); // zero norm
+        assert_eq!(cosine(&[f32::INFINITY], &[f32::INFINITY]), None); // non-finite dot
+    }
+
+    #[test]
+    fn db_path_arg_never_swallows_the_export_directory() {
+        let a = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // The bug this parse exists to avoid: `--export <dir>` first must not read <dir> as a database.
+        assert_eq!(db_path_arg(&a(&["--export", "out"])), None);
+        assert_eq!(db_path_arg(&a(&["--export", "out", "lib.db"])), Some("lib.db".into()));
+        assert_eq!(db_path_arg(&a(&["lib.db", "--export", "out"])), Some("lib.db".into()));
+        assert_eq!(db_path_arg(&a(&["--persist", "lib.db"])), Some("lib.db".into()));
+        assert_eq!(db_path_arg(&a(&["--persist"])), None);
+        assert_eq!(db_path_arg(&[]), None);
+    }
+
+    #[test]
+    fn ground_truth_gap_brackets_the_shipped_threshold() {
+        let multi_max =
+            GROUND_TRUTH.iter().filter(|(_, a, _)| *a == "multi").map(|(_, _, s)| *s).fold(f32::MIN, f32::max);
+        let single_min =
+            GROUND_TRUTH.iter().filter(|(_, a, _)| *a != "multi").map(|(_, _, s)| *s).fold(f32::MAX, f32::min);
+        assert!(multi_max < single_min, "the blind pass separated perfectly; the recorded scores must keep that gap");
+        // The shipped threshold must sit inside the measured gap: every turn-taking clip below it,
+        // every single-speaker (and overlap — structurally invisible) clip at or above it.
+        assert!(multi_max < SPEAKER_CHANGE_THRESHOLD && SPEAKER_CHANGE_THRESHOLD <= single_min);
+        for (id, answer, score) in GROUND_TRUTH {
+            assert_eq!(*score < SPEAKER_CHANGE_THRESHOLD, *answer == "multi", "clip {id} flips at the threshold");
+        }
+    }
+
+    fn seeded_db(dir: &std::path::Path, ids: &[&str]) -> String {
+        let path = dir.join("probe-test.db");
+        let db = Database::open(path.to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        for id in ids {
+            db.insert_segment(&SpeechSegment {
+                id: id.to_string(),
+                audio_path: format!("{id}.wav"),
+                raw_transcript: "test".to_string(),
+                duration_ms: 1000,
+                ..SpeechSegment::default()
+            })
+            .unwrap();
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn persist_scores_stores_every_measured_score_not_only_flagged_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = seeded_db(dir.path(), &["seg-flagged", "seg-single"]);
+        persist_scores(&db_path, &[("seg-flagged".into(), 0.25, 4_000), ("seg-single".into(), 0.75, 6_000)]).unwrap();
+        let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let score = |id: &str| -> f64 {
+            conn.query_row("SELECT speaker_change_score FROM speech_segments WHERE id = ?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        // Both rows get a score — NULL must keep meaning "not measured", never "measured, one speaker".
+        assert_eq!(score("seg-flagged"), 0.25);
+        assert_eq!(score("seg-single"), 0.75);
+    }
+
+    #[test]
+    fn persist_scores_refuses_a_library_without_the_score_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pre-v47.db");
+        // A library predating Migration v47 has no speaker_change_score column; persist must name the
+        // missing migration instead of quietly migrating the owner's schema.
+        Connection::open(&db_path).unwrap().execute("CREATE TABLE speech_segments(id TEXT PRIMARY KEY)", []).unwrap();
+        let err = persist_scores(db_path.to_str().unwrap(), &[("seg-a".into(), 0.5, 3_000)]).unwrap_err();
+        assert!(err.contains("Migration v47"), "error must name the missing migration: {err}");
+    }
+
+    fn write_wav(path: &std::path::Path, samples: usize) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for i in 0..samples {
+            w.write_sample(((i % 97) as i16) * 64).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    #[test]
+    fn export_listening_set_is_stratified_across_the_similarity_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("episode.wav");
+        write_wav(&wav, 16_000);
+        let wav = wav.to_string_lossy().into_owned();
+        let ids = ["clip-low-aaaa", "clip-mid-bbbb", "clip-high-cccc"];
+        let segments: Vec<SegRow> =
+            ids.iter().map(|id| (id.to_string(), wav.clone(), 1_000, None, "SPEAKER_00".to_string(), 0)).collect();
+        let sims = vec![
+            (ids[0].to_string(), 0.20, 1_000),
+            (ids[1].to_string(), 0.55, 1_000),
+            (ids[2].to_string(), 0.90, 1_000),
+        ];
+        let out = dir.path().join("listen");
+        export_listening_set(out.to_str().unwrap(), &sims, &segments).unwrap();
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+        let entries = manifest.as_array().unwrap();
+        assert!(entries.len() >= 3);
+        let bands: HashSet<&str> = entries.iter().map(|e| e["band"].as_str().unwrap()).collect();
+        assert_eq!(
+            bands,
+            HashSet::from(["low", "mid", "high"]),
+            "the sample must span the range, not just the worst clips"
+        );
+        for e in entries {
+            assert!(out.join(e["file"].as_str().unwrap()).is_file(), "manifest names a WAV that was not written");
+            assert!(ids.contains(&e["id"].as_str().unwrap()));
+        }
+        let manifest_ids: Vec<&str> = entries.iter().map(|e| e["id"].as_str().unwrap()).collect();
+        assert!(manifest_ids.contains(&ids[0]), "the lowest-similarity clip anchors the low band");
+        assert!(manifest_ids.contains(&ids[2]), "the highest-similarity clip anchors the high band");
+    }
+
+    #[test]
+    fn ground_truth_report_handles_flagged_pending_reviewed_and_unknown_clips() {
+        let seg = |id: &str, verified: i64| -> SegRow {
+            (id.to_string(), "episode.wav".to_string(), 4_000, None, "SPEAKER_01".to_string(), verified)
+        };
+        let segments = vec![seg("clip-pending1", 0), seg("clip-reviewed", 1)];
+        let sims = vec![
+            ("clip-pending1".to_string(), 0.30, 4_000),
+            ("clip-reviewed".to_string(), 0.35, 4_000),
+            // Measured but absent from `segments`: the meta lookup must fall back, not panic.
+            ("clip-unknown1".to_string(), 0.80, 4_000),
+        ];
+        let within: Vec<f32> = sims.iter().map(|(_, s, _)| *s).collect();
+        report_against_ground_truth(&within, &sims, &segments);
+    }
 }

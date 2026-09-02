@@ -1,6 +1,9 @@
 import re
 from pathlib import Path
 
+from _pipeline_policy_util import pipeline_surface
+from _command_policy_util import command_surface
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GITIGNORE = REPO_ROOT / ".gitignore"
@@ -104,8 +107,12 @@ def test_supported_private_media_formats_are_consistent() -> None:
     actual_sets = {
         "README.md": readme_supported_extensions(),
         "scripts/test-real-data.ps1": powershell_supported_extensions(),
-        "src-tauri/src/commands.rs": bracketed_extensions(read("src-tauri/src/commands.rs"), 'add_filter("Audio"'),
-        "src-tauri/src/pipeline.rs": bracketed_extensions(read("src-tauri/src/pipeline.rs"), "let audio_exts ="),
+        "src-tauri/src/command surface": bracketed_extensions(
+            command_surface(REPO_ROOT / "src-tauri" / "src"), 'add_filter("Audio"'
+        ),
+        "src-tauri/src/pipeline surface": bracketed_extensions(
+            pipeline_surface(REPO_ROOT / "src-tauri" / "src"), "let audio_exts ="
+        ),
         "src-tauri/tests/real_audio.rs": bracketed_extensions(read("src-tauri/tests/real_audio.rs"), "SUPPORTED_AUDIO_EXTENSIONS"),
     }
     mismatches = {

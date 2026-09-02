@@ -13,8 +13,8 @@ describe('HistoryPanel', () => {
     window.__TAURI__ = {};
     vi.mocked(invoke).mockReset();
     vi.mocked(invoke).mockImplementation((cmd: string) => {
-      if (cmd === 'can_undo' || cmd === 'can_redo') {
-        return Promise.resolve(true);
+      if (cmd === 'get_history_status_v1') {
+        return Promise.resolve({ undoAction: 'updateSegment', redoAction: 'deleteSegments' });
       }
       return Promise.resolve(null);
     });
@@ -60,8 +60,8 @@ describe('HistoryPanel', () => {
     const undoResult = await historyStore.undo();
     const redoResult = await historyStore.redo();
 
-    expect(undoResult).toBeNull();
-    expect(redoResult).toBeNull();
+    expect(undoResult).toEqual({ action: null, status: { undoAction: null, redoAction: null } });
+    expect(redoResult).toEqual({ action: null, status: { undoAction: null, redoAction: null } });
     expect(vi.mocked(invoke)).not.toHaveBeenCalled();
     await waitFor(() => {
       expect(screen.queryByText('^Z')).not.toBeInTheDocument();

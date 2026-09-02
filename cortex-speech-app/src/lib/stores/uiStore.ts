@@ -9,6 +9,7 @@ export const pipelineTotal = writable(0);
 export const pipelineCurrentFile = writable('');
 export const pipelineStatus = writable('');
 export interface AgentPipelineStage {
+  runId: string;
   stage: string;
   status: string;
   file: string;

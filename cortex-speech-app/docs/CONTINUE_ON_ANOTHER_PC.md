@@ -19,11 +19,11 @@ cd cortex-speech/cortex-speech-app
 ## 2. Public assets (from the internet, SHA-pinned — already scripted)
 ```
 npm ci
-python scripts/fetch_models.py          # VAD + CTC-300M + fine-tuned MMS ONNX -> src-tauri/models/
-python scripts/fetch_models.py --check  # verify pins, no network
+python scripts/fetch_models.py          # required VAD + ONNX Runtime support only
+python scripts/fetch_models.py --check  # verify support + any optional ASR already present
 ```
 
-## 3. The champion (NOT public, NOT in git — find by name, else copy from the old PC)
+## 3. The sole production ASR champion (NOT public, NOT in git)
 The champion = base OmniASR-7B checkpoint + a Kurdish LoRA adapter + a warm WSL server. Locate each by
 filename (run in WSL so it sees both Linux and `/mnt/*` Windows drives):
 ```
@@ -32,7 +32,7 @@ find / /mnt -name 'omniASR-LLM-7B-v2.pt' 2>/dev/null
 # the LoRA adapter + tokenizer + server (the private artifact — copy this dir over if not found)
 find / /mnt -name 'adapter_model.safetensors' 2>/dev/null      # -> OmniASR_7B_Champion/adapter_weights/
 find / /mnt -name 'omniASR_tokenizer_written_v2.model' 2>/dev/null
-find / /mnt -name 'cortex_7b_server.py' 2>/dev/null            # the warm GPU server (stays out of the repo)
+find / /mnt -name 'cortex_7b_server.py' 2>/dev/null            # tracked copy is at cortex-speech-app/scripts/
 find / /mnt -name 'cortex_7b_client.py' 2>/dev/null            # tracked copy is at cortex-speech-app/scripts/
 ```
 If the adapter/server/tokenizer aren't found, copy the whole `OmniASR_7B_Champion/` folder + the
@@ -56,10 +56,10 @@ CORTEX_7B_PORT=8799 python cortex_7b_server.py     # binds 127.0.0.1:8799 INSIDE
 "asr_model_size": "WSL7B",
 "external_asr_script_path": "<WSL path to cortex_7b_client.py from step 3>",
 "use_finetuned_asr": false,
-"cloud_llm_opt_in": false, "cloud_stt_opt_in": false
+"cloud_llm_opt_in": false, "jury_cloud_opt_in": false
 ```
 Policy (already enforced in code): 7B is the ONLY engine that becomes the transcript; if it's down the
-app asks *retry / offline* — it never silently drops to a small model.
+app offers only a champion repair/retry path — it never drops to a smaller or cloud model.
 
 ## 7. Build the app (frontend BEFORE cargo — non-negotiable)
 ```
@@ -78,12 +78,12 @@ python scripts/build_review_page.py --manifest run.jsonl --out review.html --emb
 Two tasks were in flight; pick them up and record results in the ledger (that + git is how we
 coordinate across machines — there is no shared live session):
 1. **FLEURS-ckb clean CER** — measure the champion on FLEURS-ckb (`ckb_iq` test) to confirm the
-   CV22 number (5.04% CER, but train/test disjointness unverified) and get an honest same-dataset
-   comparison vs Scribe. Decode via `Audio(decode=False)`+soundfile (step 4), then
+   CV22 number (5.04% CER, but train/test disjointness unverified) and retain any smaller-model
+   comparison as an explicitly offline diagnostic. Decode via `Audio(decode=False)`+soundfile, then
    `scripts/scorecard_7b.py <manifest> 2000`.
 2. **Ask-dialog verify** — with the 7B server DOWN, drive the exe and confirm it shows the
-   *Try 7B again / Use offline model* dialog (and `transcribe_segment` rejects with
-   `E_ASR_7B_UNAVAILABLE`), i.e. no silent downgrade.
+   champion repair/retry action (and `transcribe_segment` rejects with `E_ASR_7B_UNAVAILABLE`),
+   with no smaller-model action or silent downgrade.
 
 ## Rules (do not skip)
 Honesty law + gates in `CLAUDE.md`: never fabricate a metric; nothing "done" until USER-OBSERVABLE or

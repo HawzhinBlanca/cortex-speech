@@ -3,16 +3,18 @@
 //!
 //! WHY THIS EXISTS. The owner asked whether reviewers should be served a machine-arbitrated blend of
 //! the OmniASR-7B champion and Gemini 2.5 Pro. That question has no honest answer without a number:
-//! the champion is 7.03% CER on this exact frozen manifest, and NOBODY has measured Gemini's ckb
-//! TRANSCRIPTION quality (what was measured, on 492 review clips, is that Gemini as a text REFINER
+//! the historical champion scorecard is duplication-weighted and cannot rank a new engine, while
+//! NOBODY has measured Gemini's ckb TRANSCRIPTION quality on a clean attested set (what was measured,
+//! on 492 review clips, is that Gemini as a text REFINER
 //! rewrites 11.1% of characters — a different thing entirely). Repo law: any new cloud judge needs a
 //! measured ckb CER on the frozen gold set before it may be configured.
 //!
 //! WHAT IT DOES / DOES NOT DO. It writes ONLY a hypothesis TSV (`path\treference\thypothesis`). It
 //! computes no metric: `scripts/scorecard_gemini.py` scores that TSV through the SAME
-//! normalization + seed-42 utterance bootstrap as `scorecard_7b.py`, so the two numbers are
-//! comparable by construction rather than by hope. Two implementations of one metric is how a
-//! comparison starts lying (the mirror-drift class this repo has fixed repeatedly).
+//! normalization + seed-42 utterance bootstrap as `scorecard_7b.py`, so a future clean same-set
+//! comparison can be comparable by construction rather than by hope. This tool alone authorizes no
+//! SOTA, promotion, or release claim. Two implementations of one metric is how a comparison starts
+//! lying (the mirror-drift class this repo has fixed repeatedly).
 //!
 //! CREDENTIALS. The key comes from `ApiKeys::load` — the ONE sanctioned loader, which handles both
 //! plaintext and the DPAPI `dpapi:` ciphertext. Hand-parsing `secrets.env` here would re-create the
@@ -88,7 +90,7 @@ fn main() -> Result<(), String> {
         .cloned()
         .unwrap_or_else(|| "gemini-2.5-pro".to_string());
 
-    let keys = ApiKeys::load(&app_data_dir());
+    let keys = ApiKeys::load(&app_data_dir())?;
     let use_openrouter = args.iter().any(|a| a == "--openrouter");
     let route = if use_openrouter {
         let key = keys.openrouter.ok_or("OPENROUTER_API_KEY is not configured (set it in the app's Settings)")?;

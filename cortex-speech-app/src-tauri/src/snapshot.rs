@@ -7,28 +7,368 @@
 //! config state files, on start and periodically, keeping the newest N.
 
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
+use sha2::{Digest, Sha256};
 
-/// Small state files copied alongside the DB (best-effort; absent files are skipped). `champion.json`
-/// is the future retrain-champion pointer (M5) — harmless to list before it exists.
+/// Small state files copied alongside the DB. A promoted rotating snapshot must contain this entire
+/// recovery contract; the paid-review pilot policy is special-cased below because losing it silently
+/// changes bounded paid work into unrestricted mode.
+/// `champion.json` is the future retrain-champion pointer (M5) — harmless to list before it exists.
 ///
 /// SINGLE SOURCE OF TRUTH: `restore_db_from_snapshot` (commands.rs) restores exactly this set, so the
 /// save-side and restore-side can never drift — a file added here is automatically restored, not
 /// silently snapshotted-but-never-restored.
-pub(crate) const EXTRA_STATE: &[&str] = &["settings.json", "champion.json"];
+/// `reviewer_dialects.json`, `voice_focus.json`, and `review_pilot_policy.json` are QUEUE/PAY POLICY,
+/// and leaving them out made the
+/// restore silently permissive: a MISSING policy file means "no restriction" (only a
+/// present-but-broken one fails closed, owner instruction 2026-08-20), so a library restored
+/// without them serves every reviewer every clip — the dialect fence gone and the collection focus
+/// gone, with nothing in the UI to say so. Found 2026-08-20 by an external audit; the same restore
+/// that proves the corpus survived would quietly undo who may review what.
+#[cfg(test)]
+pub(crate) const EXTRA_STATE: &[&str] =
+    &["settings.json", "champion.json", "reviewer_dialects.json", "voice_focus.json", "review_pilot_policy.json"];
+
+/// Files whose absence is a legitimate runtime state. A recovery artifact must nevertheless record
+/// that absence explicitly: a missing file in a snapshot is otherwise indistinguishable from a
+/// failed copy, and for the queue-routing files that ambiguity can widen paid review silently.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OptionalSnapshotState {
+    pub live_file: &'static str,
+    pub absent_file: &'static str,
+    pub absent_bytes: &'static [u8],
+}
+
+pub(crate) const OPTIONAL_SNAPSHOT_STATE: &[OptionalSnapshotState] = &[
+    OptionalSnapshotState {
+        live_file: "settings.json",
+        absent_file: "settings.json.absent",
+        absent_bytes: b"cortex-snapshot-state-absent-v1:settings.json\n",
+    },
+    OptionalSnapshotState {
+        live_file: "champion.json",
+        absent_file: "champion.json.absent",
+        absent_bytes: b"cortex-snapshot-state-absent-v1:champion.json\n",
+    },
+    OptionalSnapshotState {
+        live_file: "reviewer_dialects.json",
+        absent_file: "reviewer_dialects.json.absent",
+        absent_bytes: b"cortex-snapshot-state-absent-v1:reviewer_dialects.json\n",
+    },
+    OptionalSnapshotState {
+        live_file: "voice_focus.json",
+        absent_file: "voice_focus.json.absent",
+        absent_bytes: b"cortex-snapshot-state-absent-v1:voice_focus.json\n",
+    },
+];
 
 const SNAPSHOT_PREFIX: &str = "snapshot_";
 const DB_FILE: &str = "cortex-speech.db";
 /// Rotation-exempt snapshots live under `<data_dir>/snapshots/pinned/` — the rolling prune only
 /// touches `snapshot_*` dirs at the root, so nothing here is ever auto-evicted.
 const PINNED_DIR: &str = "pinned";
+/// Canonical per-snapshot inventory: size + SHA-256 of every file in the tree.
+pub(crate) const MANIFEST_FILE: &str = "SNAPSHOT_MANIFEST.json";
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+#[derive(serde::Deserialize)]
+struct SnapshotPilotSession {
+    db_path: String,
+    reviewers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pilot_spot_checks: Vec<(String, String)>,
+    pilot_policy: Option<crate::review_pilot::ReviewPilotPolicy>,
+}
+
+fn exact_pilot_reviewer(
+    policy: &crate::review_pilot::ReviewPilotPolicy,
+    actual: &str,
+    source: &str,
+) -> Result<String, String> {
+    policy
+        .reviewers
+        .iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(actual.trim()))
+        .map(|entry| entry.name.clone())
+        .ok_or_else(|| format!("{source} contains unauthorized reviewer {actual:?}"))
+}
+
+/// A policy-bearing v59 snapshot is restorable only when SQLite already owns every hidden key that
+/// has escaped into a session or completion event. Zero is valid before traffic; missing history is
+/// not. The whole current-schema fingerprint is checked here so a dropped/changed authority trigger
+/// cannot be hidden by an otherwise healthy backup.
+fn validate_active_pilot_snapshot_authority(
+    connection: &rusqlite::Connection,
+    live_data_dir: Option<&Path>,
+    live_db_path: Option<&Path>,
+    policy: &crate::review_pilot::ReviewPilotPolicy,
+) -> Result<(), String> {
+    let schema_version: i64 = connection
+        .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |row| row.get(0))
+        .map_err(|error| format!("snapshot hidden-key schema version cannot be read: {error}"))?;
+    if schema_version < crate::review_pilot::REVIEW_PILOT_HIDDEN_KEYS_SCHEMA_VERSION {
+        // The dedicated pre-migration pin is intentionally archival. Production named restore and
+        // the external drill reject policy-bearing pre-v59 artifacts.
+        return Ok(());
+    }
+    crate::db::validate_schema_contract_at_version(connection, schema_version)
+        .map_err(|error| format!("snapshot hidden-key schema contract is not exact: {error}"))?;
+
+    let names = policy.reviewer_names();
+    if names.len() != 2 {
+        return Err("snapshot pilot roster must contain exactly two distinct reviewers".to_string());
+    }
+    let digest = policy.policy_sha256()?;
+    let baseline = policy.after_review_event_id;
+    let maximum: i64 = connection
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM review_events", [], |row| row.get(0))
+        .map_err(|error| format!("snapshot pilot review history cannot be read: {error}"))?;
+    if baseline > maximum {
+        return Err(format!("snapshot pilot baseline {baseline} is ahead of review-event maximum {maximum}"));
+    }
+    let conflicting: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM review_pilot_hidden_keys
+              WHERE (policy_sha256 = ?1 OR after_review_event_id = ?2)
+                AND NOT (policy_sha256 = ?1 AND after_review_event_id = ?2)",
+            rusqlite::params![digest, baseline],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("snapshot hidden-key namespace cannot be verified: {error}"))?;
+    if conflicting != 0 {
+        return Err(format!(
+            "snapshot has {conflicting} hidden-key grant(s) that disagree with the active policy SHA/baseline"
+        ));
+    }
+
+    let mut grants: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    let mut reviewer_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut statement = connection
+        .prepare(
+            "SELECT reviewer, segment_id FROM review_pilot_hidden_keys
+              WHERE policy_sha256 = ?1 AND after_review_event_id = ?2
+              ORDER BY reviewer COLLATE NOCASE, segment_id",
+        )
+        .map_err(|error| format!("snapshot hidden-key grants cannot be read: {error}"))?;
+    let rows = statement
+        .query_map(rusqlite::params![digest, baseline], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|error| format!("snapshot hidden-key grants cannot be read: {error}"))?;
+    for row in rows {
+        let (actual_reviewer, segment_id) =
+            row.map_err(|error| format!("snapshot hidden-key grant is unreadable: {error}"))?;
+        let reviewer = exact_pilot_reviewer(policy, &actual_reviewer, "durable hidden-key authority")?;
+        crate::validation::input::validate_identifier(&segment_id)
+            .map_err(|error| format!("durable hidden-key authority has invalid segment {segment_id:?}: {error}"))?;
+        let key = (reviewer.to_ascii_lowercase(), segment_id);
+        if !grants.insert(key.clone()) {
+            return Err(format!("snapshot hidden-key authority duplicates {}/{}", key.0, key.1));
+        }
+        *reviewer_counts.entry(key.0).or_default() += 1;
+    }
+    let per_reviewer = usize::try_from(crate::review_pilot::REVIEW_PILOT_HIDDEN_QC_PER_REVIEWER)
+        .map_err(|_| "snapshot hidden-key reviewer quota is invalid".to_string())?;
+    let total = usize::try_from(crate::review_pilot::REVIEW_PILOT_TOTAL_HIDDEN_QC)
+        .map_err(|_| "snapshot hidden-key global quota is invalid".to_string())?;
+    if reviewer_counts.values().any(|count| *count > per_reviewer) || grants.len() > total {
+        return Err("snapshot hidden-key authority exceeds the exact 2-per-reviewer/4-total quota".to_string());
+    }
+
+    let mut completed = std::collections::BTreeSet::new();
+    let mut statement = connection
+        .prepare(
+            "SELECT id, segment_id, reviewer, action FROM review_events
+              WHERE id > ?1 AND source = 'couch_spot_check' ORDER BY id",
+        )
+        .map_err(|error| format!("snapshot hidden completion history cannot be read: {error}"))?;
+    let events = statement
+        .query_map([baseline], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+        })
+        .map_err(|error| format!("snapshot hidden completion history cannot be read: {error}"))?;
+    for event in events {
+        let (event_id, segment_id, actual_reviewer, action) =
+            event.map_err(|error| format!("snapshot hidden completion event is unreadable: {error}"))?;
+        let reviewer = exact_pilot_reviewer(policy, &actual_reviewer, &format!("hidden event {event_id}"))?;
+        crate::validation::input::validate_identifier(&segment_id)
+            .map_err(|error| format!("hidden event {event_id} has invalid segment: {error}"))?;
+        if !matches!(action.as_str(), "accept" | "edit" | "reject" | "skip") {
+            return Err(format!("hidden event {event_id} has invalid action {action:?}"));
+        }
+        let key = (reviewer.to_ascii_lowercase(), segment_id.clone());
+        if !grants.contains(&key) {
+            return Err(format!("hidden event {event_id} has no durable active-policy grant"));
+        }
+        if !completed.insert(key.clone()) {
+            return Err(format!("hidden key {}/{} has multiple completion events", key.0, key.1));
+        }
+        let mut result_statement = connection
+            .prepare("SELECT action FROM spot_checks WHERE segment_id = ?1 AND reviewer = ?2 COLLATE NOCASE")
+            .map_err(|error| format!("hidden event {event_id} result cannot be read: {error}"))?;
+        let observed = result_statement
+            .query_map(rusqlite::params![segment_id, reviewer], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("hidden event {event_id} result cannot be read: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("hidden event {event_id} result cannot be read: {error}"))?;
+        if observed != [action.clone()] {
+            return Err(format!("hidden event {event_id} result mismatch: event={action:?}, results={observed:?}"));
+        }
+    }
+
+    if let (Some(data_dir), Some(db_path)) = (live_data_dir, live_db_path) {
+        let session_path = data_dir.join("couch_session.json");
+        match fs::read(&session_path) {
+            Ok(bytes) => {
+                let session: SnapshotPilotSession = serde_json::from_slice(&bytes)
+                    .map_err(|error| format!("snapshot refused because couch_session.json is invalid: {error}"))?;
+                let recorded = fs::canonicalize(&session.db_path)
+                    .map_err(|error| format!("snapshot session database path is unavailable: {error}"))?;
+                let expected = fs::canonicalize(db_path)
+                    .map_err(|error| format!("snapshot database path is unavailable: {error}"))?;
+                if recorded != expected {
+                    return Err("snapshot session belongs to a different database".to_string());
+                }
+                let session_policy = session
+                    .pilot_policy
+                    .ok_or_else(|| "snapshot session is not bound to the active pilot policy".to_string())?;
+                if session_policy.policy_sha256()? != digest {
+                    return Err("snapshot session is bound to a different pilot policy".to_string());
+                }
+                let paired = session.reviewers.values().cloned().collect::<Vec<_>>();
+                if !policy.matches_session(&paired) {
+                    return Err("snapshot session reviewer roster does not match the active pilot".to_string());
+                }
+                let mut seen = std::collections::BTreeSet::new();
+                for (segment_id, actual_reviewer) in session.pilot_spot_checks {
+                    crate::validation::input::validate_identifier(&segment_id)
+                        .map_err(|error| format!("snapshot session hidden key is invalid: {error}"))?;
+                    let reviewer = exact_pilot_reviewer(policy, &actual_reviewer, "snapshot session hidden cache")?;
+                    let key = (reviewer.to_ascii_lowercase(), segment_id);
+                    if !seen.insert(key.clone()) {
+                        return Err(format!("snapshot session duplicates hidden key {}/{}", key.0, key.1));
+                    }
+                    if !grants.contains(&key) {
+                        return Err(format!(
+                            "snapshot session hidden key {}/{} has no durable active-policy grant",
+                            key.0, key.1
+                        ));
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("snapshot session cannot be read: {error}")),
+        }
+    }
+    Ok(())
+}
+
+/// Capture paid-review policy with explicit absence semantics. A new snapshot contains exactly one
+/// of the validated policy or an absence marker. An unreadable/invalid active policy fails the whole
+/// snapshot instead of being misrepresented as intentionally absent.
+fn capture_review_pilot_state(db: &Database, primary_data_dir: &Path, staging: &Path) -> AppResult<()> {
+    let source = primary_data_dir.join(crate::review_pilot::REVIEW_PILOT_FILE);
+    crate::atomic_file::recover_interrupted_replace(&source).map_err(|error| {
+        AppError::Other(format!(
+            "snapshot refused because interrupted {} recovery failed: {error}",
+            crate::review_pilot::REVIEW_PILOT_FILE
+        ))
+    })?;
+    match fs::read(&source) {
+        Ok(bytes) => {
+            let raw = std::str::from_utf8(&bytes)
+                .map_err(|error| AppError::Other(format!("review pilot policy is not UTF-8: {error}")))?;
+            let policy = crate::review_pilot::parse(raw).map_err(AppError::Other)?;
+            crate::review_pilot::validate_controlled_focus(primary_data_dir).map_err(|error| {
+                AppError::Other(format!(
+                    "snapshot refused because the active controlled-pilot focus is not exact: {error}"
+                ))
+            })?;
+            let max_event_id: i64 = db
+                .connection()
+                .query_row("SELECT COALESCE(MAX(id), 0) FROM review_events", [], |row| row.get(0))
+                .map_err(AppError::Database)?;
+            if policy.after_review_event_id > max_event_id {
+                return Err(AppError::Other(format!(
+                    "snapshot refused because {} baseline {} is ahead of the snapshotted database review-event maximum {max_event_id}",
+                    crate::review_pilot::REVIEW_PILOT_FILE,
+                    policy.after_review_event_id
+                )));
+            }
+            validate_active_pilot_snapshot_authority(
+                db.connection(),
+                Some(primary_data_dir),
+                Some(Path::new(db.path())),
+                &policy,
+            )
+            .map_err(|error| {
+                AppError::Other(format!("snapshot refused because hidden-key authority is incomplete: {error}"))
+            })?;
+            fs::write(staging.join(crate::review_pilot::REVIEW_PILOT_FILE), bytes).map_err(AppError::Io)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::write(
+                staging.join(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE),
+                crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_BYTES,
+            )
+            .map_err(AppError::Io)?;
+        }
+        Err(error) => {
+            return Err(AppError::Other(format!(
+                "snapshot refused because active {} could not be read: {error}",
+                crate::review_pilot::REVIEW_PILOT_FILE
+            )))
+        }
+    }
+    Ok(())
+}
+
+/// Capture one of `{live bytes, explicit absence}` for every legally-optional config file.
+/// Interrupted atomic replacements are recovered first so a crash cannot be mislabelled as an
+/// intentional absence. Non-regular/unreadable sources fail the whole snapshot.
+fn capture_optional_state(primary_data_dir: &Path, staging: &Path) -> AppResult<()> {
+    for state in OPTIONAL_SNAPSHOT_STATE {
+        let source = primary_data_dir.join(state.live_file);
+        crate::atomic_file::recover_interrupted_replace(&source).map_err(|error| {
+            AppError::Other(format!(
+                "snapshot refused because interrupted {} recovery failed: {error}",
+                state.live_file
+            ))
+        })?;
+        match fs::symlink_metadata(&source) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                    return Err(AppError::Other(format!(
+                        "snapshot refused because active {} is not a regular file",
+                        state.live_file
+                    )));
+                }
+                let bytes = fs::read(&source).map_err(|error| {
+                    AppError::Other(format!(
+                        "snapshot refused because active {} could not be read: {error}",
+                        state.live_file
+                    ))
+                })?;
+                fs::write(staging.join(state.live_file), bytes).map_err(AppError::Io)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::write(staging.join(state.absent_file), state.absent_bytes).map_err(AppError::Io)?;
+            }
+            Err(error) => {
+                return Err(AppError::Other(format!(
+                    "snapshot refused because active {} could not be inspected: {error}",
+                    state.live_file
+                )))
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── Snapshot health (true-10 audit): the safety net must never fail silently for months. ────────
@@ -52,6 +392,21 @@ pub fn snapshot_health() -> SnapshotHealth {
         last_success_epoch_secs: (last > 0).then_some(last),
         consecutive_failures: CONSECUTIVE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
     }
+}
+
+/// The two counters above are PROCESS-global, so every test that reads them across a window while
+/// another test can move them is racing: a concurrent `take_snapshot` success resets the failure
+/// streak a health assertion is halfway through checking. Measured on this box: the three
+/// counter-touching tests in `mod tests`, run alone together, fail roughly one run in three, and
+/// adding unrelated snapshot work elsewhere in the module widens the window until it fails two in
+/// three. Every test that reads or moves these counters takes this lock; nothing else serializes.
+#[cfg(test)]
+static HEALTH_COUNTERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn lock_health_counters() -> std::sync::MutexGuard<'static, ()> {
+    // A panicking test must not cascade into unrelated failures for everyone after it.
+    HEALTH_COUNTERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Take a rotating snapshot into `<data_dir>/snapshots/snapshot_<ts>/`, then prune to newest `keep`.
@@ -148,7 +503,46 @@ pub(crate) fn validate_offsite_dir(target: &Path, primary_data_dir: &Path) -> Ap
 /// BEFORE a restore overwrites the live DB — a mis-restore of the wrong snapshot was otherwise
 /// recoverable only from a ≤10-min-old rolling snapshot that itself rotates out.
 pub fn take_pinned_snapshot(db: &Database, data_dir: &Path, label: &str, keep_pinned: usize) -> AppResult<PathBuf> {
+    let _capture = crate::database_runtime::begin_snapshot_capture(data_dir).map_err(AppError::Other)?;
     take_pinned_snapshot_at(db, data_dir, label, keep_pinned, now_secs())
+}
+
+/// The mandatory pre-restore pin is the one intentional exception to normal capture admission: the
+/// restore already owns its snapshot/restore gate and the DB mutex, so reacquiring it would deadlock.
+/// The explicit reservation capability binds this bypass to the caller's live ownership lifetime;
+/// ambient process-global state is not sufficient proof.
+pub(crate) fn take_pinned_snapshot_during_restore(
+    reservation: &crate::database_runtime::RestoreReservation<'_>,
+    db: &Database,
+    data_dir: &Path,
+    label: &str,
+    keep_pinned: usize,
+) -> AppResult<PathBuf> {
+    if !reservation.is_active() {
+        return Err(AppError::Other(
+            "pre-restore pinned snapshot requires an active exclusive restore reservation".to_string(),
+        ));
+    }
+    take_pinned_snapshot_at(db, data_dir, label, keep_pinned, now_secs())
+}
+
+/// Initialize a database only after a durable, rotation-exempt copy of its pre-migration pages exists.
+///
+/// A schema version above zero proves this is an established profile rather than a pristine file. If
+/// that version trails this binary, the safety pin is mandatory: a cleanly committed but semantically
+/// wrong migration cannot be undone by SQLite's transaction, and post-migration rotating snapshots
+/// would eventually evict every pre-upgrade copy. Both production database entry points call this one
+/// helper so a future startup refactor cannot quietly restore warn-and-continue behavior.
+pub fn initialize_with_required_pre_migration_pin(db: &Database, data_dir: &Path) -> AppResult<Option<PathBuf>> {
+    let current = crate::migrations::get_current_version(db)?;
+    let max_known = crate::migrations::max_supported_version();
+    let pinned = if current > 0 && current < max_known {
+        Some(take_pinned_snapshot(db, data_dir, &format!("premigration_v{current}_to_v{max_known}"), 3)?)
+    } else {
+        None
+    };
+    db.initialize()?;
+    Ok(pinned)
 }
 
 /// `take_pinned_snapshot` with an explicit timestamp (testable without wall-clock sleeps).
@@ -172,13 +566,17 @@ pub(crate) fn take_pinned_snapshot_at(
         remove_staging_dir(&staging);
         return Err(e);
     }
-    for name in EXTRA_STATE {
-        let src = data_dir.join(name);
-        if src.is_file() {
-            if let Err(e) = fs::copy(&src, staging.join(name)) {
-                tracing::warn!("pinned snapshot: could not copy {name}: {e}");
-            }
-        }
+    if let Err(error) = capture_optional_state(data_dir, &staging) {
+        remove_staging_dir(&staging);
+        return Err(error);
+    }
+    if let Err(error) = capture_review_pilot_state(db, data_dir, &staging) {
+        remove_staging_dir(&staging);
+        return Err(error);
+    }
+    if let Err(error) = write_snapshot_manifest(&staging, ts) {
+        remove_staging_dir(&staging);
+        return Err(error);
     }
     // Promote under the first FREE timestamped name — a same-second sibling bumps forward instead of
     // being overwritten.
@@ -188,26 +586,20 @@ pub(crate) fn take_pinned_snapshot_at(
         final_ts += 1;
         snap_dir = pinned_root.join(format!("{label}_{final_ts:010}"));
     }
-    if let Err(e) = fs::rename(&staging, &snap_dir) {
+    if let Err(e) = commit_snapshot_generation(&staging, &snap_dir) {
         remove_staging_dir(&staging);
-        return Err(AppError::Io(e));
+        return Err(e);
     }
-    // Bound same-label accumulation (newest keep_pinned survive) so repeated upgrades/restores
-    // can't grow without limit; different labels never evict each other.
-    let mut same_label: Vec<PathBuf> = fs::read_dir(&pinned_root)
-        .map_err(AppError::Io)?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_dir() && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&format!("{label}_")))
-        })
-        .collect();
-    same_label.sort();
-    while same_label.len() > keep_pinned.max(1) {
-        let oldest = same_label.remove(0);
-        if let Err(e) = fs::remove_dir_all(&oldest) {
-            tracing::warn!("pinned snapshot: could not prune {}: {e}", oldest.display());
-        }
+
+    // Pruning is strictly post-commit. Once the new generation is durably promoted and reopened,
+    // failure to enumerate/delete an old pin may retain extras but must not turn the valid new pin
+    // into a reported failure (nor tempt a caller to rerun a migration/restore precondition).
+    if let Err(error) = maybe_inject_snapshot_fault(SnapshotFaultPoint::BeforePrune) {
+        tracing::warn!(
+            "pinned snapshot committed; retaining extra same-label pins because pruning was refused: {error}"
+        );
+    } else {
+        prune_same_label_pins_best_effort(&pinned_root, label, keep_pinned, &snap_dir);
     }
     Ok(snap_dir)
 }
@@ -216,17 +608,51 @@ pub(crate) fn take_pinned_snapshot_at(
 /// convenience: production routes through `take_snapshot_at_from` so the quarantine dir is explicit.
 #[cfg(test)]
 pub(crate) fn take_snapshot_at(db: &Database, data_dir: &Path, keep: usize, ts: u64) -> AppResult<Option<PathBuf>> {
+    seed_test_required_snapshot_state(data_dir)?;
     take_snapshot_at_from(db, data_dir, data_dir, keep, ts)
 }
 
+#[cfg(test)]
+fn seed_test_required_snapshot_state(data_dir: &Path) -> AppResult<()> {
+    fs::create_dir_all(data_dir).map_err(AppError::Io)?;
+    let settings = serde_json::to_vec_pretty(&crate::settings::AppSettings::default())
+        .map_err(|error| AppError::Other(format!("test settings serialize: {error}")))?;
+    for (name, bytes) in [
+        ("settings.json", settings.as_slice()),
+        ("champion.json", br#"{"schema":2,"champions":{}}"#.as_slice()),
+        ("reviewer_dialects.json", b"{}".as_slice()),
+        ("voice_focus.json", br#"{"name":"test","segment_ids":["test-segment"]}"#.as_slice()),
+    ] {
+        let path = data_dir.join(name);
+        if !path.exists() {
+            fs::write(path, bytes).map_err(AppError::Io)?;
+        }
+    }
+    Ok(())
+}
+
+/// `dest_dir` is where the snapshot TREE is written; `primary_data_dir` is the live library the
+/// state files are read from. For a local snapshot they are the same directory. For the off-drive
+/// copy they are NOT: the destination is the owner's second disk, which holds no `settings.json` or
+/// `champion.json` of its own.
+///
+/// Measured 2026-08-19: this function read `EXTRA_STATE` from the DESTINATION, so every off-drive
+/// snapshot silently contained the database and nothing else — the copy is best-effort, so the two
+/// missing files only produced a debug-level warning. A restore from that tree would come back with
+/// no champion pointer (the app then serves NO champion at all) and no settings, which is precisely
+/// the disaster the off-drive copy exists to survive.
 pub(crate) fn take_snapshot_at_from(
     db: &Database,
-    data_dir: &Path,
-    quarantine_dir: &Path,
+    dest_dir: &Path,
+    primary_data_dir: &Path,
     keep: usize,
     ts: u64,
 ) -> AppResult<Option<PathBuf>> {
-    let root = data_dir.join("snapshots");
+    // Serialize the complete DB+config capture against named restores. The guard is held until the
+    // staging tree is either promoted or removed, so no restore generation can be mixed with config
+    // from another generation. It also refuses a durable marker left by an interrupted restore.
+    let _capture = crate::database_runtime::begin_snapshot_capture(primary_data_dir).map_err(AppError::Other)?;
+    let root = dest_dir.join("snapshots");
 
     // THE EMPTY-DB GUARD (B2, true-10 audit blocker): after a corruption quarantine the app opens a
     // FRESH EMPTY database. Snapshotting that empty DB every cycle would rotate out (keep=N) every
@@ -246,7 +672,7 @@ pub(crate) fn take_snapshot_at_from(
     // below is correct, but with snapshots resuming after a re-import (segment_count > 0) it meant a
     // full DB copy every cycle, unbounded (~144/day), until disk pressure. History is already frozen
     // by the pin — additional copies beyond 2×keep add no protection, so stop taking new ones.
-    if has_unacknowledged_quarantine(quarantine_dir) {
+    if has_unacknowledged_quarantine(primary_data_dir) {
         let existing = fs::read_dir(&root)
             .ok()
             .into_iter()
@@ -278,33 +704,1055 @@ pub(crate) fn take_snapshot_at_from(
         return Err(e);
     }
 
-    // Config/state files are best-effort — a missing or unreadable one must not lose the DB snapshot.
-    for name in EXTRA_STATE {
-        let src = data_dir.join(name);
-        if src.is_file() {
-            if let Err(e) = fs::copy(&src, staging.join(name)) {
-                tracing::warn!("snapshot: could not copy {name}: {e}");
-            }
-        }
+    // A promoted rotating snapshot is a complete recovery artifact. Paid-review policy is handled
+    // separately because it must be either a validated copy or an explicit absence marker.
+    if let Err(error) = capture_optional_state(primary_data_dir, &staging) {
+        remove_staging_dir(&staging);
+        return Err(error);
+    }
+    if let Err(error) = capture_review_pilot_state(db, primary_data_dir, &staging) {
+        remove_staging_dir(&staging);
+        return Err(error);
+    }
+
+    if let Err(e) = write_snapshot_manifest(&staging, ts) {
+        remove_staging_dir(&staging);
+        return Err(e);
     }
 
     let snap_dir = root.join(format!("{SNAPSHOT_PREFIX}{ts:010}"));
-    if let Err(e) = fs::rename(&staging, &snap_dir) {
+    if let Err(e) = commit_snapshot_generation(&staging, &snap_dir) {
         remove_staging_dir(&staging);
-        return Err(AppError::Io(e));
+        return Err(e);
     }
 
-    prune_snapshots_from(&root, quarantine_dir, keep)?;
+    // The snapshot is already a durable, reopened recovery generation. Rotation is non-load-bearing
+    // cleanup: retain extras and warn on any failure rather than misreporting the successful commit.
+    let prune_result = maybe_inject_snapshot_fault(SnapshotFaultPoint::BeforePrune)
+        .and_then(|()| prune_snapshots_from_preserving(&root, primary_data_dir, keep, Some(&snap_dir)));
+    if let Err(error) = prune_result {
+        tracing::warn!("snapshot committed; retaining extra rotating snapshots because pruning failed: {error}");
+    }
     Ok(Some(snap_dir))
+}
+
+/// Write the canonical inventory of a finished snapshot: size and SHA-256 of every file in it.
+///
+/// Without this, "the off-drive copy exists" is the strongest claim available — and that claim was
+/// true while the off-drive tree silently held the database alone (2026-08-19). A manifest makes the
+/// two copies COMPARABLE: identical required hashes, or a restore that must not be trusted.
+///
+/// Written into staging BEFORE the promoting rename, so a promoted snapshot always has one and a
+/// crashed one is discarded whole.
+fn write_snapshot_manifest(staging: &Path, ts: u64) -> AppResult<()> {
+    let mut files: Vec<(String, u64, String)> = Vec::new();
+    let mut entries: Vec<PathBuf> =
+        fs::read_dir(staging).map_err(AppError::Io)?.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+    entries.sort();
+    for path in entries {
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) if name != MANIFEST_FILE => name.to_string(),
+            _ => continue,
+        };
+        let size = path.metadata().map_err(AppError::Io)?.len();
+        let digest = crate::models::compute_file_sha256(&path)
+            .map_err(|e| AppError::Other(format!("snapshot manifest hash for {name}: {e}")))?;
+        files.push((name, size, digest));
+    }
+    let payload = serde_json::json!({
+        "schema": 1,
+        "reviewPilotPolicyStateSchema": 1,
+        "createdAtEpochSecs": ts,
+        "appGitSha": crate::GIT_SHA,
+        "files": files
+            .iter()
+            .map(|(name, size, digest)| serde_json::json!({"path": name, "sizeBytes": size, "sha256": digest}))
+            .collect::<Vec<_>>(),
+    });
+    let text = serde_json::to_string_pretty(&payload)
+        .map_err(|e| AppError::Other(format!("snapshot manifest serialize: {e}")))?;
+    fs::write(staging.join(MANIFEST_FILE), text.as_bytes()).map_err(AppError::Io)?;
+    Ok(())
+}
+
+/// Verify every byte promised by a snapshot manifest before a restore can touch the live database.
+/// `Ok(false)` is reserved for a truly legacy tree with NO manifest. Once a manifest exists, malformed
+/// JSON, duplicates, traversal, missing required state, and any size/hash mismatch are hard failures.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SnapshotManifestFile {
+    path: String,
+    size_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SnapshotManifestV1 {
+    schema: u64,
+    review_pilot_policy_state_schema: u64,
+    created_at_epoch_secs: u64,
+    app_git_sha: String,
+    files: Vec<SnapshotManifestFile>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SnapshotManifestV2 {
+    schema: u64,
+    created_at_epoch_secs: u64,
+    app_git_sha: String,
+    source_data_dir: String,
+    database_evidence: SnapshotDatabaseEvidence,
+    files: Vec<SnapshotManifestFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SnapshotDatabaseEvidence {
+    quick_check: Vec<String>,
+    integrity_check: Vec<String>,
+    foreign_key_violation_count: u64,
+    schema_version: u64,
+    row_counts: SnapshotRowCounts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotRowCounts {
+    speech_segments: u64,
+    review_events: u64,
+    spot_checks: u64,
+    model_versions: u64,
+    import_jobs: u64,
+    import_job_files: u64,
+    #[serde(default)]
+    review_pilot_hidden_keys: Option<u64>,
+    #[serde(default)]
+    review_campaign_registry: Option<u64>,
+    #[serde(default)]
+    review_campaign_focus: Option<u64>,
+    #[serde(default)]
+    review_campaign_transitions: Option<u64>,
+    #[serde(default)]
+    independent_review_decisions: Option<u64>,
+    #[serde(default)]
+    independent_review_reversals: Option<u64>,
+    #[serde(default)]
+    review_campaign_adjudications: Option<u64>,
+    #[serde(default)]
+    review_pool_registry: Option<u64>,
+    #[serde(default)]
+    review_pool_members: Option<u64>,
+    #[serde(default)]
+    review_pool_decisions: Option<u64>,
+    #[serde(default)]
+    review_pool_reversals: Option<u64>,
+    #[serde(default)]
+    review_pool_owner_adjudications: Option<u64>,
+    #[serde(default)]
+    review_pool_voice_certificates: Option<u64>,
+    #[serde(default)]
+    review_pool_dedup_manifests: Option<u64>,
+    #[serde(default)]
+    review_pool_duplicate_exclusions: Option<u64>,
+}
+
+fn safe_manifest_name(name: &str) -> Result<(), String> {
+    let mut components = Path::new(name).components();
+    let reserved = name.split('.').next().map(str::to_ascii_lowercase).is_some_and(|base| {
+        matches!(base.as_str(), "con" | "prn" | "aux" | "nul")
+            || (base.len() == 4
+                && (base.starts_with("com") || base.starts_with("lpt"))
+                && matches!(base.as_bytes()[3], b'1'..=b'9'))
+    });
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.eq_ignore_ascii_case(MANIFEST_FILE)
+        || !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+        || name.contains(['/', '\\'])
+        || name.chars().any(|ch| ch.is_control() || "<>:\"|?*".contains(ch))
+        || name.ends_with([' ', '.'])
+        || reserved
+    {
+        return Err(format!("snapshot manifest contains unsafe file path '{name}'"));
+    }
+    Ok(())
+}
+
+/// Exact byte identity of one snapshot artifact as captured into a private restore image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotArtifactDigest {
+    size_bytes: u64,
+    sha256: String,
+}
+
+/// Typed identity of a complete snapshot generation. The manifest is separated from its declared
+/// artifacts so a manifest-less legacy tree can never compare equal to a manifest-bound generation
+/// merely because their database/config bytes happen to match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotGenerationDigest {
+    manifest: Option<SnapshotArtifactDigest>,
+    artifacts: std::collections::BTreeMap<String, SnapshotArtifactDigest>,
+}
+
+impl SnapshotGenerationDigest {
+    fn from_files(mut files: std::collections::BTreeMap<String, SnapshotArtifactDigest>) -> Self {
+        let manifest = files.remove(MANIFEST_FILE);
+        Self { manifest, artifacts: files }
+    }
+}
+
+/// Unique private directory owned by one preflight. It is never promoted and is removed when the
+/// in-memory staged database and owned config plan have been produced.
+#[derive(Debug)]
+struct PrivateSnapshotDirectory {
+    root: PathBuf,
+}
+
+impl PrivateSnapshotDirectory {
+    fn create() -> Result<Self, String> {
+        let temp_root = std::env::temp_dir();
+        for _ in 0..16 {
+            let root =
+                temp_root.join(format!("cortex-verified-snapshot-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+            match fs::create_dir(&root) {
+                Ok(()) => return Ok(Self { root }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!("could not create private verified-snapshot directory: {error}"));
+                }
+            }
+        }
+        Err("could not allocate a unique private verified-snapshot directory".to_string())
+    }
+}
+
+impl Drop for PrivateSnapshotDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.root) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %self.root.display(), %error, "could not remove private verified-snapshot directory");
+            }
+        }
+    }
+}
+
+fn snapshot_regular_files(snapshot_dir: &Path) -> Result<std::collections::BTreeMap<String, PathBuf>, String> {
+    let root_metadata =
+        fs::symlink_metadata(snapshot_dir).map_err(|error| format!("snapshot directory is unreadable: {error}"))?;
+    if !root_metadata.file_type().is_dir() || root_metadata.file_type().is_symlink() {
+        return Err("snapshot source must be a regular, non-symlink directory".to_string());
+    }
+
+    let mut files = std::collections::BTreeMap::new();
+    let mut folded = std::collections::HashSet::new();
+    let entries = fs::read_dir(snapshot_dir).map_err(|error| format!("snapshot directory is unreadable: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("snapshot directory entry is unreadable: {error}"))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| "snapshot contains a non-UTF-8 file name".to_string())?
+            .to_string();
+        if name != MANIFEST_FILE {
+            safe_manifest_name(&name)?;
+        }
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("snapshot file '{name}' is unreadable: {error}"))?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(format!("snapshot file '{name}' must be a regular, non-symlink file"));
+        }
+        if !folded.insert(name.to_lowercase()) || files.insert(name.clone(), entry.path()).is_some() {
+            return Err(format!("snapshot tree contains a duplicate/case-colliding file '{name}'"));
+        }
+    }
+    Ok(files)
+}
+
+fn digest_bytes(hasher: Sha256, size_bytes: u64) -> SnapshotArtifactDigest {
+    let sha256 = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    SnapshotArtifactDigest { size_bytes, sha256 }
+}
+
+fn hash_snapshot_file(path: &Path, name: &str) -> Result<SnapshotArtifactDigest, String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("snapshot file '{name}' is unreadable: {error}"))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!("snapshot file '{name}' must be a regular, non-symlink file"));
+    }
+    let mut source = fs::File::open(path).map_err(|error| format!("snapshot file '{name}' is unreadable: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read =
+            source.read(&mut buffer).map_err(|error| format!("snapshot file '{name}' could not be hashed: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size_bytes = size_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| format!("snapshot file '{name}' is too large to identify"))?;
+    }
+    Ok(digest_bytes(hasher, size_bytes))
+}
+
+fn copy_snapshot_file(
+    source_path: &Path,
+    destination_path: &Path,
+    name: &str,
+) -> Result<SnapshotArtifactDigest, String> {
+    let metadata =
+        fs::symlink_metadata(source_path).map_err(|error| format!("snapshot file '{name}' is unreadable: {error}"))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!("snapshot file '{name}' must be a regular, non-symlink file"));
+    }
+    let mut source = fs::File::open(source_path)
+        .map_err(|error| format!("snapshot file '{name}' could not be opened for private capture: {error}"))?;
+    let mut destination = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination_path)
+        .map_err(|error| format!("snapshot file '{name}' could not be privately staged: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|error| format!("snapshot file '{name}' could not be privately captured: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        destination
+            .write_all(&buffer[..read])
+            .map_err(|error| format!("snapshot file '{name}' private capture could not be written: {error}"))?;
+        hasher.update(&buffer[..read]);
+        size_bytes = size_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| format!("snapshot file '{name}' is too large to capture"))?;
+    }
+    destination
+        .sync_all()
+        .map_err(|error| format!("snapshot file '{name}' private capture could not be flushed: {error}"))?;
+    Ok(digest_bytes(hasher, size_bytes))
+}
+
+fn snapshot_generation_digest(snapshot_dir: &Path) -> Result<SnapshotGenerationDigest, String> {
+    let files = snapshot_regular_files(snapshot_dir)?;
+    let digests = files
+        .into_iter()
+        .map(|(name, path)| hash_snapshot_file(&path, &name).map(|digest| (name, digest)))
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    Ok(SnapshotGenerationDigest::from_files(digests))
+}
+
+/// One immutable, private snapshot generation. Source bytes are copied and hashed through the SAME
+/// read stream. The source generation is then re-identified with a typed manifest+inventory digest;
+/// all later semantic parsing and SQLite staging use only this owned directory.
+pub(crate) struct VerifiedSnapshotImage {
+    directory: PrivateSnapshotDirectory,
+    digest: SnapshotGenerationDigest,
+    manifest_verified: bool,
+}
+
+impl VerifiedSnapshotImage {
+    pub(crate) fn capture<F>(snapshot_dir: &Path, after_capture: F) -> Result<Self, String>
+    where
+        F: FnOnce(),
+    {
+        let source_files = snapshot_regular_files(snapshot_dir)?;
+        let directory = PrivateSnapshotDirectory::create()?;
+        let captured = source_files
+            .into_iter()
+            .map(|(name, source)| {
+                let destination = directory.root.join(&name);
+                copy_snapshot_file(&source, &destination, &name).map(|digest| (name, digest))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+        let digest = SnapshotGenerationDigest::from_files(captured);
+
+        // Fault-injection boundary used by restore tests: source mutation here is exactly the old
+        // hash-before-parse/stage window. The authoritative bytes are already private, but a changed
+        // promoted source is still refused rather than silently restoring a generation no longer at
+        // the selected path.
+        after_capture();
+        let current = snapshot_generation_digest(snapshot_dir)
+            .map_err(|error| format!("snapshot source generation digest mismatch during restore preflight: {error}"))?;
+        if current != digest {
+            return Err("snapshot source generation digest mismatch during restore preflight".to_string());
+        }
+
+        let private_digest = snapshot_generation_digest(&directory.root)?;
+        if private_digest != digest {
+            return Err("private snapshot image digest mismatch before manifest verification".to_string());
+        }
+        let manifest_verified = verify_snapshot_manifest_for_restore(&directory.root)?;
+        let verified_digest = snapshot_generation_digest(&directory.root)?;
+        if verified_digest != digest {
+            return Err("private snapshot image digest mismatch during manifest verification".to_string());
+        }
+        Ok(Self { directory, digest, manifest_verified })
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.directory.root
+    }
+
+    pub(crate) fn database_path(&self) -> PathBuf {
+        self.directory.root.join(DB_FILE)
+    }
+
+    pub(crate) fn manifest_verified(&self) -> bool {
+        self.manifest_verified
+    }
+
+    pub(crate) fn verify_owned_digest(&self) -> Result<(), String> {
+        if snapshot_generation_digest(&self.directory.root)? != self.digest {
+            return Err("private snapshot image digest mismatch before restore staging".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn read_pragma_strings(connection: &rusqlite::Connection, pragma: &str) -> Result<Vec<String>, String> {
+    let mut statement = connection.prepare(pragma).map_err(|error| format!("snapshot DB evidence failed: {error}"))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("snapshot DB evidence failed: {error}"))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|error| format!("snapshot DB evidence failed: {error}"))
+}
+
+fn inspect_schema2_database_evidence(path: &Path) -> Result<SnapshotDatabaseEvidence, String> {
+    let source = crate::db::Database::open_immutable_connection(path)
+        .map_err(|error| format!("schema-2 snapshot database could not be opened immutable: {error}"))?;
+    let mut connection = rusqlite::Connection::open_in_memory()
+        .map_err(|error| format!("schema-2 evidence staging could not be opened: {error}"))?;
+    {
+        let backup = rusqlite::backup::Backup::new(&source, &mut connection)
+            .map_err(|error| format!("schema-2 evidence staging failed: {error}"))?;
+        backup
+            .run_to_completion(4096, std::time::Duration::from_millis(1), None)
+            .map_err(|error| format!("schema-2 evidence staging failed: {error}"))?;
+    }
+    let nonnegative = |table: &str| -> Result<u64, String> {
+        let value: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| row.get(0))
+            .map_err(|error| format!("schema-2 snapshot database could not count {table}: {error}"))?;
+        u64::try_from(value).map_err(|_| format!("schema-2 snapshot database has a negative count for {table}"))
+    };
+    let foreign_key_violation_count = {
+        let mut statement = connection
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(|error| format!("schema-2 snapshot foreign-key evidence failed: {error}"))?;
+        let mut rows =
+            statement.query([]).map_err(|error| format!("schema-2 snapshot foreign-key evidence failed: {error}"))?;
+        let mut count = 0u64;
+        while rows.next().map_err(|error| format!("schema-2 snapshot foreign-key evidence failed: {error}"))?.is_some()
+        {
+            count = count.saturating_add(1);
+        }
+        count
+    };
+    let schema_version: i64 = connection
+        .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |row| row.get(0))
+        .map_err(|error| format!("schema-2 snapshot migration history is unavailable: {error}"))?;
+    let count_from = |introduced_in: i64, table: &str| -> Result<Option<u64>, String> {
+        if schema_version >= introduced_in {
+            nonnegative(table).map(Some)
+        } else {
+            Ok(None)
+        }
+    };
+    Ok(SnapshotDatabaseEvidence {
+        quick_check: read_pragma_strings(&connection, "PRAGMA quick_check")?,
+        integrity_check: read_pragma_strings(&connection, "PRAGMA integrity_check")?,
+        foreign_key_violation_count,
+        schema_version: u64::try_from(schema_version)
+            .map_err(|_| "schema-2 snapshot has a negative migration version".to_string())?,
+        row_counts: SnapshotRowCounts {
+            speech_segments: nonnegative("speech_segments")?,
+            review_events: nonnegative("review_events")?,
+            spot_checks: nonnegative("spot_checks")?,
+            model_versions: nonnegative("model_versions")?,
+            import_jobs: nonnegative("import_jobs")?,
+            import_job_files: nonnegative("import_job_files")?,
+            review_pilot_hidden_keys: count_from(59, "review_pilot_hidden_keys")?,
+            review_campaign_registry: count_from(61, "review_campaign_registry")?,
+            review_campaign_focus: count_from(61, "review_campaign_focus")?,
+            review_campaign_transitions: count_from(61, "review_campaign_transitions")?,
+            independent_review_decisions: count_from(61, "independent_review_decisions")?,
+            independent_review_reversals: count_from(61, "independent_review_reversals")?,
+            review_campaign_adjudications: count_from(61, "review_campaign_adjudications")?,
+            review_pool_registry: count_from(62, "review_pool_registry")?,
+            review_pool_members: count_from(62, "review_pool_members")?,
+            review_pool_decisions: count_from(62, "review_pool_decisions")?,
+            review_pool_reversals: count_from(62, "review_pool_reversals")?,
+            review_pool_owner_adjudications: count_from(63, "review_pool_owner_adjudications")?,
+            review_pool_voice_certificates: count_from(63, "review_pool_voice_certificates")?,
+            review_pool_dedup_manifests: count_from(64, "review_pool_dedup_manifests")?,
+            review_pool_duplicate_exclusions: count_from(64, "review_pool_duplicate_exclusions")?,
+        },
+    })
+}
+
+fn validate_champion_pointer(bytes: &[u8]) -> Result<(), String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| format!("champion.json is invalid JSON: {error}"))?;
+    let root = value.as_object().ok_or_else(|| "champion.json must be an object".to_string())?;
+    if root.len() != 2 || !root.contains_key("schema") || !root.contains_key("champions") {
+        return Err("champion.json must contain exactly schema and champions".to_string());
+    }
+    if root.get("schema").and_then(serde_json::Value::as_u64) != Some(2) {
+        return Err("champion.json schema must be exactly 2".to_string());
+    }
+    let champions = root
+        .get("champions")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "champion.json champions must be an object".to_string())?;
+    let expected: std::collections::HashSet<&str> =
+        ["modelVersionId", "deploymentManifestPath", "deploymentSha256", "source", "license"].into_iter().collect();
+    for (family, entry) in champions {
+        if family.trim().is_empty() {
+            return Err("champion.json contains an empty family name".to_string());
+        }
+        let object = entry.as_object().ok_or_else(|| format!("champion.json family '{family}' must be an object"))?;
+        if object.keys().map(String::as_str).collect::<std::collections::HashSet<_>>() != expected {
+            return Err(format!("champion.json family '{family}' has an invalid field set"));
+        }
+        if object.values().any(|value| !value.is_string()) {
+            return Err(format!("champion.json family '{family}' fields must all be strings"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_present_optional_state(name: &str, bytes: &[u8]) -> Result<(), String> {
+    match name {
+        "settings.json" => crate::settings::AppSettings::parse_recovery_bytes(bytes).map(|_| ()),
+        "champion.json" => validate_champion_pointer(bytes),
+        "reviewer_dialects.json" => {
+            let text =
+                std::str::from_utf8(bytes).map_err(|error| format!("reviewer_dialects.json is not UTF-8: {error}"))?;
+            crate::dialect::parse_roster_text(text).map(|_| ())
+        }
+        "voice_focus.json" => {
+            let text = std::str::from_utf8(bytes).map_err(|error| format!("voice_focus.json is not UTF-8: {error}"))?;
+            crate::voice_focus::parse_focus_text(text).map(|_| ())
+        }
+        _ => Err(format!("unknown optional snapshot state '{name}'")),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OptionalSnapshotRestore {
+    Install(Vec<u8>),
+    ExplicitlyAbsent,
+    /// Manifestless historical trees cannot prove whether a missing file was intentional. Preserve
+    /// the current live state rather than silently widening/removing a routing policy.
+    PreserveLegacy,
+}
+
+pub(crate) fn inspect_optional_state_for_restore(
+    snapshot_dir: &Path,
+    state: OptionalSnapshotState,
+    manifest_verified: bool,
+) -> Result<OptionalSnapshotRestore, String> {
+    let live = snapshot_dir.join(state.live_file);
+    let absent = snapshot_dir.join(state.absent_file);
+    let read_optional = |path: &Path| -> Result<Option<Vec<u8>>, String> {
+        match fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("snapshot state {} is unreadable: {error}", path.display())),
+        }
+    };
+    match (read_optional(&live)?, read_optional(&absent)?) {
+        (Some(_), Some(_)) => {
+            Err(format!("snapshot is ambiguous: it contains both {} and {}", state.live_file, state.absent_file))
+        }
+        (Some(bytes), None) => {
+            validate_present_optional_state(state.live_file, &bytes)?;
+            Ok(OptionalSnapshotRestore::Install(bytes))
+        }
+        (None, Some(marker)) => {
+            if marker != state.absent_bytes {
+                return Err(format!("snapshot {} has invalid contents", state.absent_file));
+            }
+            Ok(OptionalSnapshotRestore::ExplicitlyAbsent)
+        }
+        (None, None) if manifest_verified => {
+            Err(format!("manifest-bearing snapshot is missing both {} and {}", state.live_file, state.absent_file))
+        }
+        (None, None) => {
+            tracing::warn!(
+                "LEGACY MANIFEST-LESS SNAPSHOT: neither {} nor {} is present; preserving current live state",
+                state.live_file,
+                state.absent_file
+            );
+            Ok(OptionalSnapshotRestore::PreserveLegacy)
+        }
+    }
+}
+
+/// Verify the complete recovery contract without mutating the snapshot tree.
+///
+/// Public so the read-only private-production certifier can reject a fresh-looking directory whose
+/// manifest, database evidence, or file hashes no longer verify. Restore uses this same authority.
+pub fn verify_snapshot_manifest_for_restore(snapshot_dir: &Path) -> Result<bool, String> {
+    let manifest_path = snapshot_dir.join(MANIFEST_FILE);
+    let raw = match fs::read(&manifest_path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("snapshot manifest is unreadable: {error}")),
+    };
+    let probe: serde_json::Value =
+        serde_json::from_slice(&raw).map_err(|error| format!("snapshot manifest is invalid JSON: {error}"))?;
+    let schema = probe
+        .get("schema")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "snapshot manifest schema must be exactly integer 1 or 2".to_string())?;
+    let (files, database_evidence) = match schema {
+        1 => {
+            let manifest: SnapshotManifestV1 = serde_json::from_slice(&raw)
+                .map_err(|error| format!("snapshot schema-1 manifest contract is invalid: {error}"))?;
+            if manifest.schema != 1 || manifest.review_pilot_policy_state_schema != 1 {
+                return Err("snapshot schema-1 manifest policy-state schema must be exactly 1".to_string());
+            }
+            if manifest.app_git_sha.is_empty() {
+                return Err("snapshot manifest appGitSha must be non-empty".to_string());
+            }
+            let _ = manifest.created_at_epoch_secs;
+            (manifest.files, None)
+        }
+        2 => {
+            let manifest: SnapshotManifestV2 = serde_json::from_slice(&raw)
+                .map_err(|error| format!("snapshot schema-2 manifest contract is invalid: {error}"))?;
+            if manifest.schema != 2 || manifest.app_git_sha.is_empty() || manifest.source_data_dir.is_empty() {
+                return Err("snapshot schema-2 manifest identity fields are invalid".to_string());
+            }
+            let _ = manifest.created_at_epoch_secs;
+            (manifest.files, Some(manifest.database_evidence))
+        }
+        _ => return Err("snapshot manifest schema must be exactly integer 1 or 2".to_string()),
+    };
+
+    let mut declared = std::collections::BTreeMap::<String, SnapshotManifestFile>::new();
+    let mut declared_folded = std::collections::HashSet::new();
+    for row in files {
+        safe_manifest_name(&row.path)?;
+        let folded = row.path.to_lowercase();
+        if !declared_folded.insert(folded) || declared.insert(row.path.clone(), row).is_some() {
+            return Err("snapshot manifest contains a duplicate/case-colliding file".to_string());
+        }
+    }
+    let mut actual = std::collections::BTreeMap::<String, PathBuf>::new();
+    let mut actual_folded = std::collections::HashSet::new();
+    let entries = fs::read_dir(snapshot_dir).map_err(|error| format!("snapshot directory is unreadable: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("snapshot directory entry is unreadable: {error}"))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| "snapshot contains a non-UTF-8 file name".to_string())?
+            .to_string();
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("snapshot file '{name}' is unreadable: {error}"))?;
+        if name == MANIFEST_FILE {
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                return Err("snapshot manifest must be a regular, non-symlink file".to_string());
+            }
+            continue;
+        }
+        safe_manifest_name(&name)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(format!("snapshot file '{name}' must be a regular, non-symlink file"));
+        }
+        if !actual_folded.insert(name.to_lowercase()) || actual.insert(name.clone(), entry.path()).is_some() {
+            return Err(format!("snapshot tree contains a duplicate/case-colliding file '{name}'"));
+        }
+    }
+    let declared_names = declared.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+    let actual_names = actual.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+    if declared_names != actual_names {
+        let missing = declared_names.difference(&actual_names).cloned().collect::<Vec<_>>();
+        let unlisted = actual_names.difference(&declared_names).cloned().collect::<Vec<_>>();
+        return Err(format!("snapshot manifest inventory is not exact (missing={missing:?}, unlisted={unlisted:?})"));
+    }
+    for (name, row) in &declared {
+        if row.sha256.len() != 64
+            || !row.sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(format!("snapshot manifest SHA-256 for '{name}' must be 64 lowercase hex digits"));
+        }
+        let path = &actual[name];
+        let metadata = fs::metadata(path).map_err(|error| format!("snapshot file '{name}' is unreadable: {error}"))?;
+        if metadata.len() != row.size_bytes {
+            return Err(format!(
+                "snapshot manifest size mismatch for '{name}': expected {}, got {}",
+                row.size_bytes,
+                metadata.len()
+            ));
+        }
+        let actual_sha = crate::models::compute_file_sha256(path)
+            .map_err(|error| format!("snapshot manifest could not hash '{name}': {error}"))?;
+        if actual_sha != row.sha256 {
+            return Err(format!("snapshot manifest SHA-256 mismatch for '{name}'"));
+        }
+    }
+
+    if !declared.contains_key(DB_FILE) {
+        return Err(format!("snapshot manifest is incomplete: missing required '{DB_FILE}'"));
+    }
+    for state in OPTIONAL_SNAPSHOT_STATE {
+        let present = declared.contains_key(state.live_file);
+        let absent = declared.contains_key(state.absent_file);
+        if present == absent {
+            return Err(format!(
+                "snapshot manifest must contain exactly one of {} or {}",
+                state.live_file, state.absent_file
+            ));
+        }
+        if present {
+            validate_present_optional_state(
+                state.live_file,
+                &fs::read(&actual[state.live_file]).map_err(|error| {
+                    format!("snapshot state {} is unreadable after hash verification: {error}", state.live_file)
+                })?,
+            )?;
+        } else if fs::read(&actual[state.absent_file])
+            .map_err(|error| format!("snapshot absence marker {} is unreadable: {error}", state.absent_file))?
+            != state.absent_bytes
+        {
+            return Err(format!("snapshot absence marker {} has invalid contents", state.absent_file));
+        }
+    }
+    let policy_present = declared.contains_key(crate::review_pilot::REVIEW_PILOT_FILE);
+    let absence_present = declared.contains_key(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE);
+    if policy_present == absence_present {
+        return Err(format!(
+            "snapshot manifest must contain exactly one of {} or {}",
+            crate::review_pilot::REVIEW_PILOT_FILE,
+            crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE
+        ));
+    }
+    if policy_present {
+        let bytes = fs::read(&actual[crate::review_pilot::REVIEW_PILOT_FILE])
+            .map_err(|error| format!("snapshot pilot policy is unreadable: {error}"))?;
+        let text =
+            std::str::from_utf8(&bytes).map_err(|error| format!("snapshot pilot policy is not UTF-8: {error}"))?;
+        let policy = crate::review_pilot::parse(text)?;
+        crate::review_pilot::validate_controlled_focus(snapshot_dir)
+            .map_err(|error| format!("snapshot controlled-pilot focus is invalid: {error}"))?;
+        let connection = crate::db::Database::open_immutable_connection(&actual[DB_FILE])
+            .map_err(|error| format!("snapshot pilot policy could not bind to its database: {error}"))?;
+        let max_event_id: i64 = connection
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM review_events", [], |row| row.get(0))
+            .map_err(|error| format!("snapshot pilot baseline could not be verified: {error}"))?;
+        if policy.after_review_event_id > max_event_id {
+            return Err(format!(
+                "snapshot pilot baseline {} is ahead of its database review-event maximum {max_event_id}",
+                policy.after_review_event_id
+            ));
+        }
+        validate_active_pilot_snapshot_authority(&connection, None, None, &policy)
+            .map_err(|error| format!("snapshot pilot hidden-key authority is incomplete or incoherent: {error}"))?;
+    } else if fs::read(&actual[crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE])
+        .map_err(|error| format!("snapshot pilot absence marker is unreadable: {error}"))?
+        != crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_BYTES
+    {
+        return Err(format!("snapshot {} has invalid contents", crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE));
+    }
+    if let Some(expected) = database_evidence {
+        let actual_evidence = inspect_schema2_database_evidence(&actual[DB_FILE])?;
+        if actual_evidence.quick_check != ["ok"] || actual_evidence.integrity_check != ["ok"] {
+            return Err(format!("schema-2 snapshot database failed SQLite checks: {actual_evidence:?}"));
+        }
+        if actual_evidence != expected {
+            return Err(format!(
+                "schema-2 snapshot database evidence does not match its manifest: expected {expected:?}, got {actual_evidence:?}"
+            ));
+        }
+    }
+    Ok(true)
+}
+
+/// Required state a restore cannot come back without.
+///
+/// The PRODUCTION consumer of this contract is `scripts/restore_drill.py`, which reads a snapshot
+/// from outside the app (the app may not be installable on the machine doing the recovery). This
+/// Rust copy exists so the writer's own test asserts the same required set the drill enforces — if
+/// the two ever disagree, a snapshot could satisfy one and fail the other.
+#[cfg(test)]
+pub(crate) fn manifest_missing_required(manifest: &serde_json::Value) -> Vec<String> {
+    let present: Vec<&str> = manifest
+        .get("files")
+        .and_then(|f| f.as_array())
+        .map(|rows| rows.iter().filter_map(|r| r.get("path").and_then(|p| p.as_str())).collect())
+        .unwrap_or_default();
+    let mut missing = Vec::new();
+    if !present.contains(&DB_FILE) {
+        missing.push(DB_FILE.to_string());
+    }
+    for state in OPTIONAL_SNAPSHOT_STATE {
+        if !present.contains(&state.live_file) && !present.contains(&state.absent_file) {
+            missing.push(state.live_file.to_string());
+        }
+    }
+    if !present.contains(&crate::review_pilot::REVIEW_PILOT_FILE)
+        && !present.contains(&crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE)
+    {
+        missing.push(crate::review_pilot::REVIEW_PILOT_FILE.to_string());
+    }
+    missing
 }
 
 /// Staging dirs start with '.', so no `snapshot_`/`<label>_` scan ever counts one.
 const STAGING_PREFIX: &str = ".staging_";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotFaultPoint {
+    AfterStageFilesSynced,
+    AfterStageDirectorySynced,
+    AfterStageVerified,
+    AfterRenameBeforeParentSync,
+    AfterDurablePromotion,
+    BeforePrune,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SNAPSHOT_FAULT: std::cell::Cell<Option<SnapshotFaultPoint>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn maybe_inject_snapshot_fault(point: SnapshotFaultPoint) -> AppResult<()> {
+    let injected = SNAPSHOT_FAULT.with(|fault| {
+        if fault.get() == Some(point) {
+            fault.set(None);
+            true
+        } else {
+            false
+        }
+    });
+    if injected {
+        Err(AppError::Other(format!("injected snapshot durability fault at {point:?}")))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_inject_snapshot_fault(_point: SnapshotFaultPoint) -> AppResult<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn with_snapshot_fault<T>(point: SnapshotFaultPoint, operation: impl FnOnce() -> T) -> T {
+    struct ResetSnapshotFault;
+    impl Drop for ResetSnapshotFault {
+        fn drop(&mut self) {
+            SNAPSHOT_FAULT.with(|fault| fault.set(None));
+        }
+    }
+
+    SNAPSHOT_FAULT.with(|fault| {
+        assert!(fault.replace(Some(point)).is_none(), "snapshot fault injection must not be nested");
+    });
+    let _reset = ResetSnapshotFault;
+    operation()
+}
+
+/// Flush every regular staged file (including `manifest.json`) and then the staging directory's
+/// entries. Verification happens only after both barriers, so a manifest cannot certify bytes that
+/// were never accepted by stable storage.
+fn sync_snapshot_staging(staging: &Path) -> AppResult<()> {
+    let files = snapshot_regular_files(staging).map_err(|error| {
+        AppError::Other(format!("snapshot staging could not be inventoried before durability sync: {error}"))
+    })?;
+    if !files.contains_key(MANIFEST_FILE) {
+        return Err(AppError::Other(format!("snapshot staging cannot be committed without {MANIFEST_FILE}")));
+    }
+    for (name, path) in files {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| AppError::Other(format!("snapshot staged file '{name}' could not be flushed: {error}")))?;
+    }
+    maybe_inject_snapshot_fault(SnapshotFaultPoint::AfterStageFilesSynced)?;
+    crate::atomic_file::fsync_directory_strict(staging).map_err(|error| {
+        AppError::Other(format!(
+            "snapshot staging directory entries could not be durably flushed at {}: {error}",
+            staging.display()
+        ))
+    })?;
+    maybe_inject_snapshot_fault(SnapshotFaultPoint::AfterStageDirectorySynced)
+}
+
+#[cfg(target_os = "windows")]
+fn rename_snapshot_directory_write_through(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
+    }
+
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let destination_wide: Vec<u16> = destination.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // SAFETY: both buffers are NUL-terminated and remain live for the call. No replacement flag is
+    // supplied, so an existing snapshot generation is never overwritten. WRITE_THROUGH is the
+    // Windows filesystem durability boundary for this same-volume directory promotion.
+    if unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn rename_snapshot_directory_write_through(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+fn promote_snapshot_directory(staging: &Path, final_path: &Path) -> AppResult<()> {
+    match fs::symlink_metadata(final_path) {
+        Ok(_) => {
+            return Err(AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("snapshot destination already exists: {}", final_path.display()),
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(AppError::Io(error)),
+    }
+    rename_snapshot_directory_write_through(staging, final_path).map_err(AppError::Io)?;
+    maybe_inject_snapshot_fault(SnapshotFaultPoint::AfterRenameBeforeParentSync)?;
+    crate::atomic_file::fsync_parent_dir_strict(final_path).map_err(|error| {
+        AppError::Other(format!(
+            "snapshot promotion reached {} but its parent rename could not be durably flushed: {error}",
+            final_path.display()
+        ))
+    })
+}
+
+/// Reopen the promoted SQLite file independently of the writer connection and then revalidate the
+/// complete manifest from its final name. This is the last commit boundary before any old recovery
+/// generation may be pruned.
+fn verify_promoted_snapshot(snapshot_dir: &Path) -> AppResult<()> {
+    match verify_snapshot_manifest_for_restore(snapshot_dir) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(AppError::Other(format!(
+                "promoted snapshot unexpectedly has no {MANIFEST_FILE}: {}",
+                snapshot_dir.display()
+            )))
+        }
+        Err(error) => {
+            return Err(AppError::Other(format!("promoted snapshot failed its final manifest verification: {error}")))
+        }
+    }
+
+    let database_path = snapshot_dir.join(DB_FILE);
+    let source = crate::db::Database::open_immutable_connection(&database_path).map_err(|error| {
+        AppError::Other(format!(
+            "promoted snapshot database could not be reopened immutable at {}: {error}",
+            database_path.display()
+        ))
+    })?;
+    // FTS5's integrity path may use temporary writes and can report "attempt to write a readonly
+    // database" against a perfectly healthy immutable source. Reopening the final file is still the
+    // authority; copy those exact pages into an isolated in-memory probe before quick_check, matching
+    // the restore-staging boundary without ever mutating the snapshot.
+    let mut probe = rusqlite::Connection::open_in_memory()
+        .map_err(|error| AppError::Other(format!("promoted snapshot final reopen probe could not start: {error}")))?;
+    {
+        let backup = rusqlite::backup::Backup::new(&source, &mut probe)
+            .map_err(|error| AppError::Other(format!("promoted snapshot final reopen probe failed: {error}")))?;
+        backup
+            .run_to_completion(4096, std::time::Duration::from_millis(1), None)
+            .map_err(|error| AppError::Other(format!("promoted snapshot final reopen probe failed: {error}")))?;
+    }
+    let quick_check = read_pragma_strings(&probe, "PRAGMA quick_check").map_err(|error| {
+        AppError::Other(format!("promoted snapshot database could not complete quick_check: {error}"))
+    })?;
+    if quick_check != ["ok"] {
+        return Err(AppError::Other(format!("promoted snapshot database failed final quick_check: {quick_check:?}")));
+    }
+    Ok(())
+}
+
+fn commit_snapshot_generation(staging: &Path, final_path: &Path) -> AppResult<()> {
+    sync_snapshot_staging(staging)?;
+    match verify_snapshot_manifest_for_restore(staging) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(AppError::Other(format!(
+                "snapshot staging unexpectedly has no {MANIFEST_FILE} after durability sync"
+            )))
+        }
+        Err(error) => {
+            return Err(AppError::Other(format!(
+                "snapshot refused before promotion because its durable recovery contract is incomplete: {error}"
+            )))
+        }
+    }
+    maybe_inject_snapshot_fault(SnapshotFaultPoint::AfterStageVerified)?;
+    promote_snapshot_directory(staging, final_path)?;
+    maybe_inject_snapshot_fault(SnapshotFaultPoint::AfterDurablePromotion)?;
+    verify_promoted_snapshot(final_path)
+}
+
+fn prune_same_label_pins_best_effort(pinned_root: &Path, label: &str, keep_pinned: usize, committed_pin: &Path) {
+    let entries = match fs::read_dir(pinned_root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(
+                "pinned snapshot committed; could not enumerate same-label pins under {} for pruning: {error}",
+                pinned_root.display()
+            );
+            return;
+        }
+    };
+    let prefix = format!("{label}_");
+    let mut same_label: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with(&prefix))
+        })
+        .collect();
+    same_label.sort();
+    let keep_count = keep_pinned.max(1);
+    let mut keep = std::collections::HashSet::from([committed_pin.to_path_buf()]);
+    for path in same_label.iter().rev().filter(|path| path.as_path() != committed_pin) {
+        if keep.len() >= keep_count {
+            break;
+        }
+        keep.insert(path.clone());
+    }
+    for old_pin in same_label {
+        if !keep.contains(&old_pin) {
+            if let Err(error) = fs::remove_dir_all(&old_pin) {
+                tracing::warn!("pinned snapshot: could not prune {}: {error}", old_pin.display());
+            }
+        }
+    }
+}
+
 /// Best-effort removal of a staging dir after a failed build (warn, never fail the caller further).
 fn remove_staging_dir(staging: &Path) {
-    if let Err(e) = fs::remove_dir_all(staging) {
-        tracing::warn!("snapshot: could not remove staging dir {}: {e}", staging.display());
+    if let Err(error) = fs::remove_dir_all(staging) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("snapshot: could not remove staging dir {}: {error}", staging.display());
+        }
     }
 }
 
@@ -328,33 +1776,84 @@ fn has_any_snapshot(snapshots_root: &Path) -> bool {
     })
 }
 
+fn parse_fixed_timestamp(value: &str) -> Option<u64> {
+    (value.len() == 10 && value.bytes().all(|byte| byte.is_ascii_digit())).then(|| value.parse().ok()).flatten()
+}
+
+fn parse_pinned_name(value: &str) -> Option<u64> {
+    let (label, timestamp) = value.rsplit_once('_')?;
+    let valid_label = !label.is_empty()
+        && label.len() <= 64
+        && label.bytes().next().is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+    valid_label.then(|| parse_fixed_timestamp(timestamp)).flatten()
+}
+
+/// Resolve the opaque selector returned by `list_snapshots` without ever accepting an arbitrary
+/// filesystem path. Rotating selectors are `snapshot_<10 digits>`; rotation-exempt/recovery pins are
+/// `pinned/<safe-label>_<10 digits>`. This is the single app restore path for Rust schema-1 and
+/// headless schema-2 artifacts.
+pub(crate) fn resolve_snapshot_dir(data_dir: &Path, selector: &str) -> Result<PathBuf, String> {
+    let root = data_dir.join("snapshots");
+    let path = if let Some(timestamp) = selector.strip_prefix(SNAPSHOT_PREFIX) {
+        if parse_fixed_timestamp(timestamp).is_none() {
+            return Err(format!("invalid snapshot selector '{selector}'"));
+        }
+        root.join(selector)
+    } else if let Some(name) = selector.strip_prefix("pinned/") {
+        if name.contains(['/', '\\']) || parse_pinned_name(name).is_none() {
+            return Err(format!("invalid pinned snapshot selector '{selector}'"));
+        }
+        root.join(PINNED_DIR).join(name)
+    } else {
+        return Err(format!("invalid snapshot selector '{selector}'"));
+    };
+    let metadata =
+        fs::symlink_metadata(&path).map_err(|error| format!("snapshot '{selector}' is unavailable: {error}"))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!("snapshot '{selector}' must be a real directory, not a link"));
+    }
+    Ok(path)
+}
+
+fn snapshot_info(path: &Path, name: String, timestamp: u64) -> SnapshotInfo {
+    let db_file = path.join(DB_FILE);
+    let db_size_bytes = fs::metadata(&db_file).map(|metadata| metadata.len()).unwrap_or(0);
+    let segment_count = count_snapshot_segments_readonly(&db_file);
+    SnapshotInfo { name, timestamp, db_size_bytes, segment_count }
+}
+
 /// List the existing snapshots (newest first) with the metadata the restore picker shows.
 pub fn list_snapshots(data_dir: &Path) -> Vec<SnapshotInfo> {
     let root = data_dir.join("snapshots");
-    let mut snaps: Vec<SnapshotInfo> = fs::read_dir(&root)
-        .ok()
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
+    let mut snaps = Vec::new();
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
-                return None;
+            let Ok(metadata) = fs::symlink_metadata(&path) else { continue };
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                continue;
             }
-            let name = path.file_name()?.to_str()?.to_string();
-            let ts = name.strip_prefix(SNAPSHOT_PREFIX)?.parse::<u64>().ok()?;
-            let db_file = path.join(DB_FILE);
-            let db_size_bytes = fs::metadata(&db_file).map(|m| m.len()).unwrap_or(0);
-            // Segment count via a strictly READ-ONLY connection. Database::open runs
-            // `PRAGMA journal_mode=WAL` — a WRITE that mutates the file header and spawns -wal/-shm
-            // sidecars. Doing that to a FROZEN snapshot on every restore-picker open / quarantine-banner
-            // poll violates its immutability and could leave a -wal beside it that a later restore
-            // unexpectedly replays. A snapshot that can't open reports None, so a damaged one stays
-            // visibly distinct from an empty one in the picker.
-            let segment_count = count_snapshot_segments_readonly(&db_file);
-            Some(SnapshotInfo { name, timestamp: ts, db_size_bytes, segment_count })
-        })
-        .collect();
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
+            let Some(timestamp) = name.strip_prefix(SNAPSHOT_PREFIX).and_then(parse_fixed_timestamp) else {
+                continue;
+            };
+            snaps.push(snapshot_info(&path, name, timestamp));
+        }
+    }
+    let pinned_root = root.join(PINNED_DIR);
+    if let Ok(entries) = fs::read_dir(&pinned_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&path) else { continue };
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            let Some(base) = entry.file_name().to_str().map(str::to_string) else { continue };
+            let Some(timestamp) = parse_pinned_name(&base) else { continue };
+            snaps.push(snapshot_info(&path, format!("pinned/{base}"), timestamp));
+        }
+    }
     snaps.sort_by_key(|snap| std::cmp::Reverse(snap.timestamp));
     snaps
 }
@@ -363,11 +1862,7 @@ pub fn list_snapshots(data_dir: &Path) -> Vec<SnapshotInfo> {
 /// journal-mode pragma, so a frozen snapshot inspected by the restore picker / quarantine poll is never
 /// written to (see list_snapshots). Returns None if the snapshot can't be opened/read.
 fn count_snapshot_segments_readonly(db_file: &Path) -> Option<i64> {
-    let conn = rusqlite::Connection::open_with_flags(
-        db_file,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
+    let conn = crate::db::Database::open_immutable_connection(db_file).ok()?;
     conn.query_row("SELECT COUNT(*) FROM speech_segments", [], |row| row.get::<_, i64>(0)).ok()
 }
 
@@ -404,6 +1899,15 @@ pub fn prune_snapshots(snapshots_root: &Path, keep: usize) -> AppResult<()> {
 }
 
 pub(crate) fn prune_snapshots_from(snapshots_root: &Path, quarantine_dir: &Path, keep: usize) -> AppResult<()> {
+    prune_snapshots_from_preserving(snapshots_root, quarantine_dir, keep, None)
+}
+
+fn prune_snapshots_from_preserving(
+    snapshots_root: &Path,
+    quarantine_dir: &Path,
+    keep: usize,
+    committed_snapshot: Option<&Path>,
+) -> AppResult<()> {
     if !snapshots_root.is_dir() {
         return Ok(());
     }
@@ -437,6 +1941,12 @@ pub(crate) fn prune_snapshots_from(snapshots_root: &Path, quarantine_dir: &Path,
         .collect();
     let keep_set = select_snapshots_to_keep(&snaps.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(), keep);
     for (ts, path) in snaps {
+        // The just-committed generation is load-bearing even if the wall clock moved backwards and
+        // its embedded timestamp sorts behind older snapshots. Returning success after pruning that
+        // exact directory would let a mandatory pre-migration pin vanish before migration begins.
+        if committed_snapshot.is_some_and(|committed| committed == path.as_path()) {
+            continue;
+        }
         if !keep_set.contains(&ts) {
             if let Err(e) = fs::remove_dir_all(&path) {
                 tracing::warn!("snapshot: could not prune {}: {e}", path.display());
@@ -514,6 +2024,17 @@ pub fn record_snapshot_panic() {
 mod tests {
     use super::*;
 
+    fn current_test_schema_version() -> i64 {
+        crate::migrations::max_supported_version()
+    }
+
+    fn assert_rollback_to(db: &Database, target_version: i64) {
+        let head = current_test_schema_version();
+        let expected = ((target_version + 1)..=head).rev().collect::<Vec<_>>();
+        assert_eq!(crate::migrations::rollback(db, expected.len()).unwrap(), expected);
+        assert_eq!(crate::migrations::get_current_version(db).unwrap(), target_version);
+    }
+
     fn seeded_db() -> Database {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
@@ -525,6 +2046,97 @@ mod tests {
         })
         .unwrap();
         db
+    }
+
+    fn pilot_policy() -> crate::review_pilot::ReviewPilotPolicy {
+        crate::review_pilot::parse(
+            r#"{
+              "schema_version": 1,
+              "after_review_event_id": 0,
+              "max_total_corpus_actions": 20,
+              "reviewers": [
+                {"name": "Hawzhin", "max_corpus_actions": 10},
+                {"name": "Pavel", "max_corpus_actions": 10}
+              ]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn active_pilot_snapshot_requires_exact_current_schema_and_completed_event_grants() {
+        let db = seeded_db();
+        let policy = pilot_policy();
+        validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap();
+
+        db.connection().execute("DROP TRIGGER review_pilot_hidden_keys_quota_insert", []).unwrap();
+        let schema_error = validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap_err();
+        assert!(schema_error.contains("schema contract") && schema_error.contains("missing"), "{schema_error}");
+
+        let db = seeded_db();
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        db.connection()
+            .execute(
+                "INSERT INTO review_events
+                    (segment_id, reviewer, action, source, timestamp_ms, operation_id,
+                     operation_payload_hash, requested_action, requested_transcript,
+                     served_transcript, served_revision, app_git_sha, playback_guard_version)
+                 VALUES ('hidden-complete', 'Hawzhin', 'accept', 'couch_spot_check', 1, ?1,
+                         ?2, 'accept', '', 'ڕەفەرێنس', 0, ?3,
+                         'content-hash-raw-counter-v3')",
+                rusqlite::params![operation_id, "a".repeat(64), crate::GIT_SHA],
+            )
+            .unwrap();
+        let event_error = validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap_err();
+        assert!(event_error.contains("no durable active-policy grant"), "{event_error}");
+    }
+
+    #[test]
+    fn active_pilot_pre_migration_snapshot_accepts_exact_v59_and_rejects_drift() {
+        let db = seeded_db();
+        assert_rollback_to(&db, 59);
+        let policy = pilot_policy();
+
+        validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap();
+
+        db.connection().execute("DROP TRIGGER review_pilot_hidden_keys_quota_insert", []).unwrap();
+        let error = validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap_err();
+        assert!(error.contains("schema contract") && error.contains("missing"), "{error}");
+    }
+
+    #[test]
+    fn active_pilot_snapshot_requires_live_session_keys_to_be_durable() {
+        let profile = tempfile::TempDir::new().unwrap();
+        let db_path = profile.path().join(DB_FILE);
+        let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        db.initialize().unwrap();
+        let policy = pilot_policy();
+        std::fs::write(
+            profile.path().join("couch_session.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "db_path": &db_path,
+                "reviewers": {"token-h": "Hawzhin", "token-p": "Pavel"},
+                "pilot_spot_checks": [["hidden-session", "Hawzhin"]],
+                "pilot_policy": &policy,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("no durable active-policy grant"), "{error}");
+
+        db.connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, 0, 'Hawzhin', 'hidden-session')",
+                [policy.policy_sha256().unwrap()],
+            )
+            .unwrap();
+        validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+            .unwrap();
     }
 
     #[test]
@@ -594,16 +2206,162 @@ mod tests {
     fn take_snapshot_backs_up_db_and_copies_state() {
         let tmp = tempfile::TempDir::new().unwrap();
         let data_dir = tmp.path();
-        std::fs::write(data_dir.join("settings.json"), b"{\"k\":1}").unwrap();
         let db = seeded_db();
 
         let snap = take_snapshot_at(&db, data_dir, 10, 1000).unwrap().expect("non-empty db snapshots");
         // The DB backup opens as a valid database with the row intact.
         let restored = Database::open(snap.join(DB_FILE).to_str().unwrap()).unwrap();
         assert_eq!(restored.segment_count().unwrap(), 1, "the snapshot DB preserves the data");
-        // settings.json was copied; a listed-but-absent champion.json is simply skipped.
+        // The helper seeds the complete new-format recovery contract; every required state file is copied.
         assert!(snap.join("settings.json").is_file(), "config state is copied");
-        assert!(!snap.join("champion.json").exists(), "absent state files are skipped, not errored");
+        assert!(snap.join("champion.json").exists(), "new snapshots cannot promote without required state");
+        assert_eq!(
+            std::fs::read(snap.join(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE)).unwrap(),
+            crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_BYTES,
+            "pilot absence must be explicit; a missing copy can never mean unrestricted mode"
+        );
+        assert!(!snap.join(crate::review_pilot::REVIEW_PILOT_FILE).exists());
+    }
+
+    #[test]
+    fn rotating_snapshot_records_every_legally_absent_config_and_refuses_restore_pending() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let snap = take_snapshot_at_from(&db, tmp.path(), tmp.path(), 10, 1000)
+            .unwrap()
+            .expect("absent defaults are a complete recovery state");
+        for state in OPTIONAL_SNAPSHOT_STATE {
+            assert!(!snap.join(state.live_file).exists());
+            assert_eq!(std::fs::read(snap.join(state.absent_file)).unwrap(), state.absent_bytes);
+        }
+        assert!(verify_snapshot_manifest_for_restore(&snap).unwrap());
+
+        std::fs::write(tmp.path().join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), b"interrupted restore")
+            .unwrap();
+        let error = take_snapshot_at_from(&db, tmp.path(), tmp.path(), 10, 2000).unwrap_err().to_string();
+        assert!(error.contains("restore barrier"), "{error}");
+        assert!(!tmp.path().join("snapshots").join("snapshot_0000002000").exists());
+    }
+
+    #[test]
+    fn rust_restore_verifier_accepts_exact_schema2_headless_contract_and_rejects_evidence_drift() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let snap = take_snapshot_at(&db, tmp.path(), 10, 1000).unwrap().unwrap();
+        let schema1: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(snap.join(MANIFEST_FILE)).unwrap()).unwrap();
+        let evidence = inspect_schema2_database_evidence(&snap.join(DB_FILE)).unwrap();
+        assert_eq!(
+            evidence.schema_version,
+            u64::try_from(current_test_schema_version()).expect("schema version must be non-negative")
+        );
+        assert_eq!(evidence.row_counts.review_pilot_hidden_keys, Some(0));
+        assert_eq!(evidence.row_counts.review_campaign_registry, Some(0));
+        assert_eq!(evidence.row_counts.review_pool_registry, Some(0));
+        assert_eq!(evidence.row_counts.review_pool_owner_adjudications, Some(0));
+        assert_eq!(evidence.row_counts.review_pool_voice_certificates, Some(0));
+        assert_eq!(evidence.row_counts.review_pool_dedup_manifests, Some(0));
+        assert_eq!(evidence.row_counts.review_pool_duplicate_exclusions, Some(0));
+        let schema2 = serde_json::json!({
+            "schema": 2,
+            "createdAtEpochSecs": 1000,
+            "appGitSha": crate::GIT_SHA,
+            "sourceDataDir": "C:/disposable/source",
+            "databaseEvidence": evidence,
+            "files": schema1["files"].clone(),
+        });
+        std::fs::write(snap.join(MANIFEST_FILE), serde_json::to_vec_pretty(&schema2).unwrap()).unwrap();
+        assert!(verify_snapshot_manifest_for_restore(&snap).unwrap());
+
+        let mut drifted = schema2;
+        drifted["databaseEvidence"]["rowCounts"]["speech_segments"] = serde_json::json!(999);
+        std::fs::write(snap.join(MANIFEST_FILE), serde_json::to_vec_pretty(&drifted).unwrap()).unwrap();
+        let error = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+        assert!(error.contains("evidence does not match"), "{error}");
+    }
+
+    #[test]
+    fn an_invalid_active_pilot_policy_fails_the_snapshot_instead_of_becoming_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        std::fs::write(tmp.path().join(crate::review_pilot::REVIEW_PILOT_FILE), b"{}").unwrap();
+
+        let error = take_snapshot_at(&db, tmp.path(), 10, 1000).unwrap_err().to_string();
+        assert!(error.contains(crate::review_pilot::REVIEW_PILOT_FILE), "{error}");
+        assert!(
+            !tmp.path().join("snapshots").join("snapshot_0000001000").exists(),
+            "a snapshot with untrustworthy pay policy must never be promoted"
+        );
+    }
+
+    #[test]
+    fn active_pilot_snapshot_refuses_missing_or_nonexact_focus_before_promotion() {
+        const POLICY: &[u8] = br#"{
+          "schema_version": 1,
+          "after_review_event_id": 0,
+          "max_total_corpus_actions": 20,
+          "reviewers": [
+            {"name": "Hawzhin", "max_corpus_actions": 10},
+            {"name": "Pavel", "max_corpus_actions": 10}
+          ]
+        }"#;
+        for (replacement, expected) in [
+            (None, "is required"),
+            (Some(br#"{"segment_ids":["focus-a"]}"#.as_slice()), "expected exactly 2"),
+            (Some(br#"{"segment_ids":["focus-a","focus-wrong"]}"#.as_slice()), "digest mismatch"),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let db = seeded_db();
+            seed_test_required_snapshot_state(tmp.path()).unwrap();
+            crate::review_pilot::install_test_focus(tmp.path(), ["focus-a", "focus-b"]);
+            std::fs::write(tmp.path().join(crate::review_pilot::REVIEW_PILOT_FILE), POLICY).unwrap();
+            let focus = tmp.path().join(crate::voice_focus::VOICE_FOCUS_FILE);
+            match replacement {
+                Some(bytes) => std::fs::write(&focus, bytes).unwrap(),
+                None => std::fs::remove_file(&focus).unwrap(),
+            }
+
+            let error = take_snapshot_at_from(&db, tmp.path(), tmp.path(), 10, 1000).unwrap_err().to_string();
+            assert!(error.contains(expected), "expected {expected:?} in {error}");
+            assert!(
+                !tmp.path().join("snapshots").join("snapshot_0000001000").exists(),
+                "an inexact controlled-pilot focus must never be promoted"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_never_promotes_an_unrestorable_contract_or_policy_baseline_ahead_of_its_db() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        seed_test_required_snapshot_state(tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("voice_focus.json"), b"{}").unwrap();
+        let invalid = take_snapshot_at_from(&db, tmp.path(), tmp.path(), 10, 1000).unwrap_err().to_string();
+        assert!(invalid.contains("voice_focus.json") && invalid.contains("no segment ids"), "{invalid}");
+        assert!(
+            std::fs::read_dir(tmp.path().join("snapshots"))
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().starts_with(SNAPSHOT_PREFIX)),
+            "a semantically invalid recovery tree must remain staging-only and be cleaned"
+        );
+
+        crate::review_pilot::install_test_focus(tmp.path(), ["x"]);
+        std::fs::write(
+            tmp.path().join(crate::review_pilot::REVIEW_PILOT_FILE),
+            br#"{
+              "schema_version": 1,
+              "after_review_event_id": 1,
+              "max_total_corpus_actions": 20,
+              "reviewers": [
+                {"name": "Hawzhin", "max_corpus_actions": 10},
+                {"name": "Pavel", "max_corpus_actions": 10}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let ahead = take_snapshot_at_from(&db, tmp.path(), tmp.path(), 10, 2000).unwrap_err().to_string();
+        assert!(ahead.contains("baseline 1") && ahead.contains("maximum 0"), "{ahead}");
     }
 
     #[test]
@@ -724,7 +2482,9 @@ mod tests {
         // True-10 audit: the safety net must never fail silently — health_check reads these
         // counters. A failing snapshot (data_dir path occupied by a FILE, so the snapshot dir
         // cannot be created) increments consecutive_failures; a success resets them and stamps
-        // last_success. (Statics are process-wide; assert on relative movement, not absolutes.)
+        // last_success. (Statics are process-wide; assert on relative movement, not absolutes, and
+        // hold the shared-counter lock so no concurrent test can move them mid-assertion.)
+        let _health = lock_health_counters();
         let db = seeded_db();
 
         // Failure: 'snapshots' cannot be created because a file sits at data_dir/snapshots' parent.
@@ -738,6 +2498,7 @@ mod tests {
 
         // Success: counters reset, last_success stamped.
         let good_dir = tempfile::TempDir::new().unwrap();
+        seed_test_required_snapshot_state(good_dir.path()).unwrap();
         assert!(take_snapshot(&db, good_dir.path(), 3).unwrap().is_some());
         let after_ok = snapshot_health();
         assert_eq!(after_ok.consecutive_failures, 0, "success resets the failure streak");
@@ -806,6 +2567,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let data_dir = tmp.path();
         let db = seeded_db();
+        seed_test_required_snapshot_state(data_dir).unwrap();
         // A pinned pre-migration snapshot...
         let pinned = take_pinned_snapshot(&db, data_dir, "premigration_v33_to_v34", 3).unwrap();
         assert!(pinned.join(DB_FILE).is_file());
@@ -821,6 +2583,63 @@ mod tests {
         assert!(third.join(DB_FILE).is_file());
         assert!(!second.exists(), "same-label pinned snapshots are capped at keep_pinned");
         assert!(pinned.join(DB_FILE).is_file(), "different labels never evict each other");
+    }
+
+    #[test]
+    fn pending_migrations_cannot_run_until_the_exact_pre_upgrade_database_is_pinned() {
+        let profile = tempfile::TempDir::new().unwrap();
+        seed_test_required_snapshot_state(profile.path()).unwrap();
+        let db_path = profile.path().join(DB_FILE);
+        let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        db.initialize().unwrap();
+        assert_rollback_to(&db, 57);
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "pre-upgrade-row".to_string(),
+            audio_path: "/must-survive.wav".to_string(),
+            raw_transcript: "پێش نوێکردنەوە".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Make the snapshot root impossible to create. The shared guard must return before v58-v60 run.
+        let blocked_root = profile.path().join("not-a-directory");
+        std::fs::write(&blocked_root, b"block child creation").unwrap();
+        let error = initialize_with_required_pre_migration_pin(&db, &blocked_root).unwrap_err().to_string();
+        assert!(!error.is_empty());
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 57, "a failed pin must leave v58-v60 pending");
+
+        // With a usable profile directory, the helper first promotes the v57 pages and only then runs v58-v60.
+        let pin = initialize_with_required_pre_migration_pin(&db, profile.path())
+            .unwrap()
+            .expect("an established v57 profile requires a pin");
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), current_test_schema_version());
+        assert!(verify_snapshot_manifest_for_restore(&pin).unwrap(), "the migration pin must be self-verifying");
+        let pinned = Database::open(pin.join(DB_FILE).to_string_lossy().as_ref()).unwrap();
+        assert_eq!(crate::migrations::get_current_version(&pinned).unwrap(), 57);
+        assert_eq!(pinned.segment_count().unwrap(), 1, "the pre-upgrade pin must contain the live row");
+
+        assert!(
+            initialize_with_required_pre_migration_pin(&db, profile.path()).unwrap().is_none(),
+            "an already-current schema must not create redundant migration pins"
+        );
+    }
+
+    #[test]
+    fn pending_migration_pin_accepts_and_preserves_legally_absent_config() {
+        let profile = tempfile::TempDir::new().unwrap();
+        let db_path = profile.path().join(DB_FILE);
+        let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        db.initialize().unwrap();
+        assert_rollback_to(&db, 57);
+
+        let pin = initialize_with_required_pre_migration_pin(&db, profile.path())
+            .unwrap()
+            .expect("a v57 profile requires a complete safety pin even when config uses defaults");
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), current_test_schema_version());
+        for state in OPTIONAL_SNAPSHOT_STATE {
+            assert_eq!(std::fs::read(pin.join(state.absent_file)).unwrap(), state.absent_bytes);
+        }
+        assert!(verify_snapshot_manifest_for_restore(&pin).unwrap());
     }
 
     #[test]
@@ -908,6 +2727,131 @@ mod tests {
     }
 
     #[test]
+    fn durability_faults_before_promotion_preserve_every_old_rotating_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let db = seeded_db();
+        let root = data_dir.join("snapshots");
+        for ts in [100u64, 200] {
+            take_snapshot_at(&db, data_dir, 20, ts).unwrap().expect("seed recovery generation");
+        }
+        let old = [root.join("snapshot_0000000100"), root.join("snapshot_0000000200")];
+
+        for (index, point) in [
+            SnapshotFaultPoint::AfterStageFilesSynced,
+            SnapshotFaultPoint::AfterStageDirectorySynced,
+            SnapshotFaultPoint::AfterStageVerified,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let timestamp = 300 + u64::try_from(index).unwrap() * 100;
+            let result = with_snapshot_fault(point, || take_snapshot_at(&db, data_dir, 1, timestamp));
+            assert!(result.unwrap_err().to_string().contains("injected snapshot durability fault"));
+            assert!(old.iter().all(|path| path.is_dir()), "a pre-promotion failure must preserve every old snapshot");
+            assert!(
+                !root.join(format!("snapshot_{timestamp:010}")).exists(),
+                "a pre-promotion failure must never publish a final generation"
+            );
+            assert!(
+                fs::read_dir(&root)
+                    .unwrap()
+                    .flatten()
+                    .all(|entry| !entry.file_name().to_string_lossy().starts_with(STAGING_PREFIX)),
+                "a handled pre-promotion failure should leave no hidden staging residue"
+            );
+        }
+    }
+
+    #[test]
+    fn promotion_boundary_faults_never_prune_the_previous_mandatory_pin() {
+        for point in [SnapshotFaultPoint::AfterRenameBeforeParentSync, SnapshotFaultPoint::AfterDurablePromotion] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let data_dir = tmp.path();
+            let db = seeded_db();
+            seed_test_required_snapshot_state(data_dir).unwrap();
+            let old = take_pinned_snapshot_at(&db, data_dir, "prerestore", 5, 1000).unwrap();
+
+            let result = with_snapshot_fault(point, || take_pinned_snapshot_at(&db, data_dir, "prerestore", 1, 2000));
+            assert!(result.unwrap_err().to_string().contains(&format!("{point:?}")));
+            let promoted = data_dir.join("snapshots").join(PINNED_DIR).join("prerestore_0000002000");
+            assert!(old.is_dir(), "the previous mandatory pin must survive until final reopen succeeds");
+            assert!(promoted.is_dir(), "the directory rename completed before the injected crash boundary");
+            verify_promoted_snapshot(&promoted)
+                .expect("the complete post-rename generation remains independently valid in the no-power-loss test");
+        }
+    }
+
+    #[test]
+    fn prune_failure_retains_extras_without_invalidating_new_rotating_or_pinned_generations() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let db = seeded_db();
+        let root = data_dir.join("snapshots");
+        for ts in [100u64, 200] {
+            take_snapshot_at(&db, data_dir, 20, ts).unwrap().expect("seed rotating generation");
+        }
+        let rotating = with_snapshot_fault(SnapshotFaultPoint::BeforePrune, || take_snapshot_at(&db, data_dir, 1, 300))
+            .unwrap()
+            .expect("a prune failure cannot invalidate a committed rotating generation");
+        verify_promoted_snapshot(&rotating).unwrap();
+        assert!(root.join("snapshot_0000000100").is_dir() && root.join("snapshot_0000000200").is_dir());
+
+        seed_test_required_snapshot_state(data_dir).unwrap();
+        let old_pin = take_pinned_snapshot_at(&db, data_dir, "premigration", 5, 400).unwrap();
+        let new_pin = with_snapshot_fault(SnapshotFaultPoint::BeforePrune, || {
+            take_pinned_snapshot_at(&db, data_dir, "premigration", 1, 500)
+        })
+        .expect("a prune failure cannot invalidate a committed mandatory pin");
+        verify_promoted_snapshot(&new_pin).unwrap();
+        assert!(old_pin.is_dir(), "failed pin pruning retains the extra complete predecessor");
+    }
+
+    #[test]
+    fn a_backward_clock_can_never_prune_the_generation_just_reported_committed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let db = seeded_db();
+
+        take_snapshot_at(&db, data_dir, 5, 1000).unwrap().unwrap();
+        let clock_rollback_snapshot =
+            take_snapshot_at(&db, data_dir, 1, 500).unwrap().expect("the rollback-timestamp generation still commits");
+        assert!(clock_rollback_snapshot.is_dir(), "rotation must protect the exact committed path from pruning");
+        verify_promoted_snapshot(&clock_rollback_snapshot).unwrap();
+
+        seed_test_required_snapshot_state(data_dir).unwrap();
+        let old_pin = take_pinned_snapshot_at(&db, data_dir, "premigration", 5, 1000).unwrap();
+        let clock_rollback_pin = take_pinned_snapshot_at(&db, data_dir, "premigration", 1, 500).unwrap();
+        assert!(
+            clock_rollback_pin.is_dir(),
+            "a mandatory pin may not be deleted merely because its timestamp sorts behind an older pin"
+        );
+        assert!(!old_pin.exists(), "keep=1 retains the committed pin, not the clock-newest predecessor");
+        verify_promoted_snapshot(&clock_rollback_pin).unwrap();
+    }
+
+    #[test]
+    fn final_reopen_rejects_a_manifest_consistent_non_sqlite_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let snapshot = take_snapshot_at(&db, tmp.path(), 5, 1000).unwrap().unwrap();
+        fs::write(snapshot.join(DB_FILE), b"not a sqlite database").unwrap();
+        write_snapshot_manifest(&snapshot, 1000).unwrap();
+
+        assert!(
+            verify_snapshot_manifest_for_restore(&snapshot).unwrap(),
+            "schema-1 manifest verification alone only binds bytes and intentionally does not open an absent-policy database"
+        );
+        let error = verify_promoted_snapshot(&snapshot).unwrap_err().to_string();
+        assert!(
+            error.contains("could not be reopened immutable")
+                || error.contains("final reopen probe")
+                || error.contains("quick_check"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn same_second_pinned_snapshots_do_not_overwrite_each_other() {
         // Round-24 hunt #7: <label>_<seconds> collided for two pins in the same wall-clock second —
         // create_dir_all succeeded on the existing dir and db.backup silently OVERWROTE the previous
@@ -915,6 +2859,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let data_dir = tmp.path();
         let db = seeded_db();
+        seed_test_required_snapshot_state(data_dir).unwrap();
 
         let first = take_pinned_snapshot_at(&db, data_dir, "prerestore", 5, 4242).unwrap();
         let second = take_pinned_snapshot_at(&db, data_dir, "prerestore", 5, 4242).unwrap();
@@ -922,6 +2867,27 @@ mod tests {
         assert_ne!(first, second, "a same-second pin must get a distinct dir, not overwrite");
         assert!(first.join(DB_FILE).is_file(), "the first pin's database survives");
         assert!(second.join(DB_FILE).is_file(), "the second pin has its own database");
+    }
+
+    #[test]
+    fn pinned_snapshot_never_promotes_an_incomplete_or_unverifiable_recovery_contract() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        seed_test_required_snapshot_state(tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("champion.json"), b"{}").unwrap();
+
+        let error =
+            take_pinned_snapshot_at(&db, tmp.path(), "premigration_v57_to_v58", 3, 1000).unwrap_err().to_string();
+        assert!(error.contains("champion.json") && error.contains("schema"), "{error}");
+        let pinned_root = tmp.path().join("snapshots").join(PINNED_DIR);
+        assert!(
+            std::fs::read_dir(&pinned_root).unwrap().flatten().next().is_none(),
+            "a failed pin must leave neither a promoted artifact nor staging residue"
+        );
+
+        std::fs::write(tmp.path().join("champion.json"), br#"{"schema":2,"champions":{}}"#).unwrap();
+        let pin = take_pinned_snapshot_at(&db, tmp.path(), "premigration_v57_to_v58", 3, 2000).unwrap();
+        assert!(verify_snapshot_manifest_for_restore(&pin).unwrap());
     }
 
     #[test]
@@ -933,6 +2899,7 @@ mod tests {
         let primary = tempfile::TempDir::new().unwrap();
         let second = tempfile::TempDir::new().unwrap();
         let db = seeded_db();
+        seed_test_required_snapshot_state(primary.path()).unwrap();
         std::fs::write(primary.path().join("cortex-speech.corrupt.1781500000"), b"bad db").unwrap();
 
         for ts in [100u64, 200, 300, 400] {
@@ -952,12 +2919,1009 @@ mod tests {
         let db = seeded_db();
         take_snapshot_at(&db, tmp.path(), 5, 100).unwrap().unwrap();
         take_snapshot_at(&db, tmp.path(), 5, 200).unwrap().unwrap();
+        let pinned = take_pinned_snapshot_at(&db, tmp.path(), "premigration_v57_to_v58", 3, 300).unwrap();
         let listed = list_snapshots(tmp.path());
-        assert_eq!(listed.len(), 2);
-        assert_eq!(listed[0].timestamp, 200, "newest first");
-        assert_eq!(listed[1].timestamp, 100);
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].timestamp, 300, "pinned recovery artifacts participate in the same picker");
+        assert_eq!(listed[0].name, "pinned/premigration_v57_to_v58_0000000300");
+        assert_eq!(resolve_snapshot_dir(tmp.path(), &listed[0].name).unwrap(), pinned);
+        assert!(resolve_snapshot_dir(tmp.path(), "pinned/../escape_0000000300").is_err());
+        assert_eq!(listed[1].timestamp, 200, "newest rotating snapshot follows");
+        assert_eq!(listed[2].timestamp, 100);
         assert_eq!(listed[0].segment_count, Some(1), "segment count read from the snapshot DB");
         assert!(listed[0].db_size_bytes > 0);
-        assert_eq!(listed[0].name, "snapshot_0000000200");
+        assert_eq!(listed[1].name, "snapshot_0000000200");
+    }
+
+    #[test]
+    fn manifest_names_and_snapshot_selectors_are_strictly_validated() {
+        for name in ["cortex-speech.db", "settings.json", "champion.json.absent", "review_pilot_policy.json"] {
+            safe_manifest_name(name).expect(name);
+        }
+        for name in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "con.json",
+            "prn",
+            "aux.txt",
+            "nul",
+            "com1.wav",
+            "lpt9.db",
+            "trailing ",
+            "trailing.",
+            "ba<d",
+            "ba|d",
+            "ba?d",
+            "ba*d",
+            "ba\"d",
+            "ba:d",
+            "tab\tname",
+            MANIFEST_FILE,
+            "snapshot_manifest.JSON",
+        ] {
+            assert!(safe_manifest_name(name).is_err(), "{name:?} must be refused as a manifest path");
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let snap = take_snapshot_at(&db, tmp.path(), 5, 1000).unwrap().unwrap();
+        assert_eq!(resolve_snapshot_dir(tmp.path(), "snapshot_0000001000").unwrap(), snap);
+        seed_test_required_snapshot_state(tmp.path()).unwrap();
+        let pin = take_pinned_snapshot_at(&db, tmp.path(), "drill", 3, 2000).unwrap();
+        assert_eq!(resolve_snapshot_dir(tmp.path(), "pinned/drill_0000002000").unwrap(), pin);
+
+        for selector in [
+            "",
+            "snapshot_",
+            "snapshot_123",
+            "snapshot_00000010001",
+            "snapshot_00000x1000",
+            "pinned/",
+            "pinned/_0000001000",
+            "pinned/label",
+            "pinned/label_123",
+            "pinned/-lead_0000001000",
+            "pinned/a/b_0000001000",
+            "pinned/a\\b_0000001000",
+            "../snapshots/snapshot_0000001000",
+            "C:/absolute/path",
+        ] {
+            assert!(resolve_snapshot_dir(tmp.path(), selector).is_err(), "{selector:?} must be refused");
+        }
+        let missing = resolve_snapshot_dir(tmp.path(), "snapshot_0000009999").unwrap_err();
+        assert!(missing.contains("unavailable"), "{missing}");
+        // A well-formed selector pointing at a plain FILE is not a snapshot.
+        std::fs::write(tmp.path().join("snapshots").join("snapshot_0000004242"), b"file").unwrap();
+        let not_a_dir = resolve_snapshot_dir(tmp.path(), "snapshot_0000004242").unwrap_err();
+        assert!(not_a_dir.contains("real directory"), "{not_a_dir}");
+    }
+
+    #[test]
+    fn champion_pointer_and_optional_state_validation_fail_closed() {
+        assert!(validate_champion_pointer(br#"{"schema":2,"champions":{}}"#).is_ok());
+        let valid_family = br#"{"schema":2,"champions":{"omniasr-7b":{"modelVersionId":"m","deploymentManifestPath":"p","deploymentSha256":"s","source":"user-finetuned","license":"Apache-2.0"}}}"#;
+        assert!(validate_champion_pointer(valid_family).is_ok());
+        let cases: [(&[u8], &str); 10] = [
+            (b"not json", "invalid JSON"),
+            (br#"[]"#, "must be an object"),
+            (br#"{"schema":2}"#, "exactly schema and champions"),
+            (br#"{"schema":2,"champions":{},"extra":1}"#, "exactly schema and champions"),
+            (br#"{"schema":1,"champions":{}}"#, "must be exactly 2"),
+            (br#"{"schema":2,"champions":[]}"#, "must be an object"),
+            (br#"{"schema":2,"champions":{"":{}}}"#, "empty family name"),
+            (br#"{"schema":2,"champions":{"omniasr-7b":{"modelVersionId":"m"}}}"#, "invalid field set"),
+            (
+                br#"{"schema":2,"champions":{"omniasr-7b":{"modelVersionId":1,"deploymentManifestPath":"p","deploymentSha256":"s","source":"u","license":"l"}}}"#,
+                "must all be strings",
+            ),
+            (br#"{"schema":2,"champions":{"omniasr-7b":"nope"}}"#, "must be an object"),
+        ];
+        for (bytes, expected) in cases {
+            let error = validate_champion_pointer(bytes).unwrap_err();
+            assert!(error.contains(expected), "expected '{expected}', got: {error}");
+        }
+
+        let unknown = validate_present_optional_state("mystery.json", b"{}").unwrap_err();
+        assert!(unknown.contains("unknown optional snapshot state"), "{unknown}");
+        assert!(validate_present_optional_state("reviewer_dialects.json", b"not json").is_err());
+        let non_utf8 = validate_present_optional_state("voice_focus.json", &[0xff, 0xfe]).unwrap_err();
+        assert!(non_utf8.contains("not UTF-8"), "{non_utf8}");
+    }
+
+    #[test]
+    fn optional_state_inspection_is_exact_about_presence_and_absence() {
+        let state = OPTIONAL_SNAPSHOT_STATE
+            .iter()
+            .copied()
+            .find(|state| state.live_file == "champion.json")
+            .expect("champion.json is part of the optional recovery contract");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pointer: &[u8] = br#"{"schema":2,"champions":{}}"#;
+
+        // Both present and absent at once is a contradiction, never a silent preference.
+        std::fs::write(tmp.path().join(state.live_file), pointer).unwrap();
+        std::fs::write(tmp.path().join(state.absent_file), state.absent_bytes).unwrap();
+        let ambiguous = inspect_optional_state_for_restore(tmp.path(), state, true).unwrap_err();
+        assert!(ambiguous.contains("ambiguous"), "{ambiguous}");
+
+        // A valid present copy installs the exact bytes.
+        std::fs::remove_file(tmp.path().join(state.absent_file)).unwrap();
+        assert_eq!(
+            inspect_optional_state_for_restore(tmp.path(), state, true).unwrap(),
+            OptionalSnapshotRestore::Install(pointer.to_vec())
+        );
+
+        // An invalid present copy fails instead of being installed or downgraded to absence.
+        std::fs::write(tmp.path().join(state.live_file), b"{}").unwrap();
+        assert!(inspect_optional_state_for_restore(tmp.path(), state, true).is_err());
+
+        // Explicit absence restores as absence, and a forged marker is refused.
+        std::fs::remove_file(tmp.path().join(state.live_file)).unwrap();
+        std::fs::write(tmp.path().join(state.absent_file), state.absent_bytes).unwrap();
+        assert_eq!(
+            inspect_optional_state_for_restore(tmp.path(), state, true).unwrap(),
+            OptionalSnapshotRestore::ExplicitlyAbsent
+        );
+        std::fs::write(tmp.path().join(state.absent_file), b"forged marker").unwrap();
+        let forged = inspect_optional_state_for_restore(tmp.path(), state, true).unwrap_err();
+        assert!(forged.contains("invalid contents"), "{forged}");
+
+        // Missing entirely: a manifest-bearing tree fails hard, only a legacy tree preserves live state.
+        std::fs::remove_file(tmp.path().join(state.absent_file)).unwrap();
+        let missing = inspect_optional_state_for_restore(tmp.path(), state, true).unwrap_err();
+        assert!(missing.contains("missing both"), "{missing}");
+        assert_eq!(
+            inspect_optional_state_for_restore(tmp.path(), state, false).unwrap(),
+            OptionalSnapshotRestore::PreserveLegacy
+        );
+    }
+
+    #[test]
+    fn verified_snapshot_image_pins_the_exact_promoted_source_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let snap = take_snapshot_at(&db, tmp.path(), 5, 1000).unwrap().unwrap();
+        let settings = snap.join("settings.json");
+        let original = std::fs::read(&settings).unwrap();
+
+        // The exact race the private image exists to close: the promoted source changing between
+        // capture and re-hash is refused, never silently restored.
+        let error = match VerifiedSnapshotImage::capture(&snap, || {
+            std::fs::write(&settings, b"swapped after capture").unwrap();
+        }) {
+            Ok(_) => panic!("a source mutated during capture must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.contains("digest mismatch during restore preflight"), "{error}");
+        std::fs::write(&settings, &original).unwrap();
+
+        let image = VerifiedSnapshotImage::capture(&snap, || {}).unwrap();
+        assert!(image.manifest_verified(), "a manifest-bearing snapshot must capture as verified");
+        assert!(image.database_path().is_file());
+        image.verify_owned_digest().unwrap();
+        // Tampering with the OWNED private copy is also caught before staging.
+        std::fs::write(image.root().join("settings.json"), b"tampered private copy").unwrap();
+        let owned = image.verify_owned_digest().unwrap_err();
+        assert!(owned.contains("digest mismatch before restore staging"), "{owned}");
+        let root = image.root().to_path_buf();
+        drop(image);
+        assert!(!root.exists(), "the private image directory must be removed on drop");
+
+        // Non-directory sources and nested directories inside the tree are refused outright.
+        let file_source = tmp.path().join("not-a-dir");
+        std::fs::write(&file_source, b"x").unwrap();
+        assert!(VerifiedSnapshotImage::capture(&file_source, || {}).is_err());
+        std::fs::create_dir_all(snap.join("nested")).unwrap();
+        let nested = match VerifiedSnapshotImage::capture(&snap, || {}) {
+            Ok(_) => panic!("a snapshot tree with a nested directory must be refused"),
+            Err(error) => error,
+        };
+        assert!(nested.contains("regular"), "{nested}");
+    }
+
+    #[test]
+    fn manifest_schema_and_inventory_drift_are_hard_failures() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let snap = take_snapshot_at(&db, tmp.path(), 5, 1000).unwrap().unwrap();
+        let manifest_path = snap.join(MANIFEST_FILE);
+        let pristine: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let install = |manifest: &serde_json::Value| {
+            std::fs::write(&manifest_path, serde_json::to_vec_pretty(manifest).unwrap()).unwrap();
+        };
+
+        type ManifestMutation<'a> = (&'a dyn Fn(&mut serde_json::Value), &'a str);
+        let mutations: [ManifestMutation; 5] = [
+            (&|manifest| manifest["schema"] = serde_json::json!(3), "must be exactly integer 1 or 2"),
+            (&|manifest| manifest["schema"] = serde_json::json!("1"), "must be exactly integer 1 or 2"),
+            (&|manifest| manifest["appGitSha"] = serde_json::json!(""), "appGitSha must be non-empty"),
+            (
+                &|manifest| manifest["reviewPilotPolicyStateSchema"] = serde_json::json!(2),
+                "policy-state schema must be exactly 1",
+            ),
+            (&|manifest| manifest["files"][0]["sha256"] = serde_json::json!("XYZ"), "64 lowercase hex digits"),
+        ];
+        for (mutate, expected) in mutations {
+            let mut manifest = pristine.clone();
+            mutate(&mut manifest);
+            install(&manifest);
+            let error = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+            assert!(error.contains(expected), "expected '{expected}', got: {error}");
+        }
+
+        // A declared row with a traversal path can never be trusted, whatever its hash claims.
+        let mut traversal = pristine.clone();
+        traversal["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"path": "../evil", "sizeBytes": 1, "sha256": "a".repeat(64)}));
+        install(&traversal);
+        let error = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+        assert!(error.contains("unsafe file path"), "{error}");
+
+        // An on-disk file the manifest never declared is an inexact inventory, not a bonus.
+        install(&pristine);
+        std::fs::write(snap.join("extra.bin"), b"unlisted").unwrap();
+        let unlisted = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+        assert!(unlisted.contains("not exact") && unlisted.contains("extra.bin"), "{unlisted}");
+        std::fs::remove_file(snap.join("extra.bin")).unwrap();
+
+        // A manifest whose inventory verifies but omits the DATABASE is not a recovery artifact.
+        let mut without_db = pristine.clone();
+        without_db["files"].as_array_mut().unwrap().retain(|row| row["path"] != DB_FILE);
+        install(&without_db);
+        std::fs::remove_file(snap.join(DB_FILE)).unwrap();
+        let missing_db = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+        assert!(missing_db.contains("missing required") && missing_db.contains(DB_FILE), "{missing_db}");
+    }
+
+    #[test]
+    fn retention_selector_edges_and_panic_health_accounting() {
+        assert!(select_snapshots_to_keep(&[], 5).is_empty(), "no snapshots means nothing to keep");
+        // keep=0 still keeps the newest through the daily tier — the tiers are additive floors.
+        let kept = select_snapshots_to_keep(&[1000, 2000], 0);
+        assert!(kept.contains(&2000), "the newest snapshot is always tier-protected");
+        assert!(!kept.contains(&1000), "a same-day older snapshot has no tier claim at keep=0");
+        // Duplicate timestamps must not panic or drop the shared value.
+        assert!(select_snapshots_to_keep(&[5000, 5000], 1).contains(&5000));
+
+        // A snapshot-loop panic must surface in health accounting (same shared-static contract as
+        // snapshot_health_tracks_success_and_consecutive_failures above — and the same lock).
+        let _health = lock_health_counters();
+        let before = snapshot_health().consecutive_failures;
+        record_snapshot_panic();
+        assert_eq!(snapshot_health().consecutive_failures, before + 1, "a panic counts as a failure");
+    }
+
+    #[test]
+    fn a_directory_squatting_on_a_config_file_fails_the_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        seed_test_required_snapshot_state(tmp.path()).unwrap();
+        std::fs::remove_file(tmp.path().join("champion.json")).unwrap();
+        std::fs::create_dir(tmp.path().join("champion.json")).unwrap();
+        let error = take_snapshot_at_from(&db, tmp.path(), tmp.path(), 5, 1000).unwrap_err().to_string();
+        assert!(error.contains("not a regular file"), "{error}");
+        assert!(
+            !tmp.path().join("snapshots").join("snapshot_0000001000").exists(),
+            "a directory squatting on config state must never be promoted as absence"
+        );
+    }
+
+    // ── Wave-4 branch coverage. File-backed fixtures throughout (tempfile, never :memory: for the
+    // databases these arms inspect).
+
+    fn file_seeded_db(dir: &Path, name: &str) -> Database {
+        let db = Database::open(dir.join(name).to_string_lossy().as_ref()).unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "wave4-row".to_string(),
+            audio_path: "/wave4.wav".to_string(),
+            raw_transcript: "ڕەفەرێنس".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        db
+    }
+
+    /// Windows on this box can briefly serve a stale read after a write; settle until the exact
+    /// bytes read back before any hash-sensitive verification runs.
+    fn write_settled(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+        for _ in 0..50 {
+            if std::fs::read(path).map(|read| read == bytes).unwrap_or(false) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("write to {} never settled", path.display());
+    }
+
+    /// Re-stamp one file's size/sha row in a snapshot's manifest so byte-tamper tests exercise the
+    /// SEMANTIC validators rather than the hash mismatch.
+    fn refresh_manifest_row(snap: &Path, name: &str) {
+        let manifest_path = snap.join(MANIFEST_FILE);
+        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let target = snap.join(name);
+        let row = manifest["files"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["path"] == name)
+            .unwrap_or_else(|| panic!("manifest must declare {name}"));
+        row["sizeBytes"] = serde_json::json!(target.metadata().unwrap().len());
+        row["sha256"] = serde_json::json!(crate::models::compute_file_sha256(&target).unwrap());
+        write_settled(&manifest_path, &serde_json::to_vec_pretty(&manifest).unwrap());
+    }
+
+    #[test]
+    fn pinned_snapshot_during_restore_requires_an_active_reservation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_test_required_snapshot_state(tmp.path()).unwrap();
+        let db = file_seeded_db(tmp.path(), "wave4-restore.db");
+        let runtime = crate::database_runtime::DatabaseRuntime::isolated_for_test(
+            Database::open(tmp.path().join("wave4-runtime.db").to_string_lossy().as_ref()).unwrap(),
+        );
+        let reservation = runtime.try_reserve_restore_for_test().unwrap();
+        assert!(reservation.is_active());
+
+        let pin = take_pinned_snapshot_during_restore(&reservation, &db, tmp.path(), "prerestore", 3).unwrap();
+        assert!(verify_snapshot_manifest_for_restore(&pin).unwrap(), "the in-restore pin must self-verify");
+
+        // Committing the restore releases exclusivity; the stale capability must be refused.
+        reservation.arm_named_restore().unwrap();
+        reservation.commit_named_restore().unwrap();
+        assert!(!reservation.is_active());
+        let error = take_pinned_snapshot_during_restore(&reservation, &db, tmp.path(), "prerestore", 3)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires an active exclusive restore reservation"), "{error}");
+    }
+
+    #[test]
+    fn production_take_snapshot_skips_an_empty_library_with_history() {
+        // The production wrapper's Ok(None) arm: the guard-skip is neither success nor failure.
+        // Goes through `take_snapshot`, which MOVES the shared health counters, so it takes the lock.
+        let _health = lock_health_counters();
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_test_required_snapshot_state(tmp.path()).unwrap();
+        let seeded = file_seeded_db(tmp.path(), "wave4-full.db");
+        assert!(take_snapshot(&seeded, tmp.path(), 3).unwrap().is_some());
+
+        let empty = Database::open(tmp.path().join("wave4-empty.db").to_string_lossy().as_ref()).unwrap();
+        empty.initialize().unwrap();
+        assert!(
+            take_snapshot(&empty, tmp.path(), 3).unwrap().is_none(),
+            "an empty library with prior snapshots is a guard-skip through the production wrapper too"
+        );
+    }
+
+    #[test]
+    fn a_fresh_profile_needs_no_pre_migration_pin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Database::open(tmp.path().join("wave4-fresh.db").to_string_lossy().as_ref()).unwrap();
+        assert!(
+            initialize_with_required_pre_migration_pin(&db, tmp.path()).unwrap().is_none(),
+            "a pristine schema-0 file is not an established profile; no pin is owed"
+        );
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), current_test_schema_version());
+    }
+
+    fn grant(db: &Database, digest: &str, baseline: i64, reviewer: &str, segment: &str) {
+        db.connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![digest, baseline, reviewer, segment],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn pilot_snapshot_authority_rejects_forged_grant_shapes() {
+        // The duplicate-grant and quota-excess validator arms are unreachable through inserts: the
+        // table's PRIMARY KEY collates the reviewer NOCASE and the quota trigger counts the same
+        // way, and dropping either guard trips the exact schema-contract check first. Those arms
+        // remain defense-in-depth; the rows below are the ones a real file can carry.
+        let policy = pilot_policy();
+        let digest = policy.policy_sha256().unwrap();
+        type ForgedGrant<'a> = (&'a dyn Fn(&Database), &'a str);
+        let cases: [ForgedGrant; 3] = [
+            (&|db| grant(db, &digest, 0, "Nobody", "seg-a"), "unauthorized reviewer"),
+            (&|db| grant(db, &digest, 0, "Hawzhin", "bad seg!"), "invalid segment"),
+            // Same active policy digest at a foreign baseline: a namespace the policy never armed.
+            (&|db| grant(db, &digest, 1, "Hawzhin", "seg-b"), "disagree with the active policy SHA/baseline"),
+        ];
+        for (forge, expected) in cases {
+            let profile = tempfile::TempDir::new().unwrap();
+            let db = file_seeded_db(profile.path(), "wave4-grants.db");
+            forge(&db);
+            let error = validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap_err();
+            assert!(error.contains(expected), "expected '{expected}', got: {error}");
+        }
+    }
+
+    /// One raw hidden-completion event, in the exact column shape the production writer records.
+    /// `requested_action` stays in the canonical vocabulary (the provenance trigger pins it); the
+    /// recorded `action` is what the snapshot validator re-derives meaning from.
+    fn hidden_completion_event(db: &Database, segment: &str, reviewer: &str, action: &str, index: u64) {
+        db.connection()
+            .execute(
+                "INSERT INTO review_events
+                    (segment_id, reviewer, action, source, timestamp_ms, operation_id,
+                     operation_payload_hash, requested_action, requested_transcript,
+                     served_transcript, served_revision, app_git_sha, playback_guard_version)
+                 VALUES (?1, ?2, ?3, 'couch_spot_check', 1, ?4, ?5, 'accept', '', 'ڕەفەرێنس', 0, ?6,
+                         'content-hash-raw-counter-v3')",
+                rusqlite::params![
+                    segment,
+                    reviewer,
+                    action,
+                    format!("00000000-0000-4000-8000-{index:012x}"),
+                    "a".repeat(64),
+                    crate::GIT_SHA,
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn pilot_snapshot_authority_rejects_forged_hidden_completions() {
+        let policy = pilot_policy();
+        let digest = policy.policy_sha256().unwrap();
+
+        // An action outside the review vocabulary is refused before any grant lookup.
+        let profile = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(profile.path(), "wave4-hidden.db");
+        hidden_completion_event(&db, "hidden-a", "Hawzhin", "flag", 600);
+        let error = validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap_err();
+        assert!(error.contains("has invalid action"), "{error}");
+
+        // A granted completion with no immutable spot-check result behind it.
+        let profile = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(profile.path(), "wave4-hidden.db");
+        grant(&db, &digest, 0, "Hawzhin", "hidden-b");
+        hidden_completion_event(&db, "hidden-b", "Hawzhin", "accept", 601);
+        let error = validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap_err();
+        assert!(error.contains("result mismatch"), "{error}");
+
+        // Two completion events for one hidden key: the second is a forged replay.
+        let profile = tempfile::TempDir::new().unwrap();
+        let db = file_seeded_db(profile.path(), "wave4-hidden.db");
+        grant(&db, &digest, 0, "Hawzhin", "hidden-c");
+        db.connection()
+            .execute(
+                "INSERT INTO spot_checks
+                    (segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer)
+                 VALUES ('hidden-c', 'Hawzhin', 'accept', 'ڕەفەرێنس', 'ڕەفەرێنس', 1, 0.0)",
+                [],
+            )
+            .unwrap();
+        hidden_completion_event(&db, "hidden-c", "Hawzhin", "accept", 602);
+        validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy)
+            .expect("one granted, resulted completion is coherent");
+        hidden_completion_event(&db, "hidden-c", "Hawzhin", "accept", 603);
+        let error = validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap_err();
+        assert!(error.contains("multiple completion events"), "{error}");
+    }
+
+    #[test]
+    fn pilot_snapshot_authority_validates_the_live_session_binding() {
+        let policy = pilot_policy();
+        let with_session = |bytes: &[u8]| -> (tempfile::TempDir, Database, PathBuf) {
+            let profile = tempfile::TempDir::new().unwrap();
+            let db_path = profile.path().join(DB_FILE);
+            let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+            db.initialize().unwrap();
+            std::fs::write(profile.path().join("couch_session.json"), bytes).unwrap();
+            (profile, db, db_path)
+        };
+        let session_json = |db_path: &Path, policy: &crate::review_pilot::ReviewPilotPolicy| {
+            serde_json::to_vec(&serde_json::json!({
+                "db_path": db_path,
+                "reviewers": {"token-h": "Hawzhin", "token-p": "Pavel"},
+                "pilot_spot_checks": [],
+                "pilot_policy": policy,
+            }))
+            .unwrap()
+        };
+
+        let (profile, db, db_path) = with_session(b"{not json");
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("couch_session.json is invalid"), "{error}");
+
+        // A session bound to some other database file.
+        let (profile, db, db_path) = with_session(b"placeholder");
+        let foreign = profile.path().join("foreign.db");
+        std::fs::write(&foreign, b"other database").unwrap();
+        std::fs::write(profile.path().join("couch_session.json"), session_json(&foreign, &policy)).unwrap();
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("belongs to a different database"), "{error}");
+
+        // A session with no pilot binding at all.
+        let (profile, db, db_path) = with_session(b"placeholder");
+        std::fs::write(
+            profile.path().join("couch_session.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "db_path": &db_path,
+                "reviewers": {"token-h": "Hawzhin", "token-p": "Pavel"},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("not bound to the active pilot policy"), "{error}");
+
+        // A session bound to a DIFFERENT (still well-formed) pilot policy. The corpus caps are
+        // owner-pinned, so the only field a parseable policy can differ in is its armed baseline —
+        // which the digest covers.
+        let (profile, db, db_path) = with_session(b"placeholder");
+        let other_policy = crate::review_pilot::parse(
+            r#"{
+              "schema_version": 1,
+              "after_review_event_id": 5,
+              "max_total_corpus_actions": 20,
+              "reviewers": [
+                {"name": "Hawzhin", "max_corpus_actions": 10},
+                {"name": "Pavel", "max_corpus_actions": 10}
+              ]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(profile.path().join("couch_session.json"), session_json(&db_path, &other_policy)).unwrap();
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("bound to a different pilot policy"), "{error}");
+
+        // A roster that is not the exact paired pilot.
+        let (profile, db, db_path) = with_session(b"placeholder");
+        std::fs::write(
+            profile.path().join("couch_session.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "db_path": &db_path,
+                "reviewers": {"token-h": "Hawzhin"},
+                "pilot_spot_checks": [],
+                "pilot_policy": &policy,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("roster does not match the active pilot"), "{error}");
+
+        // The same hidden key cached twice (case-folded) in one session. The first cache entry is
+        // durably granted, so the refusal under test is the duplication itself.
+        let (profile, db, db_path) = with_session(b"placeholder");
+        grant(&db, &policy.policy_sha256().unwrap(), 0, "Hawzhin", "hidden-dup");
+        std::fs::write(
+            profile.path().join("couch_session.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "db_path": &db_path,
+                "reviewers": {"token-h": "Hawzhin", "token-p": "Pavel"},
+                "pilot_spot_checks": [["hidden-dup", "Hawzhin"], ["hidden-dup", "HAWZHIN"]],
+                "pilot_policy": &policy,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("duplicates hidden key"), "{error}");
+    }
+
+    #[test]
+    fn unreadable_policy_and_incomplete_staging_are_refused() {
+        // A directory squatting on the pilot policy is unreadable, which must fail the snapshot —
+        // never be recorded as intentional absence.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        seed_test_required_snapshot_state(tmp.path()).unwrap();
+        std::fs::create_dir(tmp.path().join(crate::review_pilot::REVIEW_PILOT_FILE)).unwrap();
+        let error = take_snapshot_at_from(&db, tmp.path(), tmp.path(), 5, 1000).unwrap_err().to_string();
+        assert!(error.contains("could not be read"), "{error}");
+        assert!(!tmp.path().join("snapshots").join("snapshot_0000001000").exists());
+
+        // Staging without its manifest can never reach the durability barriers.
+        let staging = tmp.path().join("staging-probe");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join(DB_FILE), b"payload").unwrap();
+        let error = sync_snapshot_staging(&staging).unwrap_err().to_string();
+        assert!(error.contains("cannot be committed without"), "{error}");
+
+        // The private-image primitives refuse non-regular sources and occupied destinations.
+        let squatted_dir = tmp.path().join("not-a-file");
+        std::fs::create_dir_all(&squatted_dir).unwrap();
+        let error = hash_snapshot_file(&squatted_dir, "not-a-file").unwrap_err();
+        assert!(error.contains("must be a regular, non-symlink file"), "{error}");
+        let error = copy_snapshot_file(&squatted_dir, &tmp.path().join("dest.bin"), "not-a-file").unwrap_err();
+        assert!(error.contains("must be a regular, non-symlink file"), "{error}");
+        let source = tmp.path().join("source.bin");
+        std::fs::write(&source, b"bytes").unwrap();
+        let occupied = tmp.path().join("occupied.bin");
+        std::fs::write(&occupied, b"already here").unwrap();
+        let error = copy_snapshot_file(&source, &occupied, "occupied.bin").unwrap_err();
+        assert!(error.contains("could not be privately staged"), "{error}");
+    }
+
+    #[test]
+    fn schema2_identity_and_semantic_state_survive_hash_refreshing_forgeries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let snap = take_snapshot_at(&db, tmp.path(), 5, 1000).unwrap().unwrap();
+
+        // Schema-2 identity fields are hard requirements even with perfect hashes and evidence.
+        let schema1: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(snap.join(MANIFEST_FILE)).unwrap()).unwrap();
+        let evidence = inspect_schema2_database_evidence(&snap.join(DB_FILE)).unwrap();
+        let forged = serde_json::json!({
+            "schema": 2,
+            "createdAtEpochSecs": 1000,
+            "appGitSha": crate::GIT_SHA,
+            "sourceDataDir": "",
+            "databaseEvidence": evidence,
+            "files": schema1["files"].clone(),
+        });
+        write_settled(&snap.join(MANIFEST_FILE), &serde_json::to_vec_pretty(&forged).unwrap());
+        let error = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+        assert!(error.contains("identity fields are invalid"), "{error}");
+        write_settled(&snap.join(MANIFEST_FILE), &serde_json::to_vec_pretty(&schema1).unwrap());
+
+        // A semantically invalid champion pointer is refused even when its manifest row is
+        // re-stamped to match the forged bytes exactly.
+        write_settled(&snap.join("champion.json"), b"{}");
+        refresh_manifest_row(&snap, "champion.json");
+        let error = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+        assert!(error.contains("champion.json"), "{error}");
+
+        // Same for forged absence markers, in a legitimately-absent tree.
+        let absent_tmp = tempfile::TempDir::new().unwrap();
+        let absent_snap = take_snapshot_at_from(&db, absent_tmp.path(), absent_tmp.path(), 5, 1000).unwrap().unwrap();
+        write_settled(&absent_snap.join("champion.json.absent"), b"forged marker");
+        refresh_manifest_row(&absent_snap, "champion.json.absent");
+        let error = verify_snapshot_manifest_for_restore(&absent_snap).unwrap_err();
+        assert!(error.contains("invalid contents"), "{error}");
+
+        let pilot_tmp = tempfile::TempDir::new().unwrap();
+        let pilot_snap = take_snapshot_at_from(&db, pilot_tmp.path(), pilot_tmp.path(), 5, 1000).unwrap().unwrap();
+        write_settled(&pilot_snap.join(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE), b"forged pilot marker");
+        refresh_manifest_row(&pilot_snap, crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE);
+        let error = verify_snapshot_manifest_for_restore(&pilot_snap).unwrap_err();
+        assert!(
+            error.contains(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE) && error.contains("invalid contents"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_bound_pilot_policy_is_semantically_verified_at_restore() {
+        const POLICY_BASELINE_0: &[u8] = br#"{
+          "schema_version": 1,
+          "after_review_event_id": 0,
+          "max_total_corpus_actions": 20,
+          "reviewers": [
+            {"name": "Hawzhin", "max_corpus_actions": 10},
+            {"name": "Pavel", "max_corpus_actions": 10}
+          ]
+        }"#;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        seed_test_required_snapshot_state(tmp.path()).unwrap();
+        crate::review_pilot::install_test_focus(tmp.path(), ["wave4-focus"]);
+        std::fs::write(tmp.path().join(crate::review_pilot::REVIEW_PILOT_FILE), POLICY_BASELINE_0).unwrap();
+        let snap = take_snapshot_at_from(&db, tmp.path(), tmp.path(), 5, 1000).unwrap().unwrap();
+        assert!(verify_snapshot_manifest_for_restore(&snap).unwrap(), "the policy-bearing snapshot verifies");
+
+        // Rewriting the copied policy to a baseline its own database never reached is refused even
+        // with the manifest row freshly re-stamped over the forged bytes.
+        let forged_policy = String::from_utf8_lossy(POLICY_BASELINE_0)
+            .replace("\"after_review_event_id\": 0", "\"after_review_event_id\": 1");
+        write_settled(&snap.join(crate::review_pilot::REVIEW_PILOT_FILE), forged_policy.as_bytes());
+        refresh_manifest_row(&snap, crate::review_pilot::REVIEW_PILOT_FILE);
+        let error = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+        assert!(error.contains("is ahead of its database review-event maximum"), "{error}");
+    }
+
+    #[test]
+    fn partial_snapshot_trees_list_defensively_and_legacy_images_capture_unverified() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("snapshots");
+        // A bare timestamped dir with no database at all: listed, with honest empty metadata.
+        std::fs::create_dir_all(root.join("snapshot_0000000042")).unwrap();
+        // Junk that must be ignored: a malformed name and a plain file with a valid name.
+        std::fs::create_dir_all(root.join("snapshot_notdigits")).unwrap();
+        std::fs::write(root.join("snapshot_0000000099"), b"a file, not a snapshot").unwrap();
+        std::fs::create_dir_all(root.join(PINNED_DIR).join("_0000000042")).unwrap();
+        let listed = list_snapshots(tmp.path());
+        assert_eq!(listed.len(), 1, "only the well-formed directory counts: {listed:?}");
+        assert_eq!(listed[0].name, "snapshot_0000000042");
+        assert_eq!(listed[0].db_size_bytes, 0, "a missing database reads as zero bytes, not an error");
+        assert_eq!(listed[0].segment_count, None, "an unopenable database is honestly None");
+
+        // A manifest-less legacy tree captures as an image, but never as manifest-verified.
+        let legacy = tmp.path().join("legacy-tree");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join(DB_FILE), b"legacy database bytes").unwrap();
+        let image = VerifiedSnapshotImage::capture(&legacy, || {}).unwrap();
+        assert!(!image.manifest_verified(), "no manifest can never mean verified");
+        assert!(image.database_path().is_file());
+    }
+
+    // ── Wave-5 branch coverage.
+
+    #[test]
+    fn manifest_duplicate_declarations_and_exact_byte_drift_are_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+
+        // A manifest that names the same artifact twice is not an inventory: whichever row is read
+        // last would silently decide what "verified" means for those bytes.
+        let duplicated = take_snapshot_at(&db, tmp.path(), 5, 4000).unwrap().unwrap();
+        assert!(verify_snapshot_manifest_for_restore(&duplicated).unwrap(), "a fresh snapshot must verify first");
+        let manifest_path = duplicated.join(MANIFEST_FILE);
+        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let repeated = manifest["files"][0].clone();
+        manifest["files"].as_array_mut().unwrap().push(repeated);
+        write_settled(&manifest_path, &serde_json::to_vec_pretty(&manifest).unwrap());
+        let error = verify_snapshot_manifest_for_restore(&duplicated).unwrap_err();
+        assert!(error.contains("duplicate/case-colliding file"), "{error}");
+
+        // Same length, different bytes. Only the digest can see this, and it is the arm that stands
+        // between a restore and a swapped database.
+        let swapped = take_snapshot_at(&db, tmp.path(), 5, 5000).unwrap().unwrap();
+        assert!(verify_snapshot_manifest_for_restore(&swapped).unwrap());
+        let database = swapped.join(DB_FILE);
+        let mut bytes = std::fs::read(&database).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        write_settled(&database, &bytes);
+        let error = verify_snapshot_manifest_for_restore(&swapped).unwrap_err();
+        assert!(error.contains("SHA-256 mismatch"), "{error}");
+
+        // A changed length is refused before anything is hashed at all.
+        let grown = take_snapshot_at(&db, tmp.path(), 5, 6000).unwrap().unwrap();
+        assert!(verify_snapshot_manifest_for_restore(&grown).unwrap());
+        let database = grown.join(DB_FILE);
+        let mut bytes = std::fs::read(&database).unwrap();
+        bytes.push(0);
+        write_settled(&database, &bytes);
+        let error = verify_snapshot_manifest_for_restore(&grown).unwrap_err();
+        assert!(error.contains("size mismatch"), "{error}");
+    }
+
+    #[test]
+    fn absent_sources_and_shapeless_manifests_fail_closed() {
+        // A source directory that is not there at all: refused as unreadable, never captured empty.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("no-such-generation");
+        let error = match VerifiedSnapshotImage::capture(&missing, || {}) {
+            Ok(_) => panic!("a missing snapshot directory must never capture"),
+            Err(error) => error,
+        };
+        assert!(error.contains("snapshot directory is unreadable"), "{error}");
+
+        // A manifest with no files array at all declares nothing, so EVERY required artifact is
+        // missing — the drill's contract must not read a shapeless manifest as complete.
+        let shapeless = manifest_missing_required(&serde_json::json!({"schema": 1}));
+        assert!(shapeless.contains(&DB_FILE.to_string()), "{shapeless:?}");
+        assert!(shapeless.contains(&crate::review_pilot::REVIEW_PILOT_FILE.to_string()), "{shapeless:?}");
+
+        // The settings arm of the optional-state validator: recovery bytes that are not settings at
+        // all must fail rather than install as an empty configuration.
+        assert!(validate_present_optional_state("settings.json", b"not json at all").is_err());
+    }
+
+    #[test]
+    fn device_name_lookalikes_are_accepted_and_pinned_selectors_parse_exactly() {
+        // The reserved-name guard must bite ONLY the real DOS devices. Refusing a near-miss would
+        // silently drop recovery state from a snapshot's inventory, failing the restore later.
+        for name in ["com0.json", "lpt0.db", "comx.json", "communication.json", "nullable.json", "console.log"] {
+            safe_manifest_name(name).unwrap_or_else(|error| panic!("{name} must be accepted: {error}"));
+        }
+
+        // The selector parsers are the only thing standing between a picker string and a path.
+        assert_eq!(parse_fixed_timestamp("0000000000"), Some(0));
+        assert_eq!(parse_fixed_timestamp("0000001000"), Some(1_000));
+        assert_eq!(parse_fixed_timestamp("999999999"), None, "nine digits is not the fixed width");
+        assert_eq!(parse_fixed_timestamp("00000000001"), None, "eleven digits is not the fixed width");
+        assert_eq!(parse_fixed_timestamp("00000000a0"), None);
+
+        assert_eq!(parse_pinned_name("drill_0000000300"), Some(300));
+        assert_eq!(parse_pinned_name("pre_migration-1_0000000300"), Some(300), "labels may carry _ and -");
+        assert_eq!(parse_pinned_name("nounderscore"), None);
+        assert_eq!(parse_pinned_name("_0000000300"), None, "an empty label names nothing");
+        assert_eq!(parse_pinned_name("-lead_0000000300"), None, "a label must start alphanumeric");
+        assert_eq!(parse_pinned_name("la bel_0000000300"), None);
+        assert_eq!(
+            parse_pinned_name(&format!("{}_0000000300", "x".repeat(64))),
+            Some(300),
+            "64 characters is the cap, not one past it"
+        );
+        assert_eq!(parse_pinned_name(&format!("{}_0000000300", "x".repeat(65))), None);
+    }
+}
+
+#[cfg(test)]
+mod offsite_state_tests {
+    use super::*;
+    use crate::db::Database;
+
+    const VALID_PILOT_POLICY: &[u8] = br#"{
+      "schema_version": 1,
+      "after_review_event_id": 0,
+      "max_total_corpus_actions": 20,
+      "reviewers": [
+        {"name": "Hawzhin", "max_corpus_actions": 10},
+        {"name": "Pavel", "max_corpus_actions": 10}
+      ]
+    }"#;
+
+    /// The off-drive copy must carry the state files needed to actually RECOVER, not just the DB.
+    ///
+    /// Measured 2026-08-19: `take_snapshot_at_from` read `EXTRA_STATE` from the DESTINATION
+    /// directory. For a local snapshot destination == primary, so it worked and every test passed;
+    /// for the off-drive copy the destination is the owner's second disk, which holds no
+    /// `settings.json` or `champion.json` of its own. The copy is best-effort, so both files were
+    /// skipped with only a warning and every off-drive snapshot silently contained the database
+    /// alone. Restoring from it would come back with no champion pointer — and the server refuses to
+    /// start without one, so the "backup" would resurrect a library that cannot transcribe.
+    #[test]
+    fn an_offsite_snapshot_carries_settings_and_champion_from_the_live_library() {
+        let primary = tempfile::TempDir::new().unwrap();
+        let offsite = tempfile::TempDir::new().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        seed_test_required_snapshot_state(primary.path()).unwrap();
+        let settings = crate::settings::AppSettings {
+            backup_second_dir: "X:/recovery".to_string(),
+            ..crate::settings::AppSettings::default()
+        };
+        std::fs::write(primary.path().join("settings.json"), serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+        std::fs::write(primary.path().join("reviewer_dialects.json"), br#"{"Sara":["sorani"]}"#).unwrap();
+        crate::review_pilot::install_test_focus(primary.path(), ["a"]);
+        std::fs::write(primary.path().join("review_pilot_policy.json"), VALID_PILOT_POLICY).unwrap();
+
+        let snap = take_offsite_snapshot(&db, offsite.path(), primary.path(), 3).unwrap().expect("snapshot");
+
+        assert!(snap.starts_with(offsite.path()), "the tree must be written to the off-drive target");
+        for name in EXTRA_STATE {
+            let copied = snap.join(name);
+            assert!(
+                copied.is_file(),
+                "{name} is missing from the off-drive snapshot — a restore from it could not recover \
+                 the champion pointer or the owner's settings"
+            );
+        }
+        assert_eq!(
+            std::fs::read(snap.join("champion.json")).unwrap(),
+            std::fs::read(primary.path().join("champion.json")).unwrap(),
+            "the copied champion pointer must be the LIVE one, byte for byte"
+        );
+        assert!(snap.join(DB_FILE).is_file(), "the database itself must still be there");
+    }
+
+    /// A snapshot must be able to PROVE what it contains, and the two copies must be comparable.
+    #[test]
+    fn every_snapshot_carries_a_manifest_that_matches_its_bytes() {
+        let primary = tempfile::TempDir::new().unwrap();
+        let offsite = tempfile::TempDir::new().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        seed_test_required_snapshot_state(primary.path()).unwrap();
+        crate::review_pilot::install_test_focus(primary.path(), ["manifest-focus"]);
+        std::fs::write(primary.path().join("review_pilot_policy.json"), VALID_PILOT_POLICY).unwrap();
+
+        let snap = take_offsite_snapshot(&db, offsite.path(), primary.path(), 3).unwrap().unwrap();
+        let original_settings = std::fs::read(snap.join("settings.json")).unwrap();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(snap.join(MANIFEST_FILE)).unwrap()).unwrap();
+
+        assert!(
+            manifest_missing_required(&manifest).is_empty(),
+            "manifest omits required recovery state: {:?}",
+            manifest_missing_required(&manifest)
+        );
+        for row in manifest["files"].as_array().unwrap() {
+            let name = row["path"].as_str().unwrap();
+            let path = snap.join(name);
+            assert_eq!(
+                row["sizeBytes"].as_u64().unwrap(),
+                path.metadata().unwrap().len(),
+                "{name}: manifest size disagrees with the file on disk"
+            );
+            assert_eq!(
+                row["sha256"].as_str().unwrap(),
+                crate::models::compute_file_sha256(&path).unwrap(),
+                "{name}: manifest hash disagrees with the file on disk"
+            );
+        }
+        assert!(verify_snapshot_manifest_for_restore(&snap).unwrap(), "a complete new snapshot must verify");
+
+        // Even a self-consistent manifest (updated size/hash) cannot bless a different focus set
+        // while the paid-pilot policy is present. This proves semantic binding, not just tamper hash.
+        crate::review_pilot::install_test_focus(&snap, ["manifest-focus"]);
+        let focus_path = snap.join(crate::voice_focus::VOICE_FOCUS_FILE);
+        let refresh_focus_row = |manifest: &mut serde_json::Value| {
+            let row = manifest["files"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|row| row["path"] == crate::voice_focus::VOICE_FOCUS_FILE)
+                .unwrap();
+            row["sizeBytes"] = serde_json::json!(focus_path.metadata().unwrap().len());
+            row["sha256"] = serde_json::json!(crate::models::compute_file_sha256(&focus_path).unwrap());
+        };
+        refresh_focus_row(&mut manifest);
+        std::fs::write(snap.join(MANIFEST_FILE), serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        assert!(verify_snapshot_manifest_for_restore(&snap).unwrap());
+        let exact_focus = std::fs::read(&focus_path).unwrap();
+        std::fs::write(&focus_path, br#"{"segment_ids":["manifest-wrong"]}"#).unwrap();
+        refresh_focus_row(&mut manifest);
+        std::fs::write(snap.join(MANIFEST_FILE), serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        let focus_error = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+        assert!(focus_error.contains("digest mismatch"), "{focus_error}");
+        std::fs::write(&focus_path, exact_focus).unwrap();
+        refresh_focus_row(&mut manifest);
+        std::fs::write(snap.join(MANIFEST_FILE), serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        assert!(verify_snapshot_manifest_for_restore(&snap).unwrap());
+
+        // Every failure is pre-restore and loud: mismatched bytes, an incomplete inventory, and an
+        // invalid manifest can never be downgraded to the manifest-less legacy path.
+        std::fs::write(snap.join("settings.json"), b"tampered").unwrap();
+        let mismatch = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+        assert!(mismatch.contains("SHA-256 mismatch") || mismatch.contains("size mismatch"), "{mismatch}");
+        std::fs::write(snap.join("settings.json"), &original_settings).unwrap();
+
+        let mut incomplete = manifest.clone();
+        incomplete["files"].as_array_mut().unwrap().retain(|row| row["path"] != "champion.json");
+        std::fs::remove_file(snap.join("champion.json")).unwrap();
+        std::fs::write(snap.join(MANIFEST_FILE), serde_json::to_vec_pretty(&incomplete).unwrap()).unwrap();
+        let missing = verify_snapshot_manifest_for_restore(&snap).unwrap_err();
+        assert!(missing.contains("exactly one") && missing.contains("champion.json"), "{missing}");
+
+        std::fs::write(snap.join(MANIFEST_FILE), b"{not json}").unwrap();
+        assert!(verify_snapshot_manifest_for_restore(&snap).unwrap_err().contains("invalid JSON"));
+    }
+
+    /// The point of the manifest: an incomplete tree is DETECTABLE rather than merely present.
+    #[test]
+    fn a_snapshot_missing_required_state_is_reported_as_missing() {
+        let manifest = serde_json::json!({"schema": 1, "files": [{"path": "cortex-speech.db"}]});
+        let missing = manifest_missing_required(&manifest);
+        assert!(missing.contains(&"settings.json".to_string()), "{missing:?}");
+        assert!(missing.contains(&"champion.json".to_string()), "{missing:?}");
+    }
+
+    /// The local snapshot path is unchanged by the fix: destination and primary are one directory.
+    #[test]
+    fn a_local_snapshot_still_carries_its_own_state_files() {
+        // `take_snapshot` moves the process-global health counters; the lock keeps that out of the
+        // health tests' assertion windows.
+        let _health = lock_health_counters();
+        let data = tempfile::TempDir::new().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        seed_test_required_snapshot_state(data.path()).unwrap();
+        crate::review_pilot::install_test_focus(data.path(), ["local-focus"]);
+        std::fs::write(data.path().join("review_pilot_policy.json"), VALID_PILOT_POLICY).unwrap();
+
+        let snap = take_snapshot(&db, data.path(), 3).unwrap().expect("snapshot");
+        for name in EXTRA_STATE {
+            assert!(snap.join(name).is_file(), "local snapshot lost {name}");
+        }
     }
 }

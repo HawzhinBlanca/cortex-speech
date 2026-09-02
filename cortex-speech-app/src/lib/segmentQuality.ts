@@ -1,4 +1,15 @@
 import type { SpeechSegment } from './types';
+import { reviewTranscript } from './reviewTranscriptAuthority';
+
+type EffectiveTranscriptFields = Pick<
+  SpeechSegment,
+  | 'rawTranscript'
+  | 'normalizedTranscript'
+  | 'annotatedTranscript'
+  | 'verdictTranscript'
+  | 'humanDecision'
+  | 'verdict'
+>;
 
 /**
  * True when a human explicitly REJECTED this clip — the review "mark bad" action, or a jury/import
@@ -45,51 +56,20 @@ export function isPlaceholderTranscript(text: string | null | undefined): boolea
  * The transcript a segment is actually JUDGED by — the single mirror of the Rust `EFFECTIVE`
  * expression in `stats.rs` and of `quality::effective_transcript`.
  *
- * Before this existed the frontend carried three different orders for "the transcript": stats used
- * `normalized || annotated || raw`, the backend SQL used `annotated, normalized, raw`, and the real
- * rule prefers `verdictTranscript` when a human decided. So a human edit stored in verdictTranscript
- * was measured as whatever stale text sat in annotated/raw. One helper, one order.
+ * VERBATIM LAW: human verdict > human annotation > immutable champion raw. Refined/normalized text
+ * remains labeled machine evidence and can never become the review draft, export, or training text.
+ * This mirrors Rust `quality::effective_transcript` so every product surface uses the same authority.
  */
-export function effectiveTranscript(
-  seg: Pick<
-    SpeechSegment,
-    'rawTranscript' | 'annotatedTranscript' | 'verdictTranscript' | 'humanDecision' | 'verdict'
-  >,
-): string {
-  const nonEmpty = (t: string | null | undefined) => (t ?? '').trim();
-  const humanDecided =
-    ['accept', 'edit', 'human_accept', 'human_edit'].includes(
-      (seg.humanDecision ?? '').toLowerCase(),
-    ) || ['human_accept', 'human_edit'].includes((seg.verdict ?? '').toLowerCase());
-  const verdictText = nonEmpty(seg.verdictTranscript);
-  if (humanDecided && verdictText) return verdictText;
-  // VERBATIM LAW (2026-08-12): human text else the champion's verbatim raw — never an undecided
-  // machine verdict, never the LLM-refined paraphrase (measured rewriting 11% of characters).
-  return nonEmpty(seg.annotatedTranscript) || nonEmpty(seg.rawTranscript);
+export function effectiveTranscript(seg: EffectiveTranscriptFields): string {
+  return reviewTranscript(seg).trim();
 }
 
 /**
- * True when a segment carries at least one REAL transcript — a non-empty, non-placeholder string in any of
- * its transcript fields — i.e. actual content that could ship, not just an ASR placeholder or blanks. Used
- * to keep "verified" COUNTS honest: batch_verify sets verified=true with NO content guard, so "Verify all
- * pending" marks a still-pending placeholder clip (awaiting the 7B) as verified — yet export_dataset drops
- * every placeholder/empty row via the training grade, so a plain `verified` tally over-counts what the
- * dataset can actually contain. Correct-direction by design: a clip with ANY real transcript is real, so this
- * never under-counts a genuinely-good clip; it excludes only clips that are placeholder/empty EVERYWHERE.
+ * True when the Verbatim-Law authority carries shippable content: human verdict, then human annotation,
+ * then immutable champion raw. A normalized/refined transcript is labeled machine evidence, so a row with
+ * only that field populated is not shippable truth and must not make verified counts look complete.
  */
-export function hasRealTranscript(
-  seg: Pick<
-    SpeechSegment,
-    'rawTranscript' | 'normalizedTranscript' | 'annotatedTranscript' | 'verdictTranscript'
-  >,
-): boolean {
-  return [
-    seg.annotatedTranscript,
-    seg.verdictTranscript,
-    seg.normalizedTranscript,
-    seg.rawTranscript,
-  ].some((t) => {
-    const s = (t ?? '').trim();
-    return s.length > 0 && !isPlaceholderTranscript(s);
-  });
+export function hasRealTranscript(seg: EffectiveTranscriptFields): boolean {
+  const transcript = effectiveTranscript(seg);
+  return transcript.length > 0 && !isPlaceholderTranscript(transcript);
 }

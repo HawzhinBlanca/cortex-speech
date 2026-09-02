@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use unicode_normalization::UnicodeNormalization;
 
+/// Version bound to every persisted normalized transcript and durable batch configuration hash.
+pub const NORMALIZER_VERSION: &str = "sorani-normalizer-v1";
+
 /// Compile a regex from a literal pattern that is fixed at compile time.
 ///
 /// The single reviewed `unwrap` exception in this module. A failure here is unreachable by
@@ -72,12 +75,9 @@ pub struct SoraniNormalizer {
     config: NormalizationConfig,
 }
 
-/// Canonical orthography for SHIPPED TRAINING TEXT (the HF `transcription` column and the
-/// fine-tune pack `sentence`): char-only unification so ك/ک, ي/ی, ه/ھ variants collapse to one
-/// form. Human-typed corrections and ASR output otherwise mix codepoint variants in one dataset,
-/// inflating the CTC label space of the retrain corpus (and Arabic-only forms may not even exist
-/// in the model's ckb vocab). Numbers and diacritics are left exactly as written — no one-way
-/// verbalization ever enters shipped text.
+/// Explicitly derived Sorani-normalized evidence and comparison key. This must never replace a
+/// primary review/export/training label: the Verbatim Law keeps the stored human/champion transcript
+/// exact and labels any normalized view separately. Numbers and diacritics remain as written.
 pub fn canonical_training_text(text: &str) -> String {
     static CHAR_ONLY: LazyLock<SoraniNormalizer> = LazyLock::new(SoraniNormalizer::char_only);
     CHAR_ONLY.normalize(text)
@@ -612,8 +612,7 @@ mod tests {
 
     #[test]
     fn canonical_training_text_unifies_variants_but_preserves_digits() {
-        // Shipped training text: Arabic Kaf/Yeh fold to the Kurdish forms, while digits stay digits
-        // (no one-way verbalization may ever enter a shipped sentence).
+        // Explicit derived evidence: Arabic Kaf/Yeh fold to Kurdish forms while digits stay digits.
         let out = canonical_training_text("كوردي ١٤");
         assert!(out.contains('ک') && out.contains('ی'), "Kaf/Yeh unified to Kurdish forms: {out}");
         assert!(!out.contains('ك') && !out.contains('ي'), "no Arabic variants remain: {out}");

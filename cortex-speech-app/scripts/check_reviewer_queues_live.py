@@ -28,12 +28,28 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
 # A reviewer this far from running dry is fine; below it, they will be idle within a sitting and the
 # owner should know while there is still time to import more of that dialect.
 RUNWAY_WARN_CLIPS = 100
+VALID_DIALECTS = {"hawleri", "sorani", "badini"}
+
+
+def _reject_nonfinite(token: str):
+    """serde_json rejects NaN/Infinity; Python's json accepts (and json.dumps EMITS) them. A mirror
+    that parses what the server refuses reads OK against a dead queue — same rejector the repo
+    already uses in bootstrap_legacy_champion and promotion_gate."""
+    raise ValueError(f"non-finite JSON token {token!r} (the server rejects this file)")
+
+
+class PolicyBroken(Exception):
+    """A policy file EXISTS but cannot be honoured. Mirror of the server's 503: the queue serves
+    NOTHING until the file is fixed (owner instruction 2026-08-20 — present-but-broken fails
+    CLOSED), so every live link is effectively dead and the gate must say FAIL, not count clips
+    the server will never hand out."""
 
 
 def _data_dir() -> Path:
@@ -77,9 +93,10 @@ def source_dialects(dialect_rs: str) -> list[tuple[str, str]]:
 
 def dialect_of(audio_path: str, table: list[tuple[str, str]]) -> str | None:
     """Mirror of `dialect::dialect_of`."""
-    normalized = audio_path.replace("/", "\\")
+    normalized = audio_path.replace("/", "\\").lower()
     name = normalized.rsplit("\\", 1)[-1]
     for fragment, dialect in table:
+        fragment = fragment.lower()
         if fragment in name or fragment in normalized:
             return dialect
     return None
@@ -90,35 +107,83 @@ def may_judge(allowed: list[str] | None, audio_path: str, table: list[tuple[str,
     if allowed is None:
         return True
     dialect = dialect_of(audio_path, table)
-    return dialect in allowed if dialect is not None else False
+    normalized_allowed = {value.strip().lower() for value in allowed}
+    return dialect in normalized_allowed if dialect is not None else False
 
 
 def load_roster(data_dir: Path) -> dict[str, list[str]]:
-    """Mirror of `dialect::load_roster`: array-of-strings values are entries, anything else is not."""
+    """Mirror of `dialect::load_roster`: missing = unrestricted; present-but-broken raises
+    PolicyBroken (the server 503s every queue); `_`-prefixed keys are comments; any other
+    non-list-of-strings value is a typo'd RESTRICTION and is broken, not skippable."""
     path = data_dir / "reviewer_dialects.json"
     if not path.is_file():
         return {}
     try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+        parsed = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_nonfinite)
+    except (OSError, ValueError) as e:
+        raise PolicyBroken(f"reviewer_dialects.json is not valid JSON: {e}") from e
     if not isinstance(parsed, dict):
-        return {}
-    return {
-        name: value
-        for name, value in parsed.items()
-        if isinstance(value, list) and all(isinstance(v, str) for v in value)
-    }
+        raise PolicyBroken("reviewer_dialects.json is not a JSON object")
+    roster: dict[str, list[str]] = {}
+    for name, value in parsed.items():
+        if name.startswith("_"):
+            continue
+        if isinstance(value, list) and all(isinstance(v, str) for v in value):
+            if not value:
+                raise PolicyBroken(f'reviewer_dialects.json entry "{name}" must name at least one dialect')
+            normalized = []
+            for dialect in value:
+                canonical = dialect.strip().lower()
+                if canonical not in VALID_DIALECTS:
+                    raise PolicyBroken(
+                        f'reviewer_dialects.json entry "{name}" contains unknown dialect "{dialect}" '
+                        f'(allowed: {sorted(VALID_DIALECTS)})'
+                    )
+                if canonical not in normalized:
+                    normalized.append(canonical)
+            dupe = next((k for k in roster if k.strip().lower() == name.strip().lower()), None)
+            if dupe is not None:
+                raise PolicyBroken(f'reviewer_dialects.json: "{name}" and "{dupe}" name the same reviewer')
+            roster[name] = normalized
+        else:
+            raise PolicyBroken(f'reviewer_dialects.json entry "{name}" is not a list of dialect names')
+    return roster
 
 
-def live_reviewers(data_dir: Path) -> list[str]:
-    """The names whose links are live right now, from the remembered couch session."""
+def allowed_for(roster: dict[str, list[str]], reviewer: str) -> list[str] | None:
+    """Mirror of `dialect::allowed_for`: matched the way the session layer matches names (trimmed,
+    case-insensitive), never an exact dict lookup — an orphaned roster key silently un-restricted
+    exactly the reviewer it named (2026-08-20 hunt)."""
+    want = reviewer.strip().lower()
+    for name, dialects in roster.items():
+        if name.strip().lower() == want:
+            return dialects
+    return None
+
+
+def live_reviewers(data_dir: Path, db_path: Path) -> list[str]:
+    """The names whose links are live right now, mirroring `couch::load_session`'s OWN authority
+    rules (2026-08-20 hunt) — the gate previously read couch_session.json alone and passed a
+    red/green verdict about links the server itself considers dead:
+
+      * `couch_session.revoked` is authoritative: Stop writes it FIRST, and its teardown may fail to
+        delete the credential file — session present + marker present = NO live links;
+      * a session remembered against a DIFFERENT library never resumes, so its reviewers are not
+        live against this db_path;
+      * an unreadable session file is a question the gate cannot answer — FAIL loudly, never
+        "OK (no couch session)" while a running server may be serving from memory.
+    """
     session = data_dir / "couch_session.json"
+    if (data_dir / "couch_session.revoked").exists():
+        return []
     if not session.is_file():
         return []
     try:
         payload = json.loads(session.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError) as e:
+        raise PolicyBroken(f"couch_session.json exists but cannot be read: {e}") from e
+    saved_db = payload.get("db_path")
+    if isinstance(saved_db, str) and saved_db and Path(saved_db) != db_path:
         return []
     reviewers = payload.get("reviewers")
     if isinstance(reviewers, dict):  # token -> name
@@ -128,16 +193,42 @@ def live_reviewers(data_dir: Path) -> list[str]:
     return []
 
 
-def servable_clips(db_path: Path, table: list[tuple[str, str]]) -> list[tuple[str, int]]:
+def load_focus(data_dir: Path) -> set[str] | None:
+    """Mirror of `voice_focus::load_focus`: the allow-list of clip ids every queue is narrowed to.
+
+    Same fail-CLOSED contract as the Rust (owner instruction 2026-08-20): missing means no focus;
+    present-but-broken raises PolicyBroken, because the server 503s every queue until the file is
+    fixed. The gate MUST mirror the server exactly — measured 2026-08-19 the moment the focus went
+    live: this gate reported "15,318 servable pending" while every reviewer's real queue held 905.
+    A gate that counts clips the server will never hand out reads OK against a dead queue.
+    """
+    path = data_dir / "voice_focus.json"
+    if not path.is_file():
+        return None
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_nonfinite)
+    except (OSError, ValueError) as e:
+        raise PolicyBroken(f"voice_focus.json is not valid JSON: {e}") from e
+    ids = parsed.get("segment_ids") if isinstance(parsed, dict) else None
+    focus = {i for i in ids if isinstance(i, str)} if isinstance(ids, list) else set()
+    if not focus:
+        raise PolicyBroken("voice_focus.json names no segment ids")
+    return focus
+
+
+def servable_clips(
+    db_path: Path, table: list[tuple[str, str]], focus: set[str] | None = None
+) -> list[tuple[str, int]]:
     """(audio_path, duration_ms) for every clip the queue would hand out, before dialect.
 
-    The WHERE clause is `db::pending_segment_ids_for`'s, and the on-disk check is the one it does
-    per distinct path — a row whose audio is gone is not work anybody can do.
+    The WHERE clause is `db::pending_segment_ids_for`'s, the on-disk check is the one it does per
+    distinct path — a row whose audio is gone is not work anybody can do — and `focus` is the
+    voice-focus allow-list the server applies after both.
     """
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         rows = con.execute(
-            "SELECT audio_path, duration_ms FROM speech_segments "
+            "SELECT id, audio_path, duration_ms FROM speech_segments "
             " WHERE verified = 0 "
             "   AND TRIM(COALESCE(raw_transcript, '')) <> '' "
             "   AND NOT (TRIM(raw_transcript) LIKE '[%]')"
@@ -146,7 +237,9 @@ def servable_clips(db_path: Path, table: list[tuple[str, str]]) -> list[tuple[st
         con.close()
     on_disk: dict[str, bool] = {}
     out = []
-    for path, duration in rows:
+    for seg_id, path, duration in rows:
+        if focus is not None and seg_id not in focus:
+            continue
         if path not in on_disk:
             on_disk[path] = os.path.isfile(path)
         if on_disk[path]:
@@ -154,25 +247,121 @@ def servable_clips(db_path: Path, table: list[tuple[str, str]]) -> list[tuple[st
     return out
 
 
-def wrong_dialect_decisions(db_path: Path, roster: dict[str, list[str]], table: list[tuple[str, str]]) -> dict[str, int]:
-    """Verified decisions made by a reviewer on a dialect they are not allowed to judge.
+def active_pool_queue_counts(
+    data_dir: Path,
+    db_path: Path,
+    reviewers: list[str],
+    roster: dict[str, list[str]],
+) -> dict[str, int] | None:
+    """Use the active release's exact Rust queue authority when a flexible pool exists.
 
-    Reported, never failed: the 12 that exist predate the roster, and a gate that stays RED on
-    unfixable history buries the signal it was written to carry. It is here because the count should
-    only ever go DOWN — a NEW one means the routing broke again, and this is where that shows up.
+    Flexible-pool mode deliberately supersedes ``voice_focus.json``. Reapplying that historical
+    one-voice allow-list in this checker made a healthy 16,990-clip pool look like a 6,922-clip Lamo
+    queue even though the server correctly served the immutable three-voice pool. The hash-bound
+    ``pool_admin probe`` calls the same ``review_pool::pending_segment_ids`` implementation as Couch,
+    including effective reviewer decisions, two/three-review resolution, duplicate exclusions,
+    dialect restrictions, playable audio, and idempotency authority.
+    """
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        registry_exists = con.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='review_pool_registry'"
+        ).fetchone()[0]
+        if registry_exists == 0:
+            return None
+        registry_rows = con.execute("SELECT COUNT(*) FROM review_pool_registry").fetchone()[0]
+    except sqlite3.Error as error:
+        raise PolicyBroken(f"review-pool authority cannot be read: {error}") from error
+    finally:
+        con.close()
+    if registry_rows == 0:
+        return None
+    if registry_rows != 1:
+        raise PolicyBroken(f"review_pool_registry has {registry_rows} rows instead of exactly one")
+
+    try:
+        from release_private_production import active_pointer, defaults
+
+        _default_data, release_root = defaults()
+        manifest = active_pointer(data_dir, release_root)
+    except Exception as error:  # noqa: BLE001 - a broken release boundary is a queue failure
+        raise PolicyBroken(f"active flexible-pool release cannot be verified: {error}") from error
+    if manifest is None:
+        raise PolicyBroken("a flexible review pool exists without an immutable active release")
+
+    counts: dict[str, int] = {}
+    for reviewer in reviewers:
+        command = [
+            str(manifest["poolAdminExe"]),
+            "probe",
+            "--db",
+            str(db_path),
+            "--reviewer",
+            reviewer,
+        ]
+        for dialect in allowed_for(roster, reviewer) or []:
+            command.extend(["--dialect", dialect])
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=180, check=False)
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "no diagnostic").strip()
+                raise PolicyBroken(f"canonical pool probe failed for {reviewer}: {detail}")
+            payload = json.loads(result.stdout, parse_constant=_reject_nonfinite)
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            raise PolicyBroken(f"canonical pool probe is unreadable for {reviewer}: {error}") from error
+        count = payload.get("availableClips") if isinstance(payload, dict) else None
+        if (
+            type(count) is not int
+            or count < 0
+            or payload.get("readOnly") is not True
+            or payload.get("reviewer") != reviewer
+            or payload.get("passes") is not True
+            or payload.get("sampleAudioValidWav") is not True
+            or payload.get("submissionIdempotencyAuthority") is not True
+        ):
+            raise PolicyBroken(f"canonical pool probe returned invalid authority for {reviewer}")
+        counts[reviewer] = count
+    return counts
+
+
+def evaluate_pool_queues(counts: dict[str, int], warn_below: int = RUNWAY_WARN_CLIPS) -> tuple[list[str], list[str]]:
+    """Return the same zero-work failures/runway warnings from exact reviewer-specific pool counts."""
+    problems = [f"{reviewer} has a live link and ZERO clips to review." for reviewer, count in counts.items() if count == 0]
+    warnings = [
+        f"{reviewer} has only {count} clips left — import more soon."
+        for reviewer, count in counts.items()
+        if 0 < count < warn_below
+    ]
+    return problems, warnings
+
+
+def wrong_dialect_decisions(db_path: Path, roster: dict[str, list[str]], table: list[tuple[str, str]]) -> dict[str, int]:
+    """Current, attributed decisions outside the reviewer's present dialect scope.
+
+    ``review_events`` is append-only history, not the authority for the row's current verdict: an
+    undo, redo, later reviewer, or owner decision may supersede an older event.  Reading historical
+    events here previously blamed an old reviewer even when the segment was now rejected and
+    excluded downstream.  ``speech_segments.reviewed_by`` and ``human_decision`` are written
+    atomically by the current review path, so they are the only honest current-state attribution.
+
+    This remains a warning rather than a hard failure because tightening a roster can reveal legacy
+    work that predates the restriction.  A new warning after activation is nevertheless a routing
+    regression that must be investigated.
     """
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         rows = con.execute(
-            "SELECT DISTINCT e.reviewer, e.segment_id, s.audio_path FROM review_events e "
-            "  JOIN speech_segments s ON s.id = e.segment_id "
-            " WHERE e.action IN ('accept','edit','reject') AND s.verified = 1"
+            "SELECT reviewed_by, id, audio_path FROM speech_segments "
+            " WHERE verified = 1 "
+            "   AND TRIM(COALESCE(reviewed_by, '')) <> '' "
+            "   AND LOWER(COALESCE(human_decision, '')) IN "
+            "       ('accept','human_accept','edit','human_edit','reject','human_reject')"
         ).fetchall()
     finally:
         con.close()
     offenders: dict[str, int] = {}
     for reviewer, _segment_id, path in rows:
-        allowed = roster.get(reviewer)
+        allowed = allowed_for(roster, reviewer)
         if allowed is not None and not may_judge(allowed, path, table):
             offenders[reviewer] = offenders.get(reviewer, 0) + 1
     return offenders
@@ -190,7 +379,7 @@ def evaluate_queues(
     problems: list[str] = []
     warnings: list[str] = []
     for who in reviewers:
-        allowed = roster.get(who)
+        allowed = allowed_for(roster, who)
         mine = [(p, d) for p, d in clips if may_judge(allowed, p, table)]
         tag = ", ".join(allowed) if allowed else "unrestricted"
         if not mine:
@@ -211,25 +400,48 @@ def main() -> int:
         print(f"REVIEWER QUEUES: SKIP-ENV (no library at {db_path})", flush=True)
         return 0
 
-    reviewers = live_reviewers(data_dir)
+    try:
+        reviewers = live_reviewers(data_dir, db_path)
+    except PolicyBroken as e:
+        print("REVIEWER QUEUES: FAIL", flush=True)
+        print(f"  - {e} — cannot tell which links are live; a running server may be serving from memory", flush=True)
+        return 1
     if not reviewers:
         print("REVIEWER QUEUES: OK (no couch session — no links are live)", flush=True)
         return 0
 
     table = source_dialects((_repo_root() / "src-tauri" / "src" / "dialect.rs").read_text(encoding="utf-8"))
-    roster = load_roster(data_dir)
-    clips = servable_clips(db_path, table)
-
-    problems, warnings = evaluate_queues(reviewers=reviewers, roster=roster, clips=clips, table=table)
+    try:
+        roster = load_roster(data_dir)
+        pool_counts = active_pool_queue_counts(data_dir, db_path, reviewers, roster)
+        focus = None if pool_counts is not None else load_focus(data_dir)
+    except PolicyBroken as e:
+        # The server 503s every queue while a policy file is broken, so every live link is dead.
+        print("REVIEWER QUEUES: FAIL", flush=True)
+        print(f"  - {e} — the server serves NOTHING to any reviewer until this file is fixed", flush=True)
+        return 1
+    clips: list[tuple[str, int]] = []
+    if pool_counts is not None:
+        problems, warnings = evaluate_pool_queues(pool_counts)
+        print(
+            "review pool ACTIVE: exact reviewer queues "
+            + ", ".join(f"{reviewer}={count}" for reviewer, count in sorted(pool_counts.items())),
+            flush=True,
+        )
+    else:
+        clips = servable_clips(db_path, table, focus)
+        if focus is not None:
+            print(f"voice focus ACTIVE: queues narrowed to {len(focus)} clip id(s)", flush=True)
+        problems, warnings = evaluate_queues(reviewers=reviewers, roster=roster, clips=clips, table=table)
 
     offenders = wrong_dialect_decisions(db_path, roster, table)
     if offenders:
         total = sum(offenders.values())
         detail = ", ".join(f"{who} {n}" for who, n in sorted(offenders.items()))
         warnings.append(
-            f"{total} verified decision(s) were made on a dialect the reviewer may not judge ({detail}). "
-            f"These predate the roster; they are still verified and carry weight downstream, so they "
-            f"need re-reviewing. This count must only ever go DOWN."
+            f"{total} current attributed decision(s) are outside the reviewer's present dialect scope "
+            f"({detail}). Accepted/edited rows may influence downstream data; rejected rows remain "
+            f"excluded but still indicate a routing-policy breach. Investigate before export."
         )
 
     for w in warnings:
@@ -247,7 +459,7 @@ def main() -> int:
 
     print(
         f"REVIEWER QUEUES: OK ({len(reviewers)} live link(s), every one has clips to review; "
-        f"{len(clips)} servable pending)",
+        f"{sum(pool_counts.values()) if pool_counts is not None else len(clips)} reviewer-eligible pending)",
         flush=True,
     )
     return 0

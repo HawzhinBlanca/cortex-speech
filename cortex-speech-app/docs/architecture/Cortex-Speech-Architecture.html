@@ -54,6 +54,8 @@
 <p class="lead">An offline-first desktop application for <b>Central Kurdish (Sorani)</b> speech transcription, transcript curation, and ML dataset export. The default transcription engine is the user's fine-tuned <b>OmniASR-7B Champion</b> running locally on the GPU; everything works without a network, and any cloud assistance is opt-in and off by default.</p>
 <p class="meta">Architecture &amp; technical overview · generated 2026-06-30 · repo <span class="mono">github.com/HawzhinBlanca/cortex-speech</span> · <span class="mono">main @ 4787d81</span> · stack: Tauri v2 + Svelte 5 (runes) + Rust + SQLite/FTS5</p>
 
+<div class="note"><b>Historical architecture snapshot.</b> Commit facts remain for provenance, but retired runtime claims have been corrected. Current canon: production ASR is OmniASR-7B Champion only; Scribe has no runtime, key, settings, or fallback path; the only consent-gated advisory cloud model is fixed to Gemini 2.5 Pro.</div>
+
 <figure>
   <img src="cortex-e2e-architecture.svg" alt="Cortex Speech end-to-end architecture diagram">
   <figcaption>End-to-end data flow: capture → pipeline → ASR engines → jury → human review → storage → validation &amp; export. Solid violet = the OmniASR-7B Champion primary path (default); dashed = cloud (opt-in, off by default).</figcaption>
@@ -66,7 +68,7 @@
   <div class="card"><h3>Design principles</h3><ul>
     <li><b>Offline-first.</b> Local ASR + alignment + storage; no network needed.</li>
     <li><b>Honesty-first.</b> Machine output is never presented as human-verified; every transcript carries its engine provenance; metrics come from real runs only.</li>
-    <li><b>Consent-gated cloud.</b> Voice is treated as biometric data (GDPR Art. 9); cloud STT/LLM require explicit opt-in.</li>
+    <li><b>Consent-gated cloud.</b> Voice is treated as biometric data (GDPR Art. 9); the fixed Gemini 2.5 Pro advisory paths require explicit opt-in. There is no cloud ASR fallback.</li>
     <li><b>Human-in-the-loop.</b> A jury auto-adjudicates the easy cases and escalates the rest to a fast review UI; the human decision is final.</li>
   </ul></div>
   <div class="card"><h3>Tech stack</h3><ul>
@@ -84,7 +86,7 @@
   <tr><th>Stage</th><th>What happens</th><th>Key functions / files</th></tr>
   <tr><td><b>Decode</b></td><td>Audio → 16&nbsp;kHz mono PCM. Short files decode whole; long files stream in 90&nbsp;s windows to bound memory.</td><td><span class="mono">decode_to_pcm_with_timeout</span>, <span class="mono">decode_pcm_windows</span>, <span class="mono">should_stream_decode</span> (audio.rs, chunking.rs)</td></tr>
   <tr><td><b>VAD chunk</b></td><td>Silero VAD finds speech regions; regions are merged/split/absorbed to honor min/max segment length (no cutting mid-word, no spanning long silences).</td><td><span class="mono">voice_activity_detection</span>, <span class="mono">plan_speech_chunks</span> (chunking.rs)</td></tr>
-  <tr><td><b>ASR dispatch</b></td><td>Each chunk is transcribed by the active engine (default: OmniASR-7B Champion). Confidence + raw text returned per chunk.</td><td><span class="mono">build_segments_from_pcm</span>, <span class="mono">transcribe</span> (pipeline.rs)</td></tr>
+  <tr><td><b>ASR dispatch</b></td><td>Every production chunk is routed to the OmniASR-7B Champion. If it is unavailable, transcription stops; no smaller or cloud engine is substituted.</td><td><span class="mono">build_segments_from_pcm</span>, <span class="mono">transcribe</span> (pipeline.rs)</td></tr>
   <tr><td><b>Normalize</b></td><td>Sorani normalization (numerals, hamza/y-k variants) → <span class="mono">normalized_transcript</span>; all text stored Unicode NFC.</td><td><span class="mono">SoraniNormalizer</span> (normalizer.rs)</td></tr>
   <tr><td><b>Align (words)</b></td><td>Forced alignment gives per-word start/end timestamps for "tap-a-word" review. Uses the fine-tuned MMS-CTC; falls back to the bundled aligner / energy heuristic.</td><td><span class="mono">align_via_finetuned_mms</span>, <span class="mono">ctc_logits_to_word_timestamps</span> (aligner.rs, wav2vec2_asr.rs)</td></tr>
   <tr><td><b>Persist</b></td><td>Segments + multi-model hypotheses written transactionally to SQLite; FTS5 index auto-syncs.</td><td><span class="mono">persist_segments</span>, <span class="mono">insert_segments_batch</span> (db.rs)</td></tr>
@@ -93,26 +95,25 @@
 <p>After persistence the import callback triggers the jury on a <b>separate WAL DB connection</b> so heavy adjudication never starves the UI's <code>get_segments</code>.</p>
 
 <h2>3 · ASR engines</h2>
-<p>Five engines are wired; routing is by <code>settings.asr_model_size</code> (default <b>WSL7B</b>) plus <code>use_finetuned_asr</code> and consent flags.</p>
+<p>Production settings are hard-pinned to <b>WSL7B</b>. Smaller ASR implementations remain available only to explicit offline diagnostic tools and tests; they are not production settings, UI choices, import routes, or re-transcribe fallbacks.</p>
 <table>
   <tr><th>Engine</th><th>model_id</th><th>Runtime</th><th>Role</th></tr>
   <tr><td><b>OmniASR-7B Champion</b> ★</td><td><span class="mono">omniasr-wsl-7b</span></td><td>base omniASR-LLM-7B-v2 + LoRA adapter, fairseq2+PEFT, ~31&nbsp;GB, WSL GPU server on <span class="mono">127.0.0.1:8799</span></td><td><b>Primary / default.</b> The owner's fine-tuned 7B; produces every import transcript.</td></tr>
-  <tr><td>OmniASR-CTC 300M</td><td><span class="mono">omniasr-ctc-300m</span></td><td>sherpa-onnx (ONNX), ~50&nbsp;MB</td><td>Bundled local fallback / offline default-downloadable model.</td></tr>
-  <tr><td>OmniASR-CTC 1B</td><td><span class="mono">omniasr-ctc-1b</span></td><td>sherpa-onnx (ONNX), ~500&nbsp;MB</td><td>Larger base CTC (opt-in).</td></tr>
-  <tr><td>Fine-tuned MMS-1B</td><td><span class="mono">finetuned-mms-ckb</span></td><td>Wav2Vec2-CTC via <span class="mono">ort</span>, ~970&nbsp;MB, ~18.6% CER</td><td>Used for word alignment, and as an opt-in per-clip re-transcribe engine.</td></tr>
-  <tr><td>ElevenLabs Scribe</td><td><span class="mono">scribe-v1</span></td><td>Cloud REST (opt-in)</td><td>Cloud STT for a second opinion / jury vote — only with <code>cloud_stt_opt_in</code>.</td></tr>
+  <tr><td>OmniASR-CTC 300M</td><td><span class="mono">omniasr-ctc-300m</span></td><td>sherpa-onnx (ONNX), ~50&nbsp;MB</td><td>Diagnostic-only ASR / historical provenance; never a production fallback.</td></tr>
+  <tr><td>OmniASR-CTC 1B</td><td><span class="mono">omniasr-ctc-1b</span></td><td>sherpa-onnx (ONNX), ~500&nbsp;MB</td><td>Diagnostic-only ASR / historical provenance; never a production fallback.</td></tr>
+  <tr><td>Fine-tuned MMS-1B</td><td><span class="mono">finetuned-mms-ckb</span></td><td>Wav2Vec2-CTC via <span class="mono">ort</span>, ~970&nbsp;MB, ~18.6% CER</td><td>Word alignment; its ASR implementation is diagnostic-only.</td></tr>
 </table>
-<div class="note"><b>The "which model" answer.</b> There is no "base vs fine-tuned 7B" ambiguity: the OmniASR-7B Champion <i>is</i> the fine-tuned 7B (base + LoRA). The separate fine-tuned <b>MMS-1B</b> is a different, smaller model used mainly for word-timing alignment. Out of the box, transcripts are 100% the 7B Champion.</div>
+<div class="note"><b>The "which model" answer.</b> There is no "base vs fine-tuned 7B" ambiguity: the OmniASR-7B Champion <i>is</i> the fine-tuned 7B (base + LoRA). The separate fine-tuned <b>MMS-1B</b> is an alignment model whose ASR path is diagnostic-only. Production transcripts and re-transcriptions are 100% the 7B Champion.</div>
 
 <h2>4 · Jury — automatic adjudication</h2>
 <p>The jury is a multi-tier confidence router that clears the easy cases automatically and escalates the rest to a human, running on its own DB connection.</p>
 <ul>
-  <li><b>T0 — IRT consensus gate:</b> the per-segment hypotheses (7B + the two CTC models) are aligned into a confusion network and voted by an Item-Response-Theory model; a calibrated <b>conformal threshold</b> + a hypothesis-coverage guard decide auto-accept vs escalate. <span class="mono">fit_irt_consensus</span>, <span class="mono">quality/irt.rs</span>, <span class="mono">jury/mod.rs</span>.</li>
+  <li><b>T0 — IRT consensus gate:</b> stored per-segment hypothesis evidence is aligned into a confusion network and voted by an Item-Response-Theory model; a calibrated <b>conformal threshold</b> + a hypothesis-coverage guard decide auto-accept vs escalate. Production does not invoke diagnostic ASR engines to manufacture extra votes. <span class="mono">fit_irt_consensus</span>, <span class="mono">quality/irt.rs</span>, <span class="mono">jury/mod.rs</span>.</li>
   <li><b>T1 — tool evidence:</b> text-level grounding / consistency checks.</li>
   <li><b>T2 — audio judge (opt-in):</b> a cloud model (Gemini) <i>listens</i> to the clip and adjudicates; gated by <code>jury_cloud_opt_in</code>. <span class="mono">jury/t2_listener.rs</span>.</li>
   <li><b>Escalation:</b> unresolved segments enter the <b>Review Inbox</b> ordered lowest-confidence-first; the <b>Autonomy Dial</b> (Observe → Propose → ActConfirm → ActAuto) sets how much the agent may do unattended.</li>
 </ul>
-<div class="note">For this data the three Sorani ASR models agree only ~40–65% (the two CTC models are architecturally related, so their agreement is correlated and the gate vetoes it) — so the jury mostly escalates, which is why fast human review matters.</div>
+<div class="note">Historical multi-engine experiments remain as provenance and diagnostic evidence. They do not describe current production routing: the champion supplies the production draft and the human decision is final.</div>
 
 <h2>5 · Human review</h2>
 <p><b>ReviewMode.svelte</b> is a distraction-free, one-clip-at-a-time loop. The human decision is authoritative and is never overwritten by later jury runs.</p>
@@ -120,7 +121,7 @@
   <div class="card"><h3>Review actions</h3><ul>
     <li><b>Word-timing playback</b> — tap a word to hear it; karaoke highlight; playback bounded to the clip span.</li>
     <li><b>Model-provenance badge</b> — "Draft by &lt;engine&gt; — machine draft, not human-verified", drawn from recorded hypotheses (never inferred).</li>
-    <li><b>Re-transcribe this clip</b> — OmniASR-7B (server) or Fine-tuned MMS-1B (CPU); resets <code>verified=false</code>.</li>
+    <li><b>Re-transcribe this clip</b> — OmniASR-7B Champion only; resets <code>verified=false</code>.</li>
     <li><b>Mark bad</b> — records a human <i>reject</i>: excluded from export, kept and reversible.</li>
   </ul></div>
   <div class="card"><h3>Learning flywheel</h3><ul>
@@ -153,9 +154,8 @@
 <h2>8 · Privacy &amp; consent</h2>
 <p>The app is 100% offline by default. Cloud is reached only behind explicit, acknowledged opt-in:</p>
 <ul>
-  <li><code>cloud_stt_opt_in</code> — ElevenLabs Scribe STT.</li>
-  <li><code>cloud_llm_opt_in</code> — OpenRouter / Gemini LLM refinement.</li>
-  <li><code>jury_cloud_opt_in</code> — the Gemini T2 audio judge.</li>
+  <li><code>cloud_llm_opt_in</code> — optional refinement through the fixed Gemini 2.5 Pro cloud model.</li>
+  <li><code>jury_cloud_opt_in</code> — the fixed Gemini 2.5 Pro advisory T2 audio judge.</li>
 </ul>
 <p><code>settings.effective_llm_mode()</code> downgrades cloud → none whenever the relevant flag is off, and the pipeline re-checks consent before building any refiner. API keys are never persisted in tracked files; voice is handled as biometric data with consent + license enforced before any publish/train step.</p>
 
@@ -165,7 +165,7 @@
   <tr><th>Commit</th><th>Change</th></tr>
   <tr><td><span class="mono">48bde15</span></td><td>Integrated a 68-commit hardening line into the branch (30 conflicts reconciled, combining both sides' intent).</td></tr>
   <tr><td><span class="mono">1a9ae00</span></td><td><b>OmniASR-7B Champion forced as the default</b> + fail-hard import (cancel + rollback when the 7B server is down); sanitized client repo-tracked.</td></tr>
-  <tr><td><span class="mono">4787d81</span></td><td><b>Review feature:</b> per-clip re-transcribe (7B / MMS-1B), model-provenance badge, mark-bad — verified live on the real app.</td></tr>
+  <tr><td><span class="mono">4787d81</span></td><td><b>Historical review feature at that commit:</b> per-clip re-transcribe (7B / MMS-1B), model-provenance badge, mark-bad. Current production re-transcribe is champion-only.</td></tr>
 </table>
 
 <footer>

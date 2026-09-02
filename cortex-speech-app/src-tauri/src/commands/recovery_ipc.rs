@@ -1,0 +1,685 @@
+//! Versioned backup, maintenance and recovery IPC.
+//!
+//! Recovery is an owner-critical boundary: the renderer needs stable outcomes and actionable
+//! error codes, never raw SQLite errors, private paths, snapshot internals or ad-hoc JSON.
+
+use super::*;
+
+use crate::ipc_contract::{CommandErrorV1, SuggestedActionV1};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupVerificationV1 {
+    pub integrity_ok: bool,
+    pub segment_count: i64,
+}
+
+impl From<crate::backup_service::BackupVerification> for BackupVerificationV1 {
+    fn from(value: crate::backup_service::BackupVerification) -> Self {
+        Self { integrity_ok: value.integrity_ok, segment_count: value.segment_count }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuarantineNoticeV1 {
+    /// A count is sufficient for the warning surface. Local quarantine filenames remain private.
+    pub quarantined_file_count: usize,
+    pub snapshot_count: usize,
+    pub newest_snapshot_segments: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotInfoV1 {
+    /// Opaque selector returned to `restore_db_from_snapshot`; never an arbitrary filesystem path.
+    pub name: String,
+    pub timestamp: u64,
+    pub db_size_bytes: u64,
+    pub segment_count: Option<i64>,
+}
+
+impl From<crate::snapshot::SnapshotInfo> for SnapshotInfoV1 {
+    fn from(value: crate::snapshot::SnapshotInfo) -> Self {
+        Self {
+            name: value.name,
+            timestamp: value.timestamp,
+            db_size_bytes: value.db_size_bytes,
+            segment_count: value.segment_count,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryOperation {
+    Backup,
+    RestoreBackup,
+    Vacuum,
+    ReadState,
+    ArchiveQuarantine,
+    RestoreSnapshot,
+}
+
+fn recovery_rate_limited_error() -> CommandErrorV1 {
+    CommandErrorV1::new("RATE_LIMITED", "Recovery tools are busy. Wait a moment, then retry.", true)
+        .suggested(SuggestedActionV1::Retry)
+}
+
+fn invalid_recovery_request(code: &str, message: &str) -> CommandErrorV1 {
+    // The public action enum has no file/snapshot chooser. Do not send the owner to Health for an
+    // input they can repair only by choosing another source or destination.
+    CommandErrorV1::new(code, message, false)
+}
+
+fn recovery_state_unavailable_error() -> CommandErrorV1 {
+    CommandErrorV1::new(
+        "RECOVERY_STATE_UNAVAILABLE",
+        "Recovery state is unavailable. Open Health before attempting recovery again.",
+        false,
+    )
+    .suggested(SuggestedActionV1::OpenHealth)
+}
+
+fn public_recovery_failure(operation: RecoveryOperation, private_detail: &str) -> CommandErrorV1 {
+    let normalized = private_detail.to_ascii_lowercase();
+    if private_detail == RESTORE_IN_PROGRESS_MSG || normalized.contains("restore is already in progress") {
+        return CommandErrorV1::new(
+            "RESTORE_IN_PROGRESS",
+            "Database recovery is already in progress. Wait for it to finish, then retry.",
+            true,
+        )
+        .suggested(SuggestedActionV1::Retry);
+    }
+    if normalized.contains("background write is in progress")
+        || normalized.contains("database or configuration mutation is already in progress")
+    {
+        return CommandErrorV1::new(
+            "RESTORE_BLOCKED_BY_ACTIVE_WORK",
+            "Active work must finish before recovery. Cancel it or wait for it to finish, then retry.",
+            true,
+        )
+        .suggested(SuggestedActionV1::Retry);
+    }
+    if normalized.contains("database is busy")
+        || normalized.contains("database is locked")
+        || normalized.contains("active database writer")
+    {
+        return CommandErrorV1::new(
+            "DATABASE_BUSY",
+            "The library is busy. Wait for active work to finish, then retry.",
+            true,
+        )
+        .suggested(SuggestedActionV1::Retry);
+    }
+
+    let (code, message, retryable) = match operation {
+        RecoveryOperation::Backup => {
+            ("BACKUP_FAILED", "The backup could not be created and verified. The live library was not replaced.", true)
+        }
+        RecoveryOperation::RestoreBackup => (
+            "BACKUP_RESTORE_FAILED",
+            "The selected backup could not be safely restored. The current library remains protected.",
+            false,
+        ),
+        RecoveryOperation::Vacuum => (
+            "DATABASE_MAINTENANCE_FAILED",
+            "Library maintenance could not finish. No recovery source was applied.",
+            true,
+        ),
+        RecoveryOperation::ReadState => (
+            "RECOVERY_READ_FAILED",
+            "Recovery information could not be read. Retry; if it continues, open Health.",
+            true,
+        ),
+        RecoveryOperation::ArchiveQuarantine => (
+            "QUARANTINE_ARCHIVE_FAILED",
+            "The quarantined database files could not be archived. They remain preserved.",
+            true,
+        ),
+        RecoveryOperation::RestoreSnapshot => (
+            "SNAPSHOT_RESTORE_FAILED",
+            "The selected snapshot could not be safely restored. The current library remains protected.",
+            false,
+        ),
+    };
+    CommandErrorV1::new(code, message, retryable).suggested(if retryable {
+        SuggestedActionV1::Retry
+    } else {
+        SuggestedActionV1::OpenHealth
+    })
+}
+
+fn prepare_restore(state: &State<'_, AppState>) -> Result<(RestoreReservation<'static>, std::path::PathBuf), String> {
+    let data_dir = state.lock_data_dir().clone().ok_or_else(|| {
+        "Database restore refused: the app data directory is unavailable, so a mandatory pre-restore safety snapshot cannot be created."
+            .to_string()
+    })?;
+    prepare_restore_admission(data_dir, || state.writers_active())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn db_backup(dest: String, state: State<'_, AppState>) -> Result<BackupVerificationV1, CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("db_backup").map_err(|_| recovery_rate_limited_error())?;
+    let validated = validate::validate_output_path(&dest).map_err(|_| {
+        invalid_recovery_request(
+            "INVALID_BACKUP_DESTINATION",
+            "Choose a valid local backup destination outside the active library.",
+        )
+    })?;
+    // One bounded, restore-gated read snapshot keeps a slow external-drive backup away from the
+    // serialized writer while binding it to one restore generation.
+    let database = state.db_runtime();
+    let verified = run_blocking(move || {
+        let backup_db = database.open_read().map_err(|error| error.to_string())?;
+        backup_db.backup(&validated).map_err(|error| error.to_string())?;
+        crate::backup_service::verify_backup_file(Path::new(&validated)).map_err(String::from)
+    })
+    .await
+    .map_err(|error| public_recovery_failure(RecoveryOperation::Backup, &error))?;
+    Ok(verified.into())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn db_restore(src: String, state: State<'_, AppState>) -> Result<(), CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("db_restore").map_err(|_| recovery_rate_limited_error())?;
+    let validated = validate::validate_file_path(&src).map_err(|_| {
+        invalid_recovery_request("INVALID_BACKUP_SOURCE", "Choose a readable local Cortex backup database.")
+    })?;
+    let (restore_reservation, data_dir) =
+        prepare_restore(&state).map_err(|error| public_recovery_failure(RecoveryOperation::RestoreBackup, &error))?;
+    refuse_bare_restore_during_controlled_pilot(&data_dir)
+        .map_err(|error| public_recovery_failure(RecoveryOperation::RestoreBackup, &error))?;
+    let database = state.db_runtime();
+    let history = state.history_arc_for_restore();
+    let restore_reservation = run_blocking(move || {
+        database.with_restore_writer(&restore_reservation, |writer| {
+            restore_with_mandatory_snapshot(&restore_reservation, writer, &data_dir, Path::new(&validated))?;
+            Ok(())
+        })?;
+        // A cancelled Tauri future detaches spawn_blocking. Clear stale undo history in the same
+        // worker after publication and before the reservation can be dropped.
+        history.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+        Ok(restore_reservation)
+    })
+    .await
+    .map_err(|error| public_recovery_failure(RecoveryOperation::RestoreBackup, &error))?;
+    drop(restore_reservation);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn acknowledge_quarantine(state: State<'_, AppState>) -> Result<usize, CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("acknowledge_quarantine").map_err(|_| recovery_rate_limited_error())?;
+    let data_dir = state.lock_data_dir().clone().ok_or_else(recovery_state_unavailable_error)?;
+    crate::snapshot::acknowledge_quarantine(&data_dir)
+        .map_err(|error| public_recovery_failure(RecoveryOperation::ArchiveQuarantine, &error.to_string()))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn db_vacuum(state: State<'_, AppState>) -> Result<(), CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("db_vacuum").map_err(|_| recovery_rate_limited_error())?;
+    let database = state.db_runtime();
+    run_blocking(move || {
+        let mutation = database.begin_mutation()?;
+        let db = database.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| poisoned.into_inner());
+        db.vacuum().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| public_recovery_failure(RecoveryOperation::Vacuum, &error))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn get_quarantine_notice(state: State<'_, AppState>) -> Result<QuarantineNoticeV1, CommandErrorV1> {
+    RATE_LIMITER.check("get_quarantine_notice").map_err(|_| recovery_rate_limited_error())?;
+    let data_dir = state.lock_data_dir().clone().ok_or_else(recovery_state_unavailable_error)?;
+    let quarantined_file_count = std::fs::read_dir(&data_dir)
+        .map_err(|error| public_recovery_failure(RecoveryOperation::ReadState, &error.to_string()))?
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.contains(".corrupt.") && !name.ends_with("-wal") && !name.ends_with("-shm")
+        })
+        .count();
+    let snapshots = crate::snapshot::list_snapshots(&data_dir);
+    Ok(QuarantineNoticeV1 {
+        quarantined_file_count,
+        snapshot_count: snapshots.len(),
+        newest_snapshot_segments: snapshots.first().and_then(|snapshot| snapshot.segment_count),
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn list_db_snapshots(state: State<'_, AppState>) -> Result<Vec<SnapshotInfoV1>, CommandErrorV1> {
+    RATE_LIMITER.check("list_db_snapshots").map_err(|_| recovery_rate_limited_error())?;
+    let data_dir = state.lock_data_dir().clone().ok_or_else(recovery_state_unavailable_error)?;
+    Ok(crate::snapshot::list_snapshots(&data_dir).into_iter().map(SnapshotInfoV1::from).collect())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) -> Result<(), CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("restore_db_from_snapshot").map_err(|_| recovery_rate_limited_error())?;
+    if name.trim().is_empty() || name.len() > 255 || name.chars().any(char::is_control) {
+        return Err(invalid_recovery_request("INVALID_SNAPSHOT_SELECTOR", "Choose a snapshot from the recovery list."));
+    }
+    restore_db_from_snapshot_inner(name, state)
+        .await
+        .map_err(|error| public_recovery_failure(RecoveryOperation::RestoreSnapshot, &error))
+}
+
+async fn restore_db_from_snapshot_inner(name: String, state: State<'_, AppState>) -> Result<(), String> {
+    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
+    let snap_dir = crate::snapshot::resolve_snapshot_dir(&data_dir, &name)?;
+    let src = snap_dir.join("cortex-speech.db");
+    let source_metadata = std::fs::symlink_metadata(&src)
+        .map_err(|error| format!("snapshot '{name}' has no readable database file: {error}"))?;
+    if !source_metadata.file_type().is_file() || source_metadata.file_type().is_symlink() {
+        return Err(format!("snapshot '{name}' has no database file"));
+    }
+    let (restore_reservation, restore_data_dir) = prepare_restore(&state)?;
+    if let Some(pending) = load_named_restore_pending(&data_dir)? {
+        if let Some(completed_selector) = pending.completed_selector.as_deref() {
+            if completed_selector != name {
+                return Err(format!(
+                    "restore '{}' already completed and only its barrier cleanup remains; refusing selector '{}'",
+                    completed_selector, name
+                ));
+            }
+            if !crate::recovery::completed_named_restore_matches_live(&data_dir, &pending)? {
+                return Err(format!(
+                    "restore '{completed_selector}' has a completion marker but the live SQLite generation does not match it; restart Cortex so fail-closed recovery can replay the exact target or verified original"
+                ));
+            }
+            clear_review_pilot_restore_pending(&data_dir)?;
+            restore_reservation.commit_named_restore()?;
+            tracing::info!("completed pending restore-barrier cleanup for auto-snapshot {name}");
+            return Ok(());
+        }
+    }
+    let (restore_plan, restore_reservation) = {
+        let database = state.db_runtime();
+        let restore_src = src.clone();
+        let restore_snapshot_dir = snap_dir.clone();
+        let restore_selector = name.clone();
+        run_blocking(move || {
+            let restore_plan = database.with_restore_writer(&restore_reservation, |writer| {
+                prepare_and_restore_named_transaction(
+                    &restore_reservation,
+                    writer,
+                    &restore_data_dir,
+                    &restore_snapshot_dir,
+                    &restore_src,
+                    &restore_selector,
+                )
+            })?;
+            Ok((restore_plan, restore_reservation))
+        })
+        .await
+    }?;
+    state.lock_history().clear();
+    let live_controls = state.lock_settings().clone();
+    let restored = install_snapshot_restore_plan(&restore_plan, &data_dir, &live_controls)?;
+    *state.lock_settings() = restored.clone();
+    state.update_pipeline_settings(restored);
+    mark_named_restore_completed(&data_dir, &name, &restore_plan.expected_db_generation_sha256)?;
+    clear_review_pilot_restore_pending(&data_dir)?;
+    restore_reservation.commit_named_restore()?;
+    drop(restore_reservation);
+    tracing::info!("database and config restored from auto-snapshot {name}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_recovery_contracts_are_camel_case_and_hide_private_details() {
+        let backup = serde_json::to_value(BackupVerificationV1 { integrity_ok: true, segment_count: 42 })
+            .expect("serialize backup result");
+        assert_eq!(backup["integrityOk"], true);
+        assert_eq!(backup["segmentCount"], 42);
+
+        let notice = serde_json::to_value(QuarantineNoticeV1 {
+            quarantined_file_count: 2,
+            snapshot_count: 4,
+            newest_snapshot_segments: Some(42),
+        })
+        .expect("serialize quarantine notice");
+        assert_eq!(notice["quarantinedFileCount"], 2);
+        assert!(notice.get("quarantinedFiles").is_none());
+
+        let private = r#"SQL failed at C:\private\library.db; token=secret"#;
+        for operation in [
+            RecoveryOperation::Backup,
+            RecoveryOperation::RestoreBackup,
+            RecoveryOperation::Vacuum,
+            RecoveryOperation::ReadState,
+            RecoveryOperation::ArchiveQuarantine,
+            RecoveryOperation::RestoreSnapshot,
+        ] {
+            let wire =
+                serde_json::to_string(&public_recovery_failure(operation, private)).expect("serialize recovery error");
+            assert!(!wire.contains("SQL"));
+            assert!(!wire.contains("private"));
+            assert!(!wire.contains("secret"));
+            assert!(wire.contains("suggestedAction"));
+        }
+    }
+
+    #[test]
+    fn recovery_busy_and_restore_conflicts_are_retryable_without_raw_details() {
+        let busy = public_recovery_failure(RecoveryOperation::Backup, "database is locked at C:\\private.db");
+        assert_eq!(busy.code, "DATABASE_BUSY");
+        assert!(busy.retryable);
+        assert_eq!(busy.suggested_action, Some(SuggestedActionV1::Retry));
+
+        let restore = public_recovery_failure(RecoveryOperation::RestoreSnapshot, RESTORE_IN_PROGRESS_MSG);
+        assert_eq!(restore.code, "RESTORE_IN_PROGRESS");
+        assert!(restore.retryable);
+
+        for admission in [
+            "A background write is in progress (import, batch, 7B refinement, jury, or the Couch Review server)",
+            "A database or configuration mutation is already in progress — let it finish before restoring.",
+        ] {
+            let blocked = public_recovery_failure(RecoveryOperation::RestoreBackup, admission);
+            assert_eq!(blocked.code, "RESTORE_BLOCKED_BY_ACTIVE_WORK");
+            assert!(blocked.retryable);
+            assert_eq!(blocked.suggested_action, Some(SuggestedActionV1::Retry));
+        }
+
+        let invalid = invalid_recovery_request("INVALID_BACKUP_SOURCE", "Choose another backup.");
+        assert!(!invalid.retryable);
+        assert_eq!(invalid.suggested_action, None);
+
+        let read = public_recovery_failure(RecoveryOperation::ReadState, "temporary read error");
+        assert!(read.retryable);
+        assert_eq!(read.suggested_action, Some(SuggestedActionV1::Retry));
+
+        let unavailable = recovery_state_unavailable_error();
+        assert!(!unavailable.retryable);
+        assert_eq!(unavailable.suggested_action, Some(SuggestedActionV1::OpenHealth));
+    }
+
+    #[test]
+    fn every_recovery_operation_keeps_its_stable_public_fallback_code_and_action() {
+        // The renderer keys retry/health affordances off these exact codes; a rename or a
+        // retryability flip is a silent UI contract break, not a refactor.
+        for (operation, code, retryable) in [
+            (RecoveryOperation::Backup, "BACKUP_FAILED", true),
+            (RecoveryOperation::RestoreBackup, "BACKUP_RESTORE_FAILED", false),
+            (RecoveryOperation::Vacuum, "DATABASE_MAINTENANCE_FAILED", true),
+            (RecoveryOperation::ReadState, "RECOVERY_READ_FAILED", true),
+            (RecoveryOperation::ArchiveQuarantine, "QUARANTINE_ARCHIVE_FAILED", true),
+            (RecoveryOperation::RestoreSnapshot, "SNAPSHOT_RESTORE_FAILED", false),
+        ] {
+            let error = public_recovery_failure(operation, "io error: unspecified backend detail");
+            assert_eq!(error.code, code);
+            assert_eq!(error.retryable, retryable, "retryability for {code}");
+            let expected_action = if retryable { SuggestedActionV1::Retry } else { SuggestedActionV1::OpenHealth };
+            assert_eq!(error.suggested_action, Some(expected_action), "suggested action for {code}");
+        }
+    }
+
+    #[test]
+    fn conflict_classification_is_case_insensitive_and_wins_over_the_operation_fallback() {
+        // Backend detail strings are not stable in casing; classification must normalize.
+        let mixed = public_recovery_failure(RecoveryOperation::Vacuum, "Restore Is Already In Progress for this DB");
+        assert_eq!(mixed.code, "RESTORE_IN_PROGRESS", "conflict detection must beat the vacuum fallback code");
+        assert!(mixed.retryable);
+
+        for busy_detail in ["The Database Is Busy right now", "an ACTIVE DATABASE WRITER holds the connection"] {
+            let busy = public_recovery_failure(RecoveryOperation::RestoreSnapshot, busy_detail);
+            assert_eq!(busy.code, "DATABASE_BUSY", "detail: {busy_detail}");
+            assert!(busy.retryable);
+            assert_eq!(busy.suggested_action, Some(SuggestedActionV1::Retry));
+        }
+
+        let limited = recovery_rate_limited_error();
+        assert_eq!(limited.code, "RATE_LIMITED");
+        assert!(limited.retryable);
+        assert_eq!(limited.suggested_action, Some(SuggestedActionV1::Retry));
+    }
+
+    #[test]
+    fn recovery_dtos_map_service_values_verbatim_and_round_trip_the_camel_case_wire() {
+        let backup: BackupVerificationV1 =
+            crate::backup_service::BackupVerification { integrity_ok: false, segment_count: 7 }.into();
+        assert!(!backup.integrity_ok);
+        assert_eq!(backup.segment_count, 7);
+        let wire = serde_json::to_value(&backup).expect("serialize backup verification");
+        assert_eq!(serde_json::from_value::<BackupVerificationV1>(wire).expect("deserialize"), backup);
+
+        let notice =
+            QuarantineNoticeV1 { quarantined_file_count: 1, snapshot_count: 2, newest_snapshot_segments: None };
+        let wire = serde_json::to_value(&notice).expect("serialize quarantine notice");
+        assert_eq!(wire["newestSnapshotSegments"], serde_json::Value::Null);
+        assert_eq!(serde_json::from_value::<QuarantineNoticeV1>(wire).expect("deserialize"), notice);
+
+        let info: SnapshotInfoV1 = crate::snapshot::SnapshotInfo {
+            name: "snapshot_1700000000".to_string(),
+            timestamp: 1_700_000_000,
+            db_size_bytes: 4096,
+            segment_count: Some(3),
+        }
+        .into();
+        assert_eq!(info.name, "snapshot_1700000000");
+        assert_eq!(info.timestamp, 1_700_000_000);
+        assert_eq!(info.db_size_bytes, 4096);
+        assert_eq!(info.segment_count, Some(3));
+        let wire = serde_json::to_value(&info).expect("serialize snapshot info");
+        assert_eq!(wire["dbSizeBytes"], 4096);
+        assert_eq!(serde_json::from_value::<SnapshotInfoV1>(wire).expect("deserialize"), info);
+    }
+
+    #[test]
+    fn listed_snapshot_dtos_are_opaque_selectors_that_resolve_back_to_their_directory() {
+        // Real tempdir fixture: one rotating snapshot with a real SQLite library, one pinned
+        // snapshot without a database file (the size-0 / unknown-count arm of the mapping).
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let data_dir = tmp.path();
+        let rotating_dir = data_dir.join("snapshots").join("snapshot_1700000000");
+        std::fs::create_dir_all(&rotating_dir).expect("create rotating snapshot dir");
+        {
+            let db = crate::db::Database::open(rotating_dir.join("cortex-speech.db").to_string_lossy().as_ref())
+                .expect("open snapshot database");
+            db.initialize().expect("initialize snapshot database");
+        }
+        let pinned_dir = data_dir.join("snapshots").join("pinned").join("premigration_1700000001");
+        std::fs::create_dir_all(&pinned_dir).expect("create pinned snapshot dir");
+
+        let listed = crate::snapshot::list_snapshots(data_dir);
+        assert_eq!(listed.len(), 2, "fixture must list both snapshot forms");
+        for source in listed {
+            let mapped = SnapshotInfoV1::from(source.clone());
+            assert_eq!(mapped.name, source.name);
+            assert_eq!(mapped.timestamp, source.timestamp);
+            assert_eq!(mapped.db_size_bytes, source.db_size_bytes);
+            assert_eq!(mapped.segment_count, source.segment_count);
+            // The wire name is an opaque selector, never a filesystem path — and exactly what
+            // `restore_db_from_snapshot` accepts back.
+            assert!(!mapped.name.contains('/') || mapped.name.starts_with("pinned/"));
+            assert!(!mapped.name.contains('\\'));
+            let resolved = crate::snapshot::resolve_snapshot_dir(data_dir, &mapped.name)
+                .expect("listed selector must resolve for restore");
+            assert!(resolved.starts_with(data_dir.join("snapshots")));
+        }
+
+        let rotating = crate::snapshot::resolve_snapshot_dir(data_dir, "snapshot_1700000000").expect("rotating");
+        assert_eq!(rotating, rotating_dir);
+        let pinned = crate::snapshot::resolve_snapshot_dir(data_dir, "pinned/premigration_1700000001").expect("pinned");
+        assert_eq!(pinned, pinned_dir);
+        // An arbitrary path is never a valid selector even when the directory exists.
+        assert!(crate::snapshot::resolve_snapshot_dir(data_dir, "snapshots/../snapshots").is_err());
+    }
+}
+
+/// Wave-4 state-boundary coverage for the recovery `#[tauri::command]` wrappers, invoked through a
+/// genuine managed `State<'_, AppState>`. These deliberately never take a real restore reservation:
+/// `RESTORE_ADMISSION` is process-global, so an in-flight restore in one test would be visible to
+/// every other test in the binary. The refusal arms and the two non-restoring tools are what the
+/// wrappers own.
+#[cfg(test)]
+mod state_command_surface_tests {
+    use super::*;
+    use crate::test_support::managed_app_state;
+    use tauri::Manager;
+
+    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread().build().expect("build test runtime").block_on(future)
+    }
+
+    /// Seed one clip so a backup's verification count is a measured row count, not a constant 0.
+    fn seed_one_clip(app: &tauri::App<tauri::test::MockRuntime>) {
+        app.state::<AppState>()
+            .lock_db()
+            .insert_segment(&crate::db::SpeechSegment {
+                id: "recovery-seg".into(),
+                audio_path: "C:\\audio\\recovery.wav".into(),
+                raw_transcript: "دەق".into(),
+                ..crate::db::SpeechSegment::default()
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn db_backup_verifies_the_copy_it_wrote_and_refuses_an_unusable_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        seed_one_clip(&app);
+
+        let dest = tmp.path().join("backup.db");
+        let verified = block_on(db_backup(dest.to_string_lossy().into_owned(), app.state())).expect("db backup");
+        assert!(verified.integrity_ok, "the command only returns a backup it re-opened and integrity-checked");
+        assert_eq!(verified.segment_count, 1, "the count is read back out of the copy, not the live library");
+        assert!(dest.metadata().unwrap().len() > 0, "a verified backup is a real non-empty file");
+
+        let refused = block_on(db_backup(
+            tmp.path().join("no-such-dir").join("backup.db").to_string_lossy().into_owned(),
+            app.state(),
+        ))
+        .expect_err("a destination whose parent does not exist is refused");
+        assert_eq!(refused.code, "INVALID_BACKUP_DESTINATION");
+        assert!(!refused.retryable, "the owner repairs this by choosing another destination");
+        assert_eq!(refused.suggested_action, None, "there is no in-app chooser to send them to");
+    }
+
+    #[test]
+    fn db_vacuum_completes_and_db_restore_refuses_an_unreadable_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        seed_one_clip(&app);
+
+        block_on(db_vacuum(app.state())).expect("maintenance on a healthy library");
+        // Maintenance is not destructive: the seeded row survives it.
+        assert!(app.state::<AppState>().lock_db().get_segment_by_id("recovery-seg").unwrap().is_some());
+
+        let refused = block_on(db_restore("Z:\\nope\\not-a-backup.db".into(), app.state()))
+            .expect_err("an unreadable source never reaches restore admission");
+        assert_eq!(refused.code, "INVALID_BACKUP_SOURCE");
+        assert!(!refused.retryable);
+        assert_eq!(refused.suggested_action, None);
+    }
+
+    /// The notice counts only files the owner can act on; `-wal`/`-shm` sidecars are noise. Archiving
+    /// deliberately moves the sidecars too, so the two numbers are not the same number — and a change
+    /// that made them agree would either under-report the warning or strand half a corrupt database.
+    #[test]
+    fn the_quarantine_notice_hides_sidecars_that_archiving_still_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        for (name, body) in [
+            ("cortex-speech.db.corrupt.1700000000", &b"corrupt"[..]),
+            ("cortex-speech.db.corrupt.1700000000-wal", &b"wal"[..]),
+            ("cortex-speech.db.corrupt.1700000000-shm", &b"shm"[..]),
+        ] {
+            std::fs::write(tmp.path().join(name), body).unwrap();
+        }
+        let snap_dir = tmp.path().join("snapshots").join("snapshot_1700000000");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        {
+            let db = crate::db::Database::open(snap_dir.join("cortex-speech.db").to_string_lossy().as_ref()).unwrap();
+            db.initialize().unwrap();
+        }
+
+        let notice = get_quarantine_notice(app.state()).expect("quarantine notice");
+        assert_eq!(notice.quarantined_file_count, 1, "three files, one recoverable database");
+        assert_eq!(notice.snapshot_count, 1);
+        assert_eq!(notice.newest_snapshot_segments, Some(0));
+
+        let snapshots = list_db_snapshots(app.state()).expect("snapshot list");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].name, "snapshot_1700000000", "the name is the opaque restore selector");
+        assert_eq!(snapshots[0].timestamp, 1_700_000_000);
+        assert_eq!(snapshots[0].segment_count, Some(0));
+        assert!(snapshots[0].db_size_bytes > 0);
+
+        let archived = acknowledge_quarantine(app.state()).expect("archive the quarantined files");
+        assert_eq!(archived, 3, "archiving moves the whole corrupt set, sidecars included");
+        for name in [
+            "cortex-speech.db.corrupt.1700000000",
+            "cortex-speech.db.corrupt.1700000000-wal",
+            "cortex-speech.db.corrupt.1700000000-shm",
+        ] {
+            assert!(tmp.path().join("quarantine").join(name).is_file(), "{name} must be preserved, not deleted");
+            assert!(!tmp.path().join(name).exists(), "{name} must leave the live data dir");
+        }
+
+        let cleared = get_quarantine_notice(app.state()).expect("notice after archiving");
+        assert_eq!(cleared.quarantined_file_count, 0, "the warning clears once the files are archived");
+        assert_eq!(cleared.snapshot_count, 1, "archiving quarantine must not disturb the snapshots");
+    }
+
+    /// The selector guard is syntactic and runs before `resolve_snapshot_dir` — a malformed name must
+    /// never become a filesystem lookup, and an unknown-but-well-formed one must fail closed with the
+    /// public code rather than leaking the resolver's message.
+    #[test]
+    fn snapshot_restore_refuses_malformed_and_unknown_selectors_without_touching_the_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let too_long = "a".repeat(256);
+
+        for (selector, why) in [
+            ("", "an empty selector"),
+            ("   ", "a whitespace-only selector"),
+            (too_long.as_str(), "a selector over 255 chars"),
+            ("bad\u{7}name", "a selector carrying a control character"),
+        ] {
+            let refused = block_on(restore_db_from_snapshot(selector.to_string(), app.state())).expect_err(why);
+            assert_eq!(refused.code, "INVALID_SNAPSHOT_SELECTOR", "{why}");
+            assert!(!refused.retryable, "{why}");
+            assert_eq!(refused.suggested_action, None, "{why}: the owner picks another snapshot, not Health");
+        }
+
+        let unknown = block_on(restore_db_from_snapshot("snapshot_1600000000".into(), app.state()))
+            .expect_err("a well-formed selector for a snapshot that does not exist");
+        assert_eq!(unknown.code, "SNAPSHOT_RESTORE_FAILED");
+        assert!(!unknown.retryable, "a missing snapshot will not appear on retry");
+        assert_eq!(unknown.suggested_action, Some(SuggestedActionV1::OpenHealth));
+    }
+
+    /// Without a data dir there is no quarantine, no snapshot store and no pre-restore safety
+    /// snapshot. All three read tools must say so with the same actionable code.
+    #[test]
+    fn recovery_reads_refuse_when_the_app_data_directory_is_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        *app.state::<AppState>().lock_data_dir() = None;
+
+        let ack = acknowledge_quarantine(app.state()).expect_err("archiving needs a data dir");
+        let notice = get_quarantine_notice(app.state()).expect_err("the notice needs a data dir");
+        let list = list_db_snapshots(app.state()).expect_err("the snapshot list needs a data dir");
+        for error in [&ack, &notice, &list] {
+            assert_eq!(error.code, "RECOVERY_STATE_UNAVAILABLE");
+            assert!(!error.retryable, "a missing data dir does not fix itself on retry");
+            assert_eq!(error.suggested_action, Some(SuggestedActionV1::OpenHealth));
+        }
+    }
+}

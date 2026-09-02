@@ -1,6 +1,7 @@
 use crate::db::Database;
 use crate::error::AppResult;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Schema migration for the database.
 /// Each migration has a version number and an up/down script.
@@ -22,20 +23,21 @@ pub fn max_supported_version() -> i64 {
 
 /// Run all pending migrations on the database.
 pub fn run_migrations(db: &Database) -> AppResult<Vec<i64>> {
-    ensure_migrations_table(db)?;
-    let current_version = get_current_version(db)?;
+    run_migrations_inner(db, false)
+}
 
-    // Forward-compatibility guard: refuse to run when the DB schema is NEWER than this build supports,
-    // rather than silently operating on it with stale semantics. (A migration only ever moves the
-    // schema FORWARD, so a lower-version binary has no way to correctly read a higher-version DB.)
-    let max_known = max_supported_version();
-    if current_version > max_known {
-        return Err(crate::error::AppError::Other(format!(
-            "This library is at schema v{current_version}, newer than this build understands (v{max_known}). \
-             It was created by a newer version of Cortex Speech. Update the app before opening this database \
-             — refusing to run to avoid corrupting data under a schema this build does not understand."
-        )));
-    }
+/// The only entry point allowed to bootstrap an empty migration history. `Database::initialize`
+/// proves the SQLite file had no user objects *before* it creates the authoritative base tables,
+/// then passes that proof here. Keeping the proof out of the public runner matters: otherwise an
+/// existing database whose `schema_migrations` rows were deleted would be mistaken for a new file
+/// and every migration would be replayed against live data.
+pub(crate) fn run_migrations_after_pristine_initialize(db: &Database, was_pristine: bool) -> AppResult<Vec<i64>> {
+    run_migrations_inner(db, was_pristine)
+}
+
+fn run_migrations_inner(db: &Database, allow_empty_bootstrap: bool) -> AppResult<Vec<i64>> {
+    ensure_migrations_table(db)?;
+    let current_version = validate_applied_history_inner(db.connection(), allow_empty_bootstrap)?;
 
     let mut applied = Vec::new();
 
@@ -48,6 +50,89 @@ pub fn run_migrations(db: &Database) -> AppResult<Vec<i64>> {
     }
 
     Ok(applied)
+}
+
+/// A fresh SQLite file has no application-owned objects. This check must run before the base schema
+/// is created; afterwards a new file and a damaged old file can have superficially similar tables.
+pub(crate) fn database_is_pristine(conn: &rusqlite::Connection) -> AppResult<bool> {
+    let objects: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema
+          WHERE name NOT LIKE 'sqlite_%'
+            AND type IN ('table', 'view', 'trigger', 'index')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(objects == 0)
+}
+
+/// Prove that `schema_migrations` is the exact, description-bound prefix of this binary's history.
+///
+/// `MAX(version)` alone is not history: a damaged table containing only row 58 would make every older
+/// migration look applied even though none of its schema exists. This validation is shared by startup,
+/// rollback/list operations, and restore preflight so no path can silently trust that false maximum.
+fn validate_applied_history_inner(conn: &rusqlite::Connection, allow_empty_bootstrap: bool) -> AppResult<i64> {
+    let mut statement = match conn.prepare("SELECT version, description FROM schema_migrations ORDER BY version") {
+        Ok(statement) => statement,
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref message))) if message.contains("no such table") => {
+            return Err(crate::error::AppError::Other(
+                "schema_migrations is missing; refusing to infer migration history from table shape".into(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let actual = statement
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if actual.is_empty() {
+        if allow_empty_bootstrap {
+            // `Database::initialize` creates the authoritative base + FTS tables before migration 1,
+            // then calls `run_migrations`. This is the sole legitimate empty-history context.
+            return Ok(0);
+        }
+        return Err(crate::error::AppError::Other(
+            "schema_migrations is empty; refusing an external database with unprovable history".into(),
+        ));
+    }
+
+    let current_version = actual.last().map(|(version, _)| *version).unwrap_or(0);
+    let max_known = max_supported_version();
+    if current_version > max_known {
+        return Err(crate::error::AppError::Other(format!(
+            "This library is at schema v{current_version}, newer than this build supports (v{max_known}). \
+             Update the app before opening or restoring it — refusing to operate on unknown history."
+        )));
+    }
+    let expected: Vec<(i64, String)> = MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= current_version)
+        .map(|migration| (migration.version, migration.description.to_string()))
+        .collect();
+    if actual != expected {
+        let actual_versions: std::collections::BTreeSet<i64> = actual.iter().map(|(version, _)| *version).collect();
+        let expected_versions: std::collections::BTreeSet<i64> = expected.iter().map(|(version, _)| *version).collect();
+        let missing: Vec<i64> = expected_versions.difference(&actual_versions).copied().collect();
+        let unknown: Vec<i64> = actual_versions.difference(&expected_versions).copied().collect();
+        let description_mismatch: Vec<i64> = actual
+            .iter()
+            .filter_map(|(version, description)| {
+                expected
+                    .iter()
+                    .find(|(expected_version, _)| expected_version == version)
+                    .filter(|(_, expected_description)| expected_description != description)
+                    .map(|_| *version)
+            })
+            .collect();
+        return Err(crate::error::AppError::Other(format!(
+            "schema migration history is incomplete or altered: missing={missing:?}, unknown={unknown:?}, \
+             description_mismatch={description_mismatch:?}"
+        )));
+    }
+    Ok(current_version)
+}
+
+/// Strict external-database form used before restore overwrites any live page.
+pub fn validate_applied_history(conn: &rusqlite::Connection) -> AppResult<i64> {
+    validate_applied_history_inner(conn, false)
 }
 
 /// Get the current schema version. A missing `schema_migrations` table (a genuinely fresh database)
@@ -93,6 +178,13 @@ fn ensure_migrations_table(db: &Database) -> AppResult<()> {
 /// (SQLite's canonical 12-step recreate). Keyed by version so the pre-existing migration literals stay
 /// untouched. See docs/STRICT_SPEECH_SEGMENTS_PLAN.md.
 const FK_OFF_MIGRATIONS: &[i64] = &[40];
+
+/// Migrations whose purpose is to leave the *entire* database FK-clean even though they do not
+/// rebuild an FK parent table. The normal migration path deliberately does not reject pre-existing
+/// violations: older migrations must still be able to advance a legacy database. A targeted repair,
+/// however, must prove that it removed exactly the damage it claims to repair and must fail closed if
+/// any unrelated violation remains. Both apply and rollback run the check inside their transaction.
+const FK_CLEANUP_MIGRATIONS: &[i64] = &[58];
 
 /// Run `body` with `foreign_keys` OFF, VERIFYING it actually took effect and restoring it on every path.
 ///
@@ -154,6 +246,157 @@ fn reject_foreign_key_violations(tx: &rusqlite::Transaction<'_>, version: i64) -
     Ok(())
 }
 
+/// Exact source identity for the one production orphan repair authorized in v58.
+///
+/// The digest is SHA-256 over the 2,104 missing-parent segment ids in bytewise sorted order, each
+/// encoded as UTF-8 followed by `\n`.  Counts, one-to-one membership, and the abandoned-import row
+/// shape are checked in the SAME transaction below.  This prevents v58 from becoming a generic
+/// "delete every orphan in these tables" migration if another writer or another installation has a
+/// different failure with superficially similar foreign keys.
+const V58_ORPHAN_IDS: usize = 2_104;
+const V58_ORPHAN_IDS_SHA256: &str = "b4d84377b75f493383a8acbb63bea39482597f95060c32cf88eda6011fa0aec9";
+const V58_ORPHAN_FULL_TUPLE_SHA256: &str = "5776c4a205e843bc7d7550242b1542a3640427089a2af4876744667db24cb2e0";
+#[cfg(test)]
+const V58_TEST_ORPHAN_IDS_SHA256: &str = "fa888791a05c370e2b54a25c548f3e7a1a3db19260d4d526d71e320bd12e5aee";
+#[cfg(test)]
+const V58_TEST_ORPHAN_FULL_TUPLE_SHA256: &str = "05c72a200038a81071368c0788abe2ed0c2714a18516bee2cc9657a01fe64240";
+
+fn v58_orphan_ids(tx: &rusqlite::Transaction<'_>, table: &str) -> AppResult<Vec<String>> {
+    let sql = match table {
+        "segment_hypotheses" => {
+            "SELECT h.segment_id
+               FROM segment_hypotheses h
+              WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = h.segment_id)
+              ORDER BY h.segment_id"
+        }
+        "loop0_shadow_log" => {
+            "SELECT l.segment_id
+               FROM loop0_shadow_log l
+              WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = l.segment_id)
+              ORDER BY l.segment_id"
+        }
+        _ => return Err(crate::error::AppError::Other("invalid v58 orphan source table".into())),
+    };
+    let mut statement = tx.prepare(sql)?;
+    let ids = statement.query_map([], |row| row.get(0))?.collect::<Result<Vec<String>, _>>()?;
+    Ok(ids)
+}
+
+fn validate_v58_orphan_source(tx: &rusqlite::Transaction<'_>) -> AppResult<()> {
+    let hypothesis_ids = v58_orphan_ids(tx, "segment_hypotheses")?;
+    let loop0_ids = v58_orphan_ids(tx, "loop0_shadow_log")?;
+    if hypothesis_ids.is_empty() && loop0_ids.is_empty() {
+        // Normal for every fresh/healthy installation: v58 still creates the empty immutable evidence
+        // tables and records its schema version, but has no data to repair.
+        return Ok(());
+    }
+    let unique = |ids: &[String]| ids.windows(2).all(|pair| pair[0] != pair[1]);
+    if hypothesis_ids.len() != V58_ORPHAN_IDS
+        || loop0_ids.len() != V58_ORPHAN_IDS
+        || !unique(&hypothesis_ids)
+        || !unique(&loop0_ids)
+        || hypothesis_ids != loop0_ids
+    {
+        return Err(crate::error::AppError::Other(format!(
+            "migration v58 source set is not the authorized {V58_ORPHAN_IDS}+{V58_ORPHAN_IDS} abandoned-import cohort"
+        )));
+    }
+
+    // All 2,104 ids must be represented by exactly one row on each side and retain the measured
+    // abandoned OmniASR-7B import shape.  This is intentionally much narrower than merely sharing the
+    // two affected table names.
+    let shaped: i64 = tx.query_row(
+        "SELECT COUNT(*)
+           FROM segment_hypotheses h
+           JOIN loop0_shadow_log l ON l.segment_id = h.segment_id
+          WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = h.segment_id)
+            AND h.model_id = 'omniasr-7b-legacy-c348ade8a816'
+            AND h.model_version_id = 'omniasr-7b-legacy-c348ade8a816'
+            AND h.confidence IS NULL
+            AND h.transcript <> ''
+            AND l.memory_fired = 0
+            AND l.created_at IS NOT NULL
+            AND h.rowid - l.id = 2555
+            AND length(h.segment_id) = 36
+            AND substr(h.segment_id, 9, 1) = '-'
+            AND substr(h.segment_id, 14, 1) = '-'
+            AND substr(h.segment_id, 19, 1) = '-'
+            AND substr(h.segment_id, 24, 1) = '-'
+            AND length(replace(h.segment_id, '-', '')) = 32
+            AND replace(h.segment_id, '-', '') NOT GLOB '*[^0-9a-f]*'",
+        [],
+        |row| row.get(0),
+    )?;
+    if shaped != V58_ORPHAN_IDS as i64 {
+        return Err(crate::error::AppError::Other(format!(
+            "migration v58 source rows do not match the authorized abandoned-import shape ({shaped}/{V58_ORPHAN_IDS})"
+        )));
+    }
+
+    let mut digest = Sha256::new();
+    for segment_id in &hypothesis_ids {
+        digest.update(segment_id.as_bytes());
+        digest.update(b"\n");
+    }
+    let actual: String = digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    #[cfg(test)]
+    let accepted = actual == V58_ORPHAN_IDS_SHA256 || actual == V58_TEST_ORPHAN_IDS_SHA256;
+    #[cfg(not(test))]
+    let accepted = actual == V58_ORPHAN_IDS_SHA256;
+    if !accepted {
+        return Err(crate::error::AppError::Other(format!(
+            "migration v58 source identity digest is not authorized (got {actual})"
+        )));
+    }
+
+    // Bind every byte of the evidence that will be archived, including the transcript. The ID/shape
+    // proof above prevents a generic cleanup; this second digest prevents the authorized IDs from
+    // carrying altered transcription/timestamps/row identities while still looking structurally
+    // plausible. Canonical form is one compact UTF-8 JSON line per sorted segment ID:
+    // [[hypothesis source columns],[loop0 source columns]]\n.
+    let mut statement = tx.prepare(
+        "SELECT h.rowid, h.segment_id, h.model_id, h.transcript, h.confidence, h.created_at,
+                h.model_version_id, l.id, l.segment_id, l.memory_fired, l.created_at
+           FROM segment_hypotheses h
+           JOIN loop0_shadow_log l ON l.segment_id = h.segment_id
+          WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = h.segment_id)
+          ORDER BY h.segment_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            (
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ),
+            (row.get::<_, i64>(7)?, row.get::<_, String>(8)?, row.get::<_, i64>(9)?, row.get::<_, String>(10)?),
+        ))
+    })?;
+    let mut full_digest = Sha256::new();
+    for row in rows {
+        let encoded = serde_json::to_vec(&row?).map_err(|error| {
+            crate::error::AppError::Other(format!("migration v58 could not encode source evidence: {error}"))
+        })?;
+        full_digest.update(encoded);
+        full_digest.update(b"\n");
+    }
+    let actual_full: String = full_digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    #[cfg(test)]
+    let full_accepted = actual_full == V58_ORPHAN_FULL_TUPLE_SHA256 || actual_full == V58_TEST_ORPHAN_FULL_TUPLE_SHA256;
+    #[cfg(not(test))]
+    let full_accepted = actual_full == V58_ORPHAN_FULL_TUPLE_SHA256;
+    if !full_accepted {
+        return Err(crate::error::AppError::Other(format!(
+            "migration v58 full source-evidence digest is not authorized (got {actual_full})"
+        )));
+    }
+    Ok(())
+}
+
 fn apply_migration(db: &Database, migration: &Migration) -> AppResult<()> {
     let conn = db.connection();
     if FK_OFF_MIGRATIONS.contains(&migration.version) {
@@ -170,18 +413,24 @@ fn apply_migration(db: &Database, migration: &Migration) -> AppResult<()> {
         });
     }
     let tx = conn.unchecked_transaction()?;
+    if migration.version == 58 {
+        validate_v58_orphan_source(&tx)?;
+    }
     tx.execute_batch(migration.up_sql)?;
     tx.execute(
         "INSERT INTO schema_migrations (version, description) VALUES (?1, ?2)",
         rusqlite::params![migration.version, migration.description],
     )?;
+    if FK_CLEANUP_MIGRATIONS.contains(&migration.version) {
+        reject_foreign_key_violations(&tx, migration.version)?;
+    }
     tx.commit()?;
     Ok(())
 }
 
 /// Rollback the last N migrations.
 pub fn rollback(db: &Database, count: usize) -> AppResult<Vec<i64>> {
-    let current = get_current_version(db)?;
+    let current = validate_applied_history(db.connection())?;
     let mut reverted = Vec::new();
 
     for migration in MIGRATIONS.iter().rev() {
@@ -221,6 +470,9 @@ pub fn rollback(db: &Database, count: usize) -> AppResult<Vec<i64>> {
                         "DELETE FROM schema_migrations WHERE version = ?1",
                         rusqlite::params![migration.version],
                     )?;
+                    if FK_CLEANUP_MIGRATIONS.contains(&migration.version) {
+                        reject_foreign_key_violations(&tx, migration.version)?;
+                    }
                     tx.commit()?;
                 }
                 reverted.push(migration.version);
@@ -233,7 +485,7 @@ pub fn rollback(db: &Database, count: usize) -> AppResult<Vec<i64>> {
 
 /// List all migrations and their status.
 pub fn list_migrations(db: &Database) -> AppResult<Vec<MigrationStatus>> {
-    let current = get_current_version(db)?;
+    let current = validate_applied_history(db.connection())?;
     Ok(MIGRATIONS
         .iter()
         .map(|m| MigrationStatus {
@@ -1569,12 +1821,6521 @@ pub static MIGRATIONS: &[Migration] = &[
                  );",
         down_sql: Some("DROP TABLE IF EXISTS source_audio_provenance;"),
     },
+    Migration {
+        version: 55,
+        description: "Record that a reviewer actually HEARD a clip, so a verdict can be refused without it",
+        // 2026-08-19. Until now the decision surfaces gated only on `audioError` — the ABSENCE of a
+        // failure, which is not the presence of listening. A clip whose audio never loaded, or loaded
+        // and was never played, was indistinguishable from one the reviewer listened to twice. For a
+        // verbatim corpus that is the difference between a label and a guess, and it is invisible
+        // afterwards: nothing in the row says whether anyone heard it.
+        //
+        // A receipt is per (segment, revision): re-review after a correction needs its OWN evidence,
+        // because the text under judgement changed. `audio_fingerprint` binds the receipt to the
+        // BYTES that were played, so a receipt cannot be replayed against a different clip or survive
+        // the audio being swapped underneath it. `played_ms` is cumulative MEDIA time actually
+        // advanced — not wall-clock, not a play() call, and not a download — so seeking, pausing and
+        // replaying all account honestly.
+        //
+        // `policy_version` is stored per row on purpose: the sufficiency rule will be tuned, and a
+        // receipt must always say which rule it satisfied rather than being re-judged under a later
+        // one it never met.
+        up_sql: "CREATE TABLE IF NOT EXISTS playback_receipts (
+                     id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                     segment_id        TEXT NOT NULL,
+                     segment_revision  INTEGER NOT NULL,
+                     audio_fingerprint TEXT NOT NULL,
+                     reviewer          TEXT,
+                     session_id        TEXT,
+                     started_at_ms     INTEGER NOT NULL,
+                     played_ms         INTEGER NOT NULL,
+                     clip_duration_ms  INTEGER NOT NULL,
+                     coverage_ratio    REAL NOT NULL,
+                     policy_version    INTEGER NOT NULL,
+                     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+                     FOREIGN KEY (segment_id) REFERENCES speech_segments(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_playback_receipts_segment
+                     ON playback_receipts(segment_id, segment_revision);",
+        down_sql: Some("DROP INDEX IF EXISTS idx_playback_receipts_segment;
+                        DROP TABLE IF EXISTS playback_receipts;"),
+    },
+    Migration {
+        version: 56,
+        description: "Snapshot each decision's audio length onto its audit event, so pay survives clip deletion",
+        // 2026-08-20 hunt. `reviewed_audio_ms` — the phone's progress badge and the basis the owner
+        // pays on — INNER JOINed speech_segments, so deleting a reviewed clip silently shrank a
+        // reviewer's total for work they genuinely did. The audit trail kept the event (no FK, by
+        // design); the pay metric lost the duration the moment the row died. The event now carries
+        // the length it was paid against, backfilled from every clip that still exists; a legacy
+        // event whose clip is already gone stays unpriceable rather than invented.
+        up_sql: "ALTER TABLE review_events ADD COLUMN duration_ms INTEGER;
+                 UPDATE review_events SET duration_ms =
+                     (SELECT duration_ms FROM speech_segments s WHERE s.id = review_events.segment_id)
+                 WHERE duration_ms IS NULL;",
+        down_sql: Some("ALTER TABLE review_events DROP COLUMN duration_ms;"),
+    },
+    Migration {
+        version: 57,
+        description: "Version reviewer compensation and append immutable signed ledger entries",
+        // Owner authorization 2026-08-21: edit 100%, unchanged accept 10%, valid reject 10%, skip 0%
+        // at the existing 18,000 IQD/full-equivalent-hour rate. The policy starts AFTER the last
+        // legacy event present when this migration lands: historical rows do not preserve the
+        // semantic action the reviewer performed, and silently repricing them would invent payroll.
+        //
+        // `review_events.action` remains the effective CORPUS/provenance decision. The new column
+        // snapshots the distinct compensation action (e.g. an unchanged accept can be provenance-
+        // reclassified to edit, while still earning the authorized accept rate).
+        up_sql: "ALTER TABLE review_events ADD COLUMN compensation_action TEXT;
+                 ALTER TABLE review_events ADD COLUMN operation_id TEXT;
+                 ALTER TABLE review_events ADD COLUMN operation_payload_hash TEXT;
+                 CREATE UNIQUE INDEX idx_review_events_operation_id
+                     ON review_events(operation_id) WHERE operation_id IS NOT NULL;
+                 CREATE TRIGGER review_event_operation_validate_insert
+                 BEFORE INSERT ON review_events
+                 WHEN (NEW.operation_id IS NULL) <> (NEW.operation_payload_hash IS NULL)
+                   OR (NEW.operation_id IS NOT NULL AND (
+                          TRIM(NEW.operation_id) = ''
+                          OR LENGTH(NEW.operation_payload_hash) <> 64
+                          OR NEW.operation_payload_hash GLOB '*[^0-9a-f]*'
+                      ))
+                 BEGIN SELECT RAISE(ABORT, 'review operation id/hash must be paired and canonical'); END;
+                 CREATE TRIGGER review_event_operation_immutable_update
+                 BEFORE UPDATE OF operation_id, operation_payload_hash ON review_events
+                 WHEN NEW.operation_id IS NOT OLD.operation_id
+                   OR NEW.operation_payload_hash IS NOT OLD.operation_payload_hash
+                 BEGIN SELECT RAISE(ABORT, 'review operation identity is immutable'); END;
+
+                 CREATE TABLE review_compensation_policies (
+                     policy_version                 TEXT PRIMARY KEY,
+                     effective_after_event_id       INTEGER NOT NULL CHECK(effective_after_event_id >= 0),
+                     base_rate_micro_iqd_per_hour   INTEGER NOT NULL CHECK(base_rate_micro_iqd_per_hour > 0),
+                     edit_basis_points              INTEGER NOT NULL CHECK(edit_basis_points BETWEEN 0 AND 10000),
+                     accept_basis_points            INTEGER NOT NULL CHECK(accept_basis_points BETWEEN 0 AND 10000),
+                     reject_basis_points            INTEGER NOT NULL CHECK(reject_basis_points BETWEEN 0 AND 10000),
+                     skip_basis_points              INTEGER NOT NULL CHECK(skip_basis_points BETWEEN 0 AND 10000),
+                     created_at                     TEXT NOT NULL DEFAULT (datetime('now'))
+                 ) STRICT;
+                 INSERT INTO review_compensation_policies
+                     (policy_version, effective_after_event_id, base_rate_micro_iqd_per_hour,
+                      edit_basis_points, accept_basis_points, reject_basis_points, skip_basis_points)
+                 SELECT 'review-iqd-v1-2026-08-21', COALESCE(MAX(id), 0), 18000000000,
+                        10000, 1000, 1000, 0
+                   FROM review_events;
+
+                 CREATE TABLE review_compensation_ledger (
+                     id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+                     entry_id                   TEXT NOT NULL UNIQUE,
+                     entry_key                  TEXT NOT NULL UNIQUE,
+                     policy_version             TEXT NOT NULL,
+                     review_event_id            INTEGER,
+                     canonical_work_id          TEXT NOT NULL,
+                     canonical_identity_kind    TEXT NOT NULL,
+                     reviewer                   TEXT NOT NULL,
+                     segment_id                 TEXT NOT NULL,
+                     source                     TEXT NOT NULL,
+                     compensation_action        TEXT NOT NULL
+                                                    CHECK(compensation_action IN ('accept','edit','reject','skip','undo')),
+                     effective_decision         TEXT NOT NULL,
+                     decision_revision          INTEGER,
+                     duration_ms                INTEGER NOT NULL CHECK(duration_ms >= 0),
+                     rate_basis_points          INTEGER NOT NULL CHECK(rate_basis_points BETWEEN 0 AND 10000),
+                     entitlement_micro_iqd      INTEGER NOT NULL CHECK(entitlement_micro_iqd >= 0),
+                     delta_micro_iqd            INTEGER NOT NULL,
+                     corrected_entitlement_ms   INTEGER NOT NULL CHECK(corrected_entitlement_ms >= 0),
+                     delta_corrected_ms          INTEGER NOT NULL,
+                     reverses_entry_id          TEXT,
+                     created_at                 TEXT NOT NULL DEFAULT (datetime('now')),
+                     FOREIGN KEY(policy_version) REFERENCES review_compensation_policies(policy_version),
+                     FOREIGN KEY(review_event_id) REFERENCES review_events(id),
+                     FOREIGN KEY(reverses_entry_id) REFERENCES review_compensation_ledger(entry_id)
+                 ) STRICT;
+                 CREATE UNIQUE INDEX idx_review_compensation_one_entry_per_event
+                     ON review_compensation_ledger(review_event_id) WHERE review_event_id IS NOT NULL;
+                 CREATE INDEX idx_review_compensation_reviewer
+                     ON review_compensation_ledger(reviewer, policy_version, id);
+                 CREATE INDEX idx_review_compensation_work
+                     ON review_compensation_ledger(canonical_work_id, reviewer, policy_version, id);
+
+                 CREATE TABLE review_compensation_settlements (
+                     id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+                     settlement_id              TEXT NOT NULL UNIQUE,
+                     policy_version             TEXT NOT NULL,
+                     reviewer                   TEXT NOT NULL CHECK(TRIM(reviewer) <> ''),
+                     from_ledger_id_exclusive   INTEGER NOT NULL CHECK(from_ledger_id_exclusive >= 0),
+                     through_ledger_id_inclusive INTEGER NOT NULL
+                                                    CHECK(through_ledger_id_inclusive > from_ledger_id_exclusive),
+                     allocated_micro_iqd        INTEGER NOT NULL,
+                     payout_reference           TEXT NOT NULL UNIQUE CHECK(TRIM(payout_reference) <> ''),
+                     created_at                 TEXT NOT NULL DEFAULT (datetime('now')),
+                     FOREIGN KEY(policy_version) REFERENCES review_compensation_policies(policy_version)
+                 ) STRICT;
+                 CREATE UNIQUE INDEX idx_review_compensation_settlement_boundary
+                     ON review_compensation_settlements(policy_version, reviewer COLLATE NOCASE,
+                                                        through_ledger_id_inclusive);
+
+                 -- A settlement allocates one reviewer's next contiguous global-ledger interval.
+                 -- The exact amount is recomputed from immutable entries at INSERT time, so retrying
+                 -- or widening a payout range can neither pay the same delta twice nor invent money.
+                 CREATE TRIGGER review_compensation_settlement_validate_insert
+                 BEFORE INSERT ON review_compensation_settlements
+                 WHEN NEW.from_ledger_id_exclusive <> COALESCE((
+                          SELECT MAX(through_ledger_id_inclusive)
+                            FROM review_compensation_settlements
+                           WHERE policy_version = NEW.policy_version
+                             AND reviewer = NEW.reviewer COLLATE NOCASE
+                      ), 0)
+                   OR NEW.through_ledger_id_inclusive > COALESCE((
+                          SELECT MAX(id) FROM review_compensation_ledger
+                           WHERE policy_version = NEW.policy_version
+                      ), 0)
+                   OR NOT EXISTS (
+                          SELECT 1 FROM review_compensation_ledger
+                           WHERE policy_version = NEW.policy_version
+                             AND reviewer = NEW.reviewer COLLATE NOCASE
+                             AND id > NEW.from_ledger_id_exclusive
+                             AND id <= NEW.through_ledger_id_inclusive
+                      )
+                   OR NEW.allocated_micro_iqd <> COALESCE((
+                          SELECT SUM(delta_micro_iqd) FROM review_compensation_ledger
+                           WHERE policy_version = NEW.policy_version
+                             AND reviewer = NEW.reviewer COLLATE NOCASE
+                             AND id > NEW.from_ledger_id_exclusive
+                             AND id <= NEW.through_ledger_id_inclusive
+                      ), 0)
+                 BEGIN SELECT RAISE(ABORT, 'review compensation settlement range/amount is invalid'); END;
+                 CREATE TRIGGER review_compensation_settlement_immutable_update
+                 BEFORE UPDATE ON review_compensation_settlements
+                 BEGIN SELECT RAISE(ABORT, 'review compensation settlement is immutable'); END;
+                 CREATE TRIGGER review_compensation_settlement_immutable_delete
+                 BEFORE DELETE ON review_compensation_settlements
+                 BEGIN SELECT RAISE(ABORT, 'review compensation settlement is immutable'); END;
+
+                 CREATE TRIGGER review_compensation_policy_immutable_update
+                 BEFORE UPDATE ON review_compensation_policies
+                 BEGIN SELECT RAISE(ABORT, 'review compensation policy is immutable'); END;
+                 CREATE TRIGGER review_compensation_policy_immutable_delete
+                 BEFORE DELETE ON review_compensation_policies
+                 BEGIN SELECT RAISE(ABORT, 'review compensation policy is immutable'); END;
+                 CREATE TRIGGER review_compensation_ledger_immutable_update
+                 BEFORE UPDATE ON review_compensation_ledger
+                 BEGIN SELECT RAISE(ABORT, 'review compensation ledger is append-only'); END;
+                 CREATE TRIGGER review_compensation_ledger_immutable_delete
+                 BEFORE DELETE ON review_compensation_ledger
+                 BEGIN SELECT RAISE(ABORT, 'review compensation ledger is append-only'); END;",
+        down_sql: Some(
+            "CREATE TEMP TABLE review_compensation_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero = 0)
+             );
+             INSERT INTO review_compensation_rollback_guard(must_be_zero)
+             SELECT 1
+              WHERE EXISTS (SELECT 1 FROM review_compensation_ledger)
+                 OR EXISTS (SELECT 1 FROM review_compensation_settlements)
+                 OR EXISTS (
+                    SELECT 1 FROM review_events
+                     WHERE id > (SELECT effective_after_event_id
+                                   FROM review_compensation_policies
+                                  WHERE policy_version = 'review-iqd-v1-2026-08-21')
+                 );
+             DROP TABLE review_compensation_rollback_guard;
+             DROP TRIGGER IF EXISTS review_compensation_ledger_immutable_delete;
+             DROP TRIGGER IF EXISTS review_compensation_ledger_immutable_update;
+             DROP TRIGGER IF EXISTS review_compensation_settlement_immutable_delete;
+             DROP TRIGGER IF EXISTS review_compensation_settlement_immutable_update;
+             DROP TRIGGER IF EXISTS review_compensation_settlement_validate_insert;
+             DROP TRIGGER IF EXISTS review_compensation_policy_immutable_delete;
+             DROP TRIGGER IF EXISTS review_compensation_policy_immutable_update;
+             DROP TRIGGER IF EXISTS review_event_operation_immutable_update;
+             DROP TRIGGER IF EXISTS review_event_operation_validate_insert;
+             DROP INDEX IF EXISTS idx_review_compensation_work;
+             DROP INDEX IF EXISTS idx_review_compensation_reviewer;
+             DROP INDEX IF EXISTS idx_review_compensation_one_entry_per_event;
+             DROP INDEX IF EXISTS idx_review_compensation_settlement_boundary;
+             DROP INDEX IF EXISTS idx_review_events_operation_id;
+             DROP TABLE IF EXISTS review_compensation_settlements;
+             DROP TABLE IF EXISTS review_compensation_ledger;
+             DROP TABLE IF EXISTS review_compensation_policies;
+             ALTER TABLE review_events DROP COLUMN operation_payload_hash;
+             ALTER TABLE review_events DROP COLUMN operation_id;
+             ALTER TABLE review_events DROP COLUMN compensation_action;",
+        ),
+    },
+    Migration {
+        version: 58,
+        description: "Archive and remove only abandoned-import child rows whose speech segment is missing",
+        // Production preflight 2026-08-21 found exactly two FK-violation classes left by deletion of an
+        // abandoned import: segment_hypotheses and loop0_shadow_log rows whose speech_segments parent no
+        // longer exists. Never manufacture a parent and never discard the evidence. This migration copies
+        // every source column plus the original SQLite row identity and explicit repair provenance into
+        // immutable archive tables before deleting a child. Each DELETE is additionally gated on the exact
+        // archive key/rowid existing. `apply_migration` runs a whole-database foreign_key_check before commit
+        // for v58, so an unexpected third violation class aborts and restores both source tables atomically.
+        up_sql: "CREATE TABLE orphan_segment_hypotheses_archive_v58 (
+                     original_rowid            INTEGER NOT NULL UNIQUE,
+                     segment_id                 TEXT NOT NULL,
+                     model_id                   TEXT NOT NULL,
+                     transcript                 TEXT NOT NULL,
+                     confidence                 REAL,
+                     created_at                 TEXT NOT NULL,
+                     model_version_id           TEXT NOT NULL,
+                     source_table               TEXT NOT NULL
+                                                    CHECK(source_table = 'segment_hypotheses'),
+                     archive_reason             TEXT NOT NULL
+                                                    CHECK(archive_reason = 'missing speech_segments parent'),
+                     archive_migration_version  INTEGER NOT NULL CHECK(archive_migration_version = 58),
+                     archived_at                TEXT NOT NULL,
+                     PRIMARY KEY(segment_id, model_id)
+                 );
+                 CREATE TABLE orphan_loop0_shadow_log_archive_v58 (
+                     id                         INTEGER PRIMARY KEY,
+                     segment_id                 TEXT NOT NULL,
+                     memory_fired               BOOLEAN,
+                     created_at                 TEXT,
+                     source_table               TEXT NOT NULL
+                                                    CHECK(source_table = 'loop0_shadow_log'),
+                     archive_reason             TEXT NOT NULL
+                                                    CHECK(archive_reason = 'missing speech_segments parent'),
+                     archive_migration_version  INTEGER NOT NULL CHECK(archive_migration_version = 58),
+                     archived_at                TEXT NOT NULL
+                 );
+
+                 -- Plain CREATE/INSERT are deliberate. If evidence tables already exist while the schema
+                 -- version says v58 is pending, their provenance is ambiguous; fail instead of accepting or
+                 -- overwriting potentially tampered evidence.
+                 INSERT INTO orphan_segment_hypotheses_archive_v58
+                     (original_rowid, segment_id, model_id, transcript, confidence, created_at,
+                      model_version_id, source_table, archive_reason, archive_migration_version, archived_at)
+                 SELECT h.rowid, h.segment_id, h.model_id, h.transcript, h.confidence, h.created_at,
+                        h.model_version_id, 'segment_hypotheses', 'missing speech_segments parent', 58,
+                        datetime('now')
+                   FROM segment_hypotheses h
+                   WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = h.segment_id)
+                     AND h.model_id = 'omniasr-7b-legacy-c348ade8a816'
+                     AND h.model_version_id = 'omniasr-7b-legacy-c348ade8a816'
+                     AND h.confidence IS NULL
+                     AND EXISTS (
+                           SELECT 1 FROM loop0_shadow_log l
+                            WHERE l.segment_id = h.segment_id
+                              AND h.rowid - l.id = 2555
+                              AND l.memory_fired = 0
+                              AND l.created_at IS NOT NULL
+                         );
+                 INSERT INTO orphan_loop0_shadow_log_archive_v58
+                     (id, segment_id, memory_fired, created_at, source_table, archive_reason,
+                      archive_migration_version, archived_at)
+                 SELECT l.id, l.segment_id, l.memory_fired, l.created_at,
+                        'loop0_shadow_log', 'missing speech_segments parent', 58, datetime('now')
+                   FROM loop0_shadow_log l
+                   WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = l.segment_id)
+                     AND l.memory_fired = 0
+                     AND l.created_at IS NOT NULL
+                     AND EXISTS (
+                           SELECT 1 FROM segment_hypotheses h
+                            WHERE h.segment_id = l.segment_id
+                              AND h.rowid - l.id = 2555
+                              AND h.model_id = 'omniasr-7b-legacy-c348ade8a816'
+                              AND h.model_version_id = 'omniasr-7b-legacy-c348ade8a816'
+                              AND h.confidence IS NULL
+                         );
+
+                 DELETE FROM segment_hypotheses
+                  WHERE NOT EXISTS (
+                            SELECT 1 FROM speech_segments s
+                             WHERE s.id = segment_hypotheses.segment_id
+                         )
+                    AND segment_hypotheses.model_id = 'omniasr-7b-legacy-c348ade8a816'
+                    AND segment_hypotheses.model_version_id = 'omniasr-7b-legacy-c348ade8a816'
+                    AND segment_hypotheses.confidence IS NULL
+                    AND EXISTS (
+                            SELECT 1 FROM loop0_shadow_log l
+                             WHERE l.segment_id = segment_hypotheses.segment_id
+                               AND segment_hypotheses.rowid - l.id = 2555
+                               AND l.memory_fired = 0
+                               AND l.created_at IS NOT NULL
+                        )
+                    AND EXISTS (
+                            SELECT 1 FROM orphan_segment_hypotheses_archive_v58 a
+                             WHERE a.original_rowid = segment_hypotheses.rowid
+                               AND a.segment_id = segment_hypotheses.segment_id
+                               AND a.model_id = segment_hypotheses.model_id
+                               AND a.transcript IS segment_hypotheses.transcript
+                               AND a.confidence IS segment_hypotheses.confidence
+                               AND a.created_at IS segment_hypotheses.created_at
+                               AND a.model_version_id IS segment_hypotheses.model_version_id
+                        );
+                 DELETE FROM loop0_shadow_log
+                  WHERE NOT EXISTS (
+                            SELECT 1 FROM speech_segments s
+                             WHERE s.id = loop0_shadow_log.segment_id
+                         )
+                    AND loop0_shadow_log.memory_fired = 0
+                    AND loop0_shadow_log.created_at IS NOT NULL
+                    -- The live hypothesis row was deleted immediately above. Bind this second DELETE
+                    -- to its exact immutable archive twin instead of querying an already-empty source.
+                    AND EXISTS (
+                            SELECT 1 FROM orphan_segment_hypotheses_archive_v58 h
+                             WHERE h.segment_id = loop0_shadow_log.segment_id
+                               AND h.original_rowid - loop0_shadow_log.id = 2555
+                               AND h.model_id = 'omniasr-7b-legacy-c348ade8a816'
+                               AND h.model_version_id = 'omniasr-7b-legacy-c348ade8a816'
+                               AND h.confidence IS NULL
+                        )
+                    AND EXISTS (
+                            SELECT 1 FROM orphan_loop0_shadow_log_archive_v58 a
+                             WHERE a.id = loop0_shadow_log.id
+                               AND a.segment_id = loop0_shadow_log.segment_id
+                               AND a.memory_fired IS loop0_shadow_log.memory_fired
+                               AND a.created_at IS loop0_shadow_log.created_at
+                        );
+
+                 CREATE TRIGGER orphan_segment_hypotheses_archive_v58_immutable_insert
+                 BEFORE INSERT ON orphan_segment_hypotheses_archive_v58
+                 BEGIN SELECT RAISE(ABORT, 'v58 orphan archive is immutable'); END;
+                 CREATE TRIGGER orphan_segment_hypotheses_archive_v58_immutable_update
+                 BEFORE UPDATE ON orphan_segment_hypotheses_archive_v58
+                 BEGIN SELECT RAISE(ABORT, 'v58 orphan archive is immutable'); END;
+                 CREATE TRIGGER orphan_segment_hypotheses_archive_v58_immutable_delete
+                 BEFORE DELETE ON orphan_segment_hypotheses_archive_v58
+                 BEGIN SELECT RAISE(ABORT, 'v58 orphan archive is immutable'); END;
+                 CREATE TRIGGER orphan_loop0_shadow_log_archive_v58_immutable_insert
+                 BEFORE INSERT ON orphan_loop0_shadow_log_archive_v58
+                 BEGIN SELECT RAISE(ABORT, 'v58 orphan archive is immutable'); END;
+                 CREATE TRIGGER orphan_loop0_shadow_log_archive_v58_immutable_update
+                 BEFORE UPDATE ON orphan_loop0_shadow_log_archive_v58
+                 BEGIN SELECT RAISE(ABORT, 'v58 orphan archive is immutable'); END;
+                 CREATE TRIGGER orphan_loop0_shadow_log_archive_v58_immutable_delete
+                 BEFORE DELETE ON orphan_loop0_shadow_log_archive_v58
+                 BEGIN SELECT RAISE(ABORT, 'v58 orphan archive is immutable'); END;",
+        // Downgrade is deliberately conditional. Reintroducing the archived children while their parent is
+        // still absent would recreate the corruption v58 repaired; overwriting a same-key or same-rowid row
+        // created later would destroy newer work. The guard fails inside rollback's transaction and leaves
+        // v58, both archives, and all live tables unchanged. If the exact parents have been recovered and no
+        // identity conflicts exist, rollback restores every original value/rowid before dropping the archive.
+        down_sql: Some(
+            "CREATE TEMP TABLE orphan_repair_v58_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero = 0)
+             );
+             INSERT INTO orphan_repair_v58_rollback_guard(must_be_zero)
+             SELECT 1 WHERE EXISTS (
+                 SELECT 1 FROM orphan_segment_hypotheses_archive_v58 a
+                  WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = a.segment_id)
+             );
+             INSERT INTO orphan_repair_v58_rollback_guard(must_be_zero)
+             SELECT 1 WHERE EXISTS (
+                 SELECT 1 FROM orphan_loop0_shadow_log_archive_v58 a
+                  WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = a.segment_id)
+             );
+             INSERT INTO orphan_repair_v58_rollback_guard(must_be_zero)
+             SELECT 1 WHERE EXISTS (
+                 SELECT 1
+                   FROM orphan_segment_hypotheses_archive_v58 a
+                   JOIN segment_hypotheses h
+                     ON (h.segment_id = a.segment_id AND h.model_id = a.model_id)
+                     OR h.rowid = a.original_rowid
+             );
+             INSERT INTO orphan_repair_v58_rollback_guard(must_be_zero)
+             SELECT 1 WHERE EXISTS (
+                 SELECT 1
+                   FROM orphan_loop0_shadow_log_archive_v58 a
+                   JOIN loop0_shadow_log l ON l.id = a.id
+             );
+             DROP TABLE orphan_repair_v58_rollback_guard;
+
+             DROP TRIGGER orphan_segment_hypotheses_archive_v58_immutable_insert;
+             DROP TRIGGER orphan_segment_hypotheses_archive_v58_immutable_update;
+             DROP TRIGGER orphan_segment_hypotheses_archive_v58_immutable_delete;
+             DROP TRIGGER orphan_loop0_shadow_log_archive_v58_immutable_insert;
+             DROP TRIGGER orphan_loop0_shadow_log_archive_v58_immutable_update;
+             DROP TRIGGER orphan_loop0_shadow_log_archive_v58_immutable_delete;
+
+             INSERT INTO segment_hypotheses
+                 (rowid, segment_id, model_id, transcript, confidence, created_at, model_version_id)
+             SELECT original_rowid, segment_id, model_id, transcript, confidence, created_at, model_version_id
+               FROM orphan_segment_hypotheses_archive_v58
+              ORDER BY original_rowid;
+             INSERT INTO loop0_shadow_log(id, segment_id, memory_fired, created_at)
+             SELECT id, segment_id, memory_fired, created_at
+               FROM orphan_loop0_shadow_log_archive_v58
+              ORDER BY id;
+
+             DROP TABLE orphan_segment_hypotheses_archive_v58;
+            DROP TABLE orphan_loop0_shadow_log_archive_v58;",
+        ),
+    },
+    Migration {
+        version: 59,
+        description: "Persist controlled-review pilot hidden-check reservations",
+        // Hidden-QC assignment is a paid-pilot lifetime invariant, not session state.  A durable,
+        // append-only natural key prevents a lost/repaired couch_session.json from minting another
+        // pair for the same reviewer and policy baseline.  There is deliberately no segment FK:
+        // the assignment evidence must outlive corpus-row deletion just like the review ledgers do.
+        up_sql: "CREATE TABLE review_pilot_hidden_keys (
+                     policy_sha256 TEXT NOT NULL
+                         CHECK(length(policy_sha256) = 64 AND policy_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     after_review_event_id INTEGER NOT NULL
+                         CHECK(after_review_event_id >= 0),
+                     reviewer TEXT NOT NULL COLLATE NOCASE
+                         CHECK(reviewer = trim(reviewer) AND length(reviewer) BETWEEN 1 AND 40),
+                     segment_id TEXT NOT NULL
+                         CHECK(segment_id = trim(segment_id) AND length(segment_id) BETWEEN 1 AND 256),
+                     PRIMARY KEY(policy_sha256, after_review_event_id, reviewer, segment_id)
+                 ) STRICT;
+
+                 CREATE TRIGGER review_pilot_hidden_keys_policy_insert
+                 BEFORE INSERT ON review_pilot_hidden_keys
+                 WHEN EXISTS (
+                     SELECT 1 FROM review_pilot_hidden_keys
+                      WHERE after_review_event_id = NEW.after_review_event_id
+                        AND policy_sha256 <> NEW.policy_sha256
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'controlled review pilot baseline is bound to another policy'); END;
+
+                 CREATE TRIGGER review_pilot_hidden_keys_quota_insert
+                 BEFORE INSERT ON review_pilot_hidden_keys
+                 WHEN NOT EXISTS (
+                     SELECT 1 FROM review_pilot_hidden_keys
+                           WHERE policy_sha256 = NEW.policy_sha256
+                             AND after_review_event_id = NEW.after_review_event_id
+                             AND reviewer = NEW.reviewer
+                             AND segment_id = NEW.segment_id
+                      )
+                  AND (
+                       (SELECT COUNT(*) FROM review_pilot_hidden_keys
+                         WHERE policy_sha256 = NEW.policy_sha256
+                           AND after_review_event_id = NEW.after_review_event_id
+                           AND reviewer = NEW.reviewer) >= 2
+                       OR
+                       (SELECT COUNT(*) FROM review_pilot_hidden_keys
+                         WHERE policy_sha256 = NEW.policy_sha256
+                           AND after_review_event_id = NEW.after_review_event_id) >= 4
+                  )
+                 BEGIN SELECT RAISE(ABORT, 'controlled review pilot hidden-key quota exceeded'); END;
+
+                 CREATE TRIGGER review_pilot_hidden_keys_immutable_update
+                 BEFORE UPDATE ON review_pilot_hidden_keys
+                 BEGIN SELECT RAISE(ABORT, 'controlled review pilot hidden keys are append-only'); END;
+
+                 CREATE TRIGGER review_pilot_hidden_keys_immutable_delete
+                 BEFORE DELETE ON review_pilot_hidden_keys
+                 BEGIN SELECT RAISE(ABORT, 'controlled review pilot hidden keys are append-only'); END;",
+        // Once an assignment exists, silently forgetting it would reopen paid hidden-check capacity.
+        // Empty development/test databases can still downgrade; production history cannot.
+        down_sql: Some(
+            "CREATE TEMP TABLE review_pilot_hidden_keys_v59_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero = 0)
+             );
+             INSERT INTO review_pilot_hidden_keys_v59_rollback_guard(must_be_zero)
+             SELECT 1 WHERE EXISTS (SELECT 1 FROM review_pilot_hidden_keys);
+             DROP TABLE review_pilot_hidden_keys_v59_rollback_guard;
+             DROP TRIGGER review_pilot_hidden_keys_immutable_delete;
+             DROP TRIGGER review_pilot_hidden_keys_immutable_update;
+             DROP TRIGGER review_pilot_hidden_keys_quota_insert;
+             DROP TRIGGER review_pilot_hidden_keys_policy_insert;
+             DROP TABLE review_pilot_hidden_keys;",
+        ),
+    },
+    Migration {
+        version: 60,
+        description: "Make human-decision learning effects append-only and exactly reversible",
+        // A v59 Undo reverses compensation, but its learning side effects are destructive and
+        // unbound: every example for the segment is deleted, corrections remain indistinguishable
+        // from active corrections, and the mutable LOOP-0 counters cannot be restored exactly.
+        // v60 introduces one append-only effect identity shared by phone and desktop decisions.
+        // Every effect carries the exact pre-decision fields owned by the decision write plus the
+        // adjacent pre/post revisions, so Undo can be a server-owned compare-and-swap rather than a
+        // renderer-provided whole-row overwrite. Phone effects additionally bind one-to-one to their
+        // immutable review event; desktop effects deliberately have no review event. Undo appends one
+        // reversal, never deletes the effect or guesses an inverse. A desktop flag is a distinct
+        // machine-review mutation (no learning/pay effect), so it has its own append-only snapshot and
+        // reversal tables rather than shadowing a human decision in the effective-effect projection.
+        //
+        // `review_effect_state` freezes both pre-v60 frontiers.  The review-event cutoff is the
+        // semantic boundary for new effect/provenance rules; the ledger cutoff is needed solely to
+        // distinguish a pre-v60 reversal from one appended after migration when deciding whether a
+        // downgrade is lossless. Policy-3 receipts bind the current canonical decoded-PCM BLAKE3,
+        // review revision, duration, and inclusive/exclusive millisecond source endpoints; a
+        // one-millisecond duration/span difference is the only accepted rounding tolerance.
+        up_sql: "CREATE UNIQUE INDEX idx_review_compensation_one_reversal_per_entry
+                     ON review_compensation_ledger(reverses_entry_id)
+                  WHERE reverses_entry_id IS NOT NULL;
+
+                 ALTER TABLE review_events ADD COLUMN app_git_sha TEXT;
+                 ALTER TABLE review_events ADD COLUMN playback_guard_version TEXT;
+                 ALTER TABLE review_events ADD COLUMN requested_action TEXT;
+                 ALTER TABLE review_events ADD COLUMN requested_transcript TEXT;
+                 ALTER TABLE review_events ADD COLUMN served_transcript TEXT;
+                 ALTER TABLE review_events ADD COLUMN served_revision INTEGER;
+                 CREATE TRIGGER review_events_v60_provenance_validate_insert
+                 BEFORE INSERT ON review_events
+                 WHEN NEW.source IN ('couch', 'couch_spot_check')
+                  AND (
+                       NEW.app_git_sha IS NULL
+                       OR NEW.playback_guard_version IS NULL
+                       OR NEW.operation_id IS NULL
+                       OR NEW.operation_payload_hash IS NULL
+                       OR trim(NEW.operation_id) = ''
+                       OR length(NEW.operation_payload_hash) <> 64
+                       OR NEW.operation_payload_hash GLOB '*[^0-9a-f]*'
+                       OR NEW.requested_action IS NULL
+                       OR NEW.requested_action NOT IN ('accept', 'edit', 'reject', 'skip', 'bad')
+                       OR NEW.requested_transcript IS NULL
+                       OR NEW.served_transcript IS NULL
+                       OR NEW.served_transcript <> trim(NEW.served_transcript)
+                       OR length(NEW.served_transcript) = 0
+                       OR typeof(NEW.served_revision) <> 'integer'
+                       OR NEW.served_revision < 0
+                       OR length(NEW.app_git_sha) <> 40
+                       OR NEW.app_git_sha GLOB '*[^0-9a-f]*'
+                       OR NEW.playback_guard_version <> 'content-hash-raw-counter-v3'
+                  )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'paid review event requires canonical build and playback-guard provenance');
+                 END;
+                 CREATE TRIGGER review_events_v60_provenance_immutable_update
+                 BEFORE UPDATE OF app_git_sha, playback_guard_version ON review_events
+                 WHEN NEW.app_git_sha IS NOT OLD.app_git_sha
+                   OR NEW.playback_guard_version IS NOT OLD.playback_guard_version
+                 BEGIN
+                     SELECT RAISE(ABORT, 'review event build/playback provenance is immutable');
+                 END;
+
+                 ALTER TABLE playback_receipts ADD COLUMN source_start_ms INTEGER;
+                 ALTER TABLE playback_receipts ADD COLUMN source_end_ms INTEGER;
+                 CREATE TRIGGER playback_receipts_v60_span_validate_insert
+                 BEFORE INSERT ON playback_receipts
+                 WHEN NEW.policy_version = 3
+                  AND (
+                       typeof(NEW.segment_revision) <> 'integer'
+                       OR typeof(NEW.audio_fingerprint) <> 'text'
+                       OR typeof(NEW.clip_duration_ms) <> 'integer'
+                       OR typeof(NEW.source_start_ms) <> 'integer'
+                       OR typeof(NEW.source_end_ms) <> 'integer'
+                       OR NEW.source_start_ms < 0
+                       OR NEW.source_end_ms <= NEW.source_start_ms
+                       OR NOT EXISTS (
+                            SELECT 1
+                              FROM speech_segments s
+                             WHERE s.id = NEW.segment_id
+                               AND typeof(s.audio_content_hash) = 'text'
+                               AND length(s.audio_content_hash) = 64
+                               AND s.audio_content_hash NOT GLOB '*[^0-9a-f]*'
+                               AND NEW.audio_fingerprint = s.audio_content_hash
+                               AND NEW.segment_revision = s.review_revision
+                               AND s.duration_ms > 0
+                               AND NEW.clip_duration_ms > 0
+                               AND NEW.clip_duration_ms = s.duration_ms
+                               AND json_valid(s.alignment_json)
+                               AND json_type(s.alignment_json, '$.source_start_ms') = 'integer'
+                               AND json_type(s.alignment_json, '$.source_end_ms') = 'integer'
+                               AND NEW.source_start_ms =
+                                   json_extract(s.alignment_json, '$.source_start_ms')
+                               AND NEW.source_end_ms =
+                                   json_extract(s.alignment_json, '$.source_end_ms')
+                               AND abs(
+                                   s.duration_ms - (NEW.source_end_ms - NEW.source_start_ms)
+                               ) <= 1
+                       )
+                  )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'policy-3 playback evidence requires a canonical source span');
+                 END;
+                 CREATE TRIGGER playback_receipts_v60_policy3_immutable_update
+                 BEFORE UPDATE ON playback_receipts
+                 WHEN OLD.policy_version = 3 OR NEW.policy_version = 3
+                 BEGIN
+                     SELECT RAISE(ABORT, 'policy-3 playback evidence is append-only');
+                 END;
+                 CREATE TRIGGER playback_receipts_v60_policy3_immutable_delete
+                 BEFORE DELETE ON playback_receipts
+                 WHEN OLD.policy_version = 3
+                 BEGIN
+                     SELECT RAISE(ABORT, 'policy-3 playback evidence is append-only');
+                 END;
+
+                 CREATE TABLE review_effect_state (
+                     singleton_key                  INTEGER PRIMARY KEY CHECK(singleton_key = 1),
+                     effective_after_review_event_id INTEGER NOT NULL
+                                                       CHECK(effective_after_review_event_id >= 0),
+                     effective_after_ledger_id      INTEGER NOT NULL
+                                                       CHECK(effective_after_ledger_id >= 0),
+                     created_at                     TEXT NOT NULL DEFAULT (datetime('now'))
+                 ) STRICT;
+                 INSERT INTO review_effect_state
+                     (singleton_key, effective_after_review_event_id, effective_after_ledger_id)
+                 SELECT 1,
+                        COALESCE((SELECT MAX(id) FROM review_events), 0),
+                        COALESCE((SELECT MAX(id) FROM review_compensation_ledger), 0);
+                 CREATE TRIGGER review_effect_state_immutable_insert
+                 BEFORE INSERT ON review_effect_state
+                 BEGIN SELECT RAISE(ABORT, 'review effect state is immutable'); END;
+                 CREATE TRIGGER review_effect_state_immutable_update
+                 BEFORE UPDATE ON review_effect_state
+                 BEGIN SELECT RAISE(ABORT, 'review effect state is immutable'); END;
+                 CREATE TRIGGER review_effect_state_immutable_delete
+                 BEFORE DELETE ON review_effect_state
+                 BEGIN SELECT RAISE(ABORT, 'review effect state is immutable'); END;
+                 CREATE TRIGGER review_events_v60_post_cutoff_immutable_update
+                 BEFORE UPDATE ON review_events
+                 WHEN OLD.id > (
+                      SELECT effective_after_review_event_id
+                        FROM review_effect_state
+                       WHERE singleton_key = 1
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'post-v60 review events are append-only'); END;
+                 CREATE TRIGGER review_events_v60_post_cutoff_immutable_delete
+                 BEFORE DELETE ON review_events
+                 WHEN OLD.id > (
+                      SELECT effective_after_review_event_id
+                        FROM review_effect_state
+                       WHERE singleton_key = 1
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'post-v60 review events are append-only'); END;
+
+                 CREATE TABLE legacy_reviewed_segments_v60 (
+                     original_rowid      INTEGER PRIMARY KEY,
+                     id                  TEXT NOT NULL UNIQUE,
+                     audio_content_hash  TEXT,
+                     audio_fingerprint   INTEGER,
+                     alignment_json      TEXT,
+                     duration_ms         INTEGER NOT NULL,
+                     human_decision      TEXT,
+                     verdict             TEXT,
+                     verdict_transcript  TEXT,
+                     annotated_transcript TEXT,
+                     verified            INTEGER NOT NULL,
+                     reviewed_by         TEXT,
+                     corrected_at        TEXT,
+                     review_revision     INTEGER NOT NULL,
+                     escalated           INTEGER NOT NULL,
+                     is_gold             INTEGER NOT NULL,
+                     rationale           TEXT
+                 ) STRICT;
+                 INSERT INTO legacy_reviewed_segments_v60
+                     (original_rowid, id, audio_content_hash, audio_fingerprint, alignment_json,
+                      duration_ms, human_decision, verdict, verdict_transcript,
+                      annotated_transcript, verified, reviewed_by, corrected_at, review_revision,
+                      escalated, is_gold, rationale)
+                 SELECT segment.rowid, segment.id, segment.audio_content_hash,
+                        segment.audio_fingerprint, segment.alignment_json, segment.duration_ms,
+                        segment.human_decision, segment.verdict, segment.verdict_transcript,
+                        segment.annotated_transcript, segment.verified, segment.reviewed_by,
+                        segment.corrected_at, segment.review_revision, segment.escalated,
+                        segment.is_gold, segment.rationale
+                   FROM speech_segments segment
+                  WHERE segment.verified = 1
+                     OR segment.is_gold = 1
+                     OR segment.human_decision IS NOT NULL
+                     OR segment.reviewed_by IS NOT NULL
+                     OR segment.corrected_at IS NOT NULL
+                     OR segment.escalated = 1
+                     OR segment.verdict = 'escalated'
+                     OR segment.verdict LIKE 'human_%'
+                     OR EXISTS (
+                          SELECT 1
+                            FROM review_events event
+                           WHERE event.segment_id = segment.id
+                             AND event.source <> 'couch_spot_check'
+                             AND event.action IN ('accept', 'edit', 'reject')
+                     )
+                     OR EXISTS (
+                          SELECT 1
+                            FROM review_compensation_ledger ledger
+                           WHERE ledger.segment_id = segment.id
+                             AND ledger.compensation_action = 'undo'
+                     )
+                  ORDER BY segment.rowid;
+                 CREATE TRIGGER legacy_reviewed_segments_v60_immutable_insert
+                 BEFORE INSERT ON legacy_reviewed_segments_v60
+                 BEGIN SELECT RAISE(ABORT, 'legacy reviewed-segment snapshot is immutable'); END;
+                 CREATE TRIGGER legacy_reviewed_segments_v60_immutable_update
+                 BEFORE UPDATE ON legacy_reviewed_segments_v60
+                 BEGIN SELECT RAISE(ABORT, 'legacy reviewed-segment snapshot is immutable'); END;
+                 CREATE TRIGGER legacy_reviewed_segments_v60_immutable_delete
+                 BEFORE DELETE ON legacy_reviewed_segments_v60
+                 BEGIN SELECT RAISE(ABORT, 'legacy reviewed-segment snapshot is immutable'); END;
+
+                 CREATE TABLE legacy_machine_verdict_segments_v60 (
+                     original_rowid       INTEGER PRIMARY KEY,
+                     id                   TEXT NOT NULL UNIQUE,
+                     review_revision      INTEGER NOT NULL CHECK(review_revision >= 0),
+                     verdict              TEXT,
+                     verdict_transcript   TEXT,
+                     jury_transcript      TEXT,
+                     rationale            TEXT,
+                     evidence_json        TEXT,
+                     agreement_score      REAL,
+                     escalated            INTEGER NOT NULL CHECK(escalated IN (0, 1)),
+                     verified             INTEGER NOT NULL CHECK(verified IN (0, 1)),
+                     annotated_transcript TEXT,
+                     human_decision       TEXT,
+                     corrected_at         TEXT,
+                     reviewed_by          TEXT,
+                     is_gold              INTEGER NOT NULL CHECK(is_gold IN (0, 1))
+                 ) STRICT;
+                 INSERT INTO legacy_machine_verdict_segments_v60
+                     (original_rowid, id, review_revision, verdict, verdict_transcript,
+                      jury_transcript, rationale, evidence_json, agreement_score, escalated,
+                      verified, annotated_transcript, human_decision, corrected_at,
+                      reviewed_by, is_gold)
+                 SELECT segment.rowid, segment.id, segment.review_revision, segment.verdict,
+                        segment.verdict_transcript, segment.jury_transcript, segment.rationale,
+                        segment.evidence_json, segment.agreement_score, segment.escalated,
+                        segment.verified, segment.annotated_transcript, segment.human_decision,
+                        segment.corrected_at, segment.reviewed_by, segment.is_gold
+                   FROM speech_segments segment
+                  WHERE segment.verdict IN ('auto_accept', 'jury_accept', 'jury_edit', 'escalated')
+                     OR segment.jury_transcript IS NOT NULL
+                     OR segment.rationale IS NOT NULL
+                     OR segment.evidence_json IS NOT NULL
+                     OR segment.agreement_score IS NOT NULL
+                     OR segment.escalated = 1
+                  ORDER BY segment.rowid;
+                 CREATE TRIGGER legacy_machine_verdict_segments_v60_immutable_insert
+                 BEFORE INSERT ON legacy_machine_verdict_segments_v60
+                 BEGIN SELECT RAISE(ABORT, 'legacy machine-verdict snapshot is immutable'); END;
+                 CREATE TRIGGER legacy_machine_verdict_segments_v60_immutable_update
+                 BEFORE UPDATE ON legacy_machine_verdict_segments_v60
+                 BEGIN SELECT RAISE(ABORT, 'legacy machine-verdict snapshot is immutable'); END;
+                 CREATE TRIGGER legacy_machine_verdict_segments_v60_immutable_delete
+                 BEFORE DELETE ON legacy_machine_verdict_segments_v60
+                 BEGIN SELECT RAISE(ABORT, 'legacy machine-verdict snapshot is immutable'); END;
+
+                 CREATE TRIGGER speech_segments_v60_review_authority_immutable_delete
+                 BEFORE DELETE ON speech_segments
+                 WHEN OLD.verified = 1
+                   OR OLD.is_gold = 1
+                   OR OLD.human_decision IS NOT NULL
+                   OR OLD.reviewed_by IS NOT NULL
+                   OR OLD.corrected_at IS NOT NULL
+                   OR OLD.escalated = 1
+                   OR OLD.verdict = 'escalated'
+                   OR OLD.verdict LIKE 'human_%'
+                   OR OLD.verdict IN ('auto_accept', 'jury_accept', 'jury_edit')
+                   OR OLD.jury_transcript IS NOT NULL
+                   OR OLD.rationale IS NOT NULL
+                   OR OLD.evidence_json IS NOT NULL
+                   OR OLD.agreement_score IS NOT NULL
+                   OR EXISTS (
+                        SELECT 1 FROM legacy_reviewed_segments_v60 legacy
+                         WHERE legacy.original_rowid = OLD.rowid
+                           AND legacy.id = OLD.id
+                   )
+                   OR EXISTS (
+                        SELECT 1 FROM legacy_machine_verdict_segments_v60 legacy
+                         WHERE legacy.original_rowid = OLD.rowid
+                           AND legacy.id = OLD.id
+                   )
+                   OR EXISTS (SELECT 1 FROM review_events event WHERE event.segment_id = OLD.id)
+                   OR EXISTS (
+                        SELECT 1 FROM review_compensation_ledger ledger
+                         WHERE ledger.segment_id = OLD.id
+                   )
+                   OR EXISTS (
+                        SELECT 1 FROM human_decision_effect_events effect
+                         WHERE effect.segment_id = OLD.id
+                   )
+                   OR EXISTS (
+                        SELECT 1 FROM review_flag_effect_events flag
+                         WHERE flag.segment_id = OLD.id
+                   )
+                   OR EXISTS (
+                        SELECT 1 FROM playback_receipts receipt
+                         WHERE receipt.segment_id = OLD.id
+                   )
+                   OR EXISTS (SELECT 1 FROM spot_checks spot WHERE spot.segment_id = OLD.id)
+                   OR EXISTS (
+                        SELECT 1 FROM review_pilot_hidden_keys hidden
+                         WHERE hidden.segment_id = OLD.id
+                   )
+                   OR EXISTS (
+                        SELECT 1 FROM agent_examples example
+                         WHERE example.segment_id = OLD.id
+                   )
+                   OR EXISTS (
+                        SELECT 1 FROM corrections correction
+                         WHERE correction.segment_id = OLD.id
+                   )
+                   OR EXISTS (
+                        SELECT 1 FROM correction_memory memory
+                         WHERE memory.source_segment = OLD.id
+                   )
+                   OR EXISTS (
+                        SELECT 1 FROM decision_log decision
+                         WHERE decision.segment_id = OLD.id
+                   )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'segment with durable review authority cannot be deleted');
+                 END;
+
+                 CREATE TRIGGER speech_segments_v60_paid_identity_immutable_update
+                 BEFORE UPDATE OF audio_content_hash, alignment_json, duration_ms ON speech_segments
+                 WHEN EXISTS (
+                          SELECT 1
+                            FROM playback_receipts receipt
+                           WHERE receipt.segment_id = OLD.id
+                             AND receipt.policy_version = 3
+                      )
+                    OR EXISTS (
+                          SELECT 1
+                            FROM review_events event
+                            JOIN review_compensation_ledger ledger
+                              ON ledger.review_event_id = event.id
+                             AND ledger.reverses_entry_id IS NULL
+                           WHERE event.segment_id = OLD.id
+                             AND event.id > (
+                                  SELECT effective_after_review_event_id
+                                    FROM review_effect_state
+                                   WHERE singleton_key = 1
+                             )
+                             AND event.source IN ('couch', 'couch_spot_check')
+                             AND event.playback_guard_version = 'content-hash-raw-counter-v3'
+                             AND COALESCE(event.compensation_action, event.action) <> 'skip'
+                             AND ledger.compensation_action <> 'skip'
+                      )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'paid policy-3 source identity is immutable');
+                 END;
+
+                 CREATE TRIGGER review_compensation_v60_served_revision_validate_insert
+                 BEFORE INSERT ON review_compensation_ledger
+                 WHEN NEW.review_event_id IS NOT NULL
+                  AND EXISTS (
+                       SELECT 1
+                         FROM review_events event
+                        WHERE event.id = NEW.review_event_id
+                          AND event.id > (
+                               SELECT effective_after_review_event_id
+                                 FROM review_effect_state
+                                WHERE singleton_key = 1
+                          )
+                          AND (
+                               event.source = 'couch_spot_check'
+                               OR (
+                                    event.source = 'couch'
+                                    AND COALESCE(event.compensation_action, event.action) = 'skip'
+                               )
+                          )
+                  )
+                  AND NOT EXISTS (
+                       SELECT 1
+                         FROM review_events event
+                        WHERE event.id = NEW.review_event_id
+                          AND event.served_revision IS NEW.decision_revision
+                  )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'effectless paid review ledger must preserve the served revision');
+                 END;
+
+                 CREATE TABLE human_decision_effect_events (
+                     id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                     review_event_id   INTEGER UNIQUE REFERENCES review_events(id),
+                     segment_id        TEXT NOT NULL
+                                            CHECK(segment_id = trim(segment_id) AND length(segment_id) > 0),
+                     reviewer          TEXT
+                                            CHECK(reviewer IS NULL OR
+                                                  (reviewer = trim(reviewer) AND length(reviewer) BETWEEN 1 AND 80)),
+                     source            TEXT NOT NULL
+                                             CHECK(source = trim(source) AND length(source) BETWEEN 1 AND 80),
+                     operation_id      TEXT UNIQUE
+                                            CHECK(operation_id IS NULL OR (
+                                                  operation_id = lower(trim(operation_id))
+                                                  AND length(operation_id) = 36
+                                                  AND substr(operation_id, 9, 1) = '-'
+                                                  AND substr(operation_id, 14, 1) = '-'
+                                                  AND substr(operation_id, 19, 1) = '-'
+                                                  AND substr(operation_id, 24, 1) = '-'
+                                                  AND length(replace(operation_id, '-', '')) = 32
+                                                  AND replace(operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+                                            )),
+                     operation_payload_hash TEXT
+                                            CHECK(operation_payload_hash IS NULL OR (
+                                                  length(operation_payload_hash) = 64
+                                                  AND operation_payload_hash NOT GLOB '*[^0-9a-f]*'
+                                            )),
+                     action            TEXT NOT NULL CHECK(action IN ('accept','edit','reject')),
+                     served_transcript TEXT NOT NULL
+                                            CHECK(served_transcript = trim(served_transcript)
+                                                  AND length(served_transcript) > 0),
+                     decision_transcript TEXT,
+                     decision_annotated_transcript TEXT,
+                     decision_verified INTEGER NOT NULL CHECK(decision_verified IN (0, 1)),
+                     decision_corrected_at TEXT NOT NULL
+                                                  CHECK(length(trim(decision_corrected_at)) > 0),
+                     decision_rationale TEXT,
+                     requested_action  TEXT,
+                     requested_transcript TEXT,
+                     requested_timestamp_ms INTEGER,
+                     prior_revision    INTEGER NOT NULL CHECK(prior_revision >= 0),
+                     decision_revision INTEGER NOT NULL CHECK(decision_revision >= 0),
+                     prior_verified    INTEGER NOT NULL CHECK(prior_verified IN (0, 1)),
+                     prior_annotated_transcript TEXT,
+                     prior_verdict     TEXT,
+                     prior_verdict_transcript TEXT,
+                     prior_rationale   TEXT,
+                     prior_escalated   INTEGER NOT NULL CHECK(prior_escalated IN (0, 1)),
+                     prior_human_decision TEXT
+                                             CHECK(prior_human_decision IS NULL OR
+                                                   prior_human_decision IN ('accept','edit','reject')),
+                     prior_corrected_at TEXT,
+                     prior_reviewed_by TEXT,
+                     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+                     CHECK(decision_revision = prior_revision + 1),
+                     CHECK(
+                         (action IN ('accept', 'edit')
+                          AND decision_transcript IS NOT NULL
+                          AND length(trim(decision_transcript)) > 0)
+                         OR (action = 'reject' AND decision_transcript IS NULL)
+                     ),
+                     CHECK(
+                         (source = 'desktop'
+                          AND operation_id IS NOT NULL
+                          AND operation_payload_hash IS NOT NULL
+                          AND requested_action IS NOT NULL
+                          AND requested_action IN ('accept', 'edit', 'reject')
+                          AND requested_timestamp_ms IS NOT NULL
+                          AND requested_timestamp_ms > 0)
+                         OR (source <> 'desktop'
+                             AND operation_id IS NULL
+                             AND operation_payload_hash IS NULL
+                             AND requested_action IS NULL
+                             AND requested_transcript IS NULL
+                             AND requested_timestamp_ms IS NULL)
+                     ),
+                     UNIQUE(segment_id, decision_revision)
+                 ) STRICT;
+                 CREATE INDEX idx_human_decision_effect_events_segment
+                     ON human_decision_effect_events(segment_id, id);
+                 CREATE TRIGGER human_decision_effect_events_validate_rationale_insert
+                 BEFORE INSERT ON human_decision_effect_events
+                 WHEN NEW.decision_rationale IS NOT NEW.prior_rationale
+                 BEGIN
+                     SELECT RAISE(ABORT, 'human decision effect must preserve the exact prior rationale');
+                 END;
+                 CREATE TRIGGER human_decision_effect_events_validate_review_event_insert
+                 BEFORE INSERT ON human_decision_effect_events
+                 WHEN (
+                       NEW.review_event_id IS NOT NULL
+                       AND (
+                            NEW.reviewer IS NULL
+                            OR NEW.source <> 'couch'
+                            OR NOT EXISTS (
+                       SELECT 1
+                         FROM review_events r
+                         JOIN review_compensation_ledger l
+                           ON l.review_event_id = r.id
+                        WHERE r.id = NEW.review_event_id
+                          AND r.id > (
+                              SELECT effective_after_review_event_id
+                                FROM review_effect_state
+                               WHERE singleton_key = 1
+                          )
+                          AND r.source = 'couch'
+                          AND r.segment_id = NEW.segment_id
+                          AND r.reviewer = NEW.reviewer COLLATE NOCASE
+                          AND r.source = NEW.source
+                          AND r.action = NEW.action
+                          AND r.served_transcript = NEW.served_transcript
+                          AND r.served_revision IS NEW.prior_revision
+                          AND l.reverses_entry_id IS NULL
+                          AND l.segment_id = NEW.segment_id
+                          AND l.reviewer = NEW.reviewer COLLATE NOCASE
+                          AND l.source = NEW.source
+                          AND l.effective_decision = NEW.action
+                          AND l.decision_revision IS NEW.decision_revision
+                          AND NOT EXISTS (
+                              SELECT 1
+                                FROM review_compensation_ledger reversal
+                               WHERE reversal.reverses_entry_id = l.entry_id
+                          )
+                            )
+                       )
+                  )
+                    OR (
+                         NEW.review_event_id IS NULL
+                         AND (NEW.source <> 'desktop' OR NEW.reviewer IS NOT NULL)
+                    )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'human decision effect is outside its exact phone/desktop boundary');
+                 END;
+                 CREATE TRIGGER human_decision_effect_events_immutable_update
+                 BEFORE UPDATE ON human_decision_effect_events
+                 BEGIN SELECT RAISE(ABORT, 'human decision effects are append-only'); END;
+                 CREATE TRIGGER human_decision_effect_events_immutable_delete
+                 BEFORE DELETE ON human_decision_effect_events
+                 BEGIN SELECT RAISE(ABORT, 'human decision effects are append-only'); END;
+
+                 CREATE TABLE human_decision_effect_reversals (
+                     effect_event_id INTEGER PRIMARY KEY REFERENCES human_decision_effect_events(id),
+                     operation_id    TEXT NOT NULL UNIQUE
+                                           CHECK(operation_id = trim(operation_id) AND length(operation_id) > 0),
+                     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+                 ) STRICT;
+                 CREATE TRIGGER human_decision_effect_reversals_validate_phone_insert
+                 BEFORE INSERT ON human_decision_effect_reversals
+                 WHEN EXISTS (
+                          SELECT 1 FROM human_decision_effect_events e
+                           WHERE e.id = NEW.effect_event_id
+                             AND e.review_event_id IS NOT NULL
+                      )
+                  AND NOT EXISTS (
+                          SELECT 1
+                            FROM human_decision_effect_events e
+                            JOIN review_compensation_ledger original
+                              ON original.review_event_id = e.review_event_id
+                             AND original.reverses_entry_id IS NULL
+                            JOIN review_compensation_ledger reversal
+                              ON reversal.reverses_entry_id = original.entry_id
+                           WHERE e.id = NEW.effect_event_id
+                             AND reversal.compensation_action = 'undo'
+                             AND reversal.source = 'couch_undo'
+                             AND reversal.entry_key = 'undo:' || NEW.operation_id
+                      )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'phone effect reversal requires its exact compensation reversal');
+                 END;
+                 CREATE TRIGGER human_decision_effect_reversals_immutable_update
+                 BEFORE UPDATE ON human_decision_effect_reversals
+                 BEGIN SELECT RAISE(ABORT, 'human decision effect reversals are append-only'); END;
+                 CREATE TRIGGER human_decision_effect_reversals_immutable_delete
+                 BEFORE DELETE ON human_decision_effect_reversals
+                 BEGIN SELECT RAISE(ABORT, 'human decision effect reversals are append-only'); END;
+
+                 CREATE VIEW effective_human_decision_effects_v60 AS
+                 WITH active_effects AS (
+                     SELECT e.*
+                       FROM human_decision_effect_events e
+                      WHERE NOT EXISTS (
+                                SELECT 1
+                                  FROM human_decision_effect_reversals r
+                                 WHERE r.effect_event_id = e.id
+                            )
+                 )
+                 SELECT a.*
+                   FROM active_effects a
+                  WHERE NOT EXISTS (
+                            SELECT 1
+                             FROM active_effects newer
+                             WHERE newer.segment_id = a.segment_id
+                                AND newer.decision_revision > a.decision_revision
+                         );
+
+                 CREATE TABLE review_flag_effect_events (
+                     id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                     operation_id      TEXT NOT NULL UNIQUE
+                                            CHECK(
+                                                operation_id = lower(trim(operation_id))
+                                                AND length(operation_id) = 36
+                                                AND substr(operation_id, 9, 1) = '-'
+                                                AND substr(operation_id, 14, 1) = '-'
+                                                AND substr(operation_id, 19, 1) = '-'
+                                                AND substr(operation_id, 24, 1) = '-'
+                                                AND length(replace(operation_id, '-', '')) = 32
+                                                AND replace(operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+                                            ),
+                     segment_id        TEXT NOT NULL
+                                             CHECK(segment_id = trim(segment_id) AND length(segment_id) > 0),
+                     prior_revision    INTEGER NOT NULL CHECK(prior_revision >= 0),
+                     flag_revision     INTEGER NOT NULL CHECK(flag_revision >= 0),
+                     prior_verdict     TEXT,
+                     prior_rationale   TEXT,
+                     flag_rationale    TEXT NOT NULL CHECK(length(trim(flag_rationale)) > 0),
+                     prior_escalated   INTEGER NOT NULL CHECK(prior_escalated IN (0, 1)),
+                     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+                     CHECK(flag_revision = prior_revision + 1),
+                     UNIQUE(segment_id, flag_revision)
+                 ) STRICT;
+                 CREATE INDEX idx_review_flag_effect_events_segment
+                     ON review_flag_effect_events(segment_id, id);
+                 CREATE TRIGGER review_flag_effect_events_immutable_update
+                 BEFORE UPDATE ON review_flag_effect_events
+                 BEGIN SELECT RAISE(ABORT, 'review flag effects are append-only'); END;
+                 CREATE TRIGGER review_flag_effect_events_immutable_delete
+                 BEFORE DELETE ON review_flag_effect_events
+                 BEGIN SELECT RAISE(ABORT, 'review flag effects are append-only'); END;
+
+                 CREATE TABLE review_flag_effect_reversals (
+                     flag_effect_event_id INTEGER PRIMARY KEY REFERENCES review_flag_effect_events(id),
+                     operation_id         TEXT NOT NULL UNIQUE
+                                               CHECK(operation_id = trim(operation_id) AND length(operation_id) > 0),
+                     created_at           TEXT NOT NULL DEFAULT (datetime('now'))
+                 ) STRICT;
+                 CREATE TRIGGER review_flag_effect_reversals_immutable_update
+                 BEFORE UPDATE ON review_flag_effect_reversals
+                 BEGIN SELECT RAISE(ABORT, 'review flag effect reversals are append-only'); END;
+                 CREATE TRIGGER review_flag_effect_reversals_immutable_delete
+                 BEFORE DELETE ON review_flag_effect_reversals
+                 BEGIN SELECT RAISE(ABORT, 'review flag effect reversals are append-only'); END;
+
+                 CREATE VIEW effective_review_flag_effects_v60 AS
+                 WITH active_effects AS (
+                     SELECT e.*
+                       FROM review_flag_effect_events e
+                      WHERE NOT EXISTS (
+                                SELECT 1
+                                  FROM review_flag_effect_reversals r
+                                 WHERE r.flag_effect_event_id = e.id
+                            )
+                 )
+                 SELECT a.*
+                   FROM active_effects a
+                  WHERE NOT EXISTS (
+                            SELECT 1
+                             FROM active_effects newer
+                             WHERE newer.segment_id = a.segment_id
+                               AND newer.flag_revision > a.flag_revision
+                        );
+
+                 CREATE TABLE legacy_agent_examples_v60 (
+                     original_rowid    INTEGER PRIMARY KEY,
+                     id                TEXT NOT NULL UNIQUE,
+                     segment_id        TEXT NOT NULL,
+                     audio_features    TEXT,
+                     wrong_transcript  TEXT NOT NULL,
+                     human_fix         TEXT NOT NULL,
+                     created_at        TEXT NOT NULL,
+                     source            TEXT NOT NULL,
+                     verified_by_human INTEGER NOT NULL,
+                     corrector_model_id TEXT
+                 ) STRICT;
+                 INSERT INTO legacy_agent_examples_v60
+                     (original_rowid, id, segment_id, audio_features, wrong_transcript,
+                      human_fix, created_at, source, verified_by_human, corrector_model_id)
+                 SELECT rowid, id, segment_id, audio_features, wrong_transcript,
+                        human_fix, created_at, source, verified_by_human, corrector_model_id
+                   FROM agent_examples
+                  ORDER BY rowid;
+                 CREATE TRIGGER legacy_agent_examples_v60_immutable_insert
+                 BEFORE INSERT ON legacy_agent_examples_v60
+                 BEGIN SELECT RAISE(ABORT, 'legacy agent-example snapshot is immutable'); END;
+                 CREATE TRIGGER legacy_agent_examples_v60_immutable_update
+                 BEFORE UPDATE ON legacy_agent_examples_v60
+                 BEGIN SELECT RAISE(ABORT, 'legacy agent-example snapshot is immutable'); END;
+                 CREATE TRIGGER legacy_agent_examples_v60_immutable_delete
+                 BEFORE DELETE ON legacy_agent_examples_v60
+                 BEGIN SELECT RAISE(ABORT, 'legacy agent-example snapshot is immutable'); END;
+
+                 ALTER TABLE agent_examples
+                     ADD COLUMN effect_event_id INTEGER REFERENCES human_decision_effect_events(id);
+                 CREATE UNIQUE INDEX idx_agent_examples_one_per_effect_event
+                     ON agent_examples(effect_event_id) WHERE effect_event_id IS NOT NULL;
+                 CREATE TRIGGER agent_examples_v60_effect_validate_insert
+                 BEFORE INSERT ON agent_examples
+                 WHEN (NEW.source = 'human' AND (
+                           NEW.verified_by_human <> 1
+                           OR NEW.effect_event_id IS NULL
+                           OR NOT EXISTS (
+                                SELECT 1 FROM human_decision_effect_events e
+                                 WHERE e.id = NEW.effect_event_id
+                                   AND e.segment_id = NEW.segment_id
+                                   AND e.action = 'edit'
+                                   AND NOT EXISTS (
+                                        SELECT 1 FROM human_decision_effect_reversals reversal
+                                         WHERE reversal.effect_event_id = e.id
+                                   )
+                                   AND NOT EXISTS (
+                                        SELECT 1
+                                          FROM human_decision_effect_events newer
+                                         WHERE newer.segment_id = e.segment_id
+                                           AND newer.decision_revision > e.decision_revision
+                                           AND NOT EXISTS (
+                                                SELECT 1
+                                                  FROM human_decision_effect_reversals newer_reversal
+                                                 WHERE newer_reversal.effect_event_id = newer.id
+                                           )
+                                   )
+                           )
+                       ))
+                    OR (NEW.source <> 'human' AND (
+                           NEW.verified_by_human <> 0
+                           OR NEW.effect_event_id IS NOT NULL
+                       ))
+                 BEGIN
+                     SELECT RAISE(ABORT, 'human examples require their exact effect; pseudo examples must remain unbound');
+                 END;
+                 CREATE TRIGGER agent_examples_v60_effect_immutable_update
+                 BEFORE UPDATE ON agent_examples
+                 WHEN EXISTS (
+                          SELECT 1 FROM legacy_agent_examples_v60 legacy
+                           WHERE legacy.id = OLD.id
+                      )
+                   OR OLD.effect_event_id IS NOT NULL
+                   OR NEW.effect_event_id IS NOT OLD.effect_event_id
+                   OR NEW.source IS NOT OLD.source
+                   OR NEW.verified_by_human IS NOT OLD.verified_by_human
+                 BEGIN SELECT RAISE(ABORT, 'effect-bound human examples are append-only'); END;
+                 CREATE TRIGGER agent_examples_v60_effect_immutable_delete
+                 BEFORE DELETE ON agent_examples
+                 WHEN EXISTS (
+                          SELECT 1 FROM legacy_agent_examples_v60 legacy
+                           WHERE legacy.id = OLD.id
+                      )
+                   OR OLD.effect_event_id IS NOT NULL
+                   OR OLD.source = 'human'
+                   OR OLD.verified_by_human = 1
+                 BEGIN SELECT RAISE(ABORT, 'effect-bound human examples are append-only'); END;
+
+                 CREATE TABLE legacy_corrections_v60 (
+                     original_rowid     INTEGER PRIMARY KEY,
+                     id                 TEXT NOT NULL UNIQUE,
+                     segment_id         TEXT,
+                     audio_content_hash TEXT NOT NULL,
+                     raw_hypothesis     TEXT NOT NULL,
+                     ensemble_hyps_json TEXT,
+                     agreement_score    REAL,
+                     jury_verdict       TEXT,
+                     human_fix          TEXT NOT NULL,
+                     model_version_id   TEXT,
+                     adapter_id         TEXT,
+                     reviewer_id        TEXT,
+                     loop_applied       TEXT,
+                     decided_at         TEXT NOT NULL
+                 ) STRICT;
+                 INSERT INTO legacy_corrections_v60
+                     (original_rowid, id, segment_id, audio_content_hash, raw_hypothesis,
+                      ensemble_hyps_json, agreement_score, jury_verdict, human_fix,
+                      model_version_id, adapter_id, reviewer_id, loop_applied, decided_at)
+                 SELECT rowid, id, segment_id, audio_content_hash, raw_hypothesis,
+                        ensemble_hyps_json, agreement_score, jury_verdict, human_fix,
+                        model_version_id, adapter_id, reviewer_id, loop_applied, decided_at
+                   FROM corrections
+                  ORDER BY rowid;
+                 CREATE TRIGGER legacy_corrections_v60_immutable_insert
+                 BEFORE INSERT ON legacy_corrections_v60
+                 BEGIN SELECT RAISE(ABORT, 'legacy correction snapshot is immutable'); END;
+                 CREATE TRIGGER legacy_corrections_v60_immutable_update
+                 BEFORE UPDATE ON legacy_corrections_v60
+                 BEGIN SELECT RAISE(ABORT, 'legacy correction snapshot is immutable'); END;
+                 CREATE TRIGGER legacy_corrections_v60_immutable_delete
+                 BEFORE DELETE ON legacy_corrections_v60
+                 BEGIN SELECT RAISE(ABORT, 'legacy correction snapshot is immutable'); END;
+
+                 ALTER TABLE corrections
+                     ADD COLUMN effect_event_id INTEGER REFERENCES human_decision_effect_events(id);
+                 CREATE INDEX idx_corrections_reviewer_id ON corrections(reviewer_id);
+                 CREATE UNIQUE INDEX idx_corrections_one_per_effect_event
+                     ON corrections(effect_event_id) WHERE effect_event_id IS NOT NULL;
+                 CREATE TRIGGER corrections_v60_effect_validate_insert
+                 BEFORE INSERT ON corrections
+                 WHEN NEW.effect_event_id IS NULL
+                   OR NOT EXISTS (
+                        SELECT 1
+                          FROM human_decision_effect_events e
+                         WHERE e.id = NEW.effect_event_id
+                           AND e.segment_id = NEW.segment_id
+                           AND e.action = 'edit'
+                           AND (
+                                (e.reviewer IS NULL AND NEW.reviewer_id IS NULL)
+                                OR e.reviewer = NEW.reviewer_id COLLATE NOCASE
+                           )
+                           AND NOT EXISTS (
+                                SELECT 1 FROM human_decision_effect_reversals reversal
+                                 WHERE reversal.effect_event_id = e.id
+                           )
+                           AND NOT EXISTS (
+                                SELECT 1
+                                  FROM human_decision_effect_events newer
+                                 WHERE newer.segment_id = e.segment_id
+                                   AND newer.decision_revision > e.decision_revision
+                                   AND NOT EXISTS (
+                                        SELECT 1
+                                          FROM human_decision_effect_reversals newer_reversal
+                                         WHERE newer_reversal.effect_event_id = newer.id
+                                   )
+                           )
+                   )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'correction requires its exact human-decision effect');
+                 END;
+                 CREATE TRIGGER corrections_v60_effect_immutable_update
+                 BEFORE UPDATE ON corrections
+                 WHEN EXISTS (
+                          SELECT 1 FROM legacy_corrections_v60 legacy
+                           WHERE legacy.id = OLD.id
+                      )
+                   OR OLD.effect_event_id IS NOT NULL
+                   OR NEW.effect_event_id IS NOT OLD.effect_event_id
+                 BEGIN SELECT RAISE(ABORT, 'effect-bound corrections are append-only'); END;
+                 CREATE TRIGGER corrections_v60_effect_immutable_delete
+                 BEFORE DELETE ON corrections
+                 WHEN EXISTS (
+                          SELECT 1 FROM legacy_corrections_v60 legacy
+                           WHERE legacy.id = OLD.id
+                      )
+                   OR OLD.effect_event_id IS NOT NULL
+                 BEGIN SELECT RAISE(ABORT, 'effect-bound corrections are append-only'); END;
+
+                 ALTER TABLE correction_memory
+                     ADD COLUMN legacy_seed INTEGER NOT NULL DEFAULT 1 CHECK(legacy_seed IN (0, 1));
+                 CREATE UNIQUE INDEX idx_correction_memory_natural_key
+                     ON correction_memory(slot_key, wrong_token, human_token);
+                 CREATE TRIGGER correction_memory_v60_seed_validate_insert
+                 BEFORE INSERT ON correction_memory
+                 WHEN NEW.legacy_seed <> 0
+                   OR NEW.hit_count <> 0
+                   OR NEW.confirm_count <> 0
+                   OR NEW.override_count <> 0
+                   OR NEW.last_fired_at IS NOT NULL
+                   OR NEW.source_segment IS NULL
+                   OR length(trim(NEW.source_segment)) = 0
+                 BEGIN
+                     SELECT RAISE(ABORT, 'post-v60 correction memory must start from a zero append-only baseline');
+                 END;
+                 CREATE TRIGGER correction_memory_v60_baseline_immutable_update
+                 BEFORE UPDATE OF id, wrong_token, human_token, slot_key, phonetic_key,
+                                  source_segment, model_version_id, confidence, hit_count,
+                                  last_fired_at, created_at, confirm_count, override_count, legacy_seed
+                     ON correction_memory
+                 BEGIN
+                     SELECT RAISE(ABORT, 'correction memory identity/evidence baseline is immutable after v60');
+                 END;
+                 CREATE TRIGGER correction_memory_v60_immutable_delete
+                 BEFORE DELETE ON correction_memory
+                 BEGIN SELECT RAISE(ABORT, 'correction memory is append-only after v60'); END;
+
+                 CREATE TABLE correction_memory_contributions (
+                     effect_event_id INTEGER NOT NULL REFERENCES human_decision_effect_events(id),
+                     memory_id       TEXT NOT NULL REFERENCES correction_memory(id),
+                     capture_delta   INTEGER NOT NULL CHECK(capture_delta IN (0, 1)),
+                     confirm_delta   INTEGER NOT NULL CHECK(confirm_delta IN (0, 1)),
+                     override_delta  INTEGER NOT NULL CHECK(override_delta IN (0, 1)),
+                     fired_at        TEXT CHECK(fired_at IS NULL OR length(trim(fired_at)) > 0),
+                     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                     PRIMARY KEY(effect_event_id, memory_id),
+                     CHECK(capture_delta + confirm_delta + override_delta > 0),
+                     CHECK(confirm_delta + override_delta <= 1)
+                 ) STRICT;
+                 CREATE INDEX idx_correction_memory_contributions_memory
+                     ON correction_memory_contributions(memory_id, effect_event_id);
+                 CREATE TRIGGER correction_memory_contributions_effect_validate_insert
+                 BEFORE INSERT ON correction_memory_contributions
+                 WHEN NOT EXISTS (
+                      SELECT 1
+                        FROM human_decision_effect_events e
+                        JOIN correction_memory m ON m.id = NEW.memory_id
+                       WHERE e.id = NEW.effect_event_id
+                         AND e.action IN ('accept', 'edit')
+                         AND (NEW.capture_delta = 0 OR e.action = 'edit')
+                         AND (
+                              NEW.capture_delta = 0
+                              OR m.legacy_seed = 1
+                              OR EXISTS (
+                                   SELECT 1
+                                     FROM correction_memory_contributions prior_capture
+                                    WHERE prior_capture.memory_id = NEW.memory_id
+                                      AND prior_capture.capture_delta = 1
+                              )
+                              OR e.segment_id = m.source_segment
+                         )
+                         AND NOT EXISTS (
+                              SELECT 1 FROM human_decision_effect_reversals r
+                               WHERE r.effect_event_id = e.id
+                         )
+                 )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'memory contribution requires an active accept/edit effect; capture requires edit');
+                 END;
+                 CREATE TRIGGER correction_memory_contributions_immutable_update
+                 BEFORE UPDATE ON correction_memory_contributions
+                 BEGIN SELECT RAISE(ABORT, 'correction memory contributions are append-only'); END;
+                 CREATE TRIGGER correction_memory_contributions_immutable_delete
+                 BEFORE DELETE ON correction_memory_contributions
+                 BEGIN SELECT RAISE(ABORT, 'correction memory contributions are append-only'); END;
+
+                 CREATE VIEW effective_review_events_v60 AS
+                 WITH active_originals AS (
+                     SELECT e.id AS review_event_id,
+                            e.segment_id,
+                            e.reviewer,
+                            e.action,
+                            e.source,
+                            e.timestamp_ms,
+                            e.created_at AS review_event_created_at,
+                            e.duration_ms AS review_event_duration_ms,
+                            e.compensation_action AS review_event_compensation_action,
+                            e.operation_id,
+                            e.operation_payload_hash,
+                            e.requested_action,
+                            e.requested_transcript,
+                            e.served_transcript,
+                            e.served_revision,
+                            e.app_git_sha,
+                            e.playback_guard_version,
+                            l.id AS ledger_id,
+                            l.entry_id AS ledger_entry_id,
+                            l.entry_key AS ledger_entry_key,
+                            l.policy_version,
+                            l.canonical_work_id,
+                            l.canonical_identity_kind,
+                            l.reviewer AS ledger_reviewer,
+                            l.segment_id AS ledger_segment_id,
+                            l.source AS ledger_source,
+                            l.compensation_action AS ledger_compensation_action,
+                            l.effective_decision,
+                            l.decision_revision,
+                            l.duration_ms AS ledger_duration_ms,
+                            l.rate_basis_points,
+                            l.entitlement_micro_iqd,
+                            l.delta_micro_iqd,
+                            l.corrected_entitlement_ms,
+                            l.delta_corrected_ms,
+                            l.created_at AS ledger_created_at
+                       FROM review_events e
+                       JOIN review_compensation_ledger l ON l.review_event_id = e.id
+                      WHERE l.reverses_entry_id IS NULL
+                        AND NOT EXISTS (
+                                SELECT 1
+                                  FROM review_compensation_ledger reversal
+                                 WHERE reversal.reverses_entry_id = l.entry_id
+                            )
+                 )
+                 SELECT a.*
+                   FROM active_originals a
+                  WHERE NOT EXISTS (
+                            SELECT 1
+                              FROM active_originals newer
+                             WHERE newer.policy_version = a.policy_version
+                               AND newer.canonical_work_id = a.canonical_work_id
+                               AND newer.review_event_id > a.review_event_id
+                        );
+
+                 CREATE VIEW active_corrections_v60 AS
+                 SELECT c.*
+                   FROM corrections c
+                  WHERE (c.effect_event_id IS NULL AND EXISTS (
+                            SELECT 1
+                              FROM legacy_corrections_v60 legacy
+                             WHERE legacy.original_rowid = c.rowid
+                               AND legacy.id IS c.id
+                               AND legacy.segment_id IS c.segment_id
+                               AND legacy.audio_content_hash IS c.audio_content_hash
+                               AND legacy.raw_hypothesis IS c.raw_hypothesis
+                               AND legacy.ensemble_hyps_json IS c.ensemble_hyps_json
+                               AND legacy.agreement_score IS c.agreement_score
+                               AND legacy.jury_verdict IS c.jury_verdict
+                               AND legacy.human_fix IS c.human_fix
+                               AND legacy.model_version_id IS c.model_version_id
+                               AND legacy.adapter_id IS c.adapter_id
+                               AND legacy.reviewer_id IS c.reviewer_id
+                               AND legacy.loop_applied IS c.loop_applied
+                               AND legacy.decided_at IS c.decided_at
+                       ))
+                     OR EXISTS (
+                            SELECT 1
+                              FROM effective_human_decision_effects_v60 e
+                             WHERE e.id = c.effect_event_id
+                               AND (
+                                    (e.reviewer IS NULL AND c.reviewer_id IS NULL)
+                                    OR e.reviewer = c.reviewer_id COLLATE NOCASE
+                               )
+                        );
+
+                 CREATE VIEW effective_correction_memory_v60 AS
+                 WITH active_contributions AS (
+                     SELECT c.memory_id,
+                            SUM(c.capture_delta) AS active_capture_count,
+                            SUM(c.confirm_delta) AS active_confirm_count,
+                            SUM(c.override_delta) AS active_override_count,
+                            MAX(c.fired_at) AS active_last_fired_at
+                       FROM correction_memory_contributions c
+                       JOIN effective_human_decision_effects_v60 e
+                         ON e.id = c.effect_event_id
+                      GROUP BY c.memory_id
+                 ), projected AS (
+                     SELECT m.*,
+                            COALESCE(c.active_capture_count, 0) AS active_capture_count,
+                            CASE WHEN m.legacy_seed = 1 THEN m.confirm_count ELSE 0 END
+                                + COALESCE(c.active_confirm_count, 0) AS effective_confirm_count,
+                            CASE WHEN m.legacy_seed = 1 THEN m.override_count ELSE 0 END
+                                + COALESCE(c.active_override_count, 0) AS effective_override_count,
+                            CASE
+                                WHEN m.last_fired_at IS NULL THEN c.active_last_fired_at
+                                WHEN c.active_last_fired_at IS NULL THEN m.last_fired_at
+                                WHEN c.active_last_fired_at > m.last_fired_at THEN c.active_last_fired_at
+                                ELSE m.last_fired_at
+                            END AS effective_last_fired_at
+                       FROM correction_memory m
+                       LEFT JOIN active_contributions c ON c.memory_id = m.id
+                 )
+                 SELECT id,
+                        wrong_token,
+                        human_token,
+                        slot_key,
+                        phonetic_key,
+                        source_segment,
+                        model_version_id,
+                        (effective_confirm_count + 1.0)
+                            / (effective_confirm_count + effective_override_count + 2.0) AS confidence,
+                        CASE
+                            WHEN legacy_seed = 1 THEN hit_count + active_capture_count
+                            WHEN active_capture_count > 0 THEN active_capture_count - 1
+                            ELSE 0
+                        END AS hit_count,
+                        effective_last_fired_at AS last_fired_at,
+                        created_at,
+                        effective_confirm_count AS confirm_count,
+                        effective_override_count AS override_count,
+                        legacy_seed,
+                        active_capture_count
+                   FROM projected
+                  WHERE legacy_seed = 1 OR active_capture_count > 0;",
+        // Downgrade is lossless only before this schema has captured any effect.  The guard
+        // deliberately permits a populated v59 database (including pre-v60 ledger reversals), but
+        // refuses every v60 identity/evidence class before dropping its columns and views.
+        down_sql: Some(
+            "CREATE TEMP TABLE review_effect_v60_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero = 0)
+             );
+             INSERT INTO review_effect_v60_rollback_guard(must_be_zero)
+             SELECT 1
+               WHERE EXISTS (SELECT 1 FROM human_decision_effect_events)
+                  OR EXISTS (SELECT 1 FROM human_decision_effect_reversals)
+                  OR EXISTS (SELECT 1 FROM review_flag_effect_events)
+                  OR EXISTS (SELECT 1 FROM review_flag_effect_reversals)
+                  OR EXISTS (SELECT 1 FROM correction_memory_contributions)
+                 OR EXISTS (SELECT 1 FROM agent_examples WHERE effect_event_id IS NOT NULL)
+                 OR EXISTS (SELECT 1 FROM corrections WHERE effect_event_id IS NOT NULL)
+                 OR EXISTS (SELECT 1 FROM correction_memory WHERE legacy_seed = 0)
+                 OR EXISTS (
+                        SELECT 1 FROM playback_receipts
+                         WHERE policy_version = 3
+                            OR source_start_ms IS NOT NULL
+                            OR source_end_ms IS NOT NULL
+                    )
+                 OR EXISTS (
+                        SELECT 1 FROM review_events
+                         WHERE id > (SELECT effective_after_review_event_id FROM review_effect_state WHERE singleton_key = 1)
+                    )
+                 OR EXISTS (
+                        SELECT 1 FROM review_compensation_ledger
+                         WHERE reverses_entry_id IS NOT NULL
+                           AND id > (SELECT effective_after_ledger_id FROM review_effect_state WHERE singleton_key = 1)
+                    )
+                 OR EXISTS (
+                        SELECT 1
+                          FROM legacy_reviewed_segments_v60 legacy
+                          LEFT JOIN speech_segments segment
+                            ON segment.rowid = legacy.original_rowid
+                           AND segment.id = legacy.id
+                         WHERE segment.id IS NULL
+                            OR segment.audio_content_hash IS NOT legacy.audio_content_hash
+                            OR segment.audio_fingerprint IS NOT legacy.audio_fingerprint
+                            OR segment.alignment_json IS NOT legacy.alignment_json
+                            OR segment.duration_ms IS NOT legacy.duration_ms
+                            OR segment.human_decision IS NOT legacy.human_decision
+                            OR segment.verdict IS NOT legacy.verdict
+                            OR segment.verdict_transcript IS NOT legacy.verdict_transcript
+                            OR segment.annotated_transcript IS NOT legacy.annotated_transcript
+                            OR segment.verified IS NOT legacy.verified
+                            OR segment.reviewed_by IS NOT legacy.reviewed_by
+                            OR segment.corrected_at IS NOT legacy.corrected_at
+                            OR segment.review_revision < legacy.review_revision
+                            OR segment.escalated IS NOT legacy.escalated
+                            OR segment.is_gold IS NOT legacy.is_gold
+                            OR segment.rationale IS NOT legacy.rationale
+                    )
+                 OR EXISTS (
+                        SELECT 1
+                          FROM legacy_machine_verdict_segments_v60 legacy
+                          LEFT JOIN speech_segments segment
+                            ON segment.rowid = legacy.original_rowid
+                           AND segment.id = legacy.id
+                         WHERE segment.id IS NULL
+                            OR segment.review_revision < legacy.review_revision
+                            OR segment.verdict IS NOT legacy.verdict
+                            OR segment.verdict_transcript IS NOT legacy.verdict_transcript
+                            OR segment.jury_transcript IS NOT legacy.jury_transcript
+                            OR segment.rationale IS NOT legacy.rationale
+                            OR segment.evidence_json IS NOT legacy.evidence_json
+                            OR segment.agreement_score IS NOT legacy.agreement_score
+                            OR segment.escalated IS NOT legacy.escalated
+                            OR segment.verified IS NOT legacy.verified
+                            OR segment.annotated_transcript IS NOT legacy.annotated_transcript
+                            OR segment.human_decision IS NOT legacy.human_decision
+                            OR segment.corrected_at IS NOT legacy.corrected_at
+                            OR segment.reviewed_by IS NOT legacy.reviewed_by
+                            OR segment.is_gold IS NOT legacy.is_gold
+                    )
+                 OR EXISTS (
+                        SELECT 1
+                          FROM speech_segments segment
+                         WHERE (
+                               segment.verdict IN
+                                   ('auto_accept', 'jury_accept', 'jury_edit', 'escalated')
+                               OR segment.jury_transcript IS NOT NULL
+                               OR segment.rationale IS NOT NULL
+                               OR segment.evidence_json IS NOT NULL
+                               OR segment.agreement_score IS NOT NULL
+                               OR segment.escalated = 1
+                         )
+                           AND NOT EXISTS (
+                                SELECT 1
+                                  FROM legacy_machine_verdict_segments_v60 legacy
+                                 WHERE legacy.original_rowid = segment.rowid
+                                   AND legacy.id = segment.id
+                           )
+                    )
+                 OR EXISTS (
+                        SELECT 1
+                          FROM speech_segments segment
+                         WHERE (
+                               segment.verified = 1
+                               OR segment.is_gold = 1
+                               OR segment.human_decision IS NOT NULL
+                               OR segment.reviewed_by IS NOT NULL
+                               OR segment.corrected_at IS NOT NULL
+                               OR segment.escalated = 1
+                               OR segment.verdict = 'escalated'
+                               OR segment.verdict LIKE 'human_%'
+                               OR EXISTS (
+                                    SELECT 1
+                                      FROM review_events event
+                                     WHERE event.segment_id = segment.id
+                                       AND event.id <= (
+                                            SELECT effective_after_review_event_id
+                                              FROM review_effect_state
+                                             WHERE singleton_key = 1
+                                       )
+                                       AND event.source <> 'couch_spot_check'
+                                       AND event.action IN ('accept', 'edit', 'reject')
+                               )
+                               OR EXISTS (
+                                    SELECT 1
+                                      FROM review_compensation_ledger ledger
+                                     WHERE ledger.segment_id = segment.id
+                                       AND ledger.id <= (
+                                            SELECT effective_after_ledger_id
+                                              FROM review_effect_state
+                                             WHERE singleton_key = 1
+                                       )
+                                       AND ledger.compensation_action = 'undo'
+                               )
+                         )
+                           AND NOT EXISTS (
+                                SELECT 1
+                                  FROM legacy_reviewed_segments_v60 legacy
+                                 WHERE legacy.original_rowid = segment.rowid
+                                   AND legacy.id = segment.id
+                           )
+                    )
+                 OR EXISTS (
+                        SELECT 1 FROM review_events
+                         WHERE app_git_sha IS NOT NULL
+                            OR playback_guard_version IS NOT NULL
+                            OR requested_action IS NOT NULL
+                            OR requested_transcript IS NOT NULL
+                            OR served_transcript IS NOT NULL
+                            OR served_revision IS NOT NULL
+                    );
+             DROP TABLE review_effect_v60_rollback_guard;
+
+             DROP VIEW effective_correction_memory_v60;
+             DROP VIEW active_corrections_v60;
+             DROP VIEW effective_review_events_v60;
+             DROP VIEW effective_review_flag_effects_v60;
+             DROP VIEW effective_human_decision_effects_v60;
+
+             DROP TRIGGER correction_memory_contributions_immutable_delete;
+             DROP TRIGGER correction_memory_contributions_immutable_update;
+             DROP TRIGGER correction_memory_contributions_effect_validate_insert;
+             DROP INDEX idx_correction_memory_contributions_memory;
+             DROP TABLE correction_memory_contributions;
+
+             DROP TRIGGER corrections_v60_effect_validate_insert;
+             DROP TRIGGER corrections_v60_effect_immutable_delete;
+             DROP TRIGGER corrections_v60_effect_immutable_update;
+             DROP INDEX idx_corrections_one_per_effect_event;
+             DROP INDEX idx_corrections_reviewer_id;
+             ALTER TABLE corrections DROP COLUMN effect_event_id;
+             DROP TRIGGER legacy_corrections_v60_immutable_delete;
+             DROP TRIGGER legacy_corrections_v60_immutable_update;
+             DROP TRIGGER legacy_corrections_v60_immutable_insert;
+             DROP TABLE legacy_corrections_v60;
+
+             DROP TRIGGER agent_examples_v60_effect_validate_insert;
+             DROP TRIGGER agent_examples_v60_effect_immutable_delete;
+             DROP TRIGGER agent_examples_v60_effect_immutable_update;
+             DROP INDEX idx_agent_examples_one_per_effect_event;
+             ALTER TABLE agent_examples DROP COLUMN effect_event_id;
+             DROP TRIGGER legacy_agent_examples_v60_immutable_delete;
+             DROP TRIGGER legacy_agent_examples_v60_immutable_update;
+             DROP TRIGGER legacy_agent_examples_v60_immutable_insert;
+             DROP TABLE legacy_agent_examples_v60;
+
+             DROP TRIGGER correction_memory_v60_baseline_immutable_update;
+             DROP TRIGGER correction_memory_v60_seed_validate_insert;
+             DROP TRIGGER correction_memory_v60_immutable_delete;
+             DROP INDEX idx_correction_memory_natural_key;
+             ALTER TABLE correction_memory DROP COLUMN legacy_seed;
+
+             DROP TRIGGER review_flag_effect_reversals_immutable_delete;
+             DROP TRIGGER review_flag_effect_reversals_immutable_update;
+             DROP TABLE review_flag_effect_reversals;
+             DROP TRIGGER review_flag_effect_events_immutable_delete;
+             DROP TRIGGER review_flag_effect_events_immutable_update;
+             DROP INDEX idx_review_flag_effect_events_segment;
+             DROP TABLE review_flag_effect_events;
+
+             DROP TRIGGER human_decision_effect_reversals_immutable_delete;
+             DROP TRIGGER human_decision_effect_reversals_immutable_update;
+             DROP TRIGGER human_decision_effect_reversals_validate_phone_insert;
+             DROP TABLE human_decision_effect_reversals;
+             DROP TRIGGER human_decision_effect_events_immutable_delete;
+             DROP TRIGGER human_decision_effect_events_immutable_update;
+             DROP TRIGGER human_decision_effect_events_validate_review_event_insert;
+             DROP TRIGGER human_decision_effect_events_validate_rationale_insert;
+             DROP INDEX idx_human_decision_effect_events_segment;
+             DROP TABLE human_decision_effect_events;
+
+             DROP TRIGGER review_compensation_v60_served_revision_validate_insert;
+             DROP TRIGGER speech_segments_v60_paid_identity_immutable_update;
+             DROP TRIGGER speech_segments_v60_review_authority_immutable_delete;
+             DROP TRIGGER legacy_machine_verdict_segments_v60_immutable_delete;
+             DROP TRIGGER legacy_machine_verdict_segments_v60_immutable_update;
+             DROP TRIGGER legacy_machine_verdict_segments_v60_immutable_insert;
+             DROP TABLE legacy_machine_verdict_segments_v60;
+             DROP TRIGGER legacy_reviewed_segments_v60_immutable_delete;
+             DROP TRIGGER legacy_reviewed_segments_v60_immutable_update;
+             DROP TRIGGER legacy_reviewed_segments_v60_immutable_insert;
+             DROP TABLE legacy_reviewed_segments_v60;
+             DROP TRIGGER review_effect_state_immutable_delete;
+             DROP TRIGGER review_effect_state_immutable_update;
+             DROP TRIGGER review_effect_state_immutable_insert;
+             DROP TRIGGER review_events_v60_post_cutoff_immutable_delete;
+             DROP TRIGGER review_events_v60_post_cutoff_immutable_update;
+             DROP TABLE review_effect_state;
+
+             DROP TRIGGER review_events_v60_provenance_immutable_update;
+             DROP TRIGGER review_events_v60_provenance_validate_insert;
+             ALTER TABLE review_events DROP COLUMN served_revision;
+             ALTER TABLE review_events DROP COLUMN served_transcript;
+             ALTER TABLE review_events DROP COLUMN requested_transcript;
+             ALTER TABLE review_events DROP COLUMN requested_action;
+             ALTER TABLE review_events DROP COLUMN playback_guard_version;
+             ALTER TABLE review_events DROP COLUMN app_git_sha;
+
+             DROP TRIGGER playback_receipts_v60_policy3_immutable_delete;
+             DROP TRIGGER playback_receipts_v60_policy3_immutable_update;
+             DROP TRIGGER playback_receipts_v60_span_validate_insert;
+             ALTER TABLE playback_receipts DROP COLUMN source_end_ms;
+             ALTER TABLE playback_receipts DROP COLUMN source_start_ms;
+
+             DROP INDEX idx_review_compensation_one_reversal_per_entry;",
+        ),
+    },
+    Migration {
+        version: 61,
+        description: "Persist blinded independent review, adjudication, and campaign completion authority",
+        // A sequential campaign cannot become exportable merely because somebody edits its JSON
+        // setting.  The database now owns an immutable copy of the exact focus, every blinded
+        // second-pass judgement, every reversal, every adjudication, and every phase transition.
+        // The first-pass corpus row remains untouched during the independent pass: Alle sees the
+        // champion raw draft and writes into `independent_review_decisions`, so Rubar's correction
+        // is neither leaked as an answer nor overwritten by a competing judgement.
+        up_sql: "CREATE TABLE review_campaign_registry (
+                     campaign_id                    TEXT PRIMARY KEY,
+                     focus_segment_count            INTEGER NOT NULL CHECK(focus_segment_count > 0),
+                     focus_sha256                    TEXT NOT NULL
+                                                         CHECK(length(focus_sha256) = 64
+                                                           AND focus_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     first_reviewer                  TEXT NOT NULL CHECK(first_reviewer = 'Rubar'),
+                     second_reviewer                 TEXT NOT NULL CHECK(second_reviewer = 'Alle'),
+                     after_review_event_id           INTEGER NOT NULL CHECK(after_review_event_id >= 0),
+                     activated_at_review_event_id    INTEGER NOT NULL
+                                                         CHECK(activated_at_review_event_id >= after_review_event_id),
+                     created_at                      TEXT NOT NULL DEFAULT (datetime('now'))
+                 ) STRICT;
+                 CREATE TRIGGER review_campaign_registry_immutable_update
+                 BEFORE UPDATE ON review_campaign_registry
+                 BEGIN SELECT RAISE(ABORT, 'review campaign registry is immutable'); END;
+                 CREATE TRIGGER review_campaign_registry_immutable_delete
+                 BEFORE DELETE ON review_campaign_registry
+                 BEGIN SELECT RAISE(ABORT, 'review campaign registry is immutable'); END;
+
+                 CREATE TABLE review_campaign_focus (
+                     campaign_id                    TEXT NOT NULL,
+                     segment_id                     TEXT NOT NULL,
+                     ordinal                        INTEGER NOT NULL CHECK(ordinal >= 0),
+                     PRIMARY KEY(campaign_id, segment_id),
+                     UNIQUE(campaign_id, ordinal),
+                     FOREIGN KEY(campaign_id) REFERENCES review_campaign_registry(campaign_id),
+                     FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE RESTRICT
+                 ) STRICT;
+                 CREATE TRIGGER review_campaign_focus_immutable_update
+                 BEFORE UPDATE ON review_campaign_focus
+                 BEGIN SELECT RAISE(ABORT, 'review campaign focus is immutable'); END;
+                 CREATE TRIGGER review_campaign_focus_immutable_delete
+                 BEFORE DELETE ON review_campaign_focus
+                 BEGIN SELECT RAISE(ABORT, 'review campaign focus is immutable'); END;
+
+                 CREATE TABLE review_campaign_transitions (
+                     id                             INTEGER PRIMARY KEY AUTOINCREMENT,
+                     transition_id                  TEXT NOT NULL UNIQUE,
+                     campaign_id                    TEXT NOT NULL,
+                     from_phase                     TEXT NOT NULL
+                                                         CHECK(from_phase IN ('first_pass_active',
+                                                                              'second_pass_active',
+                                                                              'adjudication_active')),
+                     to_phase                       TEXT NOT NULL
+                                                         CHECK(to_phase IN ('second_pass_active',
+                                                                            'adjudication_active',
+                                                                            'completed')),
+                     max_review_event_id            INTEGER NOT NULL CHECK(max_review_event_id >= 0),
+                     independent_decision_count     INTEGER NOT NULL CHECK(independent_decision_count >= 0),
+                     adjudication_count             INTEGER NOT NULL CHECK(adjudication_count >= 0),
+                     conflicts_remaining            INTEGER NOT NULL CHECK(conflicts_remaining >= 0),
+                     progress_sha256                TEXT NOT NULL
+                                                         CHECK(length(progress_sha256) = 64
+                                                           AND progress_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     created_at_ms                  INTEGER NOT NULL CHECK(created_at_ms > 0),
+                     FOREIGN KEY(campaign_id) REFERENCES review_campaign_registry(campaign_id)
+                 ) STRICT;
+                 CREATE TRIGGER review_campaign_transition_sequence_insert
+                 BEFORE INSERT ON review_campaign_transitions
+                 WHEN
+                      (NEW.from_phase = 'first_pass_active' AND NEW.to_phase <> 'second_pass_active')
+                   OR (NEW.from_phase = 'second_pass_active'
+                       AND NEW.to_phase NOT IN ('adjudication_active', 'completed'))
+                   OR (NEW.from_phase = 'adjudication_active' AND NEW.to_phase <> 'completed')
+                   OR NEW.from_phase = NEW.to_phase
+                   OR COALESCE((
+                          SELECT to_phase FROM review_campaign_transitions
+                           WHERE campaign_id = NEW.campaign_id ORDER BY id DESC LIMIT 1
+                      ), 'first_pass_active') <> NEW.from_phase
+                 BEGIN SELECT RAISE(ABORT, 'review campaign transition is out of sequence'); END;
+                 CREATE TRIGGER review_campaign_transitions_immutable_update
+                 BEFORE UPDATE ON review_campaign_transitions
+                 BEGIN SELECT RAISE(ABORT, 'review campaign transitions are append-only'); END;
+                 CREATE TRIGGER review_campaign_transitions_immutable_delete
+                 BEFORE DELETE ON review_campaign_transitions
+                 BEGIN SELECT RAISE(ABORT, 'review campaign transitions are append-only'); END;
+
+                 CREATE TABLE independent_review_decisions (
+                     id                             INTEGER PRIMARY KEY AUTOINCREMENT,
+                     campaign_id                    TEXT NOT NULL,
+                     segment_id                     TEXT NOT NULL,
+                     reviewer                       TEXT NOT NULL,
+                     action                         TEXT NOT NULL
+                                                         CHECK(action IN ('accept','edit','reject','skip')),
+                     submitted_transcript           TEXT,
+                     served_transcript              TEXT NOT NULL CHECK(trim(served_transcript) <> ''),
+                     served_revision                INTEGER NOT NULL CHECK(served_revision >= 0),
+                     audio_content_hash             TEXT,
+                     source_start_ms                INTEGER,
+                     source_end_ms                  INTEGER,
+                     duration_ms                    INTEGER NOT NULL CHECK(duration_ms >= 0),
+                     requested_action               TEXT NOT NULL
+                                                         CHECK(requested_action IN ('accept','edit','bad','skip')),
+                     requested_transcript           TEXT NOT NULL,
+                     operation_id                   TEXT NOT NULL UNIQUE CHECK(trim(operation_id) <> ''),
+                     operation_payload_hash         TEXT NOT NULL
+                                                         CHECK(length(operation_payload_hash) = 64
+                                                           AND operation_payload_hash NOT GLOB '*[^0-9a-f]*'),
+                     app_git_sha                    TEXT NOT NULL
+                                                         CHECK(length(app_git_sha) = 40
+                                                           AND app_git_sha NOT GLOB '*[^0-9a-f]*'),
+                     playback_guard_version         TEXT NOT NULL
+                                                         CHECK(playback_guard_version = 'content-hash-raw-counter-v3'),
+                     created_at_ms                  INTEGER NOT NULL CHECK(created_at_ms > 0),
+                     FOREIGN KEY(campaign_id, segment_id)
+                         REFERENCES review_campaign_focus(campaign_id, segment_id),
+                     FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE RESTRICT
+                 ) STRICT;
+                 CREATE INDEX idx_independent_review_segment
+                     ON independent_review_decisions(campaign_id, segment_id, id);
+                 CREATE TRIGGER independent_review_decision_validate_insert
+                 BEFORE INSERT ON independent_review_decisions
+                 WHEN
+                      COALESCE((SELECT to_phase FROM review_campaign_transitions
+                                 WHERE campaign_id = NEW.campaign_id ORDER BY id DESC LIMIT 1), '')
+                          <> 'second_pass_active'
+                   OR NEW.reviewer <> (SELECT second_reviewer FROM review_campaign_registry
+                                        WHERE campaign_id = NEW.campaign_id)
+                   OR (NEW.action IN ('accept','edit')
+                       AND (NEW.submitted_transcript IS NULL OR trim(NEW.submitted_transcript) = ''))
+                   OR (NEW.action IN ('reject','skip') AND NEW.submitted_transcript IS NOT NULL)
+                   OR (NEW.action <> 'skip' AND (
+                          NEW.audio_content_hash IS NULL
+                          OR length(NEW.audio_content_hash) <> 64
+                          OR NEW.audio_content_hash GLOB '*[^0-9a-f]*'
+                          OR typeof(NEW.source_start_ms) <> 'integer'
+                          OR typeof(NEW.source_end_ms) <> 'integer'
+                          OR NEW.source_start_ms < 0
+                          OR NEW.source_end_ms <= NEW.source_start_ms
+                       ))
+                   OR EXISTS (
+                          SELECT 1 FROM independent_review_decisions prior
+                           WHERE prior.campaign_id = NEW.campaign_id
+                             AND prior.segment_id = NEW.segment_id
+                             AND NOT EXISTS (
+                                  SELECT 1 FROM independent_review_reversals reversal
+                                   WHERE reversal.decision_id = prior.id
+                             )
+                      )
+                 BEGIN SELECT RAISE(ABORT, 'independent review decision is invalid or already active'); END;
+                 CREATE TRIGGER independent_review_decisions_immutable_update
+                 BEFORE UPDATE ON independent_review_decisions
+                 BEGIN SELECT RAISE(ABORT, 'independent review decisions are append-only'); END;
+                 CREATE TRIGGER independent_review_decisions_immutable_delete
+                 BEFORE DELETE ON independent_review_decisions
+                 BEGIN SELECT RAISE(ABORT, 'independent review decisions are append-only'); END;
+
+                 CREATE TABLE independent_review_reversals (
+                     id                             INTEGER PRIMARY KEY AUTOINCREMENT,
+                     decision_id                    INTEGER NOT NULL UNIQUE,
+                     operation_id                   TEXT NOT NULL UNIQUE CHECK(trim(operation_id) <> ''),
+                     reviewer                       TEXT NOT NULL,
+                     created_at_ms                  INTEGER NOT NULL CHECK(created_at_ms > 0),
+                     FOREIGN KEY(decision_id) REFERENCES independent_review_decisions(id)
+                 ) STRICT;
+                 CREATE TRIGGER independent_review_reversal_validate_insert
+                 BEFORE INSERT ON independent_review_reversals
+                 WHEN COALESCE((
+                          SELECT transition.to_phase
+                            FROM independent_review_decisions decision
+                            JOIN review_campaign_transitions transition
+                              ON transition.campaign_id = decision.campaign_id
+                           WHERE decision.id = NEW.decision_id
+                           ORDER BY transition.id DESC LIMIT 1
+                      ), '') <> 'second_pass_active'
+                   OR NEW.reviewer <> (SELECT reviewer FROM independent_review_decisions
+                                        WHERE id = NEW.decision_id)
+                   OR EXISTS (
+                          SELECT 1
+                            FROM independent_review_decisions newer
+                            JOIN independent_review_decisions target
+                              ON target.id = NEW.decision_id
+                           WHERE newer.campaign_id = target.campaign_id
+                             AND newer.segment_id = target.segment_id
+                             AND newer.id > target.id
+                             AND NOT EXISTS (
+                                  SELECT 1 FROM independent_review_reversals prior_reversal
+                                   WHERE prior_reversal.decision_id = newer.id
+                             )
+                      )
+                 BEGIN SELECT RAISE(ABORT, 'independent review reversal is invalid or stale'); END;
+                 CREATE TRIGGER independent_review_reversals_immutable_update
+                 BEFORE UPDATE ON independent_review_reversals
+                 BEGIN SELECT RAISE(ABORT, 'independent review reversals are append-only'); END;
+                 CREATE TRIGGER independent_review_reversals_immutable_delete
+                 BEFORE DELETE ON independent_review_reversals
+                 BEGIN SELECT RAISE(ABORT, 'independent review reversals are append-only'); END;
+
+                 CREATE VIEW effective_independent_review_decisions_v61 AS
+                 SELECT decision.*
+                   FROM independent_review_decisions decision
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM independent_review_reversals reversal
+                         WHERE reversal.decision_id = decision.id
+                  );
+
+                 CREATE TABLE review_campaign_adjudications (
+                     id                             INTEGER PRIMARY KEY AUTOINCREMENT,
+                     adjudication_id                TEXT NOT NULL UNIQUE,
+                     campaign_id                    TEXT NOT NULL,
+                     segment_id                     TEXT NOT NULL,
+                     first_review_event_id          INTEGER NOT NULL,
+                     second_decision_id             INTEGER NOT NULL,
+                     resolution_kind                TEXT NOT NULL
+                                                         CHECK(resolution_kind IN ('exact_agreement','manual')),
+                     final_action                   TEXT NOT NULL CHECK(final_action IN ('retain','reject')),
+                     final_transcript               TEXT,
+                     adjudicator                    TEXT NOT NULL CHECK(trim(adjudicator) <> ''),
+                     created_at_ms                  INTEGER NOT NULL CHECK(created_at_ms > 0),
+                     UNIQUE(campaign_id, segment_id),
+                     FOREIGN KEY(campaign_id, segment_id)
+                         REFERENCES review_campaign_focus(campaign_id, segment_id),
+                     FOREIGN KEY(first_review_event_id) REFERENCES review_events(id),
+                     FOREIGN KEY(second_decision_id) REFERENCES independent_review_decisions(id)
+                 ) STRICT;
+                 CREATE TRIGGER review_campaign_adjudication_validate_insert
+                 BEFORE INSERT ON review_campaign_adjudications
+                 WHEN
+                      COALESCE((SELECT to_phase FROM review_campaign_transitions
+                                 WHERE campaign_id = NEW.campaign_id ORDER BY id DESC LIMIT 1), '')
+                          NOT IN ('second_pass_active', 'adjudication_active')
+                   OR (NEW.final_action = 'retain'
+                       AND (NEW.final_transcript IS NULL OR trim(NEW.final_transcript) = ''))
+                   OR (NEW.final_action = 'reject' AND NEW.final_transcript IS NOT NULL)
+                   OR (NEW.resolution_kind = 'exact_agreement'
+                       AND NEW.adjudicator <> 'system:exact-independent-agreement')
+                   OR (NEW.resolution_kind = 'manual'
+                       AND lower(NEW.adjudicator) GLOB 'system:*')
+                   OR NOT EXISTS (
+                          SELECT 1 FROM effective_independent_review_decisions_v61 decision
+                           WHERE decision.id = NEW.second_decision_id
+                             AND decision.campaign_id = NEW.campaign_id
+                             AND decision.segment_id = NEW.segment_id
+                      )
+                   OR NOT EXISTS (
+                          SELECT 1 FROM review_events event
+                           WHERE event.id = NEW.first_review_event_id
+                             AND event.segment_id = NEW.segment_id
+                             AND event.reviewer = (SELECT first_reviewer
+                                                     FROM review_campaign_registry
+                                                    WHERE campaign_id = NEW.campaign_id)
+                             AND event.action IN ('accept','edit','reject')
+                      )
+                 BEGIN SELECT RAISE(ABORT, 'review campaign adjudication has invalid evidence'); END;
+                 CREATE TRIGGER review_campaign_adjudications_immutable_update
+                 BEFORE UPDATE ON review_campaign_adjudications
+                 BEGIN SELECT RAISE(ABORT, 'review campaign adjudications are append-only'); END;
+                 CREATE TRIGGER review_campaign_adjudications_immutable_delete
+                 BEFORE DELETE ON review_campaign_adjudications
+                 BEGIN SELECT RAISE(ABORT, 'review campaign adjudications are append-only'); END;",
+        down_sql: Some(
+            "CREATE TEMP TABLE review_campaign_v61_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero = 0)
+             );
+             INSERT INTO review_campaign_v61_rollback_guard(must_be_zero)
+             SELECT 1 WHERE EXISTS (SELECT 1 FROM review_campaign_registry)
+                         OR EXISTS (SELECT 1 FROM review_campaign_focus)
+                         OR EXISTS (SELECT 1 FROM review_campaign_transitions)
+                         OR EXISTS (SELECT 1 FROM independent_review_decisions)
+                         OR EXISTS (SELECT 1 FROM independent_review_reversals)
+                         OR EXISTS (SELECT 1 FROM review_campaign_adjudications);
+             DROP TABLE review_campaign_v61_rollback_guard;
+             DROP TRIGGER review_campaign_adjudications_immutable_delete;
+             DROP TRIGGER review_campaign_adjudications_immutable_update;
+             DROP TRIGGER review_campaign_adjudication_validate_insert;
+             DROP TABLE review_campaign_adjudications;
+             DROP VIEW effective_independent_review_decisions_v61;
+             DROP TRIGGER independent_review_reversals_immutable_delete;
+             DROP TRIGGER independent_review_reversals_immutable_update;
+             DROP TRIGGER independent_review_reversal_validate_insert;
+             DROP TABLE independent_review_reversals;
+             DROP TRIGGER independent_review_decisions_immutable_delete;
+             DROP TRIGGER independent_review_decisions_immutable_update;
+             DROP TRIGGER independent_review_decision_validate_insert;
+             DROP INDEX idx_independent_review_segment;
+             DROP TABLE independent_review_decisions;
+             DROP TRIGGER review_campaign_transitions_immutable_delete;
+             DROP TRIGGER review_campaign_transitions_immutable_update;
+             DROP TRIGGER review_campaign_transition_sequence_insert;
+             DROP TABLE review_campaign_transitions;
+             DROP TRIGGER review_campaign_focus_immutable_delete;
+             DROP TRIGGER review_campaign_focus_immutable_update;
+             DROP TABLE review_campaign_focus;
+             DROP TRIGGER review_campaign_registry_immutable_delete;
+             DROP TRIGGER review_campaign_registry_immutable_update;
+             DROP TABLE review_campaign_registry;",
+        ),
+    },
+    Migration {
+        version: 62,
+        description: "Persist flexible voice review pool and append-only multi-review evidence",
+        // One canonical verdict remains on speech_segments. Every later judgement is stored here as
+        // independent evidence, so coverage can grow from one to two to three reviewers without a
+        // later phone overwriting the first reviewer's answer. Membership is immutable and voice-bound;
+        // a new corpus generation requires a new migration/design rather than an in-place SQL edit.
+        up_sql: "CREATE TABLE review_pool_registry (
+                     singleton_key                 INTEGER PRIMARY KEY CHECK(singleton_key = 1),
+                     pool_id                       TEXT NOT NULL UNIQUE
+                                                         CHECK(pool_id = lower(trim(pool_id))
+                                                           AND length(pool_id) = 36
+                                                           AND substr(pool_id, 9, 1) = '-'
+                                                           AND substr(pool_id, 14, 1) = '-'
+                                                           AND substr(pool_id, 19, 1) = '-'
+                                                           AND substr(pool_id, 24, 1) = '-'
+                                                           AND length(replace(pool_id, '-', '')) = 32
+                                                           AND replace(pool_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+                     focus_segment_count           INTEGER NOT NULL CHECK(focus_segment_count > 0),
+                     focus_sha256                  TEXT NOT NULL
+                                                         CHECK(length(focus_sha256) = 64
+                                                           AND focus_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     champion_model_version_id     TEXT NOT NULL
+                                                         CHECK(champion_model_version_id = trim(champion_model_version_id)
+                                                           AND length(champion_model_version_id) BETWEEN 1 AND 256),
+                     champion_deployment_sha256    TEXT NOT NULL
+                                                         CHECK(length(champion_deployment_sha256) = 64
+                                                           AND champion_deployment_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     app_git_sha                   TEXT NOT NULL
+                                                         CHECK(length(app_git_sha) = 40
+                                                           AND app_git_sha NOT GLOB '*[^0-9a-f]*'),
+                     created_at                    TEXT NOT NULL DEFAULT (datetime('now')),
+                     FOREIGN KEY(champion_model_version_id) REFERENCES model_versions(id) ON DELETE RESTRICT
+                 ) STRICT;
+                 CREATE TRIGGER review_pool_registry_immutable_update
+                 BEFORE UPDATE ON review_pool_registry
+                 BEGIN SELECT RAISE(ABORT, 'review pool registry is immutable'); END;
+                 CREATE TRIGGER review_pool_registry_immutable_delete
+                 BEFORE DELETE ON review_pool_registry
+                 BEGIN SELECT RAISE(ABORT, 'review pool registry is immutable'); END;
+
+                 CREATE TABLE review_pool_members (
+                     pool_id                       TEXT NOT NULL,
+                     segment_id                    TEXT NOT NULL,
+                     voice_name                    TEXT NOT NULL
+                                                         CHECK(voice_name = trim(voice_name)
+                                                           AND length(voice_name) BETWEEN 1 AND 80),
+                     raw_transcript                TEXT NOT NULL CHECK(trim(raw_transcript) <> ''),
+                     model_version_id              TEXT NOT NULL
+                                                         CHECK(model_version_id = trim(model_version_id)
+                                                           AND length(model_version_id) BETWEEN 1 AND 256),
+                     audio_content_hash            TEXT NOT NULL
+                                                         CHECK(length(audio_content_hash) = 64
+                                                           AND audio_content_hash NOT GLOB '*[^0-9a-f]*'),
+                     source_start_ms               INTEGER NOT NULL CHECK(source_start_ms >= 0),
+                     source_end_ms                 INTEGER NOT NULL CHECK(source_end_ms > source_start_ms),
+                     duration_ms                   INTEGER NOT NULL CHECK(duration_ms > 0),
+                     created_at                    TEXT NOT NULL DEFAULT (datetime('now')),
+                     PRIMARY KEY(pool_id, segment_id),
+                     UNIQUE(segment_id),
+                     FOREIGN KEY(pool_id) REFERENCES review_pool_registry(pool_id),
+                     FOREIGN KEY(model_version_id) REFERENCES model_versions(id) ON DELETE RESTRICT,
+                     FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE RESTRICT
+                 ) STRICT;
+                 CREATE INDEX idx_review_pool_members_voice ON review_pool_members(pool_id, voice_name, segment_id);
+                 CREATE TRIGGER review_pool_member_validate_insert
+                 BEFORE INSERT ON review_pool_members
+                 WHEN NOT EXISTS (
+                     SELECT 1 FROM review_pool_registry registry
+                     JOIN speech_segments segment ON segment.id=NEW.segment_id
+                     WHERE registry.pool_id=NEW.pool_id
+                       AND registry.champion_model_version_id=NEW.model_version_id
+                       AND segment.raw_transcript=NEW.raw_transcript
+                       AND COALESCE(segment.model_version_id, '')=NEW.model_version_id
+                       AND segment.audio_content_hash=NEW.audio_content_hash
+                       AND json_extract(segment.alignment_json, '$.source_start_ms')=NEW.source_start_ms
+                       AND json_extract(segment.alignment_json, '$.source_end_ms')=NEW.source_end_ms
+                       AND segment.duration_ms=NEW.duration_ms
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'review pool member does not match its frozen champion clip'); END;
+                 CREATE TRIGGER review_pool_members_immutable_update
+                 BEFORE UPDATE ON review_pool_members
+                 BEGIN SELECT RAISE(ABORT, 'review pool membership is immutable'); END;
+                 CREATE TRIGGER review_pool_members_immutable_delete
+                 BEFORE DELETE ON review_pool_members
+                 BEGIN SELECT RAISE(ABORT, 'review pool membership is immutable'); END;
+
+                 CREATE TABLE review_pool_decisions (
+                     id                             INTEGER PRIMARY KEY AUTOINCREMENT,
+                     pool_id                        TEXT NOT NULL,
+                     segment_id                     TEXT NOT NULL,
+                     reviewer                       TEXT NOT NULL
+                                                         CHECK(reviewer = trim(reviewer)
+                                                           AND length(reviewer) BETWEEN 1 AND 80),
+                     action                         TEXT NOT NULL
+                                                         CHECK(action IN ('accept','edit','reject','skip')),
+                     submitted_transcript           TEXT,
+                     served_transcript              TEXT NOT NULL CHECK(trim(served_transcript) <> ''),
+                     served_revision                INTEGER NOT NULL CHECK(served_revision >= 0),
+                     audio_content_hash             TEXT,
+                     source_start_ms                INTEGER,
+                     source_end_ms                  INTEGER,
+                     duration_ms                    INTEGER NOT NULL CHECK(duration_ms >= 0),
+                     requested_action               TEXT NOT NULL
+                                                         CHECK(requested_action IN ('accept','edit','bad','skip')),
+                     requested_transcript           TEXT NOT NULL,
+                     operation_id                   TEXT NOT NULL UNIQUE
+                                                         CHECK(operation_id = lower(trim(operation_id))
+                                                           AND length(operation_id) = 36
+                                                           AND substr(operation_id, 9, 1) = '-'
+                                                           AND substr(operation_id, 14, 1) = '-'
+                                                           AND substr(operation_id, 19, 1) = '-'
+                                                           AND substr(operation_id, 24, 1) = '-'
+                                                           AND length(replace(operation_id, '-', '')) = 32
+                                                           AND replace(operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+                     operation_payload_hash         TEXT NOT NULL
+                                                         CHECK(length(operation_payload_hash) = 64
+                                                           AND operation_payload_hash NOT GLOB '*[^0-9a-f]*'),
+                     app_git_sha                    TEXT NOT NULL
+                                                         CHECK(length(app_git_sha) = 40
+                                                           AND app_git_sha NOT GLOB '*[^0-9a-f]*'),
+                     playback_guard_version         TEXT NOT NULL
+                                                         CHECK(playback_guard_version = 'content-hash-raw-counter-v3'),
+                     created_at_ms                  INTEGER NOT NULL CHECK(created_at_ms > 0),
+                     FOREIGN KEY(pool_id, segment_id)
+                         REFERENCES review_pool_members(pool_id, segment_id),
+                     FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE RESTRICT
+                 ) STRICT;
+                 CREATE INDEX idx_review_pool_decision_segment
+                     ON review_pool_decisions(pool_id, segment_id, reviewer, id);
+                 CREATE TRIGGER review_pool_decision_validate_insert
+                 BEFORE INSERT ON review_pool_decisions
+                 WHEN
+                      (NEW.action IN ('accept','edit')
+                       AND (NEW.submitted_transcript IS NULL OR trim(NEW.submitted_transcript) = ''))
+                   OR (NEW.action IN ('reject','skip') AND NEW.submitted_transcript IS NOT NULL)
+                   OR (NEW.action <> 'skip' AND (
+                          NEW.audio_content_hash IS NULL
+                          OR length(NEW.audio_content_hash) <> 64
+                          OR NEW.audio_content_hash GLOB '*[^0-9a-f]*'
+                          OR typeof(NEW.source_start_ms) <> 'integer'
+                          OR typeof(NEW.source_end_ms) <> 'integer'
+                          OR NEW.source_start_ms < 0
+                          OR NEW.source_end_ms <= NEW.source_start_ms
+                       ))
+                   OR NOT EXISTS (
+                          SELECT 1 FROM review_pool_members member
+                           JOIN speech_segments segment ON segment.id=member.segment_id
+                           WHERE member.pool_id = NEW.pool_id
+                             AND member.segment_id = NEW.segment_id
+                             AND segment.verified = 1
+                             AND segment.human_decision IN ('accept','edit','reject')
+                             AND segment.raw_transcript = member.raw_transcript
+                             AND COALESCE(segment.model_version_id, '') = member.model_version_id
+                             AND segment.audio_content_hash = member.audio_content_hash
+                             AND json_extract(segment.alignment_json, '$.source_start_ms') = member.source_start_ms
+                             AND json_extract(segment.alignment_json, '$.source_end_ms') = member.source_end_ms
+                             AND segment.duration_ms = member.duration_ms
+                             AND NEW.served_transcript = trim(member.raw_transcript)
+                             AND NEW.duration_ms = member.duration_ms
+                             AND (
+                                  NEW.action = 'skip'
+                                  OR (
+                                     NEW.audio_content_hash = member.audio_content_hash
+                                     AND NEW.source_start_ms = member.source_start_ms
+                                     AND NEW.source_end_ms = member.source_end_ms
+                                  )
+                             )
+                      )
+                   OR EXISTS (
+                          SELECT 1 FROM speech_segments segment
+                           WHERE segment.id = NEW.segment_id
+                             AND lower(trim(COALESCE(segment.reviewed_by, '@desktop-owner')))
+                                 = lower(trim(NEW.reviewer))
+                      )
+                   OR EXISTS (
+                          SELECT 1 FROM review_pool_decisions prior
+                           WHERE prior.pool_id = NEW.pool_id
+                             AND prior.segment_id = NEW.segment_id
+                             AND prior.reviewer = NEW.reviewer COLLATE NOCASE
+                             AND NOT EXISTS (
+                                  SELECT 1 FROM review_pool_reversals reversal
+                                   WHERE reversal.decision_id = prior.id
+                             )
+                      )
+                   OR EXISTS (
+                          SELECT 1 FROM effective_independent_review_decisions_v61 prior
+                           WHERE prior.segment_id = NEW.segment_id
+                             AND prior.reviewer = NEW.reviewer COLLATE NOCASE
+                      )
+                   OR EXISTS (SELECT 1 FROM review_events event WHERE event.operation_id = NEW.operation_id)
+                   OR EXISTS (SELECT 1 FROM independent_review_decisions decision
+                               WHERE decision.operation_id = NEW.operation_id)
+                 BEGIN SELECT RAISE(ABORT, 'review pool decision is invalid, duplicated, or not independent'); END;
+                 CREATE TRIGGER review_pool_decisions_immutable_update
+                 BEFORE UPDATE ON review_pool_decisions
+                 BEGIN SELECT RAISE(ABORT, 'review pool decisions are append-only'); END;
+                 CREATE TRIGGER review_pool_decisions_immutable_delete
+                 BEFORE DELETE ON review_pool_decisions
+                 BEGIN SELECT RAISE(ABORT, 'review pool decisions are append-only'); END;
+
+                 CREATE TABLE review_pool_reversals (
+                     id                             INTEGER PRIMARY KEY AUTOINCREMENT,
+                     decision_id                    INTEGER NOT NULL UNIQUE,
+                     operation_id                   TEXT NOT NULL UNIQUE
+                                                         CHECK(operation_id = lower(trim(operation_id))
+                                                           AND length(operation_id) = 36
+                                                           AND substr(operation_id, 9, 1) = '-'
+                                                           AND substr(operation_id, 14, 1) = '-'
+                                                           AND substr(operation_id, 19, 1) = '-'
+                                                           AND substr(operation_id, 24, 1) = '-'
+                                                           AND length(replace(operation_id, '-', '')) = 32
+                                                           AND replace(operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+                     reviewer                       TEXT NOT NULL
+                                                         CHECK(reviewer = trim(reviewer)
+                                                           AND length(reviewer) BETWEEN 1 AND 80),
+                     created_at_ms                  INTEGER NOT NULL CHECK(created_at_ms > 0),
+                     FOREIGN KEY(decision_id) REFERENCES review_pool_decisions(id)
+                 ) STRICT;
+                 CREATE TRIGGER review_pool_reversal_validate_insert
+                 BEFORE INSERT ON review_pool_reversals
+                 WHEN NOT EXISTS (
+                         SELECT 1 FROM review_pool_decisions decision
+                          WHERE decision.id = NEW.decision_id
+                            AND decision.reviewer = NEW.reviewer COLLATE NOCASE
+                      )
+                 BEGIN SELECT RAISE(ABORT, 'review pool reversal belongs to another reviewer'); END;
+                 CREATE TRIGGER review_pool_reversals_immutable_update
+                 BEFORE UPDATE ON review_pool_reversals
+                 BEGIN SELECT RAISE(ABORT, 'review pool reversals are append-only'); END;
+                 CREATE TRIGGER review_pool_reversals_immutable_delete
+                 BEFORE DELETE ON review_pool_reversals
+                 BEGIN SELECT RAISE(ABORT, 'review pool reversals are append-only'); END;
+
+                 CREATE VIEW effective_review_pool_decisions_v62 AS
+                 SELECT decision.* FROM review_pool_decisions decision
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM review_pool_reversals reversal
+                         WHERE reversal.decision_id = decision.id
+                  );
+
+                 CREATE TRIGGER review_events_v62_pool_operation_collision
+                 BEFORE INSERT ON review_events
+                 WHEN NEW.operation_id IS NOT NULL AND EXISTS (
+                      SELECT 1 FROM review_pool_decisions decision
+                       WHERE decision.operation_id = NEW.operation_id
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'review operation id belongs to the independent pool'); END;
+                 CREATE TRIGGER independent_review_v62_pool_operation_collision
+                 BEFORE INSERT ON independent_review_decisions
+                 WHEN EXISTS (
+                      SELECT 1 FROM review_pool_decisions decision
+                       WHERE decision.operation_id = NEW.operation_id
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'review operation id belongs to the flexible pool'); END;
+                 CREATE TRIGGER speech_segments_v62_review_pool_delete
+                 BEFORE DELETE ON speech_segments
+                 WHEN EXISTS (SELECT 1 FROM review_pool_members member WHERE member.segment_id = OLD.id)
+                 BEGIN SELECT RAISE(ABORT, 'review pool clips cannot be deleted'); END;
+                 CREATE TRIGGER speech_segments_v62_review_pool_identity_update
+                 BEFORE UPDATE OF raw_transcript, model_version_id, audio_content_hash, alignment_json, duration_ms
+                 ON speech_segments
+                 WHEN EXISTS (
+                      SELECT 1 FROM review_pool_members member
+                       WHERE member.segment_id=OLD.id AND (
+                            NEW.raw_transcript IS NOT member.raw_transcript
+                         OR COALESCE(NEW.model_version_id, '') IS NOT member.model_version_id
+                         OR NEW.audio_content_hash IS NOT member.audio_content_hash
+                         OR json_extract(NEW.alignment_json, '$.source_start_ms') IS NOT member.source_start_ms
+                         OR json_extract(NEW.alignment_json, '$.source_end_ms') IS NOT member.source_end_ms
+                         OR NEW.duration_ms IS NOT member.duration_ms
+                       )
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'review pool clip identity is immutable'); END;",
+        down_sql: Some(
+            "CREATE TEMP TABLE review_pool_v62_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero = 0)
+             );
+             INSERT INTO review_pool_v62_rollback_guard(must_be_zero)
+             SELECT 1 WHERE EXISTS (SELECT 1 FROM review_pool_registry)
+                         OR EXISTS (SELECT 1 FROM review_pool_members)
+                         OR EXISTS (SELECT 1 FROM review_pool_decisions)
+                         OR EXISTS (SELECT 1 FROM review_pool_reversals);
+             DROP TABLE review_pool_v62_rollback_guard;
+             DROP TRIGGER speech_segments_v62_review_pool_identity_update;
+             DROP TRIGGER speech_segments_v62_review_pool_delete;
+             DROP TRIGGER independent_review_v62_pool_operation_collision;
+             DROP TRIGGER review_events_v62_pool_operation_collision;
+             DROP VIEW effective_review_pool_decisions_v62;
+             DROP TRIGGER review_pool_reversals_immutable_delete;
+             DROP TRIGGER review_pool_reversals_immutable_update;
+             DROP TRIGGER review_pool_reversal_validate_insert;
+             DROP TABLE review_pool_reversals;
+             DROP TRIGGER review_pool_decisions_immutable_delete;
+             DROP TRIGGER review_pool_decisions_immutable_update;
+             DROP TRIGGER review_pool_decision_validate_insert;
+             DROP INDEX idx_review_pool_decision_segment;
+             DROP TABLE review_pool_decisions;
+             DROP TRIGGER review_pool_members_immutable_delete;
+             DROP TRIGGER review_pool_members_immutable_update;
+             DROP TRIGGER review_pool_member_validate_insert;
+             DROP INDEX idx_review_pool_members_voice;
+             DROP TABLE review_pool_members;
+             DROP TRIGGER review_pool_registry_immutable_delete;
+             DROP TRIGGER review_pool_registry_immutable_update;
+             DROP TABLE review_pool_registry;",
+        ),
+    },
+    Migration {
+        version: 63,
+        description: "Bind flexible-pool consensus, owner adjudication, and voice completion certificates",
+        // Consensus itself is derived from the current effective canonical/v61/v62 evidence. Keeping
+        // that projection derived is deliberate: reversing any source decision immediately reopens the
+        // clip instead of leaving a copied `resolved=1` flag behind. Only the exceptional owner ruling
+        // and the final, export-bound voice certificate are persisted, and both are append-only.
+        up_sql: "CREATE TABLE review_pool_owner_adjudications (
+                     id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+                     pool_id                    TEXT NOT NULL,
+                     segment_id                 TEXT NOT NULL,
+                     final_action               TEXT NOT NULL CHECK(final_action IN ('retain','reject')),
+                     final_transcript           TEXT,
+                     evidence_sha256            TEXT NOT NULL
+                                                      CHECK(length(evidence_sha256) = 64
+                                                        AND evidence_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     operation_id               TEXT NOT NULL UNIQUE
+                                                      CHECK(operation_id = lower(trim(operation_id))
+                                                        AND length(operation_id) = 36
+                                                        AND substr(operation_id, 9, 1) = '-'
+                                                        AND substr(operation_id, 14, 1) = '-'
+                                                        AND substr(operation_id, 19, 1) = '-'
+                                                        AND substr(operation_id, 24, 1) = '-'
+                                                        AND length(replace(operation_id, '-', '')) = 32
+                                                        AND replace(operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+                     app_git_sha                TEXT NOT NULL
+                                                      CHECK(length(app_git_sha) = 40
+                                                        AND app_git_sha NOT GLOB '*[^0-9a-f]*'),
+                     created_at_ms              INTEGER NOT NULL CHECK(created_at_ms > 0),
+                     FOREIGN KEY(pool_id, segment_id)
+                         REFERENCES review_pool_members(pool_id, segment_id)
+                 ) STRICT;
+                 CREATE INDEX idx_review_pool_owner_adjudication_segment
+                     ON review_pool_owner_adjudications(pool_id, segment_id, id DESC);
+                 CREATE TRIGGER review_pool_owner_adjudication_validate_insert
+                 BEFORE INSERT ON review_pool_owner_adjudications
+                 WHEN (NEW.final_action='retain'
+                       AND (NEW.final_transcript IS NULL OR trim(NEW.final_transcript)=''))
+                   OR (NEW.final_action='reject' AND NEW.final_transcript IS NOT NULL)
+                   OR EXISTS (
+                        SELECT 1 FROM review_pool_voice_certificates certificate
+                        JOIN review_pool_members member
+                          ON member.pool_id=certificate.pool_id AND member.voice_name=certificate.voice_name
+                       WHERE member.pool_id=NEW.pool_id AND member.segment_id=NEW.segment_id
+                   )
+                 BEGIN SELECT RAISE(ABORT, 'owner adjudication is invalid or its voice is already certified'); END;
+                 CREATE TRIGGER review_pool_owner_adjudications_immutable_update
+                 BEFORE UPDATE ON review_pool_owner_adjudications
+                 BEGIN SELECT RAISE(ABORT, 'review pool owner adjudications are append-only'); END;
+                 CREATE TRIGGER review_pool_owner_adjudications_immutable_delete
+                 BEFORE DELETE ON review_pool_owner_adjudications
+                 BEGIN SELECT RAISE(ABORT, 'review pool owner adjudications are append-only'); END;
+
+                 CREATE TABLE review_pool_voice_certificates (
+                     id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+                     pool_id                    TEXT NOT NULL,
+                     voice_name                 TEXT NOT NULL
+                                                      CHECK(voice_name=trim(voice_name)
+                                                        AND length(voice_name) BETWEEN 1 AND 80),
+                     resolution_sha256          TEXT NOT NULL,
+                     rights_sha256              TEXT NOT NULL,
+                     audio_sha256               TEXT NOT NULL,
+                     reviewer_sha256            TEXT NOT NULL,
+                     export_manifest_sha256     TEXT NOT NULL,
+                     export_sha256sums_sha256   TEXT NOT NULL,
+                     certificate_json           TEXT NOT NULL CHECK(json_valid(certificate_json)),
+                     certificate_sha256         TEXT NOT NULL UNIQUE,
+                     retained_segments          INTEGER NOT NULL CHECK(retained_segments >= 0),
+                     rejected_segments          INTEGER NOT NULL CHECK(rejected_segments >= 0),
+                     total_duration_ms          INTEGER NOT NULL CHECK(total_duration_ms >= 0),
+                     app_git_sha                TEXT NOT NULL
+                                                      CHECK(length(app_git_sha) = 40
+                                                        AND app_git_sha NOT GLOB '*[^0-9a-f]*'),
+                     created_at_ms              INTEGER NOT NULL CHECK(created_at_ms > 0),
+                     UNIQUE(pool_id, voice_name),
+                     FOREIGN KEY(pool_id) REFERENCES review_pool_registry(pool_id),
+                     CHECK(length(resolution_sha256)=64 AND resolution_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     CHECK(length(rights_sha256)=64 AND rights_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     CHECK(length(audio_sha256)=64 AND audio_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     CHECK(length(reviewer_sha256)=64 AND reviewer_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     CHECK(length(export_manifest_sha256)=64 AND export_manifest_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     CHECK(length(export_sha256sums_sha256)=64 AND export_sha256sums_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     CHECK(length(certificate_sha256)=64 AND certificate_sha256 NOT GLOB '*[^0-9a-f]*')
+                 ) STRICT;
+                 CREATE TRIGGER review_pool_voice_certificate_validate_insert
+                 BEFORE INSERT ON review_pool_voice_certificates
+                 WHEN NOT EXISTS (
+                     SELECT 1 FROM review_pool_members member
+                      WHERE member.pool_id=NEW.pool_id AND member.voice_name=NEW.voice_name
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'review pool certificate names an unknown voice'); END;
+                 CREATE TRIGGER review_pool_voice_certificates_immutable_update
+                 BEFORE UPDATE ON review_pool_voice_certificates
+                 BEGIN SELECT RAISE(ABORT, 'review pool voice certificates are immutable'); END;
+                 CREATE TRIGGER review_pool_voice_certificates_immutable_delete
+                 BEFORE DELETE ON review_pool_voice_certificates
+                 BEGIN SELECT RAISE(ABORT, 'review pool voice certificates are immutable'); END;
+
+                 CREATE TRIGGER review_pool_v63_decision_terminal_guard
+                 BEFORE INSERT ON review_pool_decisions
+                 WHEN EXISTS (
+                        SELECT 1 FROM review_pool_voice_certificates certificate
+                        JOIN review_pool_members member
+                          ON member.pool_id=certificate.pool_id AND member.voice_name=certificate.voice_name
+                       WHERE member.pool_id=NEW.pool_id AND member.segment_id=NEW.segment_id
+                      )
+                   OR (NEW.action <> 'skip' AND 3 <= (
+                        SELECT COUNT(*) FROM (
+                            SELECT lower(trim(COALESCE(segment.reviewed_by, '@desktop-owner'))) AS reviewer
+                              FROM speech_segments segment
+                             WHERE segment.id=NEW.segment_id AND segment.verified=1
+                               AND segment.human_decision IN ('accept','edit','reject')
+                            UNION
+                            SELECT lower(trim(decision.reviewer))
+                              FROM effective_independent_review_decisions_v61 decision
+                             WHERE decision.segment_id=NEW.segment_id AND decision.action<>'skip'
+                            UNION
+                            SELECT lower(trim(decision.reviewer))
+                              FROM effective_review_pool_decisions_v62 decision
+                             WHERE decision.segment_id=NEW.segment_id AND decision.action<>'skip'
+                        )
+                   ))
+                 BEGIN SELECT RAISE(ABORT, 'review pool clip is terminal or already has three effective judgements'); END;
+                 CREATE TRIGGER review_pool_v63_reversal_certificate_guard
+                 BEFORE INSERT ON review_pool_reversals
+                 WHEN EXISTS (
+                     SELECT 1 FROM review_pool_decisions decision
+                     JOIN review_pool_members member
+                       ON member.pool_id=decision.pool_id AND member.segment_id=decision.segment_id
+                     JOIN review_pool_voice_certificates certificate
+                       ON certificate.pool_id=member.pool_id AND certificate.voice_name=member.voice_name
+                    WHERE decision.id=NEW.decision_id
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'certified review pool evidence cannot be reversed'); END;
+                 CREATE TRIGGER speech_segments_v63_certificate_review_guard
+                 BEFORE UPDATE OF human_decision, verdict, verdict_transcript, annotated_transcript,
+                                  verified, reviewed_by, review_revision
+                 ON speech_segments
+                 WHEN EXISTS (
+                     SELECT 1 FROM review_pool_members member
+                     JOIN review_pool_voice_certificates certificate
+                       ON certificate.pool_id=member.pool_id AND certificate.voice_name=member.voice_name
+                    WHERE member.segment_id=OLD.id
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'certified review pool evidence cannot change'); END;",
+        down_sql: Some(
+            "CREATE TEMP TABLE review_pool_v63_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero = 0)
+             );
+             INSERT INTO review_pool_v63_rollback_guard(must_be_zero)
+             SELECT 1 WHERE EXISTS (SELECT 1 FROM review_pool_owner_adjudications)
+                         OR EXISTS (SELECT 1 FROM review_pool_voice_certificates);
+             DROP TABLE review_pool_v63_rollback_guard;
+             DROP TRIGGER speech_segments_v63_certificate_review_guard;
+             DROP TRIGGER review_pool_v63_reversal_certificate_guard;
+             DROP TRIGGER review_pool_v63_decision_terminal_guard;
+             DROP TRIGGER review_pool_voice_certificates_immutable_delete;
+             DROP TRIGGER review_pool_voice_certificates_immutable_update;
+             DROP TRIGGER review_pool_voice_certificate_validate_insert;
+             DROP TABLE review_pool_voice_certificates;
+             DROP TRIGGER review_pool_owner_adjudications_immutable_delete;
+             DROP TRIGGER review_pool_owner_adjudications_immutable_update;
+             DROP TRIGGER review_pool_owner_adjudication_validate_insert;
+             DROP INDEX idx_review_pool_owner_adjudication_segment;
+             DROP TABLE review_pool_owner_adjudications;",
+        ),
+    },
+    Migration {
+        version: 64,
+        description: "Bind append-only duplicate-family proof and canonical review exclusions",
+        // The original v62 pool remains byte-for-byte immutable. A verified manifest adds a
+        // fail-closed serving/export overlay: every non-canonical duplicate stays auditable but can
+        // no longer be served, judged, adjudicated, resolved, certified, or exported.
+        up_sql: "CREATE TABLE review_pool_dedup_manifests (
+                     pool_id                         TEXT PRIMARY KEY,
+                     source_focus_segment_count      INTEGER NOT NULL CHECK(source_focus_segment_count > 0),
+                     source_focus_sha256              TEXT NOT NULL,
+                     algorithm_id                     TEXT NOT NULL
+                                                              CHECK(algorithm_id='cortex-cross-file-waveform-correlation-v1'),
+                     family_count                     INTEGER NOT NULL CHECK(family_count >= 0),
+                     excluded_count                   INTEGER NOT NULL CHECK(excluded_count >= 0),
+                     canonical_count                  INTEGER NOT NULL CHECK(canonical_count > 0),
+                     unconfirmed_risk_count           INTEGER NOT NULL CHECK(unconfirmed_risk_count = 0),
+                     manifest_json                    TEXT NOT NULL CHECK(json_valid(manifest_json)),
+                     manifest_sha256                  TEXT NOT NULL UNIQUE,
+                     app_git_sha                      TEXT NOT NULL,
+                     created_at_ms                    INTEGER NOT NULL CHECK(created_at_ms > 0),
+                     FOREIGN KEY(pool_id) REFERENCES review_pool_registry(pool_id),
+                     CHECK(length(source_focus_sha256)=64
+                           AND source_focus_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     CHECK(length(manifest_sha256)=64
+                           AND manifest_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     CHECK(length(app_git_sha)=40 AND app_git_sha NOT GLOB '*[^0-9a-f]*'),
+                     CHECK(canonical_count + excluded_count = source_focus_segment_count)
+                 ) STRICT;
+                 CREATE TRIGGER review_pool_dedup_manifest_validate_insert
+                 BEFORE INSERT ON review_pool_dedup_manifests
+                 WHEN NOT EXISTS (
+                        SELECT 1 FROM review_pool_registry registry
+                         WHERE registry.pool_id=NEW.pool_id
+                           AND registry.focus_segment_count=NEW.source_focus_segment_count
+                           AND registry.focus_sha256=NEW.source_focus_sha256
+                      )
+                   OR json_extract(NEW.manifest_json, '$.manifestSchema') IS NOT 1
+                   OR json_extract(NEW.manifest_json, '$.manifestSha256') IS NOT NEW.manifest_sha256
+                   OR json_extract(NEW.manifest_json, '$.pool.poolId') IS NOT NEW.pool_id
+                   OR json_extract(NEW.manifest_json, '$.pool.sourceFocusSegmentCount')
+                      IS NOT NEW.source_focus_segment_count
+                   OR json_extract(NEW.manifest_json, '$.pool.sourceFocusSha256')
+                      IS NOT NEW.source_focus_sha256
+                   OR json_extract(NEW.manifest_json, '$.algorithm.id') IS NOT NEW.algorithm_id
+                   OR json_extract(NEW.manifest_json, '$.summary.duplicateFamilies') IS NOT NEW.family_count
+                   OR json_extract(NEW.manifest_json, '$.summary.excludedMembers') IS NOT NEW.excluded_count
+                   OR json_extract(NEW.manifest_json, '$.summary.canonicalMembers') IS NOT NEW.canonical_count
+                   OR json_extract(NEW.manifest_json, '$.summary.unconfirmedRiskGroups')
+                      IS NOT NEW.unconfirmed_risk_count
+                 BEGIN SELECT RAISE(ABORT, 'review pool dedup manifest does not match its frozen authority'); END;
+                 CREATE TRIGGER review_pool_dedup_manifests_immutable_update
+                 BEFORE UPDATE ON review_pool_dedup_manifests
+                 BEGIN SELECT RAISE(ABORT, 'review pool dedup manifests are immutable'); END;
+                 CREATE TRIGGER review_pool_dedup_manifests_immutable_delete
+                 BEFORE DELETE ON review_pool_dedup_manifests
+                 BEGIN SELECT RAISE(ABORT, 'review pool dedup manifests are immutable'); END;
+
+                 CREATE TABLE review_pool_duplicate_exclusions (
+                     pool_id                         TEXT NOT NULL,
+                     segment_id                      TEXT NOT NULL,
+                     canonical_segment_id            TEXT NOT NULL,
+                     family_id                       TEXT NOT NULL,
+                     created_at_ms                    INTEGER NOT NULL CHECK(created_at_ms > 0),
+                     PRIMARY KEY(pool_id, segment_id),
+                     FOREIGN KEY(pool_id) REFERENCES review_pool_dedup_manifests(pool_id),
+                     FOREIGN KEY(pool_id, segment_id)
+                         REFERENCES review_pool_members(pool_id, segment_id),
+                     FOREIGN KEY(pool_id, canonical_segment_id)
+                         REFERENCES review_pool_members(pool_id, segment_id),
+                     CHECK(segment_id <> canonical_segment_id),
+                     CHECK(length(family_id)=64 AND family_id NOT GLOB '*[^0-9a-f]*')
+                 ) STRICT;
+                 CREATE INDEX idx_review_pool_duplicate_exclusions_canonical
+                     ON review_pool_duplicate_exclusions(pool_id, canonical_segment_id, family_id);
+                 CREATE TRIGGER review_pool_duplicate_exclusion_validate_insert
+                 BEFORE INSERT ON review_pool_duplicate_exclusions
+                 WHEN NOT EXISTS (
+                        SELECT 1 FROM review_pool_members excluded
+                        JOIN review_pool_members canonical
+                          ON canonical.pool_id=excluded.pool_id
+                         AND canonical.segment_id=NEW.canonical_segment_id
+                         AND canonical.voice_name=excluded.voice_name COLLATE BINARY
+                       WHERE excluded.pool_id=NEW.pool_id AND excluded.segment_id=NEW.segment_id
+                      )
+                   OR EXISTS (
+                        SELECT 1 FROM review_pool_duplicate_exclusions prior
+                         WHERE prior.pool_id=NEW.pool_id
+                           AND prior.segment_id=NEW.canonical_segment_id
+                      )
+                   OR EXISTS (
+                        SELECT 1 FROM speech_segments segment
+                         WHERE segment.id=NEW.segment_id AND segment.verified=1
+                           AND segment.human_decision IN
+                               ('accept','edit','reject','human_accept','human_edit','human_reject')
+                      )
+                   OR EXISTS (
+                        SELECT 1 FROM effective_review_pool_decisions_v62 decision
+                         WHERE decision.pool_id=NEW.pool_id AND decision.segment_id=NEW.segment_id
+                      )
+                   OR EXISTS (
+                        SELECT 1 FROM effective_independent_review_decisions_v61 decision
+                         WHERE decision.segment_id=NEW.segment_id
+                      )
+                   OR EXISTS (
+                        SELECT 1 FROM review_pool_owner_adjudications adjudication
+                         WHERE adjudication.pool_id=NEW.pool_id AND adjudication.segment_id=NEW.segment_id
+                      )
+                   OR EXISTS (
+                        SELECT 1 FROM review_pool_voice_certificates certificate
+                        JOIN review_pool_members member
+                          ON member.pool_id=certificate.pool_id AND member.voice_name=certificate.voice_name
+                       WHERE member.pool_id=NEW.pool_id AND member.segment_id=NEW.segment_id
+                      )
+                 BEGIN SELECT RAISE(ABORT, 'duplicate exclusion is invalid or would retire review authority'); END;
+                 CREATE TRIGGER review_pool_duplicate_exclusions_immutable_update
+                 BEFORE UPDATE ON review_pool_duplicate_exclusions
+                 BEGIN SELECT RAISE(ABORT, 'review pool duplicate exclusions are immutable'); END;
+                 CREATE TRIGGER review_pool_duplicate_exclusions_immutable_delete
+                 BEFORE DELETE ON review_pool_duplicate_exclusions
+                 BEGIN SELECT RAISE(ABORT, 'review pool duplicate exclusions are immutable'); END;
+                 CREATE TRIGGER review_pool_v64_excluded_decision_guard
+                 BEFORE INSERT ON review_pool_decisions
+                 WHEN EXISTS (
+                     SELECT 1 FROM review_pool_duplicate_exclusions exclusion
+                      WHERE exclusion.pool_id=NEW.pool_id AND exclusion.segment_id=NEW.segment_id
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'excluded duplicate clip cannot receive a review decision'); END;
+                 CREATE TRIGGER review_pool_v64_excluded_adjudication_guard
+                 BEFORE INSERT ON review_pool_owner_adjudications
+                 WHEN EXISTS (
+                     SELECT 1 FROM review_pool_duplicate_exclusions exclusion
+                      WHERE exclusion.pool_id=NEW.pool_id AND exclusion.segment_id=NEW.segment_id
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'excluded duplicate clip cannot be adjudicated'); END;
+                 CREATE TRIGGER speech_segments_v64_excluded_review_guard
+                 BEFORE UPDATE OF human_decision, verdict, verdict_transcript, annotated_transcript,
+                                  verified, reviewed_by, review_revision
+                 ON speech_segments
+                 WHEN EXISTS (
+                     SELECT 1 FROM review_pool_duplicate_exclusions exclusion
+                      WHERE exclusion.segment_id=OLD.id
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'excluded duplicate clip cannot receive canonical review evidence'); END;",
+        down_sql: Some(
+            "CREATE TEMP TABLE review_pool_v64_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero = 0)
+             );
+             INSERT INTO review_pool_v64_rollback_guard(must_be_zero)
+             SELECT 1 WHERE EXISTS (SELECT 1 FROM review_pool_dedup_manifests)
+                         OR EXISTS (SELECT 1 FROM review_pool_duplicate_exclusions);
+             DROP TABLE review_pool_v64_rollback_guard;
+             DROP TRIGGER speech_segments_v64_excluded_review_guard;
+             DROP TRIGGER review_pool_v64_excluded_adjudication_guard;
+             DROP TRIGGER review_pool_v64_excluded_decision_guard;
+             DROP TRIGGER review_pool_duplicate_exclusions_immutable_delete;
+             DROP TRIGGER review_pool_duplicate_exclusions_immutable_update;
+             DROP TRIGGER review_pool_duplicate_exclusion_validate_insert;
+             DROP INDEX idx_review_pool_duplicate_exclusions_canonical;
+             DROP TABLE review_pool_duplicate_exclusions;
+             DROP TRIGGER review_pool_dedup_manifests_immutable_delete;
+             DROP TRIGGER review_pool_dedup_manifests_immutable_update;
+             DROP TRIGGER review_pool_dedup_manifest_validate_insert;
+             DROP TABLE review_pool_dedup_manifests;",
+        ),
+    },
+    Migration {
+        version: 65,
+        description: "Preserve rights and metadata lineage on excluded duplicate audit rows",
+        // v53 increments `review_revision` after every speech-segment metadata update. The v64
+        // excluded-review guard named that implementation-owned column, so a legitimate rights
+        // revocation or provenance correction triggered the nested revision update and was aborted
+        // as if it were review evidence. Exclusions must remain immutable review-routing authority,
+        // but their underlying audit rows still need legal and operational metadata lineage.
+        // Guard only the columns that can actually create canonical human-review evidence; the
+        // decision/adjudication insert guards and canonical queue overlay remain unchanged.
+        up_sql: "DROP TRIGGER speech_segments_v64_excluded_review_guard;
+                 CREATE TRIGGER speech_segments_v64_excluded_review_guard
+                 BEFORE UPDATE OF human_decision, verdict, verdict_transcript, annotated_transcript,
+                                  verified, reviewed_by
+                 ON speech_segments
+                 WHEN EXISTS (
+                     SELECT 1 FROM review_pool_duplicate_exclusions exclusion
+                      WHERE exclusion.segment_id=OLD.id
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'excluded duplicate clip cannot receive canonical review evidence'); END;",
+        down_sql: Some(
+            "DROP TRIGGER speech_segments_v64_excluded_review_guard;
+             CREATE TRIGGER speech_segments_v64_excluded_review_guard
+             BEFORE UPDATE OF human_decision, verdict, verdict_transcript, annotated_transcript,
+                              verified, reviewed_by, review_revision
+             ON speech_segments
+             WHEN EXISTS (
+                 SELECT 1 FROM review_pool_duplicate_exclusions exclusion
+                  WHERE exclusion.segment_id=OLD.id
+             )
+             BEGIN SELECT RAISE(ABORT, 'excluded duplicate clip cannot receive canonical review evidence'); END;",
+        ),
+    },
+    Migration {
+        version: 66,
+        description: "Add non-authoritative crash-safe desktop review drafts",
+        // Drafts preserve unfinished owner input across navigation and process loss. They are not
+        // review truth: no export, evaluation, compensation, readiness, or serving-authority view
+        // references this table. A typed decision removes only the draft bound to its base revision
+        // inside the same transaction that commits human truth.
+        up_sql: "CREATE TABLE review_drafts (
+                     segment_id   TEXT PRIMARY KEY,
+                     base_revision INTEGER NOT NULL CHECK(base_revision >= 0),
+                     text         TEXT NOT NULL CHECK(length(text) <= 100000),
+                     updated_at   TEXT NOT NULL,
+                     FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE CASCADE
+                 ) STRICT;
+                 CREATE INDEX idx_review_drafts_updated_at ON review_drafts(updated_at DESC, segment_id);",
+        down_sql: Some("DROP INDEX idx_review_drafts_updated_at; DROP TABLE review_drafts;"),
+    },
+    Migration {
+        version: 67,
+        description: "Bind desktop playback evidence to server-issued grants and exact interval unions",
+        // Policy-3 receipts bind the clip/revision/content/span but accept one renderer-supplied
+        // cumulative counter.  That protects against cross-clip replay, not against an accidental or
+        // scripted `played_ms = i64::MAX`.  Policy 4 makes the renderer present a server-issued,
+        // short-lived media-grant session plus a canonical set of non-overlapping clip-relative
+        // intervals. Finalized session/interval authority is append-only; expired never-finalized
+        // attempts are intentionally collectible and do not make a schema rollback irreversible.
+        // The receipt trigger independently proves the exact sum and every immutable clip identity
+        // before the row can authorize a desktop decision.
+        up_sql: "CREATE TABLE desktop_playback_sessions_v4 (
+                     playback_receipt_id       TEXT PRIMARY KEY
+                                                    CHECK(playback_receipt_id=lower(trim(playback_receipt_id))
+                                                      AND length(playback_receipt_id)=36
+                                                      AND substr(playback_receipt_id,9,1)='-'
+                                                      AND substr(playback_receipt_id,14,1)='-'
+                                                      AND substr(playback_receipt_id,19,1)='-'
+                                                      AND substr(playback_receipt_id,24,1)='-'
+                                                      AND length(replace(playback_receipt_id,'-',''))=32
+                                                      AND replace(playback_receipt_id,'-','') NOT GLOB '*[^0-9a-f]*'),
+                     media_grant_id             TEXT NOT NULL
+                                                    CHECK(media_grant_id=lower(trim(media_grant_id))
+                                                      AND length(media_grant_id)=36
+                                                      AND substr(media_grant_id,9,1)='-'
+                                                      AND substr(media_grant_id,14,1)='-'
+                                                      AND substr(media_grant_id,19,1)='-'
+                                                      AND substr(media_grant_id,24,1)='-'
+                                                      AND length(replace(media_grant_id,'-',''))=32
+                                                      AND replace(media_grant_id,'-','') NOT GLOB '*[^0-9a-f]*'),
+                     client_attempt_id           TEXT NOT NULL
+                                                    CHECK(client_attempt_id=lower(trim(client_attempt_id))
+                                                      AND length(client_attempt_id)=36
+                                                      AND substr(client_attempt_id,9,1)='-'
+                                                      AND substr(client_attempt_id,14,1)='-'
+                                                      AND substr(client_attempt_id,19,1)='-'
+                                                      AND substr(client_attempt_id,24,1)='-'
+                                                       AND length(replace(client_attempt_id,'-',''))=32
+                                                       AND replace(client_attempt_id,'-','') NOT GLOB '*[^0-9a-f]*'),
+                     surface                     TEXT NOT NULL CHECK(surface IN ('desktop','couch')),
+                     session_binding_sha256       TEXT
+                                                    CHECK(session_binding_sha256 IS NULL OR (
+                                                      length(session_binding_sha256)=64
+                                                      AND session_binding_sha256 NOT GLOB '*[^0-9a-f]*')),
+                     grant_source_path_sha256   TEXT NOT NULL
+                                                    CHECK(length(grant_source_path_sha256)=64
+                                                      AND grant_source_path_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     segment_id                 TEXT NOT NULL,
+                     segment_revision           INTEGER NOT NULL CHECK(segment_revision >= 0),
+                     audio_content_hash         TEXT NOT NULL
+                                                    CHECK(length(audio_content_hash)=64
+                                                      AND audio_content_hash NOT GLOB '*[^0-9a-f]*'),
+                     reviewer                   TEXT,
+                     clip_duration_ms           INTEGER NOT NULL CHECK(clip_duration_ms > 0),
+                     source_start_ms             INTEGER NOT NULL CHECK(source_start_ms >= 0),
+                     source_end_ms               INTEGER NOT NULL CHECK(source_end_ms > source_start_ms),
+                     issued_at_ms                INTEGER NOT NULL CHECK(issued_at_ms > 0),
+                     expires_at_ms               INTEGER NOT NULL CHECK(expires_at_ms > issued_at_ms),
+                     CHECK(abs((source_end_ms-source_start_ms)-clip_duration_ms) <= 1),
+                     CHECK((surface='desktop' AND session_binding_sha256 IS NULL)
+                        OR (surface='couch' AND reviewer IS NOT NULL
+                            AND trim(reviewer)<>'' AND session_binding_sha256 IS NOT NULL))
+                  ) STRICT;
+                 CREATE INDEX idx_desktop_playback_sessions_v4_segment
+                     ON desktop_playback_sessions_v4(segment_id, segment_revision, issued_at_ms DESC);
+                 CREATE UNIQUE INDEX idx_desktop_playback_sessions_v4_client_attempt
+                     ON desktop_playback_sessions_v4(client_attempt_id);
+                 CREATE TRIGGER desktop_playback_sessions_v4_immutable_update
+                 BEFORE UPDATE ON desktop_playback_sessions_v4
+                 BEGIN SELECT RAISE(ABORT, 'policy-4 playback sessions are immutable'); END;
+                 CREATE TRIGGER desktop_playback_sessions_v4_immutable_delete
+                 BEFORE DELETE ON desktop_playback_sessions_v4
+                 WHEN EXISTS (
+                     SELECT 1 FROM playback_receipts receipt
+                      WHERE receipt.authority_session_id=OLD.playback_receipt_id
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'finalized policy-4 playback sessions are immutable'); END;
+
+                 ALTER TABLE playback_receipts
+                     ADD COLUMN authority_session_id TEXT
+                         REFERENCES desktop_playback_sessions_v4(playback_receipt_id);
+                 ALTER TABLE playback_receipts ADD COLUMN interval_union_sha256 TEXT;
+                 CREATE UNIQUE INDEX idx_playback_receipts_policy4_session
+                     ON playback_receipts(authority_session_id)
+                  WHERE authority_session_id IS NOT NULL;
+
+                 CREATE TABLE desktop_playback_intervals_v4 (
+                     playback_receipt_id TEXT NOT NULL,
+                     ordinal             INTEGER NOT NULL CHECK(ordinal >= 0),
+                     start_ms            INTEGER NOT NULL CHECK(start_ms >= 0),
+                     end_ms              INTEGER NOT NULL CHECK(end_ms > start_ms),
+                     observed_at_ms      INTEGER NOT NULL CHECK(observed_at_ms > 0),
+                     PRIMARY KEY(playback_receipt_id, ordinal),
+                     FOREIGN KEY(playback_receipt_id)
+                         REFERENCES desktop_playback_sessions_v4(playback_receipt_id)
+                 ) STRICT;
+                 CREATE TRIGGER desktop_playback_intervals_v4_validate_insert
+                 BEFORE INSERT ON desktop_playback_intervals_v4
+                 WHEN NOT EXISTS (
+                         SELECT 1 FROM desktop_playback_sessions_v4 session
+                           WHERE session.playback_receipt_id=NEW.playback_receipt_id
+                             AND NEW.end_ms <= session.clip_duration_ms
+                      )
+                   OR EXISTS (
+                         SELECT 1 FROM playback_receipts receipt
+                          WHERE receipt.authority_session_id=NEW.playback_receipt_id
+                      )
+                   OR NEW.ordinal <> (
+                         SELECT COUNT(*) FROM desktop_playback_intervals_v4 prior
+                          WHERE prior.playback_receipt_id=NEW.playback_receipt_id
+                      )
+                   OR EXISTS (
+                         SELECT 1 FROM desktop_playback_intervals_v4 prior
+                          WHERE prior.playback_receipt_id=NEW.playback_receipt_id
+                            AND NOT (NEW.end_ms < prior.start_ms OR NEW.start_ms > prior.end_ms)
+                      )
+                 BEGIN SELECT RAISE(ABORT, 'policy-4 playback intervals are invalid, overlapping, or finalized'); END;
+                 CREATE TRIGGER desktop_playback_intervals_v4_immutable_update
+                 BEFORE UPDATE ON desktop_playback_intervals_v4
+                 BEGIN SELECT RAISE(ABORT, 'policy-4 playback intervals are append-only'); END;
+                 CREATE TRIGGER desktop_playback_intervals_v4_immutable_delete
+                 BEFORE DELETE ON desktop_playback_intervals_v4
+                 WHEN EXISTS (
+                     SELECT 1 FROM playback_receipts receipt
+                      WHERE receipt.authority_session_id=OLD.playback_receipt_id
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'finalized policy-4 playback intervals are append-only'); END;
+                 CREATE TRIGGER playback_receipts_v67_policy4_validate_insert
+                 BEFORE INSERT ON playback_receipts
+                 WHEN NEW.policy_version=4 AND (
+                      NEW.authority_session_id IS NULL
+                      OR NEW.session_id IS NOT NEW.authority_session_id
+                      OR typeof(NEW.interval_union_sha256) <> 'text'
+                      OR length(NEW.interval_union_sha256) <> 64
+                      OR NEW.interval_union_sha256 GLOB '*[^0-9a-f]*'
+                      OR NOT EXISTS (
+                           SELECT 1 FROM desktop_playback_sessions_v4 session
+                            WHERE session.playback_receipt_id=NEW.authority_session_id
+                              AND session.segment_id=NEW.segment_id
+                              AND session.segment_revision=NEW.segment_revision
+                              AND session.audio_content_hash=NEW.audio_fingerprint
+                              AND session.reviewer IS NEW.reviewer
+                              AND session.clip_duration_ms=NEW.clip_duration_ms
+                              AND session.source_start_ms=NEW.source_start_ms
+                              AND session.source_end_ms=NEW.source_end_ms
+                               AND session.issued_at_ms=NEW.started_at_ms
+                               AND ((session.surface='desktop' AND session.session_binding_sha256 IS NULL)
+                                 OR (session.surface='couch' AND session.reviewer IS NOT NULL
+                                     AND session.session_binding_sha256 IS NOT NULL))
+                       )
+                      OR NOT EXISTS (
+                           SELECT 1 FROM desktop_playback_intervals_v4 interval
+                            WHERE interval.playback_receipt_id=NEW.authority_session_id
+                      )
+                      OR NEW.played_ms IS NOT (
+                           SELECT COALESCE(SUM(interval.end_ms-interval.start_ms),0)
+                             FROM desktop_playback_intervals_v4 interval
+                            WHERE interval.playback_receipt_id=NEW.authority_session_id
+                      )
+                      OR ABS(
+                           NEW.coverage_ratio - MIN(1.0,
+                               CAST(NEW.played_ms AS REAL)/CAST(NEW.clip_duration_ms AS REAL))
+                      ) > 0.000000001
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'policy-4 playback receipt is not bound to its exact interval authority'); END;
+                 CREATE TRIGGER playback_receipts_v67_policy4_immutable_update
+                 BEFORE UPDATE ON playback_receipts
+                 WHEN OLD.policy_version=4 OR NEW.policy_version=4
+                 BEGIN SELECT RAISE(ABORT, 'policy-4 playback evidence is append-only'); END;
+                 CREATE TRIGGER playback_receipts_v67_policy4_immutable_delete
+                 BEFORE DELETE ON playback_receipts
+                 WHEN OLD.policy_version=4
+                 BEGIN SELECT RAISE(ABORT, 'policy-4 playback evidence is append-only'); END;
+
+                 ALTER TABLE human_decision_effect_events
+                     ADD COLUMN desktop_review_contract_version INTEGER
+                         CHECK(desktop_review_contract_version IS NULL OR desktop_review_contract_version=1);
+                 ALTER TABLE human_decision_effect_events
+                     ADD COLUMN playback_authority_session_id TEXT
+                         REFERENCES desktop_playback_sessions_v4(playback_receipt_id);
+                 CREATE UNIQUE INDEX idx_human_decision_effect_policy4_authority
+                     ON human_decision_effect_events(playback_authority_session_id)
+                   WHERE playback_authority_session_id IS NOT NULL;
+                 CREATE TRIGGER speech_segments_v67_policy4_paid_identity_immutable_update
+                 BEFORE UPDATE OF audio_content_hash, alignment_json, duration_ms ON speech_segments
+                 WHEN EXISTS (
+                          SELECT 1
+                            FROM playback_receipts receipt
+                           WHERE receipt.segment_id = OLD.id
+                             AND receipt.policy_version = 4
+                      )
+                    OR EXISTS (
+                          SELECT 1
+                            FROM review_events event
+                            JOIN review_compensation_ledger ledger
+                              ON ledger.review_event_id = event.id
+                             AND ledger.reverses_entry_id IS NULL
+                           WHERE event.segment_id = OLD.id
+                             AND event.id > (
+                                  SELECT effective_after_review_event_id
+                                    FROM review_effect_state
+                                   WHERE singleton_key = 1
+                             )
+                             AND event.source IN ('couch', 'couch_spot_check')
+                             AND event.playback_guard_version = 'interval-authority-v4'
+                             AND COALESCE(event.compensation_action, event.action) <> 'skip'
+                             AND ledger.compensation_action <> 'skip'
+                      )
+                    OR EXISTS (
+                          SELECT 1
+                            FROM human_decision_effect_events effect
+                           WHERE effect.segment_id = OLD.id
+                             AND effect.playback_authority_session_id IS NOT NULL
+                      )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'paid policy-4 source identity is immutable');
+                 END;
+                 CREATE TABLE playback_authority_consumptions_v4 (
+                     playback_receipt_id       TEXT PRIMARY KEY,
+                     namespace                 TEXT NOT NULL
+                                                   CHECK(namespace IN ('canonical','spot_check','independent')),
+                     operation_id              TEXT NOT NULL UNIQUE,
+                     reviewer                  TEXT NOT NULL CHECK(trim(reviewer)<>''),
+                     segment_id                TEXT NOT NULL,
+                     created_at_ms             INTEGER NOT NULL CHECK(created_at_ms>0),
+                     FOREIGN KEY(playback_receipt_id)
+                         REFERENCES desktop_playback_sessions_v4(playback_receipt_id),
+                     FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE RESTRICT
+                 ) STRICT;
+                 CREATE TRIGGER playback_authority_consumptions_v4_validate_insert
+                 BEFORE INSERT ON playback_authority_consumptions_v4
+                 WHEN NOT EXISTS (
+                     SELECT 1
+                       FROM desktop_playback_sessions_v4 session
+                       JOIN playback_receipts receipt
+                         ON receipt.authority_session_id=session.playback_receipt_id
+                        AND receipt.policy_version=4
+                      WHERE session.playback_receipt_id=NEW.playback_receipt_id
+                        AND session.surface='couch'
+                        AND session.reviewer=NEW.reviewer COLLATE NOCASE
+                        AND session.segment_id=NEW.segment_id
+                        AND receipt.segment_id=NEW.segment_id
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'Couch playback consumption is not bound to an exact policy-4 authority'); END;
+                 CREATE TRIGGER playback_authority_consumptions_v4_immutable_update
+                 BEFORE UPDATE ON playback_authority_consumptions_v4
+                 BEGIN SELECT RAISE(ABORT, 'Couch playback consumption is immutable'); END;
+                 CREATE TRIGGER playback_authority_consumptions_v4_immutable_delete
+                 BEFORE DELETE ON playback_authority_consumptions_v4
+                 BEGIN SELECT RAISE(ABORT, 'Couch playback consumption is immutable'); END;
+
+                 DROP TRIGGER review_events_v60_provenance_validate_insert;
+                 CREATE TRIGGER review_events_v60_provenance_validate_insert
+                 BEFORE INSERT ON review_events
+                 WHEN NEW.source IN ('couch', 'couch_spot_check')
+                  AND (
+                       NEW.app_git_sha IS NULL
+                       OR NEW.playback_guard_version IS NULL
+                       OR NEW.operation_id IS NULL
+                       OR NEW.operation_payload_hash IS NULL
+                       OR trim(NEW.operation_id) = ''
+                       OR length(NEW.operation_payload_hash) <> 64
+                       OR NEW.operation_payload_hash GLOB '*[^0-9a-f]*'
+                       OR NEW.requested_action IS NULL
+                       OR NEW.requested_action NOT IN ('accept', 'edit', 'reject', 'skip', 'bad')
+                       OR NEW.requested_transcript IS NULL
+                       OR NEW.served_transcript IS NULL
+                       OR NEW.served_transcript <> trim(NEW.served_transcript)
+                       OR length(NEW.served_transcript) = 0
+                       OR typeof(NEW.served_revision) <> 'integer'
+                       OR NEW.served_revision < 0
+                       OR length(NEW.app_git_sha) <> 40
+                       OR NEW.app_git_sha GLOB '*[^0-9a-f]*'
+                       OR NEW.playback_guard_version NOT IN
+                            ('content-hash-raw-counter-v3','interval-authority-v4')
+                  )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'paid review event requires canonical build and playback-guard provenance');
+                 END;
+                 CREATE TRIGGER human_decision_effect_events_v67_policy4_validate_insert
+                 BEFORE INSERT ON human_decision_effect_events
+                 WHEN (NEW.desktop_review_contract_version IS NOT NULL
+                       OR NEW.playback_authority_session_id IS NOT NULL)
+                  AND (
+                       NEW.playback_authority_session_id IS NULL
+                       OR NOT (
+                          (NEW.source='desktop' AND NEW.desktop_review_contract_version IS 1
+                           AND EXISTS (
+                            SELECT 1
+                             FROM desktop_playback_sessions_v4 session
+                             JOIN playback_receipts receipt
+                               ON receipt.authority_session_id=session.playback_receipt_id
+                              AND receipt.policy_version=4
+                            WHERE session.playback_receipt_id=NEW.playback_authority_session_id
+                              AND session.segment_id=NEW.segment_id
+                              AND session.segment_revision=NEW.prior_revision
+                              AND receipt.segment_id=NEW.segment_id
+                              AND receipt.segment_revision=NEW.prior_revision
+                               AND receipt.audio_fingerprint=session.audio_content_hash
+                               AND session.surface='desktop'
+                           ))
+                          OR
+                          (NEW.source='couch' AND NEW.desktop_review_contract_version IS NULL
+                           AND NEW.reviewer IS NOT NULL
+                           AND EXISTS (
+                            SELECT 1
+                              FROM desktop_playback_sessions_v4 session
+                              JOIN playback_receipts receipt
+                                ON receipt.authority_session_id=session.playback_receipt_id
+                               AND receipt.policy_version=4
+                             WHERE session.playback_receipt_id=NEW.playback_authority_session_id
+                               AND session.surface='couch'
+                               AND session.reviewer=NEW.reviewer COLLATE NOCASE
+                               AND session.segment_id=NEW.segment_id
+                               AND session.segment_revision=NEW.prior_revision
+                               AND receipt.segment_id=NEW.segment_id
+                               AND receipt.segment_revision=NEW.prior_revision
+                               AND receipt.audio_fingerprint=session.audio_content_hash
+                           ))
+                       )
+                   )
+                 BEGIN SELECT RAISE(ABORT, 'review effect is not bound to one exact policy-4 receipt'); END;",
+        down_sql: Some(
+             "DELETE FROM desktop_playback_intervals_v4
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM playback_receipts receipt
+                   WHERE receipt.authority_session_id=desktop_playback_intervals_v4.playback_receipt_id
+              );
+             DELETE FROM desktop_playback_sessions_v4
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM playback_receipts receipt
+                   WHERE receipt.authority_session_id=desktop_playback_sessions_v4.playback_receipt_id
+              );
+             CREATE TEMP TABLE desktop_playback_v67_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero=0)
+             );
+             INSERT INTO desktop_playback_v67_rollback_guard(must_be_zero)
+              SELECT 1 WHERE EXISTS (SELECT 1 FROM desktop_playback_sessions_v4)
+                          OR EXISTS (SELECT 1 FROM desktop_playback_intervals_v4)
+                          OR EXISTS (SELECT 1 FROM playback_receipts WHERE policy_version=4)
+                          OR EXISTS (SELECT 1 FROM playback_authority_consumptions_v4);
+              DROP TABLE desktop_playback_v67_rollback_guard;
+              DROP TRIGGER playback_authority_consumptions_v4_immutable_delete;
+              DROP TRIGGER playback_authority_consumptions_v4_immutable_update;
+              DROP TRIGGER playback_authority_consumptions_v4_validate_insert;
+              DROP TABLE playback_authority_consumptions_v4;
+              DROP TRIGGER review_events_v60_provenance_validate_insert;
+              CREATE TRIGGER review_events_v60_provenance_validate_insert
+              BEFORE INSERT ON review_events
+              WHEN NEW.source IN ('couch', 'couch_spot_check')
+               AND (
+                    NEW.app_git_sha IS NULL
+                    OR NEW.playback_guard_version IS NULL
+                    OR NEW.operation_id IS NULL
+                    OR NEW.operation_payload_hash IS NULL
+                    OR trim(NEW.operation_id) = ''
+                    OR length(NEW.operation_payload_hash) <> 64
+                    OR NEW.operation_payload_hash GLOB '*[^0-9a-f]*'
+                    OR NEW.requested_action IS NULL
+                    OR NEW.requested_action NOT IN ('accept', 'edit', 'reject', 'skip', 'bad')
+                    OR NEW.requested_transcript IS NULL
+                    OR NEW.served_transcript IS NULL
+                    OR NEW.served_transcript <> trim(NEW.served_transcript)
+                    OR length(NEW.served_transcript) = 0
+                    OR typeof(NEW.served_revision) <> 'integer'
+                    OR NEW.served_revision < 0
+                    OR length(NEW.app_git_sha) <> 40
+                    OR NEW.app_git_sha GLOB '*[^0-9a-f]*'
+                    OR NEW.playback_guard_version <> 'content-hash-raw-counter-v3'
+               )
+              BEGIN
+                  SELECT RAISE(ABORT, 'paid review event requires canonical build and playback-guard provenance');
+              END;
+              DROP TRIGGER playback_receipts_v67_policy4_immutable_delete;
+             DROP TRIGGER playback_receipts_v67_policy4_immutable_update;
+             DROP TRIGGER playback_receipts_v67_policy4_validate_insert;
+             DROP TRIGGER speech_segments_v67_policy4_paid_identity_immutable_update;
+             DROP TRIGGER human_decision_effect_events_v67_policy4_validate_insert;
+             DROP INDEX idx_human_decision_effect_policy4_authority;
+             ALTER TABLE human_decision_effect_events DROP COLUMN playback_authority_session_id;
+             ALTER TABLE human_decision_effect_events DROP COLUMN desktop_review_contract_version;
+             DROP INDEX idx_playback_receipts_policy4_session;
+             DROP TRIGGER desktop_playback_intervals_v4_immutable_delete;
+             DROP TRIGGER desktop_playback_intervals_v4_immutable_update;
+             DROP TRIGGER desktop_playback_intervals_v4_validate_insert;
+             DROP TRIGGER desktop_playback_sessions_v4_immutable_delete;
+             DROP TRIGGER desktop_playback_sessions_v4_immutable_update;
+             ALTER TABLE playback_receipts DROP COLUMN interval_union_sha256;
+             ALTER TABLE playback_receipts DROP COLUMN authority_session_id;
+             DROP TABLE desktop_playback_intervals_v4;
+             DROP INDEX idx_desktop_playback_sessions_v4_segment;
+             DROP INDEX idx_desktop_playback_sessions_v4_client_attempt;
+             DROP TABLE desktop_playback_sessions_v4;",
+        ),
+    },
+    Migration {
+        version: 68,
+        description: "Add exact crash-safe batch operation item authority",
+        // A jobs row is the durable operation header, but a 100,000-item JSON payload cannot be
+        // rewritten after every clip without quadratic I/O and cannot attribute a row mutation in the
+        // same transaction. This strict child ledger captures every exact before projection before a
+        // worker starts and terminalizes each item in the same writer transaction as its effect.
+        // segment_id deliberately has no FK: batch evidence must survive a later segment deletion.
+        up_sql: "CREATE TABLE batch_job_items_v1 (
+                     job_id                    TEXT NOT NULL
+                         CHECK(job_id=lower(trim(job_id))
+                           AND length(job_id)=36
+                           AND substr(job_id,9,1)='-'
+                           AND substr(job_id,14,1)='-'
+                           AND substr(job_id,19,1)='-'
+                           AND substr(job_id,24,1)='-'
+                           AND length(replace(job_id,'-',''))=32
+                           AND replace(job_id,'-','') NOT GLOB '*[^0-9a-f]*'),
+                     ordinal                   INTEGER NOT NULL CHECK(ordinal>=0 AND ordinal<100000),
+                     segment_id                TEXT NOT NULL CHECK(length(trim(segment_id))>0),
+                     base_revision             INTEGER NOT NULL CHECK(base_revision>=0),
+                     source_identity_sha256     TEXT NOT NULL
+                         CHECK(length(source_identity_sha256)=64
+                           AND source_identity_sha256=lower(source_identity_sha256)
+                           AND source_identity_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     before_projection_json    TEXT NOT NULL
+                         CHECK(json_valid(before_projection_json)=1
+                           AND json_type(before_projection_json)='object'),
+                     before_projection_sha256  TEXT NOT NULL
+                         CHECK(length(before_projection_sha256)=64
+                           AND before_projection_sha256=lower(before_projection_sha256)
+                           AND before_projection_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     state                      TEXT NOT NULL DEFAULT 'pending'
+                         CHECK(state IN ('pending','applied','skipped','failed','abandoned')),
+                     after_projection_json     TEXT
+                         CHECK(after_projection_json IS NULL OR
+                           (json_valid(after_projection_json)=1
+                            AND json_type(after_projection_json)='object')),
+                     after_projection_sha256   TEXT
+                         CHECK(after_projection_sha256 IS NULL OR
+                           (length(after_projection_sha256)=64
+                            AND after_projection_sha256=lower(after_projection_sha256)
+                            AND after_projection_sha256 NOT GLOB '*[^0-9a-f]*')),
+                     effect_revision           INTEGER CHECK(effect_revision IS NULL OR effect_revision>base_revision),
+                     result_code               TEXT
+                         CHECK(result_code IS NULL OR
+                           (length(result_code) BETWEEN 1 AND 64
+                            AND result_code NOT GLOB '*[^A-Z0-9_]*')),
+                     created_at                TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                     terminal_at               TEXT,
+                     PRIMARY KEY(job_id,ordinal),
+                     UNIQUE(job_id,segment_id),
+                     FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE RESTRICT,
+                     CHECK(
+                         (state='pending'
+                          AND after_projection_json IS NULL
+                          AND after_projection_sha256 IS NULL
+                          AND effect_revision IS NULL
+                          AND result_code IS NULL
+                          AND terminal_at IS NULL)
+                         OR
+                         (state='applied'
+                          AND after_projection_json IS NOT NULL
+                          AND after_projection_sha256 IS NOT NULL
+                          AND effect_revision>base_revision
+                          AND result_code IS NULL
+                          AND terminal_at IS NOT NULL)
+                         OR
+                         (state IN ('skipped','failed','abandoned')
+                          AND after_projection_json IS NULL
+                          AND after_projection_sha256 IS NULL
+                          AND effect_revision IS NULL
+                          AND result_code IS NOT NULL
+                          AND terminal_at IS NOT NULL)
+                     )
+                 ) STRICT;
+                 CREATE INDEX idx_batch_job_items_v1_pending
+                     ON batch_job_items_v1(job_id,ordinal) WHERE state='pending';
+                 CREATE UNIQUE INDEX idx_jobs_one_live_batch_v1
+                     ON jobs((1))
+                     WHERE kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                       AND state IN ('queued','running');
+
+                 -- Hypotheses are part of machine truth and of the exact batch projection. Before
+                 -- v68 they could change without advancing the segment CAS revision, so a stale
+                 -- worker could not detect a hypothesis-only concurrent writer. Advance the same
+                 -- monotonic authority on every hypothesis mutation. Explicitly changing the
+                 -- revision avoids double-incrementing through v53's row-update trigger.
+                 CREATE TRIGGER segment_hypotheses_v68_revision_insert
+                 AFTER INSERT ON segment_hypotheses
+                 BEGIN
+                     UPDATE speech_segments
+                        SET review_revision=review_revision+1
+                      WHERE id=NEW.segment_id;
+                 END;
+                 CREATE TRIGGER segment_hypotheses_v68_revision_delete
+                 AFTER DELETE ON segment_hypotheses
+                 BEGIN
+                     UPDATE speech_segments
+                        SET review_revision=review_revision+1
+                      WHERE id=OLD.segment_id;
+                 END;
+                 CREATE TRIGGER segment_hypotheses_v68_revision_update
+                 AFTER UPDATE ON segment_hypotheses
+                 BEGIN
+                     UPDATE speech_segments
+                        SET review_revision=review_revision+1
+                      WHERE id=OLD.segment_id;
+                     UPDATE speech_segments
+                        SET review_revision=review_revision+1
+                      WHERE id=NEW.segment_id AND NEW.segment_id<>OLD.segment_id;
+                 END;
+
+                 CREATE TRIGGER jobs_v68_batch_validate_insert
+                 BEFORE INSERT ON jobs
+                 WHEN NEW.kind IN ('batch_transcribe_v1','batch_normalize_v1') AND (
+                      typeof(NEW.id)<>'text'
+                      OR typeof(NEW.idempotency_key)<>'text'
+                      OR NEW.id<>lower(trim(NEW.id))
+                      OR length(NEW.id)<>36
+                      OR substr(NEW.id,9,1)<>'-'
+                      OR substr(NEW.id,14,1)<>'-'
+                      OR substr(NEW.id,19,1)<>'-'
+                      OR substr(NEW.id,24,1)<>'-'
+                      OR length(replace(NEW.id,'-',''))<>32
+                      OR replace(NEW.id,'-','') GLOB '*[^0-9a-f]*'
+                      OR NEW.state<>'queued'
+                      OR NEW.idempotency_key IS NOT ('batch-v1:'||NEW.id)
+                      OR typeof(NEW.total)<>'integer' OR NEW.total<1 OR NEW.total>100000
+                      OR NEW.completed<>0 OR NEW.progress<>0.0
+                      OR NEW.error_code IS NOT NULL OR NEW.error_detail IS NOT NULL
+                      OR json_valid(NEW.payload_json)<>1 OR json_type(NEW.payload_json)<>'object'
+                      OR json_extract(NEW.payload_json,'$.schema') IS NOT 1
+                      OR typeof(json_extract(NEW.payload_json,'$.operationId'))<>'text'
+                      OR json_extract(NEW.payload_json,'$.operationId') IS NOT NEW.id
+                      OR json_extract(NEW.payload_json,'$.kind') IS NOT NEW.kind
+                      OR typeof(json_extract(NEW.payload_json,'$.requestSha256'))<>'text'
+                      OR length(json_extract(NEW.payload_json,'$.requestSha256'))<>64
+                      OR json_extract(NEW.payload_json,'$.requestSha256') GLOB '*[^0-9a-f]*'
+                      OR typeof(json_extract(NEW.payload_json,'$.configSha256'))<>'text'
+                      OR length(json_extract(NEW.payload_json,'$.configSha256'))<>64
+                      OR json_extract(NEW.payload_json,'$.configSha256') GLOB '*[^0-9a-f]*'
+                      OR typeof(json_extract(NEW.payload_json,'$.executorGitSha'))<>'text'
+                      OR length(json_extract(NEW.payload_json,'$.executorGitSha'))<>40
+                      OR json_extract(NEW.payload_json,'$.executorGitSha') GLOB '*[^0-9a-f]*'
+                      OR typeof(json_extract(NEW.payload_json,'$.attemptGeneration'))<>'integer'
+                      OR json_extract(NEW.payload_json,'$.attemptGeneration')<1
+                      OR typeof(json_extract(NEW.payload_json,'$.executorTokenSha256'))<>'text'
+                      OR length(json_extract(NEW.payload_json,'$.executorTokenSha256'))<>64
+                      OR json_extract(NEW.payload_json,'$.executorTokenSha256') GLOB '*[^0-9a-f]*'
+                      OR (SELECT count(*) FROM json_each(NEW.payload_json))<>8
+                 )
+                 BEGIN SELECT RAISE(ABORT,'invalid batch job header'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_kind_transition_forbidden
+                 BEFORE UPDATE OF kind ON jobs
+                 WHEN NEW.kind IS NOT OLD.kind AND (
+                      OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                      OR NEW.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                 )
+                 BEGIN SELECT RAISE(ABORT,'jobs cannot enter, leave, or switch batch authority kind'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_payload_validate_update
+                 BEFORE UPDATE OF payload_json ON jobs
+                 WHEN NEW.kind IN ('batch_transcribe_v1','batch_normalize_v1') AND (
+                      json_valid(NEW.payload_json)<>1 OR json_type(NEW.payload_json)<>'object'
+                      OR json_extract(NEW.payload_json,'$.schema') IS NOT 1
+                      OR json_extract(NEW.payload_json,'$.operationId') IS NOT NEW.id
+                      OR json_extract(NEW.payload_json,'$.kind') IS NOT NEW.kind
+                      OR typeof(json_extract(NEW.payload_json,'$.requestSha256'))<>'text'
+                      OR length(json_extract(NEW.payload_json,'$.requestSha256'))<>64
+                      OR json_extract(NEW.payload_json,'$.requestSha256') GLOB '*[^0-9a-f]*'
+                      OR typeof(json_extract(NEW.payload_json,'$.configSha256'))<>'text'
+                      OR length(json_extract(NEW.payload_json,'$.configSha256'))<>64
+                      OR json_extract(NEW.payload_json,'$.configSha256') GLOB '*[^0-9a-f]*'
+                      OR typeof(json_extract(NEW.payload_json,'$.executorGitSha'))<>'text'
+                      OR length(json_extract(NEW.payload_json,'$.executorGitSha'))<>40
+                      OR json_extract(NEW.payload_json,'$.executorGitSha') GLOB '*[^0-9a-f]*'
+                      OR typeof(json_extract(NEW.payload_json,'$.attemptGeneration'))<>'integer'
+                      OR json_extract(NEW.payload_json,'$.attemptGeneration')<1
+                      OR typeof(json_extract(NEW.payload_json,'$.executorTokenSha256'))<>'text'
+                      OR length(json_extract(NEW.payload_json,'$.executorTokenSha256'))<>64
+                      OR json_extract(NEW.payload_json,'$.executorTokenSha256') GLOB '*[^0-9a-f]*'
+                      OR (SELECT count(*) FROM json_each(NEW.payload_json))<>8
+                 )
+                 BEGIN SELECT RAISE(ABORT,'invalid updated batch job payload'); END;
+
+                 CREATE TRIGGER batch_job_items_v1_validate_insert
+                 BEFORE INSERT ON batch_job_items_v1
+                 WHEN NOT EXISTS (
+                     SELECT 1 FROM jobs parent
+                      WHERE parent.id=NEW.job_id
+                        AND parent.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                        AND parent.state='queued'
+                        AND NEW.ordinal<parent.total
+                 )
+                 BEGIN SELECT RAISE(ABORT,'batch item requires matching queued parent and ordinal'); END;
+
+                 CREATE TRIGGER batch_job_items_v1_identity_immutable
+                 BEFORE UPDATE OF job_id,ordinal,segment_id,base_revision,source_identity_sha256,
+                                  before_projection_json,before_projection_sha256,created_at
+                 ON batch_job_items_v1
+                 BEGIN SELECT RAISE(ABORT,'batch item identity and before authority are immutable'); END;
+
+                 CREATE TRIGGER batch_job_items_v1_terminal_immutable
+                 BEFORE UPDATE ON batch_job_items_v1
+                 WHEN OLD.state<>'pending'
+                 BEGIN SELECT RAISE(ABORT,'terminal batch item evidence is immutable'); END;
+
+                 CREATE TRIGGER batch_job_items_v1_transition_validate
+                 BEFORE UPDATE ON batch_job_items_v1
+                 WHEN OLD.state='pending' AND NEW.state NOT IN ('applied','skipped','failed','abandoned')
+                 BEGIN SELECT RAISE(ABORT,'batch item permits one pending-to-terminal transition'); END;
+
+                 CREATE TRIGGER batch_job_items_v1_immutable_delete
+                 BEFORE DELETE ON batch_job_items_v1
+                 BEGIN SELECT RAISE(ABORT,'batch item evidence is append-only'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_identity_immutable
+                 BEFORE UPDATE OF id,kind,idempotency_key,total,payload_json ON jobs
+                 WHEN OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1') AND (
+                      NEW.id IS NOT OLD.id
+                      OR NEW.kind IS NOT OLD.kind
+                      OR NEW.idempotency_key IS NOT OLD.idempotency_key
+                      OR NEW.total IS NOT OLD.total
+                      -- The executor identity is evidence, not mutable retry state.  A prior version
+                      -- compared only five decoded fields and therefore allowed executorGitSha,
+                      -- attemptGeneration, executorTokenSha256, whitespace, or duplicate JSON keys
+                      -- to be rewritten after admission.  Exact byte immutability closes every one
+                      -- of those aliases and keeps the request hash tied to one actual executor.
+                      OR NEW.payload_json IS NOT OLD.payload_json
+                 )
+                 BEGIN SELECT RAISE(ABORT,'batch job request identity is immutable'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_terminal_immutable
+                 BEFORE UPDATE ON jobs
+                 WHEN OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                  AND OLD.state IN ('succeeded','failed','cancelled')
+                 BEGIN SELECT RAISE(ABORT,'terminal batch header evidence is immutable'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_start_validate
+                 BEFORE UPDATE OF state ON jobs
+                 WHEN OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                  AND NEW.state='running' AND (
+                       OLD.state<>'queued'
+                       OR NEW.started_at IS NULL
+                       OR NEW.finished_at IS NOT NULL
+                       OR NEW.error_code IS NOT NULL
+                       OR NEW.error_detail IS NOT NULL
+                       OR NEW.completed<>0 OR NEW.progress<>0.0
+                       OR (SELECT count(*) FROM batch_job_items_v1 item WHERE item.job_id=OLD.id)<>OLD.total
+                       OR (SELECT min(ordinal) FROM batch_job_items_v1 item WHERE item.job_id=OLD.id) IS NOT 0
+                       OR (SELECT max(ordinal) FROM batch_job_items_v1 item WHERE item.job_id=OLD.id) IS NOT OLD.total-1
+                  )
+                 BEGIN SELECT RAISE(ABORT,'batch cannot run before its exact contiguous item set exists'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_lifecycle_validate
+                 BEFORE UPDATE OF state ON jobs
+                 WHEN OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                  AND NEW.state<>OLD.state
+                  AND NOT (
+                       (OLD.state='queued' AND NEW.state='running')
+                       OR (OLD.state='running' AND NEW.state IN ('succeeded','failed','cancelled'))
+                  )
+                 BEGIN SELECT RAISE(ABORT,'invalid batch job lifecycle transition'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_running_fields_validate
+                 BEFORE UPDATE ON jobs
+                 WHEN OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                  AND OLD.state='running' AND NEW.state='running' AND (
+                       NEW.started_at IS NOT OLD.started_at
+                       OR NEW.finished_at IS NOT NULL
+                       OR NEW.error_code IS NOT NULL
+                       OR NEW.error_detail IS NOT NULL
+                  )
+                 BEGIN SELECT RAISE(ABORT,'running batch lifecycle fields are immutable'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_progress_validate
+                 BEFORE UPDATE OF completed,progress ON jobs
+                 WHEN OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                  AND NEW.state='running' AND (
+                       NEW.completed IS NOT (
+                           SELECT count(*) FROM batch_job_items_v1 item
+                            WHERE item.job_id=OLD.id AND item.state<>'pending'
+                       )
+                       OR abs(NEW.progress-(CAST(NEW.completed AS REAL)/CAST(NEW.total AS REAL)))>0.000000001
+                  )
+                 BEGIN SELECT RAISE(ABORT,'batch progress must equal durable terminal item count'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_terminal_validate
+                 BEFORE UPDATE OF state ON jobs
+                 WHEN OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                  AND NEW.state IN ('succeeded','failed','cancelled') AND (
+                       OLD.state<>'running'
+                       OR EXISTS (SELECT 1 FROM batch_job_items_v1 item WHERE item.job_id=OLD.id AND item.state='pending')
+                       OR NEW.completed<>NEW.total
+                       OR abs(NEW.progress-1.0)>0.000000001
+                       OR NEW.started_at IS NOT OLD.started_at
+                       OR NEW.finished_at IS NULL
+                       OR NEW.payload_json IS NOT OLD.payload_json
+                       OR (NEW.state='succeeded' AND
+                           (NEW.error_code IS NOT NULL OR NEW.error_detail IS NOT NULL))
+                       OR (NEW.state IN ('failed','cancelled') AND (
+                           typeof(NEW.error_code)<>'text'
+                           OR length(NEW.error_code) NOT BETWEEN 1 AND 64
+                           OR NEW.error_code GLOB '*[^A-Z0-9_]*'
+                           OR NEW.error_detail IS NOT NULL
+                       ))
+                       OR (NEW.state='succeeded' AND EXISTS (
+                           SELECT 1 FROM batch_job_items_v1 item
+                            WHERE item.job_id=OLD.id AND item.state IN ('failed','abandoned')
+                       ))
+                       OR (NEW.state='failed' AND NOT EXISTS (
+                           SELECT 1 FROM batch_job_items_v1 item
+                            WHERE item.job_id=OLD.id AND item.state IN ('failed','abandoned')
+                       ))
+                       OR (NEW.state='cancelled' AND NOT EXISTS (
+                           SELECT 1 FROM batch_job_items_v1 item
+                            WHERE item.job_id=OLD.id AND item.state='abandoned'
+                       ))
+                       OR (NEW.state='cancelled' AND EXISTS (
+                           SELECT 1 FROM batch_job_items_v1 item
+                            WHERE item.job_id=OLD.id AND item.state='failed'
+                       ))
+                  )
+                 BEGIN SELECT RAISE(ABORT,'batch terminal state disagrees with durable item evidence'); END;
+
+                 CREATE TRIGGER jobs_v68_batch_immutable_delete
+                 BEFORE DELETE ON jobs
+                 WHEN OLD.kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                 BEGIN SELECT RAISE(ABORT,'batch job evidence is append-only'); END;",
+        down_sql: Some(
+            "CREATE TEMP TABLE batch_v68_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero=0)
+             );
+             INSERT INTO batch_v68_rollback_guard(must_be_zero)
+              SELECT 1 WHERE EXISTS (SELECT 1 FROM batch_job_items_v1)
+                          OR EXISTS (
+                              SELECT 1 FROM jobs
+                               WHERE kind IN ('batch_transcribe_v1','batch_normalize_v1')
+                          );
+             DROP TABLE batch_v68_rollback_guard;
+             DROP TRIGGER jobs_v68_batch_immutable_delete;
+             DROP TRIGGER jobs_v68_batch_terminal_validate;
+             DROP TRIGGER jobs_v68_batch_progress_validate;
+             DROP TRIGGER jobs_v68_batch_running_fields_validate;
+             DROP TRIGGER jobs_v68_batch_lifecycle_validate;
+             DROP TRIGGER jobs_v68_batch_start_validate;
+             DROP TRIGGER jobs_v68_batch_terminal_immutable;
+             DROP TRIGGER jobs_v68_batch_identity_immutable;
+             DROP TRIGGER batch_job_items_v1_immutable_delete;
+             DROP TRIGGER batch_job_items_v1_transition_validate;
+             DROP TRIGGER batch_job_items_v1_terminal_immutable;
+             DROP TRIGGER batch_job_items_v1_identity_immutable;
+             DROP TRIGGER batch_job_items_v1_validate_insert;
+             DROP TRIGGER jobs_v68_batch_payload_validate_update;
+             DROP TRIGGER jobs_v68_batch_kind_transition_forbidden;
+             DROP TRIGGER jobs_v68_batch_validate_insert;
+             DROP TRIGGER segment_hypotheses_v68_revision_update;
+             DROP TRIGGER segment_hypotheses_v68_revision_delete;
+             DROP TRIGGER segment_hypotheses_v68_revision_insert;
+             DROP INDEX idx_jobs_one_live_batch_v1;
+             DROP INDEX idx_batch_job_items_v1_pending;
+             DROP TABLE batch_job_items_v1;",
+        ),
+    },
+    Migration {
+        version: 69,
+        description: "Add exact global desktop review action order for restart-safe Undo",
+        // Decision and flag effects have independent AUTOINCREMENT sequences and their historical
+        // timestamps have only second precision. This append-only journal is therefore the sole
+        // authority for the latest desktop review action after v69. Existing histories receive one
+        // conservative barrier; no pre-v69 action is guessed into a total order.
+        up_sql: "CREATE TABLE desktop_review_legacy_actions_v1 (
+                     source_kind     TEXT NOT NULL
+                         CHECK(source_kind IN ('decision','decision_undo','flag','flag_undo')),
+                     effect_event_id INTEGER NOT NULL CHECK(effect_event_id>0),
+                     PRIMARY KEY(source_kind,effect_event_id)
+                 ) STRICT;
+
+                 INSERT INTO desktop_review_legacy_actions_v1(source_kind,effect_event_id)
+                 SELECT 'decision',id FROM human_decision_effect_events
+                  WHERE source='desktop' AND reviewer IS NULL;
+                 INSERT INTO desktop_review_legacy_actions_v1(source_kind,effect_event_id)
+                 SELECT 'decision_undo',reversal.effect_event_id
+                   FROM human_decision_effect_reversals reversal
+                   JOIN human_decision_effect_events effect ON effect.id=reversal.effect_event_id
+                  WHERE effect.source='desktop' AND effect.reviewer IS NULL;
+                 INSERT INTO desktop_review_legacy_actions_v1(source_kind,effect_event_id)
+                 SELECT 'flag',id FROM review_flag_effect_events;
+                 INSERT INTO desktop_review_legacy_actions_v1(source_kind,effect_event_id)
+                 SELECT 'flag_undo',flag_effect_event_id FROM review_flag_effect_reversals;
+
+                 CREATE TRIGGER desktop_review_legacy_actions_v1_sealed_insert
+                 BEFORE INSERT ON desktop_review_legacy_actions_v1
+                 BEGIN SELECT RAISE(ABORT,'desktop legacy review baseline is sealed'); END;
+                 CREATE TRIGGER desktop_review_legacy_actions_v1_immutable_update
+                 BEFORE UPDATE ON desktop_review_legacy_actions_v1
+                 BEGIN SELECT RAISE(ABORT,'desktop legacy review baseline is immutable'); END;
+                 CREATE TRIGGER desktop_review_legacy_actions_v1_immutable_delete
+                 BEFORE DELETE ON desktop_review_legacy_actions_v1
+                 BEGIN SELECT RAISE(ABORT,'desktop legacy review baseline is immutable'); END;
+
+                 CREATE TABLE desktop_review_action_events_v1 (
+                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                     action_kind     TEXT NOT NULL
+                         CHECK(action_kind IN ('legacy_barrier','decision','decision_undo','flag','flag_undo')),
+                     effect_event_id INTEGER,
+                     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                     CHECK(
+                         (action_kind='legacy_barrier' AND effect_event_id IS NULL)
+                         OR (action_kind<>'legacy_barrier' AND effect_event_id IS NOT NULL AND effect_event_id>0)
+                     ),
+                     UNIQUE(action_kind,effect_event_id)
+                 ) STRICT;
+                 CREATE UNIQUE INDEX idx_desktop_review_action_one_legacy_barrier_v1
+                     ON desktop_review_action_events_v1(action_kind)
+                     WHERE action_kind='legacy_barrier';
+
+                 INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id,created_at)
+                 SELECT 'legacy_barrier',NULL,'1970-01-01T00:00:00.000Z'
+                  WHERE EXISTS (SELECT 1 FROM desktop_review_legacy_actions_v1);
+
+                 CREATE TRIGGER desktop_review_action_events_v1_validate_insert
+                 BEFORE INSERT ON desktop_review_action_events_v1
+                 WHEN (NEW.action_kind<>'legacy_barrier' AND EXISTS (
+                           SELECT 1 FROM desktop_review_legacy_actions_v1 legacy
+                            WHERE legacy.source_kind=NEW.action_kind
+                              AND legacy.effect_event_id=NEW.effect_event_id
+                       ))
+                    OR (NEW.action_kind='decision' AND NOT EXISTS (
+                           SELECT 1 FROM human_decision_effect_events effect
+                            WHERE effect.id=NEW.effect_event_id
+                              AND effect.source='desktop' AND effect.reviewer IS NULL
+                       ))
+                    OR (NEW.action_kind='decision_undo' AND NOT EXISTS (
+                           SELECT 1
+                             FROM human_decision_effect_reversals reversal
+                             JOIN human_decision_effect_events effect
+                               ON effect.id=reversal.effect_event_id
+                            WHERE reversal.effect_event_id=NEW.effect_event_id
+                              AND effect.source='desktop' AND effect.reviewer IS NULL
+                       ))
+                    OR (NEW.action_kind='flag' AND NOT EXISTS (
+                           SELECT 1 FROM review_flag_effect_events flag
+                            WHERE flag.id=NEW.effect_event_id
+                       ))
+                    OR (NEW.action_kind='flag_undo' AND NOT EXISTS (
+                           SELECT 1 FROM review_flag_effect_reversals reversal
+                            WHERE reversal.flag_effect_event_id=NEW.effect_event_id
+                       ))
+                 BEGIN SELECT RAISE(ABORT,'desktop review action journal requires its exact effect'); END;
+
+                 CREATE TRIGGER desktop_review_action_events_v1_immutable_update
+                 BEFORE UPDATE ON desktop_review_action_events_v1
+                 BEGIN SELECT RAISE(ABORT,'desktop review action journal is append-only'); END;
+                 CREATE TRIGGER desktop_review_action_events_v1_immutable_delete
+                 BEFORE DELETE ON desktop_review_action_events_v1
+                 BEGIN SELECT RAISE(ABORT,'desktop review action journal is append-only'); END;
+
+                 CREATE TRIGGER human_decision_effect_events_v69_desktop_action_insert
+                 AFTER INSERT ON human_decision_effect_events
+                 WHEN NEW.source='desktop' AND NEW.reviewer IS NULL
+                 BEGIN
+                     INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id)
+                     VALUES('decision',NEW.id);
+                 END;
+                 CREATE TRIGGER review_events_v69_operation_namespace_insert
+                 BEFORE INSERT ON review_events
+                 WHEN NEW.operation_id IS NOT NULL
+                  AND (
+                       EXISTS (SELECT 1 FROM independent_review_decisions WHERE operation_id=NEW.operation_id)
+                       OR EXISTS (SELECT 1 FROM independent_review_reversals WHERE operation_id=NEW.operation_id)
+                  )
+                 BEGIN
+                     SELECT RAISE(ABORT,'canonical review event operation UUID belongs to independent review truth');
+                 END;
+                 CREATE TRIGGER human_decision_effect_events_v69_operation_namespace_insert
+                 BEFORE INSERT ON human_decision_effect_events
+                 WHEN NEW.operation_id IS NOT NULL
+                  AND (
+                       EXISTS (SELECT 1 FROM independent_review_decisions WHERE operation_id=NEW.operation_id)
+                       OR EXISTS (SELECT 1 FROM independent_review_reversals WHERE operation_id=NEW.operation_id)
+                  )
+                 BEGIN
+                     SELECT RAISE(ABORT,'canonical decision operation UUID belongs to independent review truth');
+                 END;
+                 CREATE TRIGGER human_decision_effect_reversals_v69_desktop_operation_namespace_insert
+                 BEFORE INSERT ON human_decision_effect_reversals
+                 WHEN EXISTS (
+                          SELECT 1 FROM human_decision_effect_events effect
+                           WHERE effect.id=NEW.effect_event_id
+                             AND effect.source='desktop' AND effect.reviewer IS NULL
+                      )
+                  AND (
+                       EXISTS (SELECT 1 FROM review_events WHERE operation_id=NEW.operation_id)
+                       OR EXISTS (SELECT 1 FROM human_decision_effect_events WHERE operation_id=NEW.operation_id)
+                       OR EXISTS (SELECT 1 FROM review_flag_effect_events WHERE operation_id=NEW.operation_id)
+                       OR EXISTS (SELECT 1 FROM review_flag_effect_reversals WHERE operation_id=NEW.operation_id)
+                       OR EXISTS (SELECT 1 FROM independent_review_decisions WHERE operation_id=NEW.operation_id)
+                       OR EXISTS (SELECT 1 FROM independent_review_reversals WHERE operation_id=NEW.operation_id)
+                  )
+                 BEGIN
+                     SELECT RAISE(ABORT,'desktop decision undo operation UUID belongs to another review action');
+                 END;
+                 CREATE TRIGGER human_decision_effect_reversals_v69_desktop_action_insert
+                 AFTER INSERT ON human_decision_effect_reversals
+                 WHEN EXISTS (
+                     SELECT 1 FROM human_decision_effect_events effect
+                      WHERE effect.id=NEW.effect_event_id
+                        AND effect.source='desktop' AND effect.reviewer IS NULL
+                 )
+                 BEGIN
+                     INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id)
+                     VALUES('decision_undo',NEW.effect_event_id);
+                 END;
+                 CREATE TRIGGER review_flag_effect_events_v69_desktop_action_insert
+                 AFTER INSERT ON review_flag_effect_events
+                 BEGIN
+                     INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id)
+                     VALUES('flag',NEW.id);
+                 END;
+                 CREATE TRIGGER review_flag_effect_events_v69_operation_namespace_insert
+                 BEFORE INSERT ON review_flag_effect_events
+                 WHEN EXISTS (SELECT 1 FROM review_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM human_decision_effect_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM human_decision_effect_reversals WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM review_flag_effect_reversals WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM independent_review_decisions WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM independent_review_reversals WHERE operation_id=NEW.operation_id)
+                 BEGIN
+                     SELECT RAISE(ABORT,'review flag operation UUID belongs to another review action');
+                 END;
+                 CREATE TRIGGER review_flag_effect_reversals_v69_operation_namespace_insert
+                 BEFORE INSERT ON review_flag_effect_reversals
+                 WHEN EXISTS (SELECT 1 FROM review_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM human_decision_effect_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM human_decision_effect_reversals WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM review_flag_effect_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM independent_review_decisions WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM independent_review_reversals WHERE operation_id=NEW.operation_id)
+                 BEGIN
+                     SELECT RAISE(ABORT,'review flag undo operation UUID belongs to another review action');
+                 END;
+                 CREATE TRIGGER review_flag_effect_reversals_v69_desktop_action_insert
+                 AFTER INSERT ON review_flag_effect_reversals
+                 BEGIN
+                     INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id)
+                     VALUES('flag_undo',NEW.flag_effect_event_id);
+                 END;
+                 CREATE TRIGGER independent_review_reversals_v69_operation_namespace_insert
+                 BEFORE INSERT ON independent_review_reversals
+                 WHEN EXISTS (SELECT 1 FROM review_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM human_decision_effect_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM human_decision_effect_reversals WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM review_flag_effect_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM review_flag_effect_reversals WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM independent_review_decisions WHERE operation_id=NEW.operation_id)
+                 BEGIN
+                     SELECT RAISE(ABORT,'independent reversal operation UUID belongs to another review action');
+                 END;
+                 CREATE TRIGGER independent_review_decisions_v69_operation_namespace_insert
+                 BEFORE INSERT ON independent_review_decisions
+                 WHEN EXISTS (SELECT 1 FROM review_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM human_decision_effect_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM human_decision_effect_reversals WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM review_flag_effect_events WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM review_flag_effect_reversals WHERE operation_id=NEW.operation_id)
+                    OR EXISTS (SELECT 1 FROM independent_review_reversals WHERE operation_id=NEW.operation_id)
+                 BEGIN
+                     SELECT RAISE(ABORT,'independent decision operation UUID belongs to another review action');
+                 END;",
+        down_sql: Some(
+            "CREATE TEMP TABLE desktop_review_action_v69_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero=0)
+             );
+             INSERT INTO desktop_review_action_v69_rollback_guard(must_be_zero)
+             SELECT 1 WHERE EXISTS (
+                 SELECT 1 FROM desktop_review_action_events_v1
+                  WHERE action_kind<>'legacy_barrier'
+             );
+             DROP TABLE desktop_review_action_v69_rollback_guard;
+             DROP TRIGGER independent_review_decisions_v69_operation_namespace_insert;
+             DROP TRIGGER independent_review_reversals_v69_operation_namespace_insert;
+             DROP TRIGGER review_flag_effect_reversals_v69_desktop_action_insert;
+             DROP TRIGGER review_flag_effect_reversals_v69_operation_namespace_insert;
+             DROP TRIGGER review_flag_effect_events_v69_operation_namespace_insert;
+             DROP TRIGGER review_flag_effect_events_v69_desktop_action_insert;
+             DROP TRIGGER human_decision_effect_reversals_v69_desktop_action_insert;
+             DROP TRIGGER human_decision_effect_reversals_v69_desktop_operation_namespace_insert;
+             DROP TRIGGER human_decision_effect_events_v69_operation_namespace_insert;
+             DROP TRIGGER review_events_v69_operation_namespace_insert;
+             DROP TRIGGER human_decision_effect_events_v69_desktop_action_insert;
+             DROP TRIGGER desktop_review_action_events_v1_immutable_delete;
+             DROP TRIGGER desktop_review_action_events_v1_immutable_update;
+             DROP TRIGGER desktop_review_action_events_v1_validate_insert;
+             DROP INDEX idx_desktop_review_action_one_legacy_barrier_v1;
+             DROP TABLE desktop_review_action_events_v1;
+             DROP TRIGGER desktop_review_legacy_actions_v1_immutable_delete;
+             DROP TRIGGER desktop_review_legacy_actions_v1_immutable_update;
+             DROP TRIGGER desktop_review_legacy_actions_v1_sealed_insert;
+             DROP TABLE desktop_review_legacy_actions_v1;",
+        ),
+    },
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::Database;
+    use rusqlite::params;
+
+    fn database_at_v57() -> Database {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(
+            rollback(&db, 12).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58],
+            "fixture must stop immediately before v58"
+        );
+        assert_eq!(get_current_version(&db).unwrap(), 57);
+        db
+    }
+
+    fn database_at_v59() -> Database {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            "fixture must expose the populated-v59 boundary"
+        );
+        assert_eq!(get_current_version(&db).unwrap(), 59);
+        db
+    }
+
+    fn database_at_v60() -> Database {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(
+            rollback(&db, 9).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61],
+            "fixture must expose the v60 boundary"
+        );
+        assert_eq!(get_current_version(&db).unwrap(), 60);
+        db
+    }
+
+    fn insert_review_original(
+        db: &Database,
+        segment_id: &str,
+        canonical_work_id: &str,
+        reviewer: &str,
+        source: &str,
+    ) -> (i64, String) {
+        insert_review_original_with_optional_operation(db, segment_id, canonical_work_id, reviewer, source, None)
+    }
+
+    fn insert_review_original_with_operation(
+        db: &Database,
+        segment_id: &str,
+        canonical_work_id: &str,
+        reviewer: &str,
+        source: &str,
+        operation_id: &str,
+        operation_payload_hash: &str,
+    ) -> (i64, String) {
+        insert_review_original_with_optional_operation(
+            db,
+            segment_id,
+            canonical_work_id,
+            reviewer,
+            source,
+            Some((operation_id, operation_payload_hash)),
+        )
+    }
+
+    fn insert_review_original_with_optional_operation(
+        db: &Database,
+        segment_id: &str,
+        canonical_work_id: &str,
+        reviewer: &str,
+        source: &str,
+        operation: Option<(&str, &str)>,
+    ) -> (i64, String) {
+        let has_provenance_columns: bool = db
+            .connection()
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('review_events') WHERE name='app_git_sha'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if has_provenance_columns {
+            let generated_operation_id = uuid::Uuid::new_v4().to_string();
+            let generated_operation_payload_hash = "a".repeat(64);
+            let paid_source = matches!(source, "couch" | "couch_spot_check");
+            let served_revision = (source == "couch_spot_check").then_some(1_i64).or_else(|| paid_source.then_some(0));
+            let effective_operation = operation.or_else(|| {
+                paid_source.then_some((generated_operation_id.as_str(), generated_operation_payload_hash.as_str()))
+            });
+            db.connection()
+                .execute(
+                    "INSERT INTO review_events
+                        (segment_id, reviewer, action, source, timestamp_ms, duration_ms, compensation_action,
+                         operation_id, operation_payload_hash, app_git_sha, playback_guard_version,
+                         requested_action, requested_transcript, served_transcript, served_revision)
+                     VALUES (?1, ?2, 'edit', ?3, 1000, 1000, 'edit',
+                             ?4, ?5,
+                             'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                             'content-hash-raw-counter-v3', ?6, ?7, ?8, ?9)",
+                    rusqlite::params![
+                        segment_id,
+                        reviewer,
+                        source,
+                        effective_operation.map(|value| value.0),
+                        effective_operation.map(|value| value.1),
+                        paid_source.then_some("edit"),
+                        paid_source.then_some("requested transcript"),
+                        paid_source.then_some("served transcript"),
+                        served_revision,
+                    ],
+                )
+                .unwrap();
+        } else {
+            db.connection()
+                .execute(
+                    "INSERT INTO review_events
+                        (segment_id, reviewer, action, source, timestamp_ms, duration_ms, compensation_action,
+                         operation_id, operation_payload_hash)
+                     VALUES (?1, ?2, 'edit', ?3, 1000, 1000, 'edit', ?4, ?5)",
+                    rusqlite::params![
+                        segment_id,
+                        reviewer,
+                        source,
+                        operation.map(|value| value.0),
+                        operation.map(|value| value.1),
+                    ],
+                )
+                .unwrap();
+        }
+        let event_id = db.connection().last_insert_rowid();
+        let entry_id = format!("test-entry-{event_id}");
+        let entry_key = format!("test-entry-key-{event_id}");
+        db.connection()
+            .execute(
+                "INSERT INTO review_compensation_ledger
+                    (entry_id, entry_key, policy_version, review_event_id, canonical_work_id,
+                     canonical_identity_kind, reviewer, segment_id, source, compensation_action,
+                     effective_decision, decision_revision, duration_ms, rate_basis_points,
+                     entitlement_micro_iqd, delta_micro_iqd, corrected_entitlement_ms,
+                     delta_corrected_ms)
+                 VALUES (?1, ?2, 'review-iqd-v1-2026-08-21', ?3, ?4,
+                         'audio_content_hash', ?5, ?6, ?7, 'edit',
+                         'edit', 1, 1000, 10000, 5000000, 5000000, 1000, 1000)",
+                rusqlite::params![entry_id, entry_key, event_id, canonical_work_id, reviewer, segment_id, source],
+            )
+            .unwrap();
+        (event_id, entry_id)
+    }
+
+    fn reverse_review_entry(db: &Database, original_entry_id: &str, operation: &str) -> Result<i64, rusqlite::Error> {
+        let reversal_entry_id = format!("reversal-{operation}");
+        let reversal_entry_key = format!("undo:{operation}");
+        db.connection().execute(
+            "INSERT INTO review_compensation_ledger
+                    (entry_id, entry_key, policy_version, review_event_id, canonical_work_id,
+                     canonical_identity_kind, reviewer, segment_id, source, compensation_action,
+                     effective_decision, decision_revision, duration_ms, rate_basis_points,
+                     entitlement_micro_iqd, delta_micro_iqd, corrected_entitlement_ms,
+                     delta_corrected_ms, reverses_entry_id)
+                 SELECT ?1, ?2, policy_version, NULL, canonical_work_id,
+                        canonical_identity_kind, reviewer, segment_id, 'couch_undo', 'undo',
+                        'undo', decision_revision, duration_ms, rate_basis_points,
+                        entitlement_micro_iqd, -entitlement_micro_iqd, corrected_entitlement_ms,
+                        -corrected_entitlement_ms, entry_id
+                   FROM review_compensation_ledger
+                  WHERE entry_id = ?3",
+            rusqlite::params![reversal_entry_id, reversal_entry_key, original_entry_id],
+        )?;
+        Ok(db.connection().last_insert_rowid())
+    }
+
+    fn insert_effect_event(
+        db: &Database,
+        review_event_id: Option<i64>,
+        segment_id: &str,
+        reviewer: Option<&str>,
+        source: &str,
+        revision: i64,
+    ) -> i64 {
+        insert_effect_event_with_action(db, review_event_id, segment_id, reviewer, source, "edit", revision)
+    }
+
+    fn insert_effect_event_with_action(
+        db: &Database,
+        review_event_id: Option<i64>,
+        segment_id: &str,
+        reviewer: Option<&str>,
+        source: &str,
+        action: &str,
+        revision: i64,
+    ) -> i64 {
+        try_insert_effect_event_with_action(db, review_event_id, segment_id, reviewer, source, action, revision)
+            .unwrap();
+        db.connection().last_insert_rowid()
+    }
+
+    fn try_insert_effect_event_with_action(
+        db: &Database,
+        review_event_id: Option<i64>,
+        segment_id: &str,
+        reviewer: Option<&str>,
+        source: &str,
+        action: &str,
+        revision: i64,
+    ) -> Result<usize, rusqlite::Error> {
+        let operation_id = (source == "desktop").then(|| uuid::Uuid::new_v4().to_string());
+        let operation_payload_hash = operation_id.as_ref().map(|_| "a".repeat(64));
+        let decision_transcript = (action != "reject").then_some("decision transcript");
+        let requested_action = (source == "desktop").then_some(action);
+        let requested_transcript = (source == "desktop").then_some("requested transcript");
+        let requested_timestamp_ms = (source == "desktop").then_some(1_000_i64);
+        db.connection().execute(
+            "INSERT INTO human_decision_effect_events
+                (review_event_id, segment_id, reviewer, source, operation_id,
+                 operation_payload_hash, action, served_transcript, decision_transcript,
+                 decision_annotated_transcript, decision_verified, decision_corrected_at,
+                 requested_action, requested_transcript, requested_timestamp_ms,
+                 prior_revision, decision_revision, prior_verified,
+                 prior_annotated_transcript, prior_verdict, prior_verdict_transcript,
+                 prior_escalated, prior_human_decision, prior_corrected_at, prior_reviewed_by)
+             VALUES (?1, ?2, ?3, ?4, ?7, ?8, ?5, 'served transcript', ?9,
+                     NULL, 1, '2026-08-22 00:00:00', ?10, ?11, ?12,
+                     ?6 - 1, ?6, 0,
+                     NULL, NULL, NULL,
+                     0, NULL, NULL, NULL)",
+            rusqlite::params![
+                review_event_id,
+                segment_id,
+                reviewer,
+                source,
+                action,
+                revision,
+                operation_id,
+                operation_payload_hash,
+                decision_transcript,
+                requested_action,
+                requested_transcript,
+                requested_timestamp_ms,
+            ],
+        )
+    }
+
+    fn insert_flag_effect_event(
+        db: &Database,
+        segment_id: &str,
+        prior_revision: i64,
+        prior_verdict: Option<&str>,
+        prior_rationale: Option<&str>,
+        prior_escalated: bool,
+    ) -> i64 {
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        db.connection()
+            .execute(
+                "INSERT INTO review_flag_effect_events
+                    (operation_id, segment_id, prior_revision, flag_revision,
+                     prior_verdict, prior_rationale, flag_rationale, prior_escalated)
+                 VALUES (?1, ?2, ?3, ?3 + 1, ?4, ?5, 'flagged for review', ?6)",
+                rusqlite::params![
+                    operation_id,
+                    segment_id,
+                    prior_revision,
+                    prior_verdict,
+                    prior_rationale,
+                    prior_escalated as i32
+                ],
+            )
+            .unwrap();
+        db.connection().last_insert_rowid()
+    }
+
+    fn insert_desktop_effect_with_id(db: &Database, id: i64, segment_id: &str, action: &str, revision: i64) {
+        let operation_id = format!("00000000-0000-4000-8000-{id:012x}");
+        let operation_payload_hash = format!("{id:064x}");
+        let decision_transcript = (action != "reject").then_some("post-decision transcript");
+        db.connection()
+            .execute(
+                "INSERT INTO human_decision_effect_events
+                    (id, segment_id, source, operation_id, operation_payload_hash, action,
+                     served_transcript,
+                     decision_transcript, decision_annotated_transcript, decision_verified,
+                     decision_corrected_at, requested_action, requested_transcript,
+                     requested_timestamp_ms, prior_revision, decision_revision,
+                     prior_verified, prior_escalated)
+                 VALUES (?1, ?2, 'desktop', ?3, ?4, ?5, 'served transcript',
+                         ?6, 'post-decision annotation', 1,
+                         '2026-08-22 00:00:00', ?5, 'requested transcript',
+                         1000, ?7 - 1, ?7, 0, 0)",
+                rusqlite::params![
+                    id,
+                    segment_id,
+                    operation_id,
+                    operation_payload_hash,
+                    action,
+                    decision_transcript,
+                    revision,
+                ],
+            )
+            .unwrap();
+    }
+
+    fn v58_fixture_id(index: i64) -> String {
+        format!("00000000-0000-4000-8000-{index:012x}")
+    }
+
+    #[test]
+    fn v59_hidden_key_schema_enforces_policy_scoped_quotas_and_append_only_history() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            "fixture must expose the v59 layer directly"
+        );
+        assert_eq!(get_current_version(&db).unwrap(), 59);
+        let policy = "a".repeat(64);
+        for (reviewer, segment_id) in [("Sara", "s-a"), ("sARA", "s-b"), ("Hemn", "h-a"), ("HEMN", "h-b")] {
+            db.connection()
+                .execute(
+                    "INSERT INTO review_pilot_hidden_keys
+                        (policy_sha256, after_review_event_id, reviewer, segment_id)
+                     VALUES (?1, 863, ?2, ?3)",
+                    rusqlite::params![policy, reviewer, segment_id],
+                )
+                .unwrap();
+        }
+        let reviewer_overflow = db
+            .connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, 863, 'Sara', 's-c')",
+                [&policy],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(reviewer_overflow.contains("quota exceeded"), "unexpected reviewer trigger: {reviewer_overflow}");
+        let global_overflow = db
+            .connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, 863, 'Ali', 'a-a')",
+                [&policy],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(global_overflow.contains("quota exceeded"), "unexpected global trigger: {global_overflow}");
+
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "INSERT OR IGNORE INTO review_pilot_hidden_keys
+                        (policy_sha256, after_review_event_id, reviewer, segment_id)
+                     VALUES (?1, 863, 'SARA', 's-a')",
+                    [&policy],
+                )
+                .unwrap(),
+            0,
+            "a duplicate retry is a no-op even when the reviewer spelling differs"
+        );
+        let other_policy = "b".repeat(64);
+        let rebound = db
+            .connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, 863, 'Ali', 'a-a')",
+                [&other_policy],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(rebound.contains("bound to another policy"), "unexpected policy trigger: {rebound}");
+        db.connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, 864, 'Ali', 'a-a')",
+                [&other_policy],
+            )
+            .unwrap();
+        assert!(db
+            .connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES ('BAD', 863, 'Ali', 'bad-hash')",
+                [],
+            )
+            .is_err());
+        for sql in
+            ["UPDATE review_pilot_hidden_keys SET segment_id = segment_id", "DELETE FROM review_pilot_hidden_keys"]
+        {
+            let error = db.connection().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("append-only"), "unexpected immutable-history trigger: {error}");
+        }
+        let rollback_error = rollback(&db, 1).expect_err("nonempty hidden-key history cannot be erased").to_string();
+        assert!(rollback_error.contains("CHECK constraint failed"), "unexpected rollback guard: {rollback_error}");
+        assert_eq!(get_current_version(&db).unwrap(), 59);
+
+        let empty = Database::open(":memory:").unwrap();
+        empty.initialize().unwrap();
+        assert_eq!(rollback(&empty, 10).unwrap(), vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(rollback(&empty, 1).unwrap(), vec![59]);
+        assert_eq!(get_current_version(&empty).unwrap(), 58);
+        assert_eq!(run_migrations(&empty).unwrap(), vec![59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+    }
+
+    #[test]
+    fn v60_preserves_a_populated_v59_baseline_and_can_downgrade_before_new_activity() {
+        let db = database_at_v59();
+        db.connection()
+            .execute_batch(
+                "INSERT INTO speech_segments
+                     (id, audio_path, audio_content_hash, audio_fingerprint, alignment_json,
+                      duration_ms, human_decision, verdict, verdict_transcript,
+                      annotated_transcript, verified, reviewed_by, corrected_at, review_revision,
+                      escalated, is_gold, rationale)
+                 VALUES
+                     ('v60-baseline-active', '/v60-baseline-active.wav', 'legacy-content-hash',
+                      4242, '{\"source_start_ms\":100,\"source_end_ms\":1211}', 1111,
+                      'edit', 'human_edit', 'legacy verdict transcript', 'legacy annotation',
+                      1, 'Sara', '2026-08-20 12:00:00', 7, 0, 0, 'legacy rationale');
+                 INSERT INTO speech_segments (id, audio_path)
+                 VALUES ('v60-baseline-reversed', '/v60-baseline-reversed.wav');
+                 INSERT INTO speech_segments (id, audio_path, is_gold)
+                 VALUES ('v60-baseline-gold', '/v60-baseline-gold.wav', 1);
+                 INSERT INTO agent_examples
+                     (id, segment_id, wrong_transcript, human_fix, source, verified_by_human, corrector_model_id)
+                 VALUES ('v60-pseudo', 'v60-baseline-active', 'w', 'r', 'model', 0, 'model-x');
+                 INSERT INTO agent_examples
+                     (id, segment_id, wrong_transcript, human_fix)
+                 VALUES ('v60-legacy-human', 'v60-baseline-active', 'w2', 'r2');
+                 INSERT INTO corrections
+                     (id, segment_id, audio_content_hash, raw_hypothesis, human_fix, reviewer_id)
+                 VALUES ('v60-legacy-correction', 'v60-baseline-active', 'hash-a', 'w', 'r', 'Sara');
+                 INSERT INTO correction_memory
+                     (id, wrong_token, human_token, slot_key, phonetic_key, source_segment,
+                      confidence, hit_count, last_fired_at, confirm_count, override_count)
+                 VALUES ('v60-legacy-memory', 'w', 'r', 'left|right', 'phon', 'v60-baseline-active',
+                         0.6666666666666666, 2, '2026-08-20 00:00:00', 3, 1);",
+            )
+            .unwrap();
+        let (active_event, _) = insert_review_original(&db, "v60-baseline-active", "work-v60-active", "Sara", "legacy");
+        let (_, reversed_entry) =
+            insert_review_original(&db, "v60-baseline-reversed", "work-v60-reversed", "Sara", "legacy");
+        reverse_review_entry(&db, &reversed_entry, "pre-v60").unwrap();
+        let pre_counts: (i64, i64, i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM review_events),
+                        (SELECT COUNT(*) FROM review_compensation_ledger),
+                        (SELECT COUNT(*) FROM agent_examples),
+                        (SELECT COUNT(*) FROM corrections)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+        assert_eq!(
+            rollback(&db, 9).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61],
+            "this test isolates the v60 migration"
+        );
+        assert_eq!(get_current_version(&db).unwrap(), 60);
+        let state: (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT effective_after_review_event_id, effective_after_ledger_id
+                   FROM review_effect_state WHERE singleton_key = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (2, 3), "both populated-v59 frontiers must be snapshotted exactly");
+        let reviewed_snapshot: (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*),
+                        SUM(
+                            id = 'v60-baseline-active'
+                            AND original_rowid = (
+                                SELECT rowid FROM speech_segments
+                                 WHERE id = 'v60-baseline-active'
+                            )
+                            AND audio_content_hash IS 'legacy-content-hash'
+                            AND audio_fingerprint IS 4242
+                            AND alignment_json IS '{\"source_start_ms\":100,\"source_end_ms\":1211}'
+                            AND duration_ms IS 1111
+                            AND human_decision IS 'edit'
+                            AND verdict IS 'human_edit'
+                            AND verdict_transcript IS 'legacy verdict transcript'
+                            AND annotated_transcript IS 'legacy annotation'
+                            AND verified IS 1
+                            AND reviewed_by IS 'Sara'
+                            AND corrected_at IS '2026-08-20 12:00:00'
+                            AND review_revision IS 7
+                            AND escalated IS 0
+                            AND is_gold IS 0
+                            AND rationale IS 'legacy rationale'
+                        )
+                   FROM legacy_reviewed_segments_v60",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            reviewed_snapshot,
+            (3, 1),
+            "verified, gold, and pre-v60 event/undo authority must be snapshotted byte-exactly"
+        );
+        let projected_event: i64 = db
+            .connection()
+            .query_row("SELECT review_event_id FROM effective_review_events_v60", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(projected_event, active_event, "a pre-v60 reversal must remain effective after migration");
+        let examples: (i64, i64) = db
+            .connection()
+            .query_row("SELECT COUNT(*), SUM(effect_event_id IS NULL) FROM agent_examples", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(examples, (2, 2), "legacy human and model-pseudo examples must not be reclassified");
+        let snapshot_mismatches: (i64, i64, i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM agent_examples a
+                      WHERE NOT EXISTS (
+                          SELECT 1 FROM legacy_agent_examples_v60 legacy
+                           WHERE legacy.original_rowid=a.rowid
+                             AND legacy.id IS a.id
+                             AND legacy.segment_id IS a.segment_id
+                             AND legacy.audio_features IS a.audio_features
+                             AND legacy.wrong_transcript IS a.wrong_transcript
+                             AND legacy.human_fix IS a.human_fix
+                             AND legacy.created_at IS a.created_at
+                             AND legacy.source IS a.source
+                             AND legacy.verified_by_human IS a.verified_by_human
+                             AND legacy.corrector_model_id IS a.corrector_model_id
+                      )),
+                    (SELECT COUNT(*) FROM legacy_agent_examples_v60 legacy
+                      WHERE NOT EXISTS (SELECT 1 FROM agent_examples a WHERE a.rowid=legacy.original_rowid)),
+                    (SELECT COUNT(*) FROM corrections c
+                      WHERE NOT EXISTS (
+                          SELECT 1 FROM legacy_corrections_v60 legacy
+                           WHERE legacy.original_rowid=c.rowid
+                             AND legacy.id IS c.id
+                             AND legacy.segment_id IS c.segment_id
+                             AND legacy.audio_content_hash IS c.audio_content_hash
+                             AND legacy.raw_hypothesis IS c.raw_hypothesis
+                             AND legacy.ensemble_hyps_json IS c.ensemble_hyps_json
+                             AND legacy.agreement_score IS c.agreement_score
+                             AND legacy.jury_verdict IS c.jury_verdict
+                             AND legacy.human_fix IS c.human_fix
+                             AND legacy.model_version_id IS c.model_version_id
+                             AND legacy.adapter_id IS c.adapter_id
+                             AND legacy.reviewer_id IS c.reviewer_id
+                             AND legacy.loop_applied IS c.loop_applied
+                             AND legacy.decided_at IS c.decided_at
+                      )),
+                    (SELECT COUNT(*) FROM legacy_corrections_v60 legacy
+                      WHERE NOT EXISTS (SELECT 1 FROM corrections c WHERE c.rowid=legacy.original_rowid))",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(snapshot_mismatches, (0, 0, 0, 0), "legacy snapshots must be exact and complete");
+        let active_corrections: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM active_corrections_v60", [], |row| row.get(0)).unwrap();
+        assert_eq!(active_corrections, 1, "an unbound v59 correction remains legacy-active");
+        for sql in [
+            "UPDATE legacy_agent_examples_v60 SET human_fix='forged' WHERE id='v60-legacy-human'",
+            "DELETE FROM legacy_agent_examples_v60 WHERE id='v60-legacy-human'",
+            "INSERT INTO legacy_agent_examples_v60 SELECT * FROM legacy_agent_examples_v60 LIMIT 1",
+            "UPDATE legacy_corrections_v60 SET human_fix='forged' WHERE id='v60-legacy-correction'",
+            "DELETE FROM legacy_corrections_v60 WHERE id='v60-legacy-correction'",
+            "INSERT INTO legacy_corrections_v60 SELECT * FROM legacy_corrections_v60 LIMIT 1",
+            "UPDATE legacy_reviewed_segments_v60 SET rationale='forged' WHERE id='v60-baseline-active'",
+            "DELETE FROM legacy_reviewed_segments_v60 WHERE id='v60-baseline-active'",
+            "INSERT INTO legacy_reviewed_segments_v60 SELECT * FROM legacy_reviewed_segments_v60 LIMIT 1",
+            "UPDATE agent_examples SET human_fix='forged' WHERE id='v60-legacy-human'",
+            "DELETE FROM corrections WHERE id='v60-legacy-correction'",
+        ] {
+            let error = db.connection().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("immutable") || error.contains("append-only"), "legacy proof changed: {error}");
+        }
+        let memory: (i64, i64, i64, f64, i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT hit_count, confirm_count, override_count, confidence, legacy_seed, active_capture_count
+                   FROM effective_correction_memory_v60 WHERE id = 'v60-legacy-memory'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!((memory.0, memory.1, memory.2, memory.4, memory.5), (2, 3, 1, 1, 0));
+        assert!((memory.3 - (4.0 / 6.0)).abs() < 1e-12, "legacy Beta confidence must be recomputed exactly");
+
+        let legacy_phone_binding = try_insert_effect_event_with_action(
+            &db,
+            Some(active_event),
+            "v60-baseline-active",
+            Some("Sara"),
+            "couch",
+            "edit",
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            legacy_phone_binding.contains("exact phone/desktop boundary"),
+            "a pre-cutoff event was repurposed as a v60 phone effect: {legacy_phone_binding}"
+        );
+
+        for sql in [
+            "UPDATE review_effect_state SET effective_after_review_event_id = 0",
+            "DELETE FROM review_effect_state",
+            "INSERT INTO review_effect_state(singleton_key, effective_after_review_event_id, effective_after_ledger_id) VALUES (1, 0, 0)",
+        ] {
+            let error = db.connection().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("immutable"), "unexpected state immutability error: {error}");
+        }
+
+        db.connection()
+            .execute("UPDATE speech_segments SET confidence=0.75 WHERE id='v60-baseline-active'", [])
+            .unwrap();
+        let revisions: (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT segment.review_revision, legacy.review_revision
+                   FROM speech_segments segment
+                   JOIN legacy_reviewed_segments_v60 legacy ON legacy.id=segment.id
+                  WHERE segment.id='v60-baseline-active'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(revisions, (8, 7), "unrelated metadata may advance the live revision above its authority floor");
+
+        assert_eq!(rollback(&db, 1).unwrap(), vec![60], "no v60 activity means downgrade is lossless");
+        assert_eq!(get_current_version(&db).unwrap(), 59);
+        let removed_v60_objects: (i64, i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM sqlite_master
+                      WHERE name IN ('legacy_agent_examples_v60', 'legacy_corrections_v60',
+                                     'legacy_reviewed_segments_v60',
+                                     'legacy_machine_verdict_segments_v60')),
+                    (SELECT COUNT(*) FROM pragma_table_info('review_events')
+                      WHERE name IN ('requested_action', 'requested_transcript',
+                                     'served_transcript', 'served_revision')),
+                    (SELECT COUNT(*) FROM sqlite_master
+                      WHERE type='trigger'
+                        AND name='human_decision_effect_events_validate_rationale_insert')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            removed_v60_objects,
+            (0, 0, 0),
+            "downgrade must remove only the v60 snapshot/request/rationale-proof layer"
+        );
+        let post_counts: (i64, i64, i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM review_events),
+                        (SELECT COUNT(*) FROM review_compensation_ledger),
+                        (SELECT COUNT(*) FROM agent_examples),
+                        (SELECT COUNT(*) FROM corrections)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(post_counts, pre_counts, "v60 up/down must not reinterpret or lose populated-v59 rows");
+    }
+
+    #[test]
+    fn v60_reviewed_snapshot_cannot_bless_forged_post_cutoff_human_truth() {
+        let db = database_at_v60();
+        db.connection()
+            .execute(
+                "INSERT INTO speech_segments
+                    (id, audio_path, verified, human_decision, reviewed_by, corrected_at)
+                 VALUES ('forged-unbound-human', '/forged-unbound-human.wav', 1, 'edit',
+                         'Mallory', '2026-08-22 12:00:00')",
+                [],
+            )
+            .unwrap();
+
+        let blessed: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM legacy_reviewed_segments_v60
+                  WHERE id='forged-unbound-human'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blessed, 0, "the immutable migration frontier must never absorb post-cutoff human truth");
+
+        let immutable_error = db
+            .connection()
+            .execute(
+                "INSERT INTO legacy_reviewed_segments_v60
+                    (original_rowid, id, audio_content_hash, audio_fingerprint, alignment_json,
+                     duration_ms, human_decision, verdict, verdict_transcript,
+                     annotated_transcript, verified, reviewed_by, corrected_at, review_revision,
+                     escalated, is_gold, rationale)
+                 SELECT rowid, id, audio_content_hash, audio_fingerprint, alignment_json,
+                        duration_ms, human_decision, verdict, verdict_transcript,
+                        annotated_transcript, verified, reviewed_by, corrected_at, review_revision,
+                        escalated, is_gold, rationale
+                   FROM speech_segments WHERE id='forged-unbound-human'",
+                [],
+            )
+            .expect_err("direct SQL must not be able to bless a forged human-owned row")
+            .to_string();
+        assert!(immutable_error.contains("immutable"), "unexpected snapshot guard: {immutable_error}");
+
+        let rollback_error = rollback(&db, 1)
+            .expect_err("downgrade must not erase the only evidence that this human-owned row is unbound")
+            .to_string();
+        assert!(rollback_error.contains("CHECK constraint failed"), "unexpected rollback guard: {rollback_error}");
+        assert_eq!(get_current_version(&db).unwrap(), 60);
+    }
+
+    #[test]
+    fn v60_segment_delete_requires_complete_absence_of_review_authority() {
+        let db = database_at_v59();
+        db.connection()
+            .execute_batch(
+                "INSERT INTO speech_segments
+                    (id, audio_path, verified, human_decision, reviewed_by, corrected_at)
+                 VALUES ('delete-legacy-reviewed', '/delete-legacy-reviewed.wav', 1, 'accept',
+                         'Legacy Reviewer', '2026-08-21 00:00:00');
+                 INSERT INTO speech_segments(id, audio_path) VALUES
+                    ('delete-event', '/delete-event.wav'),
+                    ('delete-effect', '/delete-effect.wav'),
+                    ('delete-flag', '/delete-flag.wav'),
+                    ('delete-pay', '/delete-pay.wav'),
+                    ('delete-spot', '/delete-spot.wav'),
+                    ('delete-hidden', '/delete-hidden.wav'),
+                    ('delete-example', '/delete-example.wav'),
+                    ('delete-correction', '/delete-correction.wav'),
+                    ('delete-memory', '/delete-memory.wav'),
+                    ('delete-decision-log', '/delete-decision-log.wav'),
+                    ('delete-machine-current', '/delete-machine-current.wav'),
+                    ('delete-clean', '/delete-clean.wav');
+                 INSERT INTO speech_segments
+                    (id, audio_path, duration_ms, alignment_json, audio_content_hash)
+                 VALUES ('delete-playback', '/delete-playback.wav', 1000,
+                         '{\"source_start_ms\":0,\"source_end_ms\":1000}',
+                         'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+                 INSERT INTO corrections
+                    (id, segment_id, audio_content_hash, raw_hypothesis, human_fix)
+                 VALUES ('delete-correction-proof', 'delete-correction', 'correction-hash', 'w', 'r');
+                 INSERT INTO correction_memory
+                    (id, wrong_token, human_token, slot_key, phonetic_key, source_segment)
+                 VALUES ('delete-memory-proof', 'w', 'r', 'slot', 'phon', 'delete-memory');",
+            )
+            .unwrap();
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+
+        assert_eq!(
+            db.connection().execute("DELETE FROM speech_segments WHERE id='delete-clean'", []).unwrap(),
+            1,
+            "a genuinely unreviewed, authority-free segment must remain deletable"
+        );
+
+        db.connection()
+            .execute(
+                "INSERT INTO speech_segments
+                    (id, audio_path, verified, human_decision, reviewed_by, corrected_at)
+                 VALUES ('delete-human-state', '/delete-human-state.wav', 1, 'edit',
+                         'Current Reviewer', '2026-08-22 00:00:00')",
+                [],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO review_events
+                    (segment_id, reviewer, action, source, timestamp_ms, duration_ms,
+                     compensation_action)
+                 VALUES ('delete-event', 'Sara', 'edit', 'test', 1000, 1000, 'edit')",
+                [],
+            )
+            .unwrap();
+        insert_effect_event(&db, None, "delete-effect", None, "desktop", 1);
+        insert_flag_effect_event(&db, "delete-flag", 0, None, None, false);
+        db.connection()
+            .execute(
+                "INSERT INTO review_compensation_ledger
+                    (entry_id, entry_key, policy_version, review_event_id, canonical_work_id,
+                     canonical_identity_kind, reviewer, segment_id, source, compensation_action,
+                     effective_decision, decision_revision, duration_ms, rate_basis_points,
+                     entitlement_micro_iqd, delta_micro_iqd, corrected_entitlement_ms,
+                     delta_corrected_ms)
+                 VALUES ('delete-pay-entry', 'delete-pay-key', 'review-iqd-v1-2026-08-21', NULL,
+                         'delete-pay-work', 'audio_content_hash', 'Sara', 'delete-pay', 'test',
+                         'skip', 'skip', NULL, 1000, 0, 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO playback_receipts
+                    (segment_id, segment_revision, audio_fingerprint, reviewer, session_id,
+                     started_at_ms, played_ms, clip_duration_ms, coverage_ratio, policy_version,
+                     source_start_ms, source_end_ms)
+                 VALUES ('delete-playback', 0,
+                         'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                         'Sara', 'delete-session',
+                         1, 1000, 1000, 1.0, 3, 0, 1000)",
+                [],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO spot_checks
+                    (segment_id, reviewer, action, submitted_transcript,
+                     expected_transcript, noticed, cer)
+                 VALUES ('delete-spot', 'Sara', 'edit', 'right', 'right', 1, 0.0)",
+                [],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, 0, 'Sara', 'delete-hidden')",
+                ["a".repeat(64)],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO agent_examples
+                    (id, segment_id, wrong_transcript, human_fix, source,
+                     verified_by_human, corrector_model_id)
+                 VALUES ('delete-example-proof', 'delete-example', 'w', 'r', 'model', 0, 'model-x')",
+                [],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO decision_log(segment_id, decision_type, timestamp_ms)
+                 VALUES ('delete-decision-log', 'test', 1)",
+                [],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET verdict='jury_accept', verdict_transcript='machine',
+                        jury_transcript='machine', evidence_json='{\"machine\":true}',
+                        agreement_score=0.8
+                  WHERE id='delete-machine-current'",
+                [],
+            )
+            .unwrap();
+
+        for segment_id in [
+            "delete-legacy-reviewed",
+            "delete-human-state",
+            "delete-event",
+            "delete-effect",
+            "delete-flag",
+            "delete-pay",
+            "delete-playback",
+            "delete-spot",
+            "delete-hidden",
+            "delete-example",
+            "delete-correction",
+            "delete-memory",
+            "delete-decision-log",
+            "delete-machine-current",
+        ] {
+            let error = db
+                .connection()
+                .execute("DELETE FROM speech_segments WHERE id=?1", [segment_id])
+                .expect_err("durable authority must make direct segment deletion fail closed")
+                .to_string();
+            assert!(
+                error.contains("durable review authority"),
+                "{segment_id} escaped the parent authority guard: {error}"
+            );
+            let remains: i64 = db
+                .connection()
+                .query_row("SELECT COUNT(*) FROM speech_segments WHERE id=?1", [segment_id], |row| row.get(0))
+                .unwrap();
+            assert_eq!(remains, 1, "failed deletion must preserve {segment_id}");
+        }
+    }
+
+    #[test]
+    fn v60_refuses_ambiguous_preexisting_correction_memory_duplicates_atomically() {
+        let db = database_at_v59();
+        db.connection()
+            .execute_batch(
+                "INSERT INTO correction_memory (id, wrong_token, human_token, slot_key, phonetic_key)
+                 VALUES ('duplicate-a', 'w', 'r', 'slot', 'p');
+                 INSERT INTO correction_memory (id, wrong_token, human_token, slot_key, phonetic_key)
+                 VALUES ('duplicate-b', 'w', 'r', 'slot', 'other-phonetic');",
+            )
+            .unwrap();
+        let error = run_migrations(&db)
+            .expect_err("v60 must fail rather than guess how to merge inconsistent natural-key duplicates")
+            .to_string();
+        assert!(error.contains("UNIQUE constraint failed"), "unexpected duplicate-baseline error: {error}");
+        assert_eq!(get_current_version(&db).unwrap(), 59, "the entire failed v60 migration must roll back");
+        let leaked_schema: i64 = db
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM pragma_table_info('correction_memory') WHERE name='legacy_seed')
+                      + (SELECT COUNT(*) FROM sqlite_master
+                          WHERE type='table' AND name='human_decision_effect_events')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked_schema, 0, "a rejected baseline must leave no half-applied v60 schema");
+    }
+
+    #[test]
+    fn v60_legacy_artifacts_cannot_be_rebound_to_a_new_effect_by_update() {
+        let db = database_at_v59();
+        db.connection()
+            .execute_batch(
+                "INSERT INTO speech_segments(id, audio_path)
+                 VALUES ('legacy-rebind-segment', '/legacy-rebind.wav');
+                 INSERT INTO agent_examples(id, segment_id, wrong_transcript, human_fix)
+                 VALUES ('legacy-rebind-example', 'legacy-rebind-segment', 'w', 'r');
+                 INSERT INTO corrections(id, segment_id, audio_content_hash, raw_hypothesis, human_fix)
+                 VALUES ('legacy-rebind-correction', 'legacy-rebind-segment', 'hash', 'w', 'r');",
+            )
+            .unwrap();
+        run_migrations(&db).unwrap();
+        let effect = insert_effect_event(&db, None, "legacy-rebind-segment", None, "desktop", 1);
+        for sql in [
+            format!("UPDATE agent_examples SET effect_event_id={effect} WHERE id='legacy-rebind-example'"),
+            format!("UPDATE corrections SET effect_event_id={effect} WHERE id='legacy-rebind-correction'"),
+        ] {
+            let error = db.connection().execute(&sql, []).unwrap_err().to_string();
+            assert!(error.contains("append-only"), "legacy artifact acquired a post-v60 effect binding: {error}");
+        }
+    }
+
+    #[test]
+    fn v60_effective_review_events_keep_only_the_latest_non_reversed_original() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let (first_event, _) = insert_review_original(&db, "review-first", "same-work", "Sara", "couch");
+        let (later_event, later_entry) = insert_review_original(&db, "review-later", "same-work", "Sara", "couch");
+        let visible: i64 = db
+            .connection()
+            .query_row("SELECT review_event_id FROM effective_review_events_v60", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(visible, later_event, "the latest active event must shadow an earlier active event for the work");
+
+        reverse_review_entry(&db, &later_entry, "later-undo").unwrap();
+        let late_effect_binding = try_insert_effect_event_with_action(
+            &db,
+            Some(later_event),
+            "review-later",
+            Some("Sara"),
+            "couch",
+            "edit",
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            late_effect_binding.contains("exact phone/desktop boundary"),
+            "an already-reversed original acquired a new phone effect: {late_effect_binding}"
+        );
+        let restored: i64 = db
+            .connection()
+            .query_row("SELECT review_event_id FROM effective_review_events_v60", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(restored, first_event, "a later row that is itself reversed must not shadow the prior event");
+        let second_reversal = reverse_review_entry(&db, &later_entry, "duplicate-later-undo")
+            .expect_err("one original ledger entry can have at most one reversal")
+            .to_string();
+        assert!(second_reversal.contains("UNIQUE constraint failed"), "unexpected reversal error: {second_reversal}");
+
+        let (_, undone_entry) = insert_review_original(&db, "redo-before", "redo-work", "Sara", "couch");
+        reverse_review_entry(&db, &undone_entry, "redo-first-undo").unwrap();
+        let (redo_event, redo_entry) = insert_review_original(&db, "redo-after", "redo-work", "Sara", "couch");
+        let redo_visible: i64 = db
+            .connection()
+            .query_row(
+                "SELECT review_event_id FROM effective_review_events_v60 WHERE canonical_work_id='redo-work'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(redo_visible, redo_event, "redo is a new original event, never mutation of the undone row");
+        let wrong_revision = db
+            .connection()
+            .execute(
+                "INSERT INTO human_decision_effect_events
+                    (review_event_id, segment_id, reviewer, source, action,
+                     served_transcript, decision_transcript, decision_verified, decision_corrected_at,
+                     prior_revision, decision_revision, prior_verified, prior_escalated)
+                 VALUES (?1, 'redo-after', 'Sara', 'couch', 'edit', 'served transcript',
+                         'decision transcript', 1, '2026-08-22 00:00:00', 98, 99, 0, 0)",
+                [redo_event],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            wrong_revision.contains("exact phone/desktop boundary"),
+            "the phone effect must bind the ledger revision: {wrong_revision}"
+        );
+        let mismatched_served = db
+            .connection()
+            .execute(
+                "INSERT INTO human_decision_effect_events
+                    (review_event_id, segment_id, reviewer, source, action,
+                     served_transcript, decision_transcript, decision_verified, decision_corrected_at,
+                     prior_revision, decision_revision, prior_verified, prior_escalated)
+                 VALUES (?1, 'redo-after', 'Sara', 'couch', 'edit', 'forged served transcript',
+                         'decision transcript', 1, '2026-08-22 00:00:00', 0, 1, 0, 0)",
+                [redo_event],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            mismatched_served.contains("exact phone/desktop boundary"),
+            "phone effect detached from its immutable served transcript: {mismatched_served}"
+        );
+        let phone_effect = insert_effect_event(&db, Some(redo_event), "redo-after", Some("Sara"), "couch", 1);
+        assert!(phone_effect > 0);
+        let phone_served_binding: (String, i64, String, i64) = db
+            .connection()
+            .query_row(
+                "SELECT event.served_transcript, event.served_revision,
+                        effect.served_transcript, effect.prior_revision
+                   FROM review_events event
+                   JOIN human_decision_effect_events effect ON effect.review_event_id=event.id
+                  WHERE effect.id=?1",
+                [phone_effect],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(phone_served_binding, ("served transcript".into(), 0, "served transcript".into(), 0));
+        let duplicate_phone_effect = db
+            .connection()
+            .execute(
+                "INSERT INTO human_decision_effect_events
+                    (review_event_id, segment_id, reviewer, source, action,
+                     served_transcript, decision_transcript, decision_verified, decision_corrected_at,
+                     prior_revision, decision_revision, prior_verified, prior_escalated)
+                 VALUES (?1, 'redo-after', 'Sara', 'couch', 'edit', 'served transcript',
+                         'decision transcript', 1, '2026-08-22 00:00:00', 0, 1, 0, 0)",
+                [redo_event],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate_phone_effect.contains("UNIQUE constraint failed"));
+        let mismatched_phone_effect = db
+            .connection()
+            .execute(
+                "INSERT INTO human_decision_effect_events
+                    (review_event_id, segment_id, reviewer, source, action,
+                     served_transcript, decision_transcript, decision_verified, decision_corrected_at,
+                     prior_revision, decision_revision, prior_verified, prior_escalated)
+                 VALUES (?1, 'wrong-segment', 'Sara', 'couch', 'edit', 'served transcript',
+                         'decision transcript', 1, '2026-08-22 00:00:00', 0, 1, 0, 0)",
+                [first_event],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(mismatched_phone_effect.contains("exact phone/desktop boundary"));
+        let unbound_phone_undo = db
+            .connection()
+            .execute(
+                "INSERT INTO human_decision_effect_reversals(effect_event_id, operation_id)
+                 VALUES (?1, 'wrong-phone-undo')",
+                [phone_effect],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(unbound_phone_undo.contains("exact compensation reversal"));
+        reverse_review_entry(&db, &redo_entry, "phone-effect-undo").unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO human_decision_effect_reversals(effect_event_id, operation_id)
+                 VALUES (?1, 'phone-effect-undo')",
+                [phone_effect],
+            )
+            .unwrap();
+
+        for sql in [
+            format!("UPDATE review_events SET action='accept' WHERE id={redo_event}"),
+            format!("DELETE FROM review_events WHERE id={redo_event}"),
+        ] {
+            let error = db.connection().execute(&sql, []).unwrap_err().to_string();
+            assert!(error.contains("append-only"), "unexpected post-cutoff event immutability error: {error}");
+        }
+
+        let (hidden_event, _) =
+            insert_review_original(&db, "hidden-effect-forbidden", "hidden-work", "Sara", "couch_spot_check");
+        let hidden_served_binding: (String, i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT event.served_transcript, event.served_revision, ledger.decision_revision
+                   FROM review_events event
+                   JOIN review_compensation_ledger ledger ON ledger.review_event_id=event.id
+                  WHERE event.id=?1",
+                [hidden_event],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(hidden_served_binding, ("served transcript".into(), 1, 1));
+        for (review_event_id, segment_id, reviewer, source, label) in [
+            (Some(hidden_event), "hidden-effect-forbidden", Some("Sara"), "couch_spot_check", "hidden spot-check"),
+            (Some(first_event), "review-first", None, "couch", "reviewer-less phone"),
+            (None, "desktop-with-reviewer", Some("Sara"), "desktop", "reviewer-bearing desktop"),
+        ] {
+            let error =
+                try_insert_effect_event_with_action(&db, review_event_id, segment_id, reviewer, source, "edit", 1)
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("exact phone/desktop boundary"), "{label} effect crossed the v60 boundary: {error}");
+        }
+    }
+
+    #[test]
+    fn v60_paid_event_build_and_playback_provenance_is_canonical_and_immutable() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let insert = |segment: &str, source: &str, sha: Option<&str>, guard: Option<&str>| {
+            let operation_id = uuid::Uuid::new_v4().to_string();
+            let paid_source = matches!(source, "couch" | "couch_spot_check");
+            db.connection().execute(
+                "INSERT INTO review_events
+                    (segment_id, reviewer, action, source, timestamp_ms, duration_ms,
+                     compensation_action, operation_id, operation_payload_hash,
+                     app_git_sha, playback_guard_version, requested_action, requested_transcript,
+                     served_transcript, served_revision)
+                 VALUES (?1, 'Sara', 'edit', ?2, 1, 1000, 'edit', ?3, ?4,
+                         ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    segment,
+                    source,
+                    paid_source.then_some(operation_id),
+                    paid_source.then(|| "a".repeat(64)),
+                    sha,
+                    guard,
+                    paid_source.then_some("edit"),
+                    paid_source.then_some("requested transcript"),
+                    paid_source.then_some("served transcript"),
+                    paid_source.then_some(0_i64),
+                ],
+            )
+        };
+        for (segment, sha, guard) in [
+            ("missing", None, None),
+            ("blank", Some(""), Some("content-hash-raw-counter-v3")),
+            ("uppercase", Some("ABCDEF0"), Some("content-hash-raw-counter-v3")),
+            ("too-short", Some("abcdef"), Some("content-hash-raw-counter-v3")),
+            ("unknown-build", Some("unknown"), Some("content-hash-raw-counter-v3")),
+            ("short-build", Some("abcdef0"), Some("content-hash-raw-counter-v3")),
+            ("old-guard", Some("0123456789abcdef0123456789abcdef01234567"), Some("raw-counter-v2")),
+        ] {
+            let error = insert(segment, "couch", sha, guard).unwrap_err().to_string();
+            assert!(error.contains("canonical build"), "unexpected provenance rejection for {segment}: {error}");
+        }
+        for sql in [
+            "INSERT INTO review_events
+                (segment_id, reviewer, action, source, timestamp_ms, duration_ms, compensation_action,
+                 app_git_sha, playback_guard_version, requested_action, requested_transcript,
+                 served_transcript, served_revision)
+             VALUES ('missing-operation', 'Sara', 'edit', 'couch', 1, 1000, 'edit',
+                     '0123456789abcdef0123456789abcdef01234567',
+                     'content-hash-raw-counter-v3', 'edit', 'requested', 'served', 0)",
+            "INSERT INTO review_events
+                (segment_id, reviewer, action, source, timestamp_ms, duration_ms, compensation_action,
+                 operation_id, operation_payload_hash, app_git_sha, playback_guard_version,
+                 requested_action, requested_transcript, served_transcript, served_revision)
+             VALUES ('missing-request-text', 'Sara', 'edit', 'couch', 1, 1000, 'edit',
+                     'missing-request-text-op',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     '0123456789abcdef0123456789abcdef01234567',
+                     'content-hash-raw-counter-v3', 'edit', NULL, 'served', 0)",
+        ] {
+            let error = db.connection().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("canonical build"), "paid request/operation evidence was optional: {error}");
+        }
+        for sql in [
+            "INSERT INTO review_events
+                (segment_id, reviewer, action, source, timestamp_ms, duration_ms, compensation_action,
+                 operation_id, operation_payload_hash, app_git_sha, playback_guard_version,
+                 requested_action, requested_transcript, served_transcript, served_revision)
+             VALUES ('missing-served', 'Sara', 'edit', 'couch', 1, 1000, 'edit',
+                     'missing-served-operation',
+                     '1111111111111111111111111111111111111111111111111111111111111111',
+                     '0123456789abcdef0123456789abcdef01234567',
+                     'content-hash-raw-counter-v3', 'edit', 'requested', NULL, 0)",
+            "INSERT INTO review_events
+                (segment_id, reviewer, action, source, timestamp_ms, duration_ms, compensation_action,
+                 operation_id, operation_payload_hash, app_git_sha, playback_guard_version,
+                 requested_action, requested_transcript, served_transcript, served_revision)
+             VALUES ('blank-served', 'Sara', 'edit', 'couch', 1, 1000, 'edit',
+                     'blank-served-operation',
+                     '2222222222222222222222222222222222222222222222222222222222222222',
+                     '0123456789abcdef0123456789abcdef01234567',
+                     'content-hash-raw-counter-v3', 'edit', 'requested', ' ', 0)",
+            "INSERT INTO review_events
+                (segment_id, reviewer, action, source, timestamp_ms, duration_ms, compensation_action,
+                 operation_id, operation_payload_hash, app_git_sha, playback_guard_version,
+                 requested_action, requested_transcript, served_transcript, served_revision)
+             VALUES ('negative-served-revision', 'Sara', 'edit', 'couch', 1, 1000, 'edit',
+                     'negative-served-revision-operation',
+                     '3333333333333333333333333333333333333333333333333333333333333333',
+                     '0123456789abcdef0123456789abcdef01234567',
+                     'content-hash-raw-counter-v3', 'edit', 'requested', 'served', -1)",
+        ] {
+            let error = db.connection().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("canonical build"), "noncanonical served evidence passed: {error}");
+        }
+        insert(
+            "full-build",
+            "couch",
+            Some("0123456789abcdef0123456789abcdef01234567"),
+            Some("content-hash-raw-counter-v3"),
+        )
+        .unwrap();
+        insert(
+            "full-build-spot",
+            "couch_spot_check",
+            Some("fedcba9876543210fedcba9876543210fedcba98"),
+            Some("content-hash-raw-counter-v3"),
+        )
+        .unwrap();
+        let standalone_hidden_event_id: i64 = db
+            .connection()
+            .query_row("SELECT id FROM review_events WHERE segment_id='full-build-spot'", [], |row| row.get(0))
+            .unwrap();
+        let insert_hidden_ledger = |decision_revision: i64| {
+            db.connection().execute(
+                "INSERT INTO review_compensation_ledger
+                    (entry_id, entry_key, policy_version, review_event_id, canonical_work_id,
+                     canonical_identity_kind, reviewer, segment_id, source, compensation_action,
+                     effective_decision, decision_revision, duration_ms, rate_basis_points,
+                     entitlement_micro_iqd, delta_micro_iqd, corrected_entitlement_ms,
+                     delta_corrected_ms)
+                 VALUES ('standalone-hidden-entry', 'standalone-hidden-key',
+                         'review-iqd-v1-2026-08-21', ?1, 'standalone-hidden-work',
+                         'audio_content_hash', 'Sara', 'full-build-spot', 'couch_spot_check',
+                         'edit', 'edit', ?2, 1000, 10000, 5000000, 5000000, 1000, 1000)",
+                rusqlite::params![standalone_hidden_event_id, decision_revision],
+            )
+        };
+        let hidden_revision_mismatch = insert_hidden_ledger(1).unwrap_err().to_string();
+        assert!(
+            hidden_revision_mismatch.contains("served revision"),
+            "hidden ledger detached from served revision: {hidden_revision_mismatch}"
+        );
+        insert_hidden_ledger(0).unwrap();
+        db.connection()
+            .execute_batch(
+                "INSERT INTO review_events
+                    (segment_id, reviewer, action, source, timestamp_ms, duration_ms,
+                     compensation_action, operation_id, operation_payload_hash,
+                     app_git_sha, playback_guard_version, requested_action, requested_transcript,
+                     served_transcript, served_revision)
+                 VALUES ('raw-bad-to-reject', 'Sara', 'reject', 'couch', 1, 1000,
+                         'reject', 'raw-bad-operation',
+                         'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                         '0123456789abcdef0123456789abcdef01234567',
+                         'content-hash-raw-counter-v3', 'bad', 'raw requested transcript',
+                         'served bad transcript', 0);
+                 INSERT INTO review_events
+                    (segment_id, reviewer, action, source, timestamp_ms, duration_ms,
+                     compensation_action, operation_id, operation_payload_hash,
+                     app_git_sha, playback_guard_version, requested_action, requested_transcript,
+                     served_transcript, served_revision)
+                 VALUES ('noop-edit-to-accept', 'Sara', 'accept', 'couch', 1, 1000,
+                         'accept', 'noop-edit-operation',
+                         'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                         '0123456789abcdef0123456789abcdef01234567',
+                         'content-hash-raw-counter-v3', 'edit', 'unchanged requested transcript',
+                         'unchanged requested transcript', 0);",
+            )
+            .unwrap();
+        insert("non-paid-source", "desktop", None, None).unwrap();
+
+        let paid: (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*), SUM(playback_guard_version='content-hash-raw-counter-v3')
+                   FROM review_events WHERE source IN ('couch','couch_spot_check')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(paid, (4, 4));
+        let raw_request_mappings: Vec<(String, String)> = db
+            .connection()
+            .prepare(
+                "SELECT requested_action, action FROM review_events
+                  WHERE segment_id IN ('raw-bad-to-reject', 'noop-edit-to-accept')
+                  ORDER BY segment_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            raw_request_mappings,
+            vec![("edit".into(), "accept".into()), ("bad".into(), "reject".into())],
+            "raw phone intent must survive server classification without semantic rewriting"
+        );
+        let event_id: i64 = db
+            .connection()
+            .query_row("SELECT id FROM review_events WHERE segment_id='full-build-spot'", [], |row| row.get(0))
+            .unwrap();
+        let update_error = db
+            .connection()
+            .execute("UPDATE review_events SET app_git_sha='abcdef1' WHERE id=?1", [event_id])
+            .unwrap_err()
+            .to_string();
+        assert!(update_error.contains("immutable") || update_error.contains("append-only"));
+        let requested_update_error = db
+            .connection()
+            .execute("UPDATE review_events SET requested_action='accept' WHERE id=?1", [event_id])
+            .unwrap_err()
+            .to_string();
+        assert!(requested_update_error.contains("append-only"));
+        let served_update_error = db
+            .connection()
+            .execute("UPDATE review_events SET served_transcript='forged' WHERE id=?1", [event_id])
+            .unwrap_err()
+            .to_string();
+        assert!(served_update_error.contains("append-only"));
+
+        let (effective_event, _) =
+            insert_review_original(&db, "requested-view", "requested-view-work", "Sara", "couch");
+        let projected_request: (String, String, String, i64) = db
+            .connection()
+            .query_row(
+                "SELECT requested_action, requested_transcript, served_transcript, served_revision
+                   FROM effective_review_events_v60 WHERE review_event_id=?1",
+                [effective_event],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(projected_request, ("edit".into(), "requested transcript".into(), "served transcript".into(), 0));
+
+        let legacy = database_at_v59();
+        legacy
+            .connection()
+            .execute(
+                "INSERT INTO review_events(segment_id, reviewer, action, source, timestamp_ms, duration_ms)
+                 VALUES ('legacy-mutable', 'Sara', 'accept', 'legacy', 1, 1000)",
+                [],
+            )
+            .unwrap();
+        run_migrations(&legacy).unwrap();
+        assert_eq!(
+            legacy
+                .connection()
+                .execute("UPDATE review_events SET timestamp_ms=2 WHERE segment_id='legacy-mutable'", [],)
+                .unwrap(),
+            1,
+            "pre-v60 event rows remain migration-compatible"
+        );
+    }
+
+    #[test]
+    fn v60_policy3_playback_receipts_bind_exact_server_identity_and_span_and_are_immutable() {
+        let db = database_at_v60();
+        db.connection()
+            .execute_batch(
+                "INSERT INTO speech_segments
+                    (id, audio_path, duration_ms, alignment_json, audio_content_hash, review_revision)
+                 VALUES ('policy3-exact', '/policy3-exact.wav', 1000,
+                         '{\"source_start_ms\":5000,\"source_end_ms\":6000}',
+                         'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 7);
+                 INSERT INTO speech_segments
+                    (id, audio_path, duration_ms, alignment_json, audio_content_hash, review_revision)
+                 VALUES ('policy3-rounded', '/policy3-rounded.wav', 999,
+                         '{\"source_start_ms\":0,\"source_end_ms\":1000}',
+                         'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 11);
+                 INSERT INTO speech_segments
+                    (id, audio_path, duration_ms, alignment_json, audio_content_hash, review_revision)
+                 VALUES ('policy3-boolean', '/policy3-boolean.wav', 1000,
+                         '{\"source_start_ms\":true,\"source_end_ms\":1001}',
+                         'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 13);
+                 INSERT INTO speech_segments
+                    (id, audio_path, duration_ms, alignment_json, audio_content_hash, review_revision)
+                 VALUES ('policy3-invalid-hash', '/policy3-invalid-hash.wav', 1000,
+                         '{\"source_start_ms\":0,\"source_end_ms\":1000}', 'not-a-blake3-digest', 17);
+                 INSERT INTO speech_segments
+                    (id, audio_path, duration_ms, alignment_json, audio_content_hash, review_revision)
+                 VALUES ('policy3-zero-duration', '/policy3-zero-duration.wav', 0,
+                         '{\"source_start_ms\":0,\"source_end_ms\":1}',
+                         'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', 19);
+                 INSERT INTO speech_segments(id, audio_path, duration_ms)
+                 VALUES ('policy2-history', '/policy2-history.wav', 1000);",
+            )
+            .unwrap();
+
+        let insert_policy3 = |segment_id: &str,
+                              segment_revision: i64,
+                              audio_content_hash: &str,
+                              clip_duration_ms: i64,
+                              start_ms: i64,
+                              end_ms: i64| {
+            db.connection().execute(
+                "INSERT INTO playback_receipts
+                    (segment_id, segment_revision, audio_fingerprint, reviewer, session_id,
+                     started_at_ms, played_ms, clip_duration_ms, coverage_ratio, policy_version,
+                     source_start_ms, source_end_ms)
+                 VALUES (?1, ?2, ?3, 'Sara', 'policy3-session',
+                         1, ?4, ?4, 1.0, 3, ?5, ?6)",
+                rusqlite::params![segment_id, segment_revision, audio_content_hash, clip_duration_ms, start_ms, end_ms],
+            )
+        };
+
+        let exact_hash = "a".repeat(64);
+        let rounded_hash = "b".repeat(64);
+        let boolean_hash = "c".repeat(64);
+        let zero_duration_hash = "d".repeat(64);
+        let wrong_hash = "f".repeat(64);
+
+        for (label, duration_ms, start_ms, end_ms) in [
+            ("ten-times-duration", 10_000, 5_000, 6_000),
+            ("ten-times-span", 1_000, 5_000, 15_000),
+            ("same-duration-wrong-span", 1_000, 6_000, 7_000),
+        ] {
+            let error =
+                insert_policy3("policy3-exact", 7, &exact_hash, duration_ms, start_ms, end_ms).unwrap_err().to_string();
+            assert!(error.contains("canonical source span"), "{label} was not rejected exactly: {error}");
+        }
+        let boolean_coordinate =
+            insert_policy3("policy3-boolean", 13, &boolean_hash, 1_000, 1, 1_001).unwrap_err().to_string();
+        assert!(
+            boolean_coordinate.contains("canonical source span"),
+            "JSON boolean was accepted as an integer coordinate: {boolean_coordinate}"
+        );
+
+        for (label, segment_id, revision, hash, duration_ms, start_ms, end_ms) in [
+            ("stale revision", "policy3-exact", 6, exact_hash.as_str(), 1_000, 5_000, 6_000),
+            ("wrong BLAKE3", "policy3-exact", 7, wrong_hash.as_str(), 1_000, 5_000, 6_000),
+            ("malformed current hash", "policy3-invalid-hash", 17, "not-a-blake3-digest", 1_000, 0, 1_000),
+            ("zero duration", "policy3-zero-duration", 19, zero_duration_hash.as_str(), 0, 0, 1),
+        ] {
+            let error =
+                insert_policy3(segment_id, revision, hash, duration_ms, start_ms, end_ms).unwrap_err().to_string();
+            assert!(error.contains("canonical source span"), "{label} was not rejected: {error}");
+        }
+
+        insert_policy3("policy3-exact", 7, &exact_hash, 1_000, 5_000, 6_000).unwrap();
+        let exact_receipt_id = db.connection().last_insert_rowid();
+        insert_policy3("policy3-rounded", 11, &rounded_hash, 999, 0, 1_000).unwrap();
+
+        for sql in [
+            format!("UPDATE playback_receipts SET played_ms=999 WHERE id={exact_receipt_id}"),
+            format!("UPDATE playback_receipts SET policy_version=2 WHERE id={exact_receipt_id}"),
+            format!("DELETE FROM playback_receipts WHERE id={exact_receipt_id}"),
+        ] {
+            let error = db.connection().execute(&sql, []).unwrap_err().to_string();
+            assert!(error.contains("append-only"), "unexpected policy-3 immutability error: {error}");
+        }
+        let cascade_error = db
+            .connection()
+            .execute("DELETE FROM speech_segments WHERE id='policy3-exact'", [])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            cascade_error.contains("durable review authority"),
+            "parent deletion reached the policy-3 cascade instead of failing closed: {cascade_error}"
+        );
+        let preserved: (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM speech_segments WHERE id='policy3-exact'),
+                        (SELECT COUNT(*) FROM playback_receipts WHERE id=?1)",
+                [exact_receipt_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, (1, 1), "the failed cascade must preserve parent and receipt atomically");
+
+        db.connection()
+            .execute(
+                "INSERT INTO playback_receipts
+                    (segment_id, segment_revision, audio_fingerprint, started_at_ms, played_ms,
+                     clip_duration_ms, coverage_ratio, policy_version)
+                 VALUES ('policy2-history', 1, 'historical', 1, 1000, 1000, 1.0, 2)",
+                [],
+            )
+            .unwrap();
+        let policy2_id = db.connection().last_insert_rowid();
+        assert_eq!(
+            db.connection().execute("UPDATE playback_receipts SET played_ms=999 WHERE id=?1", [policy2_id]).unwrap(),
+            1,
+            "historical policy-2 evidence remains readable/mutable under its historical schema"
+        );
+        assert_eq!(db.connection().execute("DELETE FROM playback_receipts WHERE id=?1", [policy2_id]).unwrap(), 1);
+
+        let rollback_error = rollback(&db, 1).expect_err("policy-3 evidence cannot be downgraded away").to_string();
+        assert!(
+            rollback_error.contains("CHECK constraint failed"),
+            "unexpected policy-3 rollback guard: {rollback_error}"
+        );
+        assert_eq!(get_current_version(&db).unwrap(), 60);
+    }
+
+    #[test]
+    fn v60_paid_evidence_freezes_source_identity_but_pre_pay_and_skip_rows_remain_editable() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.connection()
+            .execute_batch(
+                "INSERT INTO speech_segments
+                    (id, audio_path, duration_ms, alignment_json, audio_content_hash)
+                 VALUES ('paid-event-identity', '/paid-event.wav', 1000,
+                         '{\"source_start_ms\":0,\"source_end_ms\":1000}',
+                         'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+                 INSERT INTO speech_segments
+                    (id, audio_path, duration_ms, alignment_json, audio_content_hash)
+                 VALUES ('paid-receipt-identity', '/paid-receipt.wav', 1000,
+                         '{\"source_start_ms\":2000,\"source_end_ms\":3000}',
+                         'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+                 INSERT INTO speech_segments
+                    (id, audio_path, duration_ms, alignment_json, audio_content_hash)
+                 VALUES ('skip-identity', '/skip.wav', 1000,
+                         '{\"source_start_ms\":4000,\"source_end_ms\":5000}',
+                         'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc');",
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments
+                        SET audio_content_hash='dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+                            alignment_json='{\"source_start_ms\":1,\"source_end_ms\":1000}',
+                            duration_ms=999
+                      WHERE id='paid-event-identity'",
+                    [],
+                )
+                .unwrap(),
+            1,
+            "server-owned source identity remains repairable before any paid evidence exists"
+        );
+
+        insert_review_original(&db, "paid-event-identity", "paid-event-work", "Sara", "couch");
+        for sql in [
+            "UPDATE speech_segments SET audio_content_hash=NULL WHERE id='paid-event-identity'",
+            "UPDATE speech_segments SET alignment_json='{\"source_start_ms\":9,\"source_end_ms\":1008}'
+              WHERE id='paid-event-identity'",
+            "UPDATE speech_segments SET duration_ms=10000 WHERE id='paid-event-identity'",
+            "UPDATE speech_segments SET duration_ms=duration_ms WHERE id='paid-event-identity'",
+        ] {
+            let error = db.connection().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("paid policy-3 source identity is immutable"), "paid identity drifted: {error}");
+        }
+
+        db.connection()
+            .execute(
+                "INSERT INTO playback_receipts
+                    (segment_id, segment_revision, audio_fingerprint, reviewer, session_id,
+                     started_at_ms, played_ms, clip_duration_ms, coverage_ratio, policy_version,
+                     source_start_ms, source_end_ms)
+                 VALUES ('paid-receipt-identity', 0,
+                         'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                         'Sara', 'receipt-session',
+                         1, 1000, 1000, 1.0, 3, 2000, 3000)",
+                [],
+            )
+            .unwrap();
+        let receipt_freeze = db
+            .connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_content_hash='eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+                  WHERE id='paid-receipt-identity'",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(receipt_freeze.contains("paid policy-3 source identity is immutable"));
+
+        db.connection()
+            .execute(
+                "INSERT INTO review_events
+                    (segment_id, reviewer, action, source, timestamp_ms, duration_ms,
+                     compensation_action, operation_id, operation_payload_hash,
+                     app_git_sha, playback_guard_version, requested_action, requested_transcript,
+                     served_transcript, served_revision)
+                 VALUES ('skip-identity', 'Sara', 'skip', 'couch', 1, 1000,
+                         'skip', 'skip-source-identity-operation',
+                         'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                         '0123456789abcdef0123456789abcdef01234567',
+                         'content-hash-raw-counter-v3', 'skip', 'served skip transcript',
+                         'served skip transcript', 4)",
+                [],
+            )
+            .unwrap();
+        let skip_event_id = db.connection().last_insert_rowid();
+        db.connection()
+            .execute(
+                "INSERT INTO review_compensation_ledger
+                    (entry_id, entry_key, policy_version, review_event_id, canonical_work_id,
+                     canonical_identity_kind, reviewer, segment_id, source, compensation_action,
+                     effective_decision, decision_revision, duration_ms, rate_basis_points,
+                     entitlement_micro_iqd, delta_micro_iqd, corrected_entitlement_ms,
+                     delta_corrected_ms)
+                 VALUES ('skip-source-entry', 'skip-source-key', 'review-iqd-v1-2026-08-21',
+                         ?1, 'skip-source-work', 'audio_content_hash', 'Sara', 'skip-identity',
+                         'couch', 'skip', 'skip', 4, 1000, 0, 0, 0, 0, 0)",
+                [skip_event_id],
+            )
+            .unwrap();
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments
+                        SET audio_content_hash='abababababababababababababababababababababababababababababababab'
+                      WHERE id='skip-identity'",
+                    [],
+                )
+                .unwrap(),
+            1,
+            "an unpaid skip must not freeze corpus source identity"
+        );
+    }
+
+    #[test]
+    fn v60_human_effect_snapshots_are_exact_typed_and_decision_only() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO human_decision_effect_events
+                    (segment_id, reviewer, source, operation_id, operation_payload_hash,
+                     action, served_transcript, decision_transcript, decision_annotated_transcript,
+                     decision_verified, decision_corrected_at,
+                     requested_action, requested_transcript, requested_timestamp_ms,
+                     prior_revision, decision_revision,
+                     prior_verified, prior_annotated_transcript, prior_verdict,
+                     prior_verdict_transcript, prior_rationale, decision_rationale,
+                     prior_escalated, prior_human_decision, prior_corrected_at, prior_reviewed_by)
+                 VALUES ('snapshot-segment', NULL, 'desktop',
+                         '11111111-1111-4111-8111-111111111111',
+                         'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                         'edit', 'served snapshot', 'post decision', 'post annotation', 1, '2026-08-22 00:00:00',
+                         'edit', 'requested transcript', 1000, 7, 8,
+                         1, 'prior annotation', 'human_accept',
+                         'prior verdict text', 'preserved rationale', 'preserved rationale', 1, 'accept',
+                         '2026-08-21 23:59:59', 'Sara')",
+                [],
+            )
+            .unwrap();
+        let effect_id = db.connection().last_insert_rowid();
+        type EffectSnapshot = (
+            i64,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let snapshot: EffectSnapshot = db
+            .connection()
+            .query_row(
+                "SELECT prior_revision, decision_revision, prior_verified,
+                        prior_annotated_transcript, prior_verdict, prior_verdict_transcript,
+                        prior_escalated, prior_human_decision, prior_corrected_at, prior_reviewed_by,
+                        prior_rationale, decision_rationale
+                   FROM human_decision_effect_events WHERE id=?1",
+                [effect_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            snapshot,
+            (
+                7,
+                8,
+                1,
+                Some("prior annotation".into()),
+                Some("human_accept".into()),
+                Some("prior verdict text".into()),
+                1,
+                Some("accept".into()),
+                Some("2026-08-21 23:59:59".into()),
+                Some("Sara".into()),
+                Some("preserved rationale".into()),
+                Some("preserved rationale".into()),
+            ),
+            "the immutable effect must carry the exact DB-owned pre-decision state"
+        );
+        let served_snapshot: String = db
+            .connection()
+            .query_row("SELECT served_transcript FROM human_decision_effect_events WHERE id=?1", [effect_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(served_snapshot, "served snapshot");
+        let projected_rationale: (Option<String>, Option<String>) = db
+            .connection()
+            .query_row(
+                "SELECT prior_rationale, decision_rationale
+                   FROM effective_human_decision_effects_v60 WHERE id=?1",
+                [effect_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            projected_rationale,
+            (Some("preserved rationale".into()), Some("preserved rationale".into())),
+            "the effective immutable projection must retain the exact rationale boundary"
+        );
+
+        for sql in [
+            "INSERT INTO human_decision_effect_events
+                (segment_id, source, operation_id, operation_payload_hash,
+                 action, served_transcript, decision_transcript, decision_verified,
+                 decision_corrected_at, requested_action, requested_timestamp_ms,
+                 prior_revision, decision_revision, prior_verified, prior_escalated,
+                 prior_rationale, decision_rationale)
+             VALUES ('rationale-string-drift', 'desktop',
+                     '33333333-3333-4333-8333-333333333331',
+                     'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                     'accept', 'served', 'decision', 1, '2026-08-22 00:00:00',
+                     'accept', 1000, 0, 1, 0, 0, 'before', 'after')",
+            "INSERT INTO human_decision_effect_events
+                (segment_id, source, operation_id, operation_payload_hash,
+                 action, served_transcript, decision_transcript, decision_verified,
+                 decision_corrected_at, requested_action, requested_timestamp_ms,
+                 prior_revision, decision_revision, prior_verified, prior_escalated,
+                 prior_rationale, decision_rationale)
+             VALUES ('rationale-null-to-value', 'desktop',
+                     '33333333-3333-4333-8333-333333333332',
+                     'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+                     'accept', 'served', 'decision', 1, '2026-08-22 00:00:00',
+                     'accept', 1000, 0, 1, 0, 0, NULL, 'forged')",
+            "INSERT INTO human_decision_effect_events
+                (segment_id, source, operation_id, operation_payload_hash,
+                 action, served_transcript, decision_transcript, decision_verified,
+                 decision_corrected_at, requested_action, requested_timestamp_ms,
+                 prior_revision, decision_revision, prior_verified, prior_escalated,
+                 prior_rationale, decision_rationale)
+             VALUES ('rationale-value-to-null', 'desktop',
+                     '33333333-3333-4333-8333-333333333333',
+                     'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                     'accept', 'served', 'decision', 1, '2026-08-22 00:00:00',
+                     'accept', 1000, 0, 1, 0, 0, 'before', NULL)",
+        ] {
+            let error = db.connection().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("exact prior rationale"), "rationale continuity drift passed: {error}");
+        }
+
+        let null_rationale_effect = insert_effect_event(&db, None, "null-rationale-snapshot", None, "desktop", 1);
+        let null_pair: i64 = db
+            .connection()
+            .query_row(
+                "SELECT prior_rationale IS NULL AND decision_rationale IS NULL
+                   FROM human_decision_effect_events WHERE id=?1",
+                [null_rationale_effect],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_pair, 1, "nullable rationale snapshots must accept only the exact NULL/NULL pair");
+
+        for sql in [
+            "INSERT INTO human_decision_effect_events
+                (segment_id, source, action, prior_revision, decision_revision, prior_verified, prior_escalated)
+             VALUES ('skip-is-not-a-decision', 'desktop', 'skip', 0, 1, 0, 0)",
+            "INSERT INTO human_decision_effect_events
+                (segment_id, source, action, prior_revision, decision_revision, prior_verified, prior_escalated)
+             VALUES ('revision-gap', 'desktop', 'accept', 1, 3, 0, 0)",
+            "INSERT INTO human_decision_effect_events
+                (segment_id, source, action, prior_revision, decision_revision, prior_verified, prior_escalated)
+             VALUES ('bad-verified', 'desktop', 'accept', 0, 1, 2, 0)",
+            "INSERT INTO human_decision_effect_events
+                (segment_id, source, action, prior_revision, decision_revision, prior_verified, prior_escalated)
+             VALUES ('bad-escalated', 'desktop', 'accept', 0, 1, 0, -1)",
+            "INSERT INTO human_decision_effect_events
+                (segment_id, source, action, prior_revision, decision_revision, prior_verified,
+                 prior_escalated, prior_human_decision)
+             VALUES ('bad-prior-decision', 'desktop', 'accept', 0, 1, 0, 0, 'skip')",
+        ] {
+            let error = db.connection().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("constraint failed"), "unexpected typed-snapshot rejection: {error}");
+        }
+        let duplicate_revision = db
+            .connection()
+            .execute(
+                "INSERT INTO human_decision_effect_events
+                    (segment_id, source, operation_id, operation_payload_hash,
+                     action, served_transcript, decision_transcript, decision_verified, decision_corrected_at,
+                     requested_action, requested_timestamp_ms,
+                     prior_revision, decision_revision,
+                     prior_verified, prior_escalated)
+                 VALUES ('snapshot-segment', 'desktop',
+                         '22222222-2222-4222-8222-222222222222',
+                         'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                         'accept', 'served snapshot', 'post decision', 1, '2026-08-22 00:00:00',
+                         'accept', 1000, 7, 8, 0, 0)",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate_revision.contains("UNIQUE constraint failed"));
+        let immutable = db
+            .connection()
+            .execute("UPDATE human_decision_effect_events SET decision_rationale='forged' WHERE id=?1", [effect_id])
+            .unwrap_err()
+            .to_string();
+        assert!(immutable.contains("append-only"));
+    }
+
+    #[test]
+    fn v60_effective_views_order_by_revision_and_decision_requests_are_canonical() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        insert_desktop_effect_with_id(&db, 100, "out-of-id-decision", "edit", 2);
+        insert_desktop_effect_with_id(&db, 200, "out-of-id-decision", "accept", 1);
+        let effective_decision: (i64, i64, String, i64, String, String, i64) = db
+            .connection()
+            .query_row(
+                "SELECT id, decision_revision, decision_transcript, decision_verified,
+                        decision_corrected_at, requested_action, requested_timestamp_ms
+                   FROM effective_human_decision_effects_v60
+                  WHERE segment_id='out-of-id-decision'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .unwrap();
+        assert_eq!(effective_decision.0, 100, "highest revision wins even when its id is lower");
+        assert_eq!(effective_decision.1, 2);
+        assert_eq!(effective_decision.2, "post-decision transcript");
+        assert_eq!(effective_decision.3, 1);
+        assert_eq!(effective_decision.4, "2026-08-22 00:00:00");
+        assert_eq!(effective_decision.5, "edit");
+        assert_eq!(effective_decision.6, 1000);
+
+        for sql in [
+            "INSERT INTO human_decision_effect_events
+                (segment_id, source, operation_id, operation_payload_hash, action,
+                 served_transcript, decision_transcript, decision_verified, decision_corrected_at,
+                 requested_action, requested_timestamp_ms,
+                 prior_revision, decision_revision, prior_verified, prior_escalated)
+             VALUES ('blank-decision', 'desktop',
+                     '00000000-0000-4000-8000-000000000301',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     'accept', 'served', ' ', 1, '2026-08-22 00:00:00', 'accept', 1, 0, 1, 0, 0)",
+            "INSERT INTO human_decision_effect_events
+                (segment_id, source, operation_id, operation_payload_hash, action,
+                 served_transcript, decision_transcript, decision_verified, decision_corrected_at,
+                 requested_action, requested_timestamp_ms,
+                 prior_revision, decision_revision, prior_verified, prior_escalated)
+             VALUES ('reject-with-transcript', 'desktop',
+                     '00000000-0000-4000-8000-000000000302',
+                     'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                     'reject', 'served', 'forged', 1, '2026-08-22 00:00:00', 'reject', 1, 0, 1, 0, 0)",
+            "INSERT INTO human_decision_effect_events
+                (segment_id, source, operation_id, operation_payload_hash, action,
+                 served_transcript, decision_transcript, decision_verified, decision_corrected_at,
+                 prior_revision, decision_revision, prior_verified, prior_escalated)
+             VALUES ('missing-desktop-request', 'desktop',
+                     '00000000-0000-4000-8000-000000000303',
+                     'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                     'edit', 'served', 'decision', 1, '2026-08-22 00:00:00', 0, 1, 0, 0)",
+            "INSERT INTO human_decision_effect_events
+                (segment_id, source, operation_id, operation_payload_hash, action,
+                 served_transcript, decision_transcript, decision_verified, decision_corrected_at,
+                 requested_action, requested_timestamp_ms,
+                 prior_revision, decision_revision, prior_verified, prior_escalated)
+             VALUES ('bad-operation', 'desktop', 'not-a-canonical-operation',
+                     'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+                     'edit', 'served', 'decision', 1, '2026-08-22 00:00:00', 'edit', 1, 0, 1, 0, 0)",
+            "INSERT INTO human_decision_effect_events
+                (segment_id, source, operation_id, operation_payload_hash, action,
+                 served_transcript, decision_transcript, decision_verified, decision_corrected_at,
+                 requested_action, requested_timestamp_ms,
+                 prior_revision, decision_revision, prior_verified, prior_escalated)
+             VALUES ('blank-served-effect', 'desktop',
+                     '00000000-0000-4000-8000-000000000304',
+                     'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                     'edit', ' ', 'decision', 1, '2026-08-22 00:00:00', 'edit', 1, 0, 1, 0, 0)",
+        ] {
+            let error = db.connection().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("CHECK constraint failed"), "noncanonical decision evidence passed: {error}");
+        }
+
+        db.connection()
+            .execute_batch(
+                "INSERT INTO review_flag_effect_events
+                    (id, operation_id, segment_id, prior_revision, flag_revision,
+                     prior_escalated, flag_rationale)
+                 VALUES (300, '00000000-0000-4000-8000-000000000300',
+                         'out-of-id-flag', 1, 2, 0, 'revision two');
+                 INSERT INTO review_flag_effect_events
+                    (id, operation_id, segment_id, prior_revision, flag_revision,
+                     prior_escalated, flag_rationale)
+                 VALUES (400, '00000000-0000-4000-8000-000000000400',
+                         'out-of-id-flag', 0, 1, 0, 'revision one');",
+            )
+            .unwrap();
+        let effective_flag: (i64, i64, String) = db
+            .connection()
+            .query_row(
+                "SELECT id, flag_revision, flag_rationale
+                   FROM effective_review_flag_effects_v60 WHERE segment_id='out-of-id-flag'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(effective_flag, (300, 2, "revision two".into()));
+        let blank_rationale = db
+            .connection()
+            .execute(
+                "INSERT INTO review_flag_effect_events
+                    (operation_id, segment_id, prior_revision, flag_revision,
+                     prior_escalated, flag_rationale)
+                 VALUES ('00000000-0000-4000-8000-000000000401',
+                         'blank-flag', 0, 1, 0, ' ')",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(blank_rationale.contains("CHECK constraint failed"));
+    }
+
+    #[test]
+    fn v60_flag_effects_snapshot_reverse_and_remain_append_only() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let first =
+            insert_flag_effect_event(&db, "flag-segment", 4, Some("jury_edit"), Some("machine rationale"), false);
+        let second =
+            insert_flag_effect_event(&db, "flag-segment", 5, Some("escalated"), Some("first flag rationale"), true);
+        let first_snapshot: (i64, i64, Option<String>, Option<String>, i64) = db
+            .connection()
+            .query_row(
+                "SELECT prior_revision, flag_revision, prior_verdict, prior_rationale, prior_escalated
+                   FROM review_flag_effect_events WHERE id=?1",
+                [first],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            first_snapshot,
+            (4, 5, Some("jury_edit".into()), Some("machine rationale".into()), 0),
+            "flag Undo authority must be the exact DB-owned pre-flag verdict state"
+        );
+        let visible: i64 = db
+            .connection()
+            .query_row("SELECT id FROM effective_review_flag_effects_v60 WHERE segment_id='flag-segment'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(visible, second, "the latest active flag must shadow an earlier active flag");
+
+        db.connection()
+            .execute(
+                "INSERT INTO review_flag_effect_reversals(flag_effect_event_id, operation_id)
+                 VALUES (?1, 'flag-undo-second')",
+                [second],
+            )
+            .unwrap();
+        let restored: i64 = db
+            .connection()
+            .query_row("SELECT id FROM effective_review_flag_effects_v60 WHERE segment_id='flag-segment'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(restored, first, "reversing a later flag must reveal the prior active flag");
+
+        for sql in [
+            "INSERT INTO review_flag_effect_events
+                (segment_id, prior_revision, flag_revision, prior_escalated)
+             VALUES ('flag-revision-gap', 1, 3, 0)",
+            "INSERT INTO review_flag_effect_events
+                (segment_id, prior_revision, flag_revision, prior_escalated)
+             VALUES ('flag-bad-escalated', 0, 1, 2)",
+            "INSERT INTO review_flag_effect_events
+                (segment_id, prior_revision, flag_revision, prior_escalated)
+             VALUES ('', 0, 1, 0)",
+        ] {
+            let error = db.connection().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("constraint failed"), "unexpected flag-snapshot rejection: {error}");
+        }
+        let duplicate_revision = db
+            .connection()
+            .execute(
+                "INSERT INTO review_flag_effect_events
+                    (operation_id, segment_id, prior_revision, flag_revision,
+                     flag_rationale, prior_escalated)
+                 VALUES ('00000000-0000-4000-8000-000000000501',
+                         'flag-segment', 4, 5, 'duplicate flag', 0)",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate_revision.contains("UNIQUE constraint failed"));
+        let first_operation_id: String = db
+            .connection()
+            .query_row("SELECT operation_id FROM review_flag_effect_events WHERE id=?1", [first], |row| row.get(0))
+            .unwrap();
+        let duplicate_initial_operation = db
+            .connection()
+            .execute(
+                "INSERT INTO review_flag_effect_events
+                    (operation_id, segment_id, prior_revision, flag_revision,
+                     flag_rationale, prior_escalated)
+                 VALUES (?1, 'flag-operation-replay', 0, 1, 'replayed flag', 0)",
+                [&first_operation_id],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate_initial_operation.contains("UNIQUE constraint failed"),
+            "a lost-response replay must resolve through one stable flag operation: {duplicate_initial_operation}"
+        );
+        let malformed_initial_operation = db
+            .connection()
+            .execute(
+                "INSERT INTO review_flag_effect_events
+                    (operation_id, segment_id, prior_revision, flag_revision,
+                     flag_rationale, prior_escalated)
+                 VALUES ('NOT-A-UUID', 'bad-flag-operation', 0, 1, 'bad operation', 0)",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(malformed_initial_operation.contains("CHECK constraint failed"));
+        let duplicate_operation = db
+            .connection()
+            .execute(
+                "INSERT INTO review_flag_effect_reversals(flag_effect_event_id, operation_id)
+                 VALUES (?1, 'flag-undo-second')",
+                [first],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate_operation.contains("UNIQUE constraint failed"));
+
+        for sql in [
+            format!("UPDATE review_flag_effect_events SET prior_verdict='changed' WHERE id={first}"),
+            format!("DELETE FROM review_flag_effect_events WHERE id={first}"),
+            format!(
+                "UPDATE review_flag_effect_reversals SET operation_id='changed' WHERE flag_effect_event_id={second}"
+            ),
+            format!("DELETE FROM review_flag_effect_reversals WHERE flag_effect_event_id={second}"),
+        ] {
+            let error = db.connection().execute(&sql, []).unwrap_err().to_string();
+            assert!(error.contains("append-only"), "unexpected flag immutability error: {error}");
+        }
+    }
+
+    #[test]
+    fn v60_human_effects_bind_human_artifacts_without_touching_model_pseudo_examples() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.connection()
+            .execute_batch(
+                "INSERT INTO speech_segments (id, audio_path) VALUES
+                     ('effect-segment', '/effect-segment.wav'),
+                     ('other-effect-segment', '/other-effect-segment.wav'),
+                     ('accept-effect-segment', '/accept-effect-segment.wav');
+                 INSERT INTO agent_examples
+                     (id, segment_id, wrong_transcript, human_fix, source, verified_by_human, corrector_model_id)
+                 VALUES ('model-pseudo', 'effect-segment', 'w', 'r', 'model', 0, 'model-x');",
+            )
+            .unwrap();
+        let unbound_human = db
+            .connection()
+            .execute(
+                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
+                 VALUES ('unbound-human', 'effect-segment', 'w', 'r')",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(unbound_human.contains("exact effect"), "unexpected unbound-human error: {unbound_human}");
+        let forged_model_verified = db
+            .connection()
+            .execute(
+                "INSERT INTO agent_examples
+                    (id, segment_id, wrong_transcript, human_fix, source, verified_by_human)
+                 VALUES ('forged-model-verified', 'effect-segment', 'w', 'r', 'model', 1)",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(forged_model_verified.contains("pseudo examples must remain unbound"));
+        let pseudo_promotion = db
+            .connection()
+            .execute("UPDATE agent_examples SET verified_by_human=1 WHERE id='model-pseudo'", [])
+            .unwrap_err()
+            .to_string();
+        assert!(pseudo_promotion.contains("append-only"), "pseudo evidence was promoted in place: {pseudo_promotion}");
+        db.connection()
+            .execute(
+                "INSERT INTO agent_examples
+                    (id, segment_id, wrong_transcript, human_fix, source, verified_by_human)
+                 VALUES ('untrusted-cleanup', 'effect-segment', 'w', 'r', 'model', 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.connection().execute("DELETE FROM agent_examples WHERE id='untrusted-cleanup'", []).unwrap(),
+            1,
+            "untrusted pseudo examples remain cleanable"
+        );
+
+        let first_effect = insert_effect_event(&db, None, "effect-segment", None, "desktop", 1);
+        db.connection()
+            .execute(
+                "INSERT INTO agent_examples
+                    (id, segment_id, wrong_transcript, human_fix, effect_event_id)
+                 VALUES ('bound-human', 'effect-segment', 'w', 'r', ?1)",
+                [first_effect],
+            )
+            .unwrap();
+        let duplicate_example = db
+            .connection()
+            .execute(
+                "INSERT INTO agent_examples
+                    (id, segment_id, wrong_transcript, human_fix, effect_event_id)
+                 VALUES ('bound-human-duplicate', 'effect-segment', 'w2', 'r2', ?1)",
+                [first_effect],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate_example.contains("UNIQUE constraint failed"),
+            "unexpected example identity error: {duplicate_example}"
+        );
+
+        let accept_effect =
+            insert_effect_event_with_action(&db, None, "accept-effect-segment", None, "desktop", "accept", 1);
+        let accept_example = db
+            .connection()
+            .execute(
+                "INSERT INTO agent_examples
+                    (id, segment_id, wrong_transcript, human_fix, effect_event_id)
+                 VALUES ('accept-is-not-a-correction-example', 'accept-effect-segment', 'w', 'r', ?1)",
+                [accept_effect],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(accept_example.contains("exact effect"), "unexpected accept-example error: {accept_example}");
+
+        let unbound_correction = db
+            .connection()
+            .execute(
+                "INSERT INTO corrections (id, segment_id, audio_content_hash, raw_hypothesis, human_fix)
+                 VALUES ('unbound-correction', 'effect-segment', 'hash', 'w', 'r')",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(unbound_correction.contains("exact human-decision effect"));
+        db.connection()
+            .execute(
+                "INSERT INTO corrections
+                    (id, segment_id, audio_content_hash, raw_hypothesis, human_fix, effect_event_id)
+                 VALUES ('bound-correction', 'effect-segment', 'hash', 'w', 'r', ?1)",
+                [first_effect],
+            )
+            .unwrap();
+        let accept_correction = db
+            .connection()
+            .execute(
+                "INSERT INTO corrections
+                    (id, segment_id, audio_content_hash, raw_hypothesis, human_fix, effect_event_id)
+                 VALUES ('accept-is-not-a-correction', 'accept-effect-segment', 'hash', 'w', 'r', ?1)",
+                [accept_effect],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            accept_correction.contains("exact human-decision effect"),
+            "unexpected accept-correction error: {accept_correction}"
+        );
+        let duplicate_correction = db
+            .connection()
+            .execute(
+                "INSERT INTO corrections
+                    (id, segment_id, audio_content_hash, raw_hypothesis, human_fix, effect_event_id)
+                 VALUES ('bound-correction-duplicate', 'effect-segment', 'hash2', 'w2', 'r2', ?1)",
+                [first_effect],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate_correction.contains("UNIQUE constraint failed"));
+        let active_before: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM active_corrections_v60", [], |row| row.get(0)).unwrap();
+        assert_eq!(active_before, 1);
+
+        let second_effect = insert_effect_event(&db, None, "effect-segment", None, "desktop", 2);
+        let visible_effect: i64 = db
+            .connection()
+            .query_row(
+                "SELECT id FROM effective_human_decision_effects_v60 WHERE segment_id='effect-segment'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(visible_effect, second_effect, "latest active effect shadows the prior segment effect");
+        let hidden_correction: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM active_corrections_v60", [], |row| row.get(0)).unwrap();
+        assert_eq!(hidden_correction, 0, "artifacts follow the effective effect rather than current segment text");
+
+        db.connection()
+            .execute(
+                "INSERT INTO human_decision_effect_reversals(effect_event_id, operation_id)
+                 VALUES (?1, 'desktop-undo-2')",
+                [second_effect],
+            )
+            .unwrap();
+        let restored_effect: i64 = db
+            .connection()
+            .query_row(
+                "SELECT id FROM effective_human_decision_effects_v60 WHERE segment_id='effect-segment'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored_effect, first_effect, "a reversed later effect must not shadow the prior effect");
+        let restored_correction: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM active_corrections_v60", [], |row| row.get(0)).unwrap();
+        assert_eq!(restored_correction, 1);
+        let pseudo_count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_examples WHERE id='model-pseudo' AND effect_event_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pseudo_count, 1, "normal Undo must not delete an unrelated model pseudo example");
+        for sql in [
+            "UPDATE agent_examples SET human_fix='changed' WHERE id='bound-human'",
+            "DELETE FROM agent_examples WHERE id='bound-human'",
+            "UPDATE corrections SET human_fix='changed' WHERE id='bound-correction'",
+            "DELETE FROM corrections WHERE id='bound-correction'",
+        ] {
+            let error = db.connection().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("append-only"), "unexpected bound-artifact immutability error: {error}");
+        }
+
+        let (reviewer_event, _) =
+            insert_review_original(&db, "other-effect-segment", "other-effect-work", "Sara", "couch");
+        let reviewer_effect =
+            insert_effect_event(&db, Some(reviewer_event), "other-effect-segment", Some("Sara"), "couch", 1);
+        let reviewer_mismatch = db
+            .connection()
+            .execute(
+                "INSERT INTO corrections
+                    (id, segment_id, audio_content_hash, raw_hypothesis, human_fix, reviewer_id, effect_event_id)
+                 VALUES ('reviewer-mismatch', 'other-effect-segment', 'hash3', 'w', 'r', 'Hemn', ?1)",
+                [reviewer_effect],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(reviewer_mismatch.contains("exact human-decision effect"));
+
+        for (sql, expected) in [
+            (format!("UPDATE human_decision_effect_events SET action='accept' WHERE id={first_effect}"), "append-only"),
+            (format!("DELETE FROM human_decision_effect_events WHERE id={first_effect}"), "append-only"),
+            (
+                format!(
+                    "UPDATE human_decision_effect_reversals SET operation_id='changed' WHERE effect_event_id={second_effect}"
+                ),
+                "append-only",
+            ),
+            (
+                format!("DELETE FROM human_decision_effect_reversals WHERE effect_event_id={second_effect}"),
+                "append-only",
+            ),
+        ] {
+            let error = db.connection().execute(&sql, []).unwrap_err().to_string();
+            assert!(error.contains(expected), "unexpected effect immutability error: {error}");
+        }
+    }
+
+    #[test]
+    fn v60_memory_contributions_activate_and_reverse_exactly() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.connection()
+            .execute("INSERT INTO speech_segments(id, audio_path) VALUES ('memory-source', '/memory-source.wav')", [])
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO correction_memory
+                    (id, wrong_token, human_token, slot_key, phonetic_key, source_segment, legacy_seed, confidence)
+                 VALUES ('post-v60-memory', 'w', 'r', 'slot', 'phon', 'memory-source', 0, 0.5)",
+                [],
+            )
+            .unwrap();
+        for sql in [
+            "INSERT INTO correction_memory
+                (id, wrong_token, human_token, slot_key, phonetic_key, source_segment,
+                 legacy_seed, confidence)
+             VALUES ('missing-memory-source', 'w1', 'r1', 'slot-1', 'phon-1', NULL, 0, 0.5)",
+            "INSERT INTO correction_memory
+                (id, wrong_token, human_token, slot_key, phonetic_key, source_segment,
+                 legacy_seed, confidence)
+             VALUES ('blank-memory-source', 'w2', 'r2', 'slot-2', 'phon-2', ' ', 0, 0.5)",
+        ] {
+            let error = db.connection().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("zero append-only baseline"), "new memory lost its source identity: {error}");
+        }
+        let arbitrary_source_change = db
+            .connection()
+            .execute("UPDATE correction_memory SET source_segment=NULL WHERE id='post-v60-memory'", [])
+            .unwrap_err()
+            .to_string();
+        assert!(arbitrary_source_change.contains("baseline is immutable"));
+        let source_delete = db
+            .connection()
+            .execute("DELETE FROM speech_segments WHERE id='memory-source'", [])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            source_delete.contains("durable review authority"),
+            "parent deletion reached SET NULL instead of protecting memory provenance: {source_delete}"
+        );
+        let accept = insert_effect_event_with_action(&db, None, "memory-accept", None, "desktop", "accept", 1);
+        let reject = insert_effect_event_with_action(&db, None, "memory-reject", None, "desktop", "reject", 1);
+        let accept_capture = db
+            .connection()
+            .execute(
+                "INSERT INTO correction_memory_contributions
+                    (effect_event_id, memory_id, capture_delta, confirm_delta, override_delta)
+                 VALUES (?1, 'post-v60-memory', 1, 0, 0)",
+                [accept],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(accept_capture.contains("capture requires edit"));
+        db.connection()
+            .execute(
+                "INSERT INTO correction_memory_contributions
+                    (effect_event_id, memory_id, capture_delta, confirm_delta, override_delta)
+                 VALUES (?1, 'post-v60-memory', 0, 1, 0)",
+                [accept],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO human_decision_effect_reversals(effect_event_id, operation_id)
+                 VALUES (?1, 'memory-undo-accept')",
+                [accept],
+            )
+            .unwrap();
+        let reject_contribution = db
+            .connection()
+            .execute(
+                "INSERT INTO correction_memory_contributions
+                    (effect_event_id, memory_id, capture_delta, confirm_delta, override_delta)
+                 VALUES (?1, 'post-v60-memory', 0, 1, 0)",
+                [reject],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(reject_contribution.contains("accept/edit effect"));
+        let wrong_source = insert_effect_event(&db, None, "memory-wrong-source", None, "desktop", 1);
+        let wrong_first_capture = db
+            .connection()
+            .execute(
+                "INSERT INTO correction_memory_contributions
+                    (effect_event_id, memory_id, capture_delta, confirm_delta, override_delta)
+                 VALUES (?1, 'post-v60-memory', 1, 0, 0)",
+                [wrong_source],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            wrong_first_capture.contains("capture requires edit"),
+            "a new memory's first capture was detached from its source segment: {wrong_first_capture}"
+        );
+        let first = insert_effect_event(&db, None, "memory-source", None, "desktop", 1);
+        let second = insert_effect_event(&db, None, "memory-segment-b", None, "desktop", 1);
+        db.connection()
+            .execute(
+                "INSERT INTO correction_memory_contributions
+                    (effect_event_id, memory_id, capture_delta, confirm_delta, override_delta, fired_at)
+                 VALUES (?1, 'post-v60-memory', 1, 1, 0, '2026-08-22 01:00:00')",
+                [first],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO correction_memory_contributions
+                    (effect_event_id, memory_id, capture_delta, confirm_delta, override_delta, fired_at)
+                 VALUES (?1, 'post-v60-memory', 1, 0, 1, '2026-08-22 02:00:00')",
+                [second],
+            )
+            .unwrap();
+        let both: (i64, i64, i64, f64, String, i64) = db
+            .connection()
+            .query_row(
+                "SELECT hit_count, confirm_count, override_count, confidence, last_fired_at, active_capture_count
+                   FROM effective_correction_memory_v60 WHERE id='post-v60-memory'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!((both.0, both.1, both.2, both.4.as_str(), both.5), (1, 1, 1, "2026-08-22 02:00:00", 2));
+        assert!((both.3 - 0.5).abs() < 1e-12);
+
+        db.connection()
+            .execute(
+                "INSERT INTO human_decision_effect_reversals(effect_event_id, operation_id)
+                 VALUES (?1, 'memory-undo-second')",
+                [second],
+            )
+            .unwrap();
+        let one: (i64, i64, i64, f64, String, i64) = db
+            .connection()
+            .query_row(
+                "SELECT hit_count, confirm_count, override_count, confidence, last_fired_at, active_capture_count
+                   FROM effective_correction_memory_v60 WHERE id='post-v60-memory'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!((one.0, one.1, one.2, one.4.as_str(), one.5), (0, 1, 0, "2026-08-22 01:00:00", 1));
+        assert!((one.3 - (2.0 / 3.0)).abs() < 1e-12);
+
+        for sql in [
+            format!("UPDATE correction_memory_contributions SET capture_delta=0 WHERE effect_event_id={first}"),
+            format!("DELETE FROM correction_memory_contributions WHERE effect_event_id={first}"),
+            "UPDATE correction_memory SET hit_count=9 WHERE id='post-v60-memory'".to_string(),
+            "DELETE FROM correction_memory WHERE id='post-v60-memory'".to_string(),
+        ] {
+            let error = db.connection().execute(&sql, []).unwrap_err().to_string();
+            assert!(
+                error.contains("append-only") || error.contains("baseline is immutable"),
+                "unexpected immutable evidence error: {error}"
+            );
+        }
+        for sql in [
+            format!(
+                "INSERT INTO correction_memory_contributions
+                    (effect_event_id, memory_id, capture_delta, confirm_delta, override_delta)
+                 VALUES ({first}, 'post-v60-memory', 0, 0, 0)"
+            ),
+            format!(
+                "INSERT INTO correction_memory_contributions
+                    (effect_event_id, memory_id, capture_delta, confirm_delta, override_delta)
+                 VALUES ({first}, 'post-v60-memory', 0, 1, 1)"
+            ),
+        ] {
+            assert!(db.connection().execute(&sql, []).is_err(), "invalid contribution must fail: {sql}");
+        }
+
+        db.connection()
+            .execute(
+                "INSERT INTO human_decision_effect_reversals(effect_event_id, operation_id)
+                 VALUES (?1, 'memory-undo-first')",
+                [first],
+            )
+            .unwrap();
+        let omitted: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM effective_correction_memory_v60 WHERE id='post-v60-memory'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(omitted, 0, "a post-v60 memory with zero active captures must disappear from the effective view");
+
+        for table in [
+            "review_effect_state",
+            "human_decision_effect_events",
+            "human_decision_effect_reversals",
+            "review_flag_effect_events",
+            "review_flag_effect_reversals",
+            "correction_memory_contributions",
+            "legacy_agent_examples_v60",
+            "legacy_corrections_v60",
+            "legacy_reviewed_segments_v60",
+            "legacy_machine_verdict_segments_v60",
+        ] {
+            let strict: i64 = db
+                .connection()
+                .query_row("SELECT strict FROM pragma_table_list WHERE name=?1", [table], |row| row.get(0))
+                .unwrap();
+            assert_eq!(strict, 1, "{table} must be STRICT");
+        }
+    }
+
+    #[test]
+    fn v60_rollback_guard_detects_effects_and_post_migration_reversals() {
+        let with_effect = database_at_v60();
+        insert_effect_event(&with_effect, None, "rollback-effect", None, "desktop", 1);
+        let effect_error =
+            rollback(&with_effect, 1).expect_err("a recorded v60 effect cannot be erased by downgrade").to_string();
+        assert!(effect_error.contains("CHECK constraint failed"), "unexpected effect guard: {effect_error}");
+        assert_eq!(get_current_version(&with_effect).unwrap(), 60);
+
+        let with_flag_effect = database_at_v60();
+        let flag_effect = insert_flag_effect_event(
+            &with_flag_effect,
+            "rollback-flag-effect",
+            0,
+            Some("jury_edit"),
+            Some("prior rationale"),
+            false,
+        );
+        with_flag_effect
+            .connection()
+            .execute(
+                "INSERT INTO review_flag_effect_reversals(flag_effect_event_id, operation_id)
+                 VALUES (?1, 'rollback-flag-undo')",
+                [flag_effect],
+            )
+            .unwrap();
+        let flag_error = rollback(&with_flag_effect, 1)
+            .expect_err("flag effects and reversals cannot be erased by downgrade")
+            .to_string();
+        assert!(flag_error.contains("CHECK constraint failed"), "unexpected flag-effect guard: {flag_error}");
+        assert_eq!(get_current_version(&with_flag_effect).unwrap(), 60);
+
+        let with_reversal = database_at_v59();
+        let (_, baseline_entry) =
+            insert_review_original(&with_reversal, "baseline-reversal", "baseline-work", "Sara", "legacy");
+        assert_eq!(run_migrations(&with_reversal).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+        assert_eq!(rollback(&with_reversal, 9).unwrap(), vec![69, 68, 67, 66, 65, 64, 63, 62, 61]);
+        reverse_review_entry(&with_reversal, &baseline_entry, "post-v60-baseline-undo").unwrap();
+        let reversal_error = rollback(&with_reversal, 1)
+            .expect_err("the ledger cutoff must distinguish a reversal appended after migration")
+            .to_string();
+        assert!(reversal_error.contains("CHECK constraint failed"), "unexpected reversal guard: {reversal_error}");
+        assert_eq!(get_current_version(&with_reversal).unwrap(), 60);
+    }
+
+    #[test]
+    fn v60_legacy_machine_snapshot_is_exact_immutable_and_downgrade_lossless_only_when_unchanged() {
+        let db = database_at_v59();
+        db.connection()
+            .execute_batch(
+                "INSERT INTO speech_segments
+                    (id, audio_path, review_revision, verdict, verdict_transcript,
+                     jury_transcript, rationale, evidence_json, agreement_score, escalated)
+                 VALUES ('legacy-machine', '/legacy-machine.wav', 7, 'jury_accept',
+                         'legacy machine text', 'legacy machine text', 'legacy rationale',
+                         'opaque pre-v60 evidence', 0.77, 0);
+                 INSERT INTO speech_segments
+                    (id, audio_path, review_revision, verdict, verdict_transcript,
+                     jury_transcript, rationale, evidence_json, agreement_score, escalated,
+                     verified, annotated_transcript, human_decision, corrected_at, reviewed_by, is_gold)
+                 VALUES ('legacy-machine-human-overlap', '/legacy-machine-human-overlap.wav', 9,
+                         'human_edit', 'human correction', 'older machine text',
+                         'legacy machine rationale', '{\"legacy\":true}', 0.51, 0,
+                         1, 'human correction', 'edit', '2026-08-20 00:00:00', 'Sara', 1);",
+            )
+            .unwrap();
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+        assert_eq!(rollback(&db, 9).unwrap(), vec![69, 68, 67, 66, 65, 64, 63, 62, 61]);
+
+        let (machine_snapshots, human_overlap, exact): (i64, i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM legacy_machine_verdict_segments_v60),
+                    (SELECT COUNT(*) FROM legacy_reviewed_segments_v60
+                      WHERE id='legacy-machine-human-overlap'),
+                    (SELECT COUNT(*) FROM legacy_machine_verdict_segments_v60
+                      WHERE id='legacy-machine-human-overlap'
+                        AND review_revision=9
+                        AND verdict IS 'human_edit'
+                        AND verdict_transcript IS 'human correction'
+                        AND jury_transcript IS 'older machine text'
+                        AND rationale IS 'legacy machine rationale'
+                        AND evidence_json IS '{\"legacy\":true}'
+                        AND agreement_score IS 0.51
+                        AND verified=1
+                        AND annotated_transcript IS 'human correction'
+                        AND human_decision IS 'edit'
+                        AND corrected_at IS '2026-08-20 00:00:00'
+                        AND reviewed_by IS 'Sara'
+                        AND is_gold=1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((machine_snapshots, human_overlap, exact), (2, 1, 1));
+        for sql in [
+            "UPDATE legacy_machine_verdict_segments_v60 SET rationale='forged' WHERE id='legacy-machine'",
+            "DELETE FROM legacy_machine_verdict_segments_v60 WHERE id='legacy-machine'",
+            "INSERT INTO legacy_machine_verdict_segments_v60 SELECT * FROM legacy_machine_verdict_segments_v60 LIMIT 1",
+        ] {
+            let error = db.connection().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("immutable"), "unexpected snapshot guard: {error}");
+        }
+        db.connection().execute("UPDATE speech_segments SET confidence=0.6 WHERE id='legacy-machine'", []).unwrap();
+        let revisions: (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT segment.review_revision, legacy.review_revision
+                   FROM speech_segments segment
+                   JOIN legacy_machine_verdict_segments_v60 legacy ON legacy.id=segment.id
+                  WHERE segment.id='legacy-machine'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(revisions, (8, 7), "the immutable frontier is a revision floor, not a metadata freeze");
+        assert_eq!(rollback(&db, 1).unwrap(), vec![60]);
+
+        let drifted = database_at_v59();
+        drifted
+            .connection()
+            .execute(
+                "INSERT INTO speech_segments
+                    (id, audio_path, verdict, verdict_transcript, jury_transcript, rationale)
+                 VALUES ('legacy-machine-drift', '/legacy-machine-drift.wav', 'jury_accept',
+                         'machine text', 'machine text', 'original rationale')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(run_migrations(&drifted).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+        assert_eq!(rollback(&drifted, 9).unwrap(), vec![69, 68, 67, 66, 65, 64, 63, 62, 61]);
+        drifted
+            .connection()
+            .execute("UPDATE speech_segments SET rationale='forged rationale' WHERE id='legacy-machine-drift'", [])
+            .unwrap();
+        let drift_error =
+            rollback(&drifted, 1).expect_err("downgrade must refuse a drifted machine frontier").to_string();
+        assert!(drift_error.contains("CHECK constraint failed"), "unexpected drift guard: {drift_error}");
+
+        let unbound = database_at_v60();
+        unbound
+            .connection()
+            .execute(
+                "INSERT INTO speech_segments
+                    (id, audio_path, verdict, verdict_transcript, jury_transcript,
+                     evidence_json, agreement_score)
+                 VALUES ('post-v60-unbound-machine', '/post-v60-unbound-machine.wav',
+                         'jury_accept', 'unbound', 'unbound', '{\"unbound\":true}', 0.5)",
+                [],
+            )
+            .unwrap();
+        let unbound_error =
+            rollback(&unbound, 1).expect_err("downgrade must not bless a post-cutoff machine projection").to_string();
+        assert!(unbound_error.contains("CHECK constraint failed"), "unexpected unbound guard: {unbound_error}");
+    }
+
+    /// Deterministic test twin of the measured production cohort. Its sorted-id digest is the
+    /// cfg(test)-only value accepted by `validate_v58_orphan_source`; every other shape remains red.
+    fn seed_v58_authorized_cohort(db: &Database) {
+        run_with_foreign_keys_off(db.connection(), || {
+            let tx = db.connection().unchecked_transaction()?;
+            {
+                let mut insert_hypothesis = tx.prepare(
+                    "INSERT INTO segment_hypotheses
+                        (rowid, segment_id, model_id, transcript, confidence, created_at, model_version_id)
+                     VALUES (?1, ?2, 'omniasr-7b-legacy-c348ade8a816', ?3, NULL, ?4,
+                             'omniasr-7b-legacy-c348ade8a816')",
+                )?;
+                let mut insert_loop0 = tx.prepare(
+                    "INSERT INTO loop0_shadow_log(id, segment_id, memory_fired, created_at)
+                     VALUES (?1, ?2, 0, ?3)",
+                )?;
+                for index in 0..V58_ORPHAN_IDS as i64 {
+                    let segment_id = v58_fixture_id(index);
+                    let hypothesis_rowid = 2_000_000 + index;
+                    let loop0_id = hypothesis_rowid - 2_555;
+                    let transcript = if index == 0 { "دەقی یەکەم\nبە وردی" } else { "دەق" };
+                    let created_at = format!("2026-08-21 01:{:02}:{:02}", (index / 60) % 60, index % 60);
+                    insert_hypothesis.execute(rusqlite::params![
+                        hypothesis_rowid,
+                        segment_id,
+                        transcript,
+                        created_at,
+                    ])?;
+                    insert_loop0.execute(rusqlite::params![loop0_id, segment_id, created_at])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn foreign_key_violation_count(conn: &rusqlite::Connection) -> usize {
+        conn.prepare("PRAGMA foreign_key_check").unwrap().query_map([], |_| Ok(())).unwrap().count()
+    }
 
     #[test]
     fn test_migrations_run() {
@@ -1605,7 +8366,13 @@ mod tests {
             })
             .unwrap();
         }
-        db.write_segment_verdict("s-1", "auto_accept", Some("t"), None, None, Some(0.9), false).unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO decision_verdicts(segment_id, auto_accept_verdict)
+                 VALUES ('s-1', 'T0_ACCEPT')",
+                [],
+            )
+            .unwrap();
         let rowids_before: Vec<i64> = db
             .connection()
             .prepare("SELECT rowid FROM speech_segments ORDER BY id")
@@ -1627,6 +8394,130 @@ mod tests {
         db.connection()
             .execute_batch("ALTER TABLE speech_segments RENAME COLUMN agreement_score TO agent_confidence;")
             .expect("put the column back to its pre-v52 name so v40 replays against the schema it expects");
+        // v60 intentionally binds policy-3 receipts to the live speech_segments row. This synthetic
+        // HEAD -> v40 replay temporarily removes that table, an ordering no production upgrade ever
+        // performs, so preserve and restore the future trigger around only that impossible window.
+        let playback_span_trigger_sql: String = db
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type='trigger' AND name='playback_receipts_v60_span_validate_insert'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v60 playback span trigger exists at HEAD");
+        let paid_identity_trigger_sql: String = db
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type='trigger' AND name='speech_segments_v60_paid_identity_immutable_update'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v60 paid source-identity trigger exists at HEAD");
+        let pool_decision_trigger_sql: String = db
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type='trigger' AND name='review_pool_decision_validate_insert'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v62 pool decision trigger exists at HEAD");
+        let pool_member_trigger_sql: String = db
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type='trigger' AND name='review_pool_member_validate_insert'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v62 pool member trigger exists at HEAD");
+        let pool_segment_delete_trigger_sql: String = db
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type='trigger' AND name='speech_segments_v62_review_pool_delete'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v62 pool segment trigger exists at HEAD");
+        let pool_segment_identity_trigger_sql: String = db
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type='trigger' AND name='speech_segments_v62_review_pool_identity_update'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v62 pool segment identity trigger exists at HEAD");
+        let pool_terminal_trigger_sql: String = db
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type='trigger' AND name='review_pool_v63_decision_terminal_guard'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v63 pool terminal trigger exists at HEAD");
+        let certified_segment_trigger_sql: String = db
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type='trigger' AND name='speech_segments_v63_certificate_review_guard'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v63 certified-segment trigger exists at HEAD");
+        let duplicate_exclusion_trigger_sql: String = db
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type='trigger' AND name='review_pool_duplicate_exclusion_validate_insert'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v64 duplicate-exclusion trigger exists at HEAD");
+        let excluded_review_trigger_sql: String = db
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type='trigger' AND name='speech_segments_v64_excluded_review_guard'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v64 excluded-review trigger exists at HEAD");
+        // v68 advances the segment CAS revision from child-table hypothesis writes. Unlike triggers
+        // defined ON speech_segments, SQLite does not remove these when the synthetic replay drops
+        // the parent table; leaving them installed makes the historical v40 CREATE/INSERT fail with
+        // `no such table: main.speech_segments`. A real ordered rollback removes v68 first, so this
+        // HEAD-only replay must preserve, remove, and restore all three exact future triggers.
+        let hypothesis_revision_trigger_sql: Vec<String> = [
+            "segment_hypotheses_v68_revision_insert",
+            "segment_hypotheses_v68_revision_delete",
+            "segment_hypotheses_v68_revision_update",
+        ]
+        .iter()
+        .map(|name| {
+            db.connection()
+                .query_row("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1", [name], |row| row.get(0))
+                .unwrap_or_else(|error| panic!("v68 hypothesis revision trigger {name} exists at HEAD: {error}"))
+        })
+        .collect();
+        db.connection()
+            .execute_batch(
+                "DROP TRIGGER playback_receipts_v60_span_validate_insert;
+                 DROP TRIGGER speech_segments_v60_paid_identity_immutable_update;
+                 DROP TRIGGER review_pool_decision_validate_insert;
+                 DROP TRIGGER review_pool_member_validate_insert;
+                 DROP TRIGGER review_pool_v63_decision_terminal_guard;
+                 DROP TRIGGER review_pool_duplicate_exclusion_validate_insert;
+                 DROP TRIGGER speech_segments_v64_excluded_review_guard;
+                 DROP TRIGGER segment_hypotheses_v68_revision_insert;
+                 DROP TRIGGER segment_hypotheses_v68_revision_delete;
+                 DROP TRIGGER segment_hypotheses_v68_revision_update;",
+            )
+            .expect("synthetic historical replay can temporarily remove the future trigger");
         {
             let conn = db.connection();
             run_with_foreign_keys_off(conn, || {
@@ -1639,12 +8530,59 @@ mod tests {
             .expect("the FK-off recreate must succeed");
         }
 
-        // A live upgrade applies v40 and THEN every later migration; re-running v40's recreate in
-        // isolation leaves the table at v40's 34-column shape (its INSERT…SELECT copies only those 34),
-        // dropping any column a post-v40 migration added. Re-apply everything after v40 so HEAD-schema
-        // readers (get_segment_by_id below) see the real current shape — future-proof against v42+.
-        for later in MIGRATIONS.iter().filter(|m| m.version > 40) {
-            db.connection().execute_batch(later.up_sql).expect("re-applying a post-v40 migration must succeed");
+        // A live upgrade applies v40 and THEN the later migrations which extend speech_segments.
+        // Re-running v40's recreate in isolation leaves the table at v40's 34-column shape, so restore
+        // exactly those table/index/trigger changes before HEAD-schema readers run below. Unrelated
+        // migrations survive the v40 recreate and must not be replayed: in particular, v58 deliberately
+        // uses plain CREATE for immutable repair evidence and MUST reject a second application.
+        const POST_V40_SPEECH_SEGMENT_MIGRATIONS: &[i64] = &[41, 42, 43, 47, 48, 49, 50, 51, 52, 53];
+        for later in MIGRATIONS.iter().filter(|m| POST_V40_SPEECH_SEGMENT_MIGRATIONS.contains(&m.version)) {
+            if let Err(e) = db.connection().execute_batch(later.up_sql) {
+                // "duplicate column" here is the GOOD outcome for a table v40's recreate never
+                // touched (v56 alters review_events): the column survived, there is nothing to
+                // restore. Any other error is a real re-application failure.
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("duplicate column name"),
+                    "re-applying post-v40 migration v{} must succeed or be a no-op: {msg}",
+                    later.version
+                );
+            }
+        }
+        db.connection()
+            .execute_batch(&playback_span_trigger_sql)
+            .expect("restore the exact v60 playback span trigger after synthetic v40 replay");
+        db.connection()
+            .execute_batch(&paid_identity_trigger_sql)
+            .expect("restore the exact v60 paid source-identity trigger after synthetic v40 replay");
+        db.connection()
+            .execute_batch(&pool_decision_trigger_sql)
+            .expect("restore the exact v62 pool decision trigger after synthetic v40 replay");
+        db.connection()
+            .execute_batch(&pool_member_trigger_sql)
+            .expect("restore the exact v62 pool member trigger after synthetic v40 replay");
+        db.connection()
+            .execute_batch(&pool_segment_delete_trigger_sql)
+            .expect("restore the exact v62 pool segment trigger after synthetic v40 replay");
+        db.connection()
+            .execute_batch(&pool_segment_identity_trigger_sql)
+            .expect("restore the exact v62 pool segment identity trigger after synthetic v40 replay");
+        db.connection()
+            .execute_batch(&pool_terminal_trigger_sql)
+            .expect("restore the exact v63 pool terminal trigger after synthetic v40 replay");
+        db.connection()
+            .execute_batch(&certified_segment_trigger_sql)
+            .expect("restore the exact v63 certified-segment trigger after synthetic v40 replay");
+        db.connection()
+            .execute_batch(&duplicate_exclusion_trigger_sql)
+            .expect("restore the exact v64 duplicate-exclusion trigger after synthetic v40 replay");
+        db.connection()
+            .execute_batch(&excluded_review_trigger_sql)
+            .expect("restore the exact v64 excluded-review trigger after synthetic v40 replay");
+        for trigger_sql in hypothesis_revision_trigger_sql {
+            db.connection()
+                .execute_batch(&trigger_sql)
+                .expect("restore the exact v68 hypothesis revision trigger after synthetic v40 replay");
         }
 
         let conn = db.connection();
@@ -1814,8 +8752,8 @@ mod tests {
         db.initialize().unwrap();
         assert!(get_current_version(&db).unwrap() >= 38, "v38 must have applied");
 
-        // A real verdict write goes through the app path (segment + write_segment_verdict -> the
-        // decision_verdicts INSERT), so the row exists BEFORE we probe STRICT.
+        // Schema v60 deliberately disables machine verdict writes for the first paid batch. Seed the
+        // pre-existing metric row directly: this test owns the v38 table shape, not jury runtime policy.
         db.insert_segment(&crate::db::SpeechSegment {
             id: "sv-1".into(),
             audio_path: "/a.wav".into(),
@@ -1824,12 +8762,18 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        db.write_segment_verdict("sv-1", "auto_accept", Some("t"), None, None, Some(0.9), false).unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO decision_verdicts(segment_id, auto_accept_verdict)
+                 VALUES ('sv-1', 'T0_ACCEPT')",
+                [],
+            )
+            .unwrap();
         let conn = db.connection();
         let (before,): (i64,) = conn
             .query_row("SELECT COUNT(*) FROM decision_verdicts WHERE segment_id='sv-1'", [], |r| Ok((r.get(0)?,)))
             .unwrap();
-        assert_eq!(before, 1, "the real verdict write landed a decision_verdicts row");
+        assert_eq!(before, 1, "the pre-existing decision_verdicts row is present");
 
         // (2) STRICT enforcement: the table must be declared STRICT...
         let sql: String = conn
@@ -1958,6 +8902,732 @@ mod tests {
     }
 
     #[test]
+    fn v63_partial_migration_failure_is_atomic_and_recoverable() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(rollback(&db, 7).unwrap(), vec![69, 68, 67, 66, 65, 64, 63]);
+        assert_eq!(get_current_version(&db).unwrap(), 62);
+        db.connection().execute("CREATE TABLE review_pool_owner_adjudications(collision INTEGER)", []).unwrap();
+        let error = run_migrations(&db).expect_err("a v63 object collision must fail the entire migration");
+        assert!(error.to_string().contains("already exists"), "unexpected v63 failure: {error}");
+        assert_eq!(get_current_version(&db).unwrap(), 62, "failed v63 must not record its migration row");
+        let leaked_objects: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE name IN ('review_pool_voice_certificates',
+                                 'review_pool_owner_adjudication_validate_insert',
+                                 'review_pool_v63_decision_terminal_guard')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked_objects, 0, "failed v63 leaked later tables or triggers");
+        db.connection().execute("DROP TABLE review_pool_owner_adjudications", []).unwrap();
+        assert_eq!(run_migrations(&db).unwrap(), vec![63, 64, 65, 66, 67, 68, 69]);
+        assert_eq!(get_current_version(&db).unwrap(), 69);
+    }
+
+    #[test]
+    fn v64_partial_migration_failure_is_atomic_and_recoverable() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(rollback(&db, 6).unwrap(), vec![69, 68, 67, 66, 65, 64]);
+        assert_eq!(get_current_version(&db).unwrap(), 63);
+        db.connection().execute("CREATE TABLE review_pool_dedup_manifests(collision INTEGER)", []).unwrap();
+        let error = run_migrations(&db).expect_err("a v64 object collision must fail the entire migration");
+        assert!(error.to_string().contains("already exists"), "unexpected v64 failure: {error}");
+        assert_eq!(get_current_version(&db).unwrap(), 63, "failed v64 must not record its migration row");
+        let leaked_objects: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE name IN ('review_pool_duplicate_exclusions',
+                                 'review_pool_duplicate_exclusion_validate_insert',
+                                 'speech_segments_v64_excluded_review_guard')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked_objects, 0, "failed v64 leaked later tables or triggers");
+        db.connection().execute("DROP TABLE review_pool_dedup_manifests", []).unwrap();
+        assert_eq!(run_migrations(&db).unwrap(), vec![64, 65, 66, 67, 68, 69]);
+        assert_eq!(get_current_version(&db).unwrap(), 69);
+    }
+
+    #[test]
+    fn v65_partial_migration_failure_is_atomic_and_recoverable() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(rollback(&db, 5).unwrap(), vec![69, 68, 67, 66, 65]);
+        assert_eq!(get_current_version(&db).unwrap(), 64);
+        let v64_trigger_sql: String = db
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type='trigger' AND name='speech_segments_v64_excluded_review_guard'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(v64_trigger_sql.contains("review_revision"));
+        db.connection().execute("DROP TRIGGER speech_segments_v64_excluded_review_guard", []).unwrap();
+        let error = run_migrations(&db).expect_err("a missing v64 guard must fail the entire v65 migration");
+        assert!(error.to_string().contains("no such trigger"), "unexpected v65 failure: {error}");
+        assert_eq!(get_current_version(&db).unwrap(), 64, "failed v65 must not record its migration row");
+        db.connection().execute_batch(&v64_trigger_sql).unwrap();
+        assert_eq!(run_migrations(&db).unwrap(), vec![65, 66, 67, 68, 69]);
+        assert_eq!(get_current_version(&db).unwrap(), 69);
+        let v65_trigger_sql: String = db
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type='trigger' AND name='speech_segments_v64_excluded_review_guard'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!v65_trigger_sql.contains("review_revision"));
+    }
+
+    #[test]
+    fn v66_review_draft_migration_is_additive_atomic_and_recoverable() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(rollback(&db, 4).unwrap(), vec![69, 68, 67, 66]);
+        assert_eq!(get_current_version(&db).unwrap(), 65);
+        db.connection().execute("CREATE TABLE review_drafts(collision INTEGER)", []).unwrap();
+        let error = run_migrations(&db).expect_err("a v66 object collision must fail the entire migration");
+        assert!(error.to_string().contains("already exists"), "unexpected v66 failure: {error}");
+        assert_eq!(get_current_version(&db).unwrap(), 65, "failed v66 must not record its migration row");
+        let leaked_index: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_review_drafts_updated_at'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(leaked_index, 0, "failed v66 leaked its later index");
+        db.connection().execute("DROP TABLE review_drafts", []).unwrap();
+        assert_eq!(run_migrations(&db).unwrap(), vec![66, 67, 68, 69]);
+        assert_eq!(get_current_version(&db).unwrap(), 69);
+        let strict_sql: String = db
+            .connection()
+            .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'review_drafts'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(strict_sql.ends_with(" STRICT"), "review drafts must use SQLite STRICT typing");
+    }
+
+    #[test]
+    fn v67_desktop_playback_authority_migration_is_atomic_strict_and_recoverable() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(rollback(&db, 3).unwrap(), vec![69, 68, 67]);
+        assert_eq!(get_current_version(&db).unwrap(), 66);
+
+        db.connection().execute("CREATE TABLE desktop_playback_sessions_v4(collision INTEGER)", []).unwrap();
+        let error = run_migrations(&db).expect_err("a v67 object collision must fail the entire migration");
+        assert!(error.to_string().contains("already exists"), "unexpected v67 failure: {error}");
+        assert_eq!(get_current_version(&db).unwrap(), 66, "failed v67 must not record its migration row");
+        let leaked_objects: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE name IN ('desktop_playback_intervals_v4',
+                                 'idx_desktop_playback_sessions_v4_segment',
+                                 'playback_receipts_v67_policy4_validate_insert',
+                                 'speech_segments_v67_policy4_paid_identity_immutable_update')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked_objects, 0, "failed v67 leaked later tables, indexes, or triggers");
+        let receipt_columns: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('playback_receipts')
+                  WHERE name IN ('authority_session_id','interval_union_sha256')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipt_columns, 0, "failed v67 leaked additive receipt columns");
+
+        db.connection().execute("DROP TABLE desktop_playback_sessions_v4", []).unwrap();
+        assert_eq!(run_migrations(&db).unwrap(), vec![67, 68, 69]);
+        assert_eq!(get_current_version(&db).unwrap(), 69);
+        let paid_identity_trigger: String = db
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type='trigger'
+                    AND name='speech_segments_v67_policy4_paid_identity_immutable_update'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("schema 67 must install the policy-4 paid-identity freeze");
+        assert!(paid_identity_trigger.contains("receipt.policy_version = 4"));
+        assert!(paid_identity_trigger.contains("interval-authority-v4"));
+        for table in ["desktop_playback_sessions_v4", "desktop_playback_intervals_v4"] {
+            let sql: String = db
+                .connection()
+                .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name=?1", [table], |row| row.get(0))
+                .unwrap();
+            assert!(sql.ends_with(" STRICT"), "{table} must use SQLite STRICT typing: {sql}");
+        }
+
+        db.connection()
+            .execute(
+                "INSERT INTO desktop_playback_sessions_v4
+                    (playback_receipt_id,media_grant_id,client_attempt_id,surface,session_binding_sha256,
+                     grant_source_path_sha256,segment_id,
+                     segment_revision,audio_content_hash,clip_duration_ms,source_start_ms,
+                     source_end_ms,issued_at_ms,expires_at_ms)
+                 VALUES (?1,?2,?3,'desktop',NULL,?4,'abandoned-only',0,?5,1000,0,1000,1000,2000)",
+                rusqlite::params![
+                    "11111111-1111-4111-8111-111111111111",
+                    "22222222-2222-4222-8222-222222222222",
+                    "33333333-3333-4333-8333-333333333333",
+                    "a".repeat(64),
+                    "b".repeat(64),
+                ],
+            )
+            .unwrap();
+        assert_eq!(rollback(&db, 3).unwrap(), vec![69, 68, 67]);
+        assert_eq!(
+            db.connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                      WHERE type='trigger'
+                        AND name='speech_segments_v67_policy4_paid_identity_immutable_update'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "schema-67 rollback must remove its policy-4 identity trigger",
+        );
+        assert_eq!(
+            get_current_version(&db).unwrap(),
+            66,
+            "a never-finalized playback attempt is ephemeral and must not make schema 67 irreversible",
+        );
+        assert_eq!(run_migrations(&db).unwrap(), vec![67, 68, 69]);
+        assert_eq!(get_current_version(&db).unwrap(), 69);
+    }
+
+    #[test]
+    fn v68_batch_item_authority_is_strict_exact_append_only_and_rollback_guarded() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(rollback(&db, 1).unwrap(), vec![69], "this test isolates the v68 migration");
+        assert_eq!(get_current_version(&db).unwrap(), 68);
+        let conn = db.connection();
+
+        let strict: i64 = conn
+            .query_row("SELECT strict FROM pragma_table_list WHERE name='batch_job_items_v1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(strict, 1);
+
+        conn.execute(
+            "INSERT INTO speech_segments(id,audio_path,duration_ms)
+             VALUES ('revision-bound-segment','C:/proof/revision.wav',1000)",
+            [],
+        )
+        .unwrap();
+        let revision = || {
+            conn.query_row("SELECT review_revision FROM speech_segments WHERE id='revision-bound-segment'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(revision(), 0);
+        conn.execute(
+            "INSERT INTO segment_hypotheses(segment_id,model_id,transcript)
+             VALUES ('revision-bound-segment','model-a','draft-a')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(revision(), 1, "hypothesis insertion must advance the segment CAS authority");
+        conn.execute(
+            "UPDATE segment_hypotheses SET transcript='draft-b'
+              WHERE segment_id='revision-bound-segment' AND model_id='model-a'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(revision(), 2, "hypothesis replacement must advance the segment CAS authority");
+        conn.execute(
+            "DELETE FROM segment_hypotheses
+              WHERE segment_id='revision-bound-segment' AND model_id='model-a'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(revision(), 3, "hypothesis deletion must advance the segment CAS authority");
+
+        // SQLite rowid tables historically permit NULL in a non-INTEGER PRIMARY KEY. Every UUID
+        // predicate also evaluates to NULL for a NULL value, so type checks are required to keep an
+        // unaddressable header from permanently occupying the one-live-batch index.
+        let null_identity_payload = serde_json::json!({
+            "schema": 1,
+            "operationId": serde_json::Value::Null,
+            "kind": "batch_transcribe_v1",
+            "requestSha256": "a".repeat(64),
+            "configSha256": "b".repeat(64),
+            "executorGitSha": "1".repeat(40),
+            "attemptGeneration": 1,
+            "executorTokenSha256": "2".repeat(64),
+        })
+        .to_string();
+        assert!(conn
+            .execute(
+                "INSERT INTO jobs(id,kind,state,idempotency_key,total,payload_json)
+                 VALUES (NULL,'batch_transcribe_v1','queued',NULL,1,?1)",
+                [null_identity_payload],
+            )
+            .is_err());
+
+        let operation_id = "00000000-0000-4000-8000-000000000068";
+        let payload = serde_json::json!({
+            "schema": 1,
+            "operationId": operation_id,
+            "kind": "batch_transcribe_v1",
+            "requestSha256": "a".repeat(64),
+            "configSha256": "b".repeat(64),
+            "executorGitSha": "1".repeat(40),
+            "attemptGeneration": 1,
+            "executorTokenSha256": "2".repeat(64),
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO jobs(id,kind,state,idempotency_key,total,payload_json)
+             VALUES (?1,'batch_transcribe_v1','queued',?2,2,?3)",
+            params![operation_id, format!("batch-v1:{operation_id}"), payload],
+        )
+        .unwrap();
+
+        let rewritten_executor_payload = serde_json::json!({
+            "schema": 1,
+            "operationId": operation_id,
+            "kind": "batch_transcribe_v1",
+            "requestSha256": "a".repeat(64),
+            "configSha256": "b".repeat(64),
+            "executorGitSha": "1".repeat(40),
+            "attemptGeneration": 2,
+            "executorTokenSha256": "9".repeat(64),
+        })
+        .to_string();
+        assert!(
+            conn.execute(
+                "UPDATE jobs SET payload_json=?2 WHERE id=?1",
+                params![operation_id, rewritten_executor_payload],
+            )
+            .is_err(),
+            "executor provenance must be byte-immutable after durable admission"
+        );
+
+        assert!(conn
+            .execute("UPDATE jobs SET state='running', started_at=datetime('now') WHERE id=?1", params![operation_id],)
+            .is_err());
+
+        for (ordinal, segment_id) in [(0_i64, "segment-a"), (1_i64, "segment-b")] {
+            conn.execute(
+                "INSERT INTO batch_job_items_v1(
+                     job_id,ordinal,segment_id,base_revision,source_identity_sha256,
+                     before_projection_json,before_projection_sha256
+                 ) VALUES (?1,?2,?3,0,?4,?5,?6)",
+                params![
+                    operation_id,
+                    ordinal,
+                    segment_id,
+                    "c".repeat(64),
+                    serde_json::json!({"segmentId": segment_id, "revision": 0}).to_string(),
+                    if ordinal == 0 { "d".repeat(64) } else { "e".repeat(64) },
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute("UPDATE jobs SET state='running', started_at=datetime('now') WHERE id=?1", params![operation_id])
+            .unwrap();
+
+        let second_id = "00000000-0000-4000-8000-000000000069";
+        let second_payload = serde_json::json!({
+            "schema": 1,
+            "operationId": second_id,
+            "kind": "batch_normalize_v1",
+            "requestSha256": "f".repeat(64),
+            "configSha256": "1".repeat(64),
+            "executorGitSha": "2".repeat(40),
+            "attemptGeneration": 1,
+            "executorTokenSha256": "3".repeat(64),
+        })
+        .to_string();
+        assert!(conn
+            .execute(
+                "INSERT INTO jobs(id,kind,state,idempotency_key,total,payload_json)
+                 VALUES (?1,'batch_normalize_v1','queued',?2,1,?3)",
+                params![second_id, format!("batch-v1:{second_id}"), second_payload],
+            )
+            .is_err());
+
+        conn.execute(
+            "UPDATE batch_job_items_v1
+                SET state='applied', after_projection_json=?2, after_projection_sha256=?3,
+                    effect_revision=1, terminal_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+              WHERE job_id=?1 AND ordinal=0",
+            params![
+                operation_id,
+                serde_json::json!({"segmentId": "segment-a", "revision": 1}).to_string(),
+                "2".repeat(64)
+            ],
+        )
+        .unwrap();
+        conn.execute("UPDATE jobs SET completed=1, progress=0.5 WHERE id=?1", params![operation_id]).unwrap();
+        conn.execute(
+            "UPDATE batch_job_items_v1
+                SET state='skipped', result_code='SOURCE_CHANGED',
+                    terminal_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+              WHERE job_id=?1 AND ordinal=1",
+            params![operation_id],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE batch_job_items_v1 SET result_code='REWRITTEN' WHERE job_id=?1 AND ordinal=1",
+                params![operation_id],
+            )
+            .is_err());
+        conn.execute("UPDATE jobs SET completed=2, progress=1.0 WHERE id=?1", params![operation_id]).unwrap();
+        conn.execute(
+            "UPDATE jobs SET state='succeeded', finished_at=datetime('now') WHERE id=?1",
+            params![operation_id],
+        )
+        .unwrap();
+        assert!(conn.execute("DELETE FROM batch_job_items_v1 WHERE job_id=?1", params![operation_id]).is_err());
+        assert!(conn.execute("DELETE FROM jobs WHERE id=?1", params![operation_id]).is_err());
+        assert!(
+            conn.execute(
+                "UPDATE jobs SET completed=0,progress=0,error_code='REWRITTEN' WHERE id=?1",
+                params![operation_id],
+            )
+            .is_err()
+        );
+
+        conn.execute(
+            "INSERT INTO jobs(id,kind,state,total,completed,progress)
+             VALUES ('ordinary','other','running',1,0,0)",
+            [],
+        )
+        .unwrap();
+        assert!(conn.execute("UPDATE jobs SET kind='batch_transcribe_v1' WHERE id='ordinary'", []).is_err());
+
+        let rollback_error = rollback(&db, 1).unwrap_err().to_string();
+        assert!(rollback_error.contains("CHECK constraint failed"), "unexpected rollback refusal: {rollback_error}");
+        assert_eq!(get_current_version(&db).unwrap(), 68);
+
+        let empty = Database::open(":memory:").unwrap();
+        empty.initialize().unwrap();
+        assert_eq!(rollback(&empty, 1).unwrap(), vec![69], "this test isolates the v68 migration");
+        assert_eq!(rollback(&empty, 1).unwrap(), vec![68]);
+        assert_eq!(get_current_version(&empty).unwrap(), 67);
+        assert_eq!(run_migrations(&empty).unwrap(), vec![68, 69]);
+        assert_eq!(get_current_version(&empty).unwrap(), 69);
+    }
+
+    #[test]
+    fn v69_desktop_review_journal_is_strict_complete_ordered_and_rollback_guarded() {
+        use crate::db::{DesktopReviewUndoAuthority, DesktopReviewUndoAvailability, DesktopReviewUndoBlockReason};
+
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(get_current_version(&db).unwrap(), 69);
+        let conn = db.connection();
+
+        for table in ["desktop_review_legacy_actions_v1", "desktop_review_action_events_v1"] {
+            let strict: i64 = conn
+                .query_row("SELECT strict FROM pragma_table_list WHERE name=?1", [table], |row| row.get(0))
+                .unwrap();
+            assert_eq!(strict, 1, "{table} must use SQLite STRICT typing");
+        }
+        for trigger in [
+            "desktop_review_legacy_actions_v1_sealed_insert",
+            "desktop_review_legacy_actions_v1_immutable_update",
+            "desktop_review_legacy_actions_v1_immutable_delete",
+            "desktop_review_action_events_v1_validate_insert",
+            "desktop_review_action_events_v1_immutable_update",
+            "desktop_review_action_events_v1_immutable_delete",
+            "human_decision_effect_events_v69_desktop_action_insert",
+            "review_events_v69_operation_namespace_insert",
+            "human_decision_effect_events_v69_operation_namespace_insert",
+            "human_decision_effect_reversals_v69_desktop_operation_namespace_insert",
+            "human_decision_effect_reversals_v69_desktop_action_insert",
+            "review_flag_effect_events_v69_desktop_action_insert",
+            "review_flag_effect_events_v69_operation_namespace_insert",
+            "review_flag_effect_reversals_v69_operation_namespace_insert",
+            "review_flag_effect_reversals_v69_desktop_action_insert",
+            "independent_review_reversals_v69_operation_namespace_insert",
+            "independent_review_decisions_v69_operation_namespace_insert",
+        ] {
+            let present: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?1", [trigger], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(present, 1, "v69 trigger {trigger} must exist exactly once");
+        }
+        assert_eq!(db.desktop_review_undo_availability().unwrap(), DesktopReviewUndoAvailability::NoHistory);
+
+        conn.execute(
+            "INSERT INTO speech_segments
+                (id,audio_path,raw_transcript,annotated_transcript,verified,verdict,
+                 verdict_transcript,human_decision,corrected_at,review_revision)
+             VALUES
+                ('v69-decision','/v69-decision.wav','served transcript',NULL,1,'human_edit',
+                 'decision transcript','edit','2026-08-22 00:00:00',1)",
+            [],
+        )
+        .unwrap();
+        let decision = insert_effect_event_with_action(&db, None, "v69-decision", None, "desktop", "edit", 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT action_kind,effect_event_id FROM desktop_review_action_events_v1 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+            ("decision".to_string(), decision),
+        );
+        assert!(matches!(
+            db.desktop_review_undo_availability().unwrap(),
+            DesktopReviewUndoAvailability::Available(DesktopReviewUndoAuthority::Decision(authority))
+                if authority.effect_event_id == decision
+        ));
+
+        conn.execute(
+            "INSERT INTO speech_segments(id,audio_path,raw_transcript,review_revision)
+             VALUES ('v69-flag','/v69-flag.wav','machine draft',0)",
+            [],
+        )
+        .unwrap();
+        let flag = insert_flag_effect_event(&db, "v69-flag", 0, None, None, false);
+        conn.execute(
+            "UPDATE speech_segments
+                SET review_revision=1, verdict='escalated', rationale='flagged for review',
+                    escalated=1, human_decision=NULL
+              WHERE id='v69-flag'",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            db.desktop_review_undo_availability().unwrap(),
+            DesktopReviewUndoAvailability::Available(DesktopReviewUndoAuthority::Flag(authority))
+                if authority.effect_event_id == flag
+        ));
+        conn.execute(
+            "INSERT INTO review_flag_effect_reversals(flag_effect_event_id,operation_id) VALUES (?1,?2)",
+            params![flag, "00000000-0000-4000-8000-000000000690"],
+        )
+        .unwrap();
+        assert_eq!(
+            db.desktop_review_undo_availability().unwrap(),
+            DesktopReviewUndoAvailability::Blocked(DesktopReviewUndoBlockReason::LatestFlagUndone)
+        );
+
+        assert!(conn.execute("UPDATE desktop_review_action_events_v1 SET action_kind='flag' WHERE id=1", []).is_err());
+        assert!(conn.execute("DELETE FROM desktop_review_action_events_v1 WHERE id=1", []).is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO desktop_review_legacy_actions_v1(source_kind,effect_event_id) VALUES ('flag',999)",
+                [],
+            )
+            .is_err());
+
+        let rollback_error = rollback(&db, 1).unwrap_err().to_string();
+        assert!(
+            rollback_error.contains("CHECK constraint failed"),
+            "unexpected v69 rollback refusal: {rollback_error}"
+        );
+        assert_eq!(get_current_version(&db).unwrap(), 69);
+
+        let empty = Database::open(":memory:").unwrap();
+        empty.initialize().unwrap();
+        assert_eq!(rollback(&empty, 1).unwrap(), vec![69]);
+        assert_eq!(get_current_version(&empty).unwrap(), 68);
+        assert_eq!(run_migrations(&empty).unwrap(), vec![69]);
+    }
+
+    #[test]
+    fn v69_inverse_operation_namespace_triggers_reject_cross_action_collisions_without_journal_mutation() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+
+        let decision = insert_effect_event_with_action(&db, None, "v69-collision-decision", None, "desktop", "edit", 1);
+        let decision_operation: String = conn
+            .query_row("SELECT operation_id FROM human_decision_effect_events WHERE id=?1", [decision], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let journal_before: i64 =
+            conn.query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get(0)).unwrap();
+        let decision_error = conn
+            .execute(
+                "INSERT INTO human_decision_effect_reversals(effect_event_id,operation_id) VALUES (?1,?2)",
+                params![decision, decision_operation],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(decision_error.contains("belongs to another review action"), "{decision_error}");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM human_decision_effect_reversals", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            journal_before,
+            "a rejected decision inverse must not append journal authority"
+        );
+
+        let flag = insert_flag_effect_event(&db, "v69-collision-flag", 0, None, None, false);
+        let flag_operation: String = conn
+            .query_row("SELECT operation_id FROM review_flag_effect_events WHERE id=?1", [flag], |row| row.get(0))
+            .unwrap();
+        let journal_before: i64 =
+            conn.query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get(0)).unwrap();
+        let flag_error = conn
+            .execute(
+                "INSERT INTO review_flag_effect_reversals(flag_effect_event_id,operation_id) VALUES (?1,?2)",
+                params![flag, flag_operation],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(flag_error.contains("belongs to another review action"), "{flag_error}");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM review_flag_effect_reversals", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM desktop_review_action_events_v1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            journal_before,
+            "a rejected flag inverse must not append journal authority"
+        );
+    }
+
+    #[test]
+    fn v69_same_timestamp_cross_segment_actions_are_ordered_only_by_journal_id() {
+        use crate::db::{DesktopReviewUndoAuthority, DesktopReviewUndoAvailability};
+
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+        conn.execute_batch(
+            "DROP TRIGGER human_decision_effect_events_v69_desktop_action_insert;
+             DROP TRIGGER review_flag_effect_events_v69_desktop_action_insert;",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO speech_segments
+                (id,audio_path,raw_transcript,annotated_transcript,verified,verdict,
+                 verdict_transcript,human_decision,corrected_at,review_revision)
+             VALUES
+                ('same-time-decision','/same-time-decision.wav','served transcript',NULL,1,'human_edit',
+                 'decision transcript','edit','2026-08-22 00:00:00',1)",
+            [],
+        )
+        .unwrap();
+        let decision = insert_effect_event_with_action(&db, None, "same-time-decision", None, "desktop", "edit", 1);
+        conn.execute(
+            "INSERT INTO speech_segments(id,audio_path,raw_transcript,review_revision)
+             VALUES ('same-time-flag','/same-time-flag.wav','machine draft',0)",
+            [],
+        )
+        .unwrap();
+        let flag = insert_flag_effect_event(&db, "same-time-flag", 0, None, None, false);
+        conn.execute(
+            "UPDATE speech_segments
+                SET review_revision=1, verdict='escalated', rationale='flagged for review',
+                    escalated=1, human_decision=NULL
+              WHERE id='same-time-flag'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id,created_at)
+             VALUES('decision',?1,'2026-08-28T12:00:00.000Z')",
+            [decision],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id,created_at)
+             VALUES('flag',?1,'2026-08-28T12:00:00.000Z')",
+            [flag],
+        )
+        .unwrap();
+
+        db.validate_desktop_review_action_journal().unwrap();
+        assert!(
+            matches!(
+                db.desktop_review_undo_availability().unwrap(),
+                DesktopReviewUndoAvailability::Available(DesktopReviewUndoAuthority::Flag(authority))
+                    if authority.effect_event_id == flag
+            ),
+            "equal wall-clock timestamps must preserve the journal's total action order"
+        );
+    }
+
+    #[test]
+    fn v69_legacy_baseline_prevents_promotion_and_detects_missing_post_boundary_journal_rows() {
+        use crate::db::{DesktopReviewUndoAvailability, DesktopReviewUndoBlockReason};
+
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(rollback(&db, 1).unwrap(), vec![69]);
+        let legacy_decision =
+            insert_effect_event_with_action(&db, None, "legacy-v69-decision", None, "desktop", "accept", 1);
+        let legacy_flag = insert_flag_effect_event(&db, "legacy-v69-flag", 0, None, None, false);
+        db.connection()
+            .execute(
+                "INSERT INTO review_flag_effect_reversals(flag_effect_event_id,operation_id) VALUES (?1,?2)",
+                params![legacy_flag, "00000000-0000-4000-8000-000000000691"],
+            )
+            .unwrap();
+
+        assert_eq!(run_migrations(&db).unwrap(), vec![69]);
+        assert_eq!(
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM desktop_review_legacy_actions_v1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3,
+            "every pre-v69 source action must be enumerated in the sealed baseline"
+        );
+        assert_eq!(
+            db.desktop_review_undo_availability().unwrap(),
+            DesktopReviewUndoAvailability::Blocked(DesktopReviewUndoBlockReason::LegacyHistory)
+        );
+        assert!(
+            db.connection()
+                .execute(
+                    "INSERT INTO desktop_review_action_events_v1(action_kind,effect_event_id) VALUES ('decision',?1)",
+                    [legacy_decision],
+                )
+                .is_err(),
+            "a pre-v69 decision cannot be promoted past the conservative barrier"
+        );
+
+        db.connection().execute("DROP TRIGGER human_decision_effect_events_v69_desktop_action_insert", []).unwrap();
+        insert_effect_event_with_action(&db, None, "missing-v69-journal", None, "desktop", "edit", 1);
+        let error = db
+            .validate_desktop_review_action_journal()
+            .expect_err("a post-boundary source action without its journal row must fail closed");
+        assert!(error.to_string().contains("does not exactly match"), "unexpected integrity error: {error}");
+    }
+
+    #[test]
     fn initialize_applies_every_migration_and_is_idempotent() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
@@ -1973,6 +9643,77 @@ mod tests {
         let again = run_migrations(&db).unwrap();
         assert!(again.is_empty());
         assert_eq!(get_current_version(&db).unwrap(), max_version);
+    }
+
+    #[test]
+    fn exact_history_accepts_only_the_description_bound_complete_prefix() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(validate_applied_history(db.connection()).unwrap(), max_supported_version());
+
+        db.connection().execute("DELETE FROM schema_migrations WHERE version = 23", []).unwrap();
+        let missing = validate_applied_history(db.connection()).expect_err("a missing middle row must fail");
+        assert!(missing.to_string().contains("missing=[23]"), "unexpected history error: {missing}");
+
+        let description = MIGRATIONS.iter().find(|migration| migration.version == 23).unwrap().description;
+        db.connection()
+            .execute(
+                "INSERT INTO schema_migrations(version, description) VALUES (23, ?1)",
+                rusqlite::params![description],
+            )
+            .unwrap();
+        db.connection()
+            .execute("UPDATE schema_migrations SET description = 'tampered' WHERE version = 31", [])
+            .unwrap();
+        let drift = validate_applied_history(db.connection()).expect_err("description drift must fail");
+        assert!(drift.to_string().contains("description_mismatch=[31]"), "unexpected history error: {drift}");
+    }
+
+    #[test]
+    fn a_lone_maximum_or_empty_existing_history_never_bootstraps() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "history-sentinel".into(),
+            audio_path: "/sentinel.wav".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let head = max_supported_version();
+        db.connection().execute("DELETE FROM schema_migrations WHERE version <> ?1", rusqlite::params![head]).unwrap();
+        let lone = run_migrations(&db).expect_err("MAX(version) without its prefix must fail");
+        assert!(lone.to_string().contains("missing="), "unexpected history error: {lone}");
+
+        db.connection().execute("DELETE FROM schema_migrations", []).unwrap();
+        let empty = db.initialize().expect_err("an existing database with empty history must fail closed");
+        assert!(empty.to_string().contains("schema_migrations is empty"), "unexpected bootstrap error: {empty}");
+        assert!(
+            db.get_segment_by_id("history-sentinel").unwrap().is_some(),
+            "refusing damaged history must preserve live data"
+        );
+    }
+
+    #[test]
+    fn restart_refuses_a_missing_history_table_or_required_schema_object() {
+        let missing_history = Database::open(":memory:").unwrap();
+        missing_history.initialize().unwrap();
+        missing_history.connection().execute("DROP TABLE schema_migrations", []).unwrap();
+        let history_error = missing_history.initialize().expect_err("missing history must fail before startup");
+        assert!(
+            history_error.to_string().contains("schema_migrations is missing"),
+            "unexpected error: {history_error}"
+        );
+
+        let missing_object = Database::open(":memory:").unwrap();
+        missing_object.initialize().unwrap();
+        missing_object.connection().execute("DROP TABLE jobs", []).unwrap();
+        let schema_error = missing_object.initialize().expect_err("exact history cannot hide a dropped required table");
+        let schema_message = schema_error.to_string();
+        assert!(
+            schema_message.contains("missing=") && schema_message.contains("\"jobs\""),
+            "unexpected error: {schema_error}"
+        );
     }
 
     #[test]
@@ -2096,6 +9837,11 @@ mod tests {
     fn migration_v20_creates_correction_memory() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
+        assert_eq!(
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            "this test isolates the pre-v60 v20 surface"
+        );
         let conn = db.connection();
 
         // The table and both lookup indexes exist after initialize().
@@ -2155,6 +9901,11 @@ mod tests {
     fn migration_v32_adds_evidence_confidence_columns() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
+        assert_eq!(
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            "this test isolates the pre-v60 v32 surface"
+        );
         let conn = db.connection();
 
         // Both firing-outcome counters exist and default to 0. A raw insert keeps the column-default
@@ -2181,6 +9932,11 @@ mod tests {
         // keeps the memory — and crucially does NOT block the segment deletion itself.
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
+        assert_eq!(
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            "this test isolates the pre-v60 FK behavior"
+        );
         let conn = db.connection();
         // FK enforcement must be on for the SET NULL action to fire (it is, per Database::open).
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
@@ -2209,6 +9965,11 @@ mod tests {
     fn migration_v21_creates_corrections_ledger() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
+        assert_eq!(
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            "this test isolates the pre-v60 v21 surface"
+        );
         let conn = db.connection();
 
         let table: i64 = conn
@@ -2245,6 +10006,11 @@ mod tests {
         // with segment_id SET NULL.
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
+        assert_eq!(
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            "this test isolates the pre-v60 FK behavior"
+        );
         let conn = db.connection();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
@@ -2453,6 +10219,11 @@ mod tests {
         // honest, and nothing downstream would notice a smaller number.
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
+        assert_eq!(
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            "this test isolates v46's historical surface"
+        );
         assert!(get_current_version(&db).unwrap() >= 46, "v46 must have applied");
 
         db.insert_segment(&crate::db::SpeechSegment {
@@ -2463,8 +10234,18 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        db.record_spot_check("seg-scored", "Sara", "edit", "دەقی ڕاست", "دەقی ڕاست").unwrap();
-        db.record_spot_check("seg-scored", "Hemn", "accept", "دەقی هەڵە", "دەقی ڕاست").unwrap();
+        db.connection()
+            .execute_batch(
+                "INSERT INTO spot_checks
+                    (segment_id, reviewer, action, submitted_transcript,
+                     expected_transcript, noticed, cer)
+                 VALUES ('seg-scored', 'Sara', 'edit', 'دەقی ڕاست', 'دەقی ڕاست', 1, 0.0);
+                 INSERT INTO spot_checks
+                    (segment_id, reviewer, action, submitted_transcript,
+                     expected_transcript, noticed, cer)
+                 VALUES ('seg-scored', 'Hemn', 'accept', 'دەقی هەڵە', 'دەقی ڕاست', 0, 1.0);",
+            )
+            .unwrap();
 
         // Re-apply the real migration over real rows.
         let v46 = MIGRATIONS.iter().find(|m| m.version == 46).expect("v46 exists");
@@ -2490,6 +10271,707 @@ mod tests {
             2,
             "deleting the clip must not rewrite the history of who reviewed it honestly"
         );
+    }
+
+    #[test]
+    fn v57_starts_prospectively_after_the_last_legacy_event() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(
+            rollback(&db, 13).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58, 57],
+            "fixture must return to the v56 schema"
+        );
+
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "pay-cutoff".into(),
+            audio_path: "/pay-cutoff.wav".into(),
+            raw_transcript: "دەق".into(),
+            duration_ms: 1_000,
+            ..Default::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO review_events
+                    (segment_id, reviewer, action, source, timestamp_ms, duration_ms)
+                 VALUES ('pay-cutoff', 'Sara', 'accept', 'legacy', 1, 1000)",
+                [],
+            )
+            .unwrap();
+        let legacy_event_id = db.connection().last_insert_rowid();
+
+        assert_eq!(run_migrations(&db).unwrap(), vec![57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+        let cutoff: i64 = db
+            .connection()
+            .query_row(
+                "SELECT effective_after_event_id FROM review_compensation_policies
+                  WHERE policy_version = 'review-iqd-v1-2026-08-21'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cutoff, legacy_event_id);
+        let legacy_compensation_action: Option<String> = db
+            .connection()
+            .query_row("SELECT compensation_action FROM review_events WHERE id = ?1", [legacy_event_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(legacy_compensation_action.is_none(), "v57 must not invent a semantic action for history");
+
+        let before = db.review_compensation_summary("Sara").unwrap();
+        assert_eq!(before.earned_micro_iqd, 0, "legacy activity is reported, never silently repriced");
+        assert_eq!(before.legacy_events_pending_reconciliation, 1);
+
+        assert_eq!(
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            "the remainder of this test isolates v57 accounting"
+        );
+        let (priced_event_id, _) = insert_review_original(&db, "pay-cutoff", "prospective-paid-work", "Sara", "couch");
+        let after = db.review_compensation_summary("Sara").unwrap();
+        assert_eq!(after.earned_micro_iqd, 5_000_000);
+        assert_eq!(after.legacy_events_pending_reconciliation, 1);
+        assert!(priced_event_id > cutoff, "only events strictly after the captured cutoff are payable");
+    }
+
+    #[test]
+    fn v57_policy_and_ledger_rows_are_physically_immutable() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(
+            rollback(&db, 10).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            "this test isolates v57's immutable ledger"
+        );
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "pay-immutable".into(),
+            audio_path: "/pay-immutable.wav".into(),
+            raw_transcript: "دەق".into(),
+            duration_ms: 1_000,
+            ..Default::default()
+        })
+        .unwrap();
+        let operation_id = "423e4567-e89b-42d3-a456-426614174000";
+        let operation_hash = "a".repeat(64);
+        insert_review_original_with_operation(
+            &db,
+            "pay-immutable",
+            "immutable-paid-work",
+            "Sara",
+            "couch",
+            operation_id,
+            &operation_hash,
+        );
+        let ledger_id: i64 =
+            db.connection().query_row("SELECT id FROM review_compensation_ledger", [], |row| row.get(0)).unwrap();
+        db.record_review_compensation_settlement("Sara", ledger_id, "immutable-payout").unwrap();
+
+        let policy_update = db
+            .connection()
+            .execute("UPDATE review_compensation_policies SET edit_basis_points = 0", [])
+            .unwrap_err()
+            .to_string();
+        assert!(policy_update.contains("policy is immutable"), "unexpected policy UPDATE error: {policy_update}");
+        let policy_delete =
+            db.connection().execute("DELETE FROM review_compensation_policies", []).unwrap_err().to_string();
+        assert!(policy_delete.contains("policy is immutable"), "unexpected policy DELETE error: {policy_delete}");
+
+        let ledger_update = db
+            .connection()
+            .execute("UPDATE review_compensation_ledger SET delta_micro_iqd = 0", [])
+            .unwrap_err()
+            .to_string();
+        assert!(ledger_update.contains("ledger is append-only"), "unexpected ledger UPDATE error: {ledger_update}");
+        let ledger_delete =
+            db.connection().execute("DELETE FROM review_compensation_ledger", []).unwrap_err().to_string();
+        assert!(ledger_delete.contains("ledger is append-only"), "unexpected ledger DELETE error: {ledger_delete}");
+
+        let settlement_update = db
+            .connection()
+            .execute("UPDATE review_compensation_settlements SET allocated_micro_iqd = 0", [])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            settlement_update.contains("settlement is immutable"),
+            "unexpected settlement UPDATE error: {settlement_update}"
+        );
+        let settlement_delete =
+            db.connection().execute("DELETE FROM review_compensation_settlements", []).unwrap_err().to_string();
+        assert!(
+            settlement_delete.contains("settlement is immutable"),
+            "unexpected settlement DELETE error: {settlement_delete}"
+        );
+
+        let operation_update = db
+            .connection()
+            .execute(
+                "UPDATE review_events
+                    SET operation_id = '523e4567-e89b-42d3-a456-426614174000'
+                  WHERE operation_id = ?1",
+                [operation_id],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            operation_update.contains("operation identity is immutable"),
+            "unexpected operation UPDATE error: {operation_update}"
+        );
+        let hash_update = db
+            .connection()
+            .execute(
+                "UPDATE review_events SET operation_payload_hash = ?1 WHERE operation_id = ?2",
+                rusqlite::params!["b".repeat(64), operation_id],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            hash_update.contains("operation identity is immutable"),
+            "unexpected operation hash UPDATE error: {hash_update}"
+        );
+        let stored_operation: (String, String) = db
+            .connection()
+            .query_row(
+                "SELECT operation_id, operation_payload_hash FROM review_events WHERE operation_id = ?1",
+                [operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_operation, (operation_id.into(), operation_hash));
+
+        let policy: (i64, i64, i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT edit_basis_points, accept_basis_points, reject_basis_points, skip_basis_points
+                   FROM review_compensation_policies",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(policy, (10_000, 1_000, 1_000, 0));
+        let ledger: (i64, i64) = db
+            .connection()
+            .query_row("SELECT COUNT(*), SUM(delta_micro_iqd) FROM review_compensation_ledger", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(ledger, (1, 5_000_000));
+        let settlements: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM review_compensation_settlements", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(settlements, 1);
+    }
+
+    #[test]
+    fn v57_refuses_rollback_after_any_post_cutoff_financial_history() {
+        // Both branches matter. A normal paid write has a ledger row; a post-cutoff event without
+        // one signals interrupted/corrupt accounting and is even less safe to erase by downgrade.
+        for history_kind in ["ledger", "unledgered-event"] {
+            let db = Database::open(":memory:").unwrap();
+            db.initialize().unwrap();
+            assert_eq!(
+                rollback(&db, 12).unwrap(),
+                vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58],
+                "fixture must target v57 rollback semantics"
+            );
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: format!("pay-no-rollback-{history_kind}"),
+                audio_path: format!("/pay-no-rollback-{history_kind}.wav"),
+                raw_transcript: "دەق".into(),
+                duration_ms: 1_000,
+                ..Default::default()
+            })
+            .unwrap();
+
+            if history_kind == "ledger" {
+                insert_review_original(&db, "pay-no-rollback-ledger", "rollback-guard-paid-work", "Sara", "test");
+            } else {
+                db.connection()
+                    .execute(
+                        "INSERT INTO review_events
+                            (segment_id, reviewer, action, compensation_action, source, timestamp_ms, duration_ms)
+                         VALUES ('pay-no-rollback-unledgered-event', 'Sara', 'edit', 'edit', 'test', 1, 1000)",
+                        [],
+                    )
+                    .unwrap();
+            }
+            let event_count_before: i64 =
+                db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap();
+            let ledger_count_before: i64 = db
+                .connection()
+                .query_row("SELECT COUNT(*) FROM review_compensation_ledger", [], |row| row.get(0))
+                .unwrap();
+
+            let error = rollback(&db, 1).expect_err("financial history makes v57 irreversible").to_string();
+            assert!(error.contains("CHECK constraint failed"), "unexpected {history_kind} guard error: {error}");
+            assert_eq!(get_current_version(&db).unwrap(), 57, "failed rollback must retain its version row");
+            let compensation_column: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('review_events') WHERE name='compensation_action'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(compensation_column, 1, "failed rollback must retain the entire v57 schema");
+            let counts_after: (i64, i64) = db
+                .connection()
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM review_events),
+                            (SELECT COUNT(*) FROM review_compensation_ledger)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(counts_after, (event_count_before, ledger_count_before));
+            let leaked_guard: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_temp_master
+                      WHERE type='table' AND name='review_compensation_rollback_guard'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(leaked_guard, 0, "the failed transactional guard must not poison later connections");
+        }
+    }
+
+    #[test]
+    fn v58_archives_and_removes_exact_known_4208_orphans_idempotently() {
+        let db = database_at_v57();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "v58-valid-parent".into(),
+            audio_path: "/v58-valid-parent.wav".into(),
+            raw_transcript: "دەقی دروست".into(),
+            duration_ms: 1_000,
+            ..Default::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO segment_hypotheses
+                    (segment_id, model_id, transcript, confidence, created_at, model_version_id)
+                 VALUES ('v58-valid-parent', 'champion', 'valid hypothesis', 0.99,
+                         '2026-08-21 00:00:00', 'omniasr-7b-test')",
+                [],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO loop0_shadow_log(id, segment_id, memory_fired, created_at)
+                 VALUES (900000, 'v58-valid-parent', 1, '2026-08-21 00:00:01')",
+                [],
+            )
+            .unwrap();
+
+        // Reproduce the cryptographically bound production shape: 2,104 missing-parent hypotheses
+        // and the same 2,104 missing-parent LOOP-0 rows, for 4,208 violations total.
+        seed_v58_authorized_cohort(&db);
+        assert_eq!(foreign_key_violation_count(db.connection()), 4_208);
+        db.connection()
+            .execute_batch(
+                "CREATE TEMP TABLE expected_v58_hypotheses AS
+                     SELECT rowid AS original_rowid, segment_id, model_id, transcript, confidence,
+                            created_at, model_version_id
+                       FROM segment_hypotheses h
+                      WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = h.segment_id);
+                 CREATE TEMP TABLE expected_v58_loop0 AS
+                     SELECT id, segment_id, memory_fired, created_at
+                       FROM loop0_shadow_log l
+                      WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = l.segment_id);",
+            )
+            .unwrap();
+
+        let expected_hypothesis: (i64, String, String, String, Option<f64>, String, String) = db
+            .connection()
+            .query_row(
+                "SELECT rowid, segment_id, model_id, transcript, confidence, created_at, model_version_id
+                   FROM segment_hypotheses WHERE segment_id = '00000000-0000-4000-8000-000000000000'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .unwrap();
+        let expected_loop0: (i64, String, Option<i64>, Option<String>) = db
+            .connection()
+            .query_row(
+                "SELECT id, segment_id, memory_fired, created_at
+                   FROM loop0_shadow_log WHERE id = 1997445",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+        assert_eq!(foreign_key_violation_count(db.connection()), 0);
+        let archive_counts: (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM orphan_segment_hypotheses_archive_v58),
+                        (SELECT COUNT(*) FROM orphan_loop0_shadow_log_archive_v58)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(archive_counts, (2_104, 2_104), "every one of the 4,208 violations must be archived");
+        let live_child_counts: (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM segment_hypotheses),
+                        (SELECT COUNT(*) FROM loop0_shadow_log)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(live_child_counts, (1, 1), "valid-parent children must be untouched");
+
+        let archived_hypothesis: (i64, String, String, String, Option<f64>, String, String) = db
+            .connection()
+            .query_row(
+                "SELECT original_rowid, segment_id, model_id, transcript, confidence, created_at, model_version_id
+                   FROM orphan_segment_hypotheses_archive_v58
+                  WHERE segment_id = '00000000-0000-4000-8000-000000000000'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .unwrap();
+        let archived_loop0: (i64, String, Option<i64>, Option<String>) = db
+            .connection()
+            .query_row(
+                "SELECT id, segment_id, memory_fired, created_at
+                   FROM orphan_loop0_shadow_log_archive_v58 WHERE id = 1997445",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(archived_hypothesis, expected_hypothesis, "every hypothesis value and rowid must be exact");
+        assert_eq!(archived_loop0, expected_loop0, "every LOOP-0 value and id must be exact");
+        let full_archive_symmetric_difference: i64 = db
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM (
+                        SELECT original_rowid, segment_id, model_id, transcript, confidence,
+                               created_at, model_version_id
+                          FROM orphan_segment_hypotheses_archive_v58
+                        EXCEPT
+                        SELECT original_rowid, segment_id, model_id, transcript, confidence,
+                               created_at, model_version_id
+                          FROM expected_v58_hypotheses
+                    ))
+                  + (SELECT COUNT(*) FROM (
+                        SELECT original_rowid, segment_id, model_id, transcript, confidence,
+                               created_at, model_version_id
+                          FROM expected_v58_hypotheses
+                        EXCEPT
+                        SELECT original_rowid, segment_id, model_id, transcript, confidence,
+                               created_at, model_version_id
+                          FROM orphan_segment_hypotheses_archive_v58
+                    ))
+                  + (SELECT COUNT(*) FROM (
+                        SELECT id, segment_id, memory_fired, created_at
+                          FROM orphan_loop0_shadow_log_archive_v58
+                        EXCEPT
+                        SELECT id, segment_id, memory_fired, created_at FROM expected_v58_loop0
+                    ))
+                  + (SELECT COUNT(*) FROM (
+                        SELECT id, segment_id, memory_fired, created_at FROM expected_v58_loop0
+                        EXCEPT
+                        SELECT id, segment_id, memory_fired, created_at
+                          FROM orphan_loop0_shadow_log_archive_v58
+                    ))",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            full_archive_symmetric_difference, 0,
+            "all 4,208 archived rows must match the pre-migration source snapshot in both directions"
+        );
+        let bad_provenance: i64 = db
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM orphan_segment_hypotheses_archive_v58
+                      WHERE source_table <> 'segment_hypotheses'
+                         OR archive_reason <> 'missing speech_segments parent'
+                         OR archive_migration_version <> 58
+                         OR archived_at = '')
+                  + (SELECT COUNT(*) FROM orphan_loop0_shadow_log_archive_v58
+                      WHERE source_table <> 'loop0_shadow_log'
+                         OR archive_reason <> 'missing speech_segments parent'
+                         OR archive_migration_version <> 58
+                         OR archived_at = '')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bad_provenance, 0);
+
+        // The migration runner is the idempotency boundary: the second pass is a true no-op and
+        // cannot duplicate the archive. The evidence itself is physically immutable afterwards.
+        assert!(run_migrations(&db).unwrap().is_empty());
+        let archive_counts_after: (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM orphan_segment_hypotheses_archive_v58),
+                        (SELECT COUNT(*) FROM orphan_loop0_shadow_log_archive_v58)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(archive_counts_after, archive_counts);
+        for sql in [
+            "UPDATE orphan_segment_hypotheses_archive_v58 SET transcript = transcript",
+            "DELETE FROM orphan_segment_hypotheses_archive_v58",
+            "INSERT INTO orphan_segment_hypotheses_archive_v58 SELECT * FROM orphan_segment_hypotheses_archive_v58 LIMIT 1",
+            "UPDATE orphan_loop0_shadow_log_archive_v58 SET memory_fired = memory_fired",
+            "DELETE FROM orphan_loop0_shadow_log_archive_v58",
+        ] {
+            let error = db.connection().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("v58 orphan archive is immutable"), "unexpected archive guard error: {error}");
+        }
+    }
+
+    #[test]
+    fn v58_refuses_an_altered_identity_or_full_source_tuple() {
+        let altered_id = database_at_v57();
+        seed_v58_authorized_cohort(&altered_id);
+        run_with_foreign_keys_off(altered_id.connection(), || {
+            altered_id.connection().execute(
+                "UPDATE segment_hypotheses SET segment_id='ffffffff-ffff-4fff-8fff-ffffffffffff'
+                  WHERE segment_id='00000000-0000-4000-8000-000000000000'",
+                [],
+            )?;
+            altered_id.connection().execute(
+                "UPDATE loop0_shadow_log SET segment_id='ffffffff-ffff-4fff-8fff-ffffffffffff'
+                  WHERE segment_id='00000000-0000-4000-8000-000000000000'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let identity_error = run_migrations(&altered_id).expect_err("one changed ID must fail the digest");
+        assert!(identity_error.to_string().contains("identity digest is not authorized"));
+        assert_eq!(get_current_version(&altered_id).unwrap(), 57);
+
+        let altered_tuple = database_at_v57();
+        seed_v58_authorized_cohort(&altered_tuple);
+        run_with_foreign_keys_off(altered_tuple.connection(), || {
+            altered_tuple.connection().execute(
+                "UPDATE segment_hypotheses SET transcript = transcript || ' altered'
+                  WHERE segment_id='00000000-0000-4000-8000-000000000000'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let tuple_error = run_migrations(&altered_tuple).expect_err("changed transcript evidence must fail");
+        assert!(tuple_error.to_string().contains("full source-evidence digest is not authorized"));
+        assert_eq!(get_current_version(&altered_tuple).unwrap(), 57);
+    }
+
+    #[test]
+    fn v58_refuses_wrong_source_shape_and_preexisting_archive_objects() {
+        let wrong_shape = database_at_v57();
+        seed_v58_authorized_cohort(&wrong_shape);
+        run_with_foreign_keys_off(wrong_shape.connection(), || {
+            wrong_shape.connection().execute(
+                "UPDATE segment_hypotheses SET model_id='different-model'
+                  WHERE segment_id='00000000-0000-4000-8000-000000000000'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let shape_error = run_migrations(&wrong_shape).expect_err("wrong source shape must fail closed");
+        assert!(shape_error.to_string().contains("do not match the authorized abandoned-import shape"));
+        assert_eq!(get_current_version(&wrong_shape).unwrap(), 57);
+
+        let preexisting = database_at_v57();
+        preexisting
+            .connection()
+            .execute("CREATE TABLE orphan_segment_hypotheses_archive_v58(tampered TEXT)", [])
+            .unwrap();
+        let object_error = run_migrations(&preexisting).expect_err("preexisting archive provenance is ambiguous");
+        assert!(object_error.to_string().contains("already exists"), "unexpected error: {object_error}");
+        assert_eq!(get_current_version(&preexisting).unwrap(), 57);
+        let columns: i64 = preexisting
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('orphan_segment_hypotheses_archive_v58')
+                  WHERE name='tampered'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 1, "failed v58 must not overwrite or drop ambiguous evidence");
+    }
+
+    #[test]
+    fn v58_refuses_unrelated_fk_damage_and_rolls_back_the_entire_repair() {
+        let db = database_at_v57();
+        seed_v58_authorized_cohort(&db);
+        run_with_foreign_keys_off(db.connection(), || {
+            db.connection().execute(
+                "INSERT INTO playback_receipts
+                    (segment_id, segment_revision, audio_fingerprint, reviewer, session_id,
+                     started_at_ms, played_ms, clip_duration_ms, coverage_ratio, policy_version)
+                 VALUES ('v58-unrelated-orphan', 1, 'fingerprint', 'Sara', 'session',
+                         1, 1000, 1000, 1.0, 1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(foreign_key_violation_count(db.connection()), 4_209);
+
+        let error = run_migrations(&db).expect_err("an unrecognized FK violation must fail closed").to_string();
+        assert!(error.contains("migration v58 left 1 foreign-key violation"), "unexpected v58 error: {error}");
+        assert_eq!(get_current_version(&db).unwrap(), 57, "failed repair must not record v58");
+        assert_eq!(
+            foreign_key_violation_count(db.connection()),
+            4_209,
+            "the unrelated row and the entire authorized cohort must roll back intact"
+        );
+        let archive_tables: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'table' AND name IN
+                        ('orphan_segment_hypotheses_archive_v58', 'orphan_loop0_shadow_log_archive_v58')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archive_tables, 0, "a failed transaction must leave no half-created archive");
+
+        // Once an operator separately resolves the unknown class, the same pending migration can
+        // safely run and preserve the known orphan. No manual schema surgery or retry flag is needed.
+        db.connection().execute("DELETE FROM playback_receipts WHERE segment_id = 'v58-unrelated-orphan'", []).unwrap();
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+        assert_eq!(foreign_key_violation_count(db.connection()), 0);
+        let archived: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM orphan_segment_hypotheses_archive_v58", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(archived, V58_ORPHAN_IDS as i64);
+    }
+
+    #[test]
+    fn v58_rollback_refuses_missing_parents_then_restores_exact_rows_when_parents_exist() {
+        let db = database_at_v57();
+        seed_v58_authorized_cohort(&db);
+        let expected_hypothesis: (i64, String, String, String, Option<f64>, String, String) = db
+            .connection()
+            .query_row(
+                "SELECT rowid, segment_id, model_id, transcript, confidence, created_at, model_version_id
+                   FROM segment_hypotheses WHERE rowid = 2000000",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .unwrap();
+        let expected_loop0: (i64, String, Option<i64>, Option<String>) = db
+            .connection()
+            .query_row(
+                "SELECT id, segment_id, memory_fired, created_at FROM loop0_shadow_log WHERE id = 1997445",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+
+        assert_eq!(
+            rollback(&db, 11).unwrap(),
+            vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59],
+            "the empty v63/v62/v61/v60/v59 layers must be removed before probing v58"
+        );
+
+        let rollback_error = rollback(&db, 1)
+            .expect_err("rollback must not recreate children while their parents are still missing")
+            .to_string();
+        assert!(rollback_error.contains("CHECK constraint failed"), "unexpected rollback guard: {rollback_error}");
+        assert_eq!(get_current_version(&db).unwrap(), 58);
+        let preserved_archives: (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM orphan_segment_hypotheses_archive_v58),
+                        (SELECT COUNT(*) FROM orphan_loop0_shadow_log_archive_v58)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved_archives,
+            (V58_ORPHAN_IDS as i64, V58_ORPHAN_IDS as i64),
+            "failed rollback must preserve the complete immutable cohort"
+        );
+        assert_eq!(foreign_key_violation_count(db.connection()), 0);
+
+        for index in 0..V58_ORPHAN_IDS as i64 {
+            let segment_id = v58_fixture_id(index);
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: segment_id.clone(),
+                audio_path: format!("/{segment_id}.wav"),
+                raw_transcript: "recovered parent".into(),
+                duration_ms: 1_000,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        assert_eq!(rollback(&db, 1).unwrap(), vec![58]);
+        assert_eq!(get_current_version(&db).unwrap(), 57);
+        assert_eq!(foreign_key_violation_count(db.connection()), 0);
+        let archive_tables: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'table' AND name IN
+                        ('orphan_segment_hypotheses_archive_v58', 'orphan_loop0_shadow_log_archive_v58')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archive_tables, 0, "successful exact restoration may now remove the archive tables");
+        let restored_hypothesis: (i64, String, String, String, Option<f64>, String, String) = db
+            .connection()
+            .query_row(
+                "SELECT rowid, segment_id, model_id, transcript, confidence, created_at, model_version_id
+                   FROM segment_hypotheses WHERE rowid = 2000000",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .unwrap();
+        let restored_loop0: (i64, String, Option<i64>, Option<String>) = db
+            .connection()
+            .query_row(
+                "SELECT id, segment_id, memory_fired, created_at FROM loop0_shadow_log WHERE id = 1997445",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(restored_hypothesis, expected_hypothesis);
+        assert_eq!(restored_loop0, expected_loop0);
+
+        // Re-applying v58 after a safe rollback sees valid parents, archives nothing, and leaves both
+        // restored children in place. This pins the full up/down/up round trip.
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+        let reapply_counts: (i64, i64, i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM segment_hypotheses
+                          WHERE segment_id LIKE '00000000-0000-4000-8000-%'),
+                        (SELECT COUNT(*) FROM loop0_shadow_log
+                          WHERE segment_id LIKE '00000000-0000-4000-8000-%'),
+                        (SELECT COUNT(*) FROM orphan_segment_hypotheses_archive_v58),
+                        (SELECT COUNT(*) FROM orphan_loop0_shadow_log_archive_v58)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(reapply_counts, (V58_ORPHAN_IDS as i64, V58_ORPHAN_IDS as i64, 0, 0));
     }
 
     #[test]

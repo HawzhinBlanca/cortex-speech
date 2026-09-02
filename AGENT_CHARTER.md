@@ -1,5 +1,12 @@
 # Cortex Speech — Autonomous Agent Charter
 
+> [!WARNING]
+> **Owner canon overrides this older roadmap wherever model/runtime direction conflicts.** Production
+> drafting is pinned OmniASR-7B WSL champion only and fails closed; stock CTC 300M/1B and MMS are
+> explicit offline diagnostics, never fallbacks or production writers. Preserve the dated benchmark
+> goals below as historical measurement context, but do not use them to select or provision the
+> shipped runtime. See [`docs/OWNER_CANON.md`](docs/OWNER_CANON.md).
+
 > Generated 2026-06-17. Reload this file at the start of every working session. The roadmap in [docs/ROADMAP_TO_10.md](docs/ROADMAP_TO_10.md) is the source of truth for *what* to build; this charter governs *how* you work and *when* you stop.
 
 ## Mission

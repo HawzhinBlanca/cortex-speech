@@ -21,7 +21,13 @@ harness. Each check below was fail-before verified.
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# Repointed 2026-08-30: the panel's persistence logic was extracted into two controllers. The
+# invariants are unchanged; they simply live where the code now lives — save() in the persistence
+# controller, flushPendingKeys()/the key inputs' own state in the key controller, the onDestroy
+# flush and the input bindings still in the panel markup.
 PANEL = "src/lib/SettingsPanel.svelte"
+PERSISTENCE = "src/lib/settingsPersistenceController.ts"
+KEYS = "src/lib/settingsKeyController.svelte.ts"
 
 
 def _read(rel: str) -> str:
@@ -32,7 +38,7 @@ def _function_body(src: str, sig: str) -> str:
     """The text of the function starting at `sig`, up to the next top-level (2-space-indented) function."""
     start = src.find(sig)
     if start == -1:
-        raise AssertionError(f"{sig!r} not found in {PANEL} — this gate would pass vacuously")
+        raise AssertionError(f"{sig!r} not found — this gate would pass vacuously")
     rest = src[start + len(sig):]
     end = len(rest)
     # `onDestroy(` is a terminator too, not just the next function: flushPendingKeys is declared
@@ -57,7 +63,7 @@ def test_every_exit_path_flushes_a_pending_api_key() -> None:
     """
     src = _read(PANEL)
 
-    save_body = _function_body(src, "async function save(")
+    save_body = _function_body(_read(PERSISTENCE), "async function save(")
     flush_at = save_body.find("await flushPendingKeys();")
     update_at = save_body.find("await api.updateSettings(")
     assert flush_at != -1, "save() must flush pending API-key inputs before persisting settings"
@@ -81,7 +87,7 @@ def test_the_flush_routes_through_the_encrypted_store() -> None:
 
     Fail-before: replacing a helper call with `localSettings.llmApiKey = geminiKeyInput` fires this.
     """
-    body = _function_body(_read(PANEL), "async function flushPendingKeys(")
+    body = _function_body(_read(KEYS), "async function flushPendingKeys(")
     for helper in ("saveOpenrouterKey()", "saveGeminiKey()"):
         assert helper in body, f"flushPendingKeys must persist the pending key via {helper}"
     assert "localSettings" not in body, (
@@ -95,13 +101,17 @@ def test_no_api_key_input_binds_to_the_scrubbed_settings_field() -> None:
     That binding IS defect #1: it persists the key into settings.json, which AppSettings::load then
     clears. Fail-before: restoring `bind:value={localSettings.llmApiKey}` on the Gemini input fires this.
     """
-    src = _read(PANEL)
+    # The input elements moved into the AI/Jury tab components; the panel forwards the key
+    # controller's state into them. Scan the panel AND both tabs so neither can quietly rebind an
+    # input to the scrubbed settings field.
+    tabs = _read("src/lib/SettingsAiTab.svelte") + _read("src/lib/SettingsJuryTab.svelte")
+    src = _read(PANEL) + tabs
     assert "bind:value={localSettings.llmApiKey}" not in src, (
         "an API-key input is bound to localSettings.llmApiKey, which AppSettings::load scrubs — "
         "the key would be written and then deleted, exactly the 2026-08-10 defect"
     )
     for expected in ("bind:value={geminiKeyInput}", "bind:value={openrouterKeyInput}"):
-        assert expected in src, f"expected an API-key input bound to its own state ({expected})"
+        assert expected in tabs, f"expected an API-key input bound to its own state ({expected})"
 
 
 def main() -> None:

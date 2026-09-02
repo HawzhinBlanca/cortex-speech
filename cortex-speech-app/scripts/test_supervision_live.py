@@ -18,6 +18,7 @@ from check_supervision_live import evaluate_supervision  # noqa: E402
 GB = 2**30
 HEALTHY = dict(
     watchdog_state="Ready",
+    watchdog_has_current_repetition=True,
     session_expected=True,
     reviewer_count=5,
     couch_status=200,
@@ -62,10 +63,25 @@ def test_an_unreadable_start_when_available_is_not_a_failure():
     assert evaluate_supervision(**{**HEALTHY, "watchdog_starts_when_available": None}) == []
 
 
+def test_a_logon_only_watchdog_registered_after_sign_in_fails():
+    problems = evaluate_supervision(**{**HEALTHY, "watchdog_has_current_repetition": False})
+    assert len(problems) == 1, problems
+    assert "no active five-minute clock trigger" in problems[0]
+
+
+def test_an_unreadable_repetition_probe_is_not_a_failure():
+    assert evaluate_supervision(**{**HEALTHY, "watchdog_has_current_repetition": None}) == []
+
+
 def test_a_disabled_watchdog_outranks_the_drift_check():
     """Disabled is the worse problem and must be the one reported — not two confusing messages."""
     problems = evaluate_supervision(
-        **{**HEALTHY, "watchdog_state": "Disabled", "watchdog_starts_when_available": False}
+        **{
+            **HEALTHY,
+            "watchdog_state": "Disabled",
+            "watchdog_starts_when_available": False,
+            "watchdog_has_current_repetition": False,
+        }
     )
     assert len(problems) == 1, problems
     assert "DISABLED" in problems[0]

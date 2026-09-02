@@ -21,6 +21,7 @@ The pure decision logic is `evaluate_supervision` and is unit-tested by `test_su
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -31,7 +32,16 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-WATCHDOG_TASK = "CortexWatchdog"
+from release_private_production import (
+    ReleaseError,
+    defaults as release_defaults,
+    load_json,
+    validate_manifest,
+)
+
+LEGACY_WATCHDOG_TASK = "CortexWatchdog"
+PRIVATE_WATCHDOG_TASK = "CortexPrivateProductionWatchdog"
+WATCHDOG_TASK = LEGACY_WATCHDOG_TASK
 COUCH_URL = "http://127.0.0.1:8737/"
 # Same port, TLS — the couch server self-signs a certificate and serves HTTPS on every interface.
 COUCH_URL_TLS = "https://127.0.0.1:8737/"
@@ -44,6 +54,7 @@ def evaluate_supervision(
     *,
     watchdog_state: str | None,
     watchdog_starts_when_available: bool | None = None,
+    watchdog_has_current_repetition: bool | None = None,
     session_expected: bool,
     reviewer_count: int,
     couch_status: int | None,
@@ -80,6 +91,13 @@ def evaluate_supervision(
             f"drifted from scripts/ops/cortex-watchdog.ps1, which registers it WITH -StartWhenAvailable. "
             f"Re-register: powershell -ExecutionPolicy Bypass -File "
             f"cortex-speech-app/scripts/ops/cortex-watchdog.ps1 -Register"
+        )
+    elif watchdog_has_current_repetition is False:
+        problems.append(
+            f"{WATCHDOG_TASK} is enabled but has no active five-minute clock trigger for the current "
+            f"login session. A logon-only trigger registered after sign-in has no next run, leaving "
+            f"reviewers unsupervised until the owner signs out and back in. Re-register the active "
+            f"release watchdog to install both its user-scoped logon trigger and immediate clock."
         )
 
     if session_expected:
@@ -132,6 +150,38 @@ def _watchdog_starts_when_available() -> bool | None:
     return None
 
 
+def _watchdog_has_current_repetition() -> bool | None:
+    """Whether an enabled five-minute time trigger starts no later than five minutes from now."""
+    script = f"""
+$task = Get-ScheduledTask -TaskName '{WATCHDOG_TASK}' -ErrorAction SilentlyContinue
+if ($null -eq $task) {{ exit 0 }}
+$cutoff = (Get-Date).AddMinutes(5)
+$valid = @($task.Triggers | Where-Object {{
+    $_.Enabled -and
+    $_.CimClass.CimClassName -eq 'MSFT_TaskTimeTrigger' -and
+    $_.Repetition.Interval -eq 'PT5M' -and
+    $_.StartBoundary -and
+    ([datetime]$_.StartBoundary) -le $cutoff
+}})
+if ($valid.Count -gt 0) {{ 'true' }} else {{ 'false' }}
+"""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+    except (OSError, FileNotFoundError):
+        return None
+    if out.returncode != 0:
+        return None
+    answer = out.stdout.strip().lower()
+    if answer in {"true", "false"}:
+        return answer == "true"
+    return None
+
+
 def _watchdog_state() -> str | None:
     """The task's Status line, or None if the task is not registered / schtasks is unavailable."""
     try:
@@ -147,6 +197,47 @@ def _watchdog_state() -> str | None:
     for line in out.stdout.splitlines():
         if line.lower().startswith("status:"):
             return line.split(":", 1)[1].strip()
+    return None
+
+
+def _watchdog_action_arguments() -> str | None:
+    try:
+        out = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"(Get-ScheduledTask -TaskName '{WATCHDOG_TASK}' -ErrorAction SilentlyContinue).Actions[0].Arguments",
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+    except (OSError, FileNotFoundError):
+        return None
+    return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else None
+
+
+def _private_watchdog_problem(data_dir: Path) -> str | None:
+    pointer = data_dir / "active-private-production-release.json"
+    if not pointer.is_file():
+        return None
+    try:
+        value = load_json(pointer)
+        _default_data, release_root = release_defaults()
+        value = validate_manifest(value, expected_root=release_root, allow_compatible_previous=True)
+        expected_path = Path(str(value["watchdogScript"])).resolve(strict=True)
+        expected_hash = str(value["watchdogSha256"])
+        if len(expected_hash) != 64 or any(ch not in "0123456789abcdef" for ch in expected_hash):
+            raise ValueError("watchdogSha256 is invalid")
+        actual_hash = hashlib.sha256(expected_path.read_bytes()).hexdigest()
+        if actual_hash != expected_hash:
+            raise ValueError("versioned watchdog hash does not match the active release pointer")
+        arguments = _watchdog_action_arguments()
+        if arguments is None or str(expected_path).lower() not in arguments.lower():
+            raise ValueError("scheduled action does not invoke the active release's versioned watchdog")
+    except (OSError, KeyError, TypeError, ValueError, ReleaseError) as error:
+        return f"{PRIVATE_WATCHDOG_TASK} is not bound to the active immutable release: {error}"
     return None
 
 
@@ -201,11 +292,14 @@ def _couch_status() -> int | None:
 
 
 def main() -> int:
+    global WATCHDOG_TASK
     if os.name != "nt":
         print("SUPERVISION GATE: SKIP-ENV (Windows rig only — schtasks/AppData)", flush=True)
         return 0
 
     data_dir = _data_dir()
+    if (data_dir / "active-private-production-release.json").is_file():
+        WATCHDOG_TASK = PRIVATE_WATCHDOG_TASK
     reviewer_count = _session_reviewers(data_dir)
     floor_gb = float(os.environ.get("CORTEX_DISK_FLOOR_GB", DEFAULT_FLOOR_GB))
     free_bytes = shutil.disk_usage(data_dir if data_dir.exists() else Path.home()).free
@@ -213,12 +307,16 @@ def main() -> int:
     problems = evaluate_supervision(
         watchdog_state=_watchdog_state(),
         watchdog_starts_when_available=_watchdog_starts_when_available(),
+        watchdog_has_current_repetition=_watchdog_has_current_repetition(),
         session_expected=reviewer_count > 0,
         reviewer_count=reviewer_count,
         couch_status=_couch_status() if reviewer_count > 0 else None,
         free_bytes=free_bytes,
         floor_bytes=int(floor_gb * 2**30),
     )
+    private_problem = _private_watchdog_problem(data_dir)
+    if private_problem:
+        problems.append(private_problem)
 
     if problems:
         print("SUPERVISION GATE: FAIL", flush=True)

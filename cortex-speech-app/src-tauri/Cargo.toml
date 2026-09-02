@@ -25,11 +25,18 @@ resources = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+embed-resource = "=3.0.9"
+cc = "=1.2.62"
 
 [dependencies]
 # Tauri ecosystem
-tauri = { version = "2", features = ["protocol-asset"] }
+tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+# Exact RC trio per the tauri-specta v2 release contract. Keep all three pins in lockstep: the RC
+# APIs have breaking changes between releases and generated IPC is a checked-in release artifact.
+tauri-specta = { version = "=2.0.0-rc.24", features = ["derive", "typescript"] }
+specta = { version = "=2.0.0-rc.24", features = ["derive"] }
+specta-typescript = "=0.0.11"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -52,7 +59,7 @@ unicode-normalization = "0.1.23"
 
 # Async runtime
 # "time" for the champion-supervision tick (engine_runtime's tokio::time::sleep) — no net coupling.
-tokio = { version = "1", features = ["sync", "time"] }
+tokio = { version = "1", features = ["sync", "time", "macros"] }
 
 # DPAPI blob transport encoding for api_keys (0.22 already in the tree transitively — dedupes).
 base64 = "0.22"
@@ -99,6 +106,10 @@ arrow-schema = "59.0.0"
 libc = "0.2"
 
 [dev-dependencies]
+# MockRuntime harness (src/test_support.rs): dev-only "test" feature so unit tests can call
+# #[tauri::command] fns through a real State<'_, AppState>. Resolver v2 keeps dev-features out of
+# the release build (verified: `cargo tree -e normal,features` shows no tauri "test" feature).
+tauri = { version = "2", features = ["test"] }
 proptest = "1"
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -124,7 +135,14 @@ harness = false
 # DPAPI (CryptProtectData) for at-rest API-key protection in api_keys.rs. Windows-only by nature;
 # 0.61 already in the tree transitively — dedupes. Foundation carries LocalFree.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [features]
 default = ["custom-protocol"]

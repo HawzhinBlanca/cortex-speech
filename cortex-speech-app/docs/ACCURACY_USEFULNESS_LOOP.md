@@ -44,11 +44,14 @@ Everything below serves that. Where the loop CAN directly help users today is **
 correctness, honesty, privacy, UX) — so that half of the mission is real, shippable, and compounding.
 
 ### The current honest state (verify, don't trust this snapshot)
-- **Default engine** (GPU/WSL-served OmniASR-7B champion; AppSettings default asr_model_size=WSL7B):
-  **7.03% CER on FLEURS-ckb** read speech — at/above verifiable Sorani SOTA as of 2026-07-23, but
-  not reproduced under a documented normalizer and not measured on conversational/owner audio.
-- Offline **fallback** (bundled OmniASR-CTC-300M int8): **11.34% CER** — used only on a deliberate
-  user choice when the 7B server is down; the app fails LOUD, never silently downgrades (F2 contract).
+
+- **No current model attestation exists.** The historical 7.03% champion result used 922 manifest
+  rows containing only 348 distinct clips and is duplication-weighted. It is provenance, not a
+  current headline, SOTA claim, release metric, or evidence for the integrated line.
+- **Default engine identity** is the GPU/WSL-served OmniASR-7B champion. Production must run that
+  exact pinned champion or hard-stop; it may not silently substitute a smaller engine.
+- The historical offline-engine score is likewise non-primary and does not authorize fallback in
+  production. Smaller engines remain diagnostic or explicit non-production tools only.
 - Owner's own verified data: **~3 segments**; marathon **3/500**; verified audio **< 5 h**.
 - The label ceiling (gold-set noise), not the model, currently caps every number you could report.
 
@@ -85,7 +88,8 @@ Pick the first ready item; if blocked (needs owner/rig or unverifiable in-sandbo
 (§4) and drop to the next.
 
 1. **Honesty repair (always first).** Any place a number, gate, or provenance claim could be fabricated
-   or inflated. The AsoSoft-normalizer re-score (backlog #1) lives here — it protects the 7.03% headline.
+   or inflated. The clean N=348 regeneration and model attestation live here; until both pass, there is
+   no current accuracy headline to protect.
 2. **Accuracy machinery — build/harden the owner's next run.** Work the ranked backlog in
    [ASR_TECH_SCAN_2026-07-23.md §5](ASR_TECH_SCAN_2026-07-23.md): normalizer → pseudo-labeling harness →
    KenLM fusion → 1B benchmark harness → int8 quant script → active-learning queue → IAA/ECE → data
@@ -107,8 +111,9 @@ updated as the machinery lands. A rig session should be pure execution, not plum
 *goal · exact command(s) · expected artifact · which gate blesses it · what a good vs bad result looks
 like.* The highest-value orders today (build the harness first, then the order becomes runnable):
 
-- **Re-score the champion under the AsoSoft normalizer** on a contamination-checked FLEURS-ckb split →
-  confirms or corrects the 7.03% headline.
+- **Re-score the champion under the AsoSoft normalizer** on the deduplicated,
+  contamination-checked FLEURS-ckb split → creates or rejects a new attested primary result without
+  inheriting the historical duplication-weighted headline.
 - **Benchmark OmniASR-CTC-1B int8 vs 300M** on the ckb gold set → decide the offline default by measured
   delta.
 - **One pseudo-labeling round** (teacher = champion) on the 1.74M corpus, confidence-filtered, QLoRA
@@ -120,7 +125,8 @@ like.* The highest-value orders today (build the harness first, then the order b
 - Never claim accuracy improved without a real harness run pasted into the ledger.
 - Never ship a pseudo-label round (or any retrain) that a real held-out eval did not bless — self-training
   bakes in the teacher's blind spots; that is the designed-against failure.
-- Never adopt a banned/unverified model (Qwen-family for ckb; cloud ckb = Gemini 2.5 Pro + Scribe only).
+- The only consent-gated advisory cloud model is Gemini 2.5 Pro. Never use a cloud or smaller-model
+  fallback for production ASR; OmniASR-7B Champion failure is a hard stop.
 - Never make cloud load-bearing in the default path; never persist/echo API keys; never hardcode private
   Windows paths. Treat voice as biometric (consent + license + attribution before publish/train).
 - Never let "machinery built" masquerade as "accuracy raised." They are different claims; keep them apart
