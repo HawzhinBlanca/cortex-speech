@@ -55,6 +55,40 @@ _requires_windows_live_authority = unittest.skipUnless(
 
 
 class Verify10SupervisorTests(unittest.TestCase):
+    def _environment_document_without_toolchain_probe(self) -> dict[str, object]:
+        """The supervisor's environment document, minus the part that needs a real toolchain.
+
+        `_rust_coverage_environment_document()` probes rustc, cargo, the date-pinned coverage nightly
+        via rustup, and cargo-llvm-cov. The Linux and macOS smoke runners install none of those, so
+        the real call raises EvidenceError BEFORE the spawn/wait mocks are ever reached and the
+        supervisor correctly records VERIFIER_FAILURE -- which is not what the terminal-pointer tests
+        are about. Measured 2026-09-02: both green on the workstation (nightly installed), red on both
+        smoke runners, reproduced under WSL. Host, python and the contract-derived toolchain identity
+        stay real; only the four executable probes become labelled placeholders.
+        """
+        python_path = Path(sys.executable).resolve(strict=True)
+
+        def placeholder(name: str) -> dict[str, object]:
+            return {"name": name, "resolved": None, "sha256": None, "bytes": None, "version": "not probed in unit test"}
+
+        return {
+            "schema": 1,
+            "host": self.verify._environment_document(),
+            "python": {
+                "name": python_path.name,
+                "sha256": self.verify.sha256_file(python_path),
+                "bytes": python_path.stat().st_size,
+                "version": sys.version,
+            },
+            "productionRustc": placeholder("rustc"),
+            "productionCargo": placeholder("cargo"),
+            "coverageToolchain": self.verify._expected_rust_coverage_toolchain_identity(),
+            "coverageRustc": placeholder("rustc"),
+            "coverageCargo": placeholder("cargo"),
+            "cargoLlvmCov": placeholder("cargo-llvm-cov"),
+            "networkPolicy": "unit test: no toolchain probe",
+        }
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.supervisor = load_module("verify10_supervisor_fault_test", SUPERVISOR)
@@ -703,6 +737,10 @@ class Verify10SupervisorTests(unittest.TestCase):
                 process = mock.Mock(pid=os.getpid())
                 with mock.patch.object(
                     self.verify,
+                    "_rust_coverage_environment_document",
+                    side_effect=self._environment_document_without_toolchain_probe,
+                ), mock.patch.object(
+                    self.verify,
                     "spawn_isolated",
                     return_value=(process, mock.Mock()),
                 ), mock.patch.object(
@@ -788,6 +826,10 @@ class Verify10SupervisorTests(unittest.TestCase):
                     "artifactSha256": hashlib.sha256(b"synthetic coverage").hexdigest(),
                 }
                 with mock.patch.object(
+                    self.verify,
+                    "_rust_coverage_environment_document",
+                    side_effect=self._environment_document_without_toolchain_probe,
+                ), mock.patch.object(
                     self.verify,
                     "spawn_isolated",
                     side_effect=spawn_with_artifact,
