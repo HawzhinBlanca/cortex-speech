@@ -1566,6 +1566,77 @@ pub fn clear_human_decision(state: State<'_, AppState>, segment_id: String) -> R
 
 #[cfg(test)]
 mod tests {
+
+    use std::time::{Duration, Instant};
+
+    /// Bound for retrying a direct technical mark that was refused `AUDIO_PROBE_BUSY`.
+    const PROBE_BUSY_RETRY_BUDGET: Duration = Duration::from_secs(5);
+
+    /// Retry `attempt` while it answers `AUDIO_PROBE_BUSY`, for at most `budget`; any other answer
+    /// returns at once. The technical-audio probe registry caps ACTIVE flights process-wide
+    /// (`TECHNICAL_PROBE_MAX_CONCURRENCY` = 2), and every `#[test]` in this binary probes through the
+    /// same registry, so under full-suite parallelism a direct mark with a unique key can be refused
+    /// while unrelated tests hold both slots -- measured 2026-09-02, one failure in a 2561-test run,
+    /// 3/3 green standalone. BUSY is `retryable: true` ("Retry in a moment") and a client retries;
+    /// so do the tests. Production behaviour is untouched.
+    fn retry_while_probe_busy<T>(
+        budget: Duration,
+        mut attempt: impl FnMut() -> Result<T, crate::ipc_contract::CommandErrorV1>,
+    ) -> Result<T, crate::ipc_contract::CommandErrorV1> {
+        let started = Instant::now();
+        loop {
+            match attempt() {
+                Err(error) if error.code == "AUDIO_PROBE_BUSY" && started.elapsed() < budget => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn mark_unusable_retrying_busy(
+        store: &crate::stores::ReviewWriteStore,
+        request: &MarkSegmentUnusableRequestV1,
+    ) -> Result<crate::ipc_contract::MarkedSegmentUnusableV1, crate::ipc_contract::CommandErrorV1> {
+        retry_while_probe_busy(PROBE_BUSY_RETRY_BUDGET, || mark_segment_unusable_v1_on(store, request))
+    }
+
+    #[test]
+    fn retry_while_probe_busy_retries_only_busy_and_gives_up_at_the_budget() {
+        let busy = || crate::ipc_contract::CommandErrorV1::new("AUDIO_PROBE_BUSY", "busy", true);
+        let mut calls = 0;
+        let answered = retry_while_probe_busy(Duration::from_secs(5), || {
+            calls += 1;
+            if calls < 3 {
+                Err(busy())
+            } else {
+                Ok(42)
+            }
+        });
+        assert_eq!(answered.map_err(|e| e.code), Ok(42), "the first non-busy answer is returned");
+        assert_eq!(calls, 3);
+
+        let mut calls = 0;
+        let refused = retry_while_probe_busy(Duration::from_secs(5), || {
+            calls += 1;
+            Err::<(), _>(crate::ipc_contract::CommandErrorV1::new("INVALID_REQUEST", "no", false))
+        });
+        assert_eq!(refused.map_err(|e| e.code), Err("INVALID_REQUEST".to_string()), "a refusal is not retried");
+        assert_eq!(calls, 1);
+
+        let mut calls = 0;
+        let started = Instant::now();
+        let gave_up = retry_while_probe_busy(Duration::from_millis(120), || {
+            calls += 1;
+            Err::<(), _>(busy())
+        });
+        assert_eq!(
+            gave_up.map_err(|e| e.code),
+            Err("AUDIO_PROBE_BUSY".to_string()),
+            "busy past the budget is reported as busy"
+        );
+        assert!(calls >= 2 && started.elapsed() >= Duration::from_millis(120), "it kept trying until the budget");
+    }
     use super::{
         commit_review_v1_on, get_desktop_review_undo_target_v1_on, mark_segment_unusable_v1_on,
         persist_whole_segment_update_on, public_desktop_undo_error, public_precommit_playback_binding_error,
@@ -2231,7 +2302,7 @@ mod tests {
         };
         let store = review_store(&db);
 
-        let first = mark_segment_unusable_v1_on(&store, &request).expect("technical mark");
+        let first = mark_unusable_retrying_busy(&store, &request).expect("technical mark");
         assert_eq!(first.segment_id, request.segment_id);
         assert_eq!(first.committed_revision, base_revision + 1);
         assert_eq!(first.reason, TechnicalUnusableReasonV1::CorruptContainer);
@@ -2273,7 +2344,7 @@ mod tests {
         // effect before probing current bytes, or a lost success response becomes ambiguous as soon
         // as the owner restores the file.
         write_test_wav(&tmp.path().join("technical-unusable.wav"), 1_600);
-        let replay = mark_segment_unusable_v1_on(&store, &request).expect("lost-response retry");
+        let replay = mark_unusable_retrying_busy(&store, &request).expect("lost-response retry");
         assert_eq!(replay, first);
         let stale_draft_count: i64 = db
             .connection()
@@ -2296,7 +2367,7 @@ mod tests {
                 rusqlite::params!["technical-unusable", first.committed_revision],
             )
             .unwrap();
-        assert_eq!(mark_segment_unusable_v1_on(&store, &request).unwrap(), first);
+        assert_eq!(mark_unusable_retrying_busy(&store, &request).unwrap(), first);
         let mut retained_revisions_query = db
             .connection()
             .prepare(
@@ -2325,13 +2396,13 @@ mod tests {
 
         let conflicting_reason =
             MarkSegmentUnusableRequestV1 { reason: TechnicalUnusableReasonV1::DecodeFailed, ..request.clone() };
-        let conflict = mark_segment_unusable_v1_on(&store, &conflicting_reason)
+        let conflict = mark_unusable_retrying_busy(&store, &conflicting_reason)
             .expect_err("one operation UUID cannot authorize a different reason");
         assert_eq!(conflict.code, "OPERATION_ID_CONFLICT");
 
         let stale =
             MarkSegmentUnusableRequestV1 { operation_id: "88888888-8888-4888-8888-888888888888".into(), ..request };
-        let stale_error = mark_segment_unusable_v1_on(&store, &stale).expect_err("old revision must be refused");
+        let stale_error = mark_unusable_retrying_busy(&store, &stale).expect_err("old revision must be refused");
         assert_eq!(stale_error.code, "STALE_REVISION");
         assert_eq!(stale_error.details.get("currentRevision"), Some(&first.committed_revision.into()));
     }
@@ -2355,7 +2426,7 @@ mod tests {
             reason: TechnicalUnusableReasonV1::MissingFile,
         };
 
-        let error = mark_segment_unusable_v1_on(&review_store(&db), &request)
+        let error = mark_unusable_retrying_busy(&review_store(&db), &request)
             .expect_err("missing paths cannot be bound to immutable technical evidence");
         assert_eq!(error.code, "MISSING_AUDIO_REQUIRES_RELINK");
         assert!(!error.retryable);
@@ -2406,7 +2477,7 @@ mod tests {
             reason: TechnicalUnusableReasonV1::CorruptContainer,
         };
         let store = review_store(&db);
-        mark_segment_unusable_v1_on(&store, &request)
+        mark_unusable_retrying_busy(&store, &request)
             .expect("technical mark must not attempt to delete non-authoritative draft work");
 
         let row = db.get_segment_by_id("technical-unusable-atomic").unwrap().unwrap();
@@ -2437,7 +2508,7 @@ mod tests {
             reason: TechnicalUnusableReasonV1::DecodeFailed,
         };
         let store = review_store(&db);
-        let error = mark_segment_unusable_v1_on(&store, &request)
+        let error = mark_unusable_retrying_busy(&store, &request)
             .expect_err("renderer claims are not authority over a healthy backend-decodable clip");
         assert_eq!(error.code, "AUDIO_FAILURE_NOT_REPRODUCED");
         assert_eq!(error.details.get("declaredReason"), Some(&"decodeFailed".into()));
@@ -2463,7 +2534,7 @@ mod tests {
         std::fs::write(tmp.path().join("corrupt-authority.wav"), b"definitely not wav").unwrap();
         let corrupt_revision = corrupt.segment_review_revision("corrupt-authority").unwrap().unwrap();
         let corrupt_store = review_store(&corrupt);
-        let corrupt_mark = mark_segment_unusable_v1_on(
+        let corrupt_mark = mark_unusable_retrying_busy(
             &corrupt_store,
             &MarkSegmentUnusableRequestV1 {
                 operation_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
@@ -2482,7 +2553,7 @@ mod tests {
         write_test_wav(&decode_dir.path().join("decode-authority.wav"), 0);
         let decode_revision = decode.segment_review_revision("decode-authority").unwrap().unwrap();
         let decode_store = review_store(&decode);
-        let decode_mark = mark_segment_unusable_v1_on(
+        let decode_mark = mark_unusable_retrying_busy(
             &decode_store,
             &MarkSegmentUnusableRequestV1 {
                 operation_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc".into(),
@@ -2942,7 +3013,7 @@ mod tests {
             reason: TechnicalUnusableReasonV1::CorruptContainer,
         };
         let store = review_store(&db);
-        let marked = mark_segment_unusable_v1_on(&store, &request).unwrap();
+        let marked = mark_unusable_retrying_busy(&store, &request).unwrap();
         assert_eq!(marked.committed_revision, base_revision + 1);
         let private_rationale = db
             .get_segment_by_id("technical-flag-undo")
