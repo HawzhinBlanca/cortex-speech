@@ -383,7 +383,7 @@ jobs:
         run: python scripts/generate_release_checksums.py src-tauri/target/release/release-bundle --output .provenance-subjects
       - name: Attest exact release subjects
         id: attest-subjects
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: cortex-speech-app/src-tauri/target/release/release-bundle/.provenance-subjects
       - name: Finalize inner provenance and checksum inventory
@@ -426,7 +426,7 @@ jobs:
           Compress-Archive -Path 'src-tauri/target/release/release-bundle/*' -DestinationPath $archive -CompressionLevel Optimal
       - name: Attest release archive
         id: attest-archive
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: cortex-speech-app/src-tauri/target/release/release-package/cortex-speech-windows-11-x64.zip
       - name: Finalize release package authority
