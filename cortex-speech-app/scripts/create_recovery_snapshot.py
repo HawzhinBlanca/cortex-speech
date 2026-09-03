@@ -21,7 +21,6 @@ should use the default of zero.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -125,6 +124,9 @@ WINDOWS_RESERVED_NAMES = {
 }
 
 
+from policy_python import sha256_file
+
+
 def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
     """Keep old evidence shapes exact while binding every review authority through v65."""
 
@@ -155,14 +157,6 @@ def default_data_dir() -> Path:
     if not appdata:
         raise RuntimeError("APPDATA is unavailable; pass --data-dir explicitly")
     return Path(appdata) / "cortex-speech"
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def git_sha(repo_root: Path) -> str:

@@ -3752,6 +3752,781 @@ mod tests {
         );
         assert_eq!(parse_pinned_name(&format!("{}_0000000300", "x".repeat(65))), None);
     }
+
+    #[test]
+    fn manifest_names_reject_every_reachable_unsafe_shape_and_keep_valid_boundaries() {
+        let unsafe_names = [
+            "",
+            ".",
+            "..",
+            r"\rooted",
+            "nested/file",
+            "line\nbreak",
+            "bad<name",
+            "trailing-space ",
+            "trailing-dot.",
+            "nul.txt",
+            "com1.log",
+            "lpt9",
+        ];
+        for name in unsafe_names {
+            assert_eq!(
+                safe_manifest_name(name),
+                Err(format!("snapshot manifest contains unsafe file path '{name}'")),
+                "unsafe manifest name must fail closed: {name:?}",
+            );
+        }
+        assert!(
+            safe_manifest_name(&MANIFEST_FILE.to_ascii_lowercase()).is_err(),
+            "the manifest cannot declare itself, regardless of case",
+        );
+
+        for name in ["cortex-speech.db", "champion.json", "com0.log", "lpt0", "company.txt", "manifest-copy.json"] {
+            assert_eq!(safe_manifest_name(name), Ok(()), "valid boundary name was rejected: {name:?}");
+        }
+    }
+
+    #[test]
+    fn champion_pointer_rejects_every_invalid_shape_and_accepts_exact_schema_two() {
+        let parse_error = validate_champion_pointer(b"{").unwrap_err();
+        assert!(parse_error.starts_with("champion.json is invalid JSON:"), "{parse_error}");
+
+        let exact_entry = serde_json::json!({
+            "modelVersionId": "model-v1",
+            "deploymentManifestPath": "models/manifest.json",
+            "deploymentSha256": "a".repeat(64),
+            "source": "owner",
+            "license": "private",
+        });
+        let invalid = [
+            (serde_json::json!([]), "champion.json must be an object"),
+            (
+                serde_json::json!({"schema": 2, "champions": {}, "extra": true}),
+                "champion.json must contain exactly schema and champions",
+            ),
+            (serde_json::json!({"schema": 2, "other": {}}), "champion.json must contain exactly schema and champions"),
+            (
+                serde_json::json!({"champions": {}, "other": {}}),
+                "champion.json must contain exactly schema and champions",
+            ),
+            (serde_json::json!({"schema": 1, "champions": {}}), "champion.json schema must be exactly 2"),
+            (serde_json::json!({"schema": 2, "champions": []}), "champion.json champions must be an object"),
+            (
+                serde_json::json!({"schema": 2, "champions": {" \t": exact_entry.clone()}}),
+                "champion.json contains an empty family name",
+            ),
+            (
+                serde_json::json!({"schema": 2, "champions": {"asr": null}}),
+                "champion.json family 'asr' must be an object",
+            ),
+            (
+                serde_json::json!({"schema": 2, "champions": {"asr": {}}}),
+                "champion.json family 'asr' has an invalid field set",
+            ),
+            (
+                serde_json::json!({
+                    "schema": 2,
+                    "champions": {"asr": {
+                        "modelVersionId": 7,
+                        "deploymentManifestPath": "models/manifest.json",
+                        "deploymentSha256": "a".repeat(64),
+                        "source": "owner",
+                        "license": "private",
+                    }},
+                }),
+                "champion.json family 'asr' fields must all be strings",
+            ),
+        ];
+        for (value, expected) in invalid {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            assert_eq!(validate_champion_pointer(&bytes), Err(expected.to_string()), "unexpected value: {value}");
+        }
+
+        let valid = serde_json::json!({"schema": 2, "champions": {"asr": exact_entry}});
+        assert_eq!(validate_champion_pointer(&serde_json::to_vec(&valid).unwrap()), Ok(()));
+    }
+
+    #[test]
+    fn manifest_contract_rejects_identity_inventory_and_digest_drift() {
+        fn row_mut<'a>(manifest: &'a mut serde_json::Value, name: &str) -> &'a mut serde_json::Value {
+            manifest["files"].as_array_mut().unwrap().iter_mut().find(|row| row["path"] == name).unwrap()
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let snap = take_snapshot_at(&db, tmp.path(), 10, 1000).unwrap().unwrap();
+        let manifest_path = snap.join(MANIFEST_FILE);
+        let canonical: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert!(verify_snapshot_manifest_for_restore(&snap).unwrap());
+        let verify = |manifest: &serde_json::Value| {
+            std::fs::write(&manifest_path, serde_json::to_vec_pretty(manifest).unwrap()).unwrap();
+            verify_snapshot_manifest_for_restore(&snap)
+        };
+
+        assert_eq!(
+            verify(&serde_json::json!({"files": []})),
+            Err("snapshot manifest schema must be exactly integer 1 or 2".to_string()),
+        );
+        let mut future_schema = canonical.clone();
+        future_schema["schema"] = serde_json::json!(3);
+        assert_eq!(verify(&future_schema), Err("snapshot manifest schema must be exactly integer 1 or 2".to_string()),);
+        let mut unknown_field = canonical.clone();
+        unknown_field["unexpected"] = serde_json::json!(true);
+        let error = verify(&unknown_field).unwrap_err();
+        assert!(error.starts_with("snapshot schema-1 manifest contract is invalid:"), "{error}");
+
+        let mut policy_schema = canonical.clone();
+        policy_schema["reviewPilotPolicyStateSchema"] = serde_json::json!(2);
+        assert_eq!(
+            verify(&policy_schema),
+            Err("snapshot schema-1 manifest policy-state schema must be exactly 1".to_string()),
+        );
+        let mut empty_app_sha = canonical.clone();
+        empty_app_sha["appGitSha"] = serde_json::json!("");
+        assert_eq!(verify(&empty_app_sha), Err("snapshot manifest appGitSha must be non-empty".to_string()),);
+
+        let evidence = inspect_schema2_database_evidence(&snap.join(DB_FILE)).unwrap();
+        let schema2 = serde_json::json!({
+            "schema": 2,
+            "createdAtEpochSecs": 1000,
+            "appGitSha": crate::GIT_SHA,
+            "sourceDataDir": "C:/disposable/source",
+            "databaseEvidence": evidence,
+            "files": canonical["files"].clone(),
+        });
+        assert_eq!(verify(&schema2), Ok(true));
+        let mut schema2_empty_sha = schema2.clone();
+        schema2_empty_sha["appGitSha"] = serde_json::json!("");
+        assert_eq!(
+            verify(&schema2_empty_sha),
+            Err("snapshot schema-2 manifest identity fields are invalid".to_string()),
+        );
+        let mut schema2_empty_source = schema2;
+        schema2_empty_source["sourceDataDir"] = serde_json::json!("");
+        assert_eq!(
+            verify(&schema2_empty_source),
+            Err("snapshot schema-2 manifest identity fields are invalid".to_string()),
+        );
+
+        let mut collision = canonical.clone();
+        let mut collided_row = row_mut(&mut collision, DB_FILE).clone();
+        collided_row["path"] = serde_json::json!(DB_FILE.to_ascii_uppercase());
+        collision["files"].as_array_mut().unwrap().push(collided_row);
+        assert_eq!(verify(&collision), Err("snapshot manifest contains a duplicate/case-colliding file".to_string()),);
+
+        let mut unlisted = canonical.clone();
+        unlisted["files"].as_array_mut().unwrap().retain(|row| row["path"] != "champion.json");
+        let error = verify(&unlisted).unwrap_err();
+        assert!(error.contains("inventory is not exact") && error.contains("unlisted=[\"champion.json\"]"), "{error}");
+
+        let mut missing = canonical.clone();
+        missing["files"].as_array_mut().unwrap().push(serde_json::json!({
+            "path": "missing.json",
+            "sizeBytes": 0,
+            "sha256": "0".repeat(64),
+        }));
+        let error = verify(&missing).unwrap_err();
+        assert!(error.contains("inventory is not exact") && error.contains("missing=[\"missing.json\"]"), "{error}");
+
+        let mut short_sha = canonical.clone();
+        row_mut(&mut short_sha, DB_FILE)["sha256"] = serde_json::json!("0");
+        assert_eq!(
+            verify(&short_sha),
+            Err(format!("snapshot manifest SHA-256 for '{DB_FILE}' must be 64 lowercase hex digits")),
+        );
+        let mut uppercase_sha = canonical.clone();
+        row_mut(&mut uppercase_sha, DB_FILE)["sha256"] = serde_json::json!("A".repeat(64));
+        assert_eq!(
+            verify(&uppercase_sha),
+            Err(format!("snapshot manifest SHA-256 for '{DB_FILE}' must be 64 lowercase hex digits")),
+        );
+        let mut wrong_size = canonical.clone();
+        let size = row_mut(&mut wrong_size, DB_FILE)["sizeBytes"].as_u64().unwrap();
+        row_mut(&mut wrong_size, DB_FILE)["sizeBytes"] = serde_json::json!(size + 1);
+        let error = verify(&wrong_size).unwrap_err();
+        assert!(error.contains(&format!("snapshot manifest size mismatch for '{DB_FILE}'")), "{error}");
+        let mut wrong_hash = canonical.clone();
+        row_mut(&mut wrong_hash, DB_FILE)["sha256"] = serde_json::json!("0".repeat(64));
+        assert_eq!(verify(&wrong_hash), Err(format!("snapshot manifest SHA-256 mismatch for '{DB_FILE}'")),);
+
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&canonical).unwrap()).unwrap();
+        let unexpected_dir = snap.join("unexpected-dir");
+        std::fs::create_dir(&unexpected_dir).unwrap();
+        assert_eq!(
+            verify_snapshot_manifest_for_restore(&snap),
+            Err("snapshot file 'unexpected-dir' must be a regular, non-symlink file".to_string()),
+        );
+        std::fs::remove_dir(&unexpected_dir).unwrap();
+
+        let saved_db = tmp.path().join("saved-snapshot.db");
+        std::fs::rename(snap.join(DB_FILE), &saved_db).unwrap();
+        let mut without_db = canonical.clone();
+        without_db["files"].as_array_mut().unwrap().retain(|row| row["path"] != DB_FILE);
+        assert_eq!(verify(&without_db), Err(format!("snapshot manifest is incomplete: missing required '{DB_FILE}'")),);
+        std::fs::rename(saved_db, snap.join(DB_FILE)).unwrap();
+        assert_eq!(verify(&canonical), Ok(true));
+    }
+
+    #[test]
+    fn active_pilot_snapshot_authority_distinguishes_archival_schema_and_invalid_policy_shapes() {
+        let archival = seeded_db();
+        crate::migrations::rollback(&archival, 11).unwrap();
+        assert_eq!(crate::migrations::get_current_version(&archival).unwrap(), 58);
+        validate_active_pilot_snapshot_authority(archival.connection(), None, None, &pilot_policy())
+            .expect("pre-v59 capture validation is archival only; restore admission rejects it separately");
+
+        let invalid_roster = seeded_db();
+        let mut one_reviewer = pilot_policy();
+        one_reviewer.reviewers.pop();
+        let roster_error =
+            validate_active_pilot_snapshot_authority(invalid_roster.connection(), None, None, &one_reviewer)
+                .unwrap_err();
+        assert!(roster_error.contains("exactly two distinct reviewers"), "{roster_error}");
+
+        let ahead = seeded_db();
+        let mut ahead_policy = pilot_policy();
+        ahead_policy.after_review_event_id = 1;
+        let baseline_error =
+            validate_active_pilot_snapshot_authority(ahead.connection(), None, None, &ahead_policy).unwrap_err();
+        assert!(baseline_error.contains("baseline 1") && baseline_error.contains("maximum 0"), "{baseline_error}");
+    }
+
+    #[test]
+    fn active_pilot_snapshot_authority_rejects_namespace_and_completion_drift() {
+        fn insert_grant(db: &Database, policy: &crate::review_pilot::ReviewPilotPolicy, reviewer: &str, segment: &str) {
+            db.connection()
+                .execute(
+                    "INSERT INTO review_pilot_hidden_keys
+                        (policy_sha256, after_review_event_id, reviewer, segment_id)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![policy.policy_sha256().unwrap(), policy.after_review_event_id, reviewer, segment],
+                )
+                .unwrap();
+        }
+
+        fn insert_completion(db: &Database, segment: &str, reviewer: &str, action: &str) {
+            db.connection()
+                .execute(
+                    "INSERT INTO review_events
+                        (segment_id, reviewer, action, source, timestamp_ms, operation_id,
+                         operation_payload_hash, requested_action, requested_transcript,
+                         served_transcript, served_revision, app_git_sha, playback_guard_version)
+                     VALUES (?1, ?2, ?3, 'couch_spot_check', 1, ?4,
+                             ?5, 'accept', '', 'ڕەفەرێنس', 0, ?6, 'content-hash-raw-counter-v3')",
+                    rusqlite::params![
+                        segment,
+                        reviewer,
+                        action,
+                        uuid::Uuid::new_v4().to_string(),
+                        "a".repeat(64),
+                        crate::GIT_SHA
+                    ],
+                )
+                .unwrap();
+        }
+
+        fn insert_result(db: &Database, segment: &str, reviewer: &str, action: &str) {
+            db.connection()
+                .execute(
+                    "INSERT INTO spot_checks
+                        (segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer)
+                     VALUES (?1, ?2, ?3, 'ڕەفەرێنس', 'ڕەفەرێنس', 1, 0.0)",
+                    rusqlite::params![segment, reviewer, action],
+                )
+                .unwrap();
+        }
+
+        let conflict = seeded_db();
+        let policy = pilot_policy();
+        // Roster names come FROM the policy: the authority check refuses any reviewer it does
+        // not name, so a literal here is a scrub away from every fixture being refused.
+        let first = policy.reviewers[0].name.clone();
+        let second = policy.reviewers[1].name.clone();
+        conflict
+            .connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, 1, ?2, 'conflict')",
+                rusqlite::params![policy.policy_sha256().unwrap(), first.as_str()],
+            )
+            .unwrap();
+        let conflict_error =
+            validate_active_pilot_snapshot_authority(conflict.connection(), None, None, &policy).unwrap_err();
+        assert!(conflict_error.contains("disagree with the active policy SHA/baseline"), "{conflict_error}");
+
+        let unauthorized = seeded_db();
+        insert_grant(&unauthorized, &policy, "Sara", "unauthorized");
+        let reviewer_error =
+            validate_active_pilot_snapshot_authority(unauthorized.connection(), None, None, &policy).unwrap_err();
+        assert!(reviewer_error.contains("unauthorized reviewer"), "{reviewer_error}");
+
+        let invalid_segment = seeded_db();
+        insert_grant(&invalid_segment, &policy, first.as_str(), "invalid/segment");
+        let segment_error =
+            validate_active_pilot_snapshot_authority(invalid_segment.connection(), None, None, &policy).unwrap_err();
+        assert!(segment_error.contains("invalid segment"), "{segment_error}");
+
+        let invalid_action = seeded_db();
+        insert_grant(&invalid_action, &policy, first.as_str(), "invalid-action");
+        insert_completion(&invalid_action, "invalid-action", first.as_str(), "bogus");
+        let action_error =
+            validate_active_pilot_snapshot_authority(invalid_action.connection(), None, None, &policy).unwrap_err();
+        assert!(action_error.contains("invalid action"), "{action_error}");
+
+        let missing_result = seeded_db();
+        insert_grant(&missing_result, &policy, first.as_str(), "missing-result");
+        insert_completion(&missing_result, "missing-result", first.as_str(), "accept");
+        let result_error =
+            validate_active_pilot_snapshot_authority(missing_result.connection(), None, None, &policy).unwrap_err();
+        assert!(result_error.contains("result mismatch"), "{result_error}");
+
+        let duplicate_completion = seeded_db();
+        insert_grant(&duplicate_completion, &policy, first.as_str(), "duplicate-completion");
+        insert_result(&duplicate_completion, "duplicate-completion", first.as_str(), "accept");
+        insert_completion(&duplicate_completion, "duplicate-completion", first.as_str(), "accept");
+        insert_completion(&duplicate_completion, "duplicate-completion", first.as_str(), "accept");
+        let duplicate_error =
+            validate_active_pilot_snapshot_authority(duplicate_completion.connection(), None, None, &policy)
+                .unwrap_err();
+        assert!(duplicate_error.contains("multiple completion events"), "{duplicate_error}");
+
+        let coherent = seeded_db();
+        insert_grant(&coherent, &policy, first.as_str(), "coherent");
+        insert_result(&coherent, "coherent", first.as_str(), "accept");
+        insert_completion(&coherent, "coherent", first.as_str(), "accept");
+        validate_active_pilot_snapshot_authority(coherent.connection(), None, None, &policy).unwrap();
+    }
+
+    #[test]
+    fn active_pilot_snapshot_rejects_live_session_identity_and_cache_drift() {
+        let profile = tempfile::TempDir::new().unwrap();
+        let db_path = profile.path().join(DB_FILE);
+        let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        db.initialize().unwrap();
+        let policy = pilot_policy();
+        // Roster names come FROM the policy: the authority check refuses any reviewer it does
+        // not name, so a literal here is a scrub away from every fixture being refused.
+        let first = policy.reviewers[0].name.clone();
+        let second = policy.reviewers[1].name.clone();
+        let session_path = profile.path().join("couch_session.json");
+        let policy_value = serde_json::to_value(&policy).unwrap();
+        let reviewers = serde_json::json!({"token-h": first.as_str(), "token-p": second.as_str()});
+        let write_session = |recorded_db_path: &Path,
+                             session_reviewers: serde_json::Value,
+                             checks: serde_json::Value,
+                             session_policy: serde_json::Value| {
+            std::fs::write(
+                &session_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "db_path": recorded_db_path,
+                    "reviewers": session_reviewers,
+                    "pilot_spot_checks": checks,
+                    "pilot_policy": session_policy,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+
+        write_session(
+            &db_path,
+            reviewers.clone(),
+            serde_json::json!([["hidden-session", first.as_str()]]),
+            policy_value.clone(),
+        );
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("no durable active-policy grant"), "{error}");
+
+        db.connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, 0, ?2, 'hidden-session')",
+                rusqlite::params![policy.policy_sha256().unwrap(), first.as_str()],
+            )
+            .unwrap();
+
+        let other_db_path = profile.path().join("other.db");
+        std::fs::write(&other_db_path, b"not used as a database").unwrap();
+        write_session(&other_db_path, reviewers.clone(), serde_json::json!([]), policy_value.clone());
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("different database"), "{error}");
+
+        let missing_db_path = profile.path().join("missing.db");
+        write_session(&missing_db_path, reviewers.clone(), serde_json::json!([]), policy_value.clone());
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("session database path is unavailable"), "{error}");
+
+        write_session(&db_path, reviewers.clone(), serde_json::json!([]), policy_value.clone());
+        let unavailable_expected = profile.path().join("unavailable-expected.db");
+        let error = validate_active_pilot_snapshot_authority(
+            db.connection(),
+            Some(profile.path()),
+            Some(&unavailable_expected),
+            &policy,
+        )
+        .unwrap_err();
+        assert!(error.contains("snapshot database path is unavailable"), "{error}");
+
+        write_session(&db_path, reviewers.clone(), serde_json::json!([]), serde_json::Value::Null);
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("not bound to the active pilot policy"), "{error}");
+
+        let mut different_policy = policy.clone();
+        different_policy.after_review_event_id = 1;
+        write_session(
+            &db_path,
+            reviewers.clone(),
+            serde_json::json!([]),
+            serde_json::to_value(different_policy).unwrap(),
+        );
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("different pilot policy"), "{error}");
+
+        write_session(
+            &db_path,
+            serde_json::json!({"token-h": first.as_str()}),
+            serde_json::json!([]),
+            policy_value.clone(),
+        );
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("reviewer roster does not match"), "{error}");
+
+        write_session(
+            &db_path,
+            reviewers.clone(),
+            serde_json::json!([["../invalid", first.as_str()]]),
+            policy_value.clone(),
+        );
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("hidden key is invalid"), "{error}");
+
+        write_session(
+            &db_path,
+            reviewers.clone(),
+            serde_json::json!([["hidden-session", "Mallory"]]),
+            policy_value.clone(),
+        );
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("snapshot session hidden cache contains unauthorized reviewer"), "{error}");
+
+        write_session(
+            &db_path,
+            reviewers.clone(),
+            serde_json::json!([
+                ["hidden-session", first.as_str()],
+                ["hidden-session", format!(" {} ", first.to_lowercase()).as_str()],
+            ]),
+            policy_value.clone(),
+        );
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("duplicates hidden key"), "{error}");
+
+        std::fs::write(&session_path, b"not json").unwrap();
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("couch_session.json is invalid"), "{error}");
+
+        std::fs::remove_file(&session_path).unwrap();
+        std::fs::create_dir(&session_path).unwrap();
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("snapshot session cannot be read"), "{error}");
+
+        std::fs::remove_dir(&session_path).unwrap();
+        validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+            .unwrap();
+
+        write_session(&db_path, reviewers, serde_json::json!([["hidden-session", first.as_str()]]), policy_value);
+        validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+            .unwrap();
+    }
+
+    #[test]
+    fn non_regular_active_state_fails_the_snapshot_instead_of_becoming_absent() {
+        for (live_file, expected) in [
+            (crate::review_pilot::REVIEW_PILOT_FILE, "could not be read"),
+            (OPTIONAL_SNAPSHOT_STATE[0].live_file, "is not a regular file"),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let db = seeded_db();
+            std::fs::create_dir(tmp.path().join(live_file)).unwrap();
+
+            let error = take_snapshot_at(&db, tmp.path(), 10, 1000).unwrap_err().to_string();
+            assert!(error.contains(live_file) && error.contains(expected), "unexpected error for {live_file}: {error}");
+            let snapshots = tmp.path().join("snapshots");
+            assert!(snapshots.is_dir(), "the writer may create only its private snapshots root");
+            assert!(
+                std::fs::read_dir(&snapshots).unwrap().next().is_none(),
+                "unreadable {live_file} must leave neither a promoted snapshot nor staging residue"
+            );
+        }
+    }
+
+    #[test]
+    fn non_regular_active_state_fails_the_pinned_snapshot_without_residue() {
+        for (live_file, expected) in [
+            (crate::review_pilot::REVIEW_PILOT_FILE, "could not be read"),
+            (OPTIONAL_SNAPSHOT_STATE[0].live_file, "is not a regular file"),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let db = seeded_db();
+            std::fs::create_dir(tmp.path().join(live_file)).unwrap();
+
+            let error =
+                take_pinned_snapshot_at(&db, tmp.path(), "premigration_v57_to_v58", 3, 1000).unwrap_err().to_string();
+            assert!(error.contains(live_file) && error.contains(expected), "unexpected error for {live_file}: {error}");
+            let pinned = tmp.path().join("snapshots").join(PINNED_DIR);
+            assert!(pinned.is_dir(), "the writer may create only its private pinned root");
+            assert!(
+                std::fs::read_dir(&pinned).unwrap().next().is_none(),
+                "unreadable {live_file} must leave neither a promoted pin nor staging residue"
+            );
+        }
+    }
+
+    #[test]
+    fn prune_only_rotates_valid_snapshot_directories() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("snapshots");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // An existing but empty root is a valid steady state, not an error or an invented snapshot.
+        prune_snapshots(&root, 1).unwrap();
+
+        let snapshot_shaped_file = root.join("snapshot_0000000150");
+        let unrelated_dir = root.join("notes");
+        let malformed_snapshot_dir = root.join("snapshot_not-a-timestamp");
+        let old_snapshot = root.join("snapshot_0000000100");
+        let newest_snapshot = root.join("snapshot_0000000200");
+        std::fs::write(&snapshot_shaped_file, b"not a snapshot directory").unwrap();
+        for path in [&unrelated_dir, &malformed_snapshot_dir, &old_snapshot, &newest_snapshot] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+
+        prune_snapshots(&root, 1).unwrap();
+
+        assert!(snapshot_shaped_file.is_file(), "a snapshot-shaped regular file is outside rotation authority");
+        assert!(unrelated_dir.is_dir(), "an unrelated directory is outside rotation authority");
+        assert!(malformed_snapshot_dir.is_dir(), "a malformed snapshot directory is outside rotation authority");
+        assert!(!old_snapshot.exists(), "the older valid rotating snapshot is pruned");
+        assert!(newest_snapshot.is_dir(), "the newest valid rotating snapshot is retained");
+    }
+
+    #[test]
+    fn pre_restore_pin_rejects_a_completed_reservation_before_filesystem_mutation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let admission = crate::database_runtime::RestoreAdmission::new();
+        let reservation = admission.try_reserve().unwrap();
+        reservation.arm_named_restore().unwrap();
+        reservation.commit_named_restore().unwrap();
+        assert!(!reservation.is_active(), "a completed restore capability must be stale");
+
+        let error = take_pinned_snapshot_during_restore(&reservation, &db, tmp.path(), "prerestore", 3)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires an active exclusive restore reservation"), "{error}");
+        assert!(!tmp.path().join("snapshots").exists(), "a stale capability must fail before filesystem mutation");
+    }
+
+    #[test]
+    fn stale_staging_sweep_removes_only_crash_directories_and_never_invents_snapshot_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("snapshots");
+        sweep_stale_staging_dirs(&root);
+        assert!(!root.exists(), "sweeping a missing root must not create state");
+        assert!(!has_any_snapshot(&root), "a missing root has no snapshot history");
+
+        std::fs::create_dir(&root).unwrap();
+        let stale = root.join(format!("{STAGING_PREFIX}crashed-generation"));
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(stale.join("partial.db"), b"partial").unwrap();
+        let unrelated = root.join(".staging-not-a-generation");
+        std::fs::create_dir(&unrelated).unwrap();
+        let staging_named_file = root.join(format!("{STAGING_PREFIX}ordinary-file"));
+        std::fs::write(&staging_named_file, b"not a directory").unwrap();
+        let final_snapshot = root.join("snapshot_0000000001");
+        std::fs::create_dir(&final_snapshot).unwrap();
+
+        sweep_stale_staging_dirs(&root);
+        assert!(!stale.exists(), "a crash-left staging directory must be removed recursively");
+        assert!(unrelated.is_dir(), "a non-prefix directory must survive the sweep");
+        assert!(staging_named_file.is_file(), "the sweep must never delete a prefix-matching regular file");
+        assert!(final_snapshot.is_dir(), "a promoted snapshot must survive the sweep");
+        assert!(has_any_snapshot(&root), "a final snapshot directory is authoritative history");
+
+        std::fs::remove_dir(&final_snapshot).unwrap();
+        std::fs::write(root.join("snapshot_0000000002"), b"not a directory").unwrap();
+        assert!(!has_any_snapshot(&root), "a snapshot-shaped regular file must not invent history");
+    }
+
+    #[test]
+    fn snapshot_selectors_accept_only_opaque_grammar_and_real_directories() {
+        assert_eq!(parse_fixed_timestamp("0000000042"), Some(42));
+        for invalid in ["42", "000000004x"] {
+            assert_eq!(parse_fixed_timestamp(invalid), None, "invalid fixed timestamp passed: {invalid:?}");
+        }
+
+        assert_eq!(parse_pinned_name("pre_restore-2_0000000042"), Some(42));
+        assert_eq!(parse_pinned_name(&format!("{}_0000000042", "a".repeat(64))), Some(42));
+        for invalid in
+            ["missing-timestamp", "_0000000042", "-leading_0000000042", "label.with-dot_0000000042", "label_000000004x"]
+        {
+            assert_eq!(parse_pinned_name(invalid), None, "invalid pinned name passed: {invalid:?}");
+        }
+        assert_eq!(parse_pinned_name(&format!("{}_0000000042", "a".repeat(65))), None);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("snapshots");
+        let rotating = root.join("snapshot_0000000001");
+        let pinned = root.join(PINNED_DIR).join("pre_restore-2_0000000002");
+        std::fs::create_dir_all(&rotating).unwrap();
+        std::fs::create_dir_all(&pinned).unwrap();
+        assert_eq!(resolve_snapshot_dir(tmp.path(), "snapshot_0000000001").unwrap(), rotating);
+        assert_eq!(resolve_snapshot_dir(tmp.path(), "pinned/pre_restore-2_0000000002").unwrap(), pinned);
+
+        for selector in ["snapshot_1", "snapshot_000000000x", "../snapshot_0000000001", "pinned"] {
+            assert_eq!(
+                resolve_snapshot_dir(tmp.path(), selector),
+                Err(format!("invalid snapshot selector '{selector}'")),
+            );
+        }
+        for selector in
+            ["pinned/label/child_0000000002", r"pinned/label\child_0000000002", "pinned/label.with-dot_0000000002"]
+        {
+            assert_eq!(
+                resolve_snapshot_dir(tmp.path(), selector),
+                Err(format!("invalid pinned snapshot selector '{selector}'")),
+            );
+        }
+
+        let unavailable = resolve_snapshot_dir(tmp.path(), "snapshot_0000000003").unwrap_err();
+        assert!(unavailable.starts_with("snapshot 'snapshot_0000000003' is unavailable:"), "{unavailable}");
+
+        let file_selector = "snapshot_0000000004";
+        std::fs::write(root.join(file_selector), b"not a directory").unwrap();
+        assert_eq!(
+            resolve_snapshot_dir(tmp.path(), file_selector),
+            Err(format!("snapshot '{file_selector}' must be a real directory, not a link")),
+        );
+    }
+
+    #[test]
+    fn snapshot_listing_ignores_non_authoritative_entries_and_reports_missing_database_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(list_snapshots(tmp.path()).is_empty(), "an absent snapshots root is an empty listing");
+
+        let root = tmp.path().join("snapshots");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("snapshot_0000000009"), b"not a directory").unwrap();
+        std::fs::create_dir(root.join("unrelated")).unwrap();
+        std::fs::create_dir(root.join("snapshot_bad")).unwrap();
+        std::fs::create_dir(root.join("snapshot_0000000002")).unwrap();
+
+        let pinned = root.join(PINNED_DIR);
+        std::fs::create_dir(&pinned).unwrap();
+        std::fs::write(pinned.join("safe_0000000009"), b"not a directory").unwrap();
+        for invalid in ["missing-separator", "_0000000008", "safe_bad"] {
+            std::fs::create_dir(pinned.join(invalid)).unwrap();
+        }
+        std::fs::create_dir(pinned.join("safe_0000000003")).unwrap();
+
+        let listed = list_snapshots(tmp.path());
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].name, "pinned/safe_0000000003");
+        assert_eq!(listed[0].timestamp, 3);
+        assert_eq!(listed[1].name, "snapshot_0000000002");
+        assert_eq!(listed[1].timestamp, 2);
+        for snapshot in listed {
+            assert_eq!(snapshot.db_size_bytes, 0, "a missing database has no invented byte size");
+            assert_eq!(snapshot.segment_count, None, "a missing database has no invented segment count");
+        }
+    }
+
+    /// The external drill mirror must report every omitted representation while accepting either
+    /// legal live/absence form. The production restore verifier separately rejects both-at-once.
+    #[test]
+    fn manifest_required_state_mirror_covers_every_live_absent_and_omitted_representation() {
+        let missing_for = |paths: &[&str]| {
+            let files = paths.iter().map(|path| serde_json::json!({"path": path})).collect::<Vec<_>>();
+            manifest_missing_required(&serde_json::json!({"schema": 1, "files": files}))
+        };
+        let expected_required = std::iter::once(DB_FILE)
+            .chain(OPTIONAL_SNAPSHOT_STATE.iter().map(|state| state.live_file))
+            .chain(std::iter::once(crate::review_pilot::REVIEW_PILOT_FILE))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        for malformed in [
+            serde_json::Value::Null,
+            serde_json::json!({"files": "not-an-array"}),
+            serde_json::json!({"files": [{}, {"path": 7}]}),
+        ] {
+            assert_eq!(manifest_missing_required(&malformed), expected_required);
+        }
+
+        let complete_live = std::iter::once(DB_FILE)
+            .chain(OPTIONAL_SNAPSHOT_STATE.iter().map(|state| state.live_file))
+            .chain(std::iter::once(crate::review_pilot::REVIEW_PILOT_FILE))
+            .collect::<Vec<_>>();
+        assert!(missing_for(&complete_live).is_empty());
+
+        assert_eq!(missing_for(&complete_live[1..]), [DB_FILE.to_string()]);
+        for state in OPTIONAL_SNAPSHOT_STATE {
+            let absent = complete_live
+                .iter()
+                .map(|path| if *path == state.live_file { state.absent_file } else { *path })
+                .collect::<Vec<_>>();
+            assert!(
+                missing_for(&absent).is_empty(),
+                "{} absence must satisfy required-state presence",
+                state.live_file
+            );
+
+            let omitted = complete_live.iter().copied().filter(|path| *path != state.live_file).collect::<Vec<_>>();
+            assert_eq!(missing_for(&omitted), [state.live_file.to_string()]);
+        }
+
+        let pilot_absent = complete_live
+            .iter()
+            .map(|path| {
+                if *path == crate::review_pilot::REVIEW_PILOT_FILE {
+                    crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE
+                } else {
+                    *path
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(missing_for(&pilot_absent).is_empty());
+        let pilot_omitted = complete_live
+            .iter()
+            .copied()
+            .filter(|path| *path != crate::review_pilot::REVIEW_PILOT_FILE)
+            .collect::<Vec<_>>();
+        assert_eq!(missing_for(&pilot_omitted), [crate::review_pilot::REVIEW_PILOT_FILE.to_string()]);
+    }
 }
 
 #[cfg(test)]

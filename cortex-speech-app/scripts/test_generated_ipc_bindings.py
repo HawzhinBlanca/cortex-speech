@@ -14,7 +14,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = REPO_ROOT / "src-tauri" / "Cargo.toml"
 TRACKED = REPO_ROOT / "src" / "lib" / "generated" / "ipc.ts"
-GENERATION_TIMEOUT_SECONDS = 300
+# Generous because this is a real build, not a lint: the Linux/macOS smoke jobs carry no cargo
+# cache (only the Windows job does), so the first `cargo run` here compiles the whole dependency
+# graph on a 2-core hosted runner. 300s was a Windows-warm-cache number.
+GENERATION_TIMEOUT_SECONDS = 1800
 # `cargo run` below builds the dev profile, so only a dev-profile artifact proves the dependency
 # tree is already compiled. A release-only target dir leaves the dev build just as cold.
 PREBUILT_GENERATOR = (

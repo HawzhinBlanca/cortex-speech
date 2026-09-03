@@ -155,6 +155,9 @@ _REQUIRED_SLICE_DIMENSIONS = ("source", "speaker", "dialect", "audio")
 ScoreRow = tuple[int, int, int, int]
 
 
+from policy_python import sha256_file
+
+
 class GateInputError(ValueError):
     """Evidence is absent, malformed, ambiguous, or internally inconsistent."""
 
@@ -199,14 +202,6 @@ class ChallengerRunBinding:
     adapter_config_sha256: str
     tokenizer_id: str
     tokenizer_sha256: str
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def inspect_eval_manifest(path: Path) -> EvalManifest:

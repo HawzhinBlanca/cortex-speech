@@ -402,15 +402,16 @@ def request(
         resp = opener.open(req, timeout=20)
         return resp.status, resp.headers.get("Set-Cookie"), resp.read()
     except urllib.error.HTTPError as e:
-        # The STATUS is the answer here; the body is best-effort. A fixture server (or a real
-        # origin) can reset the connection before the error body is read, and losing the body must
-        # not turn a clean "we received a 302" into an unhandled ConnectionResetError that takes
-        # the whole probe down. Measured 2026-09-01 on a macOS runner: Errno 54 while reading a 302
-        # body failed test_probe_redirect_is_not_followed, which had correctly NOT followed it.
+        # The STATUS is the answer here; the body is best-effort diagnostics. Reading it can still
+        # fail after the response line and headers arrived intact: a peer that replies without
+        # draining our request body makes the close send an RST on BSD stacks, so this raises
+        # ConnectionResetError on macOS where Linux and Windows return b"". Letting that escape
+        # crashed the whole reviewer-links gate over a status code it already held -- and this gate
+        # is what says whether reviewers can work. Never lose a status to a body read.
         try:
             body = e.read()
-        except Exception:  # noqa: BLE001 - an unreadable error body is still a real answer
-            body = b""
+        except Exception as read_error:  # noqa: BLE001 - an unreadable body is not a missing status
+            body = f"<body unreadable: {read_error}>".encode()
         return e.code, None, body
     except Exception as e:  # noqa: BLE001 - transport failure is a real answer here
         return None, None, str(e).encode()

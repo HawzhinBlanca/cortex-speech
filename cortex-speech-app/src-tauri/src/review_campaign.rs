@@ -2260,6 +2260,129 @@ mod tests {
         record_independent_decision(db, policy, &input).unwrap().unwrap()
     }
 
+    /// A valid progress body for `phase`, built the way activate_second_pass/adjudicate would
+    /// persist it — each test below then breaks exactly ONE clause and must be refused for it.
+    fn valid_progress(policy: &SequentialReviewCampaign, phase: CampaignPhase) -> CampaignProgress {
+        let (decisions, adjudications, conflicts) = match phase {
+            CampaignPhase::FirstPassActive | CampaignPhase::SecondPassActive => (0, 0, 0),
+            CampaignPhase::AdjudicationActive => (policy.focus_segment_count, 0, 1),
+            CampaignPhase::Completed => (policy.focus_segment_count, policy.focus_segment_count, 0),
+        };
+        CampaignProgress {
+            schema_version: 1,
+            campaign_id: policy.campaign_id.clone(),
+            phase,
+            transition_id: "223e4567-e89b-42d3-a456-426614174111".into(),
+            // Derived from the policy, the way the production builders do it: the binding check
+            // pins first_reviewer to the campaign reviewer, so a literal here is a scrub away
+            // from refusing every "valid" body and proving nothing.
+            first_reviewer: policy.reviewer.trim().to_string(),
+            second_reviewer: SECOND_PASS_REVIEWER.into(),
+            focus_segment_count: policy.focus_segment_count,
+            focus_sha256: policy.focus_sha256.clone(),
+            max_review_event_id: policy.activated_at_review_event_id,
+            independent_decision_count: decisions,
+            adjudication_count: adjudications,
+            conflicts_remaining: conflicts,
+        }
+    }
+
+    fn parse_progress_of(
+        progress: &CampaignProgress,
+        policy: &SequentialReviewCampaign,
+    ) -> Result<CampaignProgress, String> {
+        parse_progress(&serde_json::to_string(progress).unwrap(), policy)
+    }
+
+    #[test]
+    fn progress_binding_refuses_every_single_field_drift() {
+        let policy = valid_policy();
+
+        // The reference bodies themselves must parse, or the refusals below prove nothing.
+        for phase in [CampaignPhase::SecondPassActive, CampaignPhase::AdjudicationActive, CampaignPhase::Completed] {
+            let parsed = parse_progress_of(&valid_progress(&policy, phase), &policy).unwrap();
+            assert_eq!(parsed.phase, phase);
+        }
+
+        assert!(parse_progress("{not json", &policy).unwrap_err().contains("progress is invalid"));
+
+        // Reviewer names are trimmed BEFORE the binding comparison, exactly like the roster.
+        let mut padded = valid_progress(&policy, CampaignPhase::SecondPassActive);
+        padded.first_reviewer = format!(" {} ", policy.reviewer.trim());
+        padded.second_reviewer = format!(" {SECOND_PASS_REVIEWER} ");
+        assert!(parse_progress_of(&padded, &policy).is_ok());
+
+        // Every clause of the binding check refuses on its own: progress written for any OTHER
+        // campaign, count, digest, or event boundary must never be accepted by this one.
+        type ProgressMutation = Box<dyn Fn(&mut CampaignProgress)>;
+        let breaks: Vec<(&str, ProgressMutation)> = vec![
+            ("schema_version", Box::new(|p| p.schema_version = 2)),
+            ("campaign_id", Box::new(|p| p.campaign_id = "323e4567-e89b-42d3-a456-426614174222".into())),
+            ("first_reviewer", Box::new(|p| p.first_reviewer = "Aram".into())),
+            ("second_reviewer", Box::new(|p| p.second_reviewer = "Rezan".into())),
+            ("focus_segment_count", Box::new(|p| p.focus_segment_count += 1)),
+            ("focus_sha256", Box::new(|p| p.focus_sha256 = "b".repeat(64))),
+            ("max_review_event_id", Box::new(|p| p.max_review_event_id -= 1)),
+        ];
+        for (label, sabotage) in breaks {
+            let mut progress = valid_progress(&policy, CampaignPhase::SecondPassActive);
+            sabotage(&mut progress);
+            let error = parse_progress_of(&progress, &policy).unwrap_err();
+            assert!(error.contains("does not match the bound campaign"), "{label}: {error}");
+        }
+
+        // The transition id is evidence, so a non-canonical or re-cased UUID is a forgery, not a nit.
+        let mut bad_uuid = valid_progress(&policy, CampaignPhase::SecondPassActive);
+        bad_uuid.transition_id = "not-a-uuid".into();
+        assert!(parse_progress_of(&bad_uuid, &policy).unwrap_err().contains("must be a canonical UUID"));
+        let mut upper_uuid = valid_progress(&policy, CampaignPhase::SecondPassActive);
+        upper_uuid.transition_id = upper_uuid.transition_id.to_uppercase();
+        assert!(parse_progress_of(&upper_uuid, &policy).unwrap_err().contains("lowercase hyphenated"));
+    }
+
+    #[test]
+    fn progress_phase_invariants_refuse_impossible_histories() {
+        let policy = valid_policy();
+
+        // First-pass state lives in the immutable base policy; a progress row claiming it is a
+        // second copy of the phase authority and gets refused outright.
+        let first = valid_progress(&policy, CampaignPhase::FirstPassActive);
+        assert!(parse_progress_of(&first, &policy).unwrap_err().contains("represented by the immutable base policy"));
+
+        // A freshly activated second pass cannot already contain completed work.
+        for sabotage in [
+            (|p: &mut CampaignProgress| p.independent_decision_count = 1) as fn(&mut CampaignProgress),
+            |p| p.adjudication_count = 1,
+            |p| p.conflicts_remaining = 1,
+        ] {
+            let mut progress = valid_progress(&policy, CampaignPhase::SecondPassActive);
+            sabotage(&mut progress);
+            assert!(parse_progress_of(&progress, &policy).unwrap_err().contains("premature completion counts"));
+        }
+
+        // Adjudication exists only BETWEEN a complete independent pass and the last conflict.
+        for sabotage in [
+            (|p: &mut CampaignProgress| p.independent_decision_count -= 1) as fn(&mut CampaignProgress),
+            |p| p.conflicts_remaining = 0,
+            |p| p.adjudication_count = p.focus_segment_count,
+        ] {
+            let mut progress = valid_progress(&policy, CampaignPhase::AdjudicationActive);
+            sabotage(&mut progress);
+            assert!(parse_progress_of(&progress, &policy).unwrap_err().contains("impossible completion counts"));
+        }
+
+        // "Completed" with anything left over is the lie this whole module exists to prevent.
+        for sabotage in [
+            (|p: &mut CampaignProgress| p.independent_decision_count -= 1) as fn(&mut CampaignProgress),
+            |p| p.adjudication_count -= 1,
+            |p| p.conflicts_remaining = 1,
+        ] {
+            let mut progress = valid_progress(&policy, CampaignPhase::Completed);
+            sabotage(&mut progress);
+            assert!(parse_progress_of(&progress, &policy).unwrap_err().contains("not complete"));
+        }
+    }
+
     #[test]
     fn policy_validation_refuses_every_malformed_field() {
         fn expect_invalid(mutate: impl FnOnce(&mut SequentialReviewCampaign), needle: &str) {

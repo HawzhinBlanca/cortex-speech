@@ -8994,6 +8994,12 @@ def _validate_rust_coverage_phase(
         raise EvidenceError("Rust coverage prerequisite manifest has a non-canonical envelope")
     token = manifest.get("runToken")
     phase_dir = manifest_path.parent.resolve()
+    # Re-express the manifest on the SAME resolved basis as phase_dir. The inventory check below
+    # excludes the manifest by path identity, and `phase_dir` is resolved while the caller's
+    # `manifest_path` need not be — so wherever the evidence root sits behind a symlink (macOS puts
+    # every temp dir under /var -> /private/var) the two spellings differ, the manifest fails that
+    # `!=`, and it counts as an undeclared extra file. That rejected VALID coverage evidence.
+    resolved_manifest_path = phase_dir / manifest_path.name
     if (
         manifest_path.name != RUST_COVERAGE_MANIFEST_NAME
         or not isinstance(token, str)
@@ -9078,7 +9084,7 @@ def _validate_rust_coverage_phase(
     actual = {
         candidate.relative_to(phase_dir).as_posix()
         for candidate in phase_dir.rglob("*")
-        if candidate.is_file() and candidate != manifest_path
+        if candidate.is_file() and candidate != resolved_manifest_path
     }
     if actual != set(artifact_by_path):
         raise EvidenceError("Rust coverage prerequisite artifact inventory is not exact")
@@ -9662,6 +9668,161 @@ def verify_coverage_attestation_main() -> int:
         f"sha={measured_sha[:12]} expires={manifest['expiresAt']} artifact={str(artifact_sha)[:12]}"
     )
     return 0
+
+
+def _validate_failed_rust_coverage_pointer(
+    pointer_path: Path,
+    *,
+    expected_sha: str,
+    expected_token: str | None,
+) -> dict[str, object]:
+    try:
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise EvidenceError(f"failed Rust coverage pointer cannot be read: {error}") from error
+    if not isinstance(pointer, dict) or set(pointer) != {
+        "schema",
+        "type",
+        "state",
+        "runToken",
+        "fullGitSha",
+        "verdict",
+        "terminalEvent",
+        "exitCode",
+        "endedAt",
+        "childExitCode",
+        "timedOut",
+        "eventJournal",
+        "eventJournalSha256",
+        "artifactSha256",
+    }:
+        raise EvidenceError("failed Rust coverage pointer has a non-canonical envelope")
+    token = pointer.get("runToken")
+    exit_code = pointer.get("exitCode")
+    child_exit_code = pointer.get("childExitCode")
+    timed_out = pointer.get("timedOut")
+    event_digest = pointer.get("eventJournalSha256")
+    artifact_digest = pointer.get("artifactSha256")
+    if (
+        pointer.get("schema") != 1
+        or pointer.get("type") != "RustCoveragePrerequisitePointerV1"
+        or pointer.get("state") != "FAILED"
+        or pointer.get("fullGitSha") != expected_sha
+        or not isinstance(token, str)
+        or (expected_token is not None and token != expected_token)
+        or not isinstance(pointer.get("verdict"), str)
+        or pointer.get("verdict") == "PASS"
+        or pointer.get("terminalEvent") not in {"phase_end", "publication_failure"}
+        or type(exit_code) is not int
+        or exit_code == 0
+        or (child_exit_code is not None and type(child_exit_code) is not int)
+        or (timed_out is not None and not isinstance(timed_out, bool))
+        or not isinstance(pointer.get("endedAt"), str)
+        or not isinstance(event_digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", event_digest)
+        or (
+            artifact_digest is not None
+            and (not isinstance(artifact_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", artifact_digest))
+        )
+    ):
+        raise EvidenceError("failed Rust coverage pointer identity or terminal result is invalid")
+    _parse_utc(str(pointer["endedAt"]), "failed coverage phase end")
+
+    relative_journal = Path(str(pointer.get("eventJournal", "")))
+    if relative_journal.is_absolute():
+        raise EvidenceError("failed Rust coverage pointer event journal is not relative")
+    event_journal = (pointer_path.parent / relative_journal).resolve()
+    try:
+        event_journal.relative_to(RUST_COVERAGE_PHASE_ROOT.resolve())
+    except ValueError as error:
+        raise EvidenceError("failed Rust coverage pointer escapes its immutable root") from error
+    if (
+        event_journal.parent.name != token
+        or event_journal.name != "events.jsonl"
+        or not event_journal.is_file()
+        or sha256_file(event_journal) != event_digest
+    ):
+        raise EvidenceError("failed Rust coverage pointer event journal is missing or changed")
+    try:
+        events = [json.loads(line) for line in event_journal.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise EvidenceError(f"failed Rust coverage pointer journal cannot be read: {error}") from error
+    if not events:
+        raise EvidenceError("failed Rust coverage pointer journal is empty")
+    for sequence, event in enumerate(events, start=1):
+        if (
+            not isinstance(event, dict)
+            or event.get("schema") != 1
+            or event.get("sequence") != sequence
+            or event.get("runToken") != token
+        ):
+            raise EvidenceError("failed Rust coverage pointer journal identity/sequence is invalid")
+    terminal = events[-1]
+    if (
+        terminal.get("event") != pointer.get("terminalEvent")
+        or terminal.get("verdict") != pointer.get("verdict")
+        or terminal.get("exitCode") != exit_code
+        or terminal.get("at") != pointer.get("endedAt")
+        or terminal.get("childExitCode") != child_exit_code
+        or terminal.get("timedOut") != timed_out
+    ):
+        raise EvidenceError("failed Rust coverage pointer does not match its terminal journal event")
+
+    artifact_path = event_journal.parent / RUST_COVERAGE_ARTIFACT_NAME
+    if artifact_digest is None:
+        if artifact_path.is_file():
+            raise EvidenceError("failed Rust coverage pointer omits an existing LLVM artifact")
+    elif not artifact_path.is_file() or sha256_file(artifact_path) != artifact_digest:
+        raise EvidenceError("failed Rust coverage pointer LLVM artifact is missing or changed")
+    return pointer
+
+
+def _publish_failed_rust_coverage_pointer(
+    phase_dir: Path,
+    *,
+    run_token: str,
+    full_sha: str,
+    end_record: dict[str, object],
+) -> None:
+    if (
+        end_record.get("event") not in {"phase_end", "publication_failure"}
+        or end_record.get("runToken") != run_token
+        or not isinstance(end_record.get("exitCode"), int)
+        or end_record.get("exitCode") == 0
+        or not isinstance(end_record.get("verdict"), str)
+        or end_record.get("verdict") == "PASS"
+        or not isinstance(end_record.get("at"), str)
+    ):
+        raise EvidenceError("Rust coverage failure pointer requires one matching terminal event")
+    event_journal = phase_dir / "events.jsonl"
+    if not event_journal.is_file():
+        raise EvidenceError("Rust coverage failure pointer has no durable event journal")
+    artifact_path = phase_dir / RUST_COVERAGE_ARTIFACT_NAME
+    pointer = {
+        "schema": 1,
+        "type": "RustCoveragePrerequisitePointerV1",
+        "state": "FAILED",
+        "runToken": run_token,
+        "fullGitSha": full_sha,
+        "verdict": end_record["verdict"],
+        "terminalEvent": end_record["event"],
+        "exitCode": end_record["exitCode"],
+        "endedAt": end_record["at"],
+        "childExitCode": end_record.get("childExitCode"),
+        "timedOut": end_record.get("timedOut"),
+        "eventJournal": os.path.relpath(event_journal, RUST_COVERAGE_LATEST.parent),
+        "eventJournalSha256": sha256_file(event_journal),
+        "artifactSha256": sha256_file(artifact_path) if artifact_path.is_file() else None,
+    }
+    publish_validated_json(
+        RUST_COVERAGE_LATEST,
+        pointer,
+        lambda candidate: _validate_failed_rust_coverage_pointer(
+            candidate,
+            expected_sha=full_sha,
+            expected_token=run_token,
+        ),
+    )
 
 
 def rust_coverage_prerequisite_main() -> int:
@@ -11758,7 +11919,19 @@ def _revalidate_latest_release_executable(
         "activeReleasePointerSha256",
         "activeReleaseGitSha",
     )
-    if recorded is None or observed is None or any(
+    # Drift is a *difference* between what the proof recorded and what is deployed now, in either
+    # direction: an executable that vanished, one that appeared, or one whose identity/pointer
+    # authority changed.  A proof taken on a checkout with no built application records no
+    # application-executable role at all; re-observing that same absence is not drift, and treating
+    # it as drift made every such latest-proof permanently unvalidatable.  This cannot launder a
+    # missing binary into a claim: _validate_release_artifacts still rejects a certification-eligible
+    # proof whose release artifacts omit any required role, so an empty binding can only ever back a
+    # non-certifying (INCOMPLETE/FAILED) proof.
+    if (recorded is None) != (observed is None):
+        raise EvidenceError(
+            "latest-proof release executable or active immutable release pointer changed after measurement"
+        )
+    if recorded is not None and observed is not None and any(
         recorded.get(field) != observed.get(field) for field in live_fields
     ):
         raise EvidenceError(

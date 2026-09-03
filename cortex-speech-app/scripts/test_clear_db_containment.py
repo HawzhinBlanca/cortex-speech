@@ -219,8 +219,11 @@ class ClearDbContainmentTests(unittest.TestCase):
             _remove_minted_profile(profile)
 
     def test_initialization_cannot_bless_an_existing_database(self) -> None:
-        # resolve(): macOS temp lives under /var -> /private/var; the alias refusal would
-        # otherwise (correctly) fire before the brand-new-directory refusal under test.
+        # resolve(): the only raw mkdtemp in this file, and on macOS every temp dir is reached
+        # through /var -> /private/var. Handing that spelling to the tool trips its path-alias
+        # refusal FIRST, so the run never reaches the brand-new-directory guard this case exists to
+        # pin -- it passed for the wrong reason's sake elsewhere and failed here. The assertion
+        # below is unchanged and still requires that exact refusal.
         profile = Path(tempfile.mkdtemp(prefix="cortex-e2e-")).resolve()
         token = uuid.uuid4().hex + uuid.uuid4().hex
         conn: sqlite3.Connection | None = None

@@ -16,7 +16,6 @@ tree proves nothing.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import shutil
 import sqlite3
@@ -101,6 +100,10 @@ WINDOWS_RESERVED_NAMES = {
 }
 
 
+from policy_python import sha256_file
+sha256_of = sha256_file
+
+
 def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
     """Preserve old evidence shapes and bind every durable review authority through v65."""
 
@@ -151,14 +154,6 @@ class DatabaseInspection:
     hidden_key_triggers: tuple[tuple[str, str], ...]
     hidden_event_rows: tuple[tuple[Any, Any, Any, Any], ...]
     hidden_result_rows: tuple[tuple[Any, Any, Any], ...]
-
-
-def sha256_of(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

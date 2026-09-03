@@ -1571,7 +1571,7 @@ mod tests {
     }
 
     #[test]
-    fn sequential_campaign_serves_a_full_rubar_batch_without_synthetic_checks_and_fails_on_drift() {
+    fn sequential_campaign_serves_a_full_reviewer_batch_without_synthetic_checks_and_fails_on_drift() {
         let tmp = tempfile::tempdir().unwrap();
         let (db, db_path) = test_db(tmp.path());
         let ids: HashSet<String> = (0..(QUEUE_BATCH + 5)).map(|n| format!("campaign-{n:02}")).collect();
@@ -1879,7 +1879,7 @@ mod tests {
     }
 
     #[test]
-    fn alle_second_pass_is_backend_blind_separate_and_undoable() {
+    fn second_pass_is_backend_blind_separate_and_undoable() {
         let tmp = tempfile::tempdir().unwrap();
         let (db, db_path) = test_db(tmp.path());
         let id = "blind-second-pass";
