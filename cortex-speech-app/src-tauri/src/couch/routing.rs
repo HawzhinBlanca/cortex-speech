@@ -639,12 +639,26 @@ pub(super) fn handle_request(
             }),
             Err(e) => err_reply(400, &e),
         },
-        (tiny_http::Method::Post, "/api/decision") => match read_body(request) {
-            Ok(body) => with_live_reviewer(&token, reviewer, state, || {
-                api_decision_authenticated(db, &body, reviewer, &session_binding_sha256, state)
-            }),
-            Err(e) => err_reply(400, &e),
-        },
+        (tiny_http::Method::Post, "/api/decision") => {
+            // Per-decision observability, no identity: status and wall time only. Measured
+            // 2026-09-02, a reviewer's "corrections coming back" report could only be diagnosed by
+            // joining the ReadIoError log lines to review_events by timestamp; this line makes a slow
+            // or refused save visible on its own.
+            let started = std::time::Instant::now();
+            let reply = match read_body(request) {
+                Ok(body) => with_live_reviewer(&token, reviewer, state, || {
+                    api_decision_authenticated(db, &body, reviewer, &session_binding_sha256, state)
+                }),
+                Err(e) => err_reply(400, &e),
+            };
+            tracing::info!(
+                target: "cortex_speech_app_lib::couch::decision",
+                status = reply.0,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "decision request answered"
+            );
+            reply
+        }
         (tiny_http::Method::Post, "/api/renew") => match read_body(request) {
             Ok(body) => with_live_reviewer(&token, reviewer, state, || api_renew(&body, reviewer, state)),
             Err(e) => err_reply(400, &e),

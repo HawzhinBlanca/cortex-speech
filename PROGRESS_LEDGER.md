@@ -14103,3 +14103,44 @@ vitest and the build, restored), the `updater-signature-verifier` crate (referen
 `scripts/windows_release_bundle.py`), the three unreferenced binaries and `cortex-once-admin.ps1`
 (owner-run tooling with documented undo steps, not dead code). Left as owner decisions: the vendored
 tiny_http fork, the policy-runner rewrite, and the self-signed TLS hop behind the Funnel.
+## 2026-09-03 — A queued clip stays out of the phone batch; every decision request logs status and latency
+
+From the 2026-09-02 reviewer report ("the texts I corrected are coming back"): every save had been stored,
+the diagnosis needed a timestamp join between the app log's connection errors and `review_events`, and the
+page re-served the clip whose save had never been acknowledged with the draft restored, which read as a
+lost correction and invited a second submission.
+
+- `couch.html` `load()`: a clip whose decision is still in THIS reviewer's outbox (sent, never
+  acknowledged) is kept out of the batch until the flush lands or the server refuses it; the "still
+  sending" line already counts it; the filter is scoped to the reviewer the queue response names, so a
+  colleague's queued clip on a shared phone is still served. jsdom proof
+  `tests/couch_page_outbox_hides_queued_clip.test.ts` (3 cases: hidden, nothing queued, other reviewer);
+  bite: with the filter reverted the first case fails.
+- `couch/routing.rs`: the `/api/decision` dispatch logs `status` and `elapsed_ms` under target
+  `cortex_speech_app_lib::couch::decision`, no identity, so a slow or refused save is visible on its own.
+- Pinned by `test_couch_decision_observability_policy.py`. Existing couch page jsdom tests 8/8, couch
+  Rust module 130/0, clippy clean, i18n / hygiene / storage / all-policies-execute green.
+- Not deployed: the live app still serves release a6de3c17e7ee; this reaches reviewers only through a
+  separately authorized, hash-bound deployment.
+
+## 2026-09-03 — Coverage re-measured on the current tree (no attestation, no threshold change)
+
+Measured on `6a2da82b` (main e0f07061 plus the three stacked test/observability commits) with the
+repository's own commands; the library suite under instrumentation passed 2562/0/8 both times.
+
+| metric | wave 5 (2026-09-01) | 2026-09-03 | locked |
+|---|---|---|---|
+| regions | 86.20 % | **87.43 %** | 85 |
+| lines | 86.07 % | **87.09 %** | 85 |
+| functions | 76.01 % | **77.76 %** (2537 of 11407 uncovered; ~256 more for 80) | 80 |
+| branches | 66.76 % | **69.12 %** (4309 of 13955 uncovered; ~1518 more for 80) | 80 |
+
+Commands: `cargo llvm-cov --lib --summary-only` (23:31–23:56Z) and
+`cargo +nightly-2026-07-11 llvm-cov --lib --summary-only --branch` (23:56–00:21Z). No attestation was
+published; the coverage prerequisite stays red by design until both remaining metrics meet the locked
+contract. Measured next wave for functions: the six files with the most uncovered functions hold 455
+of them (`snapshot.rs` 87, `commands/ingest.rs` 84, `commands/system_ops.rs` 83, `review_campaign.rs`
+71, `review_pool.rs` 66, `commands/segments_write.rs` 64); the two command layers are uncovered
+because their bodies take a Tauri `AppHandle`/`State`, so the AppHandle-testability debt and the
+functions campaign are the same work — extract each body into an `_on(&store, …)` inner function, the
+pattern `mark_segment_unusable_v1_on` already follows, and test the inner function.
