@@ -12961,6 +12961,20 @@ Both cases render the whole desktop dashboard through jsdom; they now carry a pe
 (`DESKTOP_RENDER_BUDGET_MS`), not a global raise: only these renders are that heavy, and a stuck test must
 still fail. Bite-proof: with the budget set to 1 ms both cases fail with "Test timed out in 1ms"; restored.
 
+## 2026-09-03 — Undo and redo run through a mock app; the history round trip is pinned on the persisted row
+
+Third harness PR of the coverage wave. `undo` and `redo` in `commands/system_ops.rs` only touch their
+`tauri::AppHandle` for the session auto-save, yet the desktop-runtime handle kept every test away from
+them. They are now generic twins (`undo_on`, `redo_on`) behind their unchanged `#[tauri::command]`
+wrappers (IPC contract untouched; the restore-reservation pin's mutation-before-lock window and the
+main-thread policy's async slice both still cover the real bodies, verified). One harness test drives
+the real mutation through `tauri::test::mock_app` with a managed `AppState`: an empty history undoes to
+a typed no-op; an edit recorded through the store's own `persist_segment_update` path is undone
+(the previous row is restored, the action moves to the redo stack) and redone (re-applied); an
+exhausted redo is a no-op that leaves the undo stack untouched; `get_history_status_v1` agrees at each
+step. Mutation bite-proof: routing the undo twin through the redo stack reds the test. Coverage stays
+a standing campaign: no re-measurement, no attestation.
+
 ## 2026-09-03 — Direct technical marks in tests retry AUDIO_PROBE_BUSY the way a client does
 
 The technical-audio probe registry caps ACTIVE flights process-wide (`TECHNICAL_PROBE_MAX_CONCURRENCY` = 2)
