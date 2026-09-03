@@ -14088,3 +14088,16 @@ framework, and a different CI coverage architecture (workstation-published attes
 **Measured:** cargo test --lib: 2604 passed, 0 failed, 8 ignored. Python gates on every touched script green
 individually; full policy suite: 144/144 policy test scripts passed (run_python_policies.py, full). `test_deidentified_tree.py` was run on the landing
 branch and fails as expected (1,050 hits) — that is the exposure the regeneration step removes.
+
+## 2026-09-03 — Ponytail audit applied: ten identical sha256 helpers now reuse policy_python.sha256_file
+
+Whole-tree over-engineering audit (`/ponytail-audit`), applied cuts only where nothing was referenced or
+the code was byte-identical. Ten scripts carried the same chunked `sha256_file`/`sha256_of` body that
+`policy_python.sha256_file` already is (zero importers before); they now import it (four drop their
+now-unused `hashlib`). 78 lines out, 28 in; py_compile clean; the twenty policy tests that exercise
+those scripts green. Withdrawn from the audit after measurement: the `@tauri-apps/plugin-dialog`
+dependency (used through dynamic imports in `src/lib/adapters/desktop.ts`; removing it broke typecheck,
+vitest and the build, restored), the `updater-signature-verifier` crate (referenced by
+`scripts/windows_release_bundle.py`), the three unreferenced binaries and `cortex-once-admin.ps1`
+(owner-run tooling with documented undo steps, not dead code). Left as owner decisions: the vendored
+tiny_http fork, the policy-runner rewrite, and the self-signed TLS hop behind the Funnel.
