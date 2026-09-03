@@ -409,7 +409,7 @@ def test_owner_runtime_writers_enter_exact_mutation_before_waiting_for_sqlite() 
     ):
         assert_boundary(rel, signature, span)
 
-    ingest = _fn_body(_read("commands/ingest.rs"), "fn emit_agent_stage_event(", span=3400)
+    ingest = _fn_body(_read("commands/ingest.rs"), "fn emit_agent_stage_event<R: tauri::Runtime>(", span=3400)
     for required in ("app_state.db_runtime()", "database.begin_mutation()", "database.lock_after_mutation(&mutation)"):
         if required not in ingest:
             raise AssertionError(f"agent-stage persistence bypasses exact restore admission: {required}")

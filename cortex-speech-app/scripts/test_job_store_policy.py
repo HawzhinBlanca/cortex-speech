@@ -64,7 +64,9 @@ def test_commands_delegate_without_raw_database_authority() -> None:
     signatures = {
         "get_interrupted_import": "pub fn get_interrupted_import(",
         "discard_interrupted_import": "pub fn discard_interrupted_import(",
-        "resume_interrupted_import": "pub fn resume_interrupted_import(",
+        # The command wrapper delegates to the runtime-generic twin (mock-app testability); the body
+        # that touches the journal is the twin.
+        "resume_interrupted_import": "pub(super) fn resume_interrupted_import_on<R: tauri::Runtime>(",
         "get_jobs": "pub async fn get_jobs(",
     }
     for name, signature in signatures.items():
