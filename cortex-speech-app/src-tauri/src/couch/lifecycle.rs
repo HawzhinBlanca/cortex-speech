@@ -722,7 +722,7 @@ where
     // Refusing it stops phone review dead with only a PAY_POLICY_REQUIRED string to explain why.
     let configured_pool = crate::review_pool::load(&preflight_db)
         .map_err(|error| format!("flexible review pool cannot start: {error}"))?;
-    // The flexible pool explicitly supersedes the old Rubar→Alle serving policy. Its historical
+    // The flexible pool explicitly supersedes the old Rezan→Aram serving policy. Its historical
     // setting and any evidence remain in SQLite (and continue blocking generic export), but they no
     // longer constrain the live roster or queue once an immutable pool is active.
     let configured_campaign = if configured_pool.is_some() {

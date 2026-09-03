@@ -1699,7 +1699,7 @@ mod tests {
         db.initialize().unwrap();
         seed_champion(&db);
         rollback_fixture_to(&db, 59);
-        db.insert_segment_full(&reviewed_segment("clip", &audio, "Rubar", first_text)).unwrap();
+        db.insert_segment_full(&reviewed_segment("clip", &audio, "Rezan", first_text)).unwrap();
         upgrade_fixture_from(&db, 59);
         db.connection()
             .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='clip'", ["a".repeat(64)])
@@ -1723,7 +1723,7 @@ mod tests {
             let audio = dir.path().join(format!("{id}.wav"));
             std::fs::write(&audio, b"wav").unwrap();
             let row = if reviewed_segment_id == Some(id) {
-                reviewed_segment(id, &audio, "Rubar", "دەقی دروست")
+                reviewed_segment(id, &audio, "Rezan", "دەقی دروست")
             } else {
                 segment(id, &audio, None)
             };
@@ -1900,7 +1900,7 @@ mod tests {
         assert!(canonical_pool.contains("a"));
         assert!(!canonical_pool.contains("b"));
         assert!(registry_matches(&db, &canonical_pool).unwrap());
-        assert_eq!(pending_segment_ids(&db, &canonical_pool, "Alle", None).unwrap(), vec!["a"]);
+        assert_eq!(pending_segment_ids(&db, &canonical_pool, "Aram", None).unwrap(), vec!["a"]);
         assert!(db
             .connection()
             .execute("UPDATE review_pool_dedup_manifests SET created_at_ms=created_at_ms+1", [])
@@ -1914,7 +1914,7 @@ mod tests {
             &canonical_pool,
             &PoolDecisionInput {
                 segment_id: "b",
-                reviewer: "Alle",
+                reviewer: "Aram",
                 action: "accept",
                 submitted_transcript: None,
                 served_transcript: "دەقی چامپیۆن",
@@ -2043,7 +2043,7 @@ mod tests {
     fn last_mile_audio_check_refuses_a_file_removed_after_pool_startup() {
         let (directory, db, pool) = one_clip_pool("دەقی دروست");
         let audio = directory.path().join("clip.wav");
-        assert_eq!(pending_segment_ids(&db, &pool, "Alle", None).unwrap(), vec!["clip"]);
+        assert_eq!(pending_segment_ids(&db, &pool, "Aram", None).unwrap(), vec!["clip"]);
 
         std::fs::remove_file(&audio).unwrap();
 
@@ -2054,7 +2054,7 @@ mod tests {
     #[test]
     fn only_a_clip_two_different_reviewers_decided_may_be_exported() {
         // OWNER CANON 2026-08-29: "a sentence is decided by any two DIFFERENT reviewers."
-        // `one_clip_pool` leaves the clip holding exactly ONE opinion (canonical, by Rubar), which
+        // `one_clip_pool` leaves the clip holding exactly ONE opinion (canonical, by Rezan), which
         // is the state 416 live clips were in on the day this was written while the pool reported
         // resolved=0 -- and the fine-tune export happily emitted 410 of them. One opinion is not a
         // decision, and must not ship.
@@ -2077,7 +2077,7 @@ mod tests {
         }
 
         // A SECOND, DIFFERENT reviewer agreeing is what makes it a decision.
-        decide(&db, &pool, "Alle", "دەقی چامپیۆن", "60000000-0000-4000-8000-0000000000a1", 2_000);
+        decide(&db, &pool, "Aram", "دەقی چامپیۆن", "60000000-0000-4000-8000-0000000000a1", 2_000);
 
         let resolved = consensus_resolved_segment_ids(&db).unwrap();
         assert!(resolved.contains("clip"), "two different reviewers agreeing decides the sentence: {resolved:?}");
@@ -2097,7 +2097,7 @@ mod tests {
         db.initialize().unwrap();
         seed_champion(&db);
         rollback_fixture_to(&db, 59);
-        db.insert_segment_full(&segment("first", &first_audio, Some("Rubar"))).unwrap();
+        db.insert_segment_full(&segment("first", &first_audio, Some("Rezan"))).unwrap();
         db.insert_segment_full(&segment("second", &second_audio, None)).unwrap();
         upgrade_fixture_from(&db, 59);
         db.connection()
@@ -2129,13 +2129,13 @@ mod tests {
             "unexpected guard: {identity_error}"
         );
 
-        assert_eq!(pending_segment_ids(&db, &pool, "Rubar", None).unwrap(), vec!["second"]);
+        assert_eq!(pending_segment_ids(&db, &pool, "Rezan", None).unwrap(), vec!["second"]);
         // OWNER CANON 2026-08-29: a sentence is decided by any two DIFFERENT reviewers, so the
         // queue serves whatever is NEAREST a decision. "first" already holds one opinion and one
         // more judgement can retire it; "second" is untouched and needs two. This assertion was
         // the reverse until the canon landed -- breadth-first maximised clips TOUCHED while
         // leaving 416 clips holding one review and zero decided.
-        assert_eq!(pending_segment_ids(&db, &pool, "Alle", None).unwrap(), vec!["first", "second"]);
+        assert_eq!(pending_segment_ids(&db, &pool, "Aram", None).unwrap(), vec!["first", "second"]);
 
         let (_, revision) = db.get_segment_by_id_with_revision("first").unwrap().unwrap();
         let operation_payload_hash = "a".repeat(64);
@@ -2144,7 +2144,7 @@ mod tests {
             &pool,
             &PoolDecisionInput {
                 segment_id: "first",
-                reviewer: "Alle",
+                reviewer: "Aram",
                 action: "edit",
                 submitted_transcript: Some("دەقی دووەم"),
                 served_transcript: "دەقی چامپیۆن",
@@ -2164,15 +2164,15 @@ mod tests {
         .unwrap();
         let lamo = coverage_by_voice(&db).unwrap().into_iter().find(|row| row.voice_name == "Lamo").unwrap();
         assert_eq!(lamo.two_reviews, 1);
-        assert!(!pending_segment_ids(&db, &pool, "Alle", None).unwrap().contains(&"first".to_string()));
+        assert!(!pending_segment_ids(&db, &pool, "Aram", None).unwrap().contains(&"first".to_string()));
         let canonical = db.get_segment_by_id("first").unwrap().unwrap();
-        assert_eq!(canonical.reviewed_by.as_deref(), Some("Rubar"));
+        assert_eq!(canonical.reviewed_by.as_deref(), Some("Rezan"));
         assert_eq!(canonical.annotated_transcript.as_deref(), Some("دەقی دروست"));
 
-        reverse_decision(&db, &pool, inserted, "Alle", "123e4567-e89b-42d3-a456-426614174001", 2).unwrap();
+        reverse_decision(&db, &pool, inserted, "Aram", "123e4567-e89b-42d3-a456-426614174001", 2).unwrap();
         let lamo = coverage_by_voice(&db).unwrap().into_iter().find(|row| row.voice_name == "Lamo").unwrap();
         assert_eq!(lamo.one_review, 1);
-        assert!(pending_segment_ids(&db, &pool, "Alle", None).unwrap().contains(&"first".to_string()));
+        assert!(pending_segment_ids(&db, &pool, "Aram", None).unwrap().contains(&"first".to_string()));
 
         let next_champion = "omniasr-7b-next-champion";
         crate::registry::register_candidate(
@@ -2208,7 +2208,7 @@ mod tests {
                 "UPDATE speech_segments
                     SET verified=1, human_decision='edit', verdict='human_edit',
                         verdict_transcript='دەقی دروست', annotated_transcript='دەقی دروست',
-                        reviewed_by='Rubar', review_revision=review_revision+1
+                        reviewed_by='Rezan', review_revision=review_revision+1
                   WHERE id IN ('a','b')",
                 [],
             )
@@ -2221,7 +2221,7 @@ mod tests {
                 &pool,
                 &PoolDecisionInput {
                     segment_id,
-                    reviewer: "Alle",
+                    reviewer: "Aram",
                     action: "edit",
                     submitted_transcript: Some("دەقی ئەلە"),
                     served_transcript: "دەقی چامپیۆن",
@@ -2247,13 +2247,13 @@ mod tests {
         let reversal_operation = "123e4567-e89b-42d3-a456-426614174062";
 
         assert_eq!(
-            reverse_decision_addressed(&db, &pool, latest, "Alle", latest_operation, reversal_operation, 30,)
+            reverse_decision_addressed(&db, &pool, latest, "Aram", latest_operation, reversal_operation, 30,)
                 .unwrap()
                 .as_deref(),
             Some("b")
         );
         assert_eq!(
-            latest_decision(&db, &pool.pool_id, "Alle").unwrap().map(|value| value.0),
+            latest_decision(&db, &pool.pool_id, "Aram").unwrap().map(|value| value.0),
             Some(older),
             "the legacy effective fallback now points at the older decision that must not be touched"
         );
@@ -2261,7 +2261,7 @@ mod tests {
         // Model commit -> lost HTTP response -> app restart -> retry. No in-memory token exists; the
         // exact request coordinates alone must replay the same durable reversal.
         assert_eq!(
-            reverse_decision_addressed(&db, &pool, latest, "alle", latest_operation, reversal_operation, 40,)
+            reverse_decision_addressed(&db, &pool, latest, "aram", latest_operation, reversal_operation, 40,)
                 .unwrap()
                 .as_deref(),
             Some("b")
@@ -2286,7 +2286,7 @@ mod tests {
             &db,
             &pool,
             older,
-            "Alle",
+            "Aram",
             older_operation,
             "123e4567-e89b-42d3-a456-426614174063",
             50,
@@ -2298,13 +2298,13 @@ mod tests {
     #[test]
     fn two_exact_outcomes_resolve_and_stop_further_serving() {
         let (_dir, db, pool) = one_clip_pool("دەقی یەکسان");
-        decide(&db, &pool, "Alle", "دەقی یەکسان", "123e4567-e89b-42d3-a456-426614174051", 1);
+        decide(&db, &pool, "Aram", "دەقی یەکسان", "123e4567-e89b-42d3-a456-426614174051", 1);
         let row = segment_resolutions(&db, Some("Lamo")).unwrap().pop().unwrap();
         assert_eq!(row.status, "resolved");
         assert_eq!(row.final_action.as_deref(), Some("retain"));
         assert_eq!(row.final_transcript.as_deref(), Some("دەقی یەکسان"));
         assert_eq!(row.reviewer_count, 2);
-        assert!(pending_segment_ids(&db, &pool, "Sewa", None).unwrap().is_empty());
+        assert!(pending_segment_ids(&db, &pool, "Sirwan", None).unwrap().is_empty());
     }
 
     #[test]
@@ -2313,7 +2313,7 @@ mod tests {
         for first in actions {
             for second in actions {
                 let mut all = HashMap::new();
-                for (reviewer, action, evidence_id) in [("Rubar", first, "pair:first"), ("Alle", second, "pair:second")]
+                for (reviewer, action, evidence_id) in [("Rezan", first, "pair:first"), ("Aram", second, "pair:second")]
                 {
                     let transcript = matches!(action, "accept" | "edit").then(|| "دەقی یەکسان".to_string());
                     insert_judgement(
@@ -2360,7 +2360,7 @@ mod tests {
         insert_judgement(
             &mut all,
             "clip".to_string(),
-            " Rubar ".to_string(),
+            " Rezan ".to_string(),
             "first".to_string(),
             "accept".to_string(),
             Some("دەق".to_string()),
@@ -2369,7 +2369,7 @@ mod tests {
         let error = insert_judgement(
             &mut all,
             "clip".to_string(),
-            "RUBAR".to_string(),
+            "REZAN".to_string(),
             "second".to_string(),
             "edit".to_string(),
             Some("دەق".to_string()),
@@ -2381,25 +2381,25 @@ mod tests {
     #[test]
     fn disagreement_gets_one_blinded_third_review_then_resolves_by_matching_pair() {
         let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
-        decide(&db, &pool, "Alle", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174052", 1);
+        decide(&db, &pool, "Aram", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174052", 1);
         let row = segment_resolutions(&db, None).unwrap().pop().unwrap();
         assert_eq!(row.status, "needsThirdReview");
-        assert_eq!(pending_segment_ids(&db, &pool, "Sewa", None).unwrap(), vec!["clip"]);
-        decide(&db, &pool, "Sewa", "دەقی یەکەم", "123e4567-e89b-42d3-a456-426614174053", 2);
+        assert_eq!(pending_segment_ids(&db, &pool, "Sirwan", None).unwrap(), vec!["clip"]);
+        decide(&db, &pool, "Sirwan", "دەقی یەکەم", "123e4567-e89b-42d3-a456-426614174053", 2);
         let row = segment_resolutions(&db, None).unwrap().pop().unwrap();
         assert_eq!(row.status, "resolved");
         assert_eq!(row.final_transcript.as_deref(), Some("دەقی یەکەم"));
-        assert_eq!(row.agreeing_reviewers, vec!["Rubar", "Sewa"]);
-        assert!(pending_segment_ids(&db, &pool, "Roza", None).unwrap().is_empty());
+        assert_eq!(row.agreeing_reviewers, vec!["Rezan", "Sirwan"]);
+        assert!(pending_segment_ids(&db, &pool, "Nasrin", None).unwrap().is_empty());
     }
 
     #[test]
     fn three_distinct_outcomes_require_owner_and_owner_ruling_is_evidence_bound() {
         let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
-        decide(&db, &pool, "Alle", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174054", 1);
-        let third_id = decide(&db, &pool, "Sewa", "دەقی سێیەم", "123e4567-e89b-42d3-a456-426614174055", 2);
+        decide(&db, &pool, "Aram", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174054", 1);
+        let third_id = decide(&db, &pool, "Sirwan", "دەقی سێیەم", "123e4567-e89b-42d3-a456-426614174055", 2);
         assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "ownerConflict");
-        assert!(pending_segment_ids(&db, &pool, "Roza", None).unwrap().is_empty());
+        assert!(pending_segment_ids(&db, &pool, "Nasrin", None).unwrap().is_empty());
         record_owner_adjudication(
             &db,
             &pool,
@@ -2413,20 +2413,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "ownerResolved");
-        reverse_decision(&db, &pool, third_id, "Sewa", "123e4567-e89b-42d3-a456-426614174057", 4).unwrap();
+        reverse_decision(&db, &pool, third_id, "Sirwan", "123e4567-e89b-42d3-a456-426614174057", 4).unwrap();
         let reopened = &segment_resolutions(&db, None).unwrap()[0];
         assert_eq!(reopened.status, "needsThirdReview");
-        assert_eq!(pending_segment_ids(&db, &pool, "Sewa", None).unwrap(), vec!["clip"]);
+        assert_eq!(pending_segment_ids(&db, &pool, "Sirwan", None).unwrap(), vec!["clip"]);
     }
 
     #[test]
     fn consensus_is_nfc_and_outer_trim_exact_but_keeps_punctuation_distinct() {
         let (_dir, db, pool) = one_clip_pool("é");
-        decide(&db, &pool, "Alle", "  e\u{301}  ", "123e4567-e89b-42d3-a456-426614174058", 1);
+        decide(&db, &pool, "Aram", "  e\u{301}  ", "123e4567-e89b-42d3-a456-426614174058", 1);
         assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "resolved");
 
         let (_dir, db, pool) = one_clip_pool("دەق");
-        decide(&db, &pool, "Alle", "دەق.", "123e4567-e89b-42d3-a456-426614174059", 1);
+        decide(&db, &pool, "Aram", "دەق.", "123e4567-e89b-42d3-a456-426614174059", 1);
         assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "needsThirdReview");
     }
 
@@ -2535,7 +2535,7 @@ mod tests {
     fn identity_normalization_and_outcome_parsing_are_exact() {
         assert_eq!(reviewer_key(None), DESKTOP_REVIEWER_KEY);
         assert_eq!(reviewer_key(Some("   ")), DESKTOP_REVIEWER_KEY);
-        assert_eq!(reviewer_key(Some(" RuBar ")), "rubar");
+        assert_eq!(reviewer_key(Some(" rEzAn ")), "rezan");
 
         assert!(valid_lower_sha256(&"a".repeat(64)));
         assert!(!valid_lower_sha256(&"A".repeat(64)));
@@ -2741,7 +2741,7 @@ mod tests {
         let mut drifted = pool.clone();
         drifted.champion_model_version_id = "omniasr-7b-other".to_string();
         assert_eq!(
-            pending_segment_ids(&db, &drifted, "Alle", None).unwrap_err(),
+            pending_segment_ids(&db, &drifted, "Aram", None).unwrap_err(),
             "review pool registry or OmniASR-7B champion identity changed after Start"
         );
     }
@@ -2757,16 +2757,16 @@ mod tests {
     #[test]
     fn queue_fails_closed_for_restricted_reviewers_and_unplayable_audio() {
         let (dir, db, pool) = one_clip_pool("دەقی دروست");
-        assert_eq!(pending_segment_ids(&db, &pool, "Alle", None).unwrap(), vec!["clip"]);
+        assert_eq!(pending_segment_ids(&db, &pool, "Aram", None).unwrap(), vec!["clip"]);
         // The temp-dir source is UNMAPPED, and an unmapped source plus a restricted reviewer must
         // serve NOTHING (fail closed), never guess a dialect.
-        assert!(pending_segment_ids(&db, &pool, "Roza", Some(&["hawleri".to_string()])).unwrap().is_empty());
-        assert!(pending_segment_ids(&db, &pool, "Roza", Some(&[])).unwrap().is_empty());
+        assert!(pending_segment_ids(&db, &pool, "Nasrin", Some(&["hawleri".to_string()])).unwrap().is_empty());
+        assert!(pending_segment_ids(&db, &pool, "Nasrin", Some(&[])).unwrap().is_empty());
 
         std::fs::remove_file(dir.path().join("clip.wav")).unwrap();
         let reloaded = load(&db).unwrap().unwrap();
         assert!(
-            pending_segment_ids(&db, &reloaded, "Alle", None).unwrap().is_empty(),
+            pending_segment_ids(&db, &reloaded, "Aram", None).unwrap().is_empty(),
             "a clip whose audio vanished before Start must never be served"
         );
     }
@@ -2779,7 +2779,7 @@ mod tests {
         let payload = "b".repeat(64);
         let base = PoolDecisionInput {
             segment_id: "clip",
-            reviewer: "Alle",
+            reviewer: "Aram",
             action: "edit",
             submitted_transcript: Some("دەقی دوو"),
             served_transcript: "دەقی چامپیۆن",
@@ -2849,28 +2849,28 @@ mod tests {
 
         // The canonical first reviewer already judged this clip under any spelling of their name.
         let mut input = base.clone();
-        input.reviewer = "  rubar  ";
+        input.reviewer = "  rezan  ";
         let error = record_decision(&db, &pool, &input).unwrap_err();
         assert!(error.contains("review pool decision is duplicated for this reviewer"), "unexpected refusal: {error}");
 
-        decide(&db, &pool, "Alle", "دەقی دوو", "123e4567-e89b-42d3-a456-426614174921", 10);
+        decide(&db, &pool, "Aram", "دەقی دوو", "123e4567-e89b-42d3-a456-426614174921", 10);
         let mut input = base.clone();
         input.operation_id = "123e4567-e89b-42d3-a456-426614174922";
         let error = record_decision(&db, &pool, &input).unwrap_err();
         assert!(error.contains("review pool decision is duplicated for this reviewer"), "unexpected refusal: {error}");
 
-        decide(&db, &pool, "Sewa", "دەقی سێ", "123e4567-e89b-42d3-a456-426614174923", 11);
+        decide(&db, &pool, "Sirwan", "دەقی سێ", "123e4567-e89b-42d3-a456-426614174923", 11);
         let mut input = base.clone();
-        input.reviewer = "Roza";
+        input.reviewer = "Nasrin";
         input.operation_id = "123e4567-e89b-42d3-a456-426614174924";
         let error = record_decision(&db, &pool, &input).unwrap_err();
         assert!(error.contains("review pool clip requires owner adjudication"), "unexpected refusal: {error}");
 
         let (_dir, db, pool) = one_clip_pool("دەقی یەک");
-        decide(&db, &pool, "Alle", "دەقی یەک", "123e4567-e89b-42d3-a456-426614174925", 12);
+        decide(&db, &pool, "Aram", "دەقی یەک", "123e4567-e89b-42d3-a456-426614174925", 12);
         let (_, revision) = db.get_segment_by_id_with_revision("clip").unwrap().unwrap();
         let mut input = base.clone();
-        input.reviewer = "Sewa";
+        input.reviewer = "Sirwan";
         input.served_revision = revision;
         input.operation_id = "123e4567-e89b-42d3-a456-426614174926";
         let error = record_decision(&db, &pool, &input).unwrap_err();
@@ -2928,8 +2928,8 @@ mod tests {
             "owner adjudication is allowed only after three distinct outcomes"
         );
 
-        decide(&db, &pool, "Alle", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174931", 1);
-        decide(&db, &pool, "Sewa", "دەقی سێیەم", "123e4567-e89b-42d3-a456-426614174932", 2);
+        decide(&db, &pool, "Aram", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174931", 1);
+        decide(&db, &pool, "Sirwan", "دەقی سێیەم", "123e4567-e89b-42d3-a456-426614174932", 2);
         let id = adjudicate("clip", "retain", Some("دەقی یەکەم"), retain_op, 3).unwrap();
         assert_eq!(
             adjudicate("clip", "retain", Some("  دەقی یەکەم  "), retain_op, 4).unwrap(),
@@ -2985,24 +2985,24 @@ mod tests {
     #[test]
     fn reversal_identity_is_durable_and_reviewer_bound() {
         let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
-        let inserted = decide(&db, &pool, "Alle", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174950", 1);
+        let inserted = decide(&db, &pool, "Aram", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174950", 1);
         assert_eq!(
-            reverse_decision(&db, &pool, inserted, "Alle", "nope", 2).unwrap_err(),
+            reverse_decision(&db, &pool, inserted, "Aram", "nope", 2).unwrap_err(),
             "review pool reversal operation id must be a canonical UUID"
         );
         let reversal_op = "123e4567-e89b-42d3-a456-426614174951";
         assert_eq!(
-            reverse_decision(&db, &pool, inserted, "Sewa", reversal_op, 2).unwrap_err(),
+            reverse_decision(&db, &pool, inserted, "Sirwan", reversal_op, 2).unwrap_err(),
             "review pool reversal target is missing or belongs to another reviewer"
         );
         assert_eq!(
-            reverse_decision(&db, &pool, inserted + 99, "Alle", reversal_op, 2).unwrap_err(),
+            reverse_decision(&db, &pool, inserted + 99, "Aram", reversal_op, 2).unwrap_err(),
             "review pool reversal target is missing or belongs to another reviewer"
         );
-        reverse_decision(&db, &pool, inserted, "Alle", reversal_op, 2).unwrap();
-        reverse_decision(&db, &pool, inserted, "ALLE", reversal_op, 3).unwrap();
+        reverse_decision(&db, &pool, inserted, "Aram", reversal_op, 2).unwrap();
+        reverse_decision(&db, &pool, inserted, "ARAM", reversal_op, 3).unwrap();
         assert_eq!(
-            reverse_decision(&db, &pool, inserted, "Alle", "123e4567-e89b-42d3-a456-426614174952", 4).unwrap_err(),
+            reverse_decision(&db, &pool, inserted, "Aram", "123e4567-e89b-42d3-a456-426614174952", 4).unwrap_err(),
             "review pool decision already has another reversal identity"
         );
         let reversals: i64 =
@@ -3014,23 +3014,23 @@ mod tests {
     fn addressed_reversal_refuses_mismatched_coordinates_without_erring() {
         let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
         let decision_op = "123e4567-e89b-42d3-a456-426614174960";
-        let inserted = decide(&db, &pool, "Alle", "دەقی دووەم", decision_op, 1);
+        let inserted = decide(&db, &pool, "Aram", "دەقی دووەم", decision_op, 1);
         let reversal_op = "123e4567-e89b-42d3-a456-426614174961";
-        assert!(reverse_decision_addressed(&db, &pool, 0, "Alle", decision_op, reversal_op, 2).unwrap().is_none());
-        assert!(reverse_decision_addressed(&db, &pool, inserted, "Alle", decision_op, reversal_op, 0)
+        assert!(reverse_decision_addressed(&db, &pool, 0, "Aram", decision_op, reversal_op, 2).unwrap().is_none());
+        assert!(reverse_decision_addressed(&db, &pool, inserted, "Aram", decision_op, reversal_op, 0)
             .unwrap()
             .is_none());
-        assert!(reverse_decision_addressed(&db, &pool, inserted, "Alle", decision_op, decision_op, 2)
+        assert!(reverse_decision_addressed(&db, &pool, inserted, "Aram", decision_op, decision_op, 2)
             .unwrap()
             .is_none());
-        assert!(reverse_decision_addressed(&db, &pool, inserted, "Sewa", decision_op, reversal_op, 2)
+        assert!(reverse_decision_addressed(&db, &pool, inserted, "Sirwan", decision_op, reversal_op, 2)
             .unwrap()
             .is_none());
         assert!(reverse_decision_addressed(
             &db,
             &pool,
             inserted,
-            "Alle",
+            "Aram",
             "123e4567-e89b-42d3-a456-426614174962",
             reversal_op,
             2,
@@ -3038,15 +3038,15 @@ mod tests {
         .unwrap()
         .is_none());
         assert_eq!(
-            reverse_decision_addressed(&db, &pool, inserted, "Alle", "bad", reversal_op, 2).unwrap_err(),
+            reverse_decision_addressed(&db, &pool, inserted, "Aram", "bad", reversal_op, 2).unwrap_err(),
             "review pool decision operation id must be a canonical UUID"
         );
         assert_eq!(
-            reverse_decision_addressed(&db, &pool, inserted, "Alle", decision_op, "bad", 2).unwrap_err(),
+            reverse_decision_addressed(&db, &pool, inserted, "Aram", decision_op, "bad", 2).unwrap_err(),
             "review pool reversal operation id must be a canonical UUID"
         );
         assert_eq!(
-            reverse_decision_addressed(&db, &pool, inserted, "Alle", decision_op, reversal_op, 2).unwrap().as_deref(),
+            reverse_decision_addressed(&db, &pool, inserted, "Aram", decision_op, reversal_op, 2).unwrap().as_deref(),
             Some("clip")
         );
         // A retry that names a DIFFERENT reversal identity for the same decision is a conflict.
@@ -3054,7 +3054,7 @@ mod tests {
             &db,
             &pool,
             inserted,
-            "Alle",
+            "Aram",
             decision_op,
             "123e4567-e89b-42d3-a456-426614174963",
             3,
@@ -3068,11 +3068,11 @@ mod tests {
         let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
         let operation_id = "123e4567-e89b-42d3-a456-426614174970";
         assert!(operation(&db, operation_id).unwrap().is_none());
-        assert!(reviewer_already_saw(&db, "clip", "Rubar").unwrap(), "the canonical first review counts as seen");
-        assert!(reviewer_already_saw(&db, "clip", "  RUBAR  ").unwrap());
-        assert!(!reviewer_already_saw(&db, "clip", "Alle").unwrap());
+        assert!(reviewer_already_saw(&db, "clip", "Rezan").unwrap(), "the canonical first review counts as seen");
+        assert!(reviewer_already_saw(&db, "clip", "  REZAN  ").unwrap());
+        assert!(!reviewer_already_saw(&db, "clip", "Aram").unwrap());
 
-        let inserted = decide(&db, &pool, "Alle", "دەقی دووەم", operation_id, 5);
+        let inserted = decide(&db, &pool, "Aram", "دەقی دووەم", operation_id, 5);
         let receipt = operation(&db, operation_id).unwrap().unwrap();
         assert_eq!(
             receipt,
@@ -3080,13 +3080,13 @@ mod tests {
                 decision_id: inserted,
                 pool_id: pool.pool_id.clone(),
                 segment_id: "clip".to_string(),
-                reviewer: "Alle".to_string(),
+                reviewer: "Aram".to_string(),
                 operation_payload_hash: "b".repeat(64),
             }
         );
-        assert!(reviewer_already_saw(&db, "clip", "alle").unwrap());
-        assert!(!reviewer_already_saw(&db, "clip", "Roza").unwrap());
-        assert!(!reviewer_already_saw(&db, "ghost", "Rubar").unwrap());
+        assert!(reviewer_already_saw(&db, "clip", "aram").unwrap());
+        assert!(!reviewer_already_saw(&db, "clip", "Nasrin").unwrap());
+        assert!(!reviewer_already_saw(&db, "ghost", "Rezan").unwrap());
     }
 
     #[test]
@@ -3123,7 +3123,7 @@ mod tests {
                 "UPDATE speech_segments
                     SET verified=1, human_decision='edit', verdict='human_edit',
                         verdict_transcript='دەقی دروست', annotated_transcript='دەقی دروست',
-                        reviewed_by='Rubar', review_revision=review_revision+1
+                        reviewed_by='Rezan', review_revision=review_revision+1
                   WHERE id IN ('a','b')",
                 [],
             )
@@ -3158,8 +3158,8 @@ mod tests {
             .unwrap()
             .unwrap()
         };
-        decide_on("a", "Alle", "دەقی دروست", "123e4567-e89b-42d3-a456-426614174980", 1);
-        decide_on("b", "Alle", "دەقی جیاواز", "123e4567-e89b-42d3-a456-426614174981", 2);
+        decide_on("a", "Aram", "دەقی دروست", "123e4567-e89b-42d3-a456-426614174980", 1);
+        decide_on("b", "Aram", "دەقی جیاواز", "123e4567-e89b-42d3-a456-426614174981", 2);
         assert_eq!(
             coverage(&db),
             VoiceCoverage {
@@ -3189,9 +3189,9 @@ mod tests {
         assert_eq!(resolved.status, "resolved");
         assert_eq!(resolved.final_action.as_deref(), Some("retain"));
         assert_eq!(resolved.final_transcript.as_deref(), Some("دەقی دروست"));
-        assert_eq!(resolved.agreeing_reviewers, vec!["Alle", "Rubar"]);
+        assert_eq!(resolved.agreeing_reviewers, vec!["Aram", "Rezan"]);
 
-        decide_on("b", "Sewa", "دەقی سێیەم", "123e4567-e89b-42d3-a456-426614174982", 3);
+        decide_on("b", "Sirwan", "دەقی سێیەم", "123e4567-e89b-42d3-a456-426614174982", 3);
         assert_eq!(
             coverage(&db),
             VoiceCoverage {
@@ -3236,7 +3236,7 @@ mod tests {
             "a blank voice filter means every voice"
         );
 
-        decide(&db, &pool, "Alle", "دەقی جیاواز", "123e4567-e89b-42d3-a456-426614174990", 1);
+        decide(&db, &pool, "Aram", "دەقی جیاواز", "123e4567-e89b-42d3-a456-426614174990", 1);
         let after = voice_authority_digests(&db, "Lamo").unwrap();
         assert_ne!(after.resolution_sha256, before.resolution_sha256, "new evidence must move the resolution digest");
         assert_ne!(after.reviewer_sha256, before.reviewer_sha256, "new evidence must move the reviewer digest");
@@ -3439,7 +3439,7 @@ mod tests {
                 "UPDATE speech_segments
                     SET verified=1, human_decision='edit', verdict='human_edit',
                         verdict_transcript='دەقی دروست', annotated_transcript='دەقی دروست',
-                        reviewed_by='Rubar', review_revision=review_revision+1
+                        reviewed_by='Rezan', review_revision=review_revision+1
                   WHERE id IN ('a','b')",
                 [],
             )

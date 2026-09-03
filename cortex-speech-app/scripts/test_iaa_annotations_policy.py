@@ -59,7 +59,7 @@ def test_two_raters_produce_a_tsv_that_kappa_can_score() -> None:
             # 32 agreements, 8 disagreements — a deliberately imperfect, realistic set.
             a = "accept" if i % 2 == 0 else "edit"
             b = a if i % 5 else "reject"
-            rows += [(f"seg-{i:03d}", "Lamo", a), (f"seg-{i:03d}", "Sewa", b)]
+            rows += [(f"seg-{i:03d}", "Lamo", a), (f"seg-{i:03d}", "Sirwan", b)]
         _make_db(db, rows)
 
         result = _run(db, out)
@@ -67,7 +67,7 @@ def test_two_raters_produce_a_tsv_that_kappa_can_score() -> None:
         assert out.is_file(), "no TSV written"
 
         header, *body = out.read_text(encoding="utf-8").strip().splitlines()
-        assert header.split("\t")[:2] == ["Lamo", "Sewa"], f"header must name both raters: {header!r}"
+        assert header.split("\t")[:2] == ["Lamo", "Sirwan"], f"header must name both raters: {header!r}"
         assert len(body) == 40, f"expected 40 doubly-annotated items, got {len(body)}"
 
         scored = subprocess.run(
@@ -86,7 +86,7 @@ def test_a_third_rater_is_excluded_by_name_never_pooled() -> None:
         db, out = tmp / "db.sqlite", tmp / "iaa.tsv"
         rows = []
         for i in range(35):
-            rows += [(f"seg-{i:03d}", "Lamo", "accept"), (f"seg-{i:03d}", "Sewa", "accept")]
+            rows += [(f"seg-{i:03d}", "Lamo", "accept"), (f"seg-{i:03d}", "Sirwan", "accept")]
         # A third reviewer with a much thinner overlap must not displace the real pair.
         rows += [("seg-000", "Zara", "reject"), ("seg-001", "Zara", "reject")]
         _make_db(db, rows)
@@ -98,7 +98,7 @@ def test_a_third_rater_is_excluded_by_name_never_pooled() -> None:
         )
         header = out.read_text(encoding="utf-8").splitlines()[0]
         assert "Zara" not in header, f"third rater leaked into the scored columns: {header!r}"
-        assert header.split("\t")[:2] == ["Lamo", "Sewa"]
+        assert header.split("\t")[:2] == ["Lamo", "Sirwan"]
 
 
 def test_no_overlap_refuses_instead_of_writing_an_empty_file() -> None:
@@ -112,7 +112,7 @@ def test_no_overlap_refuses_instead_of_writing_an_empty_file() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         db, out = tmp / "db.sqlite", tmp / "iaa.tsv"
-        _make_db(db, [("seg-a", "Lamo", "accept"), ("seg-b", "Sewa", "accept")])
+        _make_db(db, [("seg-a", "Lamo", "accept"), ("seg-b", "Sirwan", "accept")])
 
         # --min-items 0 fully disarms the floor, so ONLY the zero-overlap guard can answer here.
         # With --min-items 1 the floor replied first and this test passed whether or not the
@@ -132,7 +132,7 @@ def test_too_few_items_refuses_rather_than_reporting_a_meaningless_kappa() -> No
         db, out = tmp / "db.sqlite", tmp / "iaa.tsv"
         rows = []
         for i in range(4):
-            rows += [(f"seg-{i}", "Lamo", "accept"), (f"seg-{i}", "Sewa", "accept")]
+            rows += [(f"seg-{i}", "Lamo", "accept"), (f"seg-{i}", "Sirwan", "accept")]
         _make_db(db, rows)
 
         result = _run(db, out)

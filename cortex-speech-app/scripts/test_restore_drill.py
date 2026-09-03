@@ -135,8 +135,8 @@ def write_policy(root: Path, *, baseline: int) -> None:
                 "after_review_event_id": baseline,
                 "max_total_corpus_actions": 20,
                 "reviewers": [
-                    {"name": "Rubar", "max_corpus_actions": 10},
-                    {"name": "Alle", "max_corpus_actions": 10},
+                    {"name": "Rezan", "max_corpus_actions": 10},
+                    {"name": "Aram", "max_corpus_actions": 10},
                 ],
             }
         ),
@@ -457,8 +457,8 @@ def test_schema59_hidden_key_authority_is_bound_to_the_exact_pilot() -> None:
         connection.executemany(
             "INSERT INTO review_pilot_hidden_keys VALUES(?, 5, ?, ?)",
             [
-                (policy_sha, "Rubar", "hidden-h"),
-                (policy_sha, "Alle", "hidden-p"),
+                (policy_sha, "Rezan", "hidden-h"),
+                (policy_sha, "Aram", "hidden-p"),
             ],
         )
         connection.commit()
@@ -468,9 +468,9 @@ def test_schema59_hidden_key_authority_is_bound_to_the_exact_pilot() -> None:
         assert drill_module.drill(root) == []
 
     mismatches = (
-        ("0" * 64, 5, "Rubar", "disagrees with the active policy SHA/baseline"),
-        (None, 4, "Rubar", "disagrees with the active policy SHA/baseline"),
-        (None, 5, "Sewa", "unauthorized reviewer"),
+        ("0" * 64, 5, "Rezan", "disagrees with the active policy SHA/baseline"),
+        (None, 4, "Rezan", "disagrees with the active policy SHA/baseline"),
+        (None, 5, "Sirwan", "unauthorized reviewer"),
     )
     for wrong_sha, baseline, reviewer, expected in mismatches:
         with tempfile.TemporaryDirectory() as raw:
@@ -500,7 +500,7 @@ def test_schema59_hidden_key_authority_is_bound_to_the_exact_pilot() -> None:
         seed_tree(root, policy=False)
         connection = sqlite3.connect(root / drill_module.DB_FILE)
         connection.execute(
-            "INSERT INTO review_pilot_hidden_keys VALUES(?, 5, 'Rubar', 'orphan-grant')",
+            "INSERT INTO review_pilot_hidden_keys VALUES(?, 5, 'Rezan', 'orphan-grant')",
             ("0" * 64,),
         )
         connection.commit()
@@ -582,10 +582,10 @@ def test_schema59_policy_snapshot_requires_every_completed_hidden_event_to_have_
         seed_tree(root)
         connection = sqlite3.connect(root / drill_module.DB_FILE)
         connection.execute(
-            "INSERT INTO review_events VALUES(6, 'completed-hidden', 'Rubar', 'accept', 'couch_spot_check')"
+            "INSERT INTO review_events VALUES(6, 'completed-hidden', 'Rezan', 'accept', 'couch_spot_check')"
         )
         connection.execute(
-            "INSERT INTO spot_checks VALUES('completed-hidden', 'Rubar', 'accept')"
+            "INSERT INTO spot_checks VALUES('completed-hidden', 'Rezan', 'accept')"
         )
         connection.commit()
         connection.close()
@@ -601,14 +601,14 @@ def test_schema59_policy_snapshot_requires_every_completed_hidden_event_to_have_
         digest = drill_module.review_pilot_policy_sha256(policy)
         connection = sqlite3.connect(root / drill_module.DB_FILE)
         connection.execute(
-            "INSERT INTO review_pilot_hidden_keys VALUES(?, 5, 'Rubar', 'completed-hidden')",
+            "INSERT INTO review_pilot_hidden_keys VALUES(?, 5, 'Rezan', 'completed-hidden')",
             (digest,),
         )
         connection.execute(
-            "INSERT INTO review_events VALUES(6, 'completed-hidden', 'Rubar', 'accept', 'couch_spot_check')"
+            "INSERT INTO review_events VALUES(6, 'completed-hidden', 'Rezan', 'accept', 'couch_spot_check')"
         )
         connection.execute(
-            "INSERT INTO spot_checks VALUES('completed-hidden', 'Rubar', 'accept')"
+            "INSERT INTO spot_checks VALUES('completed-hidden', 'Rezan', 'accept')"
         )
         connection.commit()
         connection.close()

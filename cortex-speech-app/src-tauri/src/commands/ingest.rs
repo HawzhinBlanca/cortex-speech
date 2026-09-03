@@ -2110,7 +2110,7 @@ mod typed_ingest_refusal_and_identity_tests {
         // Journals can hold Windows paths inspected under another host, so both slash styles must
         // reduce to a basename — the directory part is private filesystem history.
         assert_eq!(public_import_item_label(r"D:\private\Wareen\clip one.wav"), "clip one.wav");
-        assert_eq!(public_import_item_label("/home/wareen/audio/clip.flac"), "clip.flac");
+        assert_eq!(public_import_item_label("/home/user/audio/clip.flac"), "clip.flac");
         // Control and bidi-formatting characters are display attacks, never useful UI.
         assert_eq!(public_import_item_label("evil\u{202e}gnp.wav"), "evilgnp.wav");
         assert_eq!(public_import_item_label("bad\u{0007}name.wav"), "badname.wav");

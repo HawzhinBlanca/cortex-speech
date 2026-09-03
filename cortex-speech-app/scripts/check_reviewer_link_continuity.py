@@ -5,10 +5,10 @@
 token authenticates. That is a different claim from the one that matters, and the gap is not
 theoretical -- it hid a real outage:
 
-  Alle, Pavel and Roza were dropped from the roster and re-added (2026-08-22..24). `start` mints a
+  Aram, Karwan and Nasrin were dropped from the roster and re-added (2026-08-22..24). `start` mints a
   FRESH token for a name it does not find in the remembered session, so all three links already sent
   died instantly. The live gate stayed GREEN through all of it -- it was checking the new tokens,
-  which of course authenticate. Alle's phone showed "link expired"; the record showed OK.
+  which of course authenticate. Aram's phone showed "link expired"; the record showed OK.
 
 So this gate holds a BASELINE of the fingerprint of each distributed token and reds when one moves.
 A moved fingerprint means: that person is holding a dead link and cannot report it, because the only
@@ -68,7 +68,7 @@ def drift(baseline: dict[str, str], live: dict[str, str]) -> tuple[list[str], li
     """(reminted, unknown, dropped) -- pure, so it is testable without DPAPI or a live app.
 
     Names match case-insensitively because `same_reviewer` in couch.rs does: the roster preserves the
-    casing the owner typed, and treating "rubar" and "Rubar" as two people is exactly the bug that
+    casing the owner typed, and treating "rezan" and "Rezan" as two people is exactly the bug that
     minted the fresh tokens in the first place.
     """
     base_ci = {k.casefold(): v for k, v in baseline.items()}
@@ -80,14 +80,14 @@ def drift(baseline: dict[str, str], live: dict[str, str]) -> tuple[list[str], li
 
 
 def selftest() -> int:
-    same = {"Rubar": "a" * 64}
+    same = {"Rezan": "a" * 64}
     assert drift(same, same) == ([], [], []), "a stable roster must be silent"
     # The real incident: casing preserved, token replaced.
-    assert drift({"Alle": "a" * 64}, {"alle": "b" * 64})[0] == ["alle"], "a reminted token must be caught"
+    assert drift({"Aram": "a" * 64}, {"aram": "b" * 64})[0] == ["aram"], "a reminted token must be caught"
     # Casing alone is NOT a remint -- flagging it would cry wolf on every roster retype.
-    assert drift({"Alle": "a" * 64}, {"alle": "a" * 64}) == ([], [], []), "casing is not identity"
-    assert drift({}, {"Pavel": "c" * 64})[1] == ["Pavel"], "a new reviewer needs a first link"
-    assert drift({"Sewa": "d" * 64}, {})[2] == ["Sewa"], "a dropped reviewer must be reported"
+    assert drift({"Aram": "a" * 64}, {"aram": "a" * 64}) == ([], [], []), "casing is not identity"
+    assert drift({}, {"Karwan": "c" * 64})[1] == ["Karwan"], "a new reviewer needs a first link"
+    assert drift({"Sirwan": "d" * 64}, {})[2] == ["Sirwan"], "a dropped reviewer must be reported"
     assert fingerprint("tok") != "tok", "the fingerprint must not be the token"
     print("SELFTEST OK")
     return 0

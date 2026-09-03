@@ -87,17 +87,17 @@ def seed(root: Path, *, schema: int = CURRENT_SCHEMA) -> tuple[Path, dict[str, o
     conn.close()
     session: dict[str, object] = {
         "reviewers": {
-            "dpapi-rubar": "Rubar",
-            "dpapi-alle": "Alle",
-            "dpapi-sewa": "Sewa",
+            "dpapi-rezan": "Rezan",
+            "dpapi-aram": "Aram",
+            "dpapi-sirwan": "Sirwan",
         },
         "db_path": str(db_path),
-        "spot_checks": [["r1", "Rubar"], ["a1", "Alle"], ["s1", "Sewa"]],
+        "spot_checks": [["r1", "Rezan"], ["a1", "Aram"], ["s1", "Sirwan"]],
         "pilot_spot_checks": [],
         "sessions": [
-            {"token": "cookie-r", "reviewer": "Rubar", "issued_unix": 1},
-            {"token": "cookie-a", "reviewer": "Alle", "issued_unix": 2},
-            {"token": "cookie-s", "reviewer": "Sewa", "issued_unix": 3},
+            {"token": "cookie-r", "reviewer": "Rezan", "issued_unix": 1},
+            {"token": "cookie-a", "reviewer": "Aram", "issued_unix": 2},
+            {"token": "cookie-s", "reviewer": "Sirwan", "issued_unix": 3},
         ],
     }
     (root / SESSION_FILE).write_text(json.dumps(session), encoding="utf-8")
@@ -121,7 +121,7 @@ def test_activation_preserves_target_tokens_narrows_every_session_surface_and_ba
         policy = json.loads((root / POLICY_FILE).read_text(encoding="utf-8"))
         session = json.loads((root / SESSION_FILE).read_text(encoding="utf-8"))
         assert policy == session["pilot_policy"]
-        assert [entry["name"] for entry in policy["reviewers"]] == ["Alle", "Rubar"]
+        assert [entry["name"] for entry in policy["reviewers"]] == ["Aram", "Rezan"]
         assert policy["after_review_event_id"] == 863
         assert policy["max_total_corpus_actions"] == 20
         assert result["maxCorpusActions"] == 20
@@ -130,11 +130,11 @@ def test_activation_preserves_target_tokens_narrows_every_session_surface_and_ba
         assert result["controlledPilotFocusCount"] == len(TEST_FOCUS_IDS)
         assert result["controlledPilotFocusDigest"] == TEST_FOCUS_CONTRACT.sorted_unique_segment_ids_sha256
         assert session["reviewers"] == {
-            "dpapi-rubar": "Rubar",
-            "dpapi-alle": "Alle",
+            "dpapi-rezan": "Rezan",
+            "dpapi-aram": "Aram",
         }, "protected DPAPI token bytes must be preserved exactly"
-        assert {entry["reviewer"] for entry in session["sessions"]} == {"Rubar", "Alle"}
-        assert {entry[1] for entry in session["spot_checks"]} == {"Rubar", "Alle"}
+        assert {entry["reviewer"] for entry in session["sessions"]} == {"Rezan", "Aram"}
+        assert {entry[1] for entry in session["spot_checks"]} == {"Rezan", "Aram"}
         assert session["pilot_spot_checks"] == []
         assert not (root / REVOCATION_FILE).exists()
         backup = Path(result["backup"])
@@ -148,7 +148,7 @@ def test_first_activation_refuses_unnamespaced_legacy_pilot_hidden_keys() -> Non
         db_path, _ = seed(root)
         session_path = root / SESSION_FILE
         session = json.loads(session_path.read_text(encoding="utf-8"))
-        session["pilot_spot_checks"] = [["ambiguous-key", "Rubar"]]
+        session["pilot_spot_checks"] = [["ambiguous-key", "Rezan"]]
         session_path.write_text(json.dumps(session), encoding="utf-8")
 
         try:
@@ -193,12 +193,12 @@ def test_pristine_roster_replacement_atomically_extends_the_exact_focus() -> Non
         old_policy = pilot_policy(863)
         old_policy["reviewers"] = [
             {"name": "Hawzhin", "max_corpus_actions": 10},
-            {"name": "Pavel", "max_corpus_actions": 10},
+            {"name": "Karwan", "max_corpus_actions": 10},
         ]
         policy_path = root / POLICY_FILE
         policy_path.write_text(json.dumps(old_policy), encoding="utf-8")
         current_session = {
-            "reviewers": {"old-h": "Hawzhin", "old-p": "Pavel"},
+            "reviewers": {"old-h": "Hawzhin", "old-p": "Karwan"},
             "db_path": str(db_path),
             "spot_checks": [],
             "pilot_spot_checks": [],
@@ -227,8 +227,8 @@ def test_pristine_roster_replacement_atomically_extends_the_exact_focus() -> Non
 
         assert result["rosterReplacedBeforeActivity"] is True
         assert set(json.loads((root / SESSION_FILE).read_text())["reviewers"].values()) == {
-            "Rubar",
-            "Alle",
+            "Rezan",
+            "Aram",
         }
         assert set(json.loads(focus_path.read_text())["segment_ids"]) == set(TEST_FOCUS_IDS)
         backup = Path(result["backup"])
@@ -245,7 +245,7 @@ def test_existing_pilot_cannot_reset_its_baseline_after_any_durable_activity() -
         policy_hash = sha256_file(policy_path)
         conn = sqlite3.connect(db_path)
         conn.execute(
-            "INSERT INTO review_events VALUES(864, 'corpus-work', 'Rubar', 'accept', 'couch')"
+            "INSERT INTO review_events VALUES(864, 'corpus-work', 'Rezan', 'accept', 'couch')"
         )
         conn.commit()
         conn.close()
@@ -273,16 +273,16 @@ def test_schema63_activation_imports_session_and_completed_hidden_keys_into_one_
         session_path = root / SESSION_FILE
         session = json.loads(session_path.read_text(encoding="utf-8"))
         session["pilot_spot_checks"] = [
-            ["hidden-r-session", "Rubar"],
-            ["hidden-a-session", "Alle"],
+            ["hidden-r-session", "Rezan"],
+            ["hidden-a-session", "Aram"],
         ]
         session_path.write_text(json.dumps(session), encoding="utf-8")
         conn = sqlite3.connect(db_path)
         conn.executemany(
             "INSERT INTO review_events VALUES(?, ?, ?, ?, 'couch_spot_check')",
             [
-                (864, "hidden-r-completed", "Rubar", "accept"),
-                (865, "hidden-a-completed", "Alle", "reject"),
+                (864, "hidden-r-completed", "Rezan", "accept"),
+                (865, "hidden-a-completed", "Aram", "reject"),
             ],
         )
         conn.commit()
@@ -303,10 +303,10 @@ def test_schema63_activation_imports_session_and_completed_hidden_keys_into_one_
         ).fetchall()
         conn.close()
         assert rows == [
-            (expected_digest, 863, "Alle", "hidden-a-completed"),
-            (expected_digest, 863, "Alle", "hidden-a-session"),
-            (expected_digest, 863, "Rubar", "hidden-r-completed"),
-            (expected_digest, 863, "Rubar", "hidden-r-session"),
+            (expected_digest, 863, "Aram", "hidden-a-completed"),
+            (expected_digest, 863, "Aram", "hidden-a-session"),
+            (expected_digest, 863, "Rezan", "hidden-r-completed"),
+            (expected_digest, 863, "Rezan", "hidden-r-session"),
         ]
         assert result["policySemanticSha256"] == expected_digest
         assert result["hiddenKeysImported"] == 4
@@ -330,7 +330,7 @@ def test_schema63_activation_rolls_back_when_hidden_history_exceeds_quota_or_sch
             conn = sqlite3.connect(db_path)
             if mutation == "over_quota":
                 conn.executemany(
-                    "INSERT INTO review_events VALUES(?, ?, 'Rubar', 'accept', 'couch_spot_check')",
+                    "INSERT INTO review_events VALUES(?, ?, 'Rezan', 'accept', 'couch_spot_check')",
                     [(864, "hidden-one"), (865, "hidden-two"), (866, "hidden-three")],
                 )
                 expected_max = 866
@@ -440,7 +440,7 @@ def test_non_restartable_or_duplicate_session_json_is_refused_before_revocation(
         session_path = root / SESSION_FILE
         encoded_db = json.dumps(str(db_path))
         session_path.write_text(
-            '{"reviewers":{"dpapi-secret":"Rubar","dpapi-secret":"Alle"},'
+            '{"reviewers":{"dpapi-secret":"Rezan","dpapi-secret":"Aram"},'
             f'"db_path":{encoded_db}}}',
             encoding="utf-8",
         )

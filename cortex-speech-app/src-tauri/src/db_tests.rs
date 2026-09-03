@@ -6055,7 +6055,7 @@ fn a_spot_check_is_never_served_in_a_dialect_the_reviewer_cannot_judge() {
         ids.push(id);
     }
     let candidates = |allowed: Option<&[String]>| -> Vec<String> {
-        db.list_spot_check_candidates(10, "Roza", &std::collections::HashSet::new(), allowed, None)
+        db.list_spot_check_candidates(10, "Nasrin", &std::collections::HashSet::new(), allowed, None)
             .unwrap()
             .into_iter()
             .map(|(s, _)| s.id)
@@ -6121,23 +6121,23 @@ fn reviewed_audio_ms_counts_each_clip_once_per_reviewer() {
     }
     let revision = db.segment_review_revision("a").unwrap().unwrap();
     let revision =
-        db.record_phone_human_decision_by_at_revision("a", "accept", Some("test"), "Rubar", revision).unwrap().unwrap();
-    db.record_phone_human_decision_by_at_revision("a", "edit", Some("دەقی دەستکاریکراو"), "Rubar", revision)
+        db.record_phone_human_decision_by_at_revision("a", "accept", Some("test"), "Rezan", revision).unwrap().unwrap();
+    db.record_phone_human_decision_by_at_revision("a", "edit", Some("دەقی دەستکاریکراو"), "Rezan", revision)
         .unwrap()
         .unwrap(); // same clip again — a re-decision, not new activity
     let revision = db.segment_review_revision("b").unwrap().unwrap();
-    db.record_phone_human_decision_by_at_revision("b", "reject", None, "Rubar", revision).unwrap().unwrap(); // judged activity; payable credit is separately weighted to 10%
+    db.record_phone_human_decision_by_at_revision("b", "reject", None, "Rezan", revision).unwrap().unwrap(); // judged activity; payable credit is separately weighted to 10%
     let revision = db.segment_review_revision("a").unwrap().unwrap();
-    db.record_phone_human_decision_by_at_revision("a", "accept", Some("دەقی دەستکاریکراو"), "Sewa", revision)
+    db.record_phone_human_decision_by_at_revision("a", "accept", Some("دەقی دەستکاریکراو"), "Sirwan", revision)
         .unwrap()
         .unwrap(); // another reviewer on the same clip counts for HER
 
     assert_eq!(
-        db.reviewed_audio_ms("Rubar").unwrap(),
+        db.reviewed_audio_ms("Rezan").unwrap(),
         30_000,
         "both judged clips count as activity; the repeat on clip a is not double-counted"
     );
-    assert_eq!(db.reviewed_audio_ms("Sewa").unwrap(), 9_000);
+    assert_eq!(db.reviewed_audio_ms("Sirwan").unwrap(), 9_000);
     assert_eq!(db.reviewed_audio_ms("Nobody").unwrap(), 0, "a reviewer with no work owes no rows");
 
     // PAY SURVIVES DELETION (2026-08-20 hunt): the owner pruning a reviewed clip must not shrink
@@ -6147,8 +6147,8 @@ fn reviewed_audio_ms_counts_each_clip_once_per_reviewer() {
         db.delete_segment("a").is_err(),
         "effect-bound review evidence is append-only, so deleting its source segment must fail closed"
     );
-    assert_eq!(db.reviewed_audio_ms("Rubar").unwrap(), 30_000, "failed deletion cannot shrink review progress");
-    assert_eq!(db.reviewed_audio_ms("Sewa").unwrap(), 9_000, "nor another reviewer's progress");
+    assert_eq!(db.reviewed_audio_ms("Rezan").unwrap(), 30_000, "failed deletion cannot shrink review progress");
+    assert_eq!(db.reviewed_audio_ms("Sirwan").unwrap(), 9_000, "nor another reviewer's progress");
 }
 
 fn record_payable_edit(db: &Database, segment_id: &str, reviewer: &str, duration_ms: i64) -> i64 {
@@ -8523,7 +8523,7 @@ fn confirming_a_previous_humans_correction_is_recorded_as_human_authored() {
     seed_for_provenance(&db, "reg-82681df2", "کاک لە ئەمە شتێکی تر یەعنی");
     db.record_human_decision("reg-82681df2", "edit", Some("کاک لامۆ، شتێکی تر، یەعنی"), None).unwrap();
 
-    // A later reviewer approves what they see — which is Rubar's text, not the engine's.
+    // A later reviewer approves what they see — which is Rezan's text, not the engine's.
     db.record_human_decision("reg-82681df2", "accept", Some("کاک لامۆ، شتێکی تر، یەعنی"), None).unwrap();
 
     let seg = db.get_segment_by_id("reg-82681df2").unwrap().unwrap();

@@ -321,7 +321,7 @@ mod tests {
               "after_review_event_id": {after},
               "max_total_corpus_actions": 20,
               "reviewers": [
-                {{"name": " Pavel ", "max_corpus_actions": 10}},
+                {{"name": " Karwan ", "max_corpus_actions": 10}},
                 {{"name": "Hawzhin", "max_corpus_actions": 10}}
               ]
             }}"#
@@ -335,17 +335,17 @@ mod tests {
         std::fs::write(dir.path().join(REVIEW_PILOT_FILE), policy_json(863)).unwrap();
         let policy = load(dir.path()).unwrap().unwrap();
         assert_eq!(policy.after_review_event_id, 863);
-        assert_eq!(policy.reviewer_names(), vec!["Hawzhin", "Pavel"]);
-        assert_eq!(policy.cap_for(" pAvEl "), Some(10));
-        assert!(policy.matches_session(&["Pavel".into(), "hawzhin".into()]));
-        assert!(!policy.matches_session(&["Pavel".into()]));
+        assert_eq!(policy.reviewer_names(), vec!["Hawzhin", "Karwan"]);
+        assert_eq!(policy.cap_for(" kArWaN "), Some(10));
+        assert!(policy.matches_session(&["Karwan".into(), "hawzhin".into()]));
+        assert!(!policy.matches_session(&["Karwan".into()]));
     }
 
     #[test]
     fn policy_digest_is_stable_for_equivalent_semantics_and_changes_with_the_baseline() {
         let policy = parse(&policy_json(863)).unwrap();
         let digest = policy.policy_sha256().unwrap();
-        assert_eq!(digest, "cd8c93e7336e4d7f2731cd190a8cc45101498433dfee971079cb29d64d74d333");
+        assert_eq!(digest, "85179c91ba1329d11aae45d373ff55e13cc6f279e8127c872428d325712ea1ca");
         assert_eq!(digest.len(), 64);
         assert!(digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
 
@@ -374,7 +374,7 @@ mod tests {
         duplicate_reviewer["reviewers"][1]["name"] = duplicate_reviewer["reviewers"][0]["name"].clone();
         let mut third_reviewer = valid.clone();
         let mut added = third_reviewer["reviewers"][0].clone();
-        added["name"] = serde_json::json!("Rubar");
+        added["name"] = serde_json::json!("Rezan");
         third_reviewer["reviewers"].as_array_mut().unwrap().push(added);
         let mut unknown_field = valid;
         unknown_field.as_object_mut().unwrap().insert("typo".into(), serde_json::json!(true));

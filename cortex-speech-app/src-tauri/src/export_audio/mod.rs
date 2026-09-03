@@ -1374,7 +1374,7 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&seg).unwrap();
-        record_test_phone_decision(&db, &seg.id, "edit", Some(exact_correction), "Rubar");
+        record_test_phone_decision(&db, &seg.id, "edit", Some(exact_correction), "Rezan");
         let expected_revision = db.segment_review_revision(&seg.id).unwrap().unwrap();
 
         let out = tmp.path().join("out");
@@ -1403,14 +1403,14 @@ mod tests {
             !headers.iter().any(|header| header == "reviewed_by"),
             "shared artifacts must not expose reviewer names"
         );
-        assert!(!row.iter().any(|value| value == "Rubar"), "reviewer identity leaked into shared metadata");
+        assert!(!row.iter().any(|value| value == "Rezan"), "reviewer identity leaked into shared metadata");
         assert!(reader.records().next().is_none());
 
         let jsonl = fs::read_to_string(out.join("metadata.jsonl")).unwrap();
         let exact: serde_json::Value = serde_json::from_str(jsonl.trim()).unwrap();
         assert_eq!(exact["effective_transcript"], exact_correction);
         assert_eq!(exact["review_revision"], expected_revision);
-        assert!(!jsonl.contains("Rubar"), "the authoritative exact-label sidecar must not expose reviewer identity");
+        assert!(!jsonl.contains("Rezan"), "the authoritative exact-label sidecar must not expose reviewer identity");
     }
 
     #[test]

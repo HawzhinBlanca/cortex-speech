@@ -189,7 +189,7 @@ def selftest() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         session = {
-            "reviewers": {_dpapi_protect("tok-rubar"): "Rubar", _dpapi_protect("tok-alle"): "Alle"},
+            "reviewers": {_dpapi_protect("tok-rezan"): "Rezan", _dpapi_protect("tok-aram"): "Aram"},
             "db_path": str(root / "cortex-speech.db"),
             "sessions": [],
         }
@@ -201,7 +201,7 @@ def selftest() -> int:
         assert len(list((root / VAULT_DIRNAME).glob("*.json"))) == 1, "unchanged set must not duplicate"
 
         # A remint (same name, new token) must be captured as a NEW snapshot...
-        session["reviewers"] = {_dpapi_protect("tok-rubar-2"): "Rubar", _dpapi_protect("tok-alle"): "Alle"}
+        session["reviewers"] = {_dpapi_protect("tok-rezan-2"): "Rezan", _dpapi_protect("tok-aram"): "Aram"}
         (root / "couch_session.json").write_text(json.dumps(session), encoding="utf-8")
         assert cmd_vault(root) == 0
         assert len(list((root / VAULT_DIRNAME).glob("couch_session.*.json"))) == 2, "changed set must snapshot"
@@ -212,7 +212,7 @@ def selftest() -> int:
         assert cmd_restore(root, None, force_live=True) == 0, "restore must succeed"
         assert not (root / "couch_session.revoked").exists(), "restore must remove the revoke marker"
         _, restored = load_validated(root / "couch_session.json")
-        assert ("rubar", hashlib.sha256(b"tok-rubar-2").hexdigest()) in restored, "restore must return the newest set"
+        assert ("rezan", hashlib.sha256(b"tok-rezan-2").hexdigest()) in restored, "restore must return the newest set"
 
         # An empty credential file must never become a snapshot.
         (root / "couch_session.json").write_text(json.dumps({"reviewers": {}, "sessions": []}), encoding="utf-8")

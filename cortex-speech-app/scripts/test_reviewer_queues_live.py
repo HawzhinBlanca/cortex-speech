@@ -65,22 +65,22 @@ def test_wrong_dialect_gate_reads_current_attribution_not_superseded_history() -
                 );
                 """
             )
-            # Historical Alle edit, now superseded by an unattributed legacy reject: it is neither
-            # current attribution nor downstream training data and must not accuse Alle today.
+            # Historical Aram edit, now superseded by an unattributed legacy reject: it is neither
+            # current attribution nor downstream training data and must not accuse Aram today.
             con.execute(
                 "INSERT INTO speech_segments VALUES (?, ?, 1, 'reject', NULL)",
                 ("superseded", HAWLERI_CLIP[0]),
             )
-            con.execute("INSERT INTO review_events VALUES ('Alle', 'superseded', 'edit')")
+            con.execute("INSERT INTO review_events VALUES ('Aram', 'superseded', 'edit')")
 
             # Current attribution is authoritative. Both a usable accept and an excluded reject are
             # routing violations when a Sorani-only reviewer judges Hawleri.
             con.execute(
-                "INSERT INTO speech_segments VALUES (?, ?, 1, 'accept', 'Alle')",
+                "INSERT INTO speech_segments VALUES (?, ?, 1, 'accept', 'Aram')",
                 ("current-accept", HAWLERI_CLIP[0]),
             )
             con.execute(
-                "INSERT INTO speech_segments VALUES (?, ?, 1, 'reject', 'Alle')",
+                "INSERT INTO speech_segments VALUES (?, ?, 1, 'reject', 'Aram')",
                 ("current-reject", HAWLERI_CLIP[0]),
             )
             con.execute(
@@ -93,27 +93,27 @@ def test_wrong_dialect_gate_reads_current_attribution_not_superseded_history() -
 
         assert wrong_dialect_decisions(
             db_path,
-            {"Alle": ["sorani"], "Hawzhin": ["hawleri"]},
+            {"Aram": ["sorani"], "Hawzhin": ["hawleri"]},
             TABLE,
-        ) == {"Alle": 2}
+        ) == {"Aram": 2}
 
 
 def test_the_real_incident_a_sorani_only_reviewer_with_no_sorani_clips_fails() -> None:
     problems, _ = evaluate_queues(
-        reviewers=["Roza", "Rubar"],
-        roster={"Roza": ["sorani"], "Rubar": ["hawleri", "sorani"]},
+        reviewers=["Nasrin", "Rezan"],
+        roster={"Nasrin": ["sorani"], "Rezan": ["hawleri", "sorani"]},
         clips=[HAWLERI_CLIP],
         table=TABLE,
     )
     assert len(problems) == 1, problems
-    assert "Roza" in problems[0]
+    assert "Nasrin" in problems[0]
     assert "ZERO" in problems[0]
 
 
 def test_once_the_sorani_corpus_is_mapped_everybody_has_work() -> None:
     problems, _ = evaluate_queues(
-        reviewers=["Roza", "Rubar"],
-        roster={"Roza": ["sorani"], "Rubar": ["hawleri", "sorani"]},
+        reviewers=["Nasrin", "Rezan"],
+        roster={"Nasrin": ["sorani"], "Rezan": ["hawleri", "sorani"]},
         clips=[HAWLERI_CLIP, SORANI_CLIP],
         table=TABLE,
     )
@@ -126,14 +126,14 @@ def test_an_unrestricted_reviewer_is_never_reported_while_any_work_exists() -> N
 
 
 def test_an_empty_library_fails_for_everyone_because_nobody_can_work() -> None:
-    problems, _ = evaluate_queues(reviewers=["Roza"], roster={"Roza": ["sorani"]}, clips=[], table=TABLE)
+    problems, _ = evaluate_queues(reviewers=["Nasrin"], roster={"Nasrin": ["sorani"]}, clips=[], table=TABLE)
     assert len(problems) == 1
 
 
 def test_a_thin_queue_warns_without_failing() -> None:
     problems, warnings = evaluate_queues(
-        reviewers=["Roza"],
-        roster={"Roza": ["sorani"]},
+        reviewers=["Nasrin"],
+        roster={"Nasrin": ["sorani"]},
         clips=[SORANI_CLIP] * 3,
         table=TABLE,
         warn_below=10,
@@ -143,12 +143,12 @@ def test_a_thin_queue_warns_without_failing() -> None:
 
 
 def test_flexible_pool_counts_are_reviewer_specific_and_zero_fails() -> None:
-    problems, warnings = evaluate_pool_queues({"Alle": 120, "Rubar": 0}, warn_below=100)
-    assert len(problems) == 1 and "Rubar" in problems[0] and "ZERO" in problems[0]
+    problems, warnings = evaluate_pool_queues({"Aram": 120, "Rezan": 0}, warn_below=100)
+    assert len(problems) == 1 and "Rezan" in problems[0] and "ZERO" in problems[0]
     assert warnings == []
-    problems, warnings = evaluate_pool_queues({"Alle": 99, "Rubar": 101}, warn_below=100)
+    problems, warnings = evaluate_pool_queues({"Aram": 99, "Rezan": 101}, warn_below=100)
     assert problems == []
-    assert len(warnings) == 1 and "Alle" in warnings[0] and "99" in warnings[0]
+    assert len(warnings) == 1 and "Aram" in warnings[0] and "99" in warnings[0]
 
 
 def test_unmapped_clips_fail_closed_and_are_not_counted_as_work() -> None:
@@ -158,7 +158,7 @@ def test_unmapped_clips_fail_closed_and_are_not_counted_as_work() -> None:
     assert dialect_of(unmapped[0], TABLE) is None
     assert not may_judge(["sorani"], unmapped[0], TABLE)
     problems, _ = evaluate_queues(
-        reviewers=["Roza"], roster={"Roza": ["sorani"]}, clips=[unmapped], table=TABLE
+        reviewers=["Nasrin"], roster={"Nasrin": ["sorani"]}, clips=[unmapped], table=TABLE
     )
     assert len(problems) == 1
 
@@ -176,10 +176,10 @@ def test_a_comment_key_does_not_empty_the_roster() -> None:
     # failure path is "unrestricted" — so the whole protection switched off silently.
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "reviewer_dialects.json").write_text(
-            json.dumps({"_comment": "how to edit", "Roza": ["sorani"]}), encoding="utf-8"
+            json.dumps({"_comment": "how to edit", "Nasrin": ["sorani"]}), encoding="utf-8"
         )
         roster = load_roster(Path(tmp))
-    assert roster == {"Roza": ["sorani"]}, roster
+    assert roster == {"Nasrin": ["sorani"]}, roster
 
 
 def test_a_broken_policy_file_fails_the_gate_instead_of_unrestricting_everyone() -> None:
@@ -195,12 +195,12 @@ def test_a_broken_policy_file_fails_the_gate_instead_of_unrestricting_everyone()
             pass
     with tempfile.TemporaryDirectory() as tmp:
         # A typo'd RESTRICTION: skipping it silently un-restricts exactly the reviewer it names.
-        (Path(tmp) / "reviewer_dialects.json").write_text(json.dumps({"Roza": "sorani"}), encoding="utf-8")
+        (Path(tmp) / "reviewer_dialects.json").write_text(json.dumps({"Nasrin": "sorani"}), encoding="utf-8")
         try:
             load_roster(Path(tmp))
             raise AssertionError("a typo'd roster entry must raise PolicyBroken")
         except PolicyBroken as e:
-            assert "Roza" in str(e), e
+            assert "Nasrin" in str(e), e
     for broken in ("{ not json", json.dumps({"name": "V"}), json.dumps({"name": "V", "segment_ids": []})):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "voice_focus.json").write_text(broken, encoding="utf-8")
@@ -212,17 +212,17 @@ def test_a_broken_policy_file_fails_the_gate_instead_of_unrestricting_everyone()
 
 
 def test_a_roster_key_binds_across_case_and_whitespace_and_duplicates_are_broken() -> None:
-    # 2026-08-20 hunt: the exact-match lookup let an orphaned key ("roza " vs live "Roza") load
+    # 2026-08-20 hunt: the exact-match lookup let an orphaned key ("nasrin " vs live "Nasrin") load
     # cleanly and bind NOBODY — its reviewer served unrestricted, the wrong-dialect incident back
     # through a typo'd key. The lookup now matches the way the session layer matches names.
     with tempfile.TemporaryDirectory() as tmp:
-        (Path(tmp) / "reviewer_dialects.json").write_text(json.dumps({"roza ": ["sorani"]}), encoding="utf-8")
+        (Path(tmp) / "reviewer_dialects.json").write_text(json.dumps({"nasrin ": ["sorani"]}), encoding="utf-8")
         roster = load_roster(Path(tmp))
-        assert allowed_for(roster, "Roza") == ["sorani"], "the key must bind its reviewer across case/space"
-        assert allowed_for(roster, "Rubar") is None
+        assert allowed_for(roster, "Nasrin") == ["sorani"], "the key must bind its reviewer across case/space"
+        assert allowed_for(roster, "Rezan") is None
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "reviewer_dialects.json").write_text(
-            json.dumps({"Roza": ["sorani"], "roza": ["hawleri"]}), encoding="utf-8"
+            json.dumps({"Nasrin": ["sorani"], "nasrin": ["hawleri"]}), encoding="utf-8"
         )
         try:
             load_roster(Path(tmp))
@@ -234,11 +234,11 @@ def test_a_roster_key_binds_across_case_and_whitespace_and_duplicates_are_broken
 def test_roster_values_are_normalized_and_unknown_or_empty_dialects_are_broken() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "reviewer_dialects.json").write_text(
-            json.dumps({"Roza": [" Sorani ", "SORANI", "Hawleri"]}), encoding="utf-8"
+            json.dumps({"Nasrin": [" Sorani ", "SORANI", "Hawleri"]}), encoding="utf-8"
         )
-        assert load_roster(Path(tmp)) == {"Roza": ["sorani", "hawleri"]}
+        assert load_roster(Path(tmp)) == {"Nasrin": ["sorani", "hawleri"]}
 
-    for invalid in ({"Roza": ["soranii"]}, {"Roza": []}):
+    for invalid in ({"Nasrin": ["soranii"]}, {"Nasrin": []}):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "reviewer_dialects.json").write_text(json.dumps(invalid), encoding="utf-8")
             try:

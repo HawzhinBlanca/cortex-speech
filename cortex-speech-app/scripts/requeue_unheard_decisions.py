@@ -282,7 +282,7 @@ def run(args: argparse.Namespace) -> int:
         # so a decision with no receipt is a decision taken before there was anything to record — not
         # evidence that nobody listened. Measured the moment this tool was first run: a window opening
         # 2026-08-01 selected 543 decisions, essentially the entire labelled corpus, and re-queuing
-        # them would have thrown away every hour Sewa, Rubar and Lamo have worked. The dry-run default
+        # them would have thrown away every hour Sirwan, Rezan and Lamo have worked. The dry-run default
         # is what caught it; this fence is so the next person does not need to be as lucky.
         first_receipt = conn.execute("SELECT MIN(created_at) FROM playback_receipts").fetchone()[0]
         if first_receipt is None:

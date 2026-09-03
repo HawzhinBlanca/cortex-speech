@@ -68,9 +68,9 @@ Primary evidence: `src-tauri/src/review_pool.rs` tests
 | Plan requirement | Result | Authoritative evidence |
 |---|---|---|
 | Isolated schema-63/64/65 engineering and clone-first migration | PASS | Dedicated `codex/review-production-v63` worktree; external build roots; live-sized clone preflights passed before protected handovers. |
-| Preserve links, sessions, decisions, operation IDs, outbox, and undo | PASS | Real Rubar/Alle localhost and Funnel authentication, valid WAV and idempotency probes after the v63 handover; 877 historical events preserved and no synthetic pool decisions created. |
+| Preserve links, sessions, decisions, operation IDs, outbox, and undo | PASS | Real Rezan/Aram localhost and Funnel authentication, valid WAV and idempotency probes after the v63 handover; 877 historical events preserved and no synthetic pool decisions created. |
 | Stop resolved circulation; allow exactly one third review | PASS | Review-pool queue and full 16-pair action matrix tests; concurrent HTTP reviewer tests; live queues show unresolved work without synthetic resolution. |
-| Queue p95 ≤750 ms; commit p95 ≤500 ms | PASS | Live-sized release: Rubar 153.54 ms, Alle 150.97 ms; two-reviewer decision commit 4.889 ms. |
+| Queue p95 ≤750 ms; commit p95 ≤500 ms | PASS | Live-sized release: Rezan 153.54 ms, Aram 150.97 ms; two-reviewer decision commit 4.889 ms. |
 | Mode-aware verification | PASS (implementation) | Links, queues, final review authority, compensation, and playback select the live mode. Flexible mode proves the hash-bound release/admin, exact reviewer-specific pool queue, champion/voice/report consistency, deferred-pay namespace isolation, and effective pool playback evidence; legacy mode retains its exact hidden canary and ledger rules. Fresh local/Funnel authentication and live certification pass. The genuine post-release playback sample remains an external evidence gate. |
 | Safe deployment and compatible rollback | PASS | Immutable hash-bound release, pre-migration snapshot, maintenance marker, clone preflight, post-exposure auth/queue/audio/idempotency/supervision gates, and schema-aware rollback controller tests. |
 | Exact owner rights, fail closed on conflicts/revocation | PASS | Live certification reports exact rights for every active owner recording; idempotent/scoped/conflict/revocation Rust tests pass. |
@@ -88,7 +88,7 @@ Primary evidence: `src-tauri/src/review_pool.rs` tests
 Independent post-deploy certification reported exact commit `3aca5885867bc77a87fe669cbee48556a84a04a5`,
 schema 65, healthy quick/full integrity, zero foreign keys, complete canonical audio and rights,
 `reviewReady=true`, 16,990 unresolved canonical clips, zero owner conflicts, and zero owner
-adjudications. With the live dialect policy applied, Rubar had 16,988 eligible clips and Alle 14,041;
+adjudications. With the live dialect policy applied, Rezan had 16,988 eligible clips and Aram 14,041;
 both sampled valid WAV data and proved submission idempotency. Both links authenticated read-only over
 local HTTPS and Funnel, the 14-assertion supervision gate passed, and the watchdog's last result was
 zero. Fresh schema-65 snapshots verified on local and `F:` storage; the offsite snapshot restored in
@@ -98,16 +98,16 @@ The post-`0983d54` read-only checkpoint again reported schema 65, quick/full int
 foreign keys, 16,990/16,990 canonical audio, exact rights on 20,323/20,323 source rows, zero
 unconfirmed duplicate risk, and fresh verified local/offsite snapshots. The canonical duplicate
 gate independently rescanned all 16,990 eligible clips and found zero cross-file duplicate content.
-Alle and Rubar both authenticated through Funnel, supervision passed, and the active immutable
+Aram and Rezan both authenticated through Funnel, supervision passed, and the active immutable
 binary completed 2,389 positive-control-backed offline workload loops with zero non-loopback backend
-TCP endpoints. Human state remained two genuine Rubar judgments, zero resolved clips, and 0/20
+TCP endpoints. Human state remained two genuine Rezan judgments, zero resolved clips, and 0/20
 post-release playback decisions; these numbers were not fabricated or backdated.
 
 The post-`bc1b5f7` read-only checkpoint remained review-ready: schema 65 and all 162 protected
 contract objects matched; quick/full integrity returned `ok`; foreign-key violations, missing audio,
-rights gaps, revocations, and unconfirmed duplicate risk were zero. Alle and Rubar authenticated,
+rights gaps, revocations, and unconfirmed duplicate risk were zero. Aram and Rezan authenticated,
 supervision passed with 424.8 GB free, and verified local/offsite snapshots were 253/251 seconds old.
-Human state was still two Rubar judgments, zero resolutions, and 0/20 current-release playback
+Human state was still two Rezan judgments, zero resolutions, and 0/20 current-release playback
 decisions. The reviewer process was not restarted and no live write, GPU, model server, or ASR
 inference was used.
 
@@ -118,7 +118,7 @@ These are real remaining work, not engineering defects to fabricate away:
 1. Resolve all 16,990 canonical clips through matching independent judgments, a matching pair among three, or
    explicit owner adjudication; current state is two genuine judgments and zero resolved clips.
 2. Reach zero three-way conflicts, missing audio, rights gaps, integrity errors, and stale snapshots.
-3. Kawa requires another Hawleri-capable reviewer besides Rubar; Rubar cannot self-confirm.
+3. Kawa requires another Hawleri-capable reviewer besides Rezan; Rezan cannot self-confirm.
 4. After each voice resolves, run its real certificate/export and record the resulting digests.
 5. Accumulate at least 20 ordinary post-release non-skip decisions across two reviewer browsers; the
    mode-aware playback gate must prove every one against its immutable pool decision and canonical

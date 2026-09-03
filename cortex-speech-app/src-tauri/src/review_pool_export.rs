@@ -892,7 +892,7 @@ mod tests {
             verdict: Some(if reject { "human_reject" } else { "human_edit" }.to_string()),
             verdict_transcript: (!reject).then_some(final_text),
             human_decision: Some(if reject { "reject" } else { "edit" }.to_string()),
-            reviewed_by: Some("Rubar".to_string()),
+            reviewed_by: Some("Rezan".to_string()),
             verified: true,
             duration_ms: end_ms - start_ms,
             model_version_id: Some(TEST_CHAMPION.to_string()),
@@ -1086,7 +1086,7 @@ mod tests {
                 &pool,
                 &review_pool::PoolDecisionInput {
                     segment_id: id,
-                    reviewer: "Alle",
+                    reviewer: "Aram",
                     action: if reject { "reject" } else { "edit" },
                     submitted_transcript: (!reject).then_some(transcript.as_str()),
                     served_transcript: RAW,
@@ -1437,7 +1437,7 @@ mod tests {
             pool,
             &review_pool::PoolDecisionInput {
                 segment_id: "solo",
-                reviewer: "Alle",
+                reviewer: "Aram",
                 action: "edit",
                 submitted_transcript: Some("دەقی solo"),
                 served_transcript: RAW,

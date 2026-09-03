@@ -3085,7 +3085,7 @@ mod tests {
                 "INSERT INTO review_campaign_registry
                     (campaign_id, focus_segment_count, focus_sha256, first_reviewer, second_reviewer,
                      after_review_event_id, activated_at_review_event_id)
-                 VALUES('123e4567-e89b-42d3-a456-426614174000', 1, ?1, 'Rubar', 'Alle', 0, 0)",
+                 VALUES('123e4567-e89b-42d3-a456-426614174000', 1, ?1, 'Rezan', 'Aram', 0, 0)",
                 ["a".repeat(64)],
             )
             .unwrap();
@@ -4419,7 +4419,7 @@ mod tests {
         // Snapshot creation must keep enforcing the real controlled-pilot authority contract. Use
         // its exact roster so this fixture passes snapshot admission and reaches the independent
         // named-restore semantic gate for the deliberately half-written corpus row below.
-        let policy = test_pilot_policy(0, "Hawzhin", "Pavel");
+        let policy = test_pilot_policy(0, "Hawzhin", "Karwan");
         crate::review_pilot::install_test_focus(data_dir, ["half-target"]);
         std::fs::write(
             data_dir.join(crate::review_pilot::REVIEW_PILOT_FILE),
@@ -4916,7 +4916,7 @@ mod tests {
           "after_review_event_id": 0,
           "max_total_corpus_actions": 20,
           "reviewers": [
-            {"name": "Pavel", "max_corpus_actions": 10},
+            {"name": "Karwan", "max_corpus_actions": 10},
             {"name": "Hawzhin", "max_corpus_actions": 10}
           ]
         }"#;
@@ -4971,7 +4971,7 @@ mod tests {
             "installing policy is not the commit point; the pending barrier remains authoritative"
         );
         clear_review_pilot_restore_pending(&live_dir).unwrap();
-        assert_eq!(crate::review_pilot::load(&live_dir).unwrap().unwrap().reviewer_names(), vec!["Hawzhin", "Pavel"]);
+        assert_eq!(crate::review_pilot::load(&live_dir).unwrap().unwrap().reviewer_names(), vec!["Hawzhin", "Karwan"]);
 
         // Explicit absence removes an existing policy only under the same fail-closed marker.
         std::fs::remove_file(snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_FILE)).unwrap();
@@ -5020,7 +5020,7 @@ mod tests {
           "max_total_corpus_actions": 20,
           "reviewers": [
             {"name": "Hawzhin", "max_corpus_actions": 10},
-            {"name": "Pavel", "max_corpus_actions": 10}
+            {"name": "Karwan", "max_corpus_actions": 10}
           ]
         }"#;
         crate::review_pilot::install_test_focus(live.path(), ["live-focus"]);

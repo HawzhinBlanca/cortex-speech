@@ -48,7 +48,7 @@ def seed(root: Path) -> tuple[Path, Path, dict[str, object]]:
         );
         CREATE TABLE review_compensation_policies(policy_version TEXT PRIMARY KEY);
         INSERT INTO review_compensation_policies VALUES('review-iqd-v1-2026-08-21');
-        INSERT INTO review_events VALUES(875, 'legacy', 'Rubar', 'edit', 'couch');
+        INSERT INTO review_events VALUES(875, 'legacy', 'Rezan', 'edit', 'couch');
         CREATE TABLE import_jobs(id TEXT PRIMARY KEY, dir TEXT NOT NULL, total_files INTEGER NOT NULL, status TEXT NOT NULL);
         CREATE TABLE import_job_files(job_id TEXT NOT NULL, path TEXT NOT NULL);
         CREATE TABLE speech_segments(
@@ -91,11 +91,11 @@ def seed(root: Path) -> tuple[Path, Path, dict[str, object]]:
     conn.close()
 
     session: dict[str, object] = {
-        "reviewers": {"protected-rubar": "Rubar"},
+        "reviewers": {"protected-rezan": "Rezan"},
         "db_path": str(db_path),
         "spot_checks": [],
         "pilot_spot_checks": [],
-        "sessions": [{"token": "cookie-r", "reviewer": "Rubar", "issued_unix": 1}],
+        "sessions": [{"token": "cookie-r", "reviewer": "Rezan", "issued_unix": 1}],
         "pilot_policy": None,
     }
     (root / SESSION_FILE).write_text(json.dumps(session), encoding="utf-8")
@@ -149,7 +149,7 @@ def test_success_is_exact_history_preserving_and_session_byte_preserving() -> No
         )
         conn.close()
         assert rows == [("lamo-a", "Lamo", 1), ("lamo-b", "Lamo", 1), ("other-c", "Other", 7)]
-        assert events == [(875, "legacy", "Rubar", "edit", "couch")]
+        assert events == [(875, "legacy", "Rezan", "edit", "couch")]
         assert campaign == result["campaign"]
         assert campaign["focus_segment_count"] == 2
         assert Path(str(result["backup"]), "ACTIVATION_BACKUP.json").is_file()

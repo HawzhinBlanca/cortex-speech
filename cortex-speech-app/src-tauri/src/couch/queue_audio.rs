@@ -502,8 +502,8 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
         .map(|(s, revision)| {
             serde_json::json!({
                 "id": s.id,
-                // Alle's independent pass is genuinely blind: the backend serves the champion raw
-                // draft even though speech_segments now contains Rubar's first-pass correction.
+                // Aram's independent pass is genuinely blind: the backend serves the champion raw
+                // draft even though speech_segments now contains Rezan's first-pass correction.
                 // This is a data boundary, not a presentation hint.
                 "text": if pool_policy.is_some()
                     || campaign_policy.as_ref().is_some_and(|policy| policy.is_blinded_second_pass()) {

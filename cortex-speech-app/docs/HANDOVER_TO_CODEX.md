@@ -6,7 +6,7 @@
 > unclaimed work” statements are not current. Use
 > [`PRIVATE_PRODUCTION_10_COMPLETION_AUDIT_2026-08-24.md`](PRIVATE_PRODUCTION_10_COMPLETION_AUDIT_2026-08-24.md),
 > `../../docs/OWNER_CANON.md`, the active immutable release pointer, and the generated schema-2 pool
-> certification. The live authority is schema-63 flexible consensus with Rubar and Alle reviewing;
+> certification. The live authority is schema-63 flexible consensus with Rezan and Aram reviewing;
 > hidden checks are not the flexible-pool completion authority.
 
 > **Owner amendment after this handover:** section 3 records the earlier reject-zero proposal and is

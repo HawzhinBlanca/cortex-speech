@@ -17,7 +17,7 @@ from pathlib import Path
 MIGRATIONS = Path(__file__).resolve().parents[1] / "src-tauri" / "src" / "migrations" / "mod.rs"
 PREFIX_START = "pub static MIGRATIONS: &[Migration] = &["
 FIRST_APPEND_ONLY_MIGRATION = "    Migration {\n        version: 66,"
-PRODUCTION_1_TO_65_SHA256 = "92745eae14ae11016995a2010ff035453faf8d42d8d9edda52997feed73b3fd2"
+PRODUCTION_1_TO_65_SHA256 = "60b41b8452a490d40a62232f868ca0e2c2ff82ab095874359fa393a176f8ba7f"
 
 
 def historical_prefix(source: str) -> str:

@@ -4,7 +4,7 @@
     {
       "path": "src-tauri/src/migrations/mod.rs",
       "kind": "immutable-history",
-      "sha256": "340394bc26f45d703d6c71d46554027bc9a29524409954c93d7f1e0f81c87466",
+      "sha256": "cf2ae561a1f8f2274c81ca31dbd3e28c7fa7be331b21e266d8eac67a1a6824bf",
       "max_production_lines": 5605,
       "reason": "The append-only migration catalog contains the locked historical migrations and cannot be rewritten merely to satisfy a source-layout metric.",
       "basis": "Evidence-Backed 10/10 Plan: migrations 1-65 remain byte-identical and historical migrations are an immutable catalog."

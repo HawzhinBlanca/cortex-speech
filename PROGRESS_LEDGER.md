@@ -7890,7 +7890,7 @@ anywhere. Verified from the public internet, not just locally:
     GET /api/queue             -> 401      (no credential)
     GET /api/queue?t=<REAL>    -> 401      <- the leak, closed
     POST /api/claim {token}    -> 200 + Set-Cookie
-    GET /api/queue (cookie)    -> 200, reviewer=Lamo / reviewer=Sewa
+    GET /api/queue (cookie)    -> 200, reviewer=Lamo / reviewer=Sirwan
 
 35 test call sites authenticated with `?t=` and would have gone on proving a door the product no
 longer has; they present cookies now. Two tests changed SUBJECT rather than syntax and are recorded in
@@ -7952,7 +7952,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 ## Iteration 266 — the review session went live, and the save button that discarded the key
 
 **Two reviewers are working over the public internet, verified end to end from a browser.** The
-session is up for Lamo and Sewa on the Funnel host; 15 checks pass against the public URL, not
+session is up for Lamo and Sirwan on the Funnel host; 15 checks pass against the public URL, not
 localhost: shell 200, `/api/queue` and `/api/audio/<id>` 401 without the cookie, a REAL token in
 `?t=` still 401, claim 200 with `HttpOnly; SameSite=Strict`, an unknown token refused identically,
 and a 373 KB clip actually streaming to the reviewer.
@@ -8564,12 +8564,12 @@ true, which is the finding: no gate covered this class until this iteration.
 **Measured, on the live DB (read-only), 2026-08-13.** Of 180 `accept` decisions, **36 freeze text
 that matches NO ASR hypothesis on file** — not the champion `omniasr-wsl-7b`, not
 `finetuned-mms-ckb`, not `omniasr-ctc-300m`, not `omniasr-ctc-1b`. All 36 are pre-fix (before the
-2026-08-12 11:54 clear); 33 by Rubar, 3 by Lamo. Character divergence from the champion's own
+2026-08-12 11:54 clear); 33 by Rezan, 3 by Lamo. Character divergence from the champion's own
 transcript: median 5.2%, max 14.2%. Split by era, the control is clean: **0 of 31 post-fix accepts**
 diverge, which is what proves the accept path copies the served text verbatim — so a diverging
 accept means the text served was never the champion's.
 
-Sample (id `3330566c`, Rubar, 2026-08-11):
+Sample (id `3330566c`, Rezan, 2026-08-11):
 
 * champion RAW: `خێزانەکەمان بێ بە کۆمەڵگاکە بێ بە مامۆستایانی ئاینی بێت کە...`
 * APPROVED:     `خێزانەکەمان، کۆمەڵگاکە، یان مامۆستایانی ئایینی، کە...`
@@ -8668,9 +8668,9 @@ it rather than tapping accept.
 
 | reviewer | checks | noticed | mean CER vs the known answer |
 |---|---:|---:|---:|
-| Sewa | 16 | 14 (88%) | 0.102 |
+| Sirwan | 16 | 14 (88%) | 0.102 |
 | Hawzhin | 5 | 5 (100%) | 0.045 |
-| **Rubar** | **4** | **1 (25%)** | 0.069 |
+| **Rezan** | **4** | **1 (25%)** | 0.069 |
 | Lamo | 2 | 1 (50%) | 0.080 |
 
 **Second, independent instrument — the real corpus.** Share of each reviewer's decisions where the
@@ -8678,11 +8678,11 @@ final text is byte-identical to the draft they were handed:
 
 | reviewer | decisions | accept | edit | reject | text unchanged |
 |---|---:|---:|---:|---:|---:|
-| Sewa | 152 | 39 | 106 | 7 | 30% |
-| **Rubar** | **266** | **133** | 130 | 3 | **51%** |
+| Sirwan | 152 | 39 | 106 | 7 | 30% |
+| **Rezan** | **266** | **133** | 130 | 3 | **51%** |
 | Lamo | 27 | 2 | 19 | 6 | 30% |
 
-Rubar hands the draft back untouched on half her clips against 30% for both peers, and on the
+Rezan hands the draft back untouched on half her clips against 30% for both peers, and on the
 known-answer clips she changed 1 of 4 — leaving 5.2%, 5.8% and 13.7% CER against text a human had
 already established. The 20 requeued clips she redid today came back 19 accepts with ZERO character
 change and 1 edit.
@@ -8694,12 +8694,12 @@ careful reviewer would accept. And under the verbatim law, accepting the champio
 unchanged is often CORRECT, because what the refiner used to "fix" was frequently the speaker's own
 disfluency. None of that explains 1-of-4 on clips where the answer was already known.
 
-**Why it matters more than the numbers suggest:** Rubar has made 266 of the corpus's decisions —
-more than Sewa and Lamo combined. The dataset's quality is dominated by the reviewer with the
+**Why it matters more than the numbers suggest:** Rezan has made 266 of the corpus's decisions —
+more than Sirwan and Lamo combined. The dataset's quality is dominated by the reviewer with the
 weakest listening signal.
 
 **The instrument is not exhausted:** answer keys are owner-desktop decisions, excluded per reviewer
-only once used, so Rubar can still receive up to 18 more checks. The cheap next measurement is more
+only once used, so Rezan can still receive up to 18 more checks. The cheap next measurement is more
 of her own clips, not an argument about these four.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
@@ -8730,24 +8730,24 @@ produce. Spot-check pool healthy (22 keys).
 human-decided, which is what it was built to be, but nobody should call 454 clips a fine-tuning set
 without saying how small it is.
 
-**The QC signal got STRONGER, not weaker, with more data.** Rubar received 3 more known-answer clips
+**The QC signal got STRONGER, not weaker, with more data.** Rezan received 3 more known-answer clips
 after the earlier scorecard and changed none of them:
 
 | reviewer | checks | noticed | decisions owned |
 |---|---:|---:|---:|
-| Sewa | 16 | 14 (88%) | 152 |
+| Sirwan | 16 | 14 (88%) | 152 |
 | Hawzhin | 5 | 5 (100%) | 27 (desktop) |
-| **Rubar** | **7** | **1 (14%)** | **288** |
+| **Rezan** | **7** | **1 (14%)** | **288** |
 | Lamo | 2 | 1 (50%) | 27 |
 
-**Do NOT read `mean_cer` as a quality ranking** — Sewa's is HIGHER than Rubar's (0.102 vs 0.049)
-while Sewa notices 88% and Rubar notices 14%. The answer keys are owner-desktop decisions, and a reviewer
+**Do NOT read `mean_cer` as a quality ranking** — Sirwan's is HIGHER than Rezan's (0.102 vs 0.049)
+while Sirwan notices 88% and Rezan notices 14%. The answer keys are owner-desktop decisions, and a reviewer
 writing true verbatim can legitimately diverge from a key that was standardized. `noticed` is the
 robust signal because it measures engagement, not agreement.
 
-**The exposure, stated plainly:** Rubar decided 288 of 494 clips — 58% of the corpus, more than every
+**The exposure, stated plainly:** Rezan decided 288 of 494 clips — 58% of the corpus, more than every
 other reviewer combined — and she is the one reviewer whose listening signal is weak. The cheap next
-measurement is a blind second pass: route a sample of her 153 accepts through Sewa and measure the
+measurement is a blind second pass: route a sample of her 153 accepts through Sirwan and measure the
 disagreement rate. That also builds the double-pass adjudication tier the charter still lacks.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
@@ -9014,8 +9014,8 @@ questions earlier iterations asked and got wrong.
 **FIVE OF EIGHT REVIEWERS HAD A QUEUE OF ZERO, and two independent bugs hid each other.** The 1,031
 recovered clips were relinked into `D:\Kurdish Corpora\sorani\ZarPodcast`, but `dialect.rs` still
 mapped only their pre-recovery path (`SoraniVoice_PC_`), so all 535 pending Sorani clips were
-UNMAPPED — and the dialect check fails closed, so every Sorani-only reviewer (Alle, Roza, Sabat,
-Lamo, Sewa) was served nothing. Simultaneously the roster file itself was inert: it shipped with a
+UNMAPPED — and the dialect check fails closed, so every Sorani-only reviewer (Aram, Nasrin, Shilan,
+Lamo, Sirwan) was served nothing. Simultaneously the roster file itself was inert: it shipped with a
 `"_comment"` string explaining how to edit it, and a strict `HashMap<String, Vec<String>>` parse
 rejects that outright, whose failure path is "unrestricted" — so the dialect protection was OFF for
 everyone from the moment it was installed, including the three reviewers it was written for. A
@@ -9126,7 +9126,7 @@ verified+decided copy (106 groups) then decided (6) then the canonical fuller fi
 deleted in the same BEGIN IMMEDIATE transaction, `review_events` kept as append-only history.
 Library 14,828 → 14,658. Post-conditions, all measured on the live DB: 0 duplicate groups, 0 orphan
 child rows (plus 5 PRE-EXISTING stale spot_checks rows from the 08-13 incident found and removed),
-FTS in sync, integrity_check ok. Payment totals honestly adjusted (Sewa 25.0 → 17.8 min — her
+FTS in sync, integrity_check ok. Payment totals honestly adjusted (Sirwan 25.0 → 17.8 min — her
 double-reviewed twins were the bulk of the 117).
 
 **The 37 defective verified clips went back to the paid reviewers**, not to the owner: 27 two-voice
@@ -10263,7 +10263,7 @@ invisible to every existing gate, and both were found by reading the LIVE system
 append-only history:
 
 ```
-Lamo skip -> Rubar edit -> Lamo edit -> Sewa edit -> Rubar edit -> Roza edit -> Hawzhin ACCEPT
+Lamo skip -> Rezan edit -> Lamo edit -> Sirwan edit -> Rezan edit -> Nasrin edit -> Hawzhin ACCEPT
 ```
 
 Five humans corrected the clip; the sixth pressed Accept on what they saw. `accept` asserts something
@@ -10577,11 +10577,11 @@ manifest cannot produce library-derived slices). 9 legs owner-descoped, 3 owner-
 
 ```
 reviewer   receipts   mean coverage   min coverage
-Rubar            22           0.981          0.932     every single one above the bar
+Rezan            22           0.981          0.932     every single one above the bar
 Hawzhin          18           0.721          0.000
 ```
 
-Rubar's second device produced 22 receipts and not one false refusal. That was the whole point of the
+Rezan's second device produced 22 receipts and not one false refusal. That was the whole point of the
 pilot: `timeupdate` fires on a browser, not on a policy, and one phone proved nothing about another.
 Two phones now agree.
 
@@ -10686,7 +10686,7 @@ The staged desktop-enforcement build — already compiled, waiting only for the 
 it could deploy — would have refused essentially every honest desktop verdict. Clips are windows into
 shared source files (403 of 414 exportable clips live in ONE recording), and both desktop surfaces
 report the WHOLE file's length as the coverage denominator: an honest full listen of a 10 s clip
-scored ~0.004 against the 0.85 bar. The hold-for-Rubar pause is the only reason it wasn't live.
+scored ~0.004 against the 0.85 bar. The hold-for-Rezan pause is the only reason it wasn't live.
 
 ### Confirmed and fixed (each failing-first where a test could be written)
 
@@ -10770,8 +10770,8 @@ nothing), which is the safety working.
 ### Live, proven at the serving path for all eight reviewers
 
 ```
-Hawzhin / Rubar / Pavel   served 29 = 25 Kawa + 4 spot-checks   pendingTotal 905
-Alle / Lamo / Roza / Sabat / Sewa   served 0, pendingTotal 0  ("No clips in your dialect yet")
+Hawzhin / Rezan / Karwan   served 29 = 25 Kawa + 4 spot-checks   pendingTotal 905
+Aram / Lamo / Nasrin / Shilan / Sirwan   served 0, pendingTotal 0  ("No clips in your dialect yet")
 ```
 
 Kawa is Hawleri, the five are Sorani-restricted by the owner's roster, and the owner's decision is to
@@ -10950,9 +10950,9 @@ deployed  : exe at HEAD 65deefa, supervision OK (8 links answering), stale insta
 
 Same session, the canary and the roster met: readiness is 22 decisions / coverage-clean but
 single-reviewer — and the live queue gate shows why the second reviewer hasn't appeared. The
-Kawa_Hawleri focus leaves every sorani-only reviewer (Alle, Lamo, Roza, Sabat, Sewa) with a live
-link and ZERO servable clips; Alle's "empty queue" screenshot was the system obeying the roster,
-not a bug. The second canary reviewer must be Rubar or Pavel. Owner decision surfaced: five paid
+Kawa_Hawleri focus leaves every sorani-only reviewer (Aram, Lamo, Nasrin, Shilan, Sirwan) with a live
+link and ZERO servable clips; Aram's "empty queue" screenshot was the system obeying the roster,
+not a bug. The second canary reviewer must be Rezan or Karwan. Owner decision surfaced: five paid
 links are idle for as long as the focus holds.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
@@ -10962,7 +10962,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 Asked why one reviewer's link "doesn't work", and the answer was not the one I gave first. My initial
 read — dialect roster x voice focus = 0 clips, therefore a people problem — was HALF the story and
 the wrong half. Measured properly, six of eight paid reviewers had stopped at staggered dates
-(Sewa/Lamo 08-13, Roza/Sabat 08-15, Pavel 08-16, Alle 08-17) and the cause was a defect.
+(Sirwan/Lamo 08-13, Nasrin/Shilan 08-15, Karwan 08-16, Aram 08-17) and the cause was a defect.
 
 The pairing tokens were durable. The COOKIE the page authenticates with was not: `CouchState` was
 rebuilt with `..CouchState::default()` on every start, so the server forgot every session it had
@@ -11064,7 +11064,7 @@ Measured state:
 active Hawleri focus       : 1293 playable pending; 1293/1293 exact champion provenance
 global untouched backlog  : 8731 rows without champion hypothesis (focus must remain enforced)
 live review serving       : watchdog disabled; port 8737 down; 8/8 saved links unreachable
-reviewer allocation       : Alle/Lamo/Roza/Sabat/Sewa have 0 eligible clips under this focus
+reviewer allocation       : Aram/Lamo/Nasrin/Shilan/Sirwan have 0 eligible clips under this focus
 hidden-check pool         : 0,2,0,2,0,0,0,0 — all eight reviewers below floor
 playback canary           : 0/20 post-deployment decisions
 frontend                  : 283 tests; typecheck/lint/build pass; format check red on 6 old files
@@ -11143,7 +11143,7 @@ edit 100% / unchanged accept 10% / valid reject 10% schedule is still not implem
 the literal owner authorization `change canon: review compensation` and a versioned immutable ledger.
 
 Serving-path result remains **NO-GO**: all eight links are down while the importer owns the database;
-Alle/Lamo/Roza/Sabat/Sewa have zero eligible Hawleri work; hidden-check capacity is
+Aram/Lamo/Nasrin/Shilan/Sirwan have zero eligible Hawleri work; hidden-check capacity is
 0,2,0,2,0,0,0,0; and the exact new binary has 0/20 required playback-evidenced decisions. Those are
 real campaign/owner/reviewer prerequisites, not defects that may be fabricated away.
 
@@ -11211,8 +11211,8 @@ human decisions : 623
 active focus     : yes
 cadence          : 25 work clips; ceil(batch/8) checks per refill
 Hawzhin          : 2 available / 207 required for 1293 accessible work clips
-Pavel            : 2 / 207 for 1293
-Rubar            : 0 / 207 for 1293
+Karwan            : 2 / 207 for 1293
+Rezan            : 0 / 207 for 1293
 other five       : 0 / 3 with zero accessible Hawleri work
 ```
 
@@ -11230,7 +11230,7 @@ authorization remains `change canon: review compensation`.
 
 ## 2026-08-23 — schema-61 release-gate convergence
 
-Hardened the Rubar-first/Alle-second Lamo campaign without contacting reviewers, starting services,
+Hardened the Rezan-first/Aram-second Lamo campaign without contacting reviewers, starting services,
 or loading a GPU. Production review ownership remains fail-closed: generic machine writers cannot
 author or overwrite human decisions, and historical test data now enters only through explicit
 test-only legacy fixtures. Fixed a real stale machine-upsert defect that could erase an existing
@@ -11260,8 +11260,8 @@ requeues. Resolved clips leave the queue and no fourth review is served.
 
 Added fail-closed exact owner-rights stamping, immutable per-voice certificates, deterministic staged
 ASR/TTS export, read-only certification, five-minute watchdog certification, and an isolated daily
-restore drill. On the live-sized clone, queue p95 measured 542.413 ms for Rubar and 537.993 ms for
-Alle against the 750 ms gate; two-reviewer decision commit p95 measured 4.889 ms against the 500 ms
+restore drill. On the live-sized clone, queue p95 measured 542.413 ms for Rezan and 537.993 ms for
+Aram against the 750 ms gate; two-reviewer decision commit p95 measured 4.889 ms against the 500 ms
 gate. A real offsite snapshot restored and verified in 3.355 seconds against the five-minute RTO.
 
 Release-boundary hardening now stages an immutable, hash-bound app/admin/operations bundle outside
@@ -11270,7 +11270,7 @@ marker, and journals every handover phase. The watchdog refuses malformed or tam
 pointers. Recovery restores the pinned v62 snapshot only when no v63 judgment exists; after the first
 v63 judgment it preserves that database and permits only a verified schema-63-compatible binary
 rollback. A staged rehearsal passed at schema 63 with all 20,323 audio clips present and exact rights
-coverage. Canonical read-only probes found 20,321 available clips for Rubar and 17,374 for Alle,
+coverage. Canonical read-only probes found 20,321 available clips for Rezan and 17,374 for Aram,
 materialized a valid 223,916-byte RIFF/WAVE clip, and verified live submission idempotency authority.
 
 Final isolated verification: Rust library 1,527 passed / 0 failed / 8 intentionally ignored
@@ -11335,7 +11335,7 @@ Commit `8ef5d3c1b29e41ea926bcf8ab22e3b8b2e68334d` was built as immutable release
 `8ef5d3c1b29e-8a999c88e220-2ad63448136e`, passed the live-sized schema-63 clone, and completed a
 protected same-schema handover. Independent live proof after exposure: exactly one active release
 process; database integrity healthy with zero foreign-key violations; 20,323/20,323 audio clips and
-20,323/20,323 exact rights; preserved Rubar and Alle local/Funnel credentials; valid WAV and
+20,323/20,323 exact rights; preserved Rezan and Aram local/Funnel credentials; valid WAV and
 idempotency probes; queue p95 153.54 ms and 150.97 ms; fresh local and `F:` snapshots; and watchdog
 result zero on its five-minute clock. No GPU or ASR inference ran.
 
@@ -11358,7 +11358,7 @@ master verification command still demanded the retired legacy pilot-policy file.
 master verifier. It requires the exact schema-63 pool registry, complete immutable membership,
 distinct durable reviewer identities, exact database binding, fixed port, and no simultaneous legacy
 pilot policy; pre-pool databases still fall back to the exact legacy contract. Twenty focused policy
-tests and nine release-controller tests passed. Fresh read-only checks authenticated Alle and Rubar
+tests and nine release-controller tests passed. Fresh read-only checks authenticated Aram and Rezan
 through both local HTTPS and the public Funnel without minting sessions, taking leases, or changing
 review data. This proof-only correction also requires no live release interruption.
 
@@ -11411,8 +11411,8 @@ clone preflight before exposure. Active release
 `b3cc0dfd35163f1512d399da6f8cbc119e92c88d5fa4ef20192a53bde3361a7b`, and
 `af72e4ccbf6a7ae9eb5b988197073096d4ec6d439c32fa019b158604837c6378`. Independent live proof found
 one exact listener, schema 65 quick/full integrity `ok`, zero foreign keys, 16,990/16,990 canonical
-audio, exact rights, zero dedup risk, and `reviewReady=true`. The mode-aware queue proof reports Alle
-14,041 and Rubar 16,988 eligible clips after dialect policy; both local and Funnel links authenticate
+audio, exact rights, zero dedup risk, and `reviewReady=true`. The mode-aware queue proof reports Aram
+14,041 and Rezan 16,988 eligible clips after dialect policy; both local and Funnel links authenticate
 read-only. Fresh verified local and `F:` schema-65 snapshots satisfy the ten-minute RPO, and snapshot
 `F:/cortex-backups/snapshots/snapshot_1787574862` restored alone in 3.925 seconds. The watchdog is
 enabled with last result zero. Human resolution remains incomplete; no GPU or ASR inference ran.
@@ -11442,8 +11442,8 @@ scan reports zero cross-file duplicate content; all 105 Python policy scripts pa
 syntax, and diff integrity pass; the counted Rust aggregate ran 1,649 tests across 43 binaries with a
 1,541/0/8 library result; and the exact active binary passed a positive-control egress probe with
 2,389 offline workload loops and zero non-loopback backend TCP endpoints. Final live readback kept
-`reviewReady=true`, both Alle/Rubar links authenticating, supervision green, complete audio/rights,
-zero integrity/dedup risk, and fresh local/offsite snapshots. Human progress remains two Rubar
+`reviewReady=true`, both Aram/Rezan links authenticating, supervision green, complete audio/rights,
+zero integrity/dedup risk, and fresh local/offsite snapshots. Human progress remains two Rezan
 judgments, zero resolutions, and 0/20 playback canary decisions. The active release was deliberately
 not restarted, and no live database write, GPU, model server, ASR inference, or synthetic judgment was
 used.
@@ -11462,8 +11462,8 @@ total 5,695,335 with zero crashes. All 106 Python policy scripts, including five
 policy assertions, passed on the final code. Live read-only certification remained `reviewReady=true`
 at schema 65 with all 162 contract objects exact, quick/full integrity `ok`, zero foreign keys,
 16,990/16,990 canonical audio, exact rights 20,323/20,323, zero dedup risk, fresh verified local and
-`F:` snapshots, Alle/Rubar authenticating, and supervision green with 424.8 GB free. Human progress stayed
-two Rubar judgments, zero resolutions, and 0/20 post-release playback decisions. No reviewer restart,
+`F:` snapshots, Aram/Rezan authenticating, and supervision green with 424.8 GB free. Human progress stayed
+two Rezan judgments, zero resolutions, and 0/20 post-release playback decisions. No reviewer restart,
 live database write, GPU, model server, ASR inference, or synthetic judgment occurred.
 
 ## 2026-08-25 — deep adversarial audit, and the remediation of 53 of its 55 findings
@@ -12016,7 +12016,7 @@ and any target whose fix would land in a file codex is refactoring is SKIPPED (t
 - `bfd7f280` `f50671af` `15509821` review-campaign forgery refusals, adjudication lifecycle,
   second-pass activation refusals; `d1d7c81a` all sixteen playback-error mapper arms.
 - `f1d7417b` `a334408f` pool activation + voice certificate + decision refusals, and the pay-once
-  rule (a re-typed `"RUBAR  "` cannot become a second payable opinion).
+  rule (a re-typed `"REZAN  "` cannot become a second payable opinion).
 - `6deb6f84` pay arithmetic asserted as literals (1s edit = 5_000_000 micro-IQD) and the anti-split
   work-id namespace — the rule stopping one clip becoming several paid work ids.
 - `629947b0` `3d4d74c4` restore effect-graph refusals: forged effect on a skip event, a decision
@@ -12175,7 +12175,7 @@ migration handover at 22:00 and was verified at the serving path, not the pipeli
 - Serving-path proof (post-READY, independent): active pointer AND the running process both name
   the new release; live DB at schema 69 with 32,322 segments / 1,293 review_events intact; the
   review-health probe at 22:03 — all 6 links AUTHENTICATE through the funnel, exact queues
-  (Alle 14,041 / Hawzhin 16,973 / Pavel 16,990 / Roza 14,041 / Rubar 16,599 / Sabat 14,031),
+  (Aram 14,041 / Hawzhin 16,973 / Karwan 16,990 / Nasrin 14,041 / Rezan 16,599 / Shilan 14,031),
   link continuity unchanged, vault unchanged; alarm forwarder exit 0; and a 3-minute rollback
   watch across multiple watchdog cycles — the pointer did not flip (the 77-second silent-revert
   class was checked for, not assumed away).
@@ -12296,7 +12296,7 @@ stays halted (canon hard-stop) until the owner frees VRAM and reruns start_7b_se
 ## 2026-08-31 — Canon change: reviewer capacity 8 → 10, by the owner's literal authorization
 
 The owner wrote `change canon: raise max reviewers 8 → 10` (chat, 2026-08-31) for today's
-roster: 8 working reviewers (Hawzhin, Sabat, Rubar, Lamo, Sewa, Roza, Pavel, Alle) plus the
+roster: 8 working reviewers (Hawzhin, Shilan, Rezan, Lamo, Sirwan, Nasrin, Karwan, Aram) plus the
 Iftikhar and Guest links — minted ONCE at 10 so the roster never changes again (a roster change
 remints every distributed link; the whole point is links that never move).
 
@@ -12319,8 +12319,8 @@ The roster change itself ran on the real release app over the repo's documented 
 red was that gate correctly noticing, 140/141 otherwise): Stop → 10 names → Start. Verified at
 the serving path, with real credentials, before handover to the owner:
 
-- check_reviewer_links_live --funnel: ALL 10 AUTHENTICATE (Alle, Guest, Hawzhin, Iftikhar, Lamo,
-  Pavel, Roza, Rubar, Sabat, Sewa).
+- check_reviewer_links_live --funnel: ALL 10 AUTHENTICATE (Aram, Guest, Hawzhin, Iftikhar, Lamo,
+  Karwan, Nasrin, Rezan, Shilan, Sirwan).
 - Full phone path as Iftikhar (brand-new token): claim 200 → queue 200 (clip 7158da8b, 5.9 s) →
   playback/start 200 (contract 4, receipt minted) → audio 206 + full 200 = 190,124 bytes.
 - Probe exit 0: links 10/10, queues 10/10 with clips (154,737 reviewer-eligible pending),
@@ -14202,3 +14202,33 @@ last, and a fresh identity admitted afterwards; (3) the normalization refusal ar
 rejection. Mutation bite-proof: stamping the committed rows with a wrong normalizer version reds the
 end-to-end test. `commands/batch.rs` was the lowest-covered command file (30 % lines); no policy pin
 greps the changed shapes. Coverage stays a standing campaign: no re-measurement, no attestation.
+
+## 2026-09-03 — Step 2: `public/clean-release` regenerated as main + scrub + gate
+
+Following the owner's decision (land first, then regenerate), the de-identified branch was rebuilt
+from the merged `main` rather than merged. The old branch is superseded and #72 closed; nothing was
+rebased or force-pushed.
+
+**The original scrub could not be reused.** There was no script — `76ec869b` was 41 hand-edited files
+— and it was not a consistent mapping: one real name became both "Sara" and "Rezan" by file, and two
+different real names both became "Karwan". A tool now does it deterministically: names are recovered
+in-process from that commit's diff and never printed; each maps to ONE distinct placeholder everywhere;
+matching is at letter boundaries so snake_case identifiers (`record_<name>`, `<name>_second_pass_…`)
+are covered; the source's case shape is carried (recased probes stay recased); line endings are
+preserved byte-for-byte; voice names are corpus data and untouched.
+
+Placeholders are six names verified absent from `main`: `Aram`, `Karwan`, `Nasrin`, `Rezan`, `Shilan`,
+`Sirwan`. Two facts decided them. `main` uses `Sara` and `Hemn` as generic test personas (couch fixtures
+build rosters from them), so mapping a real reviewer onto either made "a different reviewer" the SAME
+reviewer and failed five tests. And `ReviewPilotPolicy` canonicalises reviewers into sorted order, with
+tests asserting that order alongside the owner's own name, which the gate deliberately leaves unscrubbed —
+so each placeholder keeps its real name's sort position relative to it. The one pinned policy digest was
+re-pinned to the value measured on the scrubbed tree; stability and change-with-baseline still hold.
+
+**Migration 61 and the catalog pins.** The scrub rewrites two reviewer names inside migration 61 (a comment and two `CHECK` constraints), exactly as the original scrub did — leaving real names in a public SQL constraint is not an option. Since then `main` gained two gates that pin the migration catalog's hash (`test_historical_migration_prefix.py` and the private-production schema contract), so this branch re-pins those digests over the *scrubbed* catalog: four values across three files, each re-measured on the result, with the append-only contract (migrations 66–69) untouched. `main` and the private mirror keep the real, immutable catalog. This branch is a de-identified copy, not a deployable line: its migration 61 differs from the one applied to production.
+
+One test fixture path carried the owner's username in a home directory; it is rewritten and the tree is proven to hold zero user-home paths. The owner's public author email (NOTICE, README, Cargo.toml) and username-free workstation paths (`D:\`, WSL shares) are left as they are — the owner's own identity is deliberately not scrubbed.
+
+**Measured:** 46 files, 935 replacements, 0 residue by the gate's tokenizer, no filename carries a
+name; `test_deidentified_tree.py` OK with its anti-vacuity probe firing; the diff ignoring CR-at-EOL
+equals the full diff. `cargo test --lib`: 2,611 passed, 0 failed, 8 ignored (final tree, main ced96865). Full policy suite: 146 of 146 policy test scripts passed (147 gates incl. the de-identification gate).

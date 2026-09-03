@@ -203,7 +203,7 @@ struct CouchState {
     /// Pre-decision row snapshots, keyed by reviewer name — so undo is per-person and can never
     /// retract someone else's work.
     undo: HashMap<String, Vec<UndoEntry>>,
-    /// Separate from first-pass undo so Alle can never route an undo into Rubar's corpus effect.
+    /// Separate from first-pass undo so Aram can never route an undo into Rezan's corpus effect.
     independent_undo: HashMap<String, Vec<IndependentUndoEntry>>,
     /// Independent observations made in the flexible pool. Kept separate from the retired sequential
     /// campaign namespace so an Undo can never cross from one evidence system into the other.
@@ -295,7 +295,7 @@ struct CouchState {
     /// The exact operating policy this session was started under. A file edit never hot-resets a
     /// paid counter: any mismatch pauses requests until the owner explicitly stops and restarts.
     pilot_policy: Option<crate::review_pilot::ReviewPilotPolicy>,
-    /// Rubar-only full first pass. Unlike the bounded pilot this has no action cap and deliberately
+    /// Rezan-only full first pass. Unlike the bounded pilot this has no action cap and deliberately
     /// mints no pseudo-gold hidden checks; its database-bound contract blocks every export until an
     /// independent second pass exists. Any live policy/focus drift pauses the request path.
     campaign_policy: Option<crate::review_campaign::SequentialReviewCampaign>,
@@ -488,7 +488,7 @@ fn normalize_reviewers(names: &[String]) -> Result<Vec<String>, String> {
 /// ONE definition of "the same person", used everywhere a reviewer name is matched against another.
 ///
 /// `normalize_reviewers` trims but deliberately PRESERVES the casing the owner typed, and the review
-/// columns are `COLLATE NOCASE`, so "rubar" and "Rubar" are one reviewer to the roster and to the
+/// columns are `COLLATE NOCASE`, so "rezan" and "Rezan" are one reviewer to the roster and to the
 /// database. Every `==` that slipped in disagreed, and each one failed silently: a re-typed roster
 /// minted a FRESH pairing token (so every link already sent answers "link expired"), dropped the
 /// restored cookie sessions (installed phone shortcuts die), and dropped the remembered served-check
@@ -1111,7 +1111,7 @@ mod tests {
         let (_db, db_path) = test_db(tmp.path());
         let pairing = HashMap::from([
             ("pair-hawzhin".to_string(), "Hawzhin".to_string()),
-            ("pair-pavel".to_string(), "Pavel".to_string()),
+            ("pair-karwan".to_string(), "Karwan".to_string()),
         ]);
         let policy = probe_test_policy();
         let now_seconds = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -1123,7 +1123,7 @@ mod tests {
         sessions.insert("expired-cookie".to_string(), ("Hawzhin".to_string(), expired));
         let spot_checks = HashSet::from([
             ("hidden-h".to_string(), "Hawzhin".to_string()),
-            ("hidden-p".to_string(), "Pavel".to_string()),
+            ("hidden-p".to_string(), "Karwan".to_string()),
         ]);
         let pilot_spot_checks = spot_checks.clone();
         save_session(tmp.path(), &pairing, &db_path, &spot_checks, &pilot_spot_checks, &sessions, Some(&policy))
@@ -1139,14 +1139,14 @@ mod tests {
                 }],
             )]),
             in_flight_operations: HashSet::from(["in-flight-operation".to_string()]),
-            leases: HashMap::from([("leased-segment".to_string(), ("Pavel".to_string(), Instant::now()))]),
+            leases: HashMap::from([("leased-segment".to_string(), ("Karwan".to_string(), Instant::now()))]),
             reviewers: sessions.iter().map(|(token, (reviewer, _))| (token.clone(), reviewer.clone())).collect(),
             pairing_codes: pairing,
             session_issued: sessions.into_iter().map(|(token, (_, at))| (token, at)).collect(),
             spot_checks,
             pilot_spot_checks,
             session_store: Some((tmp.path().to_path_buf(), db_path.clone())),
-            skipped: HashMap::from([("Pavel".to_string(), HashSet::from(["skipped-segment".to_string()]))]),
+            skipped: HashMap::from([("Karwan".to_string(), HashSet::from(["skipped-segment".to_string()]))]),
             pilot_policy: Some(policy.clone()),
             ..CouchState::default()
         });
@@ -1182,7 +1182,7 @@ mod tests {
             br#"{}"#,
             br#"{"token":42}"#,
             br#"{"token":"pair-hawzhin","extra":true}"#,
-            br#"{"token":"pair-hawzhin","token":"pair-pavel"}"#,
+            br#"{"token":"pair-hawzhin","token":"pair-karwan"}"#,
             br#"{"token":"unknown"}"#,
             br#"{"token":"cookie-0"}"#,
             oversized.as_slice(),
@@ -1523,7 +1523,7 @@ mod tests {
                     max_corpus_actions: crate::review_pilot::REVIEW_PILOT_CORPUS_ACTIONS_PER_REVIEWER,
                 },
                 crate::review_pilot::ReviewPilotReviewer {
-                    name: "Pavel".to_string(),
+                    name: "Karwan".to_string(),
                     max_corpus_actions: crate::review_pilot::REVIEW_PILOT_CORPUS_ACTIONS_PER_REVIEWER,
                 },
             ],
@@ -1580,7 +1580,7 @@ mod tests {
         }
         std::fs::write(
             tmp.path().join("voice_focus.json"),
-            serde_json::json!({"name":"Rubar first pass", "segment_ids": &ids}).to_string(),
+            serde_json::json!({"name":"Rezan first pass", "segment_ids": &ids}).to_string(),
         )
         .unwrap();
         let focus = crate::review_campaign::focus_evidence(&ids).unwrap();
@@ -1589,7 +1589,7 @@ mod tests {
             campaign_id: "123e4567-e89b-42d3-a456-426614174000".into(),
             mode: crate::review_campaign::SEQUENTIAL_CAMPAIGN_MODE.into(),
             status: crate::review_campaign::SEQUENTIAL_CAMPAIGN_STATUS.into(),
-            reviewer: "Rubar".into(),
+            reviewer: "Rezan".into(),
             after_review_event_id: 0,
             activated_at_review_event_id: 0,
             focus_segment_count: focus.segment_count,
@@ -1605,23 +1605,23 @@ mod tests {
             )
             .unwrap();
         let state = Mutex::new(CouchState {
-            pairing_codes: HashMap::from([("pair-rubar".into(), "Rubar".into())]),
+            pairing_codes: HashMap::from([("pair-rezan".into(), "Rezan".into())]),
             session_store: Some((tmp.path().to_path_buf(), db_path)),
             campaign_policy: Some(campaign),
             ..CouchState::default()
         });
 
-        let (code, _, body, ..) = api_queue(&db, "Rubar", &state);
+        let (code, _, body, ..) = api_queue(&db, "Rezan", &state);
         assert_eq!(code, 200, "campaign queue failed: {}", String::from_utf8_lossy(&body));
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["items"].as_array().unwrap().len(), QUEUE_BATCH);
         assert!(lock_state(&state).spot_checks.is_empty(), "first pass must not mint circular hidden keys");
 
-        let (code, ..) = api_queue(&db, "Alle", &state);
-        assert_eq!(code, 503, "the first pass must authorize Rubar only");
+        let (code, ..) = api_queue(&db, "Aram", &state);
+        assert_eq!(code, 503, "the first pass must authorize Rezan only");
         std::fs::write(tmp.path().join("voice_focus.json"), r#"{"name":"drift", "segment_ids":["campaign-00"]}"#)
             .unwrap();
-        let (code, ..) = api_queue(&db, "Rubar", &state);
+        let (code, ..) = api_queue(&db, "Rezan", &state);
         assert_eq!(code, 503, "focus drift must pause the live queue");
     }
 
@@ -1653,12 +1653,12 @@ mod tests {
         let first_revision = db.segment_review_revision("pool-reviewed").unwrap().unwrap();
         let first_operation = "30000000-0000-4000-8000-000000000001";
         let first_hash =
-            crate::db::review_operation_payload_hash("pool-reviewed", "edit", "Rubar first truth", "Rubar");
+            crate::db::review_operation_payload_hash("pool-reviewed", "edit", "Rezan first truth", "Rezan");
         db.record_phone_human_decision_by_at_revision_with_operation(
             "pool-reviewed",
             "edit",
-            Some("Rubar first truth"),
-            "Rubar",
+            Some("Rezan first truth"),
+            "Rezan",
             first_revision,
             first_operation,
             &first_hash,
@@ -1678,18 +1678,18 @@ mod tests {
         )
         .unwrap();
         let state = Mutex::new(CouchState {
-            pairing_codes: HashMap::from([("pair-rubar".into(), "Rubar".into()), ("pair-alle".into(), "Alle".into())]),
+            pairing_codes: HashMap::from([("pair-rezan".into(), "Rezan".into()), ("pair-aram".into(), "Aram".into())]),
             session_store: Some((tmp.path().to_path_buf(), db_path)),
             pool_policy: Some(pool.clone()),
             ..CouchState::default()
         });
 
-        let (code, _, body, ..) = api_queue(&db, "Alle", &state);
+        let (code, _, body, ..) = api_queue(&db, "Aram", &state);
         assert_eq!(code, 200, "pool queue failed: {}", String::from_utf8_lossy(&body));
         let queue: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(queue["reviewPool"], true);
         // OWNER CANON 2026-08-29: a sentence is decided by any two DIFFERENT reviewers, so the clip
-        // NEAREST a decision is offered first. "pool-reviewed" already holds Rubar's opinion and one
+        // NEAREST a decision is offered first. "pool-reviewed" already holds Rezan's opinion and one
         // more judgement retires it; "pool-unreviewed" needs two. This assertion was the reverse
         // ("zero-coverage clips must be offered first") until the canon landed -- breadth-first
         // maximised clips touched and left 416 live clips holding one review with none decided.
@@ -1698,7 +1698,7 @@ mod tests {
         assert_eq!(queue["items"][1]["id"], "pool-unreviewed");
         assert_eq!(queue["items"][1]["speakerId"], "Halwest");
         // Unchanged and load-bearing: ordering must never leak the first reviewer's answer.
-        assert_eq!(queue["items"][0]["text"], "champion reviewed draft", "later reviews stay blind to Rubar's answer");
+        assert_eq!(queue["items"][0]["text"], "champion reviewed draft", "later reviews stay blind to Rezan's answer");
 
         // REGRESSION (2026-08-30 live incident): the decision-first ordering serves an
         // already-reviewed clip FIRST, so `verified=true` is the NORMAL state of every pool
@@ -1710,7 +1710,7 @@ mod tests {
             &db,
             &state,
             "pool-reviewed",
-            "Alle",
+            "Aram",
             "test-session-binding-pool",
             "40000000-0000-4000-8000-0000000000aa",
         );
@@ -1722,26 +1722,26 @@ mod tests {
             "operationId": pool_operation_id,
             "id": "pool-reviewed",
             "action": "edit",
-            "text": "Alle independent truth",
-            "reviewer": "Alle",
+            "text": "Aram independent truth",
+            "reviewer": "Aram",
             "rowVersion": row_version,
             "heardMs": 1_500,
             "clipDurationMs": 1_500,
         });
-        let (code, _, body, ..) = api_decision(&db, decision.to_string().as_bytes(), "Alle", &state);
+        let (code, _, body, ..) = api_decision(&db, decision.to_string().as_bytes(), "Aram", &state);
         assert_eq!(code, 200, "pool decision failed: {}", String::from_utf8_lossy(&body));
         let pool_receipt: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let pool_decision_id = pool_receipt["poolDecisionId"].as_i64().unwrap();
         let canonical = db.get_segment_by_id("pool-reviewed").unwrap().unwrap();
-        assert_eq!(canonical.reviewed_by.as_deref(), Some("Rubar"));
-        assert_eq!(canonical.annotated_transcript.as_deref(), Some("Rubar first truth"));
+        assert_eq!(canonical.reviewed_by.as_deref(), Some("Rezan"));
+        assert_eq!(canonical.annotated_transcript.as_deref(), Some("Rezan first truth"));
         let lamo = crate::review_pool::coverage_by_voice(&db)
             .unwrap()
             .into_iter()
             .find(|row| row.voice_name == "Lamo")
             .unwrap();
-        assert_eq!(lamo.two_reviews, 1, "Rubar plus Alle must calculate as two distinct reviews");
-        assert!(!crate::review_pool::pending_segment_ids(&db, &pool, "Alle", None)
+        assert_eq!(lamo.two_reviews, 1, "Rezan plus Aram must calculate as two distinct reviews");
+        assert!(!crate::review_pool::pending_segment_ids(&db, &pool, "Aram", None)
             .unwrap()
             .contains(&"pool-reviewed".to_string()));
 
@@ -1756,12 +1756,12 @@ mod tests {
         };
         assert_eq!(pool_decision_count(), 1);
         let restarted_state = Mutex::new(CouchState {
-            pairing_codes: HashMap::from([("pair-alle".into(), "alle".into())]),
+            pairing_codes: HashMap::from([("pair-aram".into(), "aram".into())]),
             session_store: Some((tmp.path().to_path_buf(), db.path().to_string())),
             pool_policy: Some(pool.clone()),
             ..CouchState::default()
         });
-        let (code, _, replay_body, ..) = api_decision(&db, decision.to_string().as_bytes(), "alle", &restarted_state);
+        let (code, _, replay_body, ..) = api_decision(&db, decision.to_string().as_bytes(), "aram", &restarted_state);
         assert_eq!(code, 200, "case-only pool replay must ACK");
         let replay: serde_json::Value = serde_json::from_slice(&replay_body).unwrap();
         assert_eq!(replay["duplicate"], true);
@@ -1772,7 +1772,7 @@ mod tests {
         let mut changed_text = decision.clone();
         changed_text["text"] = serde_json::json!("different pool truth");
         for (label, payload) in [("action", changed_action), ("text", changed_text)] {
-            let (code, ..) = api_decision(&db, payload.to_string().as_bytes(), "alle", &restarted_state);
+            let (code, ..) = api_decision(&db, payload.to_string().as_bytes(), "aram", &restarted_state);
             assert_eq!(code, 409, "changed pool {label} must conflict");
             assert_eq!(pool_decision_count(), 1);
         }
@@ -1788,17 +1788,17 @@ mod tests {
             "decisionOperationId": pool_operation_id,
             "reversalOperationId": "30000000-0000-4000-8000-000000000003",
         });
-        let (code, _, body, ..) = api_undo_with_body(&db, undo_request.to_string().as_bytes(), "Alle", &state);
+        let (code, _, body, ..) = api_undo_with_body(&db, undo_request.to_string().as_bytes(), "Aram", &state);
         assert_eq!(code, 200, "pool undo failed: {}", String::from_utf8_lossy(&body));
-        assert!(crate::review_pool::pending_segment_ids(&db, &pool, "Alle", None)
+        assert!(crate::review_pool::pending_segment_ids(&db, &pool, "Aram", None)
             .unwrap()
             .contains(&"pool-reviewed".to_string()));
         let canonical = db.get_segment_by_id("pool-reviewed").unwrap().unwrap();
-        assert_eq!(canonical.reviewed_by.as_deref(), Some("Rubar"));
-        assert_eq!(canonical.annotated_transcript.as_deref(), Some("Rubar first truth"));
+        assert_eq!(canonical.reviewed_by.as_deref(), Some("Rezan"));
+        assert_eq!(canonical.annotated_transcript.as_deref(), Some("Rezan first truth"));
         let retry_state = Mutex::new(CouchState { pool_policy: Some(pool), ..CouchState::default() });
         let (code, _, retry_body, ..) =
-            api_undo_with_body(&db, undo_request.to_string().as_bytes(), "alle", &retry_state);
+            api_undo_with_body(&db, undo_request.to_string().as_bytes(), "aram", &retry_state);
         assert_eq!(code, 200, "lost-response restart retry must replay the exact pool reversal");
         let retry: serde_json::Value = serde_json::from_slice(&retry_body).unwrap();
         assert_eq!(retry["poolDecisionId"], pool_decision_id);
@@ -1840,13 +1840,13 @@ mod tests {
         )
         .unwrap();
         let state = Mutex::new(CouchState {
-            pairing_codes: HashMap::from([("pair-rubar".into(), "Rubar".into())]),
+            pairing_codes: HashMap::from([("pair-rezan".into(), "Rezan".into())]),
             session_store: Some((tmp.path().to_path_buf(), db_path)),
             pool_policy: Some(pool),
             ..CouchState::default()
         });
 
-        let (queue_code, _, queue_body, ..) = api_queue(&db, "Rubar", &state);
+        let (queue_code, _, queue_body, ..) = api_queue(&db, "Rezan", &state);
         assert_eq!(queue_code, 200, "pool queue failed: {}", String::from_utf8_lossy(&queue_body));
         let queue: serde_json::Value = serde_json::from_slice(&queue_body).unwrap();
         let item = &queue["items"][0];
@@ -1860,7 +1860,7 @@ mod tests {
             "heardMs": 1_500,
             "clipDurationMs": 1_500,
         });
-        let (decision_code, _, decision_body, ..) = api_decision(&db, body.to_string().as_bytes(), "Rubar", &state);
+        let (decision_code, _, decision_body, ..) = api_decision(&db, body.to_string().as_bytes(), "Rezan", &state);
         assert_eq!(
             decision_code,
             200,
@@ -1870,7 +1870,7 @@ mod tests {
         let events: i64 = db
             .connection()
             .query_row(
-                "SELECT COUNT(*) FROM review_events WHERE segment_id=?1 AND reviewer='Rubar'",
+                "SELECT COUNT(*) FROM review_events WHERE segment_id=?1 AND reviewer='Rezan'",
                 [&unreviewed.id],
                 |row| row.get(0),
             )
@@ -1886,12 +1886,12 @@ mod tests {
         db.insert_segment(&seg(id, "champion raw draft")).unwrap();
         let first_revision = db.segment_review_revision(id).unwrap().unwrap();
         let first_operation = "40000000-0000-4000-8000-000000000001";
-        let first_hash = crate::db::review_operation_payload_hash(id, "edit", "Rubar corrected truth", "Rubar");
+        let first_hash = crate::db::review_operation_payload_hash(id, "edit", "Rezan corrected truth", "Rezan");
         db.record_phone_human_decision_by_at_revision_with_operation(
             id,
             "edit",
-            Some("Rubar corrected truth"),
-            "Rubar",
+            Some("Rezan corrected truth"),
+            "Rezan",
             first_revision,
             first_operation,
             &first_hash,
@@ -1905,7 +1905,7 @@ mod tests {
             campaign_id: "123e4567-e89b-42d3-a456-426614174000".into(),
             mode: crate::review_campaign::SEQUENTIAL_CAMPAIGN_MODE.into(),
             status: crate::review_campaign::SEQUENTIAL_CAMPAIGN_STATUS.into(),
-            reviewer: "Rubar".into(),
+            reviewer: "Rezan".into(),
             after_review_event_id: 0,
             activated_at_review_event_id: 1,
             focus_segment_count: focus.segment_count,
@@ -1928,35 +1928,35 @@ mod tests {
         crate::review_campaign::activate_second_pass(&db, &ids, 1).unwrap();
         let campaign = crate::review_campaign::load(&db).unwrap().unwrap();
         let state = Mutex::new(CouchState {
-            pairing_codes: HashMap::from([("pair-alle".into(), "Alle".into())]),
+            pairing_codes: HashMap::from([("pair-aram".into(), "Aram".into())]),
             session_store: Some((tmp.path().to_path_buf(), db_path)),
             campaign_policy: Some(campaign.clone()),
             ..CouchState::default()
         });
 
-        let (code, _, body, ..) = api_queue(&db, "Alle", &state);
+        let (code, _, body, ..) = api_queue(&db, "Aram", &state);
         assert_eq!(code, 200, "second-pass queue failed: {}", String::from_utf8_lossy(&body));
         let queue: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(queue["campaignPhase"], "second_pass_active");
         assert_eq!(queue["items"][0]["text"], "champion raw draft");
-        assert_ne!(queue["items"][0]["text"], "Rubar corrected truth");
+        assert_ne!(queue["items"][0]["text"], "Rezan corrected truth");
         let row_version = queue["items"][0]["rowVersion"].as_str().unwrap();
         let operation_id = "40000000-0000-4000-8000-000000000002";
         let decision = serde_json::json!({
             "operationId": operation_id,
             "id": id,
             "action": "edit",
-            "text": "Alle independent truth",
-            "reviewer": "Alle",
+            "text": "Aram independent truth",
+            "reviewer": "Aram",
             "rowVersion": row_version,
             "heardMs": 1_500,
             "clipDurationMs": 1_500,
         });
-        let (code, _, body, ..) = api_decision(&db, decision.to_string().as_bytes(), "Alle", &state);
+        let (code, _, body, ..) = api_decision(&db, decision.to_string().as_bytes(), "Aram", &state);
         assert_eq!(code, 200, "second-pass decision failed: {}", String::from_utf8_lossy(&body));
         let corpus = db.get_segment_by_id(id).unwrap().unwrap();
-        assert_eq!(corpus.reviewed_by.as_deref(), Some("Rubar"));
-        assert_eq!(corpus.annotated_transcript.as_deref(), Some("Rubar corrected truth"));
+        assert_eq!(corpus.reviewed_by.as_deref(), Some("Rezan"));
+        assert_eq!(corpus.annotated_transcript.as_deref(), Some("Rezan corrected truth"));
         let independent: (String, String) = db
             .connection()
             .query_row(
@@ -1966,7 +1966,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(independent, ("Alle".into(), "Alle independent truth".into()));
+        assert_eq!(independent, ("Aram".into(), "Aram independent truth".into()));
 
         let independent_count = || -> i64 {
             db.connection()
@@ -1981,14 +1981,14 @@ mod tests {
 
         // The second-pass receipt obeys the same restart/retype law as the paid canonical receipt.
         // Rebuild the session with the current lower-case roster spelling and replay the phone's
-        // original outbox body, whose claimed reviewer spelling correctly remains `Alle`.
+        // original outbox body, whose claimed reviewer spelling correctly remains `Aram`.
         let restarted_state = Mutex::new(CouchState {
-            pairing_codes: HashMap::from([("pair-alle".into(), "alle".into())]),
+            pairing_codes: HashMap::from([("pair-aram".into(), "aram".into())]),
             session_store: Some((tmp.path().to_path_buf(), db.path().to_string())),
             campaign_policy: Some(campaign.clone()),
             ..CouchState::default()
         });
-        let (code, _, replay_body, ..) = api_decision(&db, decision.to_string().as_bytes(), "alle", &restarted_state);
+        let (code, _, replay_body, ..) = api_decision(&db, decision.to_string().as_bytes(), "aram", &restarted_state);
         assert_eq!(code, 200, "case-only independent replay must ACK");
         let replay: serde_json::Value = serde_json::from_slice(&replay_body).unwrap();
         assert_eq!(replay["duplicate"], true);
@@ -1999,7 +1999,7 @@ mod tests {
         let mut changed_text = decision.clone();
         changed_text["text"] = serde_json::json!("different independent truth");
         for (label, payload) in [("action", changed_action), ("text", changed_text)] {
-            let (code, ..) = api_decision(&db, payload.to_string().as_bytes(), "alle", &restarted_state);
+            let (code, ..) = api_decision(&db, payload.to_string().as_bytes(), "aram", &restarted_state);
             assert_eq!(code, 409, "changed independent {label} must conflict");
             assert_eq!(independent_count(), 1);
         }
@@ -2017,7 +2017,7 @@ mod tests {
         assert_eq!(code, 409, "a different reviewer must not inherit the independent receipt");
         assert_eq!(independent_count(), 1);
 
-        let (code, _, body, ..) = api_undo(&db, "Alle", &state);
+        let (code, _, body, ..) = api_undo(&db, "Aram", &state);
         assert_eq!(code, 200, "second-pass undo failed: {}", String::from_utf8_lossy(&body));
         let reversal_operation: String = db
             .connection()
@@ -2037,7 +2037,7 @@ mod tests {
         );
         assert!(crate::review_campaign::independent_segment_pending(&db, &campaign, id).unwrap());
         let corpus = db.get_segment_by_id(id).unwrap().unwrap();
-        assert_eq!(corpus.annotated_transcript.as_deref(), Some("Rubar corrected truth"));
+        assert_eq!(corpus.annotated_transcript.as_deref(), Some("Rezan corrected truth"));
     }
 
     #[test]
@@ -3062,16 +3062,16 @@ mod tests {
         // re-typed reviewer a STRANGER to their own row: the dropped-response retry stopped counting
         // as a repeat (a second undo entry and a second DPO learning pair distilled from one human
         // correction), and the late-submit guard refused their own re-review with "already reviewed
-        // by Rubar" — an unresolvable 409 against themselves.
-        assert!(same_reviewer("Rubar", " rubar "));
-        assert!(!same_reviewer("Rubar", "Alle"));
+        // by Rezan" — an unresolvable 409 against themselves.
+        assert!(same_reviewer("Rezan", " rezan "));
+        assert!(!same_reviewer("Rezan", "Aram"));
 
         let mut prev = seg("d1", "دەقی خام");
-        prev.reviewed_by = Some("Rubar".to_string());
+        prev.reviewed_by = Some("Rezan".to_string());
         prev.human_decision = Some("edit".to_string());
         prev.verdict_transcript = Some("دەقی ڕاست".to_string());
-        assert!(is_repeat_of_stored_decision(&prev, "rubar", "edit", Some("دەقی ڕاست")), "one person, one decision");
-        assert!(!is_repeat_of_stored_decision(&prev, "Alle", "edit", Some("دەقی ڕاست")), "still not somebody else");
+        assert!(is_repeat_of_stored_decision(&prev, "rezan", "edit", Some("دەقی ڕاست")), "one person, one decision");
+        assert!(!is_repeat_of_stored_decision(&prev, "Aram", "edit", Some("دەقی ڕاست")), "still not somebody else");
 
         let tmp = tempfile::tempdir().unwrap();
         let (db, _) = test_db(tmp.path());
@@ -3080,11 +3080,11 @@ mod tests {
         let first = serde_json::json!({
             "id": "d1", "action": "edit", "text": "یەکەم", "heardMs": 1_500, "clipDurationMs": 1_500,
         });
-        assert_eq!(api_decision(&db, first.to_string().as_bytes(), "Rubar", &state).0, 200);
+        assert_eq!(api_decision(&db, first.to_string().as_bytes(), "Rezan", &state).0, 200);
         let again = serde_json::json!({
             "id": "d1", "action": "edit", "text": "دووەم", "heardMs": 1_500, "clipDurationMs": 1_500,
         });
-        let (code, _, body, ..) = api_decision(&db, again.to_string().as_bytes(), "rubar", &state);
+        let (code, _, body, ..) = api_decision(&db, again.to_string().as_bytes(), "rezan", &state);
         assert_eq!(
             code,
             200,
@@ -4763,8 +4763,8 @@ mod tests {
         let (db, db_path) = test_db(tmp.path());
         db.insert_segment(&seg("maintenance-clip", "دەقی تاقیکردنەوە")).unwrap();
         let state = Mutex::new(CouchState {
-            reviewers: HashMap::from([("cookie".to_string(), "Rubar".to_string())]),
-            pairing_codes: HashMap::from([("pairing".to_string(), "Rubar".to_string())]),
+            reviewers: HashMap::from([("cookie".to_string(), "Rezan".to_string())]),
+            pairing_codes: HashMap::from([("pairing".to_string(), "Rezan".to_string())]),
             session_store: Some((tmp.path().to_path_buf(), db_path)),
             ..CouchState::default()
         });
@@ -5684,7 +5684,7 @@ mod tests {
     #[test]
     fn a_retyped_reviewer_name_keeps_the_link_the_session_and_the_outstanding_check() {
         // `normalize_reviewers` trims but PRESERVES typed casing, and the review columns are
-        // COLLATE NOCASE — so "rubar" and "Rubar" are one reviewer everywhere except in the three
+        // COLLATE NOCASE — so "rezan" and "Rezan" are one reviewer everywhere except in the three
         // `==` comparisons the resume path used to make. Re-typing one name in Settings therefore
         // minted a fresh pairing token (every link already sent answers "link expired"), dropped the
         // restored cookie sessions (installed phone shortcuts die), and dropped the remembered
@@ -5694,9 +5694,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("retyped-roster.db").to_string_lossy().to_string();
         Database::open(&db_path).unwrap().initialize().unwrap();
-        let pairing = HashMap::from([("rubar-pair".to_string(), "Rubar".to_string())]);
-        let spot_checks = HashSet::from([("hidden-1".to_string(), "Rubar".to_string())]);
-        let sessions = HashMap::from([("rubar-cookie".to_string(), ("Rubar".to_string(), SystemTime::now()))]);
+        let pairing = HashMap::from([("rezan-pair".to_string(), "Rezan".to_string())]);
+        let spot_checks = HashSet::from([("hidden-1".to_string(), "Rezan".to_string())]);
+        let sessions = HashMap::from([("rezan-cookie".to_string(), ("Rezan".to_string(), SystemTime::now()))]);
         save_session(tmp.path(), &pairing, &db_path, &spot_checks, &HashSet::new(), &sessions, None).unwrap();
         let port_probe = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
         let port = port_probe.local_addr().unwrap().port();
@@ -5705,7 +5705,7 @@ mod tests {
         // The owner re-types the roster in a different case. Same person.
         let started = start_on_port_with_session_lifecycle(
             db_path.clone(),
-            vec!["rubar".into()],
+            vec!["rezan".into()],
             port,
             Some(tmp.path().to_path_buf()),
             save_session_snapshot,
@@ -5718,17 +5718,17 @@ mod tests {
 
         let started = started.expect("a re-typed roster still starts");
         let link = started.reviewers.first().expect("the reviewer keeps a link");
-        assert!(link.url.contains("#t=rubar-pair"), "the already-sent link must keep working: {}", link.url);
+        assert!(link.url.contains("#t=rezan-pair"), "the already-sent link must keep working: {}", link.url);
         let resumed = resumed.expect("the durable generation is readable");
-        assert_eq!(resumed.pairing.get("rubar-pair").map(String::as_str), Some("rubar"));
+        assert_eq!(resumed.pairing.get("rezan-pair").map(String::as_str), Some("rezan"));
         assert!(
-            resumed.spot_checks.contains(&("hidden-1".to_string(), "rubar".to_string())),
+            resumed.spot_checks.contains(&("hidden-1".to_string(), "rezan".to_string())),
             "the outstanding hidden check must survive, re-keyed onto the roster's current spelling: {:?}",
             resumed.spot_checks
         );
         assert_eq!(
-            resumed.sessions.get("rubar-cookie").map(|(name, _)| name.as_str()),
-            Some("rubar"),
+            resumed.sessions.get("rezan-cookie").map(|(name, _)| name.as_str()),
+            Some("rezan"),
             "the installed phone shortcut's cookie must still be a live session"
         );
     }
@@ -6091,29 +6091,29 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
         let db_path = data_dir.join("library.db").to_string_lossy().to_string();
-        let pairing = HashMap::from([("pair-secret".to_string(), "Alle".to_string())]);
+        let pairing = HashMap::from([("pair-secret".to_string(), "Aram".to_string())]);
         let issued = SystemTime::now();
-        let sessions = HashMap::from([("cookie-abc".to_string(), ("Alle".to_string(), issued))]);
+        let sessions = HashMap::from([("cookie-abc".to_string(), ("Aram".to_string(), issued))]);
         save_session(data_dir, &pairing, &db_path, &HashSet::new(), &HashSet::new(), &sessions, None).unwrap();
 
         let back = load_session(data_dir, &db_path).expect("session file readable");
         assert_eq!(
             back.sessions.get("cookie-abc").map(|(name, _)| name.as_str()),
-            Some("Alle"),
+            Some("Aram"),
             "the cookie the browser still holds must still name its reviewer after a restart"
         );
-        assert_eq!(back.pairing.get("pair-secret").map(String::as_str), Some("Alle"), "and the link too");
+        assert_eq!(back.pairing.get("pair-secret").map(String::as_str), Some("Aram"), "and the link too");
 
         // A session already past its TTL stays dead: restoring resumes, it never extends.
         let stale = SystemTime::now() - COUCH_SESSION_TTL - Duration::from_secs(60);
-        let expired = HashMap::from([("cookie-old".to_string(), ("Alle".to_string(), stale))]);
+        let expired = HashMap::from([("cookie-old".to_string(), ("Aram".to_string(), stale))]);
         save_session(data_dir, &pairing, &db_path, &HashSet::new(), &HashSet::new(), &expired, None).unwrap();
         let back = load_session(data_dir, &db_path).expect("session file readable");
         assert!(back.sessions.is_empty(), "an expired session must not be resurrected by a restart");
 
         // A reviewer dropped from the roster loses their session even if the file still holds it —
         // mirrors the name filter start_on_port applies when it rehydrates.
-        let names = ["Rubar".to_string()];
+        let names = ["Rezan".to_string()];
         save_session(data_dir, &pairing, &db_path, &HashSet::new(), &HashSet::new(), &sessions, None).unwrap();
         let back = load_session(data_dir, &db_path).expect("session file readable");
         let kept: HashMap<String, (String, SystemTime)> =
@@ -6361,7 +6361,7 @@ mod tests {
               "max_total_corpus_actions": 20,
               "reviewers": [
                 {"name":"Hawzhin","max_corpus_actions":10},
-                {"name":"Pavel","max_corpus_actions":10}
+                {"name":"Karwan","max_corpus_actions":10}
               ]
             }"#,
         )
@@ -6415,7 +6415,7 @@ mod tests {
               "max_total_corpus_actions": 20,
               "reviewers": [
                 {"name":"Hawzhin","max_corpus_actions":10},
-                {"name":"Pavel","max_corpus_actions":10}
+                {"name":"Karwan","max_corpus_actions":10}
               ]
             }"#,
         )
@@ -6425,7 +6425,7 @@ mod tests {
             session_store: Some((dir.path().to_path_buf(), db_path)),
             pairing_codes: HashMap::from([
                 ("hawzhin-pair".to_string(), "Hawzhin".to_string()),
-                ("pavel-pair".to_string(), "Pavel".to_string()),
+                ("karwan-pair".to_string(), "Karwan".to_string()),
             ]),
             pilot_policy: Some(policy.clone()),
             ..CouchState::default()
@@ -6513,7 +6513,7 @@ mod tests {
               "max_total_corpus_actions": 20,
               "reviewers": [
                 {"name":"Hawzhin","max_corpus_actions":10},
-                {"name":"Pavel","max_corpus_actions":10}
+                {"name":"Karwan","max_corpus_actions":10}
               ]
             }"#,
         )
@@ -6524,7 +6524,7 @@ mod tests {
                 session_store: Some((dir.path().to_path_buf(), db_path.clone())),
                 pairing_codes: HashMap::from([
                     ("hawzhin-pair".to_string(), "Hawzhin".to_string()),
-                    ("pavel-pair".to_string(), "Pavel".to_string()),
+                    ("karwan-pair".to_string(), "Karwan".to_string()),
                 ]),
                 pilot_policy: Some(policy.clone()),
                 fail_session_persist,
@@ -7827,7 +7827,7 @@ mod tests {
               "max_total_corpus_actions": 20,
               "reviewers": [
                 {"name":"Hawzhin","max_corpus_actions":10},
-                {"name":"Pavel","max_corpus_actions":10}
+                {"name":"Karwan","max_corpus_actions":10}
               ]
             }"#,
         )
@@ -7846,7 +7846,7 @@ mod tests {
             session_store: Some((tmp.path().to_path_buf(), db_path)),
             pairing_codes: HashMap::from([
                 ("hawzhin-pair".into(), "Hawzhin".into()),
-                ("pavel-pair".into(), "Pavel".into()),
+                ("karwan-pair".into(), "Karwan".into()),
             ]),
             pilot_policy: Some(policy),
             leases: HashMap::from([("audio-pilot-work".into(), ("Hawzhin".into(), Instant::now()))]),

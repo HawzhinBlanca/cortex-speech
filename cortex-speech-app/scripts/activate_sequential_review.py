@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Safely replace the completed two-person pilot with Rubar's full provisional first pass.
+"""Safely replace the completed two-person pilot with Rezan's full provisional first pass.
 
 The transition is offline and compare-and-swap guarded. It preserves every review/payment row and
-Rubar's existing pairing token, clears stale cookies/leases/checks, stores the exact campaign and
+Rezan's existing pairing token, clears stale cookies/leases/checks, stores the exact campaign and
 focus contract inside SQLite, retires the pilot policy, and leaves a revocation marker behind on any
 interrupted mutation. While this campaign is active, the Rust runtime blocks every dataset/training
 export until an independent second pass has been implemented and completed.
@@ -38,7 +38,7 @@ from pilot_focus_contract import focus_evidence, load_voice_focus_ids
 CAMPAIGN_SETTINGS_KEY = "review_campaign.sequential_first_pass.v1"
 CAMPAIGN_MODE = "sequential_first_pass"
 CAMPAIGN_STATUS = "first_pass_active"
-REVIEWER = "Rubar"
+REVIEWER = "Rezan"
 VOICE_FOCUS_FILE = "voice_focus.json"
 CAMPAIGN_NAMESPACE = uuid.UUID("4ad54d71-f76b-4e65-aaed-87d12fc52bd9")
 
@@ -139,7 +139,7 @@ def _verify_post_baseline(conn: sqlite3.Connection, baseline: int, activation_ma
     corpus = hidden = 0
     for event_id, reviewer, action, source in rows:
         if reviewer.strip().lower() != REVIEWER.lower():
-            raise RuntimeError(f"event {event_id} belongs to {reviewer!r}; Rubar-only takeover is refused")
+            raise RuntimeError(f"event {event_id} belongs to {reviewer!r}; Rezan-only takeover is refused")
         if action not in {"accept", "edit", "reject", "skip"}:
             raise RuntimeError(f"event {event_id} contains unsupported action {action!r}")
         if source == "couch":
@@ -312,7 +312,7 @@ def activate(
             reloaded = _load_json_object(session_path, SESSION_FILE)
             validate_saved_session_shape(reloaded)
             if reloaded != narrowed or pilot_path.exists():
-                raise RuntimeError("promoted Rubar-only session failed verification")
+                raise RuntimeError("promoted Rezan-only session failed verification")
             stored = conn.execute("SELECT value FROM settings WHERE key = ?", (CAMPAIGN_SETTINGS_KEY,)).fetchone()
             if stored is None or validate_campaign(strict_json_loads(stored[0])) != intended:
                 raise RuntimeError("promoted sequential campaign failed verification")

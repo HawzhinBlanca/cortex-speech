@@ -517,7 +517,7 @@ fn diarizer_speaker_indices_do_not_collapse_every_recording_into_one_split() {
     // A REAL speaker id must still bind recordings together, or this fix would have bought a working
     // split by throwing away the disjointness it exists to provide.
     let mut named: Vec<SpeechSegment> = Vec::new();
-    for (src, spk) in [("a.wav", "Hawzhin"), ("b.wav", "Hawzhin"), ("c.wav", "Sewa"), ("d.wav", "Rubar")] {
+    for (src, spk) in [("a.wav", "Hawzhin"), ("b.wav", "Hawzhin"), ("c.wav", "Sirwan"), ("d.wav", "Rezan")] {
         for i in 0..6 {
             named.push(mk(&format!("{src}-{i}"), src, spk));
         }
