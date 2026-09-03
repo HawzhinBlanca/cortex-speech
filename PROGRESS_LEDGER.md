@@ -12960,3 +12960,16 @@ cases passed; a re-run was green). Locally the two files complete 21 cases in ab
 Both cases render the whole desktop dashboard through jsdom; they now carry a per-case budget of 20 s
 (`DESKTOP_RENDER_BUDGET_MS`), not a global raise: only these renders are that heavy, and a stuck test must
 still fail. Bite-proof: with the budget set to 1 ms both cases fail with "Test timed out in 1ms"; restored.
+
+## 2026-09-03 — Direct technical marks in tests retry AUDIO_PROBE_BUSY the way a client does
+
+The technical-audio probe registry caps ACTIVE flights process-wide (`TECHNICAL_PROBE_MAX_CONCURRENCY` = 2)
+and every `#[test]` in the library binary probes through the same registry, so under full-suite
+parallelism a direct mark with a unique flight key is refused `AUDIO_PROBE_BUSY` while unrelated tests
+hold both slots — measured 2026-09-02: one failure in a 2561-test run
+(`backend_distinguishes_container_failure_from_post_probe_decode_failure`), 3/3 green standalone. The
+store's own tests already minimise slot-holding time for this reason (since 08-29). BUSY is
+`retryable: true` ("Retry in a moment") and a client retries; the eleven direct-mark test sites now go
+through `mark_unusable_retrying_busy`, a 5 s bounded retry on that code only. Production is untouched.
+Proof: `retry_while_probe_busy_retries_only_busy_and_gives_up_at_the_budget` — two BUSY answers then
+the result; a refusal returned at once, never retried; BUSY past the budget reported as BUSY.
