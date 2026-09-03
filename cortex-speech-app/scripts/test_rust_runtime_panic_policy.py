@@ -722,7 +722,7 @@ def test_jury_background_runs_report_failures() -> None:
 def test_pipeline_event_emits_report_failures() -> None:
     commands = command_surface()
     required = [
-        "fn emit_or_log<T>(app: &tauri::AppHandle, event: &str, payload: T)",
+        "fn emit_or_log<R: tauri::Runtime, T>(app: &tauri::AppHandle<R>, event: &str, payload: T)",
         'tracing::warn!("Failed to emit {event}: {error}");',
         '"pipeline-started"',
         '"pipeline-phase"',

@@ -108,8 +108,10 @@ def source() -> str:
 
 
 def _body(src: str, name: str) -> str:
-    """Brace-matched body of `pub fn NAME` / `pub async fn NAME`."""
-    for sig in (f"pub fn {name}(", f"pub async fn {name}("):
+    """Brace-matched body of `pub fn NAME` / `pub async fn NAME`. A command whose body only delegates
+    to a runtime-generic twin `fn NAME_on<R: tauri::Runtime>(` (mock-app testability, 2026-09-03)
+    resolves to the twin's body: that is where the spawn lives."""
+    for sig in (f"pub fn {name}(", f"pub async fn {name}(", f"fn {name}<R: tauri::Runtime>("):
         start = src.find(sig)
         if start == -1:
             continue
@@ -121,7 +123,10 @@ def _body(src: str, name: str) -> str:
             elif src[i] == "}":
                 depth -= 1
                 if depth == 0:
-                    return src[open_brace : i + 1]
+                    body = src[open_brace : i + 1]
+                    if not name.endswith("_on") and f"{name}_on(" in body:
+                        return _body(src, f"{name}_on")
+                    return body
             i += 1
     return ""
 
