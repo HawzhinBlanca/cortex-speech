@@ -73,7 +73,7 @@ if (-not (Test-Path $python)) {
 # 'continuity' answers the question the other two CANNOT: does the link the reviewer already has
 # still work? Both gates below read the pairing token out of couch_session.json, so they authenticate
 # whatever the server currently honours -- and stayed green through 2026-08-22..24 while a roster
-# re-add reminted three tokens and killed three distributed links. Alle's phone said "link expired";
+# re-add reminted three tokens and killed three distributed links. Aram's phone said "link expired";
 # this probe said OK. A reviewer holding a dead link cannot report it: all they see is the same page
 # a network blip produces.
 $results = @(

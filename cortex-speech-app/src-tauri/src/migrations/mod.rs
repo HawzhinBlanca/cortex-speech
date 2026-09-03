@@ -3628,8 +3628,8 @@ pub static MIGRATIONS: &[Migration] = &[
         // A sequential campaign cannot become exportable merely because somebody edits its JSON
         // setting.  The database now owns an immutable copy of the exact focus, every blinded
         // second-pass judgement, every reversal, every adjudication, and every phase transition.
-        // The first-pass corpus row remains untouched during the independent pass: Alle sees the
-        // champion raw draft and writes into `independent_review_decisions`, so Rubar's correction
+        // The first-pass corpus row remains untouched during the independent pass: Aram sees the
+        // champion raw draft and writes into `independent_review_decisions`, so Rezan's correction
         // is neither leaked as an answer nor overwritten by a competing judgement.
         up_sql: "CREATE TABLE review_campaign_registry (
                      campaign_id                    TEXT PRIMARY KEY,
@@ -3637,8 +3637,8 @@ pub static MIGRATIONS: &[Migration] = &[
                      focus_sha256                    TEXT NOT NULL
                                                          CHECK(length(focus_sha256) = 64
                                                            AND focus_sha256 NOT GLOB '*[^0-9a-f]*'),
-                     first_reviewer                  TEXT NOT NULL CHECK(first_reviewer = 'Rubar'),
-                     second_reviewer                 TEXT NOT NULL CHECK(second_reviewer = 'Alle'),
+                     first_reviewer                  TEXT NOT NULL CHECK(first_reviewer = 'Rezan'),
+                     second_reviewer                 TEXT NOT NULL CHECK(second_reviewer = 'Aram'),
                      after_review_event_id           INTEGER NOT NULL CHECK(after_review_event_id >= 0),
                      activated_at_review_event_id    INTEGER NOT NULL
                                                          CHECK(activated_at_review_event_id >= after_review_event_id),

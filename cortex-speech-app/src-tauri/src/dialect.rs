@@ -4,7 +4,7 @@
 //! so the map lives at the source and there is no per-row column to disagree with itself.
 //!
 //! Owner instruction 2026-08-16: reviewers who do not know Hawleri must not be handed Hawleri.
-//! Roza, Alle and Sabat had already made 13 decisions on Hawleri clips purely because the queue had
+//! Nasrin, Aram and Shilan had already made 13 decisions on Hawleri clips purely because the queue had
 //! nothing else in it — that is the failure this exists to stop.
 //!
 //! FAILS CLOSED. An unmapped source has dialect `None`, and a reviewer restricted to specific
@@ -100,7 +100,7 @@ pub fn reviewer_may_judge(allowed: Option<&[String]>, audio_path: &str) -> bool 
 /// Reviewer → the dialects they may judge, read from `<data_dir>/reviewer_dialects.json`:
 ///
 /// ```json
-/// { "Rubar": ["hawleri", "sorani"], "Roza": ["sorani"] }
+/// { "Rezan": ["hawleri", "sorani"], "Nasrin": ["sorani"] }
 /// ```
 ///
 /// A MISSING file, or a reviewer absent from it, means UNRESTRICTED — so adding this file cannot
@@ -118,7 +118,7 @@ pub fn reviewer_may_judge(allowed: Option<&[String]>, audio_path: &str) -> bool 
 ///   * a key starting with `_` is a comment and is skipped — MEASURED 2026-08-16, the file shipped
 ///     with a `"_comment"` string, and parsing the whole map strictly would have made a helpful
 ///     comment fatal (then: silently fail open; now: needlessly stop the line);
-///   * any OTHER non-list value is `Err`. It is a typo'd RESTRICTION — `"Roza": "sorani"` — and
+///   * any OTHER non-list value is `Err`. It is a typo'd RESTRICTION — `"Nasrin": "sorani"` — and
 ///     skipping it quietly un-restricts exactly the reviewer the line was written to restrict.
 pub fn load_roster(data_dir: &Path) -> Result<HashMap<String, Vec<String>>, String> {
     let path = data_dir.join("reviewer_dialects.json");
@@ -195,7 +195,7 @@ pub(crate) fn parse_roster_text(text: &str) -> Result<HashMap<String, Vec<String
 }
 
 /// The roster entry for `reviewer`, matched the way the SESSION layer matches names: trimmed and
-/// ASCII-case-insensitive (`normalize_reviewers` treats "roza" and "Roza" as the same person).
+/// ASCII-case-insensitive (`normalize_reviewers` treats "nasrin" and "Nasrin" as the same person).
 ///
 /// 2026-08-20 hunt: the lookup was an exact `HashMap::get`, so a roster key differing from the live
 /// session name by case or a stray space LOADED cleanly and bound NOBODY — the reviewer it named
@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn a_sorani_only_reviewer_is_never_handed_hawleri() {
-        // The exact case: Roza/Alle/Sabat made 13 decisions on Hawleri only because the queue had
+        // The exact case: Nasrin/Aram/Shilan made 13 decisions on Hawleri only because the queue had
         // nothing else. With a roster in place they get nothing rather than the wrong dialect.
         let sorani_only = vec![SORANI.to_string()];
         assert!(!reviewer_may_judge(Some(&sorani_only), r"D:\x\KBHP-EP07.wav"));
@@ -300,15 +300,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("reviewer_dialects.json"),
-            r#"{ "_comment": "how to edit this file", "Roza": ["sorani"], "Rubar": ["hawleri", "sorani"] }"#,
+            r#"{ "_comment": "how to edit this file", "Nasrin": ["sorani"], "Rezan": ["hawleri", "sorani"] }"#,
         )
         .unwrap();
         let roster = load_roster(dir.path()).expect("an _-prefixed comment must not break the file");
-        assert_eq!(roster.get("Roza"), Some(&vec![SORANI.to_string()]), "a real entry must still bind");
+        assert_eq!(roster.get("Nasrin"), Some(&vec![SORANI.to_string()]), "a real entry must still bind");
         assert_eq!(roster.len(), 2, "the comment is skipped, the two reviewers are kept: {roster:?}");
         assert!(
-            !reviewer_may_judge(roster.get("Roza").map(Vec::as_slice), r"D:\x\KBHP-EP07.wav"),
-            "Roza is Sorani-only, so Hawleri must be refused — this assertion failed in production"
+            !reviewer_may_judge(roster.get("Nasrin").map(Vec::as_slice), r"D:\x\KBHP-EP07.wav"),
+            "Nasrin is Sorani-only, so Hawleri must be refused — this assertion failed in production"
         );
     }
 
@@ -330,16 +330,16 @@ mod tests {
 
     #[test]
     fn a_roster_key_binds_its_reviewer_across_case_and_whitespace() {
-        // 2026-08-20 hunt: the session layer treats "roza" and "Roza" as the SAME person, but the
+        // 2026-08-20 hunt: the session layer treats "nasrin" and "Nasrin" as the SAME person, but the
         // roster lookup was an exact HashMap::get — so a key typed in the wrong case loaded cleanly
         // and bound nobody, serving its reviewer the full queue. The 2026-08-16 incident, back
         // through a typo'd KEY.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("reviewer_dialects.json"), r#"{ "roza ": ["sorani"] }"#).unwrap();
+        std::fs::write(dir.path().join("reviewer_dialects.json"), r#"{ "nasrin ": ["sorani"] }"#).unwrap();
         let roster = load_roster(dir.path()).unwrap();
-        let allowed = allowed_for(&roster, "Roza").expect("'roza ' must bind the live reviewer 'Roza'");
+        let allowed = allowed_for(&roster, "Nasrin").expect("'nasrin ' must bind the live reviewer 'Nasrin'");
         assert_eq!(allowed, &vec![SORANI.to_string()]);
-        assert!(allowed_for(&roster, "Rubar").is_none(), "and nobody else");
+        assert!(allowed_for(&roster, "Rezan").is_none(), "and nobody else");
     }
 
     #[test]
@@ -347,19 +347,19 @@ mod tests {
         // Which restriction would bind depends on hash iteration order — one is certainly a typo of
         // the other, and a file that cannot say what it means must stop the line, not guess.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("reviewer_dialects.json"), r#"{ "Roza": ["sorani"], "roza": ["hawleri"] }"#)
+        std::fs::write(dir.path().join("reviewer_dialects.json"), r#"{ "Nasrin": ["sorani"], "nasrin": ["hawleri"] }"#)
             .unwrap();
         assert!(load_roster(dir.path()).is_err(), "case-colliding keys are one broken file");
     }
 
     #[test]
     fn a_typoed_restriction_fails_closed_instead_of_unrestricting_its_reviewer() {
-        // `"Roza": "sorani"` is a line somebody wrote to RESTRICT Roza. Skip-and-log honoured the
+        // `"Nasrin": "sorani"` is a line somebody wrote to RESTRICT Nasrin. Skip-and-log honoured the
         // file while silently un-restricting exactly her — the one reviewer the line was about.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("reviewer_dialects.json"), r#"{ "Roza": "sorani" }"#).unwrap();
+        std::fs::write(dir.path().join("reviewer_dialects.json"), r#"{ "Nasrin": "sorani" }"#).unwrap();
         let err = load_roster(dir.path()).expect_err("a typo'd entry must stop the line");
-        assert!(err.contains("Roza"), "the error names the broken entry: {err}");
+        assert!(err.contains("Nasrin"), "the error names the broken entry: {err}");
     }
 
     #[test]
@@ -367,13 +367,13 @@ mod tests {
         let normalized_dir = tempfile::tempdir().unwrap();
         std::fs::write(
             normalized_dir.path().join("reviewer_dialects.json"),
-            r#"{ "Roza": [" Sorani ", "SORANI", "Hawleri"] }"#,
+            r#"{ "Nasrin": [" Sorani ", "SORANI", "Hawleri"] }"#,
         )
         .unwrap();
         let roster = load_roster(normalized_dir.path()).unwrap();
-        assert_eq!(roster.get("Roza"), Some(&vec![SORANI.to_string(), HAWLERI.to_string()]));
+        assert_eq!(roster.get("Nasrin"), Some(&vec![SORANI.to_string(), HAWLERI.to_string()]));
 
-        for invalid in [r#"{ "Roza": ["soranii"] }"#, r#"{ "Roza": [] }"#] {
+        for invalid in [r#"{ "Nasrin": ["soranii"] }"#, r#"{ "Nasrin": [] }"#] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("reviewer_dialects.json"), invalid).unwrap();
             assert!(load_roster(dir.path()).is_err(), "invalid roster entry must stop the line: {invalid}");

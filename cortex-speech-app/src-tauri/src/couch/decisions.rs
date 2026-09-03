@@ -192,7 +192,7 @@ pub(super) fn decision_operation_payload_hash(segment_id: &str, action: &str, te
 /// Match a retried phone operation against the immutable receipt that already committed it.
 ///
 /// Reviewer identity is case-insensitive throughout Couch, but the v1 payload hash deliberately
-/// preserved the reviewer's exact spelling.  A roster correction such as `Rubar` -> `rubar` after an
+/// preserved the reviewer's exact spelling.  A roster correction such as `Rezan` -> `rezan` after an
 /// app restart must therefore rederive the old digest with the spelling stored in the receipt, not
 /// with the current session spelling.  The stored spelling is only hash authority after we prove it
 /// denotes the currently authenticated reviewer; a different person, segment, action, or transcript
@@ -2051,34 +2051,34 @@ mod tests {
     fn a_roster_respelled_reviewer_still_owns_their_receipt() {
         // The v1 payload hash preserved the reviewer's exact spelling, so a roster correction must
         // rederive the digest with the STORED spelling once it proves the same person is asking.
-        let stored_hash = decision_operation_payload_hash("clip-1", "edit", "دەقی ڕاست", "Rubar");
+        let stored_hash = decision_operation_payload_hash("clip-1", "edit", "دەقی ڕاست", "Rezan");
         assert!(operation_receipt_matches_request(
             &stored_hash,
             "clip-1",
-            "Rubar",
+            "Rezan",
             "clip-1",
             "edit",
             "دەقی ڕاست",
-            "rubar"
+            "rezan"
         ));
         assert!(
-            !operation_receipt_matches_request(&stored_hash, "clip-1", "Rubar", "clip-2", "edit", "دەقی ڕاست", "Rubar"),
+            !operation_receipt_matches_request(&stored_hash, "clip-1", "Rezan", "clip-2", "edit", "دەقی ڕاست", "Rezan"),
             "a different segment is a hard conflict"
         );
         assert!(
             !operation_receipt_matches_request(
                 &stored_hash,
                 "clip-1",
-                "Rubar",
+                "Rezan",
                 "clip-1",
                 "accept",
                 "دەقی ڕاست",
-                "Rubar"
+                "Rezan"
             ),
             "changing edit to accept while reusing the UUID is a different client operation"
         );
         assert!(
-            !operation_receipt_matches_request(&stored_hash, "clip-1", "Rubar", "clip-1", "edit", "دەقی ڕاست", "Hemn"),
+            !operation_receipt_matches_request(&stored_hash, "clip-1", "Rezan", "clip-1", "edit", "دەقی ڕاست", "Hemn"),
             "a different person never inherits the receipt"
         );
     }
@@ -3258,23 +3258,23 @@ mod tests {
         // An already-canonical clip in pool mode routes through the pool handler, where the pool
         // boundary still holds: a non-member is refused, not observed.
         let outside_revision = db.segment_review_revision("outside").unwrap().unwrap();
-        let outside_hash = decision_operation_payload_hash("outside", "edit", "دەقی ڕووبار", "Rubar");
+        let outside_hash = decision_operation_payload_hash("outside", "edit", "دەقی ڕووبار", "Rezan");
         db.record_phone_human_decision_by_at_revision_with_operation(
             "outside",
             "edit",
             Some("دەقی ڕووبار"),
-            "Rubar",
+            "Rezan",
             outside_revision,
             "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa36",
             &outside_hash,
         )
         .unwrap()
         .unwrap();
-        lock_state(&st).served_work.insert(("outside".into(), "Rubar".into()));
+        lock_state(&st).served_work.insert(("outside".into(), "Rezan".into()));
         let (code, body) = decide(
             &db,
             &st,
-            "Rubar",
+            "Rezan",
             &serde_json::json!({
                 "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa37",
                 "id": "outside",
@@ -3301,7 +3301,7 @@ mod tests {
             campaign_id: campaign_id.clone(),
             mode: crate::review_campaign::SEQUENTIAL_CAMPAIGN_MODE.into(),
             status: crate::review_campaign::SEQUENTIAL_CAMPAIGN_STATUS.into(),
-            reviewer: "Rubar".into(),
+            reviewer: "Rezan".into(),
             after_review_event_id: 0,
             activated_at_review_event_id: 0,
             focus_segment_count: evidence.segment_count,
@@ -3313,7 +3313,7 @@ mod tests {
                 campaign_id,
                 phase,
                 transition_id: "123e4567-e89b-42d3-a456-426614174601".into(),
-                first_reviewer: "Rubar".into(),
+                first_reviewer: "Rezan".into(),
                 second_reviewer: crate::review_campaign::SECOND_PASS_REVIEWER.into(),
                 focus_segment_count: evidence.segment_count,
                 focus_sha256: evidence.sha256,
@@ -3335,7 +3335,7 @@ mod tests {
         let call =
             |value: serde_json::Value, policy: &crate::review_campaign::SequentialReviewCampaign| -> (u16, String) {
                 let body = pool_body(value);
-                let (code, _, reply, _) = api_independent_decision(&db, &body, "Alle", &binding, &st, policy);
+                let (code, _, reply, _) = api_independent_decision(&db, &body, "Aram", &binding, &st, policy);
                 (code, String::from_utf8(reply).unwrap())
             };
 
@@ -3430,7 +3430,7 @@ mod tests {
         );
 
         // Served, but the database no longer carries ANY campaign: the live re-check pauses it.
-        lock_state(&st).served_work.insert(("ind-1".into(), "Alle".into()));
+        lock_state(&st).served_work.insert(("ind-1".into(), "Aram".into()));
         let (code, body) = call(
             serde_json::json!({
                 "operationId": "20000000-0000-4000-8000-0000000000a7",
@@ -3459,7 +3459,7 @@ mod tests {
         let (db, _) = test_db(tmp.path());
         let blinded = second_pass_campaign(crate::review_campaign::CampaignPhase::SecondPassActive);
         let undo = |st: &Mutex<CouchState>| -> (u16, String) {
-            let (code, _, reply, _) = api_independent_undo(&db, "Alle", st, &blinded);
+            let (code, _, reply, _) = api_independent_undo(&db, "Aram", st, &blinded);
             (code, String::from_utf8(reply).unwrap())
         };
 
@@ -3469,23 +3469,23 @@ mod tests {
 
         // A remembered token naming a decision that does not exist fails closed AND is retained,
         // so the retry replays the same target instead of sliding to an older decision.
-        remember_independent_undo(&st, "Alle", "20000000-0000-4000-8000-0000000000b1", "ind-gone", 4_242);
+        remember_independent_undo(&st, "Aram", "20000000-0000-4000-8000-0000000000b1", "ind-gone", 4_242);
         let (code, body) = undo(&st);
         assert_eq!(code, 500, "{body}");
         assert!(body.contains("target is missing or outside this campaign"), "{body}");
         assert_eq!(
-            lock_state(&st).independent_undo.get("Alle").map(Vec::len),
+            lock_state(&st).independent_undo.get("Aram").map(Vec::len),
             Some(1),
             "the exact token is pushed back for the retry"
         );
 
         // A token whose forward UUID cannot derive a reversal identity is also retained.
         let derived = state();
-        remember_independent_undo(&derived, "Alle", "NOT-A-UUID", "ind-bad", 7);
+        remember_independent_undo(&derived, "Aram", "NOT-A-UUID", "ind-bad", 7);
         let (code, body) = undo(&derived);
         assert_eq!(code, 500, "{body}");
         assert!(body.contains("independent undo identity cannot be derived"), "{body}");
-        assert_eq!(lock_state(&derived).independent_undo.get("Alle").map(Vec::len), Some(1));
+        assert_eq!(lock_state(&derived).independent_undo.get("Aram").map(Vec::len), Some(1));
     }
 
     #[test]

@@ -91,11 +91,11 @@ prerequisites, not optional polish.
 
 | reviewer | decisions | median s/clip | accept % | spot-checks noticed |
 |---|---|---|---|---|
-| Rubar | 482 | 21.0 | **56 %** | **0.33** |
-| Sewa | 168 | 21.6 | 24 % | 0.88 |
+| Rezan | 482 | 21.0 | **56 %** | **0.33** |
+| Sirwan | 168 | 21.6 | 24 % | 0.88 |
 | Hawzhin (owner) | 159 | 42.2 | 11 % | **1.00** |
 | Lamo | 32 | 26.7 | 16 % | 0.50 |
-| Roza | 6 | 18.2 | 57 % | 0.00 |
+| Nasrin | 6 | 18.2 | 57 % | 0.00 |
 
 Honest review measured about **2.5× realtime**. **273,600 IQD is now only the all-edit upper bound**
 for 15.2 full-equivalent hours, not a payout forecast; the actual prospective total follows the

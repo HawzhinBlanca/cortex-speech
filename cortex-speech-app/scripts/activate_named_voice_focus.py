@@ -192,12 +192,12 @@ def activate(
         if _canonical_path(Path(str(session["db_path"]))) != _canonical_path(db_path):
             raise RuntimeError(f"{SESSION_FILE} belongs to a different database")
         if sorted({str(name).strip().lower() for name in session["reviewers"].values()}) != [REVIEWER.lower()]:
-            raise RuntimeError("named-voice activation requires the live durable roster to contain only Rubar")
+            raise RuntimeError("named-voice activation requires the live durable roster to contain only Rezan")
         if any(
             str(entry.get("reviewer", "")).strip().lower() != REVIEWER.lower()
             for entry in session.get("sessions", [])
         ):
-            raise RuntimeError("named-voice activation found a non-Rubar saved cookie session")
+            raise RuntimeError("named-voice activation found a non-Rezan saved cookie session")
         if session.get("spot_checks", []) or session.get("pilot_spot_checks", []) or session.get("pilot_policy") is not None:
             raise RuntimeError("named-voice activation requires the retired pilot state")
 

@@ -1,4 +1,4 @@
-//! Offline, fail-closed administration for the sequential Rubar -> Alle review campaign.
+//! Offline, fail-closed administration for the sequential Rezan -> Aram review campaign.
 //!
 //! This binary deliberately has no "force" switch. Phase changes are compare-and-swap operations
 //! whose evidence is revalidated by the serving/export code on every later load.

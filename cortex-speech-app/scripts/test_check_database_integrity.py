@@ -174,8 +174,8 @@ class DatabaseIntegrityGateTests(unittest.TestCase):
                 ("a" * 64, "Hawzhin", "hidden-h1"),
                 ("a" * 64, "Hawzhin", "hidden-h2"),
                 ("a" * 64, "Hawzhin", "hidden-h3"),
-                ("a" * 64, "Pavel", "hidden-p1"),
-                ("a" * 64, "Rubar", "hidden-r1"),
+                ("a" * 64, "Karwan", "hidden-p1"),
+                ("a" * 64, "Rezan", "hidden-r1"),
             ],
         )
         connection.execute(

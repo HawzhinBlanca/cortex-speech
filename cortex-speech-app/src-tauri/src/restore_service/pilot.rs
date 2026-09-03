@@ -602,7 +602,7 @@ mod tests {
       "max_total_corpus_actions": 20,
       "reviewers": [
         {"name": "Hawzhin", "max_corpus_actions": 10},
-        {"name": "Pavel", "max_corpus_actions": 10}
+        {"name": "Karwan", "max_corpus_actions": 10}
       ]
     }"#;
 
@@ -852,7 +852,7 @@ mod tests {
         assert!(error.contains("must cap this certification pilot"), "{error}");
 
         // ...a VALID policy with a different roster identity is refused as a different policy...
-        let other = POLICY_JSON.replace("\"name\": \"Pavel\"", "\"name\": \"Someone\"");
+        let other = POLICY_JSON.replace("\"name\": \"Karwan\"", "\"name\": \"Someone\"");
         let error = require_active_pilot_policy_binding(
             &floor,
             Some(&floor_policy),

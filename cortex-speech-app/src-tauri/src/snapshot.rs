@@ -2056,7 +2056,7 @@ mod tests {
               "max_total_corpus_actions": 20,
               "reviewers": [
                 {"name": "Hawzhin", "max_corpus_actions": 10},
-                {"name": "Pavel", "max_corpus_actions": 10}
+                {"name": "Karwan", "max_corpus_actions": 10}
               ]
             }"#,
         )
@@ -2115,7 +2115,7 @@ mod tests {
             profile.path().join("couch_session.json"),
             serde_json::to_vec(&serde_json::json!({
                 "db_path": &db_path,
-                "reviewers": {"token-h": "Hawzhin", "token-p": "Pavel"},
+                "reviewers": {"token-h": "Hawzhin", "token-p": "Karwan"},
                 "pilot_spot_checks": [["hidden-session", "Hawzhin"]],
                 "pilot_policy": &policy,
             }))
@@ -2302,7 +2302,7 @@ mod tests {
           "max_total_corpus_actions": 20,
           "reviewers": [
             {"name": "Hawzhin", "max_corpus_actions": 10},
-            {"name": "Pavel", "max_corpus_actions": 10}
+            {"name": "Karwan", "max_corpus_actions": 10}
           ]
         }"#;
         for (replacement, expected) in [
@@ -2355,7 +2355,7 @@ mod tests {
               "max_total_corpus_actions": 20,
               "reviewers": [
                 {"name": "Hawzhin", "max_corpus_actions": 10},
-                {"name": "Pavel", "max_corpus_actions": 10}
+                {"name": "Karwan", "max_corpus_actions": 10}
               ]
             }"#,
         )
@@ -3423,7 +3423,7 @@ mod tests {
         let session_json = |db_path: &Path, policy: &crate::review_pilot::ReviewPilotPolicy| {
             serde_json::to_vec(&serde_json::json!({
                 "db_path": db_path,
-                "reviewers": {"token-h": "Hawzhin", "token-p": "Pavel"},
+                "reviewers": {"token-h": "Hawzhin", "token-p": "Karwan"},
                 "pilot_spot_checks": [],
                 "pilot_policy": policy,
             }))
@@ -3452,7 +3452,7 @@ mod tests {
             profile.path().join("couch_session.json"),
             serde_json::to_vec(&serde_json::json!({
                 "db_path": &db_path,
-                "reviewers": {"token-h": "Hawzhin", "token-p": "Pavel"},
+                "reviewers": {"token-h": "Hawzhin", "token-p": "Karwan"},
             }))
             .unwrap(),
         )
@@ -3473,7 +3473,7 @@ mod tests {
               "max_total_corpus_actions": 20,
               "reviewers": [
                 {"name": "Hawzhin", "max_corpus_actions": 10},
-                {"name": "Pavel", "max_corpus_actions": 10}
+                {"name": "Karwan", "max_corpus_actions": 10}
               ]
             }"#,
         )
@@ -3510,7 +3510,7 @@ mod tests {
             profile.path().join("couch_session.json"),
             serde_json::to_vec(&serde_json::json!({
                 "db_path": &db_path,
-                "reviewers": {"token-h": "Hawzhin", "token-p": "Pavel"},
+                "reviewers": {"token-h": "Hawzhin", "token-p": "Karwan"},
                 "pilot_spot_checks": [["hidden-dup", "Hawzhin"], ["hidden-dup", "HAWZHIN"]],
                 "pilot_policy": &policy,
             }))
@@ -3614,7 +3614,7 @@ mod tests {
           "max_total_corpus_actions": 20,
           "reviewers": [
             {"name": "Hawzhin", "max_corpus_actions": 10},
-            {"name": "Pavel", "max_corpus_actions": 10}
+            {"name": "Karwan", "max_corpus_actions": 10}
           ]
         }"#;
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4539,7 +4539,7 @@ mod offsite_state_tests {
       "max_total_corpus_actions": 20,
       "reviewers": [
         {"name": "Hawzhin", "max_corpus_actions": 10},
-        {"name": "Pavel", "max_corpus_actions": 10}
+        {"name": "Karwan", "max_corpus_actions": 10}
       ]
     }"#;
 

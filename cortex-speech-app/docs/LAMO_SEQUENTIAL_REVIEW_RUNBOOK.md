@@ -1,7 +1,7 @@
 # Lamo sequential review runbook
 
-**Current canon (2026-08-23):** one exact 6,922-clip Lamo focus. Rubar completes the first pass;
-only then does Alle receive a blind, independent second pass. Payment is outside this release path.
+**Current canon (2026-08-23):** one exact 6,922-clip Lamo focus. Rezan completes the first pass;
+only then does Aram receive a blind, independent second pass. Payment is outside this release path.
 The only transcription model accepted for this campaign is the proven OmniASR-7B champion identity.
 
 This document is an operating contract, not a statement that the live service is healthy. Every
@@ -9,8 +9,8 @@ session and every phase change must be proven again against the exact live files
 
 ## Non-negotiable stop rules
 
-- Never let Rubar and Alle work the same campaign phase concurrently.
-- Never activate Alle until the atomic transition proves all 6,922 effective Rubar phone decisions.
+- Never let Rezan and Aram work the same campaign phase concurrently.
+- Never activate Aram until the atomic transition proves all 6,922 effective Rezan phone decisions.
 - Never edit campaign JSON, SQLite campaign tables, decisions, or adjudications by hand.
 - Never use a generic/legacy exporter for this campaign. It remains blocked even after completion.
 - Never add rights or consent metadata by assumption. Missing rights correctly blocks TTS export.
@@ -44,7 +44,7 @@ python "$Repo\scripts\check_review_serving_provenance.py" $Db
 During first pass it binds the exact focus and reports completed and pending counts. The atomic
 activation command repeats that proof under a write lock and is the only phase-change authority.
 
-## Rubar first pass → Alle second pass
+## Rezan first pass → Aram second pass
 
 1. Stop Cortex and its watchdog; confirm no reviewer session or database writer is active.
 2. Create a verified recovery snapshot and run its disposable restore drill:
@@ -62,21 +62,21 @@ python "$Repo\scripts\restore_drill.py" '<the exact snapshot directory printed a
 $MaxEvent = python -c "import sqlite3,sys; c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True); print(c.execute('select coalesce(max(id),0) from review_events').fetchone()[0])" $Db
 ```
 
-5. Atomically prove Rubar completion, freeze the focus in SQLite, and activate Alle:
+5. Atomically prove Rezan completion, freeze the focus in SQLite, and activate Aram:
 
 ```powershell
 & $Admin activate-second-pass --db $Db --focus $Focus --expected-max-review-event-id $MaxEvent
 & $Admin certify --db $Db
 ```
 
-Success must report `second_pass_active`, `authorizedReviewer: Alle`, `registeredFocus.segmentCount: 6922`,
+Success must report `second_pass_active`, `authorizedReviewer: Aram`, `registeredFocus.segmentCount: 6922`,
 `independentPending: 6922`, zero adjudications, zero conflicts, clean SQLite checks, and zero
 foreign-key violations. Any mismatch is a hard stop; there is no force option.
 
 6. Start the tested Cortex release, run the live supervision/link/queue probes, then release only
-   Alle's already-issued link. Rubar remains paused.
+   Aram's already-issued link. Rezan remains paused.
 
-## Alle completion → adjudication
+## Aram completion → adjudication
 
 With Cortex stopped:
 

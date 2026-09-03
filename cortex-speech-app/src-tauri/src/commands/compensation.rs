@@ -159,7 +159,7 @@ mod tests {
             .unwrap();
         let revision = database.segment_review_revision("clip").unwrap().unwrap();
         database
-            .record_phone_human_decision_by_at_revision("clip", "edit", Some("truth"), "Rubar", revision)
+            .record_phone_human_decision_by_at_revision("clip", "edit", Some("truth"), "Rezan", revision)
             .unwrap()
             .unwrap();
     }

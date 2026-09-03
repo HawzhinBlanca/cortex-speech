@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Atomically arm the strict Rubar and Alle paid-review certification pilot.
+"""Atomically arm the strict Rezan and Aram paid-review certification pilot.
 
 This is the only supported writer for ``review_pilot_policy.json``. It requires Couch, the desktop
 app, importer, and watchdog to be offline; takes SQLite's write reservation; compares the caller's
 event-id precondition; revokes auto-resume; backs up the remembered session/policy; narrows durable
-pairing, cookie, and outstanding hidden-check state to Rubar + Alle without decrypting or changing
+pairing, cookie, and outstanding hidden-check state to Rezan + Aram without decrypting or changing
 their DPAPI tokens; writes the same policy snapshot into the session; rechecks the event-id; then
 promotes the policy, session, and optional focus together. The revocation marker is removed last.
 Any crash after mutation begins therefore
@@ -58,7 +58,7 @@ POLICY_FILE = "review_pilot_policy.json"
 SESSION_FILE = "couch_session.json"
 REVOCATION_FILE = "couch_session.revoked"
 POLICY_VERSION = "review-iqd-v1-2026-08-21"
-REVIEWERS = ("Rubar", "Alle")
+REVIEWERS = ("Rezan", "Aram")
 CAP_PER_REVIEWER = 10
 TOTAL_CAP = 20
 HIDDEN_QC_PER_REVIEWER = 2
@@ -740,7 +740,7 @@ def _activate_locked(
         narrowed = narrow_session(original_session, db_path, policy)
         if replace_roster_before_activity:
             # Old cookies and assignments belong to the retired roster generation. Pairing links are
-            # retained, but every mutable/leased cache is reset so Rubar and Alle claim a clean batch.
+            # retained, but every mutable/leased cache is reset so Rezan and Aram claim a clean batch.
             narrowed["sessions"] = []
             narrowed["spot_checks"] = []
             narrowed["pilot_spot_checks"] = []

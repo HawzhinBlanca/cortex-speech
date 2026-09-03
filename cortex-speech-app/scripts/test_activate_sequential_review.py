@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for the fail-closed Rubar-only first-pass transition."""
+"""Regression tests for the fail-closed Rezan-only first-pass transition."""
 
 from __future__ import annotations
 
@@ -35,12 +35,12 @@ def seed(root: Path, *, foreign_reviewer: bool = False) -> tuple[Path, dict[str,
         CREATE TABLE review_compensation_policies(policy_version TEXT PRIMARY KEY);
         INSERT INTO review_compensation_policies VALUES('review-iqd-v1-2026-08-21');
         INSERT INTO review_events VALUES(863, 'legacy', 'legacy', 'accept', 'couch');
-        INSERT INTO review_events VALUES(864, 'work-a', 'Rubar', 'edit', 'couch');
-        INSERT INTO review_events VALUES(865, 'hidden-a', 'Rubar', 'accept', 'couch_spot_check');
+        INSERT INTO review_events VALUES(864, 'work-a', 'Rezan', 'edit', 'couch');
+        INSERT INTO review_events VALUES(865, 'hidden-a', 'Rezan', 'accept', 'couch_spot_check');
         """
     )
     if foreign_reviewer:
-        conn.execute("UPDATE review_events SET reviewer='Alle' WHERE id=864")
+        conn.execute("UPDATE review_events SET reviewer='Aram' WHERE id=864")
     conn.executemany(
         "INSERT INTO schema_migrations(version, description) VALUES(?, ?)",
         source_migrations(DEFAULT_MIGRATIONS),
@@ -51,13 +51,13 @@ def seed(root: Path, *, foreign_reviewer: bool = False) -> tuple[Path, dict[str,
     policy = pilot_policy(863)
     (root / POLICY_FILE).write_text(json.dumps(policy), encoding="utf-8")
     session: dict[str, object] = {
-        "reviewers": {"protected-rubar": "Rubar", "protected-alle": "Alle"},
+        "reviewers": {"protected-rezan": "Rezan", "protected-aram": "Aram"},
         "db_path": str(db_path),
-        "spot_checks": [["hidden-a", "Rubar"], ["hidden-b", "Alle"]],
-        "pilot_spot_checks": [["hidden-a", "Rubar"], ["hidden-b", "Alle"]],
+        "spot_checks": [["hidden-a", "Rezan"], ["hidden-b", "Aram"]],
+        "pilot_spot_checks": [["hidden-a", "Rezan"], ["hidden-b", "Aram"]],
         "sessions": [
-            {"token": "cookie-r", "reviewer": "Rubar", "issued_unix": 1},
-            {"token": "cookie-a", "reviewer": "Alle", "issued_unix": 2},
+            {"token": "cookie-r", "reviewer": "Rezan", "issued_unix": 1},
+            {"token": "cookie-a", "reviewer": "Aram", "issued_unix": 2},
         ],
         "pilot_policy": policy,
     }
@@ -88,7 +88,7 @@ def test_activation_preserves_history_and_token_but_retires_every_pilot_surface(
         )
 
         session = json.loads((root / SESSION_FILE).read_text(encoding="utf-8"))
-        assert session["reviewers"] == {"protected-rubar": REVIEWER}
+        assert session["reviewers"] == {"protected-rezan": REVIEWER}
         assert session["sessions"] == []
         assert session["spot_checks"] == []
         assert session["pilot_spot_checks"] == []
@@ -120,7 +120,7 @@ def test_activation_preserves_history_and_token_but_retires_every_pilot_surface(
 
 
 def test_cas_and_foreign_reviewer_fail_before_any_live_mutation() -> None:
-    for foreign_reviewer, expected_error in ((False, "CAS mismatch"), (True, "Rubar-only takeover")):
+    for foreign_reviewer, expected_error in ((False, "CAS mismatch"), (True, "Rezan-only takeover")):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
             db_path, _ = seed(root, foreign_reviewer=foreign_reviewer)
@@ -169,7 +169,7 @@ def test_interruption_between_session_promotion_and_pilot_retirement_resumes_saf
         conn.close()
         session = json.loads((root / SESSION_FILE).read_text(encoding="utf-8"))
         session.update({
-            "reviewers": {"protected-rubar": "Rubar"},
+            "reviewers": {"protected-rezan": "Rezan"},
             "sessions": [],
             "spot_checks": [],
             "pilot_spot_checks": [],

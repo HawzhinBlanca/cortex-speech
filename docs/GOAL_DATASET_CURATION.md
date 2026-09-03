@@ -74,7 +74,7 @@ Stop a pass when the next-largest defect needs an owner decision. Do not invent 
 - **Speaker identity is per-recording.** `SPEAKER_00..07` are diarizer indices, not people. The split
   fix scopes them to their recording; true speaker-disjointness needs CAM++ embeddings clustered
   across files. Not built.
-- **Reviewer QC.** Rubar noticed 1 of 7 known-answer clips while owning the largest share of
+- **Reviewer QC.** Rezan noticed 1 of 7 known-answer clips while owning the largest share of
   decisions. The cheap next measurement is a blind second pass of her accepts through another
   reviewer, which also builds the double-pass tier the charter still lacks.
 - **Dialect disparity 14.79 points.** Measured, unfixed. The Hawleri material is the right kind of
