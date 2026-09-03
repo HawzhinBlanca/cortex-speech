@@ -1639,9 +1639,9 @@ mod tests {
     }
     use super::{
         commit_review_v1_on, get_desktop_review_undo_target_v1_on, mark_segment_unusable_v1_on,
-        persist_whole_segment_update_on, public_desktop_undo_error, public_precommit_playback_binding_error,
-        public_segment_delete_error, public_segment_metadata_error, public_speaker_rename_error,
-        record_human_decision_on, record_review_flag_on, retired_legacy_decision_error,
+        persist_whole_segment_update_on, public_desktop_undo_error, public_playback_error,
+        public_precommit_playback_binding_error, public_segment_delete_error, public_segment_metadata_error,
+        public_speaker_rename_error, record_human_decision_on, record_review_flag_on, retired_legacy_decision_error,
         undo_desktop_review_action_v1_on, validate_playback_receipt_identity,
     };
     use crate::database_runtime::DatabaseRuntime;
@@ -1653,7 +1653,8 @@ mod tests {
         ReviewDecisionV1, TechnicalUnusableReasonV1, UndoDesktopReviewRequestV1,
     };
     use crate::stores::{
-        require_listened, ReviewWriteStore, SegmentDeleteError, SegmentMetadataUpdateError, SpeakerRenameError,
+        require_listened, serialize_technical_audio_probe_test, ReviewWriteStore, SegmentDeleteError,
+        SegmentMetadataUpdateError, SpeakerRenameError,
     };
     use sha2::{Digest, Sha256};
 
@@ -1666,6 +1667,46 @@ mod tests {
 
     fn exact_undo_request(target: &DesktopReviewUndoTargetV1, operation_id: &str) -> UndoDesktopReviewRequestV1 {
         UndoDesktopReviewRequestV1 { target: target.clone(), operation_id: operation_id.into() }
+    }
+
+    #[test]
+    fn every_playback_refusal_maps_to_a_typed_public_code_and_scrubs_the_backend_text() {
+        use crate::ipc_contract::SuggestedActionV1 as A;
+        // (internal marker, public code, retryable, suggested action) — one row per arm, in the
+        // mapper's own order so a shadowed marker would show up as the WRONG code, not a miss.
+        let arms: [(&str, &str, bool, A); 16] = [
+            ("E_PLAYBACK_COVERAGE_INSUFFICIENT", "PLAYBACK_COVERAGE_INSUFFICIENT", true, A::Retry),
+            ("E_NO_PLAYBACK_EVIDENCE", "NO_PLAYBACK_EVIDENCE", true, A::ReloadClip),
+            ("E_PLAYBACK_TIME_IMPLAUSIBLE", "PLAYBACK_TIME_IMPLAUSIBLE", true, A::ReloadClip),
+            ("E_PLAYBACK_REVISION_CHANGED", "PLAYBACK_REVISION_CHANGED", true, A::ReloadClip),
+            ("E_PLAYBACK_EVIDENCE_CHANGED", "PLAYBACK_EVIDENCE_CHANGED", true, A::ReloadClip),
+            ("session is missing or expired", "PLAYBACK_SESSION_EXPIRED", true, A::ReloadClip),
+            ("token expired mid-flight", "PLAYBACK_SESSION_EXPIRED", true, A::ReloadClip),
+            ("active-time budget exceeded", "PLAYBACK_SESSION_EXPIRED", true, A::ReloadClip),
+            ("E_PLAYBACK_SESSION_LIMIT", "PLAYBACK_SESSION_LIMIT", true, A::ReloadClip),
+            ("E_PLAYBACK_SESSION_FINALIZED", "PLAYBACK_SESSION_FINALIZED", false, A::Retry),
+            ("E_PLAYBACK_CANCEL_IDENTITY_MISMATCH", "PLAYBACK_CANCEL_IDENTITY_MISMATCH", false, A::ReloadClip),
+            ("receipt covers a different imported source", "PLAYBACK_AUTHORITY_MISMATCH", false, A::ReloadClip),
+            ("receipt covers a different interval union", "PLAYBACK_AUTHORITY_MISMATCH", false, A::ReloadClip),
+            ("Database Is LOCKED by another writer", "DATABASE_BUSY", true, A::Retry),
+            ("the DATABASE IS BUSY right now", "DATABASE_BUSY", true, A::Retry),
+            ("some backend detail nobody phone-side should read", "PLAYBACK_PROOF_FAILED", false, A::OpenHealth),
+        ];
+        for (marker, code, retryable, action) in arms {
+            // The internal text rides inside a larger message, the way real errors arrive.
+            let internal = format!("refused: {marker} (C:\\private\\owner-profile\\clip.wav)");
+            let error = public_playback_error(&internal);
+            assert_eq!(error.code, code, "{marker}");
+            assert_eq!(error.retryable, retryable, "{marker}");
+            assert_eq!(error.suggested_action, Some(action), "{marker}");
+            // The mapper exists to SCRUB: no fragment of the backend text — least of all a private
+            // filesystem path — may survive into what a reviewer's phone displays.
+            assert!(
+                !error.message.contains("owner-profile") && !error.message.contains(marker),
+                "{marker}: public message leaked internal text: {}",
+                error.message
+            );
+        }
     }
 
     #[test]
@@ -2283,6 +2324,7 @@ mod tests {
 
     #[test]
     fn technical_unusable_mark_is_cas_bound_idempotent_non_human_and_export_excluded() {
+        let _probe_serial = serialize_technical_audio_probe_test();
         let tmp = tempfile::tempdir().unwrap();
         let db = db_with_clip(tmp.path(), "technical-unusable");
         std::fs::write(tmp.path().join("technical-unusable.wav"), b"not an audio container").unwrap();
@@ -2453,6 +2495,7 @@ mod tests {
 
     #[test]
     fn technical_unusable_mark_never_deletes_a_saved_draft() {
+        let _probe_serial = serialize_technical_audio_probe_test();
         let tmp = tempfile::tempdir().unwrap();
         let db = db_with_clip(tmp.path(), "technical-unusable-atomic");
         std::fs::write(tmp.path().join("technical-unusable-atomic.wav"), b"not an audio container").unwrap();
@@ -2497,6 +2540,7 @@ mod tests {
 
     #[test]
     fn healthy_audio_direct_invocation_is_refused_without_any_mutation() {
+        let _probe_serial = serialize_technical_audio_probe_test();
         let tmp = tempfile::tempdir().unwrap();
         let db = db_with_clip(tmp.path(), "healthy-unusable-refusal");
         write_test_wav(&tmp.path().join("healthy-unusable-refusal.wav"), 16_000);
@@ -2528,6 +2572,7 @@ mod tests {
 
     #[test]
     fn backend_distinguishes_container_failure_from_post_probe_decode_failure() {
+        let _probe_serial = serialize_technical_audio_probe_test();
         let tmp = tempfile::tempdir().unwrap();
 
         let corrupt = db_with_clip(tmp.path(), "corrupt-authority");

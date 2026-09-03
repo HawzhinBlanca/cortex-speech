@@ -326,7 +326,12 @@ def pilot_policy(after_review_event_id: int) -> dict[str, object]:
 
 
 def _canonical_path(path: Path) -> str:
-    return os.path.normcase(os.path.abspath(path))
+    # realpath, not abspath: every caller compares a path RECORDED in couch_session.json against a
+    # live `db_path` that was already `.resolve()`d, and resolve() follows symlinks while abspath
+    # does not. Canonicalising only one side refuses a valid activation wherever the data dir sits
+    # behind a link -- macOS routes every temp dir through /var -> /private/var. Still an exact
+    # equality check; both sides are simply reduced the same way before comparing.
+    return os.path.normcase(os.path.realpath(path))
 
 
 def narrow_session(session: dict[str, object], db_path: Path, policy: dict[str, object]) -> dict[str, object]:

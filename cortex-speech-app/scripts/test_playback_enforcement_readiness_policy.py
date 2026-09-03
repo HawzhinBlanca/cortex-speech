@@ -420,6 +420,16 @@ def test_verify_10_keeps_the_current_build_empty_canary_red() -> None:
     assert "--since" not in payload, "verify-10 must use the exact binary's own build-time cutoff"
     assert "--min-decisions" not in payload, "the gate's pinned 20-decision default must remain in force"
 
+    if os.name != "nt":
+        # Everything above is the platform-independent half — how the canary is REGISTERED — and it
+        # just ran. What follows drives it through `verify.run_gate`, and that enters verify-10's
+        # live product authority, which is Windows Known Folder resolution end to end. It cannot
+        # exist on a Linux/macOS runner, so the run half is announced as skipped rather than being
+        # handed a fabricated authority. On Windows — where verify-10 actually certifies — the whole
+        # case runs unchanged, so the 0/20-must-be-RED pin is never weakened where it counts.
+        print("    SKIP: live-run half is Windows-only (Known Folder resolution); registration pins ran")
+        return
+
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         # The child never receives CORTEX_DB: the gate's environment allowlist admits only

@@ -2671,6 +2671,57 @@ mod tests {
     }
 
     #[test]
+    fn consent_revocation_floor_rejects_ambiguous_legacy_identity_and_missing_authority() {
+        for unsafe_path in ["   ", "clip\0.wav"] {
+            let floor = crate::db::Database::open(":memory:").unwrap();
+            floor.initialize().unwrap();
+            floor.insert_segment(&test_segment("withdrawn", "original.wav", "withdrawn recording")).unwrap();
+            floor
+                .connection()
+                .execute(
+                    "UPDATE speech_segments
+                        SET audio_path = ?1,
+                            audio_content_hash = NULL,
+                            rights_revoked_at = '2026-08-31 00:00:00'
+                      WHERE id = 'withdrawn'",
+                    [unsafe_path],
+                )
+                .unwrap();
+            let target = crate::db::Database::open(":memory:").unwrap();
+            target.initialize().unwrap();
+
+            let error = require_consent_revocation_superset(&floor, &target).unwrap_err();
+            assert!(
+                error.contains("withdrawn legacy recording has no safe durable identity"),
+                "ambiguous legacy identity {unsafe_path:?} must fail closed: {error}"
+            );
+        }
+
+        let floor = crate::db::Database::open(":memory:").unwrap();
+        floor.initialize().unwrap();
+        floor.insert_segment(&test_segment("withdrawn", "recording.wav", "withdrawn recording")).unwrap();
+        floor
+            .connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_content_hash = ?1,
+                        rights_revoked_at = '2026-08-31 00:00:00'
+                  WHERE id = 'withdrawn'",
+                ["d".repeat(64)],
+            )
+            .unwrap();
+        let target = crate::db::Database::open(":memory:").unwrap();
+        target.initialize().unwrap();
+
+        let error = require_consent_revocation_superset(&floor, &target).unwrap_err();
+        assert!(
+            error.contains("forget 1 withdrawn recording identity")
+                && error.contains("resurrect 0 withdrawn recording identity"),
+            "a target that omits the withdrawn recording must fail closed: {error}"
+        );
+    }
+
+    #[test]
     fn staged_compensation_semantics_accept_writer_history_and_refuse_segment_deletion() {
         let db = crate::db::Database::open(":memory:").unwrap();
         db.initialize().unwrap();

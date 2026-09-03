@@ -20,7 +20,7 @@ pub(crate) use import_write::ImportWriteStore;
 pub(crate) use jobs::JobStore;
 pub(crate) use review_draft::{ReviewDraftRecord, ReviewDraftStore};
 #[cfg(test)]
-pub(crate) use review_write::require_listened;
+pub(crate) use review_write::{require_listened, serialize_technical_audio_probe_test};
 pub(crate) use review_write::{
     ReviewCommitError, ReviewFlagCommitError, ReviewWriteStore, TechnicalUnusableCommitError,
 };

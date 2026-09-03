@@ -176,10 +176,16 @@ def test_vectorized_rule_b_keeps_the_exact_matcher_semantics() -> None:
 
     drifted = TEXT.replace("تەواوی", "تەڵاوی")
     different = "ئەمە دەقێکی جیاواز و درێژە کە نابێت وەک دووبارە ناسێنرێت لە تاقیکردنەوەدا"
+    # Forward separators, unlike the Windows literals elsewhere in this file: duplicate_groups
+    # identifies clips with os.path.basename, which is platform-flavoured, so r"D:\x\one.flac" keeps
+    # its whole string as the "basename" off Windows and the hard-coded expectation below fails for
+    # a path reason rather than a duplicate-detection one. ntpath and posixpath BOTH reduce
+    # "/x/one.flac" to "one.flac", so the assertion stays literal and exact on every platform.
+    # Masked until now only because this case is numpy-gated and CI pip-installs nothing.
     rows = [
-        ("a", r"D:\x\one.flac", ALIGN, TEXT, 0),
-        ("b", r"D:\x\two.flac", ALIGN, drifted, 0),
-        ("c", r"D:\x\three.flac", ALIGN, different, 0),
+        ("a", "/x/one.flac", ALIGN, TEXT, 0),
+        ("b", "/x/two.flac", ALIGN, drifted, 0),
+        ("c", "/x/three.flac", ALIGN, different, 0),
     ]
     with mock.patch("check_dataset_duplicates.RULE_B_VECTOR_THRESHOLD", 2):
         groups = duplicate_groups(rows)
@@ -339,6 +345,10 @@ def test_audio_confirmation_ignores_same_file_pairs_and_splits_true_components()
             return True
         return False
 
+    # PureWindowsPath, not Path: the fixture paths above are Windows literals, and on Linux/macOS
+    # `Path(r"D:\x\one.wav").name` is the WHOLE string — the stand-in clips would then all carry
+    # distinct identities, `verdict` would never fire, and this pin would report "no duplicates"
+    # on exactly the case it exists to catch.
     with mock.patch(
         "check_dataset_duplicates._clip_pcm",
         # PureWindowsPath: the fixture rows carry Windows drive paths; plain Path leaves the

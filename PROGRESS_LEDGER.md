@@ -12987,6 +12987,1123 @@ store's own tests already minimise slot-holding time for this reason (since 08-2
 through `mark_unusable_retrying_busy`, a 5 s bounded retry on that code only. Production is untouched.
 Proof: `retry_while_probe_busy_retries_only_busy_and_gives_up_at_the_budget` — two BUSY answers then
 the result; a refusal returned at once, never retried; BUSY past the budget reported as BUSY.
+## 2026-08-29 — The published tree names no reviewer, and a gate now says so
+
+`origin` is a PUBLIC repository. The reviewers are private individuals who agreed to transcribe
+audio, not to appear in a public git history. 577 name occurrences were scrubbed across 41 files
+once. Sixteen came back the same day this entry was written, in test fixtures that used real
+reviewer names as sample data, and `git blame` attributes every one of them to commits made hours
+earlier in this session. Nothing objected, because nothing was checking: the rule existed only in a
+human's memory.
+
+`scripts/test_deidentified_tree.py` now checks it. The forbidden names are stored as SALTED SHA-256
+digests, never as literals — a gate that spelled the names out would be the leak it exists to
+prevent, and this way the gate file itself stays publishable. It tokenizes every tracked text file,
+lowercases, hashes, and compares. Two exclusions are deliberate and documented in the file: the
+repository author's own name, which git records as commit authorship, and the VOICE names of the
+corpus speakers, which are dataset identity the owner holds distribution rights to.
+
+The gate immediately found five occurrences a case-sensitive `git grep -w` sweep had missed —
+a lowercase reviewer name embedded in work-id fixtures, and three test FUNCTION names. Fixtures were renamed
+to neutral identifiers (Alpha, Bravo, Delta), preserving the byte lengths the work-id length-prefix
+assertions depend on (the old and new fixture names are both five characters, so `reviewer-work-v1:5:` stays
+true). No policy script pinned any of the renamed test functions; that was checked before renaming,
+because a renamed symbol silently breaks a greppable pin.
+
+Measured: 1,812/1,812 library tests, 0 failed, 8 ignored. The gate carries an anti-vacuity check that
+proves a real reviewer name hashes into the forbidden set while a neutral fixture name does not, so
+a future edit cannot leave it asserting nothing. No live database write, no deploy, no reviewer
+restart.
+
+## 2026-08-30 — Reliability iterations 1–2: restore refusal coverage
+
+The pinned robustness scoreboard ranked
+`restore_service::effects::validate_review_effect_semantics` first. Work stayed on
+`public/clean-release` in the isolated `cortex-scrub` worktree; no live database, reviewer service,
+scheduled task, release pointer, model, GPU setting, or production artifact was touched.
+
+- Iteration 1 proved that every noncanonical schema-v60 frontier field and both frontiers claiming
+  nonexistent event/ledger history are refused for the intended reason. Commits `f9566433` and
+  `75ebb3df` were pushed. Exact pinned coverage passed 1,814 library tests with 0 failures and moved
+  restore branches from 58.59% to 58.99% (622 to 616 uncovered); overall branches moved from 59.24%
+  to 59.30%.
+- Iteration 2 took the next uncovered desktop-operation boundary. One table-driven test proves that
+  an unlinked desktop effect is refused if it is relabelled as Couch work, acquires a reviewer, or
+  loses its operation id, payload hash, requested action, or timestamp. Focused result:
+  `test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 1807 filtered out`. Strict
+  all-target/all-feature Clippy with `-D warnings` and rustfmt both exited 0. Commit
+  `e32b5a3a3aa66b4fbe50f15cac9f3a5c539846cb` was pushed and independently matched on
+  `origin/public/clean-release`.
+
+Honest status before the iteration-2 remeasurement: P0 remains unknown because no current health
+heartbeat exists; P1 remains red and materially below its locked bars; P2 remains green.
+
+## 2026-08-30 — Reliability iteration 3: exact legacy correction-memory boundary
+
+The current pinned scoreboard still ranked
+`restore_service::effects::validate_review_effect_semantics` first. The next exercised refusal gap
+was the schema-v60 correction-memory boundary: only rows that existed before migration may carry
+`legacy_seed = 1`; every post-v60 row starts at zero and requires immutable effect-bound capture
+lineage.
+
+One two-sided regression now constructs the exact grandfathered row and proves it remains
+restorable, then applies `legacy_seed = 2` with restored-file guards disabled and proves the
+validator returns the specific invalid-legacy-boundary refusal. Focused result:
+`test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 1807 filtered out`. Strict
+all-target/all-feature Clippy with `-D warnings` and rustfmt both exited 0. Commit
+`0cd9c52b734775f047069a4c0d3281d4dfed3a44` was pushed and independently matched on
+`origin/public/clean-release`.
+
+Honest status before the iteration-3 remeasurement: the product chunk is green and pushed, but no
+coverage improvement is claimed until the pinned all-target run finishes. P0 remains unknown; P1
+remains red; P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 4: correction-memory contribution admission
+
+The same top-ranked restore validator next exposed its correction-memory contribution admission
+cluster. One table-driven regression inserts eight guarded restored-file corruptions: missing effect,
+missing memory, an out-of-range capture delta, a zero contribution, simultaneous confirm/override,
+capture on an accept decision, confirm without `fired_at`, and blank `fired_at`. Every case first
+proves its corrupt row was inserted, then requires either the exact missing-effect refusal or the
+exact action/evidence-identity refusal.
+
+Focused result: `test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 1807 filtered out`.
+Strict all-target/all-feature Clippy with `-D warnings` and rustfmt both exited 0. Commit
+`69d9b9b7b07a2be9f49839c5e8fdcf1caf9e8786` was pushed and independently matched on
+`origin/public/clean-release`.
+
+Honest status before the iteration-4 remeasurement: no coverage delta is claimed yet. P0 remains
+unknown; P1 remains red; P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 5: exact correction-memory override outcome
+
+Iteration 4's exact clean-SHA measurement at ledger commit `3de0ec770835d4ac75912182f03092d96d37f51c`
+passed 1,817 library tests with 0 failures and 8 ignores, reliability 23/23, soak 1/1, Tauri
+integration 1/1, shell smoke 1/1, user-data 2/2, and all Criterion targets. Overall branch coverage
+moved 59.34% to 59.43%; restore moved 59.39% to 60.03%, reducing uncovered restore branches from
+610 to 602. P1 therefore remains red, P2 remains green, and P0 remains unknown because no current
+production heartbeat exists.
+
+The scoreboard kept `restore_service::effects::validate_review_effect_semantics` first. The next
+uncovered semantic arm was `MemoryOutcome::Override`. A two-sided regression now constructs an exact
+grandfathered memory which would rewrite an accepted transcript away from the human answer. Its
+override contribution is first admitted by the real schema and accepted by the restore validator;
+the same immutable evidence is then relabelled as a confirmation with restored-file guards disabled,
+and the validator must return the exact outcome-rederivation refusal.
+
+Focused result: `test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 1807 filtered out`.
+Installed stable rustfmt passed its exact check, and installed stable Clippy passed all targets and
+all features with `-D warnings`; the pinned measurement nightly lacks both optional components but
+continues to own test and coverage execution. Commit `4fdb416e` was pushed and independently matched
+on `origin/public/clean-release`.
+
+Honest status before the iteration-5 remeasurement: the product chunk is green and pushed, but no
+new coverage delta is claimed until the exact pinned all-target run finishes. Production and
+scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 6: immutable legacy decision baseline
+
+Iteration 5's exact clean-SHA measurement at ledger commit `bf298d6fe1b07e1bc9312b52dde66eb0d0964b3e`
+passed 1,818 library tests with 0 failures and 8 ignores, reliability 23/23, soak 1/1, Tauri
+integration 1/1, shell smoke 1/1, user-data 2/2, and all Criterion targets. Overall branch coverage
+moved 59.43% to 59.46%; restore moved 60.03% to 60.36%, reducing uncovered restore branches from
+602 to 597. P1 remains red, P2 green, and P0 unknown because the production heartbeat is absent.
+
+The next dense uncovered cluster was the first post-v60 decision's binding to its immutable reviewed
+schema-59 origin. The regression builds that authority through the real rollback/migrate path,
+validates the exact migrated terminal state, records a phone decision through the production writer,
+then applies eight one-field prior-state corruptions: verified flag, annotated transcript, verdict,
+verdict transcript, escalation, human decision, correction timestamp, and reviewer. Every corruption
+is proven to apply, must produce the exact legacy-baseline refusal, and is reset before the full chain
+is revalidated.
+
+The first draft also changed `prior_rationale`; its focused run failed because that field is correctly
+rejected earlier by the effect identity boundary. That case was removed rather than misreported as
+legacy-baseline coverage. The corrected focused proof passed 1/1, and the complete restore-effects
+suite passed 20/20. Installed stable rustfmt passed its exact check; installed stable Clippy passed all
+targets/features with `-D warnings`. Product commit `a3d59363` was pushed and independently matched on
+`origin/public/clean-release`.
+
+Honest status before the iteration-6 remeasurement: the corrected product chunk is green and pushed,
+but no new coverage delta is claimed until the exact pinned all-target run finishes. Production and
+scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 7: exact reversal terminal snapshots
+
+Iteration 6's exact clean-SHA measurement at ledger commit `390fc14e082570090ca6e40dd6355a4db9ae7563`
+passed 1,819 library tests with 0 failures and 8 ignores, reliability 23/23, soak 1/1, Tauri
+integration 1/1, shell smoke 1/1, user-data 2/2, and all Criterion targets. Overall branch coverage
+moved 59.46% to 59.69%; restore moved 60.36% to 62.35%, reducing uncovered restore branches from
+597 to 567. The measured secondary effects target fell from 198 to 168 uncovered branches. P1
+remains red, P2 green, and P0 unknown because the production heartbeat is absent.
+
+The next uniquely owned terminal guards were the latest decision-reversal and flag-reversal
+snapshots. The corrected regression drives a real phone decision plus undo and a real review flag
+plus undo through production writers, proves both clean inverse states validate, then changes verdict
+and escalation independently for each. All four corruptions are proven to apply, must produce their
+exact decision/flag reversal refusal, and are reset before revalidating the clean inverse.
+
+Two earlier drafts failed honestly and were narrowed instead of weakened: lowering revision is
+rejected earlier by the latest-effect revision floor, while stable human fields are rejected earlier
+by the exact effect-chain projection. Those cases cannot truthfully claim terminal-guard coverage and
+are absent from the final test. The corrected focused proof passed 1/1 and the complete restore-effects
+suite passed 21/21. Installed stable rustfmt passed; installed stable Clippy passed all targets/features
+with `-D warnings`. Product commit `ee61fc0b` was pushed and independently matched on
+`origin/public/clean-release`.
+
+Honest status before the iteration-7 remeasurement: the corrected product chunk is green and pushed,
+but no new coverage delta is claimed until the exact pinned all-target run finishes. Production and
+scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 8: exact active terminal snapshots
+
+Iteration 7's exact clean-SHA measurement at ledger commit `615e7222f1bddfc88084b1f8ab998b98a30e2b45`
+passed 1,820 library tests with 0 failures and 8 ignores, E2E 10/10, reliability 23/23, soak 1/1,
+Tauri integration 1/1, shell smoke 1/1, user-data 2/2, and all Criterion targets. Overall branch
+coverage moved 59.69% to 59.75%; restore moved 62.35% to 62.75%, reducing uncovered restore branches
+from 567 to 561. The measured secondary effects target fell from 168 to 162 uncovered branches. P1
+remains red, P2 green, and P0 unknown because the production heartbeat is absent.
+
+The next uniquely owned terminal guards were the active decision and active flag snapshots. One
+regression drives a genuine active phone decision and a genuine active review flag through production
+writers, proves both clean states validate, then changes verdict and escalation independently for each.
+All four corruptions are proven to apply, must produce their exact active-decision or active-flag
+terminal refusal, and are reset before revalidating the clean state. Stable human fields, rationale,
+and revision were deliberately excluded because earlier effect-chain, rationale, and revision-floor
+guards own those failures.
+
+The focused proof passed 1/1 and the complete restore-effects suite passed 22/22. Installed stable
+rustfmt passed its exact check; installed stable Clippy passed all targets/features with `-D warnings`.
+Product commit `4db34bf942604755633976aba211ae65da3444b9` is ready for the ledger commit and exact push.
+
+Honest status before the iteration-8 remeasurement: the product chunk is green, but no new coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 9: exhaustive effect identity fields
+
+Iteration 8's exact measurement at ledger commit `fb62fbd48531f76d5caff36c46d829074df4d2dd`
+completed 1,821 library tests with 0 failures and 8 ignores, E2E 10/10, reliability 23/23, soak 1/1,
+Tauri integration 1/1, shell smoke 1/1, user-data 2/2, and all Criterion targets. The first concurrent
+nightly attempt exhausted the Windows pagefile and produced cascading metadata diagnostics; a fresh
+run with `CARGO_BUILD_JOBS=1` preserved the exact source, targets, features, branch instrumentation,
+and thresholds and completed successfully. The certifying wrapper still exited red solely because the
+locked coverage thresholds remain unmet. Overall branch coverage stayed 59.75%; restore moved 62.75%
+to 62.88%, reducing uncovered restore branches from 561 to 559. The active effects function fell from
+162 to 160 uncovered branches. P1 remains red, P2 green, and P0 unknown because the production
+heartbeat is absent.
+
+The new LLVM artifact exposed ten untested fields in the immutable effect identity/revision boundary.
+One table-driven regression starts every case from a genuine typed desktop effect, proves that clean
+state validates, then independently corrupts the effect id, segment id, decision revision, action,
+decision-verified flag, prior-verified flag, prior-escalation flag, rationale continuity, served-text
+presence, or served-text canonical form. Every mutation is proven to apply and must produce the exact
+identity/revision refusal. The typed desktop shape deliberately avoids the earlier Couch event/pay-link
+guard that correctly owns comparable phone-effect failures.
+
+The focused proof passed 1/1 and the complete restore-effects suite passed 23/23. Installed stable
+rustfmt passed its exact check; installed stable Clippy passed all targets/features with `-D warnings`.
+Product commit `f0417be9b70ad00c28cb5193cf65865da03a1582` is ready for the ledger commit and exact push.
+
+Honest status before the iteration-9 remeasurement: the product chunk is green, but no new coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 10: exhaustive review-flag identity fields
+
+Iteration 9's exact serialized measurement at ledger commit
+`ff985aa640b178ed9a966c4a4fbd5f2097d8496d` completed 1,822 library tests with 0 failures and 8
+ignores, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell smoke 1/1,
+user-data 2/2, and all Criterion targets. The certifying wrapper exited red solely because the
+locked coverage thresholds remain unmet. Overall branch coverage moved 59.75% to 59.83%; restore
+moved 62.88% to 63.55%, reducing uncovered restore branches from 559 to 549. The active effects
+function fell from 160 to 150 uncovered branches. P1 remains red, P2 green, and P0 unknown because
+the production heartbeat is absent.
+
+The next LLVM-ranked cluster contained seven unproved fields in the review-flag immutable
+revision/operation identity clause. The new table-driven regression starts every case from a genuine
+flag written through the production API, proves that clean state validates, then independently
+corrupts the effect id, operation UUID, segment id, flag revision, rationale presence, rationale
+canonical form, or prior-escalation flag. Every mutation is proven to apply and must produce the exact
+flag-identity refusal. The reversal-operation arm was deliberately excluded because the exact artifact
+already showed it covered.
+
+The focused proof passed 1/1 and the complete restore-effects suite passed 24/24. Installed stable
+rustfmt passed; installed stable Clippy passed all targets/features with `-D warnings`. Product commit
+`918ac6b6fb2e92c9a392db434cf57ecb51831f89` is ready for the ledger commit and exact push.
+
+Honest status before the iteration-10 remeasurement: the product chunk is green, but no new coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 11: exhaustive post-v60 memory baseline fields
+
+Iteration 10's exact serialized measurement at ledger commit
+`863d9448f906cf6fe8c567c2bc6e0cf425c20a74` completed 1,823 library tests with 0 failures and 8
+ignores, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell smoke 1/1,
+user-data 2/2, and all Criterion targets. The certifying wrapper exited red solely because the
+locked coverage thresholds remain unmet. Overall branch coverage moved 59.83% to 59.87%; restore
+moved 63.55% to 64.01%, reducing uncovered restore branches from 549 to 542. The active effects
+function fell from 150 to 143 uncovered branches. P1 remains red, P2 green, and P0 unknown because
+the production heartbeat is absent.
+
+The next LLVM-ranked cluster contained twelve unproved fields in the post-v60 correction-memory
+zero-baseline capture boundary. The new table-driven regression starts each case from a real edit
+through the production decision writer, proves its generated memory and contribution validate, then
+independently corrupts the memory UUID, wrong/human token presence, slot presence, token distinction,
+confidence finiteness, exact baseline confidence, confirmation/override baseline, fired-at baseline,
+capture presence, or capture origin. Every mutation is proven to apply and must produce the exact
+zero-baseline capture-identity refusal. The hit-count arm was deliberately excluded because the exact
+artifact already showed it covered.
+
+The focused proof passed 1/1 and the complete restore-effects suite passed 25/25. Installed stable
+rustfmt passed; installed stable Clippy passed all targets/features with `-D warnings`. Product commit
+`b8efd92efe12eb632debac1e2aa6236ea1867f12` is ready for the ledger commit and exact push.
+
+Honest status before the iteration-11 remeasurement: the product chunk is green, but no new coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 12: exhaustive immutable legacy terminal fields
+
+Iteration 11's exact serialized measurement at ledger commit
+`cb778605494cfe09e7233ded3e8a043e1dcba26d` completed 1,824 library tests with 0 failures and 8
+ignores, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell smoke 1/1,
+user-data 2/2, and all Criterion targets. The certifying wrapper exited red solely because the
+locked coverage thresholds remain unmet. Overall branch coverage moved 59.87% to 59.96%; restore
+moved 64.01% to 64.81%, reducing uncovered restore branches from 542 to 530. The active effects
+function fell from 143 to 131 uncovered branches. P1 remains red, P2 green, and P0 unknown because
+the production heartbeat is absent.
+
+The numerically largest remaining thirteen-branch cluster was rejected as a false next target: its
+later phone-effect equality checks cannot be reached in a failing state because the earlier
+post-v60 event query already requires the exact same source, reviewer, event, effect, ledger, action,
+and revision linkage. No guard was weakened and no fixture was manufactured to game coverage.
+
+The next reachable cluster was the immutable pre-v60 terminal snapshot. The new regression creates a
+reviewed schema-59 segment, migrates it through the real schema-60 snapshot, proves the exact state
+validates, then independently corrupts and resets all eleven compared fields: review revision, human
+decision, verdict, verdict transcript, annotated transcript, verified flag, reviewer, correction
+timestamp, escalation, gold flag, and rationale. Every mutation must produce the exact immutable
+legacy-terminal refusal, and every reset is revalidated.
+
+The focused proof passed 1/1 and the complete restore-effects suite passed 26/26. Installed stable
+rustfmt passed; installed stable Clippy passed all targets/features with `-D warnings`. Product commit
+`34ff3bce243ae6a047e0cf3a3d59d23f1a97e5df` is ready for the ledger commit and exact push.
+
+Honest status before the iteration-12 remeasurement: the product chunk is green, but no new coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 13: exhaustive review-event provenance fields
+
+Iteration 12's exact serialized measurement at ledger commit
+`cfca7041370863db54262244ee16a01226665203` completed 1,825 library tests with 0 failures and 8
+ignores, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell smoke 1/1,
+user-data 2/2, and all Criterion targets. The certifying wrapper exited red solely because the
+locked coverage thresholds remain unmet. Overall branch coverage moved 59.96% to 60.06%; restore
+moved 64.81% to 65.54%, reducing uncovered restore branches from 530 to 519. The active effects
+function fell from 131 to 120 uncovered branches. P1 remains red, P2 green, and P0 unknown because
+the production heartbeat is absent.
+
+The next reachable LLVM cluster contained ten unproved post-v60 review-event provenance fields. The
+new regression starts every case from a real phone decision and independently corrupts source,
+action, requested action, payload-hash shape, payload-hash equality, requested-text canonicality,
+served-text canonicality, served revision, request classification, or build-SHA alphabet. Every
+mutation is proven to apply and must produce the exact Couch/build/playback provenance refusal. The
+requested-text case recomputes a matching payload hash for the deliberately untrimmed text so the
+text-canonicality guard, rather than the earlier digest comparison, owns the failure.
+
+The focused proof passed 1/1 and the complete restore-effects suite passed 27/27. Installed stable
+rustfmt passed; installed stable Clippy passed all targets/features with `-D warnings`. Product commit
+`dbde48ea46d9a468a07331d458c8e89f906c09f7` is ready for the ledger commit and exact push.
+
+Honest status before the iteration-13 remeasurement: the product chunk is green, but no new coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 14: exhaustive effect-bound agent-example provenance
+
+Iteration 13's exact serialized measurement at ledger commit
+`e36fda5b60336aa57ebd96651882c97590dac32f` completed 1,826 library tests with 0 failures and 8
+ignores, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell smoke 1/1,
+user-data 2/2, and all Criterion targets. The certifying wrapper exited red solely because the
+locked coverage thresholds remain unmet. Overall branch coverage moved 60.06% to 60.13%; restore
+moved 65.54% to 66.20%, reducing uncovered restore branches from 519 to 509. The active effects
+function fell from 120 to 110 uncovered branches. P1 remains red, P2 green, and P0 unknown because
+the production heartbeat is absent.
+
+The next reachable LLVM cluster contained ten unproved effect-bound agent-example provenance
+conditions. The new table-driven regression starts every case from a genuine edit written through
+the production phone-decision API, proves the writer created exactly one effect-bound agent example
+and correction, and proves that clean state validates. It then independently corrupts the example
+UUID, segment ownership, edit-only authority, human source, verification bit, wrong/fix presence,
+wrong/fix distinction, retained-speech derivation, or correction-row equality. The edit-only case
+updates the otherwise exact event/effect/ledger action trio together, ensuring the agent-example
+guard—not an earlier linkage check—owns the refusal. Every case must produce the exact genuine-human-
+edit refusal under the restored-file threat model.
+
+The focused proof passed 1/1 and the complete restore-effects suite passed 28/28. Installed stable
+rustfmt passed; installed stable Clippy passed all targets/features with `-D warnings`. Product commit
+`41408b448d1c284721fe31af3a43a7b660e44ef4` is ready for the ledger commit and exact push.
+
+Honest status before the iteration-14 remeasurement: the product chunk is green, but no new coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-30 — Reliability iteration 15: exhaustive effect-bound correction provenance
+
+Iteration 14's exact serialized measurement at ledger commit
+`9a3003f842497836dd222a27c3053b4c59b11e1c` completed 1,827 library tests with 0 failures and 8
+ignores, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell smoke 1/1,
+user-data 2/2, and all Criterion targets. The certifying wrapper exited red solely because the
+locked coverage thresholds remain unmet. Overall branch coverage moved 60.13% to 60.22%; restore
+moved 66.20% to 66.87%, reducing uncovered restore branches from 509 to 499. The active effects
+function fell from 110 to 100 uncovered branches. P1 remains red, P2 green, and P0 unknown because
+the production heartbeat is absent.
+
+The next reachable LLVM cluster contained ten unproved effect-bound correction provenance
+conditions. The new table-driven regression starts every case from a genuine edit written through
+the production phone-decision API, proves the writer created exactly one bound agent example and
+correction, and proves that clean state validates. It then independently corrupts correction UUID,
+edit-only authority, reviewer identity, audio hash, wrong/fix presence, wrong/fix distinction,
+decision-text equality, retained-speech derivation, or one-correction-per-effect ownership. Cases
+that alter correction text remove the earlier agent-example row under the restored-file threat model
+so the correction guard, rather than the earlier example/correction equality guard, owns the refusal.
+The edit-only case preserves event/effect/ledger linkage by updating the three action fields together.
+
+The focused proof passed 1/1 and the complete restore-effects suite passed 29/29. Installed stable
+rustfmt passed; installed stable Clippy passed all targets/features with `-D warnings`. Product commit
+`6875964c61027086c6214e881bc1ab3be54e00d8` is ready for the ledger commit and exact push.
+
+Honest status before the iteration-15 remeasurement: the product chunk is green, but no new coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
+
+The first exact iteration-15 measurement at pushed ledger commit
+`b34c0b71b3bc3aeb1e6b7ce7ba31545e0a6127eb` completed 1,828 library tests with 0 failures and 8
+ignores plus the same green E2E, reliability, soak, Tauri, shell, user-data, and Criterion matrix.
+The artifact (`aa7ffbfe9eef41b699b7b4752192d2e4`, SHA-256
+`6e90c1146ff3f654acde6d284da946be0e7b880a596aefa3f975abeaf3de9c58`) proved only nine of the ten
+targeted correction branches turned green: overall branches reached 60.28%, restore reached 67.46%
+(499 → 490 uncovered), and the active effects target moved 100 → 91. The noncanonical correction
+audio hash was correctly intercepted by the earlier retained-segment hash-equality guard, so the
+initial fixture did not prove the later canonical-hash condition.
+
+Follow-up product commit `5830cbf8361c63754ae85dc7942fcfdc367a0bda` repairs that proof without
+weakening either guard: it corrupts the retained segment and correction hash together under the
+restored-file threat model, preserving their equality so canonicality owns the refusal. The repaired
+focused proof passed 1/1, restore effects passed 29/29, and strict stable Clippy/rustfmt passed. The
+first artifact is retained as evidence of the caught miss; no final iteration-15 delta is claimed
+until a new exact pinned all-target run measures the follow-up commit.
+
+## 2026-08-31 — Reliability iteration 16: exhaustive typed-desktop operation fields
+
+The repaired exact iteration-15 measurement at pushed ledger commit
+`dc08e85f98461c2c98288ca01a3c7b431b3a8ad8` completed 1,828 library tests with 0 failures and 8
+ignores, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell smoke 1/1,
+user-data 2/2, and all Criterion targets. The certifying wrapper exited red solely because the
+locked coverage thresholds remain unmet. The final artifact (`5a5c6aa8c94f4dee89375f9a4e40a281`,
+SHA-256 `1fcaeabcfe55f052c49e4dfd7ec56071e0b6f5053d9a3881ed4da56e893a5243`) proved all ten intended
+correction conditions green. Overall branches reached 60.30%; restore reached 67.53%, reducing
+uncovered restore branches from 499 to 489, and the active effects target moved 100 to 90. The same
+run measured IPC at 42.61% (438/1,028) while the first iteration-15 run measured 42.80% (440/1,028)
+without an IPC code change; that two-branch difference is retained as coverage-run variance rather
+than misreported as a product regression. P1 remains red, P2 green, and P0 unknown because the
+production heartbeat is absent.
+
+The next reachable LLVM cluster contained five unproved inner conditions in the typed-desktop
+operation boundary. The new table-driven regression begins with the exact v1 desktop-effect shape,
+including its production digest formula and playback authority, proves the clean row validates, then
+independently supplies a noncanonical operation UUID, noncanonical payload hash, nonpositive request
+timestamp, unnormalized requested text, or empty requested text. Existing tests already own tuple
+presence and payload equality; the new cases use present but invalid values so each inner semantic
+guard owns its refusal. Larger-looking phone-link and retained-current-state clusters were excluded
+because earlier exact guards already prove the same equalities, making their later failure arms
+unreachable without weakening validation.
+
+The focused proof passed 1/1 across all five mutations and the complete restore-effects suite passed
+30/30. Installed stable rustfmt passed; installed stable Clippy passed all targets/features with
+`-D warnings`. Product commit `adf1dfb35841c3f61d1c19f90173cec382c9e88c` is ready for the
+ledger commit and exact push.
+
+Honest status before the iteration-16 remeasurement: the product chunk is green, but no coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-31 — Reliability iteration 17: exhaustive unsnapshotted prior truth
+
+Iteration 16's exact serialized measurement at pushed ledger commit
+`1042546c2e1c1de10f90876838fccd4e71d8a60d` completed 1,829 library tests with 0 failures and 8
+ignores, importer 14/14, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and all Criterion targets. The certifying wrapper exited red solely
+because the locked coverage thresholds remain unmet. The artifact (`8215c7138c704f8ba52c913f5277cb97`,
+SHA-256 `dbfcb5b8f07e0705c0f74d9c26cc7cc7caa1a0dd565a36577a8992316e4c3e5a`) proved all five intended
+typed-desktop conditions green. Overall branches reached 60.35%; restore reached 67.86%, reducing
+uncovered restore branches from 489 to 484, and the active effects target moved 90 to 85. The
+artifact gained five intended effects branches plus unrelated run variance of +2 in commands and
+-1 in normalizer; IPC returned to 42.80% (440/1,028). P1 remains red, P2 green, and P0 unknown
+because the production heartbeat is absent.
+
+The next reachable LLVM cluster contained seven unproved ways a first post-v60 mutation could claim
+unsnapshotted human prior truth. The new regression uses genuine production phone accepts rather
+than edits for decision cases, so no correction/example/memory evidence exists to intercept changes
+to prior annotation, human decision, reviewer, correction timestamp, or human verdict. Separate
+genuine review flags prove forged prior escalation and prior human verdict. Every clean fixture
+validates before exactly one immutable prior field is changed under the restored-file threat model,
+and every case must produce the exact unsnapshotted-human-truth refusal. No learning rows, linkage
+guards, or production validation were weakened or removed.
+
+The focused proof passed 1/1 across all seven mutations and the complete restore-effects suite passed
+31/31. Installed stable rustfmt passed; installed stable Clippy passed all targets/features with
+`-D warnings`. Product commit `cec922e430afcff3ea006033b60a394be07a7168` is ready for the
+ledger commit and exact push.
+
+Honest status before the iteration-17 remeasurement: the product chunk is green, but no coverage
+delta is claimed until the exact pinned all-target run finishes. P0 remains unknown, P1 remains red,
+and P2 remains green. Production and scheduled tasks were untouched.
+
+## 2026-08-31 — Reliability iteration 18: remaining prior and contribution boundaries
+
+Iteration 17's exact serialized measurement at pushed ledger commit
+`1714162741f52ccdaddaf3fad6e939e72154f46f` completed 1,830 library tests with 0 failures and 8
+ignores plus a green importer, E2E, reliability, soak, Tauri, shell, user-data, and Criterion matrix.
+Artifact `ab6d9771e9234c4a8cefbe238b322639` (SHA-256
+`f1e1c0432e50fa6a0256d199b9e08b18cbb5dcd1244e58fd603ec147cd76b591`) moved overall branches
+60.35% to 60.41%, restore 67.86% to 68.39% (484 to 476 uncovered), and active effects 85 to 77.
+The wrapper remained red solely at locked thresholds. P1 remains red, P2 green, and P0 unknown.
+
+The first iteration-18 draft attempted five legacy-origin arms. Its focused run correctly failed
+because the production flag writer refuses a flag on a segment that already owns a human decision;
+the three apparent legacy-first-flag branches are therefore not honest production-writer targets.
+Those cases were removed instead of inserting forged flags or weakening the writer.
+
+The corrected five-branch chunk proves the two reachable legacy-decision origin fields and the three
+remaining correction-memory contribution fields. A migrated schema-59 reviewed segment receives a
+genuine post-v60 accept; the revision case moves event, effect, and pay-ledger revisions together so
+legacy revision ownership—not earlier linkage—owns the refusal, while the rationale case moves both
+effect rationale fields together. Contribution proof adds out-of-range confirm and override values,
+plus a genuine production reject effect with a forged contribution, proving contributions remain
+accept/edit-only.
+
+All three focused tests passed, the complete restore-effects suite passed 33/33, stable rustfmt
+passed, and strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`b161796d0ea25e90525413b643d20c869757fc3a` is ready for the ledger commit and exact push. No
+coverage delta is claimed before exact clean-SHA measurement. Production and scheduled tasks were
+untouched.
+
+## 2026-08-31 — Reliability iteration 19: snapshot manifest filename boundaries
+
+Iteration 18's exact serialized measurement at pushed ledger commit
+`f39daf8c4343a9263b893b2d9f1b501271011804` completed 1,832 library tests with 0 failures and 8
+ignores, importer 14/14, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and all Criterion targets. Artifact
+`31a98f84537a4f4089ca25a7952c51d1` (SHA-256
+`3ddd39661a115deacb694e0749daec9ca27286d85ba83afee9fa32af9082735a`) moved overall branch
+coverage to 60.46% and restore to 68.86% (476 to 469 uncovered). The active effects convention
+fell from 77 to 70 uncovered branches. The wrapper remained red solely at locked thresholds. P1
+remains red, P2 green, and P0 unknown because the production heartbeat is absent.
+
+The next highest restore-critical debt was snapshot manifest filename hardening. A new private-
+contract regression proves every reachable unsafe-shape arm: empty/current/parent names,
+case-insensitive manifest self-reference, rooted and nested paths, control and Windows-special
+characters, trailing space or dot, classic reserved devices, and numbered COM/LPT devices. It also
+proves valid boundaries including COM0, LPT0, longer non-device prefixes, ordinary database/config
+files, and a non-self manifest-like name. The explicit separator predicate remains structurally
+unreachable because rooted or multi-component paths are rejected by the preceding component guards;
+the test does not falsely claim it.
+
+The focused proof passed 1/1, the complete snapshot suite passed 30/30, stable rustfmt passed, and
+strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`43cafc8e90e17f5a3fd3d2ae88890e1feadbfa77` then received an exact pinned all-target measurement:
+1,833 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `302c2012afb841f398ae5c7c8dafc4cb` (SHA-256
+`e8d2c0c794bfb3f1669b1dd219f69c348eecb94fab86187f20be4f8b72576729`) proves snapshot branches
+moved 233/392 to 247/392 and restore moved 1,037/1,506 to 1,051/1,506, reducing uncovered restore
+branches from 469 to 455. Overall coverage is branches 7,761/12,811 (60.58%), lines
+76,090/95,444 (79.72%), regions 135,168/169,454 (79.77%), and functions 6,485/9,606 (67.51%).
+The target supplied all 14 restore gains; unrelated run variance added one branch each in
+`atomic_file.rs` and `jury/learning.rs`, while `normalizer.rs` varied by one covered line in the
+opposite direction. Remaining minimum deficits are 2,488 overall branches, 5,038 lines, 8,868
+regions, and 1,200 functions; critical branch deficits are review 157, payment 147, playback 119,
+restore 305, and IPC 486. Production, live data, scheduled tasks, release pointers, credentials,
+and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 20: exhaustive champion-pointer restore contract
+
+The next reachable snapshot cluster was the required `champion.json` restore-state boundary. One
+private-contract regression supplies malformed JSON, a non-object root, an extra root field, each
+independently missing required root key, the wrong schema, a non-object champions map, a whitespace-
+only family, a non-object family entry, the wrong family field set, and a non-string field. It also
+proves an exact schema-2 champion entry with the five required string fields. Every failure case
+asserts the stable production-owned refusal; the parser-detail suffix is intentionally asserted only
+by its application prefix.
+
+The focused proof passed 1/1, the complete snapshot suite passed 31/31, stable rustfmt passed, and
+strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`e27e3033539cdf3446f85dae568bf7d78be0b45d` then received an exact pinned all-target measurement:
+1,834 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `c920994d0a1f4510b1c201540b215fe1` (SHA-256
+`94340383048eb020e54e6d942fea4eab88e78d878539134b2a3b084fed5750bc`) proves snapshot branches
+moved 247/392 to 256/392 and restore moved 1,051/1,506 to 1,060/1,506, reducing uncovered restore
+branches from 455 to 446. Overall coverage is branches 7,768/12,811 (60.64%), lines
+76,159/95,498 (79.75%), regions 135,278/169,534 (79.79%), and functions 6,491/9,607 (67.57%).
+The target supplied nine restore branches; unrelated run variance removed one covered branch and
+line each from `atomic_file.rs` and `couch/lifecycle.rs`, while `normalizer.rs` gained one covered
+line. Remaining minimum deficits are 2,481 overall branches, 5,015 lines, 8,826 regions, and 1,195
+functions; critical branch deficits are review 157, payment 147, playback 119, restore 296, and IPC
+486. Production, live data, scheduled tasks, release pointers, credentials, and GPU/model
+configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 21: snapshot selector authority boundaries
+
+The next reachable snapshot cluster was the opaque selector grammar and real-directory admission
+boundary. One regression proves fixed timestamps require exactly ten decimal digits; pin labels are
+non-empty, at most 64 bytes, begin alphanumerically, and otherwise contain only alphanumerics,
+underscore, or hyphen. It exercises both valid rotating and pinned directories, rejects short and
+nondigit timestamps, missing/empty/oversized/invalid pin labels, forward- and backslash nesting,
+arbitrary selectors, valid-but-unavailable selectors, and a selector resolving to a file. The
+directory-symlink disjunct remains intentionally unclaimed because creating directory symlinks is
+privilege-dependent on Windows; the production refusal remains intact.
+
+The focused proof passed 1/1, the complete snapshot suite passed 32/32, stable rustfmt passed, and
+strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`251e2aeee78751b8ac6f91c702eb8440134ccfce` then received an exact pinned all-target measurement:
+1,835 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `707a6c1151174d19abafb42f4c8df83d` (SHA-256
+`9fa1158691d609dc9ae59296c7fb5ccc2db84176d9d1c2bd96223b2465b06fc9`) proves snapshot branches
+moved 256/392 to 264/392 and restore moved 1,060/1,506 to 1,068/1,506, reducing uncovered restore
+branches from 446 to 438. Overall coverage is branches 7,776/12,811 (60.70%), lines
+76,194/95,533 (79.76%), regions 135,357/169,621 (79.80%), and functions 6,493/9,608 (67.58%).
+The target supplied all eight net branch gains; unrelated run variance was audio +1, Couch lifecycle
++1, jury learning -1, and normalizer -1. Remaining minimum deficits are 2,473 overall branches,
+5,010 lines, 8,821 regions, and 1,194 functions; critical branch deficits are review 157, payment
+147, playback 119, restore 288, and IPC 486. Production, live data, scheduled tasks, release
+pointers, credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 22: snapshot manifest identity and inventory integrity
+
+The next reachable snapshot cluster was the restore manifest's identity, exact-inventory, and
+content-binding contract. One private-contract regression proves missing and future schemas,
+schema-1 unknown fields and policy-schema drift, empty schema-1 identity, empty schema-2 identity
+and source directory, case-colliding declarations, unlisted and missing files, malformed lowercase
+SHA-256 values, size and digest mismatches, an unexpected directory, and removal of the mandatory
+database from both disk and the declared inventory. It first proves the generated schema-1
+manifest, constructs and proves a database-evidence-bound schema-2 manifest, and finally restores
+the canonical database and manifest and proves them again. The typed manifest schema cannot differ
+from the schema probe, and a second exact-name duplicate arm is shadowed by the preceding
+case-folded duplicate guard; neither is falsely claimed as independently reachable.
+
+The focused proof passed 1/1, the complete snapshot suite passed 33/33, stable rustfmt passed, and
+strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`61623cfee510e43ae6e61d60373f1ad73fb58e93` then received an exact pinned all-target measurement:
+1,836 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `dfac15b44b3b43f8ab1497755533cc1c` (SHA-256
+`49d5a5bf721ebacf05818430e417ee4049a0acdfa0ec6c26fae7453f01a35578`) proves snapshot branches
+moved 264/392 to 279/400 and restore moved 1,068/1,506 to 1,083/1,514, reducing uncovered restore
+branches from 438 to 431. Overall coverage is branches 7,793/12,819 (60.79%), lines
+76,318/95,637 (79.80%), regions 135,655/169,875 (79.86%), and functions 6,501/9,614 (67.62%).
+The target supplied all 15 snapshot branch gains; unrelated run variance added one covered branch
+each in `atomic_file.rs` and `jury/learning.rs`. Remaining minimum deficits are 2,463 overall
+branches, 4,974 lines, 8,739 regions, and 1,191 functions; critical branch deficits are review 157,
+payment 147, playback 119, restore 280, and IPC 486. Production, live data, scheduled tasks, release
+pointers, credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 23: hostile snapshot-listing admission
+
+The next reachable snapshot cluster was the restore picker's directory-listing boundary. One
+private-contract regression proves an absent snapshots root yields an empty list; regular files
+with otherwise valid rotating or pinned names are ignored; unrelated and malformed rotating
+directories are ignored; pinned names missing a timestamp separator, carrying an empty label, or
+carrying an invalid timestamp are ignored; and valid rotating and pinned directories with no
+database are listed in timestamp order without inventing byte size or segment count. Directory
+symlinks remain privilege-dependent on Windows, non-Unicode directory entries cannot be created
+through the normal Windows filesystem API, and a metadata lookup race is nondeterministic; none is
+falsely claimed by this portable proof.
+
+The focused proof passed 1/1, the complete snapshot suite passed 34/34, stable rustfmt passed, and
+strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`d9c21f61742f3df1e2c1cd0c1fa2b76b8cd50f48` then received an exact pinned all-target measurement:
+1,837 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `5423cff7ce5f4902b072c9f2c4268e6f` (SHA-256
+`944b40e125e4c794b6820956d1d7d176677bd987da653ecec18fcced3c03ba35`) proves snapshot branches
+moved 279/400 to 284/400 and restore moved 1,083/1,514 to 1,088/1,514, reducing uncovered restore
+branches from 431 to 426. Overall coverage is branches 7,796/12,819 (60.82%), lines
+76,342/95,663 (79.80%), regions 135,706/169,936 (79.86%), and functions 6,502/9,615 (67.62%).
+The target supplied five snapshot branch gains; unrelated run variance removed one covered branch
+each from `atomic_file.rs` and `jury/learning.rs`. Remaining minimum deficits are 2,460 overall
+branches, 4,972 lines, 8,740 regions, and 1,190 functions; critical branch deficits are review 157,
+payment 147, playback 119, restore 275, and IPC 486. Production, live data, scheduled tasks, release
+pointers, credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 24: exhaustive required-state drill mirror
+
+The next reachable snapshot cluster was the Rust mirror of the external restore drill's required-
+state check. The prior two-assertion test was replaced with an exhaustive contract regression that
+proves null, non-array, and pathless/non-string inventories report the full required set; omission
+of the mandatory database is reported independently; every optional settings, champion, reviewer-
+dialects, and voice-focus state is accepted in either live-file or exact absence-marker form and is
+reported when both are omitted; and paid-pilot state is likewise accepted as live policy or absence
+marker and reported when omitted. This mirror answers only whether a representation is missing;
+the production restore verifier's stricter exactly-one rule remains unchanged and separately proven.
+
+The focused proof passed 1/1, the complete snapshot namespace passed 38/38, stable rustfmt passed,
+and strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`80ddde11777e84d35cd6304789b46fe88d914cb3` then received an exact pinned all-target measurement:
+1,837 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `d71c3201f5c046208fc7eb5bc94f3110` (SHA-256
+`37a07289e96e3495cb0a66cdb5876faa51ed88dac71263beb9cce5eb0dd42961`) proves snapshot branches
+moved 284/400 to 291/404 and restore moved 1,088/1,514 to 1,095/1,518, reducing uncovered snapshot
+branches from 116 to 113 and uncovered restore branches from 426 to 423. Overall coverage is
+branches 7,804/12,823 (60.86%), lines 76,391/95,710 (79.82%), regions 135,786/170,012 (79.87%),
+and functions 6,508/9,621 (67.64%). The target supplied seven covered snapshot branches while its
+expanded exhaustive test introduced four measured branches; unrelated run variance added one
+covered branch in `atomic_file.rs`. Remaining minimum deficits are 2,455 overall branches, 4,963
+lines, 8,725 regions, and 1,189 functions; critical branch deficits are review 157, payment 147,
+playback 119, restore 272, and IPC 486. Production, live data, scheduled tasks, release pointers,
+credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 25: selective stale-staging crash cleanup
+
+The next reachable snapshot cluster was crash-left staging cleanup and the empty-database guard's
+snapshot-presence predicate. One private-contract regression proves sweeping a missing root is a
+no-op that creates nothing; a nested `.staging_*` directory is removed recursively; a similarly
+named non-prefix directory, a prefix-matching regular file, and a promoted `snapshot_*` directory
+all survive the sweep; a real final snapshot directory counts as prior history; and a regular file
+with a snapshot-shaped name cannot invent history. The warning path for an OS-denied recursive
+removal remains environment-dependent and is not forged by passing a non-production input.
+
+The focused proof passed 1/1, the complete snapshot namespace passed 39/39, stable rustfmt passed,
+and strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`d619375713a1ed51e9a1810fd21c68cd6b01686b` then received an exact pinned all-target measurement:
+1,838 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `df2d96f790e64902b9ce83595fcf8be1` (SHA-256
+`c32763b22b7a17c27c64849add0702c665aa40794c85d4c865d4525166f44b63`) proves snapshot branches
+moved 291/404 to 294/404 and restore moved 1,095/1,518 to 1,098/1,518, reducing uncovered snapshot
+branches from 113 to 110 and uncovered restore branches from 423 to 420. Overall coverage is
+branches 7,805/12,823 (60.87%), lines 76,416/95,736 (79.82%), regions 135,848/170,075 (79.88%),
+and functions 6,509/9,622 (67.65%). The target supplied three covered snapshot branches with no
+new snapshot branch denominator. Unrelated run variance removed two covered branches, lines, and
+regions from `commands.rs`, temporarily moving IPC branches from 440/1,028 to 438/1,028. Remaining
+minimum deficits are 2,454 overall branches, 4,960 lines, 8,716 regions, and 1,189 functions;
+critical branch deficits are review 157, payment 147, playback 119, restore 269, and IPC 488.
+Production, live data, scheduled tasks, release pointers, credentials, and GPU/model configuration
+were untouched.
+
+## 2026-08-31 — Reliability iteration 26: authoritative snapshot-prune inputs
+
+The next reachable snapshot cluster was rotating-prune input discrimination. One private-contract
+regression proves an existing but empty snapshots root is a valid no-op; a snapshot-shaped regular
+file, unrelated directory, and malformed `snapshot_*` directory remain outside rotation authority;
+and, in the same mixed tree, the older valid rotating snapshot is pruned while the newest valid
+snapshot survives. The warning path for an OS-denied recursive removal remains environment-dependent
+and is not forged by weakening production input checks.
+
+The focused proof passed 1/1, the complete snapshot namespace passed 40/40, stable rustfmt passed,
+and strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`0f133bf6a9dbe9e0f9bdc8bf0d21c497eced1337` then received an exact pinned all-target measurement:
+1,839 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `9f92777f00ec44199884632c79ea463b` (SHA-256
+`3630c8ad9b50f9e396d52aa3c915caa99fe31235e49b5936d978c385e7e820fb`) proves snapshot branches
+moved 294/404 to 296/404 and restore moved 1,098/1,518 to 1,100/1,518, reducing uncovered snapshot
+branches from 110 to 108 and uncovered restore branches from 420 to 418. Overall coverage is
+branches 7,809/12,823 (60.90%), lines 76,444/95,757 (79.83%), regions 135,914/170,121 (79.89%),
+and functions 6,510/9,623 (67.65%). The target supplied exactly two covered snapshot branches with
+no new snapshot branch denominator. Unrelated run variance restored two covered branches in
+`commands.rs`, moving IPC branches from 438/1,028 back to 440/1,028. Remaining minimum deficits are
+2,450 overall branches, 4,950 lines, 8,689 regions, and 1,189 functions; critical branch deficits
+are review 157, payment 147, playback 119, restore 267, and IPC 486. Production, live data,
+scheduled tasks, release pointers, credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 27: bounded pinned-snapshot deletion authority
+
+The next exact snapshot branch exposed a broader deletion-authority defect. Same-label pinned
+retention previously accepted every directory whose name merely started with `<label>_`, so a
+malformed timestamp or overlapping longer label could enter the deletion set; snapshot construction
+also accepted path-like labels before joining them into staging and final paths. Pinned labels now
+share the restore selector's bounded grammar and fail before the snapshots tree is created. Retention
+admits only real directories whose name is the exact requested label plus a canonical ten-digit
+timestamp. The existing cap regression now deterministically proves a same-label regular file,
+malformed same-label directory, overlapping-label directory, and different-label pin all survive
+while the older of two valid exact-label pins is evicted. It also removes a 1.1-second timing sleep.
+The OS-denied recursive-removal warning remains environment-dependent and explicitly unclaimed.
+
+The corrected focused proof passed 3/3, the complete snapshot namespace passed 41/41, stable rustfmt
+passed, and strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`3d54ef845fd7472c94c3453ed17d6c9f3da52876` then received an exact pinned all-target measurement:
+1,840 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `466a219cf1e64627909e81462ea191b4` (SHA-256
+`572bb604341b193b4be10410ff9e5c39585f234b42817bcf434dc0e0a00a2bbc`) proves snapshot branches
+moved 296/404 to 299/406 and restore moved 1,100/1,518 to 1,103/1,520, reducing uncovered snapshot
+branches from 108 to 107 and uncovered restore branches from 418 to 417. Overall coverage is
+branches 7,810/12,825 (60.90%), lines 76,473/95,792 (79.83%), regions 135,963/170,186 (79.89%),
+and functions 6,512/9,625 (67.66%). The target supplied three covered branches while the stronger
+authority predicate introduced two measured branches. Unrelated run variance removed one covered
+branch each from `audio.rs` and `jury/learning.rs`. Remaining minimum deficits are 2,450 overall
+branches, 4,951 lines, 8,696 regions, and 1,188 functions; critical branch deficits are review 157,
+payment 147, playback 119, restore 265, and IPC 486. Production, live data, scheduled tasks, release
+pointers, credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 28: active-pilot archival and namespace authority
+
+The next reachable snapshot cluster was the private active-pilot authority validator. Two adversarial
+regressions now distinguish schema-58 archival capture validation from production restore admission;
+reject a mutated one-reviewer policy and a baseline ahead of review history; reject a conflicting
+same-digest/different-baseline namespace, unauthorized reviewer, invalid segment identity, invalid
+completion action, missing spot result, and duplicate completion event; and accept one coherent
+grant/event/result chain. The archival assertion is deliberately narrow: the production restore
+contract still fails closed for policy-bearing pre-v59 artifacts, as independently enforced by the
+restore verifier and external drill.
+
+The first focused fixture run passed 1/2 because deleting a policy trigger correctly failed the
+earlier exact-schema guard before the intended namespace conflict. The corrected cross-baseline
+fixture then passed the schema guard but the second run passed 1/2 because its forged requested action
+correctly failed the database provenance trigger. Keeping requested action canonical while corrupting
+only the historical event action produced the intended final proof: focused 2/2, complete snapshot
+namespace 43/43, stable rustfmt, and strict stable Clippy across all targets/features with
+`-D warnings`. Product commit `bf206406f595c937ff28dde303e7d1d626f9339e` then received an exact
+pinned all-target measurement: 1,842 library tests passed with 0 failures and 8 ignores, importer
+14/14, ASR containment 1/1, audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1,
+Tauri integration 1/1, shell smoke 1/1, user-data 2/2, and every Criterion target green. The
+certifying wrapper exited 1 solely because coverage thresholds remain unmet.
+
+Artifact `46ae563878fd426a85ba618c1e1fee59` (SHA-256
+`3e3d98079041854e79803de7464cd6e601bab578a7410493e3a4356b9a7f40b9`) proves snapshot branches
+moved 299/406 to 311/410 and restore moved 1,103/1,520 to 1,115/1,524, reducing uncovered snapshot
+branches from 107 to 99 and uncovered restore branches from 417 to 409. Overall coverage is branches
+7,824/12,829 (60.99%), lines 76,602/95,895 (79.88%), regions 136,224/170,411 (79.94%), and
+functions 6,520/9,630 (67.71%). The target supplied twelve covered branches while the two new
+regressions introduced four measured branches. Unrelated run variance restored one covered branch
+in `audio.rs` and added one in `normalizer.rs`. Remaining minimum deficits are 2,440 overall
+branches, 4,909 lines, 8,626 regions, and 1,184 functions; critical branch deficits are review 157,
+payment 147, playback 119, restore 257, and IPC 486. Production, live data, scheduled tasks, release
+pointers, credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 29: live pilot-session identity and cache authority
+
+The next reachable snapshot cluster was the live `couch_session.json` admission boundary inside the
+private active-pilot authority validator. The existing durable-cache regression now also rejects a
+session bound to a different database, an unavailable recorded or expected database path, an absent
+or different pilot policy, a mismatched reviewer roster, an invalid segment identity, an unauthorized
+reviewer, a duplicate case-insensitive hidden key, malformed JSON, and a session path that is present
+but unreadable. It separately proves that a missing session is legal because the database remains the
+durable authority, and that one exact live session backed by its durable grant is accepted. Production
+snapshot and restore behavior is unchanged.
+
+The first focused run reached the intended unauthorized-reviewer refusal but failed because its
+assertion expected older wording. After matching the current exact error contract, the focused proof
+passed 1/1, the complete snapshot namespace passed 43/43, stable rustfmt passed, and strict stable
+Clippy passed all targets/features with `-D warnings`. Product commit
+`5790c0618615c57232b07cdc940fe5dde23abf76` then received an exact pinned all-target measurement:
+1,842 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `0b74c4e02868488c84ffc670c0faa706` (SHA-256
+`a04bf599c822fc02184d28eecdf5a27b3cb0a717c413a3082df1fe3a3fa76cd1`) proves snapshot branches
+moved 311/410 to 316/410 and restore moved 1,115/1,524 to 1,120/1,524, reducing uncovered snapshot
+branches from 99 to 94 and uncovered restore branches from 409 to 404. Overall coverage is branches
+7,830/12,829 (61.03%), lines 76,711/95,991 (79.91%), regions 136,450/170,617 (79.97%), and
+functions 6,526/9,631 (67.76%). The target supplied five covered snapshot branches with no new
+snapshot branch denominator. Unrelated run variance added one covered branch in `atomic_file.rs`,
+removed one in `couch/lifecycle.rs`, added two in `couch/queue_audio.rs`, and removed one in
+`review_pilot.rs`, for a net gain of one. Remaining minimum deficits are 2,434 overall branches,
+4,882 lines, 8,575 regions, and 1,179 functions; critical branch deficits are review 157, payment
+147, playback 119, restore 252, and IPC 486. Production, live data, scheduled tasks, release
+pointers, credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 30: stale restore-capability refusal
+
+The next deterministic snapshot branch was the pre-restore pin's capability-lifetime boundary. One
+isolated regression creates a private restore admission, reserves and durably arms it, completes the
+restore transaction, and proves that the still-held but no-longer-active capability is rejected before
+the snapshots directory can be created. This distinguishes possession of an old reservation object
+from current ownership of the exact restore generation; production snapshot and restore behavior is
+unchanged.
+
+The focused proof passed 1/1, the complete snapshot namespace passed 44/44, stable rustfmt passed, and
+strict stable Clippy passed all targets/features with `-D warnings`. Product commit
+`0dbc7e582fae47672dbb31fb0e70c68b810b8524` then received an exact pinned all-target measurement:
+1,843 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `3ab631989c0d4e4f90672d01de2e4443` (SHA-256
+`a1477b258aa4009a9e5aa3ad75c527077bd513049220736210ff382268f38a8e`) proves snapshot branches
+moved 316/410 to 317/410 and restore moved 1,120/1,524 to 1,121/1,524, reducing uncovered snapshot
+branches from 94 to 93 and uncovered restore branches from 404 to 403. Overall coverage is branches
+7,830/12,829 (61.03%), lines 76,731/96,005 (79.92%), regions 136,499/170,649 (79.99%), and
+functions 6,527/9,632 (67.76%). The target supplied one covered snapshot branch with no new snapshot
+branch denominator. Unrelated run variance added one covered branch in `couch/lifecycle.rs`, removed
+two in `couch/queue_audio.rs`, added one in `jury/learning.rs`, and removed one in `normalizer.rs`,
+for a net loss of one that exactly offset the target gain in the overall branch count. Remaining
+minimum deficits are 2,434 overall branches, 4,874 lines, 8,553 regions, and 1,179 functions;
+critical branch deficits are review 157, payment 147, playback 119, restore 251, and IPC 486.
+Production, live data, scheduled tasks, release pointers, credentials, and GPU/model configuration
+were untouched.
+
+## 2026-08-31 — Reliability iteration 31: non-file recovery-state refusal
+
+The next deterministic snapshot cluster was source object-type authority. One production-path
+regression places a directory first at the paid-pilot policy path and then at the first generic
+optional-state path. Both cases fail closed instead of becoming intentional absence, and both prove
+the writer removes its private staging tree without promoting any snapshot. Production snapshot and
+restore behavior is unchanged.
+
+The focused proof passed 1/1 across both object-type cases, the complete snapshot namespace passed
+45/45, stable rustfmt passed, and strict stable Clippy passed all targets/features with `-D warnings`.
+Product commit `3b5234586af37dbeb8082bfe377edb2ea9883053` then received an exact pinned all-target measurement:
+1,844 library tests passed with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1,
+audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell
+smoke 1/1, user-data 2/2, and every Criterion target green. The certifying wrapper exited 1 solely
+because coverage thresholds remain unmet.
+
+Artifact `7533e5233554425aad315704b7bc4b7b` (SHA-256
+`623e9779b6d53c459cb186f7f0fcccb53cf92c8e32928d02b268b28c447224d3`) proves snapshot branches
+moved 317/410 to 322/414 and restore moved 1,121/1,524 to 1,126/1,528, reducing uncovered snapshot
+branches from 93 to 92 and uncovered restore branches from 403 to 402. Overall coverage is branches
+7,835/12,833 (61.05%), lines 76,751/96,020 (79.93%), regions 136,524/170,684 (79.99%), and
+functions 6,528/9,633 (67.77%). The target supplied five covered snapshot branches while its stronger
+two-case regression introduced four measured branches. Unrelated run variance removed one covered
+branch each from `db/history.rs` and `jury/learning.rs`, and added one each in `normalizer.rs` and
+`review_pilot.rs`, for a net zero change. Remaining minimum deficits are 2,432 overall branches,
+4,866 lines, 8,558 regions, and 1,179 functions; critical branch deficits are review 157, payment
+147, playback 119, restore 250, and IPC 486. Production, live data, scheduled tasks, release pointers,
+credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 32: pinned recovery-state type refusal
+
+The archival pre-migration writer now has direct parity proof with the rotating writer's recovery-state
+object-type boundary. One production-path regression places a directory first at the paid-pilot policy
+path and then at the first generic optional-state path. Both pinned-snapshot cases fail closed instead of
+recording intentional absence, and both remove their private staging directory without promoting a pin.
+Production snapshot and restore behavior is unchanged.
+
+The focused proof passed 1/1 across both object-type cases, the complete snapshot namespace passed
+46/46, stable rustfmt passed, and strict stable Clippy passed all targets/features with `-D warnings`.
+Product commit `2d6a1f61810118374c7b56b0d35f0e6beb25e73d` then received an exact pinned
+all-target measurement: 1,845 library tests passed with 0 failures and 8 ignores, importer 14/14,
+ASR containment 1/1, audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri
+integration 1/1, shell smoke 1/1, user-data 2/2, and every Criterion target green. The certifying
+wrapper exited 1 solely because coverage thresholds remain unmet.
+
+Artifact `c13a7df864084a83a8a91ce87f9a2a04` (SHA-256
+`20fad3bcde3f374c1ea5bd9533515e9b24ba1ee6c8e3905f9894729adcfe34fa`) proves snapshot
+branches moved 322/414 to 326/418 and restore moved 1,126/1,528 to 1,130/1,532. The target
+supplied four covered branches while introducing four measured branches, leaving uncovered snapshot
+branches at 92 and uncovered restore branches at 402; the restore threshold deficit nevertheless
+improved from 250 to 249. Overall coverage is branches 7,836/12,837 (61.04%), lines
+76,773/96,036 (79.94%), regions 136,578/170,719 (80.00%), and functions 6,529/9,634
+(67.77%). Unrelated run variance removed two covered branches from `commands.rs`, one from
+`couch/lifecycle.rs`, and one from `normalizer.rs`, while adding one in `jury/learning.rs`, for a
+net loss of three. Remaining minimum deficits are 2,434 overall branches, 4,858 lines, 8,534
+regions, and 1,179 functions; critical branch deficits are review 157, payment 147, playback 119,
+restore 249, and IPC 488.
+
+A separate verifier-hygiene finding remains: after the terminal threshold failure, the generated
+`latest-rust-coverage-prerequisite.json` pointer still reported `RUNNING` even though the run's event
+stream recorded `phase_end`, exit 1, no timeout, and verdict `FAIL`. No generated pointer was manually
+rewritten; its terminal-state publication needs its own bounded remediation. Production, live data,
+scheduled tasks, release pointers, credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 33: terminal coverage-pointer publication
+
+The exact Rust coverage prerequisite no longer leaves its authoritative latest-run pointer stuck at
+`RUNNING` after a terminal nonzero result. Every owned failure path now publishes a canonical
+`FAILED` envelope bound to the immutable event journal and any produced LLVM artifact. A failure
+after measurement but before completion publication records a distinct `publication_failure`, while
+a process that loses the coverage lease cannot overwrite the active owner's pointer. Successful
+`COMPLETED` evidence remains the only consumable prerequisite; a validated `FAILED` pointer reports
+the terminal verdict and requires a rerun.
+
+Three focused supervisor regressions passed 3/3: ordinary child failure replaces `RUNNING`, a
+post-measurement manifest-publication failure cannot strand it, and a lease loser preserves the
+active pointer byte-for-byte. The existing prerequisite anti-forgery/staleness proof also passed 1/1.
+The full verifier-supervisor module passed 33/33, Python compilation passed, workflow policy passed,
+and the execution-discovery guard passed 10 assertions while scanning 130 policy files. The blanket
+policy runner was deliberately not invoked because it would execute the desktop-forbidden 7B launch
+guard; the directly governing policies were run instead.
+
+Product commit `afc965a76f20a739f07bdcba4f0860fa90402db9` then received a real serialized
+post-commit prerequisite replay. It passed 1,845 library tests with 0 failures and 8 ignores, importer
+14/14, ASR containment 1/1, audio integration 13/13, E2E 10/10, reliability 23/23, soak 1/1,
+Tauri integration 1/1, shell smoke 1/1, user-data 2/2, and every Criterion target. The child exited
+1 solely at the locked coverage thresholds, without timeout or retry. Run
+`c1888ad79277491f8b621d7c069e260b` produced LLVM artifact SHA-256
+`cf7eb9fb9b04f73912b5b2afb7721b473712122201e4b9fba5f77f2461434a33`; its latest
+pointer finished as `FAILED` / `FAIL` / exit 1 and was accepted by the production failure-pointer
+validator with event-journal SHA-256
+`9e3face64da8bdba18eadfad7c1f71c4e6e6c7f53e0088d2be07410b0e12c3d2`.
+
+No Rust production code changed in this iteration. The replay's nondeterministic coverage variance
+was 7,838/12,837 branches (61.06%), 76,771/96,036 lines (79.94%), 136,568/170,719 regions
+(80.00%), and 6,529/9,634 functions (67.77%); restore remained 1,130/1,532 branches (73.76%).
+Remaining minimum deficits at this replay are 2,432 overall branches, 4,860 lines, 8,544 regions,
+1,179 functions, 157 review branches, 147 payment, 119 playback, 249 restore, and 486 IPC. P1
+remains red, P2 remains green, and P0 remains unknown. Production, live data, scheduled tasks,
+release pointers, credentials, and GPU/model configuration were untouched.
+
+## 2026-08-31 — Reliability iteration 34: consent identity floor and deterministic probe tests
+
+The consent-revocation restore floor now has direct production-path regression proof for its
+fail-closed legacy identity boundary. A withdrawn recording with no content hash is refused when its
+legacy path is whitespace-only or contains an embedded NUL, because neither value is a safe durable
+identity. A canonical withdrawn content hash that is completely absent from the restore target is
+also refused as one forgotten identity and zero resurrected identities. Production restore behavior
+is unchanged; product commit `51a4ad8922c953eec65a5958efd0a2137ddae2b4` adds only this proof.
+
+The focused consent proof passed 1/1, the consent-revocation-floor cluster passed 2/2, the broader
+restore cluster passed 82/82, stable rustfmt passed, and strict stable Clippy passed all
+targets/features with `-D warnings`. The first exact replay, run
+`417f867f9c5d44c4923b67952f117de2`, honestly published `FAILED` / `FAIL` / exit 1 with no artifact:
+one existing command regression received the process-global registry's `AUDIO_PROBE_BUSY` refusal
+instead of reaching its intended injected database failure. This was a test-isolation defect, not a
+consent-floor failure or a coverage-threshold result.
+
+Corrective commit `f3c9dc5a758f422c2d36d2c7375716cfb5a1705d` gives every test that drives or
+intentionally occupies the technical-audio probe registry one shared test-only serialization guard,
+including callers in separate modules. Production's strict two-probe concurrency cap is unchanged.
+The formerly failing proof passed 1/1, the complete command cluster passed 23/23, the review-write
+cluster passed 12/12, stable rustfmt passed, and strict stable Clippy again passed all
+targets/features with `-D warnings`.
+
+The corrected exact one-worker replay at `f3c9dc5a758f422c2d36d2c7375716cfb5a1705d` passed
+1,846 library tests with 0 failures and 8 ignores, importer 14/14, ASR containment 1/1, audio
+integration 13/13, E2E 10/10, reliability 23/23, soak 1/1, Tauri integration 1/1, shell smoke
+1/1, user-data 2/2, and every Criterion target. It exited 1 solely at the locked coverage
+thresholds, without timeout or retry. Run `16e3fd016a4040be958b78ca9d74b188` produced LLVM artifact
+SHA-256 `4ecce69fd397bdda16034ce18abbe315b332180a3a017605e5484b550d795282`; its canonical latest
+pointer and event-journal SHA-256
+`130c617e1b89376295adfd1661bc5b61b31f6c21455fb9ba28442c9e3dddd140` were accepted by the
+production failure-pointer validator.
+
+The target `restore_service/authority.rs` improved from 23/34 to 27/34 branches
+(67.65% to 79.41%), 281/314 to 284/314 lines, and 387/448 to 389/448 regions. Overall coverage is
+7,845/12,841 branches (61.09%), 76,825/96,078 lines (79.96%), 136,655/170,783 regions (80.02%),
+and 6,531/9,632 functions (67.81%). Restore is 1,134/1,532 branches (74.02%). Remaining minimum
+deficits are 2,428 overall branches, 4,842 lines, 8,511 regions, 1,175 functions, 157 review
+branches, 147 payment, 119 playback, 245 restore, and 487 IPC. P1 remains red, P2 remains green,
+and P0 remains unknown. Production, live data, scheduled tasks, release pointers, credentials, and
+GPU/model configuration were untouched.
+
+## 2026-09-03 — Landing the clean-release work onto main, by the owner's decision
+
+The owner chose "land Fable 5's work into `main` first, then regenerate `public/clean-release`"
+over a direct merge of `main` into the PR branch. The direct merge was measured first and refused:
+222 conflicted files and 1,984 conflict hunks, of which 38 files would have pulled reviewer names back
+onto the de-identified branch (`main` carries 827 occurrences across 44 files; `clean-release` carries
+none). That is not a conflict resolution, it is a decision, so it was put to the owner.
+
+**What the work actually is.** `clean-release` is 96 commits ahead of the merge base; all but the
+scrub itself touch only **30 files**. The other ~190 conflicting files were the scrub. Applied as one
+three-way patch onto `main`: 10 files clean, 19 with conflicts, 0 failed hunks, 54 conflict hunks.
+
+**The rule applied to every hunk, checked against a measured fact each time:** `main` (PR #73, the
+reconciled serving line) wins wherever the two lines chose a *different implementation of the same
+fix*; the clean-release work lands wherever it is *additive and compiles against main's code*.
+Both lines had independently fixed the same cross-platform bugs, sometimes twice — different helper
+names (`lock_technical_probe_tests` vs `serialize_technical_audio_probe_test`), different decorators
+(`_requires_windows_live_authority` vs `requires_live_product_authority`), different model-resolution
+designs (`bundled_dir_containing` vs per-file `resolve_model_file`), a different snapshot fault-injection
+framework, and a different CI coverage architecture (workstation-published attestation vs in-CI
+`cargo llvm-cov`). In every such case the serving line's design was kept.
+
+**Landed (additive, compiled and tested against main):**
+- `restore_service/effects.rs`: 19 restore-validator tests that exist only on clean-release. All 25
+  refusal strings they assert were verified present in main's validator before landing. Four call
+  sites used the old 3-argument `record_review_flag`; main's takes `base_revision: i64` second, and
+  they now obtain it the way main's own tests do (`segment_review_revision`).
+- `snapshot.rs`: 15 additive tests (manifest boundaries, champion-pointer shapes, selector grammar,
+  stale-staging sweep, pilot-snapshot authority). Main's fault-injection framework kept verbatim.
+- `restore_service/compensation.rs`: the second, disjoint test set (entitlement arithmetic, work-id
+  shape, reviewer validity) unioned with main's — no duplicate names, all imports present.
+- `review_campaign.rs`: the progress-binding drift tests unioned with main's.
+- `test_verify10_supervisor.py` and `scripts/verify_10.py`: main's versions, unmodified. The
+  clean-release changes to both had ridden in through cleanly-applied hunks and reproduced the exact
+  Linux-only failure (`'VERIFIER_FAILURE' != 'FAIL'`) on #88's CI; main's are green on Linux. The
+  latest-release freshness test turned out to already exist on main.
+- `verify10_supervisor.py`: `_posix_process_creation_time` refactor (the helper exists).
+- `check_reviewer_links_live.py`: keep the unreadable-body text instead of discarding it.
+- `test_generated_ipc_bindings.py`: main's constant kept, raised 300 → 1800 s with the work's
+  reasoning (Linux/macOS runners compile cold on two cores).
+- `ci.yml`: policies run *after* `npm run build` on Linux/macOS (the IPC-bindings gate compiles the
+  lib, and `tauri::generate_context!` needs `dist/`); `setup:python-policies` still precedes it.
+- `PROGRESS_LEDGER.md`: both append-only histories kept (34 clean-release "reliability iteration"
+  sections after main's 30).
+- One real fix folded in while reconciling: review_write's private probe-test lock and
+  segments_write's crate-wide serializer were two different mutexes guarding the same 2-slot probe
+  registry, so a test from each module could run concurrently and refuse one with `ProbeBusy` — the
+  intermittent failure seen on CI on 2026-08-30. They are now one lock.
+
+- Three literal adaptations, each preserving the test's intent on main's schema 69: the effects.rs
+  legacy-baseline tests roll back 10 migrations (not 8 from 67) and expect `[60..69]` forward; the
+  snapshot archival test reaches schema 58 by rolling back 11. The campaign progress fixture and the
+  two pilot-roster snapshot tests hard-coded *scrubbed* reviewer names (`Rezan`, `Chiman`, `Karwan`)
+  that main's binding checks refuse by name; they now derive the names from the policy, which is
+  both what the production builders do and scrub-proof.
+
+**Deliberately NOT landed, and why:**
+- `test_deidentified_tree.py` — belongs to the regeneration step. `main` is un-scrubbed by design
+  until then; landing the gate here would red main's own CI on 1,050 hits.
+- `test_verify10_fuzz_policy.py` — pairs with clean-release's `_fuzz_cmd`; main's `verify_10.py`
+  was kept, so main's test was kept (it passes).
+- `review_pool.rs` voice-certificate test and schema-67 seeding helper — reference
+  `VoiceCertificateInput` / `validate_voice_certificate_evidence` and migrations 66–67, none of which
+  exist on main (schema 69, `REVIEW_POOL_SCHEMA_VERSION` 63). Cannot compile here.
+- `ci.yml` in-CI `cargo llvm-cov` job and the Windows-gate re-coupling step — main moved coverage
+  to a workstation-published attestation and decoupled the Windows gate by an explicit owner
+  decision (2026-09-01); re-coupling would reverse it.
+- `models.rs` `the_onnx_runtime_is_found_in_a_models_dir_that_has_no_optional_asr_weights` — arrived
+  in a cleanly-applied hunk but asserts clean-release's per-file resolution; main's design differs.
+- `snapshot.rs` `pinned_snapshot_labels_fail_before_filesystem_mutation` — asserts label validation
+  main's writer does not have. **Gap flagged, not ported:** on main, `take_pinned_snapshot_at` accepts
+  an empty label and creates `pinned/_0000001000`. Clean-release rejects empty, leading-punctuation,
+  traversal, nested and over-long labels. Porting that touches a durability path and is the owner's
+  call, not a test-landing's.
+- `models.rs` per-file resolution and the CTC-presence test — main's WSL7B-champion design
+  supersedes them.
+
+**Measured:** cargo test --lib: 2604 passed, 0 failed, 8 ignored. Python gates on every touched script green
+individually; full policy suite: 144/144 policy test scripts passed (run_python_policies.py, full). `test_deidentified_tree.py` was run on the landing
+branch and fails as expected (1,050 hits) — that is the exposure the regeneration step removes.
 
 ## 2026-09-03 — Ingest workers are testable through a mock app; two worker contracts pinned
 

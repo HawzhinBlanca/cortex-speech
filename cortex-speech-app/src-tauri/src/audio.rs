@@ -1148,6 +1148,14 @@ pub fn voice_activity_detection(
     let model_path = crate::models::resolve_model_file("silero_vad_v4.onnx");
 
     if model_path.exists() {
+        // Same probe `SileroVad::new` carries, for the same documented reason: with no LOADABLE
+        // ONNX Runtime, `Session::builder()` blocks forever rather than failing. This function
+        // builds sessions on two paths of its own (cache miss below, fresh-load fallback further
+        // down) and neither was probed — on the 2026-08-28 coverage runner, where onnxruntime.dll
+        // was present-but-unloadable, the probed constructor test FAILED fast while every test
+        // routing through here hung until the run's 7200s budget died, reporting nothing. On a
+        // healthy install this is a cached atomic read.
+        crate::models::ensure_ort_runtime_loadable().map_err(AppError::Onnx)?;
         // Use a cached ONNX session AND state_dims across `voice_activity_detection`
         // calls so that callers that invoke `detect()` consecutively (as in `proptest`,
         // ~64 cases) only pay the ONNX model load cost once and avoid redundant

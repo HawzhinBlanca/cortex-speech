@@ -83,6 +83,17 @@ struct TechnicalProbeRegistry {
 static TECHNICAL_PROBE_REGISTRY: LazyLock<Mutex<TechnicalProbeRegistry>> =
     LazyLock::new(|| Mutex::new(TechnicalProbeRegistry::default()));
 
+/// The technical-probe registry is process-global, so tests that intentionally occupy it or drive
+/// a real probe must share one test-only boundary. Otherwise Rust's parallel test runner can turn a
+/// test of a later database failure into an unrelated `ProbeBusy` refusal.
+#[cfg(test)]
+static TECHNICAL_PROBE_TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn serialize_technical_audio_probe_test() -> std::sync::MutexGuard<'static, ()> {
+    TECHNICAL_PROBE_TEST_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn lock_probe_registry() -> std::sync::MutexGuard<'static, TechnicalProbeRegistry> {
     TECHNICAL_PROBE_REGISTRY.lock().unwrap_or_else(|poisoned| {
         tracing::warn!("Recovering poisoned technical-audio probe registry");
@@ -826,10 +837,13 @@ mod tests {
         Database, HumanDecisionUndoOutcome, HumanFlagUndoOutcome, PlaybackDecisionProof, PlaybackReceipt, SpeechSegment,
     };
 
-    static TECHNICAL_PROBE_TEST_LOCK: Mutex<()> = Mutex::new(());
-
+    /// One lock for EVERY test that drives the process-global probe registry, in this module and
+    /// in commands::segments_write alike. Two independent mutexes (one per module) would let a
+    /// test from each run concurrently on the same TECHNICAL_PROBE_MAX_CONCURRENCY slots and
+    /// refuse one with ProbeBusy -- the exact intermittent failure the registry tests exist to
+    /// prevent.
     fn lock_technical_probe_tests() -> std::sync::MutexGuard<'static, ()> {
-        TECHNICAL_PROBE_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        super::serialize_technical_audio_probe_test()
     }
 
     fn store_with_clip() -> (tempfile::TempDir, ReviewWriteStore, DatabaseRuntime) {
@@ -2180,6 +2194,7 @@ mod tests {
 
     #[test]
     fn truncated_audio_tail_is_never_accepted_as_clean_eof() {
+        let _serial = serialize_technical_audio_probe_test();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("truncated-tail.wav");
         write_wav(&path, 16_000, 16_000);

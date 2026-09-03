@@ -3610,4 +3610,1307 @@ mod tests {
         let error = validate_review_effect_semantics(&db).unwrap_err();
         assert!(error.contains("lacks its exact operation-bound compensation inverse"), "{error}");
     }
+
+    #[test]
+    fn every_noncanonical_review_effect_frontier_field_is_refused() {
+        for (label, mutation) in [
+            ("wrong singleton key", "UPDATE review_effect_state SET singleton_key = 2"),
+            ("negative review-event frontier", "UPDATE review_effect_state SET effective_after_review_event_id = -1"),
+            ("negative compensation-ledger frontier", "UPDATE review_effect_state SET effective_after_ledger_id = -1"),
+            ("blank creation time", "UPDATE review_effect_state SET created_at = '   '"),
+        ] {
+            let db = seeded_db("frontier-field-clip");
+            db.connection().execute("DROP TRIGGER review_effect_state_immutable_update", []).unwrap();
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
+            assert_eq!(db.connection().execute(mutation, []).unwrap(), 1, "{label}: corruption must apply");
+
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("one canonical schema-v60 frontier row"),
+                "{label}: validator must reject the corrupted frontier, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_effect_frontiers_cannot_claim_history_that_does_not_exist() {
+        for (label, mutation, expected) in [
+            (
+                "review-event frontier",
+                "UPDATE review_effect_state SET effective_after_review_event_id = 1",
+                "frontiers (1, 0) exceed retained history (0, 0)",
+            ),
+            (
+                "compensation-ledger frontier",
+                "UPDATE review_effect_state SET effective_after_ledger_id = 1",
+                "frontiers (0, 1) exceed retained history (0, 0)",
+            ),
+        ] {
+            let db = seeded_db("frontier-history-clip");
+            db.connection().execute("DROP TRIGGER review_effect_state_immutable_update", []).unwrap();
+            assert_eq!(db.connection().execute(mutation, []).unwrap(), 1, "{label}: corruption must apply");
+
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(error.contains(expected), "{label}: unexpected refusal: {error}");
+        }
+    }
+
+    #[test]
+    fn legacy_correction_memory_requires_the_exact_grandfathered_seed() {
+        // Schema v60 marks only memory that already existed at migration time with legacy_seed=1;
+        // every new memory starts at 0 and must carry effect-bound capture lineage. Reproduce the
+        // legitimate migrated shape first, then corrupt the restored bytes beyond either boundary.
+        let db = seeded_db("legacy-memory-clip");
+        db.connection().execute("DROP TRIGGER correction_memory_v60_seed_validate_insert", []).unwrap();
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "INSERT INTO correction_memory
+                        (id, wrong_token, human_token, slot_key, phonetic_key, legacy_seed)
+                     VALUES ('00000000-0000-4000-8000-000000000901',
+                             'legacy-wrong', 'legacy-fix', 'legacy|slot', 'legacy', 1)",
+                    [],
+                )
+                .unwrap(),
+            1,
+            "the fixture must contain one genuine migrated memory"
+        );
+        validate_review_effect_semantics(&db).expect("an exact grandfathered legacy memory must remain restorable");
+
+        db.connection().execute("DROP TRIGGER correction_memory_v60_baseline_immutable_update", []).unwrap();
+        db.connection().execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "UPDATE correction_memory SET legacy_seed = 2
+                      WHERE id = '00000000-0000-4000-8000-000000000901'",
+                    [],
+                )
+                .unwrap(),
+            1,
+            "the corruption must apply, or the refusal proves nothing"
+        );
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("has an invalid legacy boundary"), "unexpected refusal: {error}");
+    }
+
+    #[test]
+    fn every_uncovered_post_v60_memory_baseline_field_is_refused() {
+        let corruptions = [
+            ("noncanonical memory id", "UPDATE correction_memory SET id = 'not-a-uuid' WHERE id = ?1"),
+            ("blank wrong token", "UPDATE correction_memory SET wrong_token = '   ' WHERE id = ?1"),
+            ("blank human token", "UPDATE correction_memory SET human_token = '   ' WHERE id = ?1"),
+            ("blank slot key", "UPDATE correction_memory SET slot_key = '   ' WHERE id = ?1"),
+            (
+                "equivalent wrong and human tokens",
+                "UPDATE correction_memory SET human_token = wrong_token WHERE id = ?1",
+            ),
+            ("nonfinite confidence", "UPDATE correction_memory SET confidence = 9e999 WHERE id = ?1"),
+            ("nonbaseline confidence", "UPDATE correction_memory SET confidence = 0.6 WHERE id = ?1"),
+            ("nonzero confirmation baseline", "UPDATE correction_memory SET confirm_count = 1 WHERE id = ?1"),
+            ("nonzero override baseline", "UPDATE correction_memory SET override_count = 1 WHERE id = ?1"),
+            (
+                "premature fired-at baseline",
+                "UPDATE correction_memory SET last_fired_at = '2026-08-30 00:00:00' WHERE id = ?1",
+            ),
+            ("missing capture", "DELETE FROM correction_memory_contributions WHERE memory_id = ?1"),
+            (
+                "capture without its origin effect",
+                "UPDATE correction_memory_contributions SET effect_event_id = effect_event_id + 100000 WHERE memory_id = ?1",
+            ),
+        ];
+
+        for (label, sabotage) in corruptions {
+            let db = seeded_db("post-v60-memory-baseline");
+            decided(&db, "post-v60-memory-baseline", 470);
+            let memory_id: String = db
+                .connection()
+                .query_row("SELECT id FROM correction_memory WHERE legacy_seed = 0 ORDER BY id LIMIT 1", [], |row| {
+                    row.get(0)
+                })
+                .expect("a genuine edit must create at least one post-v60 correction memory");
+            validate_review_effect_semantics(&db).expect("the genuine post-v60 memory must validate first");
+
+            for trigger in [
+                "correction_memory_v60_baseline_immutable_update",
+                "correction_memory_contributions_immutable_update",
+                "correction_memory_contributions_immutable_delete",
+            ] {
+                db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).unwrap();
+            }
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+            assert_eq!(
+                db.connection().execute(sabotage, [&memory_id]).unwrap(),
+                1,
+                "{label}: the corruption must apply, or the refusal proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("lacks its zero-baseline capture identity"),
+                "{label}: expected the exact post-v60 baseline refusal, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn correction_memory_contributions_refuse_every_invalid_action_or_evidence_shape() {
+        // These rows drive the live corrector and therefore may not be detached from an existing
+        // memory/effect, invent impossible deltas, capture on a non-edit, or claim an outcome
+        // without its firing timestamp. Each case starts from one genuine accepted phone decision
+        // plus one legitimate migrated memory, then inserts exactly one restored-file corruption.
+        let cases = [
+            ("missing effect", true, false, 0, 1, 0, Some("2026-08-30 00:00:00"), "names a missing effect"),
+            (
+                "missing memory",
+                false,
+                true,
+                0,
+                1,
+                0,
+                Some("2026-08-30 00:00:00"),
+                "violates its action/evidence identity",
+            ),
+            ("out-of-range capture", false, false, 2, 0, 0, None, "violates its action/evidence identity"),
+            (
+                "out-of-range confirmation",
+                false,
+                false,
+                0,
+                2,
+                0,
+                Some("2026-08-30 00:00:00"),
+                "violates its action/evidence identity",
+            ),
+            (
+                "out-of-range override",
+                false,
+                false,
+                0,
+                0,
+                2,
+                Some("2026-08-30 00:00:00"),
+                "violates its action/evidence identity",
+            ),
+            ("zero contribution", false, false, 0, 0, 0, None, "violates its action/evidence identity"),
+            (
+                "simultaneous confirm and override",
+                false,
+                false,
+                0,
+                1,
+                1,
+                Some("2026-08-30 00:00:00"),
+                "violates its action/evidence identity",
+            ),
+            ("capture on accept", false, false, 1, 0, 0, None, "violates its action/evidence identity"),
+            ("confirm without fired-at", false, false, 0, 1, 0, None, "violates its action/evidence identity"),
+            ("blank fired-at", false, false, 0, 0, 1, Some("   "), "violates its action/evidence identity"),
+        ];
+
+        for (label, missing_effect, missing_memory, capture, confirm, override_delta, fired_at, expected) in cases {
+            let db = seeded_db("contribution-boundary");
+            let revision = db.segment_review_revision("contribution-boundary").unwrap().unwrap();
+            db.record_phone_human_decision_by_at_revision_with_operation(
+                "contribution-boundary",
+                "accept",
+                Some("machine draft"),
+                "Reviewer",
+                revision,
+                &canonical_operation(460),
+                &crate::db::review_operation_payload_hash(
+                    "contribution-boundary",
+                    "accept",
+                    "machine draft",
+                    "Reviewer",
+                ),
+            )
+            .unwrap()
+            .unwrap();
+            let effect_id: i64 = db
+                .connection()
+                .query_row("SELECT MAX(id) FROM human_decision_effect_events", [], |row| row.get(0))
+                .unwrap();
+
+            db.connection().execute("DROP TRIGGER correction_memory_v60_seed_validate_insert", []).unwrap();
+            db.connection()
+                .execute(
+                    "INSERT INTO correction_memory
+                        (id, wrong_token, human_token, slot_key, phonetic_key, legacy_seed)
+                     VALUES ('00000000-0000-4000-8000-000000000902',
+                             'known-wrong', 'known-fix', 'known|slot', 'known', 1)",
+                    [],
+                )
+                .unwrap();
+            validate_review_effect_semantics(&db).expect("the genuine decision and legacy memory must validate first");
+
+            db.connection().execute("DROP TRIGGER correction_memory_contributions_effect_validate_insert", []).unwrap();
+            db.connection().execute_batch("PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;").unwrap();
+            let inserted_effect = if missing_effect { effect_id + 100_000 } else { effect_id };
+            let inserted_memory = if missing_memory {
+                "00000000-0000-4000-8000-000000009999"
+            } else {
+                "00000000-0000-4000-8000-000000000902"
+            };
+            assert_eq!(
+                db.connection()
+                    .execute(
+                        "INSERT INTO correction_memory_contributions
+                            (effect_event_id, memory_id, capture_delta, confirm_delta, override_delta, fired_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![inserted_effect, inserted_memory, capture, confirm, override_delta, fired_at],
+                    )
+                    .unwrap(),
+                1,
+                "{label}: the corruption must apply, or the refusal proves nothing"
+            );
+
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
+        }
+    }
+
+    #[test]
+    fn a_reject_effect_cannot_own_a_memory_contribution() {
+        let db = seeded_db("reject-contribution");
+        let revision = db.segment_review_revision("reject-contribution").unwrap().unwrap();
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "reject-contribution",
+            "reject",
+            None,
+            "Reviewer",
+            revision,
+            &canonical_operation(520),
+            &crate::db::review_operation_payload_hash("reject-contribution", "reject", "", "Reviewer"),
+        )
+        .unwrap()
+        .unwrap();
+        let effect_id: i64 = db
+            .connection()
+            .query_row("SELECT MAX(id) FROM human_decision_effect_events", [], |row| row.get(0))
+            .unwrap();
+        db.connection().execute("DROP TRIGGER correction_memory_v60_seed_validate_insert", []).unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO correction_memory
+                    (id, wrong_token, human_token, slot_key, phonetic_key, legacy_seed)
+                 VALUES ('00000000-0000-4000-8000-000000000904',
+                         'known-wrong', 'known-fix', 'known|slot', 'known', 1)",
+                [],
+            )
+            .unwrap();
+        validate_review_effect_semantics(&db).expect("the genuine reject and legacy memory must validate first");
+
+        db.connection().execute("DROP TRIGGER correction_memory_contributions_effect_validate_insert", []).unwrap();
+        db.connection().execute_batch("PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;").unwrap();
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "INSERT INTO correction_memory_contributions
+                        (effect_event_id, memory_id, capture_delta, confirm_delta, override_delta, fired_at)
+                     VALUES (?1, '00000000-0000-4000-8000-000000000904', 0, 1, 0,
+                             '2026-08-30 00:00:00')",
+                    [effect_id],
+                )
+                .unwrap(),
+            1
+        );
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("violates its action/evidence identity"), "unexpected refusal: {error}");
+    }
+
+    #[test]
+    fn correction_memory_override_outcome_is_rederived_from_the_exact_human_decision() {
+        // A memory that rewrites "machine draft" to "corrected draft" makes an accepted
+        // "machine draft" farther from the human answer, so its only honest outcome is Override.
+        // First prove that exact restored shape remains valid, then relabel only the outcome as a
+        // confirmation and require the semantic validator (not a CHECK constraint) to refuse it.
+        let db = seeded_db("override-outcome");
+        let revision = db.segment_review_revision("override-outcome").unwrap().unwrap();
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "override-outcome",
+            "accept",
+            Some("machine draft"),
+            "Reviewer",
+            revision,
+            &canonical_operation(461),
+            &crate::db::review_operation_payload_hash("override-outcome", "accept", "machine draft", "Reviewer"),
+        )
+        .unwrap()
+        .unwrap();
+        let effect_id: i64 = db
+            .connection()
+            .query_row("SELECT MAX(id) FROM human_decision_effect_events", [], |row| row.get(0))
+            .unwrap();
+        let memory = crate::corrections::extract_substitution_memories("machine draft", "corrected draft")
+            .into_iter()
+            .next()
+            .expect("the fixture must yield one exact substitution memory");
+        let memory_id = "00000000-0000-4000-8000-000000000903";
+
+        db.connection().execute("DROP TRIGGER correction_memory_v60_seed_validate_insert", []).unwrap();
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "INSERT INTO correction_memory
+                        (id, wrong_token, human_token, slot_key, phonetic_key, legacy_seed)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                    rusqlite::params![
+                        memory_id,
+                        memory.wrong_token,
+                        memory.human_token,
+                        memory.slot_key,
+                        memory.phonetic_key,
+                    ],
+                )
+                .unwrap(),
+            1,
+            "the fixture must contain one exact migrated memory"
+        );
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "INSERT INTO correction_memory_contributions
+                        (effect_event_id, memory_id, capture_delta, confirm_delta, override_delta, fired_at)
+                     VALUES (?1, ?2, 0, 0, 1, '2026-08-30 00:00:00')",
+                    rusqlite::params![effect_id, memory_id],
+                )
+                .unwrap(),
+            1,
+            "the exact override evidence must pass the schema guard"
+        );
+        validate_review_effect_semantics(&db).expect("a correctly classified override must remain restorable");
+
+        db.connection().execute("DROP TRIGGER correction_memory_contributions_immutable_update", []).unwrap();
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "UPDATE correction_memory_contributions
+                        SET confirm_delta = 1, override_delta = 0
+                      WHERE effect_event_id = ?1 AND memory_id = ?2",
+                    rusqlite::params![effect_id, memory_id],
+                )
+                .unwrap(),
+            1,
+            "the outcome relabeling must apply, or the refusal proves nothing"
+        );
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(
+            error.contains("is not re-derived from the served/decision text"),
+            "a forged confirmation for a proven override must be refused: {error}"
+        );
+    }
+
+    #[test]
+    fn first_post_v60_decision_must_start_from_the_exact_legacy_reviewed_state() {
+        // Build the authority in the only honest order: create reviewed human truth on schema 59,
+        // migrate it into the immutable v60 snapshot, then record one new phone decision through
+        // the production writer. The validator must accept that complete chain before any sabotage.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(crate::migrations::rollback(&db, 10).unwrap(), vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60]);
+        paid_segment(&db, "legacy-decision-baseline");
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments
+                        SET review_revision = 5,
+                            verified = 1,
+                            annotated_transcript = 'legacy truth',
+                            verdict = 'human_edit',
+                            verdict_transcript = 'legacy truth',
+                            human_decision = 'edit',
+                            corrected_at = '2026-08-29 00:00:00',
+                            reviewed_by = 'Legacy Reviewer',
+                            escalated = 0,
+                            is_gold = 0,
+                            rationale = NULL
+                      WHERE id = 'legacy-decision-baseline'",
+                    [],
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+        validate_review_effect_semantics(&db).expect("the exact migrated terminal state must remain restorable");
+
+        let revision = db.segment_review_revision("legacy-decision-baseline").unwrap().unwrap();
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "legacy-decision-baseline",
+            "accept",
+            Some("legacy truth"),
+            "Reviewer",
+            revision,
+            &canonical_operation(462),
+            &crate::db::review_operation_payload_hash("legacy-decision-baseline", "accept", "legacy truth", "Reviewer"),
+        )
+        .unwrap()
+        .unwrap();
+        validate_review_effect_semantics(&db).expect("a real first post-v60 decision must bind to its legacy origin");
+
+        db.connection().execute("DROP TRIGGER human_decision_effect_events_immutable_update", []).unwrap();
+        let corruptions = [
+            (
+                "verified flag",
+                "UPDATE human_decision_effect_events SET prior_verified = 0",
+                "UPDATE human_decision_effect_events SET prior_verified = 1",
+            ),
+            (
+                "annotated transcript",
+                "UPDATE human_decision_effect_events SET prior_annotated_transcript = 'forged annotation'",
+                "UPDATE human_decision_effect_events SET prior_annotated_transcript = 'legacy truth'",
+            ),
+            (
+                "verdict",
+                "UPDATE human_decision_effect_events SET prior_verdict = 'human_accept'",
+                "UPDATE human_decision_effect_events SET prior_verdict = 'human_edit'",
+            ),
+            (
+                "verdict transcript",
+                "UPDATE human_decision_effect_events SET prior_verdict_transcript = 'forged verdict text'",
+                "UPDATE human_decision_effect_events SET prior_verdict_transcript = 'legacy truth'",
+            ),
+            (
+                "escalation flag",
+                "UPDATE human_decision_effect_events SET prior_escalated = 1",
+                "UPDATE human_decision_effect_events SET prior_escalated = 0",
+            ),
+            (
+                "human decision",
+                "UPDATE human_decision_effect_events SET prior_human_decision = 'accept'",
+                "UPDATE human_decision_effect_events SET prior_human_decision = 'edit'",
+            ),
+            (
+                "correction timestamp",
+                "UPDATE human_decision_effect_events SET prior_corrected_at = '2026-08-29 00:00:01'",
+                "UPDATE human_decision_effect_events SET prior_corrected_at = '2026-08-29 00:00:00'",
+            ),
+            (
+                "reviewer",
+                "UPDATE human_decision_effect_events SET prior_reviewed_by = 'Other Reviewer'",
+                "UPDATE human_decision_effect_events SET prior_reviewed_by = 'Legacy Reviewer'",
+            ),
+        ];
+        for (label, sabotage, restore) in corruptions {
+            assert_eq!(
+                db.connection().execute(sabotage, []).unwrap(),
+                1,
+                "{label}: the corruption must apply, or the refusal proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("does not start from its immutable pre-v60 reviewed state"),
+                "{label}: expected the exact legacy-baseline refusal, got: {error}"
+            );
+            assert_eq!(db.connection().execute(restore, []).unwrap(), 1, "{label}: reset must restore the fixture");
+            validate_review_effect_semantics(&db).expect("each reset must recover the exact valid chain");
+        }
+    }
+
+    #[test]
+    fn every_uncovered_unsnapshotted_human_prior_field_is_refused() {
+        // Accept is intentional: unlike an edit it writes no correction/example/memory evidence,
+        // so changing the immutable prior snapshot cannot be intercepted by an earlier learning
+        // provenance guard. Every fixture begins with a real phone decision or flag, validates,
+        // then changes exactly one prior-truth field under the restored-file threat model.
+        let decision_corruptions = [
+            (
+                "prior annotated transcript",
+                "UPDATE human_decision_effect_events SET prior_annotated_transcript = 'forged prior annotation'",
+            ),
+            ("prior human decision", "UPDATE human_decision_effect_events SET prior_human_decision = 'edit'"),
+            ("prior reviewer", "UPDATE human_decision_effect_events SET prior_reviewed_by = 'Forged Reviewer'"),
+            (
+                "prior correction timestamp",
+                "UPDATE human_decision_effect_events SET prior_corrected_at = '2026-08-31 00:00:00'",
+            ),
+            ("prior human verdict", "UPDATE human_decision_effect_events SET prior_verdict = 'human_edit'"),
+        ];
+
+        for (index, (label, sabotage)) in decision_corruptions.into_iter().enumerate() {
+            let db = seeded_db("unsnapshotted-decision-prior");
+            let revision = db.segment_review_revision("unsnapshotted-decision-prior").unwrap().unwrap();
+            db.record_phone_human_decision_by_at_revision_with_operation(
+                "unsnapshotted-decision-prior",
+                "accept",
+                Some("machine draft"),
+                "Reviewer",
+                revision,
+                &canonical_operation(480 + index as u64),
+                &crate::db::review_operation_payload_hash(
+                    "unsnapshotted-decision-prior",
+                    "accept",
+                    "machine draft",
+                    "Reviewer",
+                ),
+            )
+            .unwrap()
+            .unwrap();
+            validate_review_effect_semantics(&db).expect("the genuine accept decision must validate first");
+
+            db.connection().execute("DROP TRIGGER human_decision_effect_events_immutable_update", []).unwrap();
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
+            assert_eq!(
+                db.connection().execute(sabotage, []).unwrap(),
+                1,
+                "{label}: the corruption must apply, or this case proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("starts from unsnapshotted human review truth"),
+                "{label}: expected the exact unsnapshotted-prior refusal, got: {error}"
+            );
+        }
+
+        for (index, (label, sabotage)) in [
+            ("prior flag escalation", "UPDATE review_flag_effect_events SET prior_escalated = 1"),
+            ("prior flag human verdict", "UPDATE review_flag_effect_events SET prior_verdict = 'human_edit'"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let db = seeded_db("unsnapshotted-flag-prior");
+            db.record_review_flag(
+                "unsnapshotted-flag-prior",
+                db.segment_review_revision("unsnapshotted-flag-prior").unwrap().unwrap(),
+                "genuine concern",
+                &canonical_operation(490 + index as u64),
+            )
+            .unwrap();
+            validate_review_effect_semantics(&db).expect("the genuine review flag must validate first");
+
+            db.connection().execute("DROP TRIGGER review_flag_effect_events_immutable_update", []).unwrap();
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
+            assert_eq!(
+                db.connection().execute(sabotage, []).unwrap(),
+                1,
+                "{label}: the corruption must apply, or this case proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("starts from unsnapshotted human review truth"),
+                "{label}: expected the exact unsnapshotted-prior refusal, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_reachable_legacy_decision_origin_field_is_refused() {
+        let migrated_reviewed_db = |id: &str| {
+            let db = Database::open(":memory:").unwrap();
+            db.initialize().unwrap();
+            assert_eq!(crate::migrations::rollback(&db, 10).unwrap(), vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60]);
+            paid_segment(&db, id);
+            assert_eq!(
+                db.connection()
+                    .execute(
+                        "UPDATE speech_segments
+                            SET review_revision = 5,
+                                verified = 1,
+                                annotated_transcript = 'legacy truth',
+                                verdict = 'human_edit',
+                                verdict_transcript = 'legacy truth',
+                                human_decision = 'edit',
+                                corrected_at = '2026-08-29 00:00:00',
+                                reviewed_by = 'Legacy Reviewer',
+                                rationale = 'legacy rationale'
+                          WHERE id = ?1",
+                        [id],
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+            validate_review_effect_semantics(&db).expect("the exact migrated reviewed state must validate");
+            db
+        };
+
+        for (index, (label, sabotage)) in [
+            (
+                "decision predates the legacy revision",
+                "UPDATE review_events SET served_revision = 4;
+                 UPDATE review_compensation_ledger SET decision_revision = 5 WHERE review_event_id IS NOT NULL;
+                 UPDATE human_decision_effect_events SET prior_revision = 4, decision_revision = 5",
+            ),
+            (
+                "decision prior rationale differs from legacy",
+                "UPDATE human_decision_effect_events
+                    SET prior_rationale = 'forged rationale', decision_rationale = 'forged rationale'",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let db = migrated_reviewed_db("legacy-origin-decision");
+            let revision = db.segment_review_revision("legacy-origin-decision").unwrap().unwrap();
+            db.record_phone_human_decision_by_at_revision_with_operation(
+                "legacy-origin-decision",
+                "accept",
+                Some("legacy truth"),
+                "Reviewer",
+                revision,
+                &canonical_operation(500 + index as u64),
+                &crate::db::review_operation_payload_hash(
+                    "legacy-origin-decision",
+                    "accept",
+                    "legacy truth",
+                    "Reviewer",
+                ),
+            )
+            .unwrap()
+            .unwrap();
+            validate_review_effect_semantics(&db).expect("the genuine post-migration decision must validate first");
+
+            for trigger in [
+                "human_decision_effect_events_immutable_update",
+                "review_compensation_ledger_immutable_update",
+                "review_compensation_ledger_append_only_update",
+                "review_events_v60_post_cutoff_immutable_update",
+                "review_events_v60_provenance_immutable_update",
+                "review_event_operation_immutable_update",
+            ] {
+                db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).unwrap();
+            }
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
+            db.connection().execute_batch(sabotage).unwrap();
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("does not start from its immutable pre-v60 reviewed state"),
+                "{label}: expected the exact immutable-origin refusal, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_legacy_terminal_field_must_match_its_immutable_snapshot() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(crate::migrations::rollback(&db, 10).unwrap(), vec![69, 68, 67, 66, 65, 64, 63, 62, 61, 60]);
+        paid_segment(&db, "legacy-terminal-fields");
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments
+                        SET review_revision = 5,
+                            verified = 1,
+                            annotated_transcript = 'legacy truth',
+                            verdict = 'human_edit',
+                            verdict_transcript = 'legacy truth',
+                            human_decision = 'edit',
+                            corrected_at = '2026-08-29 00:00:00',
+                            reviewed_by = 'Legacy Reviewer',
+                            escalated = 0,
+                            is_gold = 0,
+                            rationale = NULL
+                      WHERE id = 'legacy-terminal-fields'",
+                    [],
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
+        validate_review_effect_semantics(&db).expect("the exact migrated legacy terminal state must validate first");
+
+        let corruptions = [
+            (
+                "review revision",
+                "UPDATE speech_segments SET review_revision = 4 WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET review_revision = 5 WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "human decision",
+                "UPDATE speech_segments SET human_decision = 'accept' WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET human_decision = 'edit' WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "verdict",
+                "UPDATE speech_segments SET verdict = 'human_accept' WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET verdict = 'human_edit' WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "verdict transcript",
+                "UPDATE speech_segments SET verdict_transcript = 'forged truth' WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET verdict_transcript = 'legacy truth' WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "annotated transcript",
+                "UPDATE speech_segments SET annotated_transcript = 'forged truth' WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET annotated_transcript = 'legacy truth' WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "verified flag",
+                "UPDATE speech_segments SET verified = 0 WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET verified = 1 WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "reviewer",
+                "UPDATE speech_segments SET reviewed_by = 'Other Reviewer' WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET reviewed_by = 'Legacy Reviewer' WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "correction timestamp",
+                "UPDATE speech_segments SET corrected_at = '2026-08-29 00:00:01' WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET corrected_at = '2026-08-29 00:00:00' WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "escalation flag",
+                "UPDATE speech_segments SET escalated = 1 WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET escalated = 0 WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "gold flag",
+                "UPDATE speech_segments SET is_gold = 1 WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET is_gold = 0 WHERE id = 'legacy-terminal-fields'",
+            ),
+            (
+                "rationale",
+                "UPDATE speech_segments SET rationale = 'forged rationale' WHERE id = 'legacy-terminal-fields'",
+                "UPDATE speech_segments SET rationale = NULL WHERE id = 'legacy-terminal-fields'",
+            ),
+        ];
+        for (label, sabotage, restore) in corruptions {
+            assert_eq!(
+                db.connection().execute(sabotage, []).unwrap(),
+                1,
+                "{label}: the corruption must apply, or the refusal proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("disagrees with its immutable pre-v60 terminal state"),
+                "{label}: expected the exact legacy-terminal refusal, got: {error}"
+            );
+            assert_eq!(db.connection().execute(restore, []).unwrap(), 1, "{label}: reset must restore the fixture");
+            validate_review_effect_semantics(&db).expect("each reset must recover the exact migrated terminal state");
+        }
+    }
+
+    #[test]
+    fn reversed_decisions_and_flags_require_their_exact_terminal_snapshots() {
+        let decision_db = seeded_db("decision-reversal-terminal");
+        decided_then_undone(&decision_db, "decision-reversal-terminal", 463, 464);
+        validate_review_effect_semantics(&decision_db).expect("a genuine decision undo must validate first");
+        let decision_corruptions = [
+            (
+                "verdict",
+                "UPDATE speech_segments SET verdict = 'human_edit' WHERE id = 'decision-reversal-terminal'",
+                "UPDATE speech_segments SET verdict = NULL WHERE id = 'decision-reversal-terminal'",
+            ),
+            (
+                "escalation",
+                "UPDATE speech_segments SET escalated = 1 WHERE id = 'decision-reversal-terminal'",
+                "UPDATE speech_segments SET escalated = 0 WHERE id = 'decision-reversal-terminal'",
+            ),
+        ];
+        for (label, sabotage, restore) in decision_corruptions {
+            assert_eq!(decision_db.connection().execute(sabotage, []).unwrap(), 1, "{label}: corruption must apply");
+            let error = validate_review_effect_semantics(&decision_db).unwrap_err();
+            assert!(
+                error.contains("does not reflect human-decision reversal"),
+                "{label}: expected the exact decision-reversal refusal, got: {error}"
+            );
+            assert_eq!(decision_db.connection().execute(restore, []).unwrap(), 1, "{label}: reset must apply");
+            validate_review_effect_semantics(&decision_db).expect("each decision reset must restore the exact inverse");
+        }
+
+        let flag_db = seeded_db("flag-reversal-terminal");
+        let flag = flag_db
+            .record_review_flag(
+                "flag-reversal-terminal",
+                flag_db.segment_review_revision("flag-reversal-terminal").unwrap().unwrap(),
+                "genuine concern",
+                &canonical_operation(465),
+            )
+            .unwrap();
+        assert!(matches!(
+            flag_db.undo_review_flag(flag.effect_event_id, &canonical_operation(466)).unwrap(),
+            crate::db::HumanFlagUndoOutcome::Applied { .. }
+        ));
+        validate_review_effect_semantics(&flag_db).expect("a genuine flag undo must validate first");
+        let flag_corruptions = [
+            (
+                "verdict",
+                "UPDATE speech_segments SET verdict = 'escalated' WHERE id = 'flag-reversal-terminal'",
+                "UPDATE speech_segments SET verdict = NULL WHERE id = 'flag-reversal-terminal'",
+            ),
+            (
+                "escalation",
+                "UPDATE speech_segments SET escalated = 1 WHERE id = 'flag-reversal-terminal'",
+                "UPDATE speech_segments SET escalated = 0 WHERE id = 'flag-reversal-terminal'",
+            ),
+        ];
+        for (label, sabotage, restore) in flag_corruptions {
+            assert_eq!(flag_db.connection().execute(sabotage, []).unwrap(), 1, "{label}: corruption must apply");
+            let error = validate_review_effect_semantics(&flag_db).unwrap_err();
+            assert!(
+                error.contains("does not reflect review-flag reversal"),
+                "{label}: expected the exact flag-reversal refusal, got: {error}"
+            );
+            assert_eq!(flag_db.connection().execute(restore, []).unwrap(), 1, "{label}: reset must apply");
+            validate_review_effect_semantics(&flag_db).expect("each flag reset must restore the exact inverse");
+        }
+    }
+
+    #[test]
+    fn active_decisions_and_flags_require_their_exact_terminal_snapshots() {
+        let decision_db = seeded_db("decision-active-terminal");
+        decided(&decision_db, "decision-active-terminal", 467);
+        validate_review_effect_semantics(&decision_db).expect("a genuine active decision must validate first");
+        let decision_corruptions = [
+            (
+                "verdict",
+                "UPDATE speech_segments SET verdict = 'human_accept' WHERE id = 'decision-active-terminal'",
+                "UPDATE speech_segments SET verdict = 'human_edit' WHERE id = 'decision-active-terminal'",
+            ),
+            (
+                "escalation",
+                "UPDATE speech_segments SET escalated = 1 WHERE id = 'decision-active-terminal'",
+                "UPDATE speech_segments SET escalated = 0 WHERE id = 'decision-active-terminal'",
+            ),
+        ];
+        for (label, sabotage, restore) in decision_corruptions {
+            assert_eq!(decision_db.connection().execute(sabotage, []).unwrap(), 1, "{label}: corruption must apply");
+            let error = validate_review_effect_semantics(&decision_db).unwrap_err();
+            assert!(
+                error.contains("disagrees with its latest active human-decision effect"),
+                "{label}: expected the exact active-decision refusal, got: {error}"
+            );
+            assert_eq!(decision_db.connection().execute(restore, []).unwrap(), 1, "{label}: reset must apply");
+            validate_review_effect_semantics(&decision_db)
+                .expect("each decision reset must restore the exact terminal state");
+        }
+
+        let flag_db = seeded_db("flag-active-terminal");
+        flag_db
+            .record_review_flag(
+                "flag-active-terminal",
+                flag_db.segment_review_revision("flag-active-terminal").unwrap().unwrap(),
+                "genuine concern",
+                &canonical_operation(468),
+            )
+            .unwrap();
+        validate_review_effect_semantics(&flag_db).expect("a genuine active flag must validate first");
+        let flag_corruptions = [
+            (
+                "verdict",
+                "UPDATE speech_segments SET verdict = 'human_edit' WHERE id = 'flag-active-terminal'",
+                "UPDATE speech_segments SET verdict = 'escalated' WHERE id = 'flag-active-terminal'",
+            ),
+            (
+                "escalation",
+                "UPDATE speech_segments SET escalated = 0 WHERE id = 'flag-active-terminal'",
+                "UPDATE speech_segments SET escalated = 1 WHERE id = 'flag-active-terminal'",
+            ),
+        ];
+        for (label, sabotage, restore) in flag_corruptions {
+            assert_eq!(flag_db.connection().execute(sabotage, []).unwrap(), 1, "{label}: corruption must apply");
+            let error = validate_review_effect_semantics(&flag_db).unwrap_err();
+            assert!(
+                error.contains("disagrees with its latest active review-flag effect"),
+                "{label}: expected the exact active-flag refusal, got: {error}"
+            );
+            assert_eq!(flag_db.connection().execute(restore, []).unwrap(), 1, "{label}: reset must apply");
+            validate_review_effect_semantics(&flag_db).expect("each flag reset must restore the exact terminal state");
+        }
+    }
+
+    #[test]
+    fn every_remaining_effect_identity_field_is_refused_at_its_own_boundary() {
+        let corruptions = [
+            ("nonpositive effect id", "UPDATE human_decision_effect_events SET id = 0"),
+            ("blank segment id", "UPDATE human_decision_effect_events SET segment_id = '   '"),
+            (
+                "nonconsecutive decision revision",
+                "UPDATE human_decision_effect_events SET decision_revision = prior_revision + 2",
+            ),
+            ("nondecision action", "UPDATE human_decision_effect_events SET action = 'skip'"),
+            ("invalid decision verified", "UPDATE human_decision_effect_events SET decision_verified = 2"),
+            ("invalid prior verified", "UPDATE human_decision_effect_events SET prior_verified = 2"),
+            ("invalid prior escalation", "UPDATE human_decision_effect_events SET prior_escalated = 2"),
+            (
+                "decision rationale drifts from prior",
+                "UPDATE human_decision_effect_events SET decision_rationale = 'forged rationale'",
+            ),
+            ("empty served transcript", "UPDATE human_decision_effect_events SET served_transcript = ''"),
+            (
+                "noncanonical served transcript",
+                "UPDATE human_decision_effect_events SET served_transcript = '  machine draft  '",
+            ),
+        ];
+
+        for (label, sabotage) in corruptions {
+            let db = seeded_db("desktop-identity-fields");
+            let authority = "11111111-2222-4333-8444-555555555555";
+            let prior_revision = db.segment_review_revision("desktop-identity-fields").unwrap().unwrap();
+            let genuine = crate::db::desktop_review_v1_payload_hash(
+                "desktop-identity-fields",
+                prior_revision,
+                "edit",
+                Some("desktop corrected"),
+                authority,
+            );
+            insert_typed_desktop_effect(&db, "desktop-identity-fields", authority, &genuine);
+            validate_review_effect_semantics(&db).expect("the genuine typed desktop effect must validate first");
+
+            unlock_effects(&db);
+            assert_eq!(
+                db.connection().execute(sabotage, []).unwrap(),
+                1,
+                "{label}: the corruption must apply, or the refusal proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("violates its immutable identity/revision boundary"),
+                "{label}: expected the exact effect-identity refusal, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_uncovered_flag_identity_field_is_refused_at_its_own_boundary() {
+        let corruptions = [
+            ("nonpositive effect id", "UPDATE review_flag_effect_events SET id = 0"),
+            ("noncanonical operation id", "UPDATE review_flag_effect_events SET operation_id = 'NOT-A-CANONICAL-UUID'"),
+            ("blank segment id", "UPDATE review_flag_effect_events SET segment_id = '   '"),
+            ("nonconsecutive flag revision", "UPDATE review_flag_effect_events SET flag_revision = prior_revision + 2"),
+            ("blank flag rationale", "UPDATE review_flag_effect_events SET flag_rationale = '   '"),
+            (
+                "noncanonical flag rationale",
+                "UPDATE review_flag_effect_events SET flag_rationale = '  genuine concern  '",
+            ),
+            ("invalid prior escalation", "UPDATE review_flag_effect_events SET prior_escalated = 2"),
+        ];
+
+        for (label, sabotage) in corruptions {
+            let db = seeded_db("flag-identity-fields");
+            db.record_review_flag(
+                "flag-identity-fields",
+                db.segment_review_revision("flag-identity-fields").unwrap().unwrap(),
+                "genuine concern",
+                &canonical_operation(469),
+            )
+            .unwrap();
+            validate_review_effect_semantics(&db).expect("the genuine review-flag effect must validate first");
+
+            db.connection().execute("DROP TRIGGER review_flag_effect_events_immutable_update", []).unwrap();
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+            assert_eq!(
+                db.connection().execute(sabotage, []).unwrap(),
+                1,
+                "{label}: the corruption must apply, or the refusal proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("violates its immutable revision/operation identity"),
+                "{label}: expected the exact flag-identity refusal, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_uncovered_review_event_provenance_field_is_refused() {
+        let corruptions = [
+            ("unknown source", "UPDATE review_events SET source = 'forged-source'"),
+            ("unknown action", "UPDATE review_events SET action = 'forged-action'"),
+            ("unknown requested action", "UPDATE review_events SET requested_action = 'forged-request'"),
+            ("noncanonical payload hash", "UPDATE review_events SET operation_payload_hash = 'not-a-hash'"),
+            (
+                "mismatched canonical payload hash",
+                "UPDATE review_events SET operation_payload_hash = '0000000000000000000000000000000000000000000000000000000000000000'",
+            ),
+            ("noncanonical served text", "UPDATE review_events SET served_transcript = '  machine draft  '"),
+            ("negative served revision", "UPDATE review_events SET served_revision = -1"),
+            ("invalid request classification", "UPDATE review_events SET action = 'skip'"),
+            (
+                "nonhex build sha",
+                "UPDATE review_events SET app_git_sha = 'gggggggggggggggggggggggggggggggggggggggg'",
+            ),
+        ];
+
+        for (label, sabotage) in corruptions {
+            let db = seeded_db("event-provenance-fields");
+            decided(&db, "event-provenance-fields", 471);
+            validate_review_effect_semantics(&db).expect("the genuine review event must validate first");
+            for trigger in [
+                "review_events_v60_post_cutoff_immutable_update",
+                "review_events_v60_provenance_immutable_update",
+                "review_event_operation_immutable_update",
+            ] {
+                db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).unwrap();
+            }
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+            assert_eq!(
+                db.connection().execute(sabotage, []).unwrap(),
+                1,
+                "{label}: the corruption must apply, or the refusal proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("lacks canonical Couch/build/playback provenance"),
+                "{label}: expected the exact event-provenance refusal, got: {error}"
+            );
+        }
+
+        let db = seeded_db("event-provenance-request-text");
+        decided(&db, "event-provenance-request-text", 472);
+        validate_review_effect_semantics(&db).expect("the genuine request text must validate first");
+        for trigger in [
+            "review_events_v60_post_cutoff_immutable_update",
+            "review_events_v60_provenance_immutable_update",
+            "review_event_operation_immutable_update",
+        ] {
+            db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).unwrap();
+        }
+        let noncanonical_request = "  corrected text  ";
+        let matching_hash = crate::db::review_operation_payload_hash(
+            "event-provenance-request-text",
+            "edit",
+            noncanonical_request,
+            "Reviewer",
+        );
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "UPDATE review_events SET requested_transcript = ?1, operation_payload_hash = ?2",
+                    rusqlite::params![noncanonical_request, matching_hash],
+                )
+                .unwrap(),
+            1,
+            "the noncanonical request and its matching hash must both apply"
+        );
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(
+            error.contains("lacks canonical Couch/build/playback provenance"),
+            "expected the request-text canonicality refusal, got: {error}"
+        );
+    }
+
+    #[test]
+    fn every_uncovered_effect_bound_agent_example_field_is_refused() {
+        let corruptions = [
+            ("noncanonical example id", "UPDATE agent_examples SET id = 'not-a-canonical-uuid' WHERE effect_event_id IS NOT NULL"),
+            (
+                "example crosses its segment boundary",
+                "UPDATE agent_examples SET segment_id = 'another-segment' WHERE effect_event_id IS NOT NULL",
+            ),
+            (
+                "example is attached to a non-edit effect",
+                "UPDATE review_events SET action = 'accept' WHERE id = (SELECT review_event_id FROM human_decision_effect_events LIMIT 1);
+                 UPDATE review_compensation_ledger SET effective_decision = 'accept' WHERE review_event_id IS NOT NULL;
+                 UPDATE human_decision_effect_events SET action = 'accept'",
+            ),
+            ("nonhuman example source", "UPDATE agent_examples SET source = 'model' WHERE effect_event_id IS NOT NULL"),
+            (
+                "example is not human verified",
+                "UPDATE agent_examples SET verified_by_human = 0 WHERE effect_event_id IS NOT NULL",
+            ),
+            ("blank wrong transcript", "UPDATE agent_examples SET wrong_transcript = '' WHERE effect_event_id IS NOT NULL"),
+            ("blank human fix", "UPDATE agent_examples SET human_fix = '' WHERE effect_event_id IS NOT NULL"),
+            (
+                "learning-equivalent wrong and fix",
+                "UPDATE agent_examples SET wrong_transcript = human_fix WHERE effect_event_id IS NOT NULL",
+            ),
+            (
+                "wrong side is not rederived from retained speech",
+                "UPDATE agent_examples SET wrong_transcript = 'different machine draft' WHERE effect_event_id IS NOT NULL",
+            ),
+            (
+                "example disagrees with its correction row",
+                "UPDATE corrections SET raw_hypothesis = 'different correction draft' WHERE effect_event_id IS NOT NULL",
+            ),
+        ];
+
+        for (label, sabotage) in corruptions {
+            let db = seeded_db("agent-example-fields");
+            decided(&db, "agent-example-fields", 425);
+            let row_counts: (i64, i64) = db
+                .connection()
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM agent_examples WHERE effect_event_id IS NOT NULL),
+                         (SELECT COUNT(*) FROM corrections WHERE effect_event_id IS NOT NULL)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(row_counts, (1, 1), "{label}: the genuine edit must write both learning rows");
+            validate_review_effect_semantics(&db).expect("the genuine edit learning rows must validate first");
+
+            for trigger in [
+                "agent_examples_v60_effect_immutable_update",
+                "corrections_v60_effect_immutable_update",
+                "human_decision_effect_events_immutable_update",
+                "review_compensation_ledger_immutable_update",
+                "review_events_v60_post_cutoff_immutable_update",
+                "review_events_v60_provenance_immutable_update",
+                "review_event_operation_immutable_update",
+            ] {
+                db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).unwrap();
+            }
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+            db.connection().execute_batch(sabotage).unwrap();
+
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("is not one genuine human edit"),
+                "{label}: expected the exact effect-bound example refusal, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_uncovered_effect_bound_correction_field_is_refused() {
+        let corruptions = [
+            (
+                "noncanonical correction id",
+                "UPDATE corrections SET id = 'not-a-canonical-uuid' WHERE effect_event_id IS NOT NULL",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "correction is attached to a non-edit effect",
+                "DELETE FROM agent_examples WHERE effect_event_id IS NOT NULL;
+                 UPDATE review_events SET action = 'accept' WHERE id = (SELECT review_event_id FROM human_decision_effect_events LIMIT 1);
+                 UPDATE review_compensation_ledger SET effective_decision = 'accept' WHERE review_event_id IS NOT NULL;
+                 UPDATE human_decision_effect_events SET action = 'accept'",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "reviewer crosses the effect boundary",
+                "UPDATE corrections SET reviewer_id = 'Other Reviewer' WHERE effect_event_id IS NOT NULL",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "noncanonical audio hash",
+                "UPDATE speech_segments SET audio_content_hash = 'not-an-audio-hash' WHERE id = 'correction-fields';
+                 UPDATE corrections SET audio_content_hash = 'not-an-audio-hash' WHERE effect_event_id IS NOT NULL",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "blank wrong transcript",
+                "DELETE FROM agent_examples WHERE effect_event_id IS NOT NULL;
+                 UPDATE corrections SET raw_hypothesis = '' WHERE effect_event_id IS NOT NULL",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "blank human fix",
+                "DELETE FROM agent_examples WHERE effect_event_id IS NOT NULL;
+                 UPDATE corrections SET human_fix = '' WHERE effect_event_id IS NOT NULL",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "learning-equivalent wrong and fix",
+                "DELETE FROM agent_examples WHERE effect_event_id IS NOT NULL;
+                 UPDATE corrections SET raw_hypothesis = human_fix WHERE effect_event_id IS NOT NULL",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "fix disagrees with the decision effect",
+                "DELETE FROM agent_examples WHERE effect_event_id IS NOT NULL;
+                 UPDATE human_decision_effect_events
+                    SET decision_transcript = 'different corrected text',
+                        decision_annotated_transcript = 'different corrected text'",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "wrong side is not rederived from retained speech",
+                "DELETE FROM agent_examples WHERE effect_event_id IS NOT NULL;
+                 UPDATE corrections SET raw_hypothesis = 'different machine draft' WHERE effect_event_id IS NOT NULL",
+                "violates edit/audio/reviewer identity",
+            ),
+            (
+                "one effect owns duplicate corrections",
+                "DROP INDEX idx_corrections_one_per_effect_event;
+                 INSERT INTO corrections
+                     (id, segment_id, audio_content_hash, raw_hypothesis, human_fix,
+                      jury_verdict, model_version_id, reviewer_id, effect_event_id)
+                 SELECT '00000000-0000-4000-8000-000000000426', segment_id,
+                        audio_content_hash, raw_hypothesis, human_fix, jury_verdict,
+                        model_version_id, reviewer_id, effect_event_id
+                   FROM corrections WHERE effect_event_id IS NOT NULL",
+                "owns more than one correction",
+            ),
+        ];
+
+        for (label, sabotage, expected) in corruptions {
+            let db = seeded_db("correction-fields");
+            decided(&db, "correction-fields", 426);
+            let row_counts: (i64, i64) = db
+                .connection()
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM agent_examples WHERE effect_event_id IS NOT NULL),
+                         (SELECT COUNT(*) FROM corrections WHERE effect_event_id IS NOT NULL)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(row_counts, (1, 1), "{label}: the genuine edit must write both learning rows");
+            validate_review_effect_semantics(&db).expect("the genuine correction must validate first");
+
+            for trigger in [
+                "agent_examples_v60_effect_immutable_delete",
+                "corrections_v60_effect_immutable_update",
+                "human_decision_effect_events_immutable_update",
+                "review_compensation_ledger_immutable_update",
+                "review_events_v60_post_cutoff_immutable_update",
+                "review_events_v60_provenance_immutable_update",
+                "review_event_operation_immutable_update",
+                "speech_segments_v60_paid_identity_immutable_update",
+                "speech_segments_v67_policy4_paid_identity_immutable_update",
+            ] {
+                db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).unwrap();
+            }
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+            db.connection().execute_batch(sabotage).unwrap();
+
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(error.contains(expected), "{label}: expected correction refusal '{expected}', got: {error}");
+        }
+    }
+
+    #[test]
+    fn every_uncovered_desktop_operation_field_is_refused() {
+        // Start from the exact typed-v1 writer shape, prove it restores, then damage one member of
+        // the operation tuple at a time. These are deliberately values rather than NULLs: the
+        // existing boundary test owns tuple presence, while this one proves the inner semantic
+        // guards are independently reachable under the restored-file threat model.
+        for (label, sabotage) in [
+            (
+                "noncanonical operation id",
+                "UPDATE human_decision_effect_events SET operation_id = 'not-a-canonical-uuid'",
+            ),
+            (
+                "noncanonical payload hash",
+                "UPDATE human_decision_effect_events SET operation_payload_hash = 'not-a-canonical-hash'",
+            ),
+            ("nonpositive request timestamp", "UPDATE human_decision_effect_events SET requested_timestamp_ms = 0"),
+            (
+                "unnormalized requested transcript",
+                "UPDATE human_decision_effect_events SET requested_transcript = ' desktop corrected '",
+            ),
+            ("empty requested transcript", "UPDATE human_decision_effect_events SET requested_transcript = ''"),
+        ] {
+            let db = seeded_db("desktop-operation-fields");
+            let authority = "11111111-2222-4333-8444-555555555555";
+            let prior_revision = db.segment_review_revision("desktop-operation-fields").unwrap().unwrap();
+            let genuine = crate::db::desktop_review_v1_payload_hash(
+                "desktop-operation-fields",
+                prior_revision,
+                "edit",
+                Some("desktop corrected"),
+                authority,
+            );
+            insert_typed_desktop_effect(&db, "desktop-operation-fields", authority, &genuine);
+            validate_review_effect_semantics(&db).expect("the genuine typed desktop effect must validate first");
+
+            assert_eq!(
+                db.connection().execute(sabotage, []).unwrap(),
+                1,
+                "{label}: the corruption must apply, or this case proves nothing"
+            );
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("outside the exact anonymous desktop operation boundary"),
+                "{label}: expected the exact desktop-operation refusal, got: {error}"
+            );
+        }
+    }
 }
