@@ -12973,3 +12973,16 @@ store's own tests already minimise slot-holding time for this reason (since 08-2
 through `mark_unusable_retrying_busy`, a 5 s bounded retry on that code only. Production is untouched.
 Proof: `retry_while_probe_busy_retries_only_busy_and_gives_up_at_the_budget` — two BUSY answers then
 the result; a refusal returned at once, never retried; BUSY past the budget reported as BUSY.
+
+## 2026-09-03 — Ponytail audit applied: ten identical sha256 helpers now reuse policy_python.sha256_file
+
+Whole-tree over-engineering audit (`/ponytail-audit`), applied cuts only where nothing was referenced or
+the code was byte-identical. Ten scripts carried the same chunked `sha256_file`/`sha256_of` body that
+`policy_python.sha256_file` already is (zero importers before); they now import it (four drop their
+now-unused `hashlib`). 78 lines out, 28 in; py_compile clean; the twenty policy tests that exercise
+those scripts green. Withdrawn from the audit after measurement: the `@tauri-apps/plugin-dialog`
+dependency (used through dynamic imports in `src/lib/adapters/desktop.ts`; removing it broke typecheck,
+vitest and the build, restored), the `updater-signature-verifier` crate (referenced by
+`scripts/windows_release_bundle.py`), the three unreferenced binaries and `cortex-once-admin.ps1`
+(owner-run tooling with documented undo steps, not dead code). Left as owner decisions: the vendored
+tiny_http fork, the policy-runner rewrite, and the self-signed TLS hop behind the Funnel.

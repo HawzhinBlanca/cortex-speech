@@ -53,12 +53,8 @@ DEFAULT_PYTHON = "/home/ai/.venv-wsl-whisper/bin/python"
 LOADED_RE = re.compile(r"Loaded (\d+) samples")
 
 
-def sha256_of(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+from policy_python import sha256_file
+sha256_of = sha256_file
 
 
 def canonical_json_bytes(value: object) -> bytes:
