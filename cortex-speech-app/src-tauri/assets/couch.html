@@ -1296,7 +1296,21 @@
       // background retry lands mid-playback, and snapping to clip 0 re-assigns the src, which zeroes
       // the renderer-reported traversal union and makes the reviewer replay the clip.
       const showingId = queue[i] && queue[i].id;
-      queue = res.items; i = 0; heldByOthers = res.heldByOthers || 0;
+      // A clip whose decision is still in THIS reviewer's outbox (sent, never acknowledged -- a
+      // dropped link) is decided as far as this phone is concerned. Serving it again with the draft
+      // restored reads as "my correction came back" (measured 2026-09-02 on a reviewer's failing
+      // link: 20 of 20 saves paired with a server-side connection error) and invites a second
+      // submission. Keep it out of the batch until the flush lands or the server refuses it; the
+      // "still sending" line already counts it. The server's own view of pending is not overridden:
+      // an outbox entry the server refuses is dropped by flushOutbox and the clip returns.
+      const who = res.reviewer || me;
+      const queuedIds = new Set(
+        readOutbox()
+          .map((record) => record.submission || record)
+          .filter((s) => !s.reviewer || !who || s.reviewer === who)
+          .map((s) => s.id),
+      );
+      queue = res.items.filter((s) => !queuedIds.has(s.id)); i = 0; heldByOthers = res.heldByOthers || 0;
       if (showingId) {
         const stillAt = queue.findIndex((s) => s.id === showingId);
         if (stillAt > 0) i = stillAt;
