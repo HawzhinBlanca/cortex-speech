@@ -1,5 +1,6 @@
 import { readFileSync } from 'fs';
 import path from 'path';
+// @ts-expect-error jsdom is already Vitest's runtime dependency but ships no bundled declarations.
 import { JSDOM } from 'jsdom';
 import { afterEach, describe, expect, it } from 'vitest';
 
