@@ -14042,8 +14042,10 @@ framework, and a different CI coverage architecture (workstation-published attes
 - `restore_service/compensation.rs`: the second, disjoint test set (entitlement arithmetic, work-id
   shape, reviewer validity) unioned with main's — no duplicate names, all imports present.
 - `review_campaign.rs`: the progress-binding drift tests unioned with main's.
-- `test_verify10_supervisor.py`: the latest-release freshness test added; main's Windows-only
-  decorator kept.
+- `test_verify10_supervisor.py` and `scripts/verify_10.py`: main's versions, unmodified. The
+  clean-release changes to both had ridden in through cleanly-applied hunks and reproduced the exact
+  Linux-only failure (`'VERIFIER_FAILURE' != 'FAIL'`) on #88's CI; main's are green on Linux. The
+  latest-release freshness test turned out to already exist on main.
 - `verify10_supervisor.py`: `_posix_process_creation_time` refactor (the helper exists).
 - `check_reviewer_links_live.py`: keep the unreadable-body text instead of discarding it.
 - `test_generated_ipc_bindings.py`: main's constant kept, raised 300 → 1800 s with the work's
