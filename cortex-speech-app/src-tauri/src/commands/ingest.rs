@@ -308,7 +308,7 @@ pub async fn open_audio_file(app: tauri::AppHandle) -> Result<Option<String>, Co
     Ok(picked.and_then(|p| p.as_path().map(|p| p.to_string_lossy().to_string())))
 }
 
-pub(super) fn emit_or_log<T>(app: &tauri::AppHandle, event: &str, payload: T)
+pub(super) fn emit_or_log<R: tauri::Runtime, T>(app: &tauri::AppHandle<R>, event: &str, payload: T)
 where
     T: serde::Serialize + Clone,
 {
@@ -342,8 +342,8 @@ fn public_pipeline_error_payload(run_id: Option<&str>, private_file: &str, code:
 /// Log private diagnostics only in the native log, then emit the closed public event shape. Raw
 /// database/decoder errors and absolute paths must never hitchhike around the typed command layer
 /// through an asynchronous event.
-fn emit_public_pipeline_error(
-    app: &tauri::AppHandle,
+fn emit_public_pipeline_error<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     run_id: Option<&str>,
     private_file: &str,
     private_error: &str,
@@ -353,7 +353,7 @@ fn emit_public_pipeline_error(
     emit_or_log(app, "pipeline-error", public_pipeline_error_payload(run_id, private_file, code));
 }
 
-fn emit_import_enrichment_complete(app: &tauri::AppHandle, run_id: &str, segment_ids: &[String]) {
+fn emit_import_enrichment_complete<R: tauri::Runtime>(app: &tauri::AppHandle<R>, run_id: &str, segment_ids: &[String]) {
     emit_or_log(
         app,
         "import-enrichment-complete",
@@ -384,7 +384,12 @@ struct AgentStageEmission<'a> {
     total: usize,
 }
 
-fn emit_agent_stage_event(app: &tauri::AppHandle, run_id: Option<&str>, source: &str, event: AgentStageEmission<'_>) {
+fn emit_agent_stage_event<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    run_id: Option<&str>,
+    source: &str,
+    event: AgentStageEmission<'_>,
+) {
     // Raw detail remains available to native diagnostics and (when correlated) the durable audit
     // record. It is deliberately not part of the renderer event below.
     tracing::debug!(
@@ -442,7 +447,12 @@ fn emit_agent_stage_event(app: &tauri::AppHandle, run_id: Option<&str>, source: 
     );
 }
 
-fn emit_pipeline_event(app: &tauri::AppHandle, event: &PipelineEvent, run_id: Option<&str>, source: &str) {
+fn emit_pipeline_event<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    event: &PipelineEvent,
+    run_id: Option<&str>,
+    source: &str,
+) {
     match event {
         PipelineEvent::Started { total } => {
             emit_or_log(
@@ -561,11 +571,11 @@ pub async fn import_directory(
     let worker_agent_run_id = agent_run_id.clone();
     let worker = std::thread::Builder::new().name("cortex-import-directory".into()).spawn(move || {
         let agent_run_id = worker_agent_run_id;
-        struct ImportGuard {
-            app: tauri::AppHandle,
+        struct ImportGuard<R: tauri::Runtime> {
+            app: tauri::AppHandle<R>,
             run_id: String,
         }
-        impl Drop for ImportGuard {
+        impl<R: tauri::Runtime> Drop for ImportGuard<R> {
             fn drop(&mut self) {
                 if let Some(app_state) = self.app.try_state::<AppState>() {
                     app_state.finish_import();
@@ -681,6 +691,17 @@ pub fn resume_interrupted_import(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ImportResumeV1, CommandErrorV1> {
+    resume_interrupted_import_on(job_id, run_id, app, state)
+}
+
+/// The command body, generic over the runtime so a test can drive the real worker through a mock
+/// app handle; production monomorphizes to the desktop runtime through the wrapper above.
+pub(super) fn resume_interrupted_import_on<R: tauri::Runtime>(
+    job_id: String,
+    run_id: String,
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+) -> Result<ImportResumeV1, CommandErrorV1> {
     let agent_run_id = canonical_import_run_id(&run_id).map_err(|_| invalid_import_run_id_error())?;
     if RATE_LIMITER.check("resume_interrupted_import").is_err() {
         state.remember_import_rejection(&agent_run_id);
@@ -728,11 +749,11 @@ pub fn resume_interrupted_import(
     let worker_agent_run_id = agent_run_id.clone();
     let worker = std::thread::Builder::new().name("cortex-import-resume".into()).spawn(move || {
         let agent_run_id = worker_agent_run_id;
-        struct ImportGuard {
-            app: tauri::AppHandle,
+        struct ImportGuard<R: tauri::Runtime> {
+            app: tauri::AppHandle<R>,
             run_id: String,
         }
-        impl Drop for ImportGuard {
+        impl<R: tauri::Runtime> Drop for ImportGuard<R> {
             fn drop(&mut self) {
                 if let Some(app_state) = self.app.try_state::<AppState>() {
                     app_state.finish_import();
@@ -796,6 +817,17 @@ pub fn import_audio_file(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<crate::ipc_contract::FileImportStartedV1, CommandErrorV1> {
+    import_audio_file_on(path, run_id, app, state)
+}
+
+/// The command body, generic over the runtime so a test can drive the real worker through a mock
+/// app handle; production monomorphizes to the desktop runtime through the wrapper above.
+pub(super) fn import_audio_file_on<R: tauri::Runtime>(
+    path: String,
+    run_id: String,
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+) -> Result<crate::ipc_contract::FileImportStartedV1, CommandErrorV1> {
     let agent_run_id = canonical_import_run_id(&run_id).map_err(|_| invalid_import_run_id_error())?;
     if RATE_LIMITER.check("import_audio_file").is_err() {
         state.remember_import_rejection(&agent_run_id);
@@ -820,11 +852,11 @@ pub fn import_audio_file(
     let worker_agent_run_id = agent_run_id.clone();
     let worker = std::thread::Builder::new().name("cortex-import-file".into()).spawn(move || {
         let agent_run_id = worker_agent_run_id;
-        struct ImportGuard {
-            app: tauri::AppHandle,
+        struct ImportGuard<R: tauri::Runtime> {
+            app: tauri::AppHandle<R>,
             run_id: String,
         }
-        impl Drop for ImportGuard {
+        impl<R: tauri::Runtime> Drop for ImportGuard<R> {
             fn drop(&mut self) {
                 if let Some(app_state) = self.app.try_state::<AppState>() {
                     app_state.finish_import();
@@ -2536,5 +2568,198 @@ mod state_ingest_command_harness_tests {
         );
         harness.finish_file_picker(&successor);
         harness.try_start_file_picker().expect("the owner's own release reopens the slot");
+    }
+}
+
+#[cfg(test)]
+mod state_ingest_worker_harness_tests {
+    //! The import and resume workers driven through a mock app with a real `AppState`,
+    //! model-free. The champion preflight refuses against the empty test registry before any
+    //! socket is opened, so these run identically on a workstation with a live champion and on a
+    //! CI runner without one. What they pin is the settle contract the workers' own comments
+    //! describe: a worker that fails for any reason still releases the import gate, reports a
+    //! scrubbed public error and emits its terminal events -- never a progress UI stuck
+    //! "processing" forever.
+    use super::*;
+    use crate::test_support::managed_app_state;
+    use crate::ImportRunAdmission;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use tauri::Listener;
+
+    type MockApp = tauri::App<tauri::test::MockRuntime>;
+
+    /// Decode of a 1 s fixture plus the registry preflight refusal, with CI headroom.
+    const SETTLE_BUDGET: Duration = Duration::from_secs(60);
+
+    fn run(n: u8) -> String {
+        format!("00000000-0000-4000-8000-0000000000{n:02x}")
+    }
+
+    /// A real 1 s mono 16 kHz WAV: `validate_file_path` admits it and the decode is trivial.
+    fn one_second_wav(dir: &std::path::Path, name: &str) -> String {
+        let path = dir.join(name);
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).expect("create wav");
+        for i in 0..16_000u32 {
+            let t = f64::from(i) / 16_000.0;
+            writer
+                .write_sample((8_000.0 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()) as i16)
+                .expect("write sample");
+        }
+        writer.finalize().expect("finalize wav");
+        crate::test_support::await_stable_fixture(&path);
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Every payload the app emits under `event`, in order, on a channel the test can wait on.
+    fn capture(app: &MockApp, event: &str) -> mpsc::Receiver<serde_json::Value> {
+        let (tx, rx) = mpsc::channel();
+        app.listen_any(event.to_string(), move |event| {
+            let payload = serde_json::from_str(event.payload()).unwrap_or(serde_json::Value::Null);
+            let _ = tx.send(payload);
+        });
+        rx
+    }
+
+    #[test]
+    fn import_audio_file_refuses_bad_identity_and_paths_and_records_the_rejection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let harness = app.state::<AppState>();
+        let wav = one_second_wav(tmp.path(), "refusals.wav");
+
+        let invalid = import_audio_file_on(wav, "not-a-run".into(), app.handle().clone(), app.state())
+            .expect_err("a non-canonical run identity must refuse before touching the gate");
+        assert_eq!(invalid.code, "INVALID_IMPORT_RUN_ID");
+
+        let missing = tmp.path().join("missing.wav").to_string_lossy().into_owned();
+        let refused = import_audio_file_on(missing, run(0xb1), app.handle().clone(), app.state())
+            .expect_err("a path that does not exist must refuse");
+        assert_eq!(refused.code, "INVALID_AUDIO_PATH");
+        assert_eq!(
+            harness.import_run_admission(&run(0xb1)),
+            ImportRunAdmission::Rejected,
+            "a refused start is remembered as rejected, never left unknown"
+        );
+        assert!(harness.try_import_recovery_admission().is_some(), "a refused start must release the import gate");
+    }
+
+    #[test]
+    fn import_worker_settles_and_reports_a_scrubbed_failure_without_a_registered_champion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let harness = app.state::<AppState>();
+        let wav = one_second_wav(tmp.path(), "clip.wav");
+        let settled = capture(&app, "import-worker-settled");
+        let errors = capture(&app, "pipeline-error");
+        let completes = capture(&app, "import-complete");
+
+        let run_id = run(0xb2);
+        let started = import_audio_file_on(wav, run_id.clone(), app.handle().clone(), app.state())
+            .expect("a readable file is admitted; the worker decides the outcome");
+        assert!(matches!(started.status, crate::ipc_contract::ImportStartStatusV1::Started));
+        assert!(matches!(started.source, crate::ipc_contract::ImportSourceV1::File));
+        assert_eq!(started.run_id, run_id);
+
+        let settle = settled.recv_timeout(SETTLE_BUDGET).expect("the worker guard emits import-worker-settled");
+        assert_eq!(settle["runId"], run_id);
+        assert_eq!(settle["source"], "file");
+        assert_eq!(harness.import_run_admission(&run_id), ImportRunAdmission::Settled);
+        assert!(harness.try_import_recovery_admission().is_some(), "the guard released the import gate");
+
+        let error = errors.recv_timeout(Duration::from_secs(5)).expect("a failed import reports pipeline-error");
+        assert_eq!(error["code"], IMPORT_PROCESSING_FAILED);
+        assert_eq!(error["runId"], run_id);
+        assert_eq!(error["file"], "clip.wav", "the public label is the basename only");
+        let wire = error.to_string();
+        assert!(!wire.contains(&tmp.path().to_string_lossy().into_owned()), "no private path on the wire: {wire}");
+        assert!(!wire.contains("E_ASR_7B"), "the private halt reason stays in the native log: {wire}");
+
+        let complete =
+            completes.recv_timeout(Duration::from_secs(5)).expect("import-complete is emitted on failure too");
+        assert_eq!(complete["runId"], run_id);
+        assert_eq!(complete["total"], 1);
+        assert_eq!(complete["succeeded"], 0);
+        assert_eq!(complete["failed"], 1);
+        assert_eq!(complete["source"], "file");
+    }
+
+    #[test]
+    fn resume_interrupted_import_refuses_exactly_then_reruns_the_folder_and_settles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let harness = app.state::<AppState>();
+        let handle = app.handle().clone();
+
+        let invalid_run = resume_interrupted_import_on("job".into(), "not-a-run".into(), handle.clone(), app.state())
+            .expect_err("a non-canonical run identity must refuse");
+        assert_eq!(invalid_run.code, "INVALID_IMPORT_RUN_ID");
+
+        let invalid_job = resume_interrupted_import_on("bad id".into(), run(0xc1), handle.clone(), app.state())
+            .expect_err("a malformed journal identity must refuse");
+        assert_eq!(invalid_job.code, "INVALID_IMPORT_JOB_ID");
+        assert_eq!(harness.import_run_admission(&run(0xc1)), ImportRunAdmission::Rejected);
+
+        let none = resume_interrupted_import_on("import-job-none".into(), run(0xc2), handle.clone(), app.state())
+            .expect_err("nothing to resume");
+        assert_eq!(none.code, "NO_INTERRUPTED_IMPORT");
+        assert!(!none.retryable, "no journal is a fact, not a retry");
+        assert_eq!(harness.import_run_admission(&run(0xc2)), ImportRunAdmission::Rejected);
+        assert!(harness.try_import_recovery_admission().is_some(), "a refused resume releases the gate");
+
+        let vanished = tmp.path().join("vanished");
+        let vanished_job = harness
+            .job_store()
+            .begin_import(&vanished.to_string_lossy(), 1)
+            .expect("journal for a folder that is gone");
+        let changed = resume_interrupted_import_on("import-job-other".into(), run(0xc3), handle.clone(), app.state())
+            .expect_err("a stale journal identity must not resume the live successor");
+        assert_eq!(changed.code, "IMPORT_JOB_CHANGED");
+        let missing = resume_interrupted_import_on(vanished_job, run(0xc4), handle.clone(), app.state())
+            .expect_err("the folder no longer exists");
+        assert_eq!(missing.code, "IMPORT_SOURCE_MISSING");
+        assert_eq!(harness.import_run_admission(&run(0xc4)), ImportRunAdmission::Rejected);
+
+        let folder = tmp.path().join("resume-source");
+        std::fs::create_dir_all(&folder).unwrap();
+        let job = harness.job_store().begin_import(&folder.to_string_lossy(), 0).expect("journal for an empty folder");
+        let settled = capture(&app, "import-worker-settled");
+        let errors = capture(&app, "pipeline-error");
+        let resumed = resume_interrupted_import_on(job.clone(), run(0xc5), handle, app.state())
+            .expect("an existing folder with a journal is admitted for resume");
+        assert!(matches!(resumed.status, ImportResumeStatusV1::Started));
+        assert!(resumed.resuming);
+        assert_eq!(resumed.run_id, run(0xc5));
+        assert_ne!(
+            resumed.import_job_id, job,
+            "the crashed journal is retired; a fresh journal tracks the resumed run"
+        );
+
+        let settle = settled.recv_timeout(SETTLE_BUDGET).expect("the resume worker guard emits import-worker-settled");
+        assert_eq!(settle["runId"], run(0xc5));
+        assert_eq!(settle["source"], "directory");
+        assert_eq!(harness.import_run_admission(&run(0xc5)), ImportRunAdmission::Settled);
+        assert!(harness.try_import_recovery_admission().is_some(), "the resume worker released the gate");
+
+        // An empty resume folder is a failure by design: silently reporting success would leave the
+        // handed-off successor journal orphaned, so the flow refuses and RETAINS the journal for a
+        // deliberate discard.
+        let error = errors.recv_timeout(Duration::from_secs(5)).expect("an empty resume folder is reported");
+        assert_eq!(error["code"], IMPORT_PROCESSING_FAILED);
+        assert_eq!(error["runId"], run(0xc5));
+        assert_eq!(error["file"], "resume-source", "the public label is the folder's basename only");
+        assert!(!error.to_string().contains(&tmp.path().to_string_lossy().into_owned()), "no private path on the wire");
+        let offered = get_interrupted_import(app.state())
+            .expect("read the journal after the resume")
+            .expect("the durable journal is retained so the user can discard it deliberately");
+        assert_eq!(offered.id, resumed.import_job_id, "the retained journal is the successor minted at handoff");
+        discard_interrupted_import(offered.id, app.state()).expect("an exact-identity discard closes it");
+        assert!(get_interrupted_import(app.state()).expect("after discard").is_none());
     }
 }

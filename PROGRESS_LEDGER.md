@@ -12974,6 +12974,32 @@ through `mark_unusable_retrying_busy`, a 5 s bounded retry on that code only. Pr
 Proof: `retry_while_probe_busy_retries_only_busy_and_gives_up_at_the_budget` — two BUSY answers then
 the result; a refusal returned at once, never retried; BUSY past the budget reported as BUSY.
 
+## 2026-09-03 — Ingest workers are testable through a mock app; two worker contracts pinned
+
+`commands/ingest.rs` sat at 45 % lines because its import, resume and batch workers take
+`tauri::AppHandle`, the desktop-runtime handle a test cannot construct; nothing had ever invoked them.
+The emit helpers and the two worker bodies are now generic over `R: tauri::Runtime`
+(`import_audio_file_on`, `resume_interrupted_import_on`); each `#[tauri::command]` keeps its exact
+signature as a one-line wrapper, so the IPC contract, bindings and every registration are byte-identical
+(IPC contract pin green, bindings untouched). Three harness tests drive the real workers through
+`tauri::test::mock_app` with a managed `AppState`, model-free: the champion preflight refuses against the
+empty test registry before any socket is opened, so the runs are identical on this workstation, where a
+live champion listens, and on a CI runner. Pinned: (1) a bad run identity or a missing file refuses,
+records the rejection and releases the import gate; (2) a worker that fails still releases the gate,
+emits `pipeline-error` with the basename only and no private path, emits `import-complete` with
+failed 1, and the guard emits `import-worker-settled` last; (3) every resume refusal arm
+(`INVALID_IMPORT_RUN_ID`, `INVALID_IMPORT_JOB_ID`, `NO_INTERRUPTED_IMPORT`, `IMPORT_JOB_CHANGED`,
+`IMPORT_SOURCE_MISSING`) and the retained-journal contract: an empty resume folder is a failure by
+design and the handed-off successor journal stays offered until an exact-identity discard. Mutation
+bite-proof: removing the file guard's `finish_import()` reds the settle test. Four policy pins that grep
+the old shapes were updated in the same commit and each was bite-proven by removing its guarded line:
+rust-runtime-panic (exact `emit_or_log` signature), job-store (resume body now in the twin), restore
+reservation (agent-stage anchor), ui-thread audit (follows a delegating wrapper to its twin). Scope cut:
+`batch_transcribe_blocking` stays on the concrete handle because it hands it to
+`DurableBatchWorkerGuard` (concrete by construction, second caller in `batch.rs`); the batch admission
+path is the next small PR together with that guard. Coverage is a standing campaign: the measured
+functions figure (77.76 % on 6a2da82b) is not re-measured here; no attestation.
+
 ## 2026-09-03 — Ponytail audit applied: ten identical sha256 helpers now reuse policy_python.sha256_file
 
 Whole-tree over-engineering audit (`/ponytail-audit`), applied cuts only where nothing was referenced or
@@ -13027,3 +13053,4 @@ of them (`snapshot.rs` 87, `commands/ingest.rs` 84, `commands/system_ops.rs` 83,
 because their bodies take a Tauri `AppHandle`/`State`, so the AppHandle-testability debt and the
 functions campaign are the same work — extract each body into an `_on(&store, …)` inner function, the
 pattern `mark_segment_unusable_v1_on` already follows, and test the inner function.
+tiny_http fork, the policy-runner rewrite, and the self-signed TLS hop behind the Funnel.
