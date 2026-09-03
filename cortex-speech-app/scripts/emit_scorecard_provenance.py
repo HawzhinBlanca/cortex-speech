@@ -25,7 +25,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -39,12 +38,8 @@ import promotion_gate as gate  # noqa: E402
 SCHEMA_VERSION = 1
 
 
-def sha256_of(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+from policy_python import sha256_file
+sha256_of = sha256_file
 
 
 def scorecard_facts(path: Path) -> tuple[str, str]:

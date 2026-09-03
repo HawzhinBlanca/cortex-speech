@@ -55,6 +55,10 @@ CONTROL_FILES = {
 }
 
 
+from policy_python import sha256_file
+sha256_of = sha256_file
+
+
 def _data_dir() -> Path:
     appdata = os.environ.get("APPDATA")
     return Path(appdata) / "cortex-speech" if appdata else Path.home() / ".local" / "share" / "cortex-speech"
@@ -88,14 +92,6 @@ def is_sha256(value: object) -> bool:
         and value == value.lower()
         and all(char in "0123456789abcdef" for char in value)
     )
-
-
-def sha256_of(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def canonical_json_bytes(value: object) -> bytes:

@@ -43,12 +43,7 @@ from check_review_serving_provenance import ChampionRegistryError, current_champ
 MAX_DISAGREEMENTS = 1
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+from policy_python import sha256_file
 
 
 def ids_sha256(ids: list[str]) -> str:

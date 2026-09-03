@@ -36,17 +36,12 @@ CANARY_SCHEMA = 1
 MAX_CANARY_CASES = 8
 
 
+from policy_python import sha256_file
+
+
 def data_dir() -> Path:
     appdata = os.environ.get("APPDATA")
     return Path(appdata) / "cortex-speech" if appdata else Path.home() / ".local/share/cortex-speech"
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def canonical_bytes(value: object) -> bytes:

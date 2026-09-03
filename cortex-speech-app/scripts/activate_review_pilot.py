@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import os
 import shutil
@@ -71,19 +70,14 @@ COUCH_PORT = 8737
 REQUIRED_SCHEMA = latest_source_schema(DEFAULT_MIGRATIONS)
 
 
+from policy_python import sha256_file
+
+
 def default_data_dir() -> Path:
     appdata = os.environ.get("APPDATA")
     if not appdata:
         raise RuntimeError("APPDATA is unavailable; pass --data-dir")
     return Path(appdata) / "cortex-speech"
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def atomic_write(path: Path, payload: bytes) -> None:
