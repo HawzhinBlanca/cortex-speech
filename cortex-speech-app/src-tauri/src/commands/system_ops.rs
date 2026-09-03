@@ -462,6 +462,15 @@ pub async fn undo(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<crate::ipc_contract::HistoryMutationResultV1, crate::ipc_contract::CommandErrorV1> {
+    undo_on(state, app).await
+}
+
+/// The command body, generic over the runtime so a test can drive the real history mutation
+/// through a mock app handle; production monomorphizes to the desktop runtime via the wrapper.
+pub(super) async fn undo_on<R: tauri::Runtime>(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle<R>,
+) -> Result<crate::ipc_contract::HistoryMutationResultV1, crate::ipc_contract::CommandErrorV1> {
     RATE_LIMITER.check("undo").map_err(|_| history_rate_limited_error())?;
     let database = state.db_runtime();
     let history = state.history_arc_for_restore();
@@ -501,6 +510,15 @@ pub async fn undo(
 pub async fn redo(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
+) -> Result<crate::ipc_contract::HistoryMutationResultV1, crate::ipc_contract::CommandErrorV1> {
+    redo_on(state, app).await
+}
+
+/// The command body, generic over the runtime so a test can drive the real history mutation
+/// through a mock app handle; production monomorphizes to the desktop runtime via the wrapper.
+pub(super) async fn redo_on<R: tauri::Runtime>(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle<R>,
 ) -> Result<crate::ipc_contract::HistoryMutationResultV1, crate::ipc_contract::CommandErrorV1> {
     RATE_LIMITER.check("redo").map_err(|_| history_rate_limited_error())?;
     let database = state.db_runtime();
@@ -1882,5 +1900,81 @@ mod system_ops_boundary_tests {
                 "{id} must never receive an invented score"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod state_history_command_harness_tests {
+    //! Undo and redo driven through a mock app with a real `AppState`: the mutation admission, the
+    //! writer lock, the history stacks, the persisted row and the session auto-save, in-process.
+    use super::*;
+    use crate::history::HistoryManager;
+    use crate::ipc_contract::HistoryActionV1;
+    use crate::test_support::managed_app_state;
+
+    type MockApp = tauri::App<tauri::test::MockRuntime>;
+
+    fn seed_segment(app: &MockApp, id: &str, raw: &str) {
+        app.state::<AppState>()
+            .lock_db()
+            .insert_segment(&crate::db::SpeechSegment {
+                id: id.into(),
+                audio_path: format!("C:/fixtures/{id}.wav"),
+                raw_transcript: raw.into(),
+                duration_ms: 1_000,
+                ..crate::db::SpeechSegment::default()
+            })
+            .unwrap();
+    }
+
+    /// The store's own recording path: persist the update and push the previous/current pair.
+    fn edit_transcript(app: &MockApp, id: &str, raw: &str) {
+        let state = app.state::<AppState>();
+        let db = state.lock_db();
+        let history = state.lock_history();
+        let mut segment = db.get_segment_by_id(id).unwrap().expect("seeded segment");
+        segment.raw_transcript = raw.into();
+        HistoryManager::persist_segment_update(&db, &history, &segment).expect("persist the edit into history");
+    }
+
+    fn raw_transcript(app: &MockApp, id: &str) -> String {
+        app.state::<AppState>().lock_db().get_segment_by_id(id).unwrap().expect("segment").raw_transcript
+    }
+
+    #[test]
+    fn undo_and_redo_walk_the_history_stacks_and_restore_the_persisted_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let handle = app.handle().clone();
+        let undo_now = || tauri::async_runtime::block_on(undo_on(app.state(), handle.clone()));
+        let redo_now = || tauri::async_runtime::block_on(redo_on(app.state(), handle.clone()));
+
+        let nothing = undo_now().expect("undo with an empty history is a no-op, not an error");
+        assert_eq!(nothing.action, None);
+        assert_eq!(nothing.status.undo_action, None);
+        assert_eq!(nothing.status.redo_action, None);
+
+        seed_segment(&app, "seg-a", "دەقی یەکەم");
+        edit_transcript(&app, "seg-a", "دەقی ڕاستکراوە");
+        assert_eq!(raw_transcript(&app, "seg-a"), "دەقی ڕاستکراوە");
+        let status = get_history_status_v1(app.state()).expect("status after one edit");
+        assert_eq!(status.undo_action, Some(HistoryActionV1::UpdateSegment));
+        assert_eq!(status.redo_action, None);
+
+        let undone = undo_now().expect("undo the edit");
+        assert_eq!(undone.action, Some(HistoryActionV1::UpdateSegment));
+        assert_eq!(undone.status.undo_action, None, "the only edit moved to the redo stack");
+        assert_eq!(undone.status.redo_action, Some(HistoryActionV1::UpdateSegment));
+        assert_eq!(raw_transcript(&app, "seg-a"), "دەقی یەکەم", "undo restores the previous persisted row");
+
+        let redone = redo_now().expect("redo the edit");
+        assert_eq!(redone.action, Some(HistoryActionV1::UpdateSegment));
+        assert_eq!(redone.status.undo_action, Some(HistoryActionV1::UpdateSegment));
+        assert_eq!(redone.status.redo_action, None);
+        assert_eq!(raw_transcript(&app, "seg-a"), "دەقی ڕاستکراوە", "redo re-applies the edit");
+
+        let exhausted = redo_now().expect("redo with an empty redo stack is a no-op");
+        assert_eq!(exhausted.action, None);
+        assert_eq!(exhausted.status.undo_action, Some(HistoryActionV1::UpdateSegment), "the undo stack is untouched");
     }
 }
