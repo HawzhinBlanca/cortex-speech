@@ -1433,10 +1433,10 @@ pub async fn batch_transcribe(
     })?
 }
 
-fn batch_transcribe_blocking(
+fn batch_transcribe_blocking<R: tauri::Runtime>(
     ids: Vec<String>,
     operation_id: String,
-    app: tauri::AppHandle,
+    app: tauri::AppHandle<R>,
 ) -> Result<BatchStartedV1, CommandErrorV1> {
     let state = app.state::<AppState>();
     let operation = crate::BatchOperation::Transcribe;
@@ -2573,7 +2573,7 @@ mod state_ingest_command_harness_tests {
 
 #[cfg(test)]
 mod state_ingest_worker_harness_tests {
-    //! The import and resume workers driven through a mock app with a real `AppState`,
+    //! The import, resume and batch workers driven through a mock app with a real `AppState`,
     //! model-free. The champion preflight refuses against the empty test registry before any
     //! socket is opened, so these run identically on a workstation with a live champion and on a
     //! CI runner without one. What they pin is the settle contract the workers' own comments
@@ -2582,7 +2582,7 @@ mod state_ingest_worker_harness_tests {
     //! "processing" forever.
     use super::*;
     use crate::test_support::managed_app_state;
-    use crate::ImportRunAdmission;
+    use crate::{BatchRunAdmission, ImportRunAdmission};
     use std::sync::mpsc;
     use std::time::Duration;
     use tauri::Listener;
@@ -2761,5 +2761,39 @@ mod state_ingest_worker_harness_tests {
         assert_eq!(offered.id, resumed.import_job_id, "the retained journal is the successor minted at handoff");
         discard_interrupted_import(offered.id, app.state()).expect("an exact-identity discard closes it");
         assert!(get_interrupted_import(app.state()).expect("after discard").is_none());
+    }
+
+    #[test]
+    fn batch_transcribe_refuses_before_champion_admission_and_releases_the_batch_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let harness = app.state::<AppState>();
+        let handle = app.handle().clone();
+        let op = |n: u8| format!("00000000-0000-4000-8000-0000000000{n:02x}");
+
+        let invalid_op = batch_transcribe_blocking(vec!["seg-a".into()], "not-an-operation".into(), handle.clone())
+            .expect_err("a non-canonical operation identity must refuse");
+        assert_eq!(invalid_op.code, "INVALID_BATCH_OPERATION_ID");
+
+        let empty = batch_transcribe_blocking(vec![], op(0xd1), handle.clone()).expect_err("an empty selection");
+        assert_eq!(empty.code, "INVALID_BATCH_SELECTION");
+        assert_eq!(harness.batch_run_admission(&op(0xd1)).0, BatchRunAdmission::Rejected);
+
+        // No champion is registered in the test registry: the preflight refuses BEFORE durable admission
+        // and before any socket is opened, on this workstation and on CI alike.
+        let refused = batch_transcribe_blocking(vec!["seg-a".into(), "seg-b".into()], op(0xd2), handle.clone())
+            .expect_err("no registered champion");
+        assert_eq!(refused.code, "CHAMPION_UNAVAILABLE");
+        assert!(refused.retryable);
+        assert_eq!(refused.suggested_action, Some(SuggestedActionV1::OpenHealth));
+        assert_eq!(
+            harness.batch_run_admission(&op(0xd2)).0,
+            BatchRunAdmission::Rejected,
+            "a refused batch is remembered"
+        );
+
+        let again = batch_transcribe_blocking(vec!["seg-a".into()], op(0xd3), handle)
+            .expect_err("still no champion; the gate was released, so this is the same refusal, not IN_PROGRESS");
+        assert_eq!(again.code, "CHAMPION_UNAVAILABLE");
     }
 }

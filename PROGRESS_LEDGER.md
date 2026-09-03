@@ -14185,3 +14185,20 @@ because their bodies take a Tauri `AppHandle`/`State`, so the AppHandle-testabil
 functions campaign are the same work — extract each body into an `_on(&store, …)` inner function, the
 pattern `mark_segment_unusable_v1_on` already follows, and test the inner function.
 tiny_http fork, the policy-runner rewrite, and the self-signed TLS hop behind the Funnel.
+## 2026-09-03 — Durable batch guard and both batch bodies testable through a mock app; a normalization batch proven end to end
+
+Follow-up to the ingest harness: `DurableBatchWorkerGuard` and its owner enum are generic over
+`R: tauri::Runtime` with the desktop runtime as the default, so every bare spelling of the type
+(`lib.rs` fixtures, `batch.rs`) compiles unchanged and `new_for_test` stays on the concrete default;
+`batch_transcribe_blocking` and `batch_normalize_blocking` take the generic handle behind their
+unchanged `#[tauri::command]` wrappers (IPC contract untouched). Three harness tests: (1) the
+transcription admission refuses a bad operation identity and an empty selection, records the
+rejection, and, with no champion registered in the test registry, refuses `CHAMPION_UNAVAILABLE`
+before durable admission and before any socket, releasing the gate for the next identity; (2) a
+normalization batch over two seeded segments runs end to end, in-process and model-free: durable
+admission, the worker, one progress event per segment, a committed `normalized_transcript` stamped
+with `NORMALIZER_VERSION` on every row, the recorded outcome Completed 2/2/0, `batch-worker-settled`
+last, and a fresh identity admitted afterwards; (3) the normalization refusal arms record the
+rejection. Mutation bite-proof: stamping the committed rows with a wrong normalizer version reds the
+end-to-end test. `commands/batch.rs` was the lowest-covered command file (30 % lines); no policy pin
+greps the changed shapes. Coverage stays a standing campaign: no re-measurement, no attestation.

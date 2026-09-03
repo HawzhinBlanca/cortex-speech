@@ -228,10 +228,10 @@ pub async fn batch_normalize(
     })?
 }
 
-fn batch_normalize_blocking(
+fn batch_normalize_blocking<R: tauri::Runtime>(
     ids: Vec<String>,
     operation_id: String,
-    app: tauri::AppHandle,
+    app: tauri::AppHandle<R>,
 ) -> Result<BatchStartedV1, CommandErrorV1> {
     let state = app.state::<AppState>();
     let operation = crate::BatchOperation::Normalize;
@@ -632,5 +632,133 @@ mod admission_contract_tests {
              \"normalizeNumbers\":true,\"verbalizeNumbers\":false,\"normalizeHamza\":true,\
              \"removeDiacritics\":false,\"normalizerVersion\":\"v-test\"}"
         );
+    }
+}
+
+#[cfg(test)]
+mod state_batch_normalize_harness_tests {
+    //! A normalization batch driven end to end through a mock app with a real `AppState`: durable
+    //! admission, the worker, per-item commits and terminal evidence, all in-process and model-free.
+    use super::*;
+    use crate::test_support::managed_app_state;
+    use crate::{BatchRunAdmission, BatchRunDisposition};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use tauri::Listener;
+    use tauri::Manager;
+
+    type MockApp = tauri::App<tauri::test::MockRuntime>;
+
+    /// Two tiny segments plus the durable admission round trip, with CI headroom.
+    const SETTLE_BUDGET: Duration = Duration::from_secs(60);
+
+    fn capture(app: &MockApp, event: &str) -> mpsc::Receiver<serde_json::Value> {
+        let (tx, rx) = mpsc::channel();
+        app.listen_any(event.to_string(), move |event| {
+            let payload = serde_json::from_str(event.payload()).unwrap_or(serde_json::Value::Null);
+            let _ = tx.send(payload);
+        });
+        rx
+    }
+
+    fn seed_segment(app: &MockApp, id: &str, raw: &str) {
+        app.state::<AppState>()
+            .lock_db()
+            .insert_segment(&crate::db::SpeechSegment {
+                id: id.into(),
+                audio_path: format!("C:/fixtures/{id}.wav"),
+                raw_transcript: raw.into(),
+                duration_ms: 1_000,
+                ..crate::db::SpeechSegment::default()
+            })
+            .unwrap();
+    }
+
+    fn normalized_row(app: &MockApp, id: &str) -> (Option<String>, Option<String>) {
+        app.state::<AppState>()
+            .lock_db()
+            .connection()
+            .query_row(
+                "SELECT normalized_transcript, normalizer_version FROM speech_segments WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn batch_normalize_admits_durably_normalizes_every_segment_and_settles_with_terminal_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let harness = app.state::<AppState>();
+        seed_segment(&app, "seg-a", "ئەمە ١٢٣ دەقە");
+        seed_segment(&app, "seg-b", "دەقی دووەم");
+        let settled = capture(&app, "batch-worker-settled");
+        let progress = capture(&app, "batch-progress");
+        let op = "00000000-0000-4000-8000-0000000000e1".to_string();
+
+        let started = batch_normalize_blocking(vec!["seg-a".into(), "seg-b".into()], op.clone(), app.handle().clone())
+            .expect("two existing segments are admitted durably");
+        assert!(matches!(started.status, BatchStartStatusV1::Started));
+        assert!(matches!(started.operation, BatchOperationV1::Normalize));
+        assert_eq!(started.operation_id, op);
+
+        let settle = settled.recv_timeout(SETTLE_BUDGET).expect("the durable guard emits batch-worker-settled");
+        assert_eq!(settle["operationId"], op);
+        assert_eq!(settle["operation"], "normalize");
+        let (admission, operation, outcome) = harness.batch_run_admission(&op);
+        assert_eq!(admission, BatchRunAdmission::Settled);
+        assert_eq!(operation, Some(crate::BatchOperation::Normalize));
+        let outcome = outcome.expect("a settled batch carries its recorded outcome");
+        assert_eq!(outcome.disposition, BatchRunDisposition::Completed);
+        assert_eq!((outcome.total, outcome.succeeded, outcome.failed), (2, 2, 0));
+        assert!(!outcome.cancelled);
+
+        for id in ["seg-a", "seg-b"] {
+            let (normalized, version) = normalized_row(&app, id);
+            assert!(normalized.is_some(), "{id}: the worker commits a normalized transcript");
+            assert_eq!(
+                version.as_deref(),
+                Some(crate::normalizer::NORMALIZER_VERSION),
+                "{id}: stamped with the normalizer version"
+            );
+        }
+
+        let mut kinds = Vec::new();
+        while let Ok(event) = progress.try_recv() {
+            assert_eq!(event["operationId"], op);
+            kinds.push(event["type"].as_str().unwrap_or("").to_string());
+        }
+        assert_eq!(kinds.first().map(String::as_str), Some("started"));
+        assert_eq!(kinds.last().map(String::as_str), Some("completed"));
+        assert_eq!(kinds.iter().filter(|k| k.as_str() == "progress").count(), 2, "one progress event per segment");
+
+        // The gate is released: a fresh identity is admitted again, not refused as already running.
+        let again = batch_normalize_blocking(
+            vec!["seg-a".into()],
+            "00000000-0000-4000-8000-0000000000e2".into(),
+            app.handle().clone(),
+        )
+        .expect("a settled batch releases the gate for the next one");
+        assert!(matches!(again.status, BatchStartStatusV1::Started));
+        settled.recv_timeout(SETTLE_BUDGET).expect("the second batch settles too");
+    }
+
+    #[test]
+    fn batch_normalize_refuses_bad_identity_and_selection_and_records_the_rejection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = managed_app_state(tmp.path());
+        let harness = app.state::<AppState>();
+        let handle = app.handle().clone();
+
+        let invalid_op = batch_normalize_blocking(vec!["seg-a".into()], "not-an-operation".into(), handle.clone())
+            .expect_err("a non-canonical operation identity must refuse");
+        assert_eq!(invalid_op.code, "INVALID_BATCH_OPERATION_ID");
+
+        let op = "00000000-0000-4000-8000-0000000000e3".to_string();
+        let empty = batch_normalize_blocking(vec![], op.clone(), handle).expect_err("an empty selection");
+        assert_eq!(empty.code, "INVALID_BATCH_SELECTION");
+        assert!(!empty.retryable);
+        assert_eq!(harness.batch_run_admission(&op).0, BatchRunAdmission::Rejected, "a refused batch is remembered");
     }
 }

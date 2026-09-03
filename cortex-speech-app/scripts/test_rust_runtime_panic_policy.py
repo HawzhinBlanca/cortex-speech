@@ -1357,7 +1357,12 @@ def test_batch_normalize_uses_a_targeted_update_not_a_whole_row_upsert() -> None
     start = batch.find(marker)
     if start == -1:
         raise AssertionError("batch_normalize not found — this gate would pass vacuously")
+    # The production body only: everything up to the first test region. Test fixtures below it may
+    # seed rows with insert_segment; the command must not.
     body = batch[start:]
+    tests_at = body.find(chr(10) + "#[cfg(test)]")
+    if tests_at != -1:
+        body = body[:tests_at]
     if "insert_segment(" in body:
         raise AssertionError(
             "batch_normalize uses a whole-row insert_segment upsert — a concurrent write to the segment "
