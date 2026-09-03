@@ -4041,7 +4041,6 @@ mod tests {
         // Roster names come FROM the policy: the authority check refuses any reviewer it does
         // not name, so a literal here is a scrub away from every fixture being refused.
         let first = policy.reviewers[0].name.clone();
-        let second = policy.reviewers[1].name.clone();
         conflict
             .connection()
             .execute(
