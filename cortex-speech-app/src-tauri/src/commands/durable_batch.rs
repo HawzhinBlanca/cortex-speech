@@ -180,14 +180,16 @@ pub(crate) fn publishable_durable_batch_status(
 /// journal is admitted, including the fallible OS-spawn boundary. Drop ordering is intentional:
 /// durable terminal truth and exact undo authority must both exist before the process-local gate is
 /// reopened or a physical-settlement event tells the renderer to query final status.
-enum DurableBatchGuardOwner {
-    App(tauri::AppHandle),
+enum DurableBatchGuardOwner<R: tauri::Runtime = tauri::Wry> {
+    App(tauri::AppHandle<R>),
     #[cfg(test)]
     Test(std::sync::Arc<AppState>),
 }
 
-pub(crate) struct DurableBatchWorkerGuard {
-    owner: DurableBatchGuardOwner,
+/// Generic over the runtime (default: the desktop runtime) so a test can drive a real worker
+/// through a mock app handle; production never names the parameter.
+pub(crate) struct DurableBatchWorkerGuard<R: tauri::Runtime = tauri::Wry> {
+    owner: DurableBatchGuardOwner<R>,
     operation_id: String,
     operation: crate::BatchOperation,
     lease: Option<crate::stores::BatchExecutionLease>,
@@ -197,34 +199,15 @@ pub(crate) struct DurableBatchWorkerGuard {
     history_recorded: bool,
 }
 
-impl DurableBatchWorkerGuard {
+impl<R: tauri::Runtime> DurableBatchWorkerGuard<R> {
     pub(crate) fn new(
-        app: tauri::AppHandle,
+        app: tauri::AppHandle<R>,
         operation_id: String,
         operation: crate::BatchOperation,
         lease: crate::stores::BatchExecutionLease,
     ) -> Self {
         Self {
             owner: DurableBatchGuardOwner::App(app),
-            operation_id,
-            operation,
-            lease: Some(lease),
-            worker_entered: false,
-            durably_terminalized: false,
-            terminal_status: None,
-            history_recorded: false,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_for_test(
-        state: std::sync::Arc<AppState>,
-        operation_id: String,
-        operation: crate::BatchOperation,
-        lease: crate::stores::BatchExecutionLease,
-    ) -> Self {
-        Self {
-            owner: DurableBatchGuardOwner::Test(state),
             operation_id,
             operation,
             lease: Some(lease),
@@ -376,7 +359,28 @@ impl DurableBatchWorkerGuard {
     }
 }
 
-impl Drop for DurableBatchWorkerGuard {
+#[cfg(test)]
+impl DurableBatchWorkerGuard {
+    pub(crate) fn new_for_test(
+        state: std::sync::Arc<AppState>,
+        operation_id: String,
+        operation: crate::BatchOperation,
+        lease: crate::stores::BatchExecutionLease,
+    ) -> Self {
+        Self {
+            owner: DurableBatchGuardOwner::Test(state),
+            operation_id,
+            operation,
+            lease: Some(lease),
+            worker_entered: false,
+            durably_terminalized: false,
+            terminal_status: None,
+            history_recorded: false,
+        }
+    }
+}
+
+impl<R: tauri::Runtime> Drop for DurableBatchWorkerGuard<R> {
     fn drop(&mut self) {
         let process_settlement_ready = self
             .terminal_status_for_drop()
