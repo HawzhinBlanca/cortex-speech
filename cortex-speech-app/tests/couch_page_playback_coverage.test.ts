@@ -106,9 +106,13 @@ describe('couch.html unique playback coverage', () => {
     page.tick(0.5);
     expect(page.traversalMs()).toBe(500);
 
+    // A media error on an attempt-carrying source RE-ARMS the clip (couch_page_lost_playback_attempt):
+    // the dead attempt is replaced, and evidence gathered under it cannot be credited to the new one,
+    // so the union is empty and the tick that follows the error must not start it again.
     page.player.dispatchEvent(new page.dom.window.Event('error'));
+    expect(page.traversalMs(), 'a replaced attempt starts with no evidence').toBe(0);
     page.tick(1);
-    expect(page.traversalMs(), 'error-to-next-tick is not continuous playback').toBe(500);
+    expect(page.traversalMs(), 'error-to-next-tick is not continuous playback').toBe(0);
 
     page.dom.window.eval(
       "queue = [{ id: 'coverage-a', text: 'دەقی نوێ', durationMs: 10000, rowVersion: 'rev-b' }]; i = 0; show(false);",
