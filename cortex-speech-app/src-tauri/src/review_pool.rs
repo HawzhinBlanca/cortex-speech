@@ -4740,6 +4740,117 @@ mod tests {
     }
 
     #[test]
+    fn paid_pool_named_snapshot_restore_preserves_proof_credit_settlement_and_later_undo() {
+        use crate::database_runtime::RestoreAdmission;
+        use crate::recovery::{
+            clear_review_pilot_restore_pending, install_snapshot_restore_plan, load_named_restore_pending,
+            mark_named_restore_completed,
+        };
+        use crate::restore_service::prepare_and_restore_named_transaction;
+
+        let (dir, fixture, pool) = disk_one_clip_pool("123e4567-e89b-42d3-a456-4266141740b1", "دەقی دروست");
+        let data_dir = dir.path();
+        let live_path = data_dir.join("cortex-speech.db");
+        fixture.backup(&live_path).unwrap();
+        drop(fixture);
+        let mut live = Database::open(live_path.to_str().unwrap()).unwrap();
+        live.initialize().unwrap();
+        let obsolete = crate::snapshot::take_snapshot_at(&live, data_dir, 5, 1000).unwrap().unwrap();
+
+        let (_, revision) = live.get_segment_by_id_with_revision("clip").unwrap().unwrap();
+        let audio_hash = clip_hash("a");
+        let proof = authority(&live, "Alle", "clip");
+        let mut input = alle_edit_on_a(revision, &audio_hash, OPS[0], Some(&proof));
+        input.segment_id = "clip";
+        let decision_id = record_decision(&live, &pool, &input).unwrap().unwrap();
+        let credit_id: i64 = live
+            .connection()
+            .query_row(
+                "SELECT id FROM review_compensation_ledger WHERE entry_key=?1",
+                [format!("pool-decision:{decision_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let settlement = live.record_review_compensation_settlement("Alle", credit_id, "restored-pool-payout").unwrap();
+        assert_eq!(settlement.allocated_micro_iqd, 5_000_000);
+        assert_eq!(pool_write_counts(&live), (1, 1, 1));
+
+        // A previously valid backup may not erase subsequently earned money or listening evidence.
+        let paid_generation = live.restore_generation_sha256().unwrap();
+        let admission = RestoreAdmission::new();
+        {
+            let reservation = admission.try_reserve().unwrap();
+            let error = prepare_and_restore_named_transaction(
+                &reservation,
+                &mut live,
+                data_dir,
+                &obsolete,
+                &obsolete.join("cortex-speech.db"),
+                "snapshot_0000001000",
+            )
+            .unwrap_err();
+            assert!(error.contains("review_compensation_ledger"), "wrong refusal: {error}");
+        }
+        assert_eq!(live.restore_generation_sha256().unwrap(), paid_generation);
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+        let pins = data_dir.join("snapshots").join("pinned");
+        assert!(!pins.exists() || std::fs::read_dir(&pins).unwrap().next().is_none());
+
+        let target = crate::snapshot::take_snapshot_at(&live, data_dir, 5, 2000).unwrap().unwrap();
+        assert!(crate::snapshot::verify_snapshot_manifest_for_restore(&target).unwrap());
+        let source = target.join("cortex-speech.db");
+        let source_before = std::fs::read(&source).unwrap();
+        // Non-reviewed work makes the source and live generations genuinely different. The page
+        // replacement must remove it while retaining ALL paid-review authority in the backup.
+        live.insert_segment_full(&segment("unreviewed-after-backup", &data_dir.join("clip.wav"), None)).unwrap();
+        assert_ne!(live.restore_generation_sha256().unwrap(), paid_generation);
+        let reservation = admission.try_reserve().unwrap();
+        let plan = prepare_and_restore_named_transaction(
+            &reservation,
+            &mut live,
+            data_dir,
+            &target,
+            &source,
+            "snapshot_0000002000",
+        )
+        .unwrap();
+        assert_eq!(live.restore_generation_sha256().unwrap(), plan.expected_db_generation_sha256);
+        assert!(live.get_segment_by_id("unreviewed-after-backup").unwrap().is_none());
+        assert_eq!(pool_write_counts(&live), (1, 1, 1));
+        crate::restore_service::validate_review_compensation_semantics(&live).unwrap();
+        install_snapshot_restore_plan(&plan, data_dir, &crate::settings::AppSettings::default()).unwrap();
+        mark_named_restore_completed(data_dir, "snapshot_0000002000", &plan.expected_db_generation_sha256).unwrap();
+        clear_review_pilot_restore_pending(data_dir).unwrap();
+        reservation.commit_named_restore().unwrap();
+        drop(reservation);
+        drop(live);
+
+        let restored = Database::open(live_path.to_str().unwrap()).unwrap();
+        restored.initialize().expect("real restored pages must pass startup's exact playback/ledger audit");
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+        assert_eq!(pool_write_counts(&restored), (1, 1, 1));
+        let replayed_settlement =
+            restored.record_review_compensation_settlement("Alle", credit_id, "restored-pool-payout").unwrap();
+        assert_eq!(replayed_settlement.allocated_micro_iqd, settlement.allocated_micro_iqd);
+        let settlement_count: i64 = restored
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM review_compensation_settlements WHERE payout_reference='restored-pool-payout'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(settlement_count, 1, "restored payout retries must not mint a second settlement");
+        let restored_pool = load(&restored).unwrap().unwrap();
+        reverse_decision_addressed(&restored, &restored_pool, decision_id, "Alle", OPS[0], OPS[1], 2_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pool_write_counts(&restored), (1, 2, 1));
+        crate::restore_service::validate_review_compensation_semantics(&restored).unwrap();
+        assert!(std::fs::read(&source).unwrap() == source_before, "restore never edits the source backup");
+    }
+
+    #[test]
     fn a_forged_or_orphaned_pool_consumption_fails_the_startup_audit() {
         // Orphaned: a genuine receipt consumed by an operation no judgement table knows.
         let (dir, db, pool) = disk_one_clip_pool("123e4567-e89b-42d3-a456-4266141740c0", "دەقی دروست");
