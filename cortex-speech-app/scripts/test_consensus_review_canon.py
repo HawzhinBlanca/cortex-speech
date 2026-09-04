@@ -118,8 +118,13 @@ def test_the_queue_serves_what_is_nearest_a_decision() -> None:
     )
     require(
         POOL,
-        "pending.push((distance_to_decision, created_at, segment_id));",
-        "that ordering is what the queue actually pushes",
+        "let spread_key: [u8; 32] = Sha256::digest(segment_id.as_bytes()).into();",
+        "equal-priority work receives a deterministic content-independent spread key",
+    )
+    require(
+        POOL,
+        "pending.push((distance_to_decision, spread_key, segment_id));",
+        "decision proximity stays authoritative while stable spreading prevents import-order replay",
     )
 
 
