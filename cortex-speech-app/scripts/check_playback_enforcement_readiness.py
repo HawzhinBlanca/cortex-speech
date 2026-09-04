@@ -21,7 +21,8 @@ So absence of warnings is only evidence when the warning could have been emitted
 that first, and refuses to return READY on an empty window:
 
   1. the binary under test actually CONTAINS the observe marker — otherwise silence is vacuous;
-  2. phone decisions in the active review namespace were taken in the window, at least
+  2. phone decisions in the active review namespace were taken in the window (canonical first
+     opinions from ``review_events`` plus, in flexible-pool mode, pool second opinions), at least
      ``--min-decisions`` of them;
   3. more than one reviewer is represented, because `timeupdate` fires on a DEVICE, not on a policy:
      twenty clips from one phone say nothing about the other seven reviewers' browsers, and
@@ -57,6 +58,11 @@ MIN_PLAYBACK_COVERAGE = 0.85
 LEGACY_PLAYBACK_POLICY_VERSION = 1
 CONTENT_HASH_ONLY_PLAYBACK_POLICY_VERSION = 2
 PLAYBACK_POLICY_VERSION = 3
+# The phone's own receipt contract (`COUCH_PLAYBACK_POLICY_VERSION` in couch.rs, live since the
+# 2026-08-31 release): a server-issued media session with an exact interval union. Same raw-counter
+# formula and the same exact source span as policy 3. Measured 2026-09-04: 1,104 of 1,812 live
+# receipts were policy 4 and this gate reported every one as a contract violation.
+COUCH_PLAYBACK_POLICY_VERSION = 4
 HISTORICAL_PLAYBACK_POLICY_VERSIONS = frozenset(
     {LEGACY_PLAYBACK_POLICY_VERSION, CONTENT_HASH_ONLY_PLAYBACK_POLICY_VERSION}
 )
@@ -304,7 +310,7 @@ def playback_receipt_semantic_issues(conn: sqlite3.Connection) -> tuple[int, lis
         _computed, reason = canonical_receipt_coverage(
             (receipt_id, played_ms, clip_duration_ms, stored_coverage, policy_version),
             allowed_policy_versions=HISTORICAL_PLAYBACK_POLICY_VERSIONS
-            | frozenset({PLAYBACK_POLICY_VERSION}),
+            | frozenset({PLAYBACK_POLICY_VERSION, COUCH_PLAYBACK_POLICY_VERSION}),
         )
         if reason:
             errors.append(reason)
@@ -341,10 +347,10 @@ def playback_receipt_semantic_issues(conn: sqlite3.Connection) -> tuple[int, lis
                 "has no canonical server-derived audio content hash"
             )
             continue
-        if policy_version == PLAYBACK_POLICY_VERSION:
+        if policy_version in (PLAYBACK_POLICY_VERSION, COUCH_PLAYBACK_POLICY_VERSION):
             expected_source_span, span_reason = canonical_source_span(current_alignment_json)
             if expected_source_span is None:
-                errors.append(f"policy-3 receipt {receipt_id} cannot be validated: {span_reason}")
+                errors.append(f"policy-{policy_version} receipt {receipt_id} cannot be validated: {span_reason}")
                 continue
             duration_issue = source_span_duration_issue(
                 current_duration,
@@ -352,7 +358,7 @@ def playback_receipt_semantic_issues(conn: sqlite3.Connection) -> tuple[int, lis
                 subject=f"segment {segment_id!r} duration",
             )
             if duration_issue:
-                errors.append(f"policy-3 receipt {receipt_id} cannot be validated: {duration_issue}")
+                errors.append(f"policy-{policy_version} receipt {receipt_id} cannot be validated: {duration_issue}")
                 continue
             span_issue = receipt_source_span_issue(
                 receipt_id,
@@ -488,7 +494,8 @@ def uncovered(
         WHERE segment_id = ? AND {reviewer_clause}
           AND typeof(segment_revision) = 'integer' AND segment_revision = ?
           AND audio_fingerprint = ?
-          AND typeof(policy_version) = 'integer' AND policy_version = {PLAYBACK_POLICY_VERSION}
+          AND typeof(policy_version) = 'integer'
+          AND policy_version IN ({PLAYBACK_POLICY_VERSION}, {COUCH_PLAYBACK_POLICY_VERSION})
           AND created_at <= datetime(?)
         """,
         parameters,
@@ -514,7 +521,11 @@ def uncovered(
         if span_issue:
             invalid_reasons.append(span_issue)
             continue
-        coverage, reason = canonical_receipt_coverage(receipt, expected_duration_ms=duration_ms)
+        coverage, reason = canonical_receipt_coverage(
+            receipt,
+            expected_duration_ms=duration_ms,
+            allowed_policy_versions=frozenset({PLAYBACK_POLICY_VERSION, COUCH_PLAYBACK_POLICY_VERSION}),
+        )
         if reason:
             invalid_reasons.append(reason)
         elif coverage is not None:
@@ -629,13 +640,15 @@ def main() -> int:
         else:
             print(
                 "PASS [receipt integrity]: every receipt recomputes from canonical raw counters "
-                "and policy-3 spans match server identity"
+                "and policy-3/4 spans match server identity"
             )
 
-        if flexible_pool is not None:
-            rows = pool_decisions_since(conn, since)
-        else:
-            rows = decisions_since(conn, since)
+        # A pool clip nobody has judged yet is decided through the ordinary PAID canonical path and
+        # lands in `review_events`; `review_pool_decisions` holds only SECOND opinions. Counting the
+        # pool table alone read a window holding 1,042 phone decisions as "0 decision(s)" (2026-09-04).
+        canonical_rows = decisions_since(conn, since)
+        pool_rows = pool_decisions_since(conn, since) if flexible_pool is not None else []
+        rows = [(row, False) for row in canonical_rows] + [(row, True) for row in pool_rows]
         print(f"       phone decisions in window: {len(rows)}")
         if len(rows) < args.min_decisions:
             failures += 1
@@ -646,7 +659,7 @@ def main() -> int:
         else:
             print(f"PASS [evidence]: {len(rows)} decision(s) is a real sample")
 
-        represented = sorted({str(row[2]) for row in rows})
+        represented = sorted({str(row[2]) for row, _ in rows})
         if rows:
             print(f"       reviewers represented: {len(represented)} ({', '.join(represented)})")
         if rows and len(represented) < args.min_reviewers:
@@ -659,9 +672,9 @@ def main() -> int:
             print(f"PASS [devices]: {len(represented)} distinct reviewer(s) exercised the guard")
 
         refused = []
-        for row in rows:
+        for row, is_pool_decision in rows:
             event_id, seg, who, at, timestamp_ms = row[:5]
-            if flexible_pool is not None:
+            if is_pool_decision:
                 required_revision = row[5] if type(row[5]) is int else None
                 why = pool_decision_identity_issue(conn, row)
             else:
