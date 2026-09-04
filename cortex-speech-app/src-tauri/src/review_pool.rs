@@ -1529,6 +1529,7 @@ pub fn record_decision(db: &Database, pool: &ReviewPool, input: &PoolDecisionInp
     let (changed, decision_id) = with_pool_full_sync(db, || {
         let tx = rusqlite::Transaction::new_unchecked(db.connection(), rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("review pool decision cannot lock the database: {error}"))?;
+        require_pool_operation_namespace_on(&tx, input.operation_id, false)?;
         let reviewers = reviewer_sets_on(&tx)?;
         let adjudications = owner_adjudications_on(&tx)?;
         let current = reviewers.get(input.segment_id);
@@ -1728,6 +1729,39 @@ pub fn latest_decision(
         .map_err(|error| format!("latest review pool decision cannot be read: {error}"))
 }
 
+/// A pool UUID cannot alias evidence owned by another review table. Call under the same IMMEDIATE
+/// transaction as the effect and credit. Same-table replay is checked by the caller and unique keys.
+fn require_pool_operation_namespace_on(
+    conn: &rusqlite::Connection,
+    operation_id: &str,
+    reversal: bool,
+) -> Result<(), String> {
+    let collision: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+             SELECT 1 FROM review_events WHERE operation_id=?1
+             UNION ALL SELECT 1 FROM human_decision_effect_events WHERE operation_id=?1
+             UNION ALL SELECT 1 FROM human_decision_effect_reversals WHERE operation_id=?1
+             UNION ALL SELECT 1 FROM review_flag_effect_events WHERE operation_id=?1
+             UNION ALL SELECT 1 FROM review_flag_effect_reversals WHERE operation_id=?1
+             UNION ALL SELECT 1 FROM independent_review_decisions WHERE operation_id=?1
+             UNION ALL SELECT 1 FROM independent_review_reversals WHERE operation_id=?1
+             UNION ALL SELECT 1 FROM review_pool_decisions WHERE operation_id=?1 AND ?2
+             UNION ALL SELECT 1 FROM review_pool_reversals WHERE operation_id=?1 AND NOT ?2
+         )",
+            rusqlite::params![operation_id, reversal],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("review pool operation namespace cannot be checked: {error}"))?;
+    if collision {
+        return Err(
+            "E_REVIEW_OPERATION_NAMESPACE_COLLISION: pool operation UUID already belongs to other review truth"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 pub fn reverse_decision(
     db: &Database,
     pool: &ReviewPool,
@@ -1755,6 +1789,7 @@ pub fn reverse_decision(
     let changed = with_pool_full_sync(db, || {
         let tx = rusqlite::Transaction::new_unchecked(db.connection(), rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("review pool reversal cannot lock the database: {error}"))?;
+        require_pool_operation_namespace_on(&tx, operation_id, true)?;
         let changed = tx
             .execute(
                 "INSERT INTO review_pool_reversals(decision_id, operation_id, reviewer, created_at_ms)
@@ -1844,6 +1879,7 @@ pub fn reverse_decision_addressed(
                 && stored_reviewer.eq_ignore_ascii_case(reviewer))
             .then_some(segment_id));
         }
+        require_pool_operation_namespace_on(&tx, reversal_operation_id, true)?;
         tx.execute(
             "INSERT INTO review_pool_reversals(decision_id, operation_id, reviewer, created_at_ms)
              VALUES(?1, ?2, ?3, ?4)",
@@ -2623,7 +2659,8 @@ mod tests {
         assert_eq!(canonical.reviewed_by.as_deref(), Some("Rubar"));
         assert_eq!(canonical.annotated_transcript.as_deref(), Some("دەقی دروست"));
 
-        reverse_decision(&db, &pool, inserted, "Alle", "123e4567-e89b-42d3-a456-426614174001", 2).unwrap();
+        // Undo is a distinct durable operation, not a second use of the decision UUID.
+        reverse_decision(&db, &pool, inserted, "Alle", "123e4567-e89b-42d3-a456-426614174002", 2).unwrap();
         let lamo = coverage_by_voice(&db).unwrap().into_iter().find(|row| row.voice_name == "Lamo").unwrap();
         assert_eq!(lamo.one_review, 1);
         assert!(pending_segment_ids(&db, &pool, "Alle", None).unwrap().contains(&"first".to_string()));
@@ -4207,6 +4244,69 @@ mod tests {
         );
     }
 
+    /// Independent audit: missing listening proof must be rejected before any paid effect commits.
+    #[test]
+    fn paid_pool_rejects_missing_listening_authority_without_any_durable_effect() {
+        let (_dir, db, pool) = two_clip_pool(None);
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET verified=1, human_decision='edit', verdict='human_edit',
+                        verdict_transcript='دەقی دروست', annotated_transcript='دەقی دروست',
+                        reviewed_by='Rubar', review_revision=review_revision+1
+                  WHERE id='a'",
+                [],
+            )
+            .unwrap();
+        let (_, revision) = db.get_segment_by_id_with_revision("a").unwrap().unwrap();
+        let audio_hash = db.segment_audio_content_hash("a").unwrap().expect("fixture has canonical PCM identity");
+        let payload_hash = "e".repeat(64);
+        let durable_counts = || -> (i64, i64, i64) {
+            db.connection()
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM review_pool_decisions),
+                            (SELECT COUNT(*) FROM review_compensation_ledger),
+                            (SELECT COUNT(*) FROM playback_authority_consumptions_v4)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+        };
+        let before = durable_counts();
+        let result = record_decision(
+            &db,
+            &pool,
+            &PoolDecisionInput {
+                segment_id: "a",
+                reviewer: "Alle",
+                action: "edit",
+                submitted_transcript: Some("دەقی ئەلە"),
+                served_transcript: "دەقی چامپیۆن",
+                served_revision: revision,
+                audio_content_hash: Some(&audio_hash),
+                source_start_ms: Some(0),
+                source_end_ms: Some(1_000),
+                duration_ms: 1_000,
+                requested_action: "edit",
+                requested_transcript: "دەقی ئەلە",
+                operation_id: "123e4567-e89b-42d3-a456-426614174903",
+                operation_payload_hash: &payload_hash,
+                created_at_ms: 1_000,
+                playback_authority_session_id: None,
+            },
+        );
+        assert_eq!(
+            durable_counts(),
+            before,
+            "missing listening proof must leave decisions, credits and consumptions unchanged; writer returned {result:?}"
+        );
+        let error = result.expect_err("paid non-skip decisions require listening authority at the write boundary");
+        assert!(
+            error.contains("E_NO_PLAYBACK_EVIDENCE"),
+            "must refuse the missing proof, not unrelated fixture drift: {error}"
+        );
+    }
+
     /// Owner canon 2026-09-04: "pool second opinions are paid at the same weights as first opinions
     /// (edit 100%, accept 10%, reject 10%)". Pinned as money: one committed pool judgement mints exactly
     /// one ledger credit at the first-opinion weight, a replay mints nothing, the reviewer's undo
@@ -4383,6 +4483,116 @@ mod tests {
             count("SELECT COUNT(*) FROM review_compensation_ledger WHERE source IN ('couch_pool','couch_pool_undo')"),
             count("SELECT COUNT(*) FROM playback_authority_consumptions_v4 WHERE namespace='independent'"),
         )
+    }
+
+    #[test]
+    fn pool_rejects_operation_uuid_already_owned_by_canonical_skip() {
+        let (_dir, db, pool) = two_clip_pool(None);
+        rubar_first_opinions_on_a_and_b(&db);
+        db.record_review_event("b", "Sewa", "skip", "couch", 1_000).unwrap();
+        let canonical_operation: String = db
+            .connection()
+            .query_row("SELECT operation_id FROM review_events WHERE segment_id='b' AND reviewer='Sewa'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let revision = db.segment_review_revision("a").unwrap().unwrap();
+        let audio_hash = clip_hash("a");
+        let proof = authority(&db, "Alle", "a");
+        let before = pool_write_counts(&db);
+        let result =
+            record_decision(&db, &pool, &alle_edit_on_a(revision, &audio_hash, &canonical_operation, Some(&proof)));
+        assert_eq!(
+            pool_write_counts(&db),
+            before,
+            "pool write must refuse a canonical operation UUID before any durable effect; result={result:?}"
+        );
+        let error = result.expect_err("canonical operation UUID cannot also identify a pool decision");
+        assert!(error.contains("E_REVIEW_OPERATION_NAMESPACE_COLLISION"), "{error}");
+        record_decision(&db, &pool, &alle_edit_on_a(revision, &audio_hash, OPS[0], Some(&proof)))
+            .unwrap()
+            .expect("the same valid proof and decision succeed with a fresh operation UUID");
+        assert_eq!(pool_write_counts(&db), (1, 1, 1));
+    }
+
+    #[test]
+    fn canonical_skip_rejects_operation_uuid_already_owned_by_pool() {
+        let (_dir, db, pool) = two_clip_pool(None);
+        rubar_first_opinions_on_a_and_b(&db);
+        let revision = db.segment_review_revision("a").unwrap().unwrap();
+        let audio_hash = clip_hash("a");
+        let proof = authority(&db, "Alle", "a");
+        record_decision(&db, &pool, &alle_edit_on_a(revision, &audio_hash, OPS[0], Some(&proof))).unwrap().unwrap();
+        let canonical_counts =
+            || -> (i64, i64) {
+                db.connection().query_row(
+                "SELECT (SELECT COUNT(*) FROM review_events), (SELECT COUNT(*) FROM review_compensation_ledger)",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap()
+            };
+        let before = canonical_counts();
+        let payload = crate::db::review_operation_payload_hash("b", "skip", "", "Sewa");
+        let result = db.record_review_event_with_operation("b", "Sewa", "skip", "couch", 2_000, OPS[0], &payload);
+        assert_eq!(
+            canonical_counts(),
+            before,
+            "canonical write must refuse a pool operation UUID before any durable effect; result={result:?}"
+        );
+        let error = result.expect_err("pool operation UUID cannot also identify a canonical skip").to_string();
+        assert!(error.contains("review operation id belongs to the independent pool"), "{error}");
+        db.record_review_event_with_operation("b", "Sewa", "skip", "couch", 2_000, OPS[1], &payload)
+            .expect("the same valid canonical skip succeeds with a fresh operation UUID");
+    }
+
+    #[test]
+    fn pool_undo_rejects_operation_uuid_owned_by_canonical_skip() {
+        let (_dir, db, pool) = two_clip_pool(None);
+        rubar_first_opinions_on_a_and_b(&db);
+        let revision = db.segment_review_revision("a").unwrap().unwrap();
+        let audio_hash = clip_hash("a");
+        let proof = authority(&db, "Alle", "a");
+        let decision =
+            record_decision(&db, &pool, &alle_edit_on_a(revision, &audio_hash, OPS[0], Some(&proof))).unwrap().unwrap();
+        db.record_review_event("b", "Sewa", "skip", "couch", 2_000).unwrap();
+        let canonical_operation: String = db
+            .connection()
+            .query_row("SELECT operation_id FROM review_events WHERE segment_id='b' AND reviewer='Sewa'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let before = pool_write_counts(&db);
+        let result = reverse_decision_addressed(&db, &pool, decision, "Alle", OPS[0], &canonical_operation, 3_000);
+        let startup = db.initialize().map_err(|error| error.to_string());
+        assert_eq!(pool_write_counts(&db), before,
+            "undo must not append a reversal/credit under a canonical operation UUID; result={result:?}, startup={startup:?}");
+        assert!(result.is_err(), "colliding reversal operation must be refused");
+        startup.expect("refused undo collision must leave a valid startup state");
+    }
+
+    #[test]
+    fn canonical_skip_rejects_operation_uuid_owned_by_pool_undo() {
+        let (_dir, db, pool) = two_clip_pool(None);
+        rubar_first_opinions_on_a_and_b(&db);
+        let revision = db.segment_review_revision("a").unwrap().unwrap();
+        let audio_hash = clip_hash("a");
+        let proof = authority(&db, "Alle", "a");
+        let decision =
+            record_decision(&db, &pool, &alle_edit_on_a(revision, &audio_hash, OPS[0], Some(&proof))).unwrap().unwrap();
+        reverse_decision_addressed(&db, &pool, decision, "Alle", OPS[0], OPS[1], 2_000).unwrap().unwrap();
+        let count = || -> i64 {
+            db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap()
+        };
+        let before = count();
+        let payload = crate::db::review_operation_payload_hash("b", "skip", "", "Sewa");
+        let result = db.record_review_event_with_operation("b", "Sewa", "skip", "couch", 3_000, OPS[1], &payload);
+        let startup = db.initialize().map_err(|error| error.to_string());
+        assert_eq!(
+            count(),
+            before,
+            "canonical skip must not commit under a pool-undo UUID; result={result:?}, startup={startup:?}"
+        );
+        assert!(result.is_err(), "pool-undo operation must not be reused by a canonical write");
+        startup.expect("refused canonical collision must leave a valid startup state");
     }
 
     #[test]

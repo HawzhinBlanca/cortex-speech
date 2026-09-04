@@ -900,6 +900,10 @@ pub fn record_independent_decision(
                  SELECT 1 FROM review_flag_effect_reversals WHERE operation_id=?1
                  UNION ALL
                  SELECT 1 FROM independent_review_reversals WHERE operation_id=?1
+                 UNION ALL
+                 SELECT 1 FROM review_pool_decisions WHERE operation_id=?1
+                 UNION ALL
+                 SELECT 1 FROM review_pool_reversals WHERE operation_id=?1
              )",
             [input.operation_id],
             |row| row.get(0),
@@ -1057,6 +1061,10 @@ pub fn reverse_independent_decision(
                  SELECT 1 FROM independent_review_decisions WHERE operation_id=?1
                  UNION ALL
                  SELECT 1 FROM independent_review_reversals WHERE operation_id=?1
+                 UNION ALL
+                 SELECT 1 FROM review_pool_decisions WHERE operation_id=?1
+                 UNION ALL
+                 SELECT 1 FROM review_pool_reversals WHERE operation_id=?1
              )",
             [operation_id],
             |row| row.get(0),
