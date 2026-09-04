@@ -91,11 +91,19 @@ def test_pool_decisions_mint_compensation_and_consume_playback_authority_atomica
     body = pool[record:pool.find("pub fn latest_decision(", record)]
     for needle, why in (
         ("Database::append_review_pool_compensation_tx(", "the credit is minted inside the decision transaction"),
-        ('consume_couch_playback_authority_on(', "the policy-4 authority is consumed inside the decision transaction"),
-        ('"independent",', "the consumption is recorded under the CHECK-constrained independent namespace"),
+        (
+            "let Some(authority_id) = input.playback_authority_session_id else",
+            "a paid pool judgement without policy-4 authority must be refused, never committed",
+        ),
+        (
+            "consume_couch_playback_authority_for_pool_decision_on(",
+            "the policy-4 authority is re-verified and consumed inside the decision transaction",
+        ),
     ):
         if needle not in body:
             raise AssertionError(f"record_decision lost: {why} ({needle!r})")
+    if "if let Some(authority_id) = input.playback_authority_session_id" in body:
+        raise AssertionError("record_decision must not pay a non-skip judgement that carries no playback authority")
     if "tx.commit()" not in body or body.find("Database::append_review_pool_compensation_tx(") > body.rfind("tx.commit()"):
         raise AssertionError("the pool credit must be written BEFORE the decision transaction commits")
     for fn in ("pub fn reverse_decision(", "pub fn reverse_decision_addressed("):
@@ -120,6 +128,41 @@ def test_pool_decisions_mint_compensation_and_consume_playback_authority_atomica
             "the consumption namespaces are CHECK-constrained by schema 67; a pool second opinion is recorded as "
             "`independent`, never as a namespace the table would refuse"
         )
+    pool_consumer = core.split("pub(crate) fn consume_couch_playback_authority_for_pool_decision_on(")
+    if len(pool_consumer) != 2:
+        raise AssertionError("db/core.rs lost consume_couch_playback_authority_for_pool_decision_on")
+    pool_consumer_body = pool_consumer[1][:2500]
+    for needle, why in (
+        ("has_sufficient_desktop_playback_evidence_v4_on(", "the pool proof is re-verified against the current row"),
+        ('"independent",', "the pool consumption is recorded under the CHECK-constrained independent namespace"),
+        ("E_NO_PLAYBACK_EVIDENCE", "an insufficient proof is a refusal, not a silent pass"),
+    ):
+        if needle not in pool_consumer_body:
+            raise AssertionError(f"pool authority consumer lost: {why} ({needle!r})")
+    audit = core.split("let malformed_consumptions: i64 = conn.query_row(")
+    if len(audit) != 2:
+        raise AssertionError("db/core.rs lost the startup consumption audit")
+    audit_body = audit[1][:3000]
+    for needle in (
+        "SELECT 1 FROM review_pool_decisions decision",
+        "AND decision.action<>'skip'",
+        "AND decision.served_revision=session.segment_revision",
+        "AND decision.audio_content_hash=session.audio_content_hash",
+    ):
+        if needle not in audit_body:
+            raise AssertionError(
+                f"the startup audit no longer links an `independent` consumption to its exact pool decision ({needle!r}); "
+                "a reopened database would either refuse every paid second opinion or accept a forged one"
+            )
+    restore = _read("restore_service/compensation.rs")
+    for needle in (
+        '} else if ledger.source == "couch_pool" {',
+        '"couch_undo" | "couch_pool_undo"',
+        "has no exact consumed policy-4 playback authority",
+        "does not have exactly one current-policy credit",
+    ):
+        if needle not in restore:
+            raise AssertionError(f"restore_service/compensation.rs lost the pool credit/undo validation anchor {needle!r}")
     print("[OK] pool decisions mint compensation and consume playback authority in one transaction")
 
 

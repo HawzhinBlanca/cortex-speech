@@ -1807,6 +1807,20 @@ pub(super) fn api_undo_with_body(db: &Database, body: &[u8], reviewer: &str, sta
         HumanDecisionUndoOutcome::AlreadyApplied { segment, .. } => (segment, None),
         HumanDecisionUndoOutcome::Conflict { segment } => {
             retain_phone_undo_token(state, reviewer, insertion_index, entry);
+            let second_opinions: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM effective_review_pool_decisions_v62 WHERE segment_id = ?1",
+                    [&segment.id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if second_opinions > 0 {
+                return err_reply(
+                    409,
+                    "another reviewer has since judged this clip — the first opinion can no longer be undone",
+                );
+            }
             let owner = segment.reviewed_by.clone();
             return match owner {
                 Some(other) if !other.eq_ignore_ascii_case(reviewer) => {
@@ -3203,6 +3217,21 @@ mod tests {
         );
         // 1,500 ms at 18,000 IQD/h = 7,500,000 micro-IQD; 10% of it is 750,000.
         assert_eq!(delta, 750_000);
+
+        // The first opinion now carries another reviewer's paid work, and the pool refuses to start over
+        // a pool decision on an unverified clip: Sara's Undo is refused without mutation, and the pool
+        // still loads over this history.
+        let (code, body) = undo_raw(&db, &st, "Sara", &[]);
+        assert_eq!(code, 409, "a first opinion another reviewer has judged cannot be undone: {body}");
+        assert!(body.contains("can no longer be undone"), "{body}");
+        let canonical = row(&db, "in-pool");
+        assert!(canonical.verified && canonical.human_decision.is_some(), "the refused undo mutates nothing");
+        let reversals: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM human_decision_effect_reversals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(reversals, 0, "a refused undo writes no reversal");
+        crate::review_pool::load(&db).unwrap().expect("the pool still starts over this history");
     }
 
     #[test]
@@ -3248,7 +3277,7 @@ mod tests {
                 operation_id: planted_op,
                 operation_payload_hash: &planted_hash,
                 created_at_ms: 1_700_000_000_000,
-                playback_authority_session_id: None,
+                playback_authority_session_id: Some(&policy4_receipt(&db, "Sara", "in-pool")),
             },
         )
         .unwrap()
@@ -3734,7 +3763,7 @@ mod tests {
                 operation_id: planted_op,
                 operation_payload_hash: &planted_hash,
                 created_at_ms: 1_700_000_000_000,
-                playback_authority_session_id: None,
+                playback_authority_session_id: Some(&policy4_receipt(&db, "Sara", "in-pool")),
             },
         )
         .unwrap()

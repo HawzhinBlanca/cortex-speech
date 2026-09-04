@@ -42,6 +42,7 @@ use std::time::{Duration, Instant};
 const LIVE_PORT: u16 = 8737;
 const FIRST_ID: &str = "serving-path-first";
 const SKIP_ID: &str = "serving-path-skip";
+const THIRD_ID: &str = "serving-path-third";
 /// Fixture identities only. Real reviewers are people, and their names are data this repository does
 /// not carry — the roster lives in the owner's profile, never in the tracked tree.
 const REVIEWER_ONE: &str = "Fixture-Reviewer-One";
@@ -52,6 +53,7 @@ const FENCED_OPERATION: &str = "00000000-0000-4000-8000-000000000102";
 const SKIP_OPERATION: &str = "00000000-0000-4000-8000-000000000103";
 const LEGACY_COUNTER_OPERATION: &str = "00000000-0000-4000-8000-000000000104";
 const NO_PROOF_OPERATION: &str = "00000000-0000-4000-8000-000000000105";
+const THIRD_OPERATION: &str = "00000000-0000-4000-8000-000000000106";
 const CLIP_DURATION_MS: i64 = 1_500;
 /// `MIN_PLAYBACK_COVERAGE` is 0.85 and `DESKTOP_PLAYBACK_MAX_RATE` is 2, so a full-clip interval union
 /// is only plausible once at least `CLIP_DURATION_MS / 2` of real wall clock has passed since the
@@ -157,7 +159,7 @@ fn spawn_server_child(
         .env("CORTEX_SERVING_PROBE_READY", &ready_path)
         .env("CORTEX_SERVING_PROBE_CONTROL", &control_path)
         .env("CORTEX_COUCH_PORT", port.to_string())
-        .env("RUST_LOG", "warn")
+        .env("RUST_LOG", "error")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -220,7 +222,8 @@ fn seed_profile(data_dir: &Path, db_path: &Path) {
         .execute("UPDATE model_versions SET status='champion' WHERE id=?1", [champion_id])
         .expect("activate isolated champion identity");
 
-    let clips = [(FIRST_ID, "دەقی یەکەم", 330.0_f32), (SKIP_ID, "دەقی دووەم", 550.0_f32)];
+    let clips =
+        [(FIRST_ID, "دەقی یەکەم", 330.0_f32), (SKIP_ID, "دەقی دووەم", 550.0_f32), (THIRD_ID, "دەقی سێیەم", 440.0_f32)];
     let mut members = Vec::new();
     for (id, transcript, frequency) in clips {
         let audio_path = data_dir.join(format!("{id}.wav"));
@@ -380,6 +383,18 @@ fn post_decision(agent: &ureq::Agent, base: &str, cookie: &str, body: &Value) ->
     }
 }
 
+/// The undo route's raw reply, for refusals that come back as plain text rather than JSON.
+fn post_undo_text(agent: &ureq::Agent, base: &str, cookie: &str) -> (u16, String) {
+    match agent.post(&format!("{base}/api/undo")).set("Cookie", cookie).send_bytes(&[]) {
+        Ok(response) => {
+            let status = response.status();
+            (status, response.into_string().unwrap_or_default())
+        }
+        Err(ureq::Error::Status(status, response)) => (status, response.into_string().unwrap_or_default()),
+        Err(error) => panic!("isolated undo transport failed: {error}"),
+    }
+}
+
 fn post_undo(agent: &ureq::Agent, base: &str, cookie: &str) -> (u16, Value) {
     let response =
         agent.post(&format!("{base}/api/undo")).set("Cookie", cookie).send_bytes(&[]).expect("isolated undo request");
@@ -536,7 +551,7 @@ fn reviewer_flow_survives_real_https_retries_and_restarts() {
         "the one-opinion clip is nearest a decision and must lead the second reviewer's queue: {second_queue}",
     );
     assert!(find_item(&second_queue, SKIP_ID).is_some(), "untouched pool work is still served: {second_queue}");
-    assert_eq!(second_queue["pendingTotal"], 2, "nothing is fenced out of the pending count any more: {second_queue}");
+    assert_eq!(second_queue["pendingTotal"], 3, "nothing is fenced out of the pending count any more: {second_queue}");
     let (second_audio_status, second_bytes) = get_audio(&agent, &base, &two_cookie, FIRST_ID, None);
     assert_eq!(second_audio_status, 200, "a served one-opinion clip must stream its audio to the second reviewer");
     assert!(second_bytes.starts_with(b"RIFF"), "the second reviewer receives the real WAV bytes");
@@ -601,17 +616,53 @@ fn reviewer_flow_survives_real_https_retries_and_restarts() {
         "the pool replay must be a duplicate acknowledgement, not a second judgement",
     );
 
+    // ── A first opinion another reviewer has judged is locked ────────────────────────────────────
+    // Reviewer one's latest action is the judgement on FIRST_ID, which now carries reviewer two's paid
+    // second opinion. Retracting it would leave a pool decision standing on an unverified clip, and
+    // `review_pool::load` refuses to START over that history — the next restart would take every
+    // reviewer's link down. So the Undo is refused, without mutation, and says why.
+    let (locked_status, locked) = post_undo_text(&agent, &base, &one_cookie);
+    assert_eq!(locked_status, 409, "a first opinion another reviewer has judged cannot be undone: {locked}");
+    assert!(locked.contains("can no longer be undone"), "the refusal names the real reason: {locked}");
+
+    // Reviewer one's next real judgement, on the untouched third clip, is the action a restart-safe
+    // Undo must find: a canonical skip pushes no undo entry (it wrote nothing) and the locked first
+    // opinion is not reversible, so this judgement is the latest reversible action.
+    let third = item(&after_skip, THIRD_ID).clone();
+    let third_row_version = third["rowVersion"].as_str().expect("served clip carries a revision").to_string();
+    let third_receipt = earn_playback_receipt(
+        &agent,
+        &base,
+        &one_cookie,
+        THIRD_ID,
+        &third_row_version,
+        "00000000-0000-4000-8000-0000000002c3",
+    );
+    let (third_status, third_body) = post_decision(
+        &agent,
+        &base,
+        &one_cookie,
+        &json!({
+            "operationId": THIRD_OPERATION,
+            "id": THIRD_ID,
+            "action": "accept",
+            "text": third["text"],
+            "rowVersion": third_row_version,
+            "playbackReceiptId": third_receipt,
+        }),
+    );
+    assert_eq!(third_status, 200, "a proven canonical judgement on the third clip lands: {third_body}");
+
     // ── Restart boundary: the session, its cookies and the undo authority must survive a kill ─────
+    // The database now holds a paid pool second opinion; generation 2's startup audit must accept it.
     server1.crash();
     let (server2, status2) = spawn_server_child(&data_dir, &db_path, port, 2, "resume");
     assert_eq!(status2["running"], true);
     let agent = tls_agent(&data_dir);
     // The in-memory undo stack died with generation 1, so this is served purely from the database.
-    // A canonical skip pushes no undo entry (it wrote nothing), which makes the reviewer's judgement
-    // on FIRST_ID the actual latest action to reverse.
     let (undo_status, undo) = post_undo(&agent, &base, &one_cookie);
     assert_eq!(undo_status, 200, "restart-safe undo failed: {undo}");
-    assert_eq!(undo["id"], FIRST_ID, "restart recovery must undo the actual latest action");
+    assert_eq!(undo["id"], THIRD_ID, "restart recovery must undo the actual latest reversible action");
 
     server2.crash();
     let (server3, status3) = spawn_server_child(&data_dir, &db_path, port, 3, "resume");
@@ -619,15 +670,14 @@ fn reviewer_flow_survives_real_https_retries_and_restarts() {
     let agent = tls_agent(&data_dir);
     let (undo_replay_status, undo_replay) = post_undo(&agent, &base, &one_cookie);
     assert_eq!(undo_replay_status, 200, "lost Undo response must replay after another restart");
-    assert_eq!(undo_replay["id"], FIRST_ID, "a replayed Undo must not reverse an older decision instead");
+    assert_eq!(undo_replay["id"], THIRD_ID, "a replayed Undo must not reverse an older decision instead");
 
-    // The undo made FIRST_ID savable again, so the mirror must hand it back — the fence and the queue
-    // agree in BOTH directions, not just the refusing one.
+    // The undo made THIRD_ID savable again, so the queue must hand it back.
     let requeued = queue(&agent, &base, &one_cookie);
-    item(&requeued, FIRST_ID);
+    item(&requeued, THIRD_ID);
     let requeued_row_version = requeued["items"][0]["rowVersion"].as_str().unwrap_or_default().to_string();
     assert!(!requeued_row_version.is_empty(), "a requeued clip still carries a revision: {requeued}");
-    let (requeued_audio_status, requeued_bytes) = get_audio(&agent, &base, &one_cookie, FIRST_ID, None);
+    let (requeued_audio_status, requeued_bytes) = get_audio(&agent, &base, &one_cookie, THIRD_ID, None);
     assert_eq!(requeued_audio_status, 200, "a requeued clip must be playable again");
     assert!(requeued_bytes.starts_with(b"RIFF"), "the requeued audio route must still return a real WAV");
 
@@ -649,6 +699,15 @@ fn reviewer_flow_survives_real_https_retries_and_restarts() {
         count(&db, "SELECT COUNT(*) FROM human_decision_effect_reversals", &[]),
         1,
         "the replayed Undo after a second restart must not reverse anything twice",
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM speech_segments WHERE id=?1 AND verified=1 AND human_decision='accept'",
+            &[&FIRST_ID],
+        ),
+        1,
+        "the locked first opinion stands: the refused Undo mutated nothing",
     );
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM review_pool_decisions", &[]),
@@ -719,18 +778,18 @@ fn reviewer_flow_survives_real_https_retries_and_restarts() {
             "SELECT COUNT(*) FROM review_compensation_ledger WHERE reviewer=?1 COLLATE NOCASE",
             &[&REVIEWER_ONE],
         ),
-        3,
-        "the accept credit, the zero-weight skip, and the undo reversal are each their own immutable row",
+        4,
+        "two accept credits, the zero-weight skip, and the undo reversal are each their own immutable row",
     );
     assert_eq!(
         count(
             &db,
-            "SELECT delta_micro_iqd FROM review_compensation_ledger
+            "SELECT COALESCE(SUM(delta_micro_iqd), 0) FROM review_compensation_ledger
               WHERE reviewer=?1 COLLATE NOCASE AND compensation_action='accept'",
             &[&REVIEWER_ONE],
         ),
-        ACCEPT_MICRO_IQD,
-        "a playback-evidenced unchanged accept earns the canon rate, not an approximation of it",
+        2 * ACCEPT_MICRO_IQD,
+        "each playback-evidenced unchanged accept earns the canon rate, not an approximation of it",
     );
     assert_eq!(
         count(
@@ -748,17 +807,17 @@ fn reviewer_flow_survives_real_https_retries_and_restarts() {
             "SELECT COALESCE(SUM(delta_micro_iqd), 0) FROM review_compensation_ledger WHERE reviewer=?1 COLLATE NOCASE",
             &[&REVIEWER_ONE],
         ),
-        0,
-        "an undone judgement must leave a net-zero balance, credit and reversal both still visible",
+        ACCEPT_MICRO_IQD,
+        "the undone judgement nets to zero and the locked first opinion stays paid, credit and reversal both visible",
     );
 
-    // OWNER CANON 2026-08-29: a sentence is decided by any two DIFFERENT reviewers. The second opinion
-    // is exactly what the pay fence refuses, so while the fence stands NO pool clip can be resolved
-    // through the phone. This is the fence's real cost, and it is asserted rather than left implicit —
-    // the day an owner pay contract prices pool work, this expectation must change WITH the fence.
+    // OWNER CANON 2026-08-29: a sentence is decided by any two DIFFERENT reviewers. Owner canon
+    // 2026-09-04 pays the second opinion, so the phone can now finish a clip: reviewer one's accept and
+    // reviewer two's identical pool accept resolve FIRST_ID; the skipped clip and the undone judgement
+    // return to pending work.
     let resolution = review_pool::resolution_summary(&db).expect("read pool resolution summary");
-    assert_eq!(resolution.total_clips, 2);
-    assert_eq!(resolution.resolved_clips, 0, "no clip can be decided while the second opinion is fenced");
+    assert_eq!(resolution.total_clips, 3);
+    assert_eq!(resolution.resolved_clips, 1, "two different reviewers agreeing decide the clip");
     assert_eq!(resolution.owner_conflicts, 0);
     assert_eq!(resolution.needs_third_review, 0);
     assert_eq!(

@@ -1603,22 +1603,34 @@ pub fn record_decision(db: &Database, pool: &ReviewPool, input: &PoolDecisionInp
             // Owner canon 2026-09-04: a second opinion is paid exactly like a first one. Consume the
             // playback authority and mint the credit in THIS transaction, so no committed judgement
             // can exist unpaid and no lost response can pay twice.
-            if let Some(authority_id) = input.playback_authority_session_id {
-                // `playback_authority_consumptions_v4.namespace` is CHECK-constrained to
-                // canonical | spot_check | independent (schema 67). A pool second opinion is an
-                // independent second opinion, and its operation id names the exact
-                // review_pool_decisions row, so no new namespace (and no schema 70) is needed.
-                crate::db::consume_couch_playback_authority_on(
-                    &tx,
-                    authority_id,
-                    "independent",
-                    input.operation_id,
-                    input.reviewer,
-                    input.segment_id,
-                    input.created_at_ms,
-                )
-                .map_err(|error| format!("review pool playback authority cannot be consumed: {error}"))?;
-            }
+            let Some(authority_id) = input.playback_authority_session_id else {
+                return Err(
+                    "E_NO_PLAYBACK_EVIDENCE: a paid pool judgement requires this reviewer's finalized policy-4 playback authority"
+                        .to_string(),
+                );
+            };
+            let (Some(content_hash), Some(source_start_ms), Some(source_end_ms)) =
+                (input.audio_content_hash, input.source_start_ms, input.source_end_ms)
+            else {
+                return Err("review pool decision is missing the audio identity its playback proof binds".to_string());
+            };
+            // The proof is re-verified against the current row and consumed inside THIS transaction
+            // (namespace `independent`, linked back through this row's operation id): a missing,
+            // reused, or mismatched authority rolls the judgement, its consumption and its credit
+            // back together.
+            crate::db::consume_couch_playback_authority_for_pool_decision_on(
+                &tx,
+                authority_id,
+                input.reviewer,
+                input.segment_id,
+                input.served_revision,
+                content_hash,
+                source_start_ms,
+                source_end_ms,
+                input.operation_id,
+                input.created_at_ms,
+            )
+            .map_err(|error| format!("review pool playback authority cannot be consumed: {error}"))?;
             Database::append_review_pool_compensation_tx(
                 &tx,
                 decision_id,
@@ -1637,6 +1649,65 @@ pub fn record_decision(db: &Database, pool: &ReviewPool, input: &PoolDecisionInp
         return Ok(None);
     }
     Ok(Some(decision_id))
+}
+
+/// Mint a finalized policy-4 Couch playback authority from a SYNTHETIC full-coverage traversal.
+///
+/// Fixture facility only: test databases, and `pool_admin benchmark-commit` on a disposable clone
+/// (that CLI refuses without `--confirm-disposable`). It runs the production finalization — source
+/// lease, decoded-PCM identity, revision/span re-resolution under BEGIN IMMEDIATE — so the rows it
+/// writes have exactly the shape a phone reviewer's do, but nobody listened. No production code path
+/// calls it, and it must never run against the live database.
+pub fn mint_synthetic_playback_authority(
+    db: &Database,
+    reviewer: &str,
+    segment_id: &str,
+    session_binding_sha256: &str,
+) -> Result<String, String> {
+    let revision = db
+        .segment_review_revision(segment_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("segment {segment_id} has no review revision"))?;
+    let segment = db
+        .get_segment_by_id(segment_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("segment {segment_id} is missing"))?;
+    let audio_content_hash = db
+        .segment_audio_content_hash(segment_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("segment {segment_id} has no PCM identity"))?;
+    let (source_start_ms, source_end_ms) = db
+        .segment_source_span(segment_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("segment {segment_id} has no canonical source span"))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(10_000)
+        .max(10_000);
+    let authority = crate::db::CouchPlaybackAttemptAuthority {
+        playback_receipt_id: uuid::Uuid::new_v4().hyphenated().to_string(),
+        media_grant_id: uuid::Uuid::new_v4().hyphenated().to_string(),
+        client_attempt_id: uuid::Uuid::new_v4().hyphenated().to_string(),
+        session_binding_sha256: session_binding_sha256.to_string(),
+        reviewer: reviewer.to_string(),
+        segment_id: segment_id.to_string(),
+        segment_revision: revision,
+        audio_content_hash,
+        source_path: std::path::PathBuf::from(&segment.audio_path),
+        clip_duration_ms: segment.duration_ms,
+        source_start_ms,
+        source_end_ms,
+        issued_at_ms: now_ms,
+        expires_at_ms: now_ms + 60_000,
+    };
+    db.finalize_couch_playback_attempt_v1(
+        &authority,
+        &[crate::db::DesktopPlaybackInterval { start_ms: 0, end_ms: segment.duration_ms }],
+        segment.duration_ms,
+    )
+    .map(|receipt| receipt.playback_receipt_id)
+    .map_err(|error| error.to_string())
 }
 
 pub fn latest_decision(
@@ -1855,10 +1926,48 @@ mod tests {
         value
     }
 
+    thread_local! {
+        static CLIP_HASH_SCRATCH: tempfile::TempDir = tempfile::tempdir().expect("clip identity scratch directory");
+    }
+
+    /// A real 16 kHz mono WAV whose decoded PCM depends only on `seed`, so a fixture's stored
+    /// `audio_content_hash` (`clip_hash(seed)`) is the file's TRUE identity and policy-4 finalization
+    /// verifies the source lease exactly as it does for a phone reviewer.
+    fn write_clip_wav(path: &Path, seed: &str) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        let seed = seed.as_bytes();
+        for n in 0..16_000_usize {
+            let salt = seed.get(n % seed.len().max(1)).copied().unwrap_or(128) as i16 - 128;
+            writer.write_sample(((n % 1000) as i16).wrapping_mul(30).wrapping_add(salt)).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    fn clip_hash(seed: &str) -> String {
+        CLIP_HASH_SCRATCH.with(|dir| {
+            let path = dir.path().join(format!("{seed}.wav"));
+            if !path.exists() {
+                write_clip_wav(&path, seed);
+            }
+            crate::export_bundle::current_canonical_pcm_blake3(&path).unwrap()
+        })
+    }
+
+    /// A finalized policy-4 authority for `reviewer` on `segment_id`, bound to the fixture session.
+    fn authority(db: &Database, reviewer: &str, segment_id: &str) -> String {
+        mint_synthetic_playback_authority(db, reviewer, segment_id, &"f".repeat(64)).unwrap()
+    }
+
     fn one_clip_pool(first_text: &str) -> (tempfile::TempDir, Database, ReviewPool) {
         let dir = tempfile::tempdir().unwrap();
         let audio = dir.path().join("clip.wav");
-        std::fs::write(&audio, b"wav").unwrap();
+        write_clip_wav(&audio, "a");
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         seed_champion(&db);
@@ -1866,7 +1975,7 @@ mod tests {
         db.insert_segment_full(&reviewed_segment("clip", &audio, "Rubar", first_text)).unwrap();
         upgrade_fixture_from(&db, 59);
         db.connection()
-            .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='clip'", ["a".repeat(64)])
+            .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='clip'", [clip_hash("a")])
             .unwrap();
         let pool = activate(
             &db,
@@ -1885,7 +1994,7 @@ mod tests {
         rollback_fixture_to(&db, 59);
         for id in ["a", "b"] {
             let audio = dir.path().join(format!("{id}.wav"));
-            std::fs::write(&audio, b"wav").unwrap();
+            write_clip_wav(&audio, id);
             let row = if reviewed_segment_id == Some(id) {
                 reviewed_segment(id, &audio, "Rubar", "دەقی دروست")
             } else {
@@ -1895,10 +2004,10 @@ mod tests {
         }
         upgrade_fixture_from(&db, 59);
         db.connection()
-            .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='a'", ["a".repeat(64)])
+            .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='a'", [clip_hash("a")])
             .unwrap();
         db.connection()
-            .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='b'", ["b".repeat(64)])
+            .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='b'", [clip_hash("b")])
             .unwrap();
         let pool = activate(
             &db,
@@ -2000,6 +2109,7 @@ mod tests {
 
     fn decide(db: &Database, pool: &ReviewPool, reviewer: &str, text: &str, operation_id: &str, at: i64) -> i64 {
         let (_, revision) = db.get_segment_by_id_with_revision("clip").unwrap().unwrap();
+        let authority = authority(db, reviewer, "clip");
         record_decision(
             db,
             pool,
@@ -2010,7 +2120,7 @@ mod tests {
                 submitted_transcript: Some(text),
                 served_transcript: "دەقی چامپیۆن",
                 served_revision: revision,
-                audio_content_hash: Some(&"a".repeat(64)),
+                audio_content_hash: Some(&clip_hash("a")),
                 source_start_ms: Some(0),
                 source_end_ms: Some(1_000),
                 duration_ms: 1_000,
@@ -2019,7 +2129,7 @@ mod tests {
                 operation_id,
                 operation_payload_hash: &"b".repeat(64),
                 created_at_ms: at,
-                playback_authority_session_id: None,
+                playback_authority_session_id: Some(&authority),
             },
         )
         .unwrap()
@@ -2031,7 +2141,7 @@ mod tests {
             voice_name: voice_name.to_string(),
             raw_transcript: "دەقی چامپیۆن".to_string(),
             model_version_id: TEST_CHAMPION.to_string(),
-            audio_content_hash: "a".repeat(64),
+            audio_content_hash: clip_hash("a"),
             source_start_ms: 0,
             source_end_ms: 1_000,
             duration_ms: 1_000,
@@ -2084,7 +2194,7 @@ mod tests {
                 submitted_transcript: None,
                 served_transcript: "دەقی چامپیۆن",
                 served_revision: 0,
-                audio_content_hash: Some(&"b".repeat(64)),
+                audio_content_hash: Some(&clip_hash("b")),
                 source_start_ms: Some(0),
                 source_end_ms: Some(1_000),
                 duration_ms: 1_000,
@@ -2432,8 +2542,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first_audio = dir.path().join("first.wav");
         let second_audio = dir.path().join("second.wav");
-        std::fs::write(&first_audio, b"wav").unwrap();
-        std::fs::write(&second_audio, b"wav").unwrap();
+        write_clip_wav(&first_audio, "a");
+        write_clip_wav(&second_audio, "b");
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         seed_champion(&db);
@@ -2446,7 +2556,7 @@ mod tests {
                 "UPDATE speech_segments
                     SET audio_content_hash=CASE id WHEN 'first' THEN ?1 ELSE ?2 END
                   WHERE id IN ('first','second')",
-                rusqlite::params!["a".repeat(64), "b".repeat(64)],
+                rusqlite::params![clip_hash("a"), clip_hash("b")],
             )
             .unwrap();
         let pool_id = "123e4567-e89b-42d3-a456-426614174000";
@@ -2480,6 +2590,8 @@ mod tests {
 
         let (_, revision) = db.get_segment_by_id_with_revision("first").unwrap().unwrap();
         let operation_payload_hash = "a".repeat(64);
+        let audio_hash = clip_hash("a");
+        let authority = authority(&db, "Alle", "first");
         let inserted = record_decision(
             &db,
             &pool,
@@ -2490,7 +2602,7 @@ mod tests {
                 submitted_transcript: Some("دەقی دووەم"),
                 served_transcript: "دەقی چامپیۆن",
                 served_revision: revision,
-                audio_content_hash: Some(&operation_payload_hash),
+                audio_content_hash: Some(&audio_hash),
                 source_start_ms: Some(0),
                 source_end_ms: Some(1_000),
                 duration_ms: 1_000,
@@ -2499,7 +2611,7 @@ mod tests {
                 operation_id: "123e4567-e89b-42d3-a456-426614174001",
                 operation_payload_hash: &operation_payload_hash,
                 created_at_ms: 1,
-                playback_authority_session_id: None,
+                playback_authority_session_id: Some(&authority),
             },
         )
         .unwrap()
@@ -2557,7 +2669,8 @@ mod tests {
             .unwrap();
         let decide_segment = |segment_id: &str, operation_id: &str, created_at_ms: i64| {
             let (_, revision) = db.get_segment_by_id_with_revision(segment_id).unwrap().unwrap();
-            let audio_hash = segment_id.repeat(64);
+            let audio_hash = clip_hash(segment_id);
+            let authority = authority(&db, "Alle", segment_id);
             record_decision(
                 &db,
                 &pool,
@@ -2577,7 +2690,7 @@ mod tests {
                     operation_id,
                     operation_payload_hash: &"e".repeat(64),
                     created_at_ms,
-                    playback_authority_session_id: None,
+                    playback_authority_session_id: Some(&authority),
                 },
             )
             .unwrap()
@@ -3118,7 +3231,7 @@ mod tests {
     fn record_decision_refuses_invalid_identity_actions_and_stale_evidence() {
         let (_dir, db, pool) = one_clip_pool("دەقی یەک");
         let (_, revision) = db.get_segment_by_id_with_revision("clip").unwrap().unwrap();
-        let hash = "a".repeat(64);
+        let hash = clip_hash("a");
         let payload = "b".repeat(64);
         let base = PoolDecisionInput {
             segment_id: "clip",
@@ -3477,7 +3590,8 @@ mod tests {
 
         let decide_on = |segment_id: &str, reviewer: &str, text: &str, operation_id: &str, at: i64| {
             let (_, revision) = db.get_segment_by_id_with_revision(segment_id).unwrap().unwrap();
-            let audio_hash = segment_id.repeat(64);
+            let audio_hash = clip_hash(segment_id);
+            let authority = authority(&db, reviewer, segment_id);
             record_decision(
                 &db,
                 &pool,
@@ -3497,7 +3611,7 @@ mod tests {
                     operation_id,
                     operation_payload_hash: &"e".repeat(64),
                     created_at_ms: at,
-                    playback_authority_session_id: None,
+                    playback_authority_session_id: Some(&authority),
                 },
             )
             .unwrap()
@@ -3822,7 +3936,7 @@ mod tests {
     fn disk_one_clip_pool(pool_uuid: &str, first_text: &str) -> (tempfile::TempDir, Database, ReviewPool) {
         let dir = tempfile::tempdir().unwrap();
         let audio = dir.path().join("clip.wav");
-        std::fs::write(&audio, b"wav").unwrap();
+        write_clip_wav(&audio, "a");
         let db = Database::open(dir.path().join("pool-fixture.db").to_str().unwrap()).unwrap();
         db.initialize().unwrap();
         seed_champion(&db);
@@ -3830,7 +3944,7 @@ mod tests {
         db.insert_segment_full(&reviewed_segment("clip", &audio, "Sara", first_text)).unwrap();
         upgrade_fixture_from(&db, 59);
         db.connection()
-            .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='clip'", ["a".repeat(64)])
+            .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='clip'", [clip_hash("a")])
             .unwrap();
         let pool =
             activate(&db, pool_uuid, &[PoolMemberInput { segment_id: "clip".into(), voice_name: "Lamo".into() }])
@@ -4012,15 +4126,15 @@ mod tests {
         rollback_fixture_to(&db, 59);
         for (id, canonical_reviewer) in [("fresh", Some("Nechir")), ("needs", Some("Nechir")), ("untouched", None)] {
             let audio = dir.path().join(format!("{id}.wav"));
-            std::fs::write(&audio, b"wav").unwrap();
+            write_clip_wav(&audio, id);
             db.insert_segment_full(&segment(id, &audio, canonical_reviewer)).unwrap();
         }
         upgrade_fixture_from(&db, 59);
-        for (id, byte) in [("fresh", "a"), ("needs", "b"), ("untouched", "c")] {
+        for id in ["fresh", "needs", "untouched"] {
             db.connection()
                 .execute(
                     "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
-                    rusqlite::params![id, byte.repeat(64)],
+                    rusqlite::params![id, clip_hash(id)],
                 )
                 .unwrap();
         }
@@ -4039,6 +4153,7 @@ mod tests {
         // distinct reviewers is exactly the state a third opinion exists to break.
         let (_, revision) = db.get_segment_by_id_with_revision("needs").unwrap().unwrap();
         let audio_content_hash = pool.members.get("needs").unwrap().audio_content_hash.clone();
+        let authority = authority(&db, "Sara", "needs");
         record_decision(
             &db,
             &pool,
@@ -4058,7 +4173,7 @@ mod tests {
                 operation_id: "123e4567-e89b-42d3-a456-426614174060",
                 operation_payload_hash: &"b".repeat(64),
                 created_at_ms: 1,
-                playback_authority_session_id: None,
+                playback_authority_session_id: Some(&authority),
             },
         )
         .unwrap()
@@ -4099,18 +4214,10 @@ mod tests {
     #[test]
     fn a_pool_second_opinion_is_paid_once_at_the_first_opinion_weight_and_undo_reverses_it() {
         let (_dir, db, pool) = two_clip_pool(None);
-        db.connection()
-            .execute(
-                "UPDATE speech_segments
-                    SET verified=1, human_decision='edit', verdict='human_edit',
-                        verdict_transcript='دەقی دروست', annotated_transcript='دەقی دروست',
-                        reviewed_by='Rubar', review_revision=review_revision+1
-                  WHERE id IN ('a','b')",
-                [],
-            )
-            .unwrap();
+        rubar_first_opinions_on_a_and_b(&db);
         let (_, revision) = db.get_segment_by_id_with_revision("a").unwrap().unwrap();
-        let audio_hash = "a".repeat(64);
+        let audio_hash = clip_hash("a");
+        let authority = authority(&db, "Alle", "a");
         let decision_operation = "123e4567-e89b-42d3-a456-426614174901";
         let input = PoolDecisionInput {
             segment_id: "a",
@@ -4128,7 +4235,7 @@ mod tests {
             operation_id: decision_operation,
             operation_payload_hash: &"e".repeat(64),
             created_at_ms: 1_000,
-            playback_authority_session_id: None,
+            playback_authority_session_id: Some(&authority),
         };
         let decision_id = record_decision(&db, &pool, &input).unwrap().expect("the second opinion commits");
 
@@ -4211,5 +4318,266 @@ mod tests {
             "the first opinion's owner is untouched by the second opinion's money: {:?}",
             ledger("Rubar")
         );
+    }
+
+    /// Rubar's canonical first opinion on both clips of `two_clip_pool`, the state a pool second
+    /// opinion is served against.
+    fn rubar_first_opinions_on_a_and_b(db: &Database) {
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET verified=1, human_decision='edit', verdict='human_edit',
+                        verdict_transcript='دەقی دروست', annotated_transcript='دەقی دروست',
+                        reviewed_by='Rubar', review_revision=review_revision+1
+                  WHERE id IN ('a','b')",
+                [],
+            )
+            .unwrap();
+    }
+
+    const PAYLOAD_HASH: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const OPS: [&str; 8] = [
+        "123e4567-e89b-42d3-a456-426614174930",
+        "123e4567-e89b-42d3-a456-426614174931",
+        "123e4567-e89b-42d3-a456-426614174932",
+        "123e4567-e89b-42d3-a456-426614174933",
+        "123e4567-e89b-42d3-a456-426614174934",
+        "123e4567-e89b-42d3-a456-426614174935",
+        "123e4567-e89b-42d3-a456-426614174936",
+        "123e4567-e89b-42d3-a456-426614174937",
+    ];
+
+    /// Alle's paid edit on clip `a`, exactly as the phone route would hand it to the writer.
+    fn alle_edit_on_a<'a>(
+        revision: i64,
+        audio_hash: &'a str,
+        operation_id: &'a str,
+        authority: Option<&'a str>,
+    ) -> PoolDecisionInput<'a> {
+        PoolDecisionInput {
+            segment_id: "a",
+            reviewer: "Alle",
+            action: "edit",
+            submitted_transcript: Some("دەقی ئەلە"),
+            served_transcript: "دەقی چامپیۆن",
+            served_revision: revision,
+            audio_content_hash: Some(audio_hash),
+            source_start_ms: Some(0),
+            source_end_ms: Some(1_000),
+            duration_ms: 1_000,
+            requested_action: "edit",
+            requested_transcript: "دەقی ئەلە",
+            operation_id,
+            operation_payload_hash: PAYLOAD_HASH,
+            created_at_ms: 1_000,
+            playback_authority_session_id: authority,
+        }
+    }
+
+    /// (pool decisions, pool ledger rows, independent consumptions): the three writes one paid pool
+    /// judgement makes, which must land together or not at all.
+    fn pool_write_counts(db: &Database) -> (i64, i64, i64) {
+        let count = |sql: &str| -> i64 { db.connection().query_row(sql, [], |row| row.get(0)).unwrap() };
+        (
+            count("SELECT COUNT(*) FROM review_pool_decisions"),
+            count("SELECT COUNT(*) FROM review_compensation_ledger WHERE source IN ('couch_pool','couch_pool_undo')"),
+            count("SELECT COUNT(*) FROM playback_authority_consumptions_v4 WHERE namespace='independent'"),
+        )
+    }
+
+    #[test]
+    fn a_paid_pool_judgement_without_exact_playback_authority_writes_nothing() {
+        let (_dir, db, pool) = two_clip_pool(None);
+        rubar_first_opinions_on_a_and_b(&db);
+        let audio_hash = clip_hash("a");
+        let revision = |db: &Database| db.get_segment_by_id_with_revision("a").unwrap().unwrap().1;
+
+        // No authority at all.
+        let refused =
+            record_decision(&db, &pool, &alle_edit_on_a(revision(&db), &audio_hash, OPS[0], None)).unwrap_err();
+        assert!(refused.contains("E_NO_PLAYBACK_EVIDENCE"), "{refused}");
+        assert_eq!(pool_write_counts(&db), (0, 0, 0), "a refused judgement leaves no decision, credit or consumption");
+
+        // Somebody else's listening.
+        let sewa = authority(&db, "Sewa", "a");
+        let refused =
+            record_decision(&db, &pool, &alle_edit_on_a(revision(&db), &audio_hash, OPS[1], Some(&sewa))).unwrap_err();
+        assert!(refused.contains("E_NO_PLAYBACK_EVIDENCE"), "wrong reviewer: {refused}");
+        assert_eq!(pool_write_counts(&db), (0, 0, 0));
+
+        // Alle's listening, but of the other clip.
+        let other_clip = authority(&db, "Alle", "b");
+        let refused =
+            record_decision(&db, &pool, &alle_edit_on_a(revision(&db), &audio_hash, OPS[2], Some(&other_clip)))
+                .unwrap_err();
+        assert!(refused.contains("E_NO_PLAYBACK_EVIDENCE"), "wrong clip: {refused}");
+        assert_eq!(pool_write_counts(&db), (0, 0, 0));
+
+        // Alle listened to this clip, then its revision moved before the judgement landed.
+        let stale = authority(&db, "Alle", "a");
+        db.connection()
+            .execute("UPDATE speech_segments SET review_revision=review_revision+1 WHERE id='a'", [])
+            .unwrap();
+        let refused =
+            record_decision(&db, &pool, &alle_edit_on_a(revision(&db), &audio_hash, OPS[3], Some(&stale))).unwrap_err();
+        assert!(refused.contains("E_NO_PLAYBACK_EVIDENCE"), "stale revision: {refused}");
+        assert_eq!(pool_write_counts(&db), (0, 0, 0));
+
+        // Exact proof, but the credit cannot be written: the judgement and the consumption roll back
+        // with it, so no committed pool opinion can ever exist unpaid.
+        let exact = authority(&db, "Alle", "a");
+        let triggers: Vec<String> = db
+            .connection()
+            .prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='review_compensation_policies'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for name in triggers {
+            db.connection().execute(&format!("DROP TRIGGER \"{name}\""), []).unwrap();
+        }
+        db.connection().execute("DELETE FROM review_compensation_policies", []).unwrap();
+        let refused =
+            record_decision(&db, &pool, &alle_edit_on_a(revision(&db), &audio_hash, OPS[4], Some(&exact))).unwrap_err();
+        assert!(refused.contains("compensation"), "credit failure: {refused}");
+        assert_eq!(pool_write_counts(&db), (0, 0, 0), "a failed credit rolls the judgement and its consumption back");
+    }
+
+    #[test]
+    fn a_spent_pool_playback_authority_cannot_pay_twice_but_a_fresh_listen_can() {
+        let (_dir, db, pool) = two_clip_pool(None);
+        rubar_first_opinions_on_a_and_b(&db);
+        let (_, revision) = db.get_segment_by_id_with_revision("a").unwrap().unwrap();
+        let audio_hash = clip_hash("a");
+        let spent = authority(&db, "Alle", "a");
+        let first = record_decision(&db, &pool, &alle_edit_on_a(revision, &audio_hash, OPS[0], Some(&spent)))
+            .unwrap()
+            .expect("a proven second opinion lands");
+        assert_eq!(pool_write_counts(&db), (1, 1, 1));
+
+        // Undo frees the reviewer to judge again, not the receipt they already spent.
+        reverse_decision(&db, &pool, first, "Alle", OPS[1], 2_000).unwrap();
+        assert_eq!(pool_write_counts(&db), (1, 2, 1), "undo appends its reversal and consumes nothing");
+        let reused =
+            record_decision(&db, &pool, &alle_edit_on_a(revision, &audio_hash, OPS[2], Some(&spent))).unwrap_err();
+        assert!(reused.contains("E_PLAYBACK_RECEIPT_CONSUMED"), "{reused}");
+        assert_eq!(pool_write_counts(&db), (1, 2, 1), "a spent receipt writes nothing");
+
+        let fresh = authority(&db, "Alle", "a");
+        record_decision(&db, &pool, &alle_edit_on_a(revision, &audio_hash, OPS[3], Some(&fresh)))
+            .unwrap()
+            .expect("a fresh listen pays again");
+        assert_eq!(pool_write_counts(&db), (2, 3, 2));
+    }
+
+    /// The whole durable life of one paid second opinion: first opinion -> proven second opinion ->
+    /// process restart -> settlement -> undo -> restart, with the restore validator accepting the
+    /// database at every stage. Startup runs the same policy-4 audit a staged restore does.
+    #[test]
+    fn a_paid_pool_judgement_survives_reopen_restore_validation_settlement_and_undo() {
+        let (dir, db, pool) = disk_one_clip_pool("123e4567-e89b-42d3-a456-4266141740b0", "دەقی دروست");
+        let db_path = dir.path().join("pool-fixture.db");
+        let validate = crate::restore_service::validate_review_compensation_semantics;
+        validate(&db).expect("a pristine pool database is a valid restore target");
+
+        let (_, revision) = db.get_segment_by_id_with_revision("clip").unwrap().unwrap();
+        let audio_hash = clip_hash("a");
+        let authority = authority(&db, "Alle", "clip");
+        let mut input = alle_edit_on_a(revision, &audio_hash, OPS[0], Some(&authority));
+        input.segment_id = "clip";
+        let decision_id = record_decision(&db, &pool, &input).unwrap().expect("the second opinion commits");
+        validate(&db).expect("a paid second opinion is a valid restore target");
+
+        drop(db);
+        let db = Database::open(db_path.to_str().unwrap()).unwrap();
+        db.initialize().expect("startup audit accepts the paid pool judgement's consumption");
+        let pool = load(&db).unwrap().expect("the pool survives the restart");
+        validate(&db).unwrap();
+
+        let credit_id: i64 = db
+            .connection()
+            .query_row(
+                "SELECT id FROM review_compensation_ledger WHERE entry_key=?1",
+                [format!("pool-decision:{decision_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let settlement = db.record_review_compensation_settlement("Alle", credit_id, "payout-pool-1").unwrap();
+        assert_eq!(settlement.allocated_micro_iqd, 5_000_000, "a 1,000 ms edit at 18,000 IQD/h settles exactly");
+        validate(&db).expect("a settled second opinion is a valid restore target");
+
+        assert_eq!(
+            reverse_decision_addressed(&db, &pool, decision_id, "Alle", OPS[0], OPS[1], 2_000).unwrap().as_deref(),
+            Some("clip")
+        );
+        validate(&db).expect("an undone second opinion is a valid restore target");
+
+        drop(db);
+        let db = Database::open(db_path.to_str().unwrap()).unwrap();
+        db.initialize().expect("startup audit accepts the undone pool judgement");
+        validate(&db).unwrap();
+        assert_eq!(pool_write_counts(&db), (1, 2, 1));
+        let balance: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COALESCE(SUM(delta_micro_iqd),0) FROM review_compensation_ledger WHERE reviewer='Alle'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(balance, 0, "credit and reversal net to zero; the settled payout stays on the books");
+    }
+
+    #[test]
+    fn a_forged_or_orphaned_pool_consumption_fails_the_startup_audit() {
+        // Orphaned: a genuine receipt consumed by an operation no judgement table knows.
+        let (dir, db, pool) = disk_one_clip_pool("123e4567-e89b-42d3-a456-4266141740c0", "دەقی دروست");
+        let db_path = dir.path().join("pool-fixture.db");
+        let (_, revision) = db.get_segment_by_id_with_revision("clip").unwrap().unwrap();
+        let audio_hash = clip_hash("a");
+        let genuine = authority(&db, "Alle", "clip");
+        let mut input = alle_edit_on_a(revision, &audio_hash, OPS[0], Some(&genuine));
+        input.segment_id = "clip";
+        record_decision(&db, &pool, &input).unwrap().expect("a genuine paid judgement sits beside the forgery");
+        let stray = authority(&db, "Sewa", "clip");
+        db.connection()
+            .execute(
+                "INSERT INTO playback_authority_consumptions_v4
+                    (playback_receipt_id,namespace,operation_id,reviewer,segment_id,created_at_ms)
+                 VALUES (?1,'independent',?2,'Sewa','clip',5)",
+                rusqlite::params![stray, OPS[5]],
+            )
+            .unwrap();
+        drop(db);
+        let reopened = Database::open(db_path.to_str().unwrap()).unwrap();
+        let error = reopened.initialize().unwrap_err().to_string();
+        assert!(error.contains("orphaned or mismatched consumption"), "orphan: {error}");
+
+        // Forged: a consumption that points at a SKIP (which mints nothing and consumes nothing).
+        let (dir, db, pool) = disk_one_clip_pool("123e4567-e89b-42d3-a456-4266141740c1", "دەقی دروست");
+        let db_path = dir.path().join("pool-fixture.db");
+        let (_, revision) = db.get_segment_by_id_with_revision("clip").unwrap().unwrap();
+        let mut skip = alle_edit_on_a(revision, &audio_hash, OPS[6], None);
+        skip.segment_id = "clip";
+        skip.reviewer = "Sewa";
+        skip.action = "skip";
+        skip.submitted_transcript = None;
+        skip.requested_action = "skip";
+        record_decision(&db, &pool, &skip).unwrap().expect("a skip is recorded unpaid");
+        assert_eq!(pool_write_counts(&db), (1, 0, 0), "a skip consumes no authority and mints no credit");
+        let unspent = authority(&db, "Sewa", "clip");
+        db.connection()
+            .execute(
+                "INSERT INTO playback_authority_consumptions_v4
+                    (playback_receipt_id,namespace,operation_id,reviewer,segment_id,created_at_ms)
+                 VALUES (?1,'independent',?2,'Sewa','clip',6)",
+                rusqlite::params![unspent, OPS[6]],
+            )
+            .unwrap();
+        drop(db);
+        let reopened = Database::open(db_path.to_str().unwrap()).unwrap();
+        let error = reopened.initialize().unwrap_err().to_string();
+        assert!(error.contains("orphaned or mismatched consumption"), "skip forgery: {error}");
     }
 }

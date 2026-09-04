@@ -262,6 +262,10 @@ fn commit_benchmark_worker(
     let mut commits = Vec::with_capacity(iterations);
     for index in 0..iterations {
         let operation_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        // Synthetic listening evidence for a disposable clone (the subcommand refuses without
+        // --confirm-disposable); minted outside the timed window so the sample is the commit alone.
+        let authority =
+            review_pool::mint_synthetic_playback_authority(&db, &reviewer, &clip.segment_id, &"b".repeat(64))?;
         let started = std::time::Instant::now();
         let decision_id = review_pool::record_decision(
             &db,
@@ -282,7 +286,7 @@ fn commit_benchmark_worker(
                 operation_id: &operation_id,
                 operation_payload_hash: &if reviewer.ends_with('A') { "a".repeat(64) } else { "b".repeat(64) },
                 created_at_ms: 1_000_000_i64.saturating_add(index as i64),
-                playback_authority_session_id: None,
+                playback_authority_session_id: Some(&authority),
             },
         )?
         .ok_or_else(|| "commit benchmark decision unexpectedly changed zero rows".to_string())?;
@@ -1323,8 +1327,36 @@ mod tests {
         }
     }
 
+    thread_local! {
+        static CLIP_HASH_SCRATCH: tempfile::TempDir = tempfile::tempdir().expect("clip identity scratch directory");
+    }
+
+    /// A real 16 kHz mono WAV whose decoded PCM depends only on `seed`, so a fixture clip's stored
+    /// identity (`clip_hash(seed)`) is the file's TRUE PCM hash and policy-4 finalization verifies
+    /// the source lease exactly as it does for a phone reviewer.
+    fn write_clip_wav(path: &Path, seed: usize) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        let salt = (seed % 100) as i16;
+        for n in 0..16_000_usize {
+            writer.write_sample(((n % 1000) as i16).wrapping_mul(30).wrapping_add(salt)).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
     fn clip_hash(index: usize) -> String {
-        format!("{:064x}", index + 1)
+        CLIP_HASH_SCRATCH.with(|dir| {
+            let path = dir.path().join(format!("{index}.wav"));
+            if !path.exists() {
+                write_clip_wav(&path, index);
+            }
+            cortex_speech_app_lib::export_bundle::current_canonical_pcm_blake3(&path).unwrap()
+        })
     }
 
     const FIXTURE_POOL_ID: &str = "123e4567-e89b-42d3-a456-426614174060";
@@ -1337,9 +1369,10 @@ mod tests {
         seed_champion(&db);
         let rows: Vec<_> = clips
             .iter()
-            .map(|(id, reviewed)| {
+            .enumerate()
+            .map(|(index, (id, reviewed))| {
                 let audio = data_dir.join(format!("{id}.wav"));
-                std::fs::write(&audio, b"wav").unwrap();
+                write_clip_wav(&audio, index);
                 fixture_segment(id, &audio, reviewed.then_some("ReviewerA"))
             })
             .collect();
@@ -1374,6 +1407,9 @@ mod tests {
         let (reviewer, action, text) = verdict;
         let (_, revision) = db.get_segment_by_id_with_revision(segment_id).unwrap().unwrap();
         let skip = action == "skip";
+        let authority = (!skip).then(|| {
+            review_pool::mint_synthetic_playback_authority(db, reviewer, segment_id, &"b".repeat(64)).unwrap()
+        });
         review_pool::record_decision(
             db,
             pool,
@@ -1393,7 +1429,7 @@ mod tests {
                 operation_id: &uuid::Uuid::new_v4().hyphenated().to_string(),
                 operation_payload_hash: &"b".repeat(64),
                 created_at_ms: at,
-                playback_authority_session_id: None,
+                playback_authority_session_id: authority.as_deref(),
             },
         )
         .unwrap()

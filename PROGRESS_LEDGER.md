@@ -14199,9 +14199,16 @@ fence by skipping every one-opinion clip before the distance-to-decision orderin
 (`review-iqd-v1-2026-08-21`), the same basis points and the same canonical work identity
 (`reviewer-work-v1:<reviewer>:<audio>`) as a first opinion, keyed on the immutable pool decision id
 (`pool-decision:<id>`, source `couch_pool`, no `review_events` row), plus
-`append_review_pool_compensation_reversal_tx` (source `couch_pool_undo`). `record_decision` consumes the
-policy-4 playback authority (namespace `pool`) and mints the credit inside its own transaction; both
-reversal paths append the signed inverse; the queue mirror is gone. `api_pool_decision` now demands the
+`append_review_pool_compensation_reversal_tx` (source `couch_pool_undo`). `record_decision` REQUIRES the
+reviewer's own finalized policy-4 playback authority for every non-skip judgement (`let Some(..) else
+Err`), re-verifies it against the current row inside the transaction
+(`consume_couch_playback_authority_for_pool_decision_on`: reviewer, clip, revision, PCM identity, span,
+coverage, interval sum) and consumes it under the CHECK-constrained `independent` namespace — the
+consumption table admits exactly canonical | spot_check | independent, a pool judgement IS an
+independent second opinion, and its operation id names exactly one `review_pool_decisions` row — then
+mints the credit, all before commit; a missing, spent, or mismatched authority or a failed credit rolls
+the judgement, consumption and credit back together. Both reversal paths append the signed inverse; the
+queue mirror is gone. `api_pool_decision` now demands the
 same policy-4 proof as the canonical path — the legacy `heardMs` counter it still accepted would have
 turned every real second opinion into a 428 the moment the fence lifted — and the routing lets a KNOWN
 canonical operation fall through to its duplicate acknowledgement: a lost-response replay of a first
@@ -14209,21 +14216,83 @@ opinion arrives after its own commit made the clip canonical, and diverting it i
 answered 409, which the phone reports as "could not be saved". The blinded second-pass CAMPAIGN pays
 nothing and keeps its fence.
 
-**Pins.** `test_pool_pay_fence_scope_policy.py` re-pinned to the new contract (production routing, no
-`cfg(not(test))` refusal, credit before commit, reversal on both undo paths, mirror gone, campaign
-still fenced). `check_review_compensation_readiness.py` validates every `couch_pool` row against its
-`review_pool_decisions` row (action, reviewer, clip, duration, served revision, canonical identity,
-weight, delta) and requires exactly one credit per non-skip pool decision. `docs/OWNER_CANON.md`
-carries the change. Rust: `a_pool_second_opinion_is_paid_once_at_the_first_opinion_weight_and_undo_reverses_it`
-(review_pool) — one credit of 5,000,000 micro-IQD for a 1,000 ms edit, nothing on replay, exact
-inverse on undo, nothing on a replayed undo, the first opinion's owner untouched;
-`a_second_reviewer_is_paid_for_a_proven_pool_opinion_after_a_real_canonical_accept` (couch) — the
-integration flow in miniature with clause-level diagnostics; `reviewer_serving_path` now proves the
-one-opinion clip leads the second reviewer's queue, streams its audio, refuses an unproven second
-opinion with 428, lands a proven one exactly once at 750,000 micro-IQD for a 1,500 ms accept, and
-consumes the second reviewer's authority exactly once.
+**Codex's independent review (2026-09-04 23:54, `CODEX_REVIEW_BLOCKERS_20260904.md`, five P1s) and what
+closed each.** (1) The first cut consumed under a new namespace `pool` that the schema-67 CHECK refuses —
+no migration; the consumption is `independent`, and operation uniqueness across the pool and legacy
+independent tables is now part of the startup collision audit (`review_pool_decisions` and
+`review_pool_reversals` joined into the `independent_operations` CTE). (2) Reopening a database with a pool
+consumption failed the startup audit because its `independent` arm joined only
+`independent_review_decisions`: the arm now also accepts a `review_pool_decisions` row with the same
+operation id, clip and reviewer, `action<>'skip'`, and `served_revision` / `audio_content_hash` equal to the
+finalized session's — an orphaned consumption or one pointing at a skip fails reopen (negative fixtures
+pinned). (3) `restore_service/compensation.rs` gains the `couch_pool` credit branch (decision row, action,
+reviewer, clip, duration, served revision, canonical audio identity, retained segment identity, consumed
+policy-4 receipt+session+consumption, rate/delta/corrected arithmetic through the shared
+`validate_credit_arithmetic`) and the `couch_pool_undo` branch (exact inverse of the latest unreversed
+entry AND a matching `review_pool_reversals` row); every non-skip pool decision must hold exactly one
+credit. (4) The writer refuses to pay without proof (above); rollback tests cover missing proof, another
+reviewer's receipt, another clip's receipt, a receipt of a moved revision, a spent receipt after undo, and a
+failed credit insert — decision, credit and consumption all absent after each. Every fixture that plants
+a pool decision now mints a real finalized authority through `review_pool::mint_synthetic_playback_authority`
+(the production finalization: source lease, decoded-PCM identity, revision/span re-resolution under BEGIN
+IMMEDIATE), which required the pool fixtures to write REAL 16 kHz WAVs whose stored `audio_content_hash` is
+their true PCM hash (`clip_hash(seed)`) instead of `"a".repeat(64)` next to a 3-byte file; the
+`pool_admin benchmark-commit` worker (disposable clone, `--confirm-disposable`) mints the same way.
+(5) `check_review_compensation_readiness.py`: the flexible-pool branch no longer proves "deferred" pay on
+schema 65/66 (it declared every post-activation first-opinion credit illegal and had exited 1 on the live
+schema-69 library with 1,885 events); `audit_flexible_paid` is pinned to the exact deployed schema (69),
+walks the real ledger — one exact credit per post-cutoff first opinion and per non-skip pool opinion,
+consumed policy-4 listening behind every pool credit, a durable `review_pool_reversals` row behind every
+pool undo, exact contiguous settlements (shared `_audit_settlements`) — and the unpaid-work scanner links
+pool credits through `pool-decision:<id>` as well as the legacy shared operation id.
 
-**Measured after.** RESULTS_PLACEHOLDER
+**Pins.** `test_pool_pay_fence_scope_policy.py` re-pinned to the new contract (production routing, no
+`cfg(not(test))` refusal, mandatory authority, in-transaction re-verification and `independent` consumption,
+startup-audit pool linkage, restore pool/undo anchors, credit before commit, reversal on both undo paths,
+mirror gone, campaign still fenced). `test_check_review_compensation_readiness.py`: 44 pins, eight new for
+the paid flexible pool through the real CLI (first + second opinions pass; unpaid non-skip opinion,
+credit without consumed listening, credit paid twice, undo without its reversal row, tampered delta, wrong
+schema all exit 1; undo with its reversal row nets to zero with no unpaid-work warning).
+`docs/OWNER_CANON.md` carries the change. Rust (`review_pool`):
+`a_pool_second_opinion_is_paid_once_at_the_first_opinion_weight_and_undo_reverses_it`,
+`a_paid_pool_judgement_without_exact_playback_authority_writes_nothing`,
+`a_spent_pool_playback_authority_cannot_pay_twice_but_a_fresh_listen_can`,
+`a_paid_pool_judgement_survives_reopen_restore_validation_settlement_and_undo` (decide → validate →
+drop/reopen → settle 5,000,000 micro-IQD → validate → addressed undo → validate → drop/reopen; net zero,
+payout on the books), `a_forged_or_orphaned_pool_consumption_fails_the_startup_audit`; (`couch`)
+`a_second_reviewer_is_paid_for_a_proven_pool_opinion_after_a_real_canonical_accept`; `reviewer_serving_path`
+proves the one-opinion clip leads the second reviewer's queue, streams its audio, refuses an unproven second
+opinion with 428, lands a proven one exactly once at 750,000 micro-IQD for a 1,500 ms accept, consumes the
+second reviewer's authority exactly once under `independent`, and the server child restarts twice on that
+database (the startup audit accepts the pool consumption).
+
+**A hazard the integration test surfaced, and its fix.** With second opinions landing, the first reviewer's
+phone Undo of a clip another reviewer had since judged left a pool decision standing on an unverified clip,
+and `review_pool::load` (the check `couch::start`/`resume` runs) refused to START over that history —
+`reviewer_flow_survives_real_https_retries_and_restarts` died at its second restart with "review pool
+decision history is inconsistent with its frozen clip authority". That is the "pool row kills phone review
+on next build" blast radius again, this time reachable from a reviewer's thumb. Fix at the writer:
+`undo_human_decision_with_authority` (db/decisions.rs) refuses, inside its transaction, to reverse a first
+opinion whose clip holds an effective pool decision (`Conflict`, no mutation); the phone answers 409
+"another reviewer has since judged this clip — the first opinion can no longer be undone" (the desktop's
+existing conflict handling covers its path). Pinned in `couch::decisions` (Sara's undo after Hemn's paid
+second opinion → 409, nothing reversed, the pool still loads) and in the integration flow, which now seeds a
+third clip: the locked first opinion answers 409 before the restart, the restart-safe Undo and its
+lost-response replay target the third clip across two restarts, the locked first opinion stands, and the
+resolution summary shows the clip DECIDED by two different reviewers agreeing (resolved 1 of 3).
+
+**Measured after** (worktree `cortex-incident`, branch `feat/pool-second-opinion-pay` rebased on origin/main
+18fe5c72; `CARGO_TARGET_DIR=cortex-incident-target`): `cargo test --lib -- review_pool
+restore_service::compensation couch::decisions couch::tests db::core` 246 passed / 0 failed;
+`cargo test --bin pool_admin` 33 / 0; `cargo test --test reviewer_serving_path` 1 / 0 (helper 1 / 0);
+`cargo clippy --all-targets -- -D warnings` clean; `cargo fmt --check` clean; policy pins
+`test_pool_pay_fence_scope_policy`, `test_check_review_compensation_readiness` (44), `test_consensus_review_canon`,
+`test_couch_clock_policy`, `test_restore_reservation_gate`, `test_review_draft_authority_policy`,
+`test_coverage_attestation_policy` all PASS; `check_review_compensation_readiness.py` READ-ONLY against the live
+library (schema 69): exit 0, mode flexible-pool / paid, 1,954 post-cutoff first-opinion events, 1,955 ledger
+entries (1 reversal), 0 pool decisions, 0 collisions, 0 FK violations, 32,610,409,500 micro-IQD earned,
+5,571,381 ms corrected audio — the same command exited 1 on main. Full `cargo test --lib`: 2,626 passed / 0 failed / 8 ignored (1,257 s).
+Not yet measured: a real phone second opinion on the live library (none can exist before this ships).
 
 ## 2026-09-04 — Reviewer links and silent audio: the server forgets a playback attempt, the phone never lets go of it
 
