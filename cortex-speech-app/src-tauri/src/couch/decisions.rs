@@ -490,11 +490,11 @@ pub(super) fn api_independent_decision(
 /// Record a second-or-later pool judgement without mutating the canonical first answer. The queue
 /// always serves the raw OmniASR-7B draft in pool mode, keeping this observation independent from the
 /// correction already stored on `speech_segments`.
-#[cfg(test)]
 pub(super) fn api_pool_decision(
     db: &Database,
     parsed: &DecisionBody,
     reviewer: &str,
+    session_binding_sha256: &str,
     state: &Mutex<CouchState>,
     pool: &crate::review_pool::ReviewPool,
 ) -> Reply {
@@ -610,14 +610,21 @@ pub(super) fn api_pool_decision(
         }
         other => return err_reply(400, &format!("unknown action '{other}'")),
     };
-    if parsed.heard_ms.is_some_and(|value| value < 0) || parsed.clip_duration_ms.is_some_and(|value| value < 0) {
-        return err_reply(400, "playback counters must not be negative");
-    }
-
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    let (content_hash, source_span) = if action == "skip" {
-        (None, None)
+    // Same listening bar as the canonical path: a pool second opinion is paid like a first opinion
+    // (owner canon 2026-09-04), so it must carry the same policy-4 authority. The legacy heardMs
+    // counter this branch used to accept is refused with the same marker the canonical path emits.
+    let (content_hash, source_span, playback_proof) = if action == "skip" {
+        (None, None, None)
     } else {
+        if parsed.heard_ms.is_some() || parsed.clip_duration_ms.is_some() {
+            return err_reply(
+                428,
+                &format!(
+                    "E_NO_PLAYBACK_EVIDENCE: {LEGACY_RAW_COUNTER_REFUSAL_MARKER}; legacy playback counters cannot authorize a verdict"
+                ),
+            );
+        }
         let content_hash = match db.segment_audio_content_hash(&parsed.id) {
             Ok(Some(value)) => value,
             Ok(None) => return err_reply(503, "playback identity is unavailable for this clip"),
@@ -628,40 +635,36 @@ pub(super) fn api_pool_decision(
             Ok(None) => return err_reply(503, "playback source span is unavailable for this clip"),
             Err(error) => return err_reply(500, &format!("playback source-span lookup failed: {error}")),
         };
-        let Some(heard_ms) = parsed.heard_ms else {
-            return err_reply(428, "E_NO_PLAYBACK_EVIDENCE: listen to the clip before deciding");
+        let Some(playback_receipt_id) = parsed.playback_receipt_id.as_deref() else {
+            return err_reply(428, "E_NO_PLAYBACK_EVIDENCE: finalize this clip's playback attempt before deciding");
         };
-        let receipt = crate::db::PlaybackReceipt {
-            segment_id: parsed.id.clone(),
-            segment_revision: served_revision,
-            audio_content_hash: content_hash.clone(),
-            reviewer: Some(reviewer.to_string()),
-            session_id: None,
-            started_at_ms: now_ms,
-            played_ms: heard_ms,
-            clip_duration_ms: parsed.clip_duration_ms.unwrap_or(0),
-            source_start_ms: None,
-            source_end_ms: None,
-        };
-        match db.record_playback_receipt_if_at_revision(&receipt, served_revision) {
-            Ok(true) => {}
-            Ok(false) => return err_reply(409, "this clip changed since it was served — reload for the fresh draft"),
-            Err(error) => return err_reply(500, &format!("playback receipt not recorded: {error}")),
-        }
-        match db.has_sufficient_playback_evidence(&parsed.id, served_revision, &content_hash, Some(reviewer)) {
-            Ok(true) => {}
-            Ok(false) => {
+        let proof = match db.couch_playback_proof_v4(
+            &parsed.id,
+            served_revision,
+            &content_hash,
+            reviewer,
+            session_binding_sha256,
+            playback_receipt_id,
+        ) {
+            Ok(Some(proof)) => proof,
+            Ok(None) => {
                 return err_reply(
                     428,
-                    &db.require_playback_evidence(&parsed.id, served_revision, &content_hash, Some(reviewer))
-                        .err()
-                        .map(|error| error.to_string())
-                        .unwrap_or_else(|| "E_NO_PLAYBACK_EVIDENCE".to_string()),
+                    "E_NO_PLAYBACK_EVIDENCE: playback authority does not match this reviewer, session, clip, or revision",
                 );
             }
-            Err(error) => return err_reply(500, &format!("playback evidence check failed: {error}")),
-        }
-        (Some(content_hash), Some(source_span))
+            Err(error) => return playback_error_reply(&error.to_string()),
+        };
+        (Some(content_hash), Some(source_span), Some(proof))
+    };
+    let playback_authority_session_id = match playback_proof.as_ref() {
+        None => None,
+        Some(proof) => match proof.authority_session_id.as_deref() {
+            Some(authority) => Some(authority),
+            None => {
+                return err_reply(428, "E_NO_PLAYBACK_EVIDENCE: pool verdicts require one exact policy-4 authority")
+            }
+        },
     };
 
     {
@@ -690,6 +693,7 @@ pub(super) fn api_pool_decision(
         operation_id,
         operation_payload_hash: &operation_payload_hash,
         created_at_ms: now_ms,
+        playback_authority_session_id,
     };
     let committed = crate::review_pool::record_decision(db, pool, &input);
     lock_state(state).in_flight_operations.remove(operation_id);
@@ -784,26 +788,20 @@ pub(super) fn api_decision_authenticated(
             Ok(None) => false,
             Err(error) => return err_reply(500, &error.to_string()),
         };
-        if pool_replay || already_canonical {
-            // ONLY this branch is refused in production. A pool observation is a SECOND judgement on a
-            // clip that already carries a canonical human answer, and `review_pool::record_decision`
-            // never writes `review_compensation_ledger` — serving it would take playback-evidenced work
-            // for free, so it fails closed until an owner-approved pool pay contract exists.
-            //
-            // The refusal used to sit at `is_some()`, before this routing ran, and `couch::start` had a
-            // matching one. Together they killed ALL phone review whenever a pool row existed — and the
-            // live library carries one permanently — including the FIRST-pass path below, which is fully
-            // paid under review-iqd-v1-2026-08-21 and is the only path any reviewer is actually using.
-            #[cfg(test)]
-            return api_pool_decision(db, &parsed, reviewer, state, pool);
-            #[cfg(not(test))]
-            {
-                let _ = pool;
-                return err_reply(
-                    503,
-                    &format!("{PAY_POLICY_REQUIRED}: external flexible-pool decisions are disabled"),
-                );
-            }
+        // A lost-response replay of a CANONICAL decision arrives after its own commit made the clip
+        // already-canonical. It belongs to the canonical path below, which acknowledges it as a
+        // duplicate; diverting it here would answer 409 and the phone would report a saved
+        // decision as "could not be saved".
+        let canonical_replay = match parsed.operation_id.as_deref().map(|id| db.review_operation(id)).transpose() {
+            Ok(receipt) => receipt.flatten().is_some(),
+            Err(error) => return err_reply(500, &format!("operation receipt lookup failed: {error}")),
+        };
+        if (pool_replay || already_canonical) && !canonical_replay {
+            // A pool observation is a SECOND judgement on a clip that already carries a canonical
+            // human answer. Owner canon 2026-09-04 prices it at the first-opinion weights, and
+            // `review_pool::record_decision` mints that credit in its own transaction, so the
+            // PAY_POLICY_REQUIRED fence that used to stand here (and its queue mirror) is retired.
+            return api_pool_decision(db, &parsed, reviewer, session_binding_sha256, state, pool);
         }
     }
     let early_campaign = match active_campaign_policy(db, reviewer, state) {
@@ -1809,6 +1807,21 @@ pub(super) fn api_undo_with_body(db: &Database, body: &[u8], reviewer: &str, sta
         HumanDecisionUndoOutcome::AlreadyApplied { segment, .. } => (segment, None),
         HumanDecisionUndoOutcome::Conflict { segment } => {
             retain_phone_undo_token(state, reviewer, insertion_index, entry);
+            let second_opinions: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM effective_review_pool_decisions_v62
+                      WHERE segment_id = ?1 AND action <> 'skip'",
+                    [&segment.id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if second_opinions > 0 {
+                return err_reply(
+                    409,
+                    "another reviewer has since judged this clip — the first opinion can no longer be undone",
+                );
+            }
             let owner = segment.reviewed_by.clone();
             return match owner {
                 Some(other) if !other.eq_ignore_ascii_case(reviewer) => {
@@ -2916,7 +2929,8 @@ mod tests {
         value: serde_json::Value,
     ) -> (u16, String) {
         let body = pool_body(value);
-        let (code, _, reply, _) = api_pool_decision(db, &body, reviewer, st, pool);
+        let (code, _, reply, _) =
+            api_pool_decision(db, &body, reviewer, &couch_session_binding_sha256("couch-test-session"), st, pool);
         (code, String::from_utf8(reply).unwrap())
     }
 
@@ -3110,7 +3124,17 @@ mod tests {
                 "heardMs": -1,
             }),
         );
-        assert_eq!((code, body.as_str()), (400, "playback counters must not be negative"));
+        assert_eq!(
+            (code, body.as_str()),
+            (
+                428,
+                format!(
+                    "E_NO_PLAYBACK_EVIDENCE: {LEGACY_RAW_COUNTER_REFUSAL_MARKER}; legacy playback counters cannot authorize a verdict"
+                )
+                .as_str()
+            ),
+            "a pool second opinion refuses legacy counters exactly like a first opinion"
+        );
         let (code, body) = pool_decide(
             &db,
             &st,
@@ -3124,11 +3148,172 @@ mod tests {
                 "rowVersion": current,
             }),
         );
-        assert_eq!((code, body.as_str()), (428, "E_NO_PLAYBACK_EVIDENCE: listen to the clip before deciding"));
+        assert_eq!(
+            (code, body.as_str()),
+            (428, "E_NO_PLAYBACK_EVIDENCE: finalize this clip's playback attempt before deciding")
+        );
 
         assert_eq!(pool_decisions(), 0, "every refusal above must leave the observation table empty");
         let untouched = row(&db, "in-pool");
         assert!(!untouched.verified && untouched.human_decision.is_none(), "the canonical row is never mutated");
+    }
+
+    /// Owner canon 2026-09-04: pool second opinions are paid at first-opinion weights, so the fence
+    /// that used to answer 503 here is gone. This is the integration flow in miniature — a REAL canonical
+    /// accept through `api_decision`, then a different reviewer's proven second opinion through the same
+    /// routed entry point — and it pins the money: one `couch_pool` credit at the accept weight.
+    #[test]
+    fn a_second_reviewer_is_paid_for_a_proven_pool_opinion_after_a_real_canonical_accept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, pool) = pool_fixture(tmp.path());
+        let st = Mutex::new(CouchState { pool_policy: Some(pool.clone()), ..CouchState::default() });
+        lock_state(&st).served_work.insert(("in-pool".into(), "Sara".into()));
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa51",
+                "id": "in-pool",
+                "action": "accept",
+                "text": "دەقی چامپیۆن",
+                "rowVersion": stamp(&db, "in-pool"),
+                "playbackReceiptId": policy4_receipt(&db, "Sara", "in-pool"),
+            }),
+        );
+        assert_eq!(code, 200, "the first opinion lands on the paid canonical path: {body}");
+        let canonical = row(&db, "in-pool");
+        assert!(canonical.verified && canonical.human_decision.is_some(), "the clip is now already-canonical");
+
+        lock_state(&st).served_work.insert(("in-pool".into(), "Hemn".into()));
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Hemn",
+            &serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa52",
+                "id": "in-pool",
+                "action": "accept",
+                "text": "دەقی چامپیۆن",
+                "rowVersion": stamp(&db, "in-pool"),
+                "playbackReceiptId": policy4_receipt(&db, "Hemn", "in-pool"),
+            }),
+        );
+        assert_eq!(code, 200, "a proven second opinion by a different reviewer must land: {body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(reply["poolDecisionId"].is_i64(), "the second opinion is a durable pool decision: {body}");
+        let (source, bps, delta): (String, i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT source, rate_basis_points, delta_micro_iqd FROM review_compensation_ledger
+                  WHERE reviewer='Hemn' COLLATE NOCASE",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("exactly one credit for the second opinion");
+        assert_eq!(
+            (source.as_str(), bps),
+            ("couch_pool", 1_000),
+            "an unchanged accept earns 10%, same as a first opinion"
+        );
+        // 1,500 ms at 18,000 IQD/h = 7,500,000 micro-IQD; 10% of it is 750,000.
+        assert_eq!(delta, 750_000);
+
+        // The first opinion now carries another reviewer's paid work, and the pool refuses to start over
+        // a pool decision on an unverified clip: Sara's Undo is refused without mutation, and the pool
+        // still loads over this history.
+        let (code, body) = undo_raw(&db, &st, "Sara", &[]);
+        assert_eq!(code, 409, "a first opinion another reviewer has judged cannot be undone: {body}");
+        assert!(body.contains("can no longer be undone"), "{body}");
+        let canonical = row(&db, "in-pool");
+        assert!(canonical.verified && canonical.human_decision.is_some(), "the refused undo mutates nothing");
+        let reversals: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM human_decision_effect_reversals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(reversals, 0, "a refused undo writes no reversal");
+        crate::review_pool::load(&db).unwrap().expect("the pool still starts over this history");
+    }
+
+    #[test]
+    fn a_pool_skip_does_not_lock_the_first_reviewers_undo() {
+        assert_first_opinion_undo_after_no_remaining_pool_judgement("skip");
+    }
+
+    #[test]
+    fn an_undone_pool_judgement_does_not_lock_the_first_reviewers_undo() {
+        assert_first_opinion_undo_after_no_remaining_pool_judgement("accept");
+    }
+
+    fn assert_first_opinion_undo_after_no_remaining_pool_judgement(second_action: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, pool) = pool_fixture(tmp.path());
+        let st = Mutex::new(CouchState { pool_policy: Some(pool), ..CouchState::default() });
+        lock_state(&st).served_work.insert(("in-pool".into(), "Sara".into()));
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa61",
+                "id": "in-pool", "action": "accept", "text": "دەقی چامپیۆن",
+                "rowVersion": stamp(&db, "in-pool"),
+                "playbackReceiptId": policy4_receipt(&db, "Sara", "in-pool"),
+            }),
+        );
+        assert_eq!(code, 200, "first judgement: {body}");
+        lock_state(&st).served_work.insert(("in-pool".into(), "Hemn".into()));
+        let second_operation = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa62";
+        let mut request = serde_json::json!({
+            "operationId": second_operation,
+            "id": "in-pool", "action": second_action,
+            "text": if second_action == "skip" { "" } else { "دەقی چامپیۆن" },
+            "rowVersion": stamp(&db, "in-pool"),
+        });
+        if second_action != "skip" {
+            request["playbackReceiptId"] = serde_json::json!(policy4_receipt(&db, "Hemn", "in-pool"));
+        }
+        let (code, body) = decide(&db, &st, "Hemn", &request);
+        assert_eq!(code, 200, "second reviewer {second_action}: {body}");
+        if second_action != "skip" {
+            let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let target = serde_json::json!({
+                "poolDecisionId": response["poolDecisionId"].as_i64().unwrap().to_string(),
+                "decisionOperationId": second_operation,
+                "reversalOperationId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbb63",
+            });
+            let (code, body) = undo_raw(&db, &st, "Hemn", target.to_string().as_bytes());
+            assert_eq!(code, 200, "second opinion must first be undone: {body}");
+        }
+        let effective_judgements: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM effective_review_pool_decisions_v62 WHERE action <> 'skip'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(effective_judgements, 0);
+        let (code, body) = undo_raw(&db, &st, "Sara", &[]);
+        assert_eq!(code, 200, "no other effective judgement may lock the first opinion: {body}");
+        let canonical = row(&db, "in-pool");
+        assert!(!canonical.verified && canonical.human_decision.is_none());
+        db.initialize().expect("canonical undo must leave a valid startup state");
+        crate::review_pool::load(&db).unwrap().expect("unpaid skips and reversed judgements cannot break pool startup");
+        crate::restore_service::validate_review_compensation_semantics(&db).unwrap();
+        if second_action == "skip" {
+            assert!(
+                crate::review_pool::reviewer_already_saw(&db, "in-pool", "Hemn").unwrap(),
+                "allowing canonical undo must not erase the other reviewer's skip history"
+            );
+            let credits: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM review_compensation_ledger WHERE reviewer='Hemn' COLLATE NOCASE",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(credits, 0, "a skipped clip earns no credit");
+        }
     }
 
     #[test]
@@ -3174,6 +3359,7 @@ mod tests {
                 operation_id: planted_op,
                 operation_payload_hash: &planted_hash,
                 created_at_ms: 1_700_000_000_000,
+                playback_authority_session_id: Some(&policy4_receipt(&db, "Sara", "in-pool")),
             },
         )
         .unwrap()
@@ -3213,7 +3399,7 @@ mod tests {
                 "action": "accept",
                 "text": "دەقی چامپیۆن",
                 "rowVersion": stamp(&db, "in-pool"),
-                "heardMs": 1500,
+                "playbackReceiptId": policy4_receipt(&db, "Sara", "in-pool"),
             }),
         );
         assert_eq!((code, body.as_str()), (409, "you already reviewed this clip — reload for another one"));
@@ -3524,7 +3710,14 @@ mod tests {
             "text": "دەقی چامپیۆن",
             "rowVersion": stamp(&pooled, "in-pool"),
         }));
-        let (code, _, reply, _) = api_pool_decision(&pooled, &parsed, "Sara", &bound_pool, &drifted);
+        let (code, _, reply, _) = api_pool_decision(
+            &pooled,
+            &parsed,
+            "Sara",
+            &couch_session_binding_sha256("couch-test-session"),
+            &bound_pool,
+            &drifted,
+        );
         let reply = String::from_utf8(reply).unwrap();
         assert_eq!((code, reply.as_str()), (503, "review pool changed while this decision was being checked"));
 
@@ -3538,7 +3731,14 @@ mod tests {
             "text": "دەقی چامپیۆن",
             "rowVersion": stamp(&plain, "in-pool"),
         }));
-        let (code, _, reply, _) = api_pool_decision(&plain, &parsed, "Sara", &unbound, &pool);
+        let (code, _, reply, _) = api_pool_decision(
+            &plain,
+            &parsed,
+            "Sara",
+            &couch_session_binding_sha256("couch-test-session"),
+            &unbound,
+            &pool,
+        );
         let reply = String::from_utf8(reply).unwrap();
         assert_eq!((code, reply.as_str()), (503, "review pool is no longer active"));
     }
@@ -3569,7 +3769,7 @@ mod tests {
                 "action": "accept",
                 "text": "دەقی چامپیۆن",
                 "rowVersion": stamp(&db, "in-pool"),
-                "heardMs": 1500,
+                "playbackReceiptId": policy4_receipt(&db, "Sara", "in-pool"),
             }),
         );
         assert_eq!((code, body.as_str()), (409, "this clip changed while the decision was being saved — reload"));
@@ -3588,7 +3788,7 @@ mod tests {
                 "action": "accept",
                 "text": "دەقی چامپیۆن",
                 "rowVersion": stamp(&db, "in-pool"),
-                "heardMs": 1500,
+                "playbackReceiptId": policy4_receipt(&db, "Sara", "in-pool"),
             }),
         );
         assert_eq!((code, body.as_str()), (409, "another reviewer is working on this clip"));
@@ -3607,7 +3807,7 @@ mod tests {
                 "action": "accept",
                 "text": "دەقی چامپیۆن",
                 "rowVersion": stamp(&db, "in-pool"),
-                "heardMs": 1500,
+                "playbackReceiptId": policy4_receipt(&db, "Sara", "in-pool"),
             }),
         );
         assert_eq!((code, body.as_str()), (503, "this operation is still being saved — retrying is safe"));
@@ -3645,6 +3845,7 @@ mod tests {
                 operation_id: planted_op,
                 operation_payload_hash: &planted_hash,
                 created_at_ms: 1_700_000_000_000,
+                playback_authority_session_id: Some(&policy4_receipt(&db, "Sara", "in-pool")),
             },
         )
         .unwrap()
@@ -3707,7 +3908,7 @@ mod tests {
                 "action": "accept",
                 "text": "دەقی چامپیۆن",
                 "rowVersion": stamp(&db, "in-pool"),
-                "heardMs": 1500,
+                "playbackReceiptId": policy4_receipt(&db, "Nechir", "in-pool"),
             }),
         );
         assert_eq!(code, 500, "{body}");
@@ -3750,7 +3951,7 @@ mod tests {
                 "action": "accept",
                 "text": "دەقی چامپیۆن",
                 "rowVersion": stamp(&db, "in-pool"),
-                "heardMs": 1500,
+                "playbackReceiptId": policy4_receipt(&db, "Sara", "in-pool"),
             }),
         );
         assert_eq!(code, 200, "{body}");

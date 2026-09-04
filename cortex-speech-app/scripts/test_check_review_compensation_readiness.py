@@ -247,35 +247,158 @@ class CompensationReadinessGateTests(unittest.TestCase):
         )
         return completed.returncode, json.loads(completed.stdout)
 
-    def activate_flexible_pool(self, *, created_at: str = "2026-08-24 08:00:00") -> None:
+    POOL_ID = "123e4567-e89b-42d3-a456-426614174000"
+
+    def activate_flexible_pool(self, *, schema_version: int = 69) -> None:
+        """A live flexible pool on the exact deployed schema, with the policy-4 evidence tables the
+        paid audit joins (sessions, receipts, consumptions) mirrored at the columns it reads."""
         connection = sqlite3.connect(self.db)
         connection.executescript(
-            """
-            INSERT INTO schema_migrations VALUES (63, 'flexible pool fixture');
-            INSERT INTO schema_migrations VALUES (64, 'dedup fixture');
-            INSERT INTO schema_migrations VALUES (65, 'rights-lineage fixture');
+            f"""
+            INSERT INTO schema_migrations VALUES ({schema_version}, 'flexible pool fixture');
             CREATE TABLE review_pool_registry(
                 singleton_key INTEGER, pool_id TEXT, focus_segment_count INTEGER,
                 focus_sha256 TEXT, created_at TEXT
             );
             CREATE TABLE review_pool_members(pool_id TEXT, segment_id TEXT);
-            CREATE TABLE review_pool_decisions(id INTEGER, operation_id TEXT);
-            CREATE TABLE review_pool_reversals(id INTEGER);
-            INSERT INTO review_pool_members VALUES
-                ('123e4567-e89b-42d3-a456-426614174000', 's1');
+            CREATE TABLE review_pool_decisions(
+                id INTEGER PRIMARY KEY, pool_id TEXT NOT NULL, segment_id TEXT NOT NULL,
+                reviewer TEXT NOT NULL, action TEXT NOT NULL, served_revision INTEGER NOT NULL,
+                audio_content_hash TEXT, source_start_ms INTEGER, source_end_ms INTEGER,
+                duration_ms INTEGER NOT NULL, operation_id TEXT NOT NULL UNIQUE,
+                playback_guard_version TEXT NOT NULL DEFAULT 'content-hash-raw-counter-v3'
+            );
+            CREATE TABLE review_pool_reversals(
+                id INTEGER PRIMARY KEY, decision_id INTEGER NOT NULL UNIQUE,
+                operation_id TEXT NOT NULL UNIQUE, reviewer TEXT NOT NULL
+            );
+            CREATE TABLE desktop_playback_sessions_v4(
+                playback_receipt_id TEXT PRIMARY KEY, surface TEXT NOT NULL, reviewer TEXT,
+                segment_id TEXT NOT NULL, segment_revision INTEGER NOT NULL, audio_content_hash TEXT NOT NULL
+            );
+            CREATE TABLE playback_receipts(
+                id INTEGER PRIMARY KEY, segment_id TEXT NOT NULL, segment_revision INTEGER NOT NULL,
+                audio_fingerprint TEXT NOT NULL, reviewer TEXT, authority_session_id TEXT,
+                policy_version INTEGER NOT NULL, coverage_ratio REAL NOT NULL,
+                clip_duration_ms INTEGER NOT NULL, source_start_ms INTEGER, source_end_ms INTEGER
+            );
+            CREATE TABLE playback_authority_consumptions_v4(
+                playback_receipt_id TEXT PRIMARY KEY, namespace TEXT NOT NULL,
+                operation_id TEXT NOT NULL UNIQUE, reviewer TEXT NOT NULL, segment_id TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            INSERT INTO review_pool_members VALUES ('{self.POOL_ID}', 's1');
             """
         )
         connection.execute(
-            "INSERT INTO review_pool_registry VALUES (1, ?, 1, ?, ?)",
-            (
-                "123e4567-e89b-42d3-a456-426614174000",
-                "a" * 64,
-                created_at,
-            ),
+            "INSERT INTO review_pool_registry VALUES (1, ?, 1, ?, '2026-08-24 08:00:00')",
+            (self.POOL_ID, "a" * 64),
         )
         connection.commit()
         connection.close()
         (self.root / "review_pilot_policy.json").unlink()
+
+    def insert_paid_pool_opinion(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        decision_id: int,
+        reviewer: str = "Alle",
+        action: str = "edit",
+        credit: bool = True,
+        listened: bool = True,
+    ) -> str:
+        """One pool second opinion on s1 exactly as the app records it: the immutable decision, the
+        reviewer's consumed policy-4 listening (session + receipt + `independent` consumption bound to
+        the decision's operation id) and its single `couch_pool` credit. Returns the operation id."""
+        operation_id = f"{decision_id:08x}-aaaa-4aaa-8aaa-{decision_id:012x}"
+        receipt_id = f"{decision_id:08x}-bbbb-4bbb-8bbb-{decision_id:012x}"
+        audio_hash = "a" * 64
+        connection.execute(
+            """INSERT INTO review_pool_decisions
+                   (id, pool_id, segment_id, reviewer, action, served_revision, audio_content_hash,
+                    source_start_ms, source_end_ms, duration_ms, operation_id)
+                 VALUES (?, ?, 's1', ?, ?, 1, ?, 0, 1000, 1000, ?)""",
+            (decision_id, self.POOL_ID, reviewer, action, audio_hash, operation_id),
+        )
+        if listened:
+            connection.execute(
+                "INSERT INTO desktop_playback_sessions_v4 VALUES (?, 'couch', ?, 's1', 1, ?)",
+                (receipt_id, reviewer, audio_hash),
+            )
+            connection.execute(
+                """INSERT INTO playback_receipts
+                       (segment_id, segment_revision, audio_fingerprint, reviewer, authority_session_id,
+                        policy_version, coverage_ratio, clip_duration_ms, source_start_ms, source_end_ms)
+                     VALUES ('s1', 1, ?, ?, ?, 4, 1.0, 1000, 0, 1000)""",
+                (audio_hash, reviewer, receipt_id),
+            )
+            connection.execute(
+                """INSERT INTO playback_authority_consumptions_v4
+                     VALUES (?, 'independent', ?, ?, 's1', 1700000000000)""",
+                (receipt_id, operation_id, reviewer),
+            )
+        if credit and action != "skip":
+            basis_points = 10_000 if action == "edit" else 1_000
+            entitlement = 5_000_000 if action == "edit" else 500_000
+            corrected = 1000 if action == "edit" else 0
+            connection.execute(
+                """INSERT INTO review_compensation_ledger
+                       (id, entry_id, entry_key, policy_version, review_event_id,
+                        canonical_work_id, canonical_identity_kind, reviewer, segment_id, source,
+                        compensation_action, effective_decision, decision_revision, duration_ms,
+                        rate_basis_points, entitlement_micro_iqd, delta_micro_iqd,
+                        corrected_entitlement_ms, delta_corrected_ms, reverses_entry_id)
+                     VALUES (?, ?, ?, 'review-iqd-v1-2026-08-21', NULL, ?,
+                             'audio_content_hash+source_span', ?, 's1', 'couch_pool', ?, ?, 1, 1000,
+                             ?, ?, ?, ?, ?, NULL)""",
+                (
+                    100 + decision_id,
+                    f"pool-entry-{decision_id}",
+                    f"pool-decision:{decision_id}",
+                    f"reviewer-work-v1:{len(reviewer.lower())}:{reviewer.lower()}:audio-segment-v1:{audio_hash}:0:1000",
+                    reviewer,
+                    action,
+                    action,
+                    basis_points,
+                    entitlement,
+                    entitlement,
+                    corrected,
+                    corrected,
+                ),
+            )
+        return operation_id
+
+    def append_pool_undo(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        decision_id: int,
+        reversal_operation_id: str,
+        with_reversal_row: bool = True,
+    ) -> None:
+        """The signed inverse the app appends when a pool opinion is undone, plus (normally) the durable
+        review_pool_reversals row the undo settles."""
+        connection.execute(
+            """INSERT INTO review_compensation_ledger
+                   (id, entry_id, entry_key, policy_version, review_event_id,
+                    canonical_work_id, canonical_identity_kind, reviewer, segment_id, source,
+                    compensation_action, effective_decision, decision_revision, duration_ms,
+                    rate_basis_points, entitlement_micro_iqd, delta_micro_iqd,
+                    corrected_entitlement_ms, delta_corrected_ms, reverses_entry_id)
+                 SELECT 200 + ?, 'pool-undo-' || ?, 'undo:' || ?, policy_version, NULL,
+                        canonical_work_id, canonical_identity_kind, reviewer, segment_id,
+                        'couch_pool_undo', 'undo', 'undo', decision_revision, duration_ms,
+                        0, 0, -delta_micro_iqd, 0, -delta_corrected_ms, entry_id
+                   FROM review_compensation_ledger WHERE entry_key = 'pool-decision:' || ?""",
+            (decision_id, decision_id, reversal_operation_id, decision_id),
+        )
+        if with_reversal_row:
+            connection.execute(
+                "INSERT INTO review_pool_reversals (decision_id, operation_id, reviewer) "
+                "SELECT ?, ?, reviewer FROM review_pool_decisions WHERE id = ?",
+                (decision_id, reversal_operation_id, decision_id),
+            )
 
     def rewrite_all_durations(self, duration_ms: int) -> None:
         """Keep every pay artifact internally consistent while changing the server denominator."""
@@ -1057,22 +1180,155 @@ class CompensationReadinessGateTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertTrue(any("duplicate canonical pay identities" in error for error in report["errors"]), report)
 
-    def test_flexible_pool_proves_deferred_compensation_without_legacy_pilot(self):
+    # ── flexible pool: PAID second opinions (owner canon 2026-09-04), audited through the real CLI ──
+
+    def test_flexible_pool_pays_first_and_second_opinions_through_the_real_cli(self):
         self.activate_flexible_pool()
+        connection = sqlite3.connect(self.db)
+        self.insert_paid_pool_opinion(connection, decision_id=1)  # Alle edit: 5,000,000
+        self.insert_paid_pool_opinion(connection, decision_id=2, reviewer="Sewa", action="accept")  # 500,000
+        self.insert_paid_pool_opinion(connection, decision_id=3, reviewer="Roza", action="skip")  # unpaid
+        connection.commit()
+        connection.close()
+
         code, report = self.run_gate()
+
         self.assertEqual(code, 0, report)
         self.assertTrue(report["ok"], report)
         self.assertEqual(report["mode"], "flexible-pool")
-        self.assertEqual(report["compensationOperationalStatus"], "deferred")
-        self.assertEqual(report["postPoolLegacyReviewEvents"], 0)
-        self.assertEqual(report["postPoolLegacyLedgerEntries"], 0)
+        self.assertEqual(report["compensationOperationalStatus"], "paid")
+        self.assertEqual(report["schemaVersion"], 69)
+        # Rubar's canonical first opinion (fixture event 1) and both paid pool opinions.
+        self.assertEqual(report["postCutoffEvents"], 1)
+        self.assertEqual(report["paidPoolDecisions"], 2)
+        self.assertEqual(report["poolDecisionCredits"], 2)
+        self.assertEqual(report["totalEarnedMicroIqd"], 5_000_000 + 5_000_000 + 500_000)
+        self.assertEqual(report["correctedAudioMs"], 2000)
+        self.assertEqual(report["warnings"], [])
 
-    def test_flexible_pool_refuses_legacy_pay_events_after_activation(self):
-        self.activate_flexible_pool(created_at="2026-08-21 00:00:00")
+    def test_flexible_pool_refuses_an_unpaid_non_skip_pool_opinion(self):
+        self.activate_flexible_pool()
+        connection = sqlite3.connect(self.db)
+        self.insert_paid_pool_opinion(connection, decision_id=1, credit=False)
+        connection.commit()
+        connection.close()
+
         code, report = self.run_gate()
-        self.assertEqual(code, 1)
-        self.assertTrue(any("legacy paid-review event" in error for error in report["errors"]), report)
-        self.assertTrue(any("legacy compensation" in error for error in report["errors"]), report)
+
+        self.assertEqual(code, 1, report)
+        self.assertTrue(
+            any("pool decision 1 (edit) has 0 ledger credits; required exactly one" in error for error in report["errors"]),
+            report,
+        )
+        self.assertTrue(any("UNPAID WORK" in warning for warning in report["warnings"]), report)
+
+    def test_flexible_pool_refuses_a_pool_credit_without_consumed_listening(self):
+        self.activate_flexible_pool()
+        connection = sqlite3.connect(self.db)
+        self.insert_paid_pool_opinion(connection, decision_id=1, listened=False)
+        connection.commit()
+        connection.close()
+
+        code, report = self.run_gate()
+
+        self.assertEqual(code, 1, report)
+        self.assertTrue(
+            any("has no exact consumed policy-4 playback authority" in error for error in report["errors"]), report
+        )
+
+    def test_flexible_pool_refuses_a_pool_credit_paid_twice(self):
+        self.activate_flexible_pool()
+        connection = sqlite3.connect(self.db)
+        self.insert_paid_pool_opinion(connection, decision_id=1)
+        connection.execute(
+            """INSERT INTO review_compensation_ledger
+                 SELECT id + 50, entry_id || '-dup', entry_key, policy_version, review_event_id,
+                        canonical_work_id, canonical_identity_kind, reviewer, segment_id, source,
+                        compensation_action, effective_decision, decision_revision, duration_ms,
+                        rate_basis_points, entitlement_micro_iqd, delta_micro_iqd,
+                        corrected_entitlement_ms, delta_corrected_ms, created_at, reverses_entry_id
+                   FROM review_compensation_ledger WHERE entry_key = 'pool-decision:1'"""
+        )
+        connection.commit()
+        connection.close()
+
+        code, report = self.run_gate()
+
+        self.assertEqual(code, 1, report)
+        self.assertTrue(
+            any("pool decision 1 (edit) has 2 ledger credits; required exactly one" in error for error in report["errors"]),
+            report,
+        )
+
+    def test_flexible_pool_undo_must_settle_its_durable_reversal(self):
+        self.activate_flexible_pool()
+        connection = sqlite3.connect(self.db)
+        self.insert_paid_pool_opinion(connection, decision_id=1)
+        self.append_pool_undo(
+            connection,
+            decision_id=1,
+            reversal_operation_id="99999999-9999-4999-8999-999999999999",
+            with_reversal_row=False,
+        )
+        connection.commit()
+        connection.close()
+
+        code, report = self.run_gate()
+
+        self.assertEqual(code, 1, report)
+        self.assertTrue(
+            any("does not name the durable pool reversal it settles" in error for error in report["errors"]), report
+        )
+
+    def test_flexible_pool_undo_with_its_reversal_row_nets_to_zero(self):
+        self.activate_flexible_pool()
+        connection = sqlite3.connect(self.db)
+        self.insert_paid_pool_opinion(connection, decision_id=1)
+        self.append_pool_undo(
+            connection, decision_id=1, reversal_operation_id="99999999-9999-4999-8999-999999999999"
+        )
+        connection.commit()
+        connection.close()
+
+        code, report = self.run_gate()
+
+        self.assertEqual(code, 0, report)
+        self.assertEqual(report["reversalEntries"], 1)
+        self.assertEqual(report["poolDecisionCredits"], 1)
+        # Only Rubar's first opinion remains earned; the undone second opinion nets to zero.
+        self.assertEqual(report["totalEarnedMicroIqd"], 5_000_000)
+        self.assertEqual(report["warnings"], [], "an undone pool opinion is not unpaid work")
+
+    def test_flexible_pool_refuses_tampered_pool_credit_math(self):
+        self.activate_flexible_pool()
+        connection = sqlite3.connect(self.db)
+        self.insert_paid_pool_opinion(connection, decision_id=1)
+        connection.execute("DROP TRIGGER review_compensation_ledger_immutable_update")
+        connection.execute(
+            "UPDATE review_compensation_ledger SET delta_micro_iqd = delta_micro_iqd + 1 WHERE entry_key = 'pool-decision:1'"
+        )
+        connection.execute(
+            "CREATE TRIGGER review_compensation_ledger_immutable_update "
+            "BEFORE UPDATE ON review_compensation_ledger "
+            "BEGIN SELECT RAISE(ABORT, 'immutable'); END"
+        )
+        connection.commit()
+        connection.close()
+
+        code, report = self.run_gate()
+
+        self.assertEqual(code, 1, report)
+        self.assertTrue(any("ledger delta mismatch at pool-entry-1" in error for error in report["errors"]), report)
+
+    def test_flexible_pool_requires_the_exact_current_schema(self):
+        self.activate_flexible_pool(schema_version=68)
+
+        code, report = self.run_gate()
+
+        self.assertEqual(code, 1, report)
+        self.assertTrue(
+            any("requires exact schema (69,), found 68" in error for error in report["errors"]), report
+        )
 
     def test_verify_10_runs_live_compensation_readiness_without_a_skip_probe(self):
         """The master release verdict must not ignore a stale or corrupt live pay database."""

@@ -7,10 +7,12 @@ effective post-cutoff event, append-only triggers, durable schema-v60 hidden-key
 24-action pilot ceiling, signed re-decision/reversal arithmetic, and canonical audio identity for
 every focused clip.
 
-Flexible schema-65 pool compensation is operationally deferred by owner canon. In that mode the gate
-does not invent pay: it proves the legacy pilot is absent, the immutable legacy policy/schema remain
-intact, and no flexible-pool decision has leaked into the legacy review-event or compensation ledger
-namespace. A source migration or a green boolean alone is never accepted as live evidence.
+In flexible-pool mode (owner canon 2026-09-04: pool second opinions are paid at the first-opinion
+weights) the gate audits the real ledger fail-closed on the exact current schema: every post-cutoff
+first opinion and every non-skip pool opinion carries exactly one exact credit, every pool credit its
+consumed policy-4 listening authority, every undo its durable reversal, every settlement its exact
+contiguous ledger range. A source migration or a green boolean alone is never accepted as live
+evidence.
 """
 
 from __future__ import annotations
@@ -48,6 +50,13 @@ from review_pilot_hidden_contract import (
 POLICY_VERSION = COMPENSATION_POLICY_VERSION
 BASE_RATE_MICRO_IQD_PER_HOUR = 18_000_000_000
 BASIS_POINTS = {"edit": 10_000, "accept": 1_000, "reject": 1_000, "skip": 0}
+# The flexible paid audit reads schema-specific evidence tables (policy-4 sessions/receipts/consumptions,
+# pool decisions/reversals) and is pinned to the exact deployed schema on purpose: a migration must
+# re-earn this gate, never inherit it.
+FLEXIBLE_PAID_SCHEMA_VERSIONS = (69,)
+# Mirrors src-tauri/src/db/core.rs MIN_PLAYBACK_COVERAGE / DESKTOP_PLAYBACK_POLICY_VERSION.
+MIN_PLAYBACK_COVERAGE = 0.85
+COUCH_PLAYBACK_POLICY_VERSION = 4
 REQUIRED_TRIGGERS = {
     "review_event_operation_validate_insert",
     "review_event_operation_immutable_update",
@@ -80,9 +89,23 @@ REQUIRED_TRIGGERS = {
 # balance with no sign of it.  Every entry is (table, its reversal table); the effective row set is
 # the decision minus its reversal, exactly as effective_review_pool_decisions_v62 /
 # effective_independent_review_decisions_v61 define it.
+# The third element is the SQL predicate (over aliases `ledger` and `decision`) that links a credit to
+# the decision. Pool credits are keyed `pool-decision:<id>` with source `couch_pool` (owner canon
+# 2026-09-04); the legacy shared-operation-id link stays recognised so history is never re-flagged.
 UNPAID_DECISION_TABLES = (
-    ("review_pool_decisions", "review_pool_reversals"),
-    ("independent_review_decisions", "independent_review_reversals"),
+    (
+        "review_pool_decisions",
+        "review_pool_reversals",
+        "(ledger.source = 'couch_pool' AND ledger.entry_key = 'pool-decision:' || decision.id)"
+        " OR EXISTS (SELECT 1 FROM review_events event"
+        "             WHERE event.id = ledger.review_event_id AND event.operation_id = decision.operation_id)",
+    ),
+    (
+        "independent_review_decisions",
+        "independent_review_reversals",
+        "EXISTS (SELECT 1 FROM review_events event"
+        "         WHERE event.id = ledger.review_event_id AND event.operation_id = decision.operation_id)",
+    ),
 )
 # skip carries 0 basis points under review-iqd-v1-2026-08-21, so an uncredited skip is not unpaid
 # work; counting it would inflate the very number the owner has to decide on.
@@ -108,9 +131,101 @@ def _connect_read_only(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def audit_flexible_deferred(db_path: Path) -> dict[str, Any] | None:
-    """Return the flexible-mode deferred-pay audit, or None when legacy mode is active."""
+def _audit_settlements(
+    connection: sqlite3.Connection, ledger_rows: list[sqlite3.Row], errors: list[str]
+) -> dict[str, Any]:
+    """Every settlement covers one exact, contiguous, unique-referenced range of the reviewer's ledger."""
+    settlements = list(
+        connection.execute(
+            """SELECT settlement_id, reviewer, from_ledger_id_exclusive,
+                      through_ledger_id_inclusive, allocated_micro_iqd, payout_reference
+                 FROM review_compensation_settlements
+                WHERE policy_version = ?
+                ORDER BY reviewer COLLATE NOCASE, through_ledger_id_inclusive""",
+            (POLICY_VERSION,),
+        )
+    )
+    last_boundary: dict[str, int] = {}
+    payout_references: set[str] = set()
+    for settlement in settlements:
+        reviewer_key = str(settlement["reviewer"]).strip().casefold()
+        expected_from = last_boundary.get(reviewer_key, 0)
+        observed_from = int(settlement["from_ledger_id_exclusive"])
+        through = int(settlement["through_ledger_id_inclusive"])
+        if observed_from != expected_from or through <= observed_from:
+            errors.append(f"settlement {settlement['settlement_id']} has a non-contiguous range")
+        exact = sum(
+            int(row["delta_micro_iqd"])
+            for row in ledger_rows
+            if str(row["reviewer"]).strip().casefold() == reviewer_key
+            and int(row["id"]) > observed_from
+            and int(row["id"]) <= through
+        )
+        if exact != int(settlement["allocated_micro_iqd"]):
+            errors.append(f"settlement {settlement['settlement_id']} amount differs from immutable ledger range")
+        reference = str(settlement["payout_reference"]).strip()
+        if not reference or reference in payout_references:
+            errors.append(f"settlement {settlement['settlement_id']} has an empty/duplicate payout reference")
+        payout_references.add(reference)
+        last_boundary[reviewer_key] = through
+    return {
+        "settlements": len(settlements),
+        "settledMicroIqd": sum(int(row["allocated_micro_iqd"]) for row in settlements),
+    }
 
+
+def _check_credit_arithmetic(
+    row: sqlite3.Row, action: str, prior: int, prior_corrected: int, errors: list[str]
+) -> None:
+    """Rate, entitlement, delta and corrected-audio math of one credit against the running balances."""
+    entry_id = str(row["entry_id"])
+    expected_bps = BASIS_POINTS.get(action)
+    if expected_bps is None:
+        errors.append(f"ledger entry {entry_id} has unsupported action {action!r}")
+        return
+    try:
+        entitlement = _exact_entitlement(int(row["duration_ms"]), expected_bps) if expected_bps else 0
+    except ValueError as error:
+        errors.append(f"ledger entry {entry_id}: {error}")
+        entitlement = -1
+    if int(row["rate_basis_points"]) != expected_bps or int(row["entitlement_micro_iqd"]) != entitlement:
+        errors.append(f"ledger rate/entitlement mismatch at {entry_id}")
+    expected_delta = 0 if action == "skip" else entitlement - prior
+    if int(row["delta_micro_iqd"]) != expected_delta:
+        errors.append(f"ledger delta mismatch at {entry_id}: {row['delta_micro_iqd']} != {expected_delta}")
+    target_corrected = int(row["duration_ms"]) if action == "edit" else prior_corrected if action == "skip" else 0
+    if int(row["corrected_entitlement_ms"]) != target_corrected:
+        errors.append(
+            f"corrected entitlement mismatch at {entry_id}: {row['corrected_entitlement_ms']} != {target_corrected}"
+        )
+    if int(row["delta_corrected_ms"]) != target_corrected - prior_corrected:
+        errors.append(
+            f"corrected delta mismatch at {entry_id}: {row['delta_corrected_ms']} != {target_corrected - prior_corrected}"
+        )
+
+
+def _expected_reviewer_work_id(connection: sqlite3.Connection, reviewer: object, segment_id: object) -> tuple[str | None, str]:
+    segment = connection.execute(
+        "SELECT id, audio_content_hash, alignment_json, duration_ms FROM speech_segments WHERE id = ?",
+        (segment_id,),
+    ).fetchone()
+    if segment is None:
+        return None, "segment is missing"
+    canonical, identity_reason, _audio_work_id = _canonical_focus_status(segment)
+    if not canonical:
+        return None, identity_reason
+    return canonical_reviewer_work_id(reviewer, segment["audio_content_hash"], segment["alignment_json"])
+
+
+def audit_flexible_paid(db_path: Path) -> dict[str, Any] | None:
+    """Return the flexible-pool PAID compensation audit, or None when no pool is active.
+
+    Owner canon 2026-09-04: pool second opinions are paid at the first-opinion weights (edit 100%,
+    accept 10%, reject 10%). This mode therefore audits the real ledger instead of proving that
+    nothing was paid: one exact credit per post-cutoff first opinion and per non-skip pool opinion,
+    consumed policy-4 listening behind every pool credit, a durable reversal behind every undo, exact
+    contiguous settlements. It reads schema-specific tables and is pinned to the exact deployed schema.
+    """
     if not db_path.is_file():
         return None
     try:
@@ -126,21 +241,17 @@ def audit_flexible_deferred(db_path: Path) -> dict[str, Any] | None:
     evidence: dict[str, Any] = {
         "database": str(db_path.resolve()),
         "mode": "flexible-pool",
-        "compensationOperationalStatus": "deferred",
+        "compensationOperationalStatus": "paid",
         "policyVersion": POLICY_VERSION,
+        "uncreditedSecondPassDecisions": [],
+        "warnings": [],
     }
     try:
         pool = active_flexible_pool(connection)
         if pool is None:
             return None
         pool_id, member_count, focus_sha256 = pool
-        evidence.update(
-            {
-                "poolId": pool_id,
-                "poolMembers": member_count,
-                "poolFocusSha256": focus_sha256,
-            }
-        )
+        evidence.update({"poolId": pool_id, "poolMembers": member_count, "poolFocusSha256": focus_sha256})
         if (db_path.parent / REVIEW_PILOT_FILE).exists():
             errors.append("flexible pool and legacy controlled-pilot policy are active together")
 
@@ -148,8 +259,12 @@ def audit_flexible_deferred(db_path: Path) -> dict[str, Any] | None:
             connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
         )
         evidence["schemaVersion"] = schema_version
-        if schema_version not in (65, 66):
-            errors.append(f"flexible compensation audit requires supported schema 65 or 66, found {schema_version}")
+        if schema_version not in FLEXIBLE_PAID_SCHEMA_VERSIONS:
+            errors.append(
+                f"flexible paid-compensation audit requires exact schema {FLEXIBLE_PAID_SCHEMA_VERSIONS}, "
+                f"found {schema_version}"
+            )
+            return {**evidence, "ok": False, "errors": errors}
 
         policy_rows = connection.execute(
             """SELECT effective_after_event_id, base_rate_micro_iqd_per_hour,
@@ -160,18 +275,20 @@ def audit_flexible_deferred(db_path: Path) -> dict[str, Any] | None:
         evidence["policyRows"] = len(policy_rows)
         if len(policy_rows) != 1:
             errors.append(f"expected one immutable {POLICY_VERSION} policy row, found {len(policy_rows)}")
-        else:
-            row = policy_rows[0]
-            observed = (
-                row["base_rate_micro_iqd_per_hour"],
-                row["edit_basis_points"],
-                row["accept_basis_points"],
-                row["reject_basis_points"],
-                row["skip_basis_points"],
-            )
-            expected = (BASE_RATE_MICRO_IQD_PER_HOUR, 10_000, 1_000, 1_000, 0)
-            if observed != expected:
-                errors.append(f"policy constants differ: observed={observed}, expected={expected}")
+            return {**evidence, "ok": False, "errors": errors}
+        policy = policy_rows[0]
+        observed = (
+            policy["base_rate_micro_iqd_per_hour"],
+            policy["edit_basis_points"],
+            policy["accept_basis_points"],
+            policy["reject_basis_points"],
+            policy["skip_basis_points"],
+        )
+        expected = (BASE_RATE_MICRO_IQD_PER_HOUR, 10_000, 1_000, 1_000, 0)
+        if observed != expected:
+            errors.append(f"policy constants differ: observed={observed}, expected={expected}")
+        cutoff = int(policy["effective_after_event_id"])
+        evidence["effectiveAfterEventId"] = cutoff
 
         triggers = {
             row["name"]: row["sql"] or ""
@@ -195,52 +312,289 @@ def audit_flexible_deferred(db_path: Path) -> dict[str, Any] | None:
             errors.append(f"immutable triggers do not abort writes: {non_aborting}")
         evidence["immutableTriggers"] = sorted(triggers)
 
-        registry_rows = connection.execute(
-            "SELECT created_at FROM review_pool_registry WHERE pool_id=?", (pool_id,)
-        ).fetchall()
-        if len(registry_rows) != 1 or not isinstance(registry_rows[0]["created_at"], str):
-            errors.append("flexible pool activation time is not uniquely recorded")
-            activated_at = "9999-12-31 23:59:59"
-        else:
-            activated_at = registry_rows[0]["created_at"]
-            valid_time = connection.execute("SELECT datetime(?) IS NOT NULL", (activated_at,)).fetchone()[0]
-            if valid_time != 1:
-                errors.append("flexible pool activation time is invalid")
-        evidence["poolActivatedAt"] = activated_at
-
-        post_pool_legacy_events = int(
-            connection.execute(
-                """SELECT COUNT(*) FROM review_events
-                    WHERE source IN ('couch','couch_spot_check')
-                      AND datetime(created_at) >= datetime(?)""",
-                (activated_at,),
-            ).fetchone()[0]
-        )
-        post_pool_ledger = int(
-            connection.execute(
-                "SELECT COUNT(*) FROM review_compensation_ledger WHERE datetime(created_at) >= datetime(?)",
-                (activated_at,),
-            ).fetchone()[0]
-        )
         operation_collisions = int(
             connection.execute(
                 """SELECT COUNT(*) FROM review_pool_decisions pool
                     JOIN review_events event ON event.operation_id=pool.operation_id"""
             ).fetchone()[0]
         )
-        evidence.update(
-            {
-                "postPoolLegacyReviewEvents": post_pool_legacy_events,
-                "postPoolLegacyLedgerEntries": post_pool_ledger,
-                "crossNamespaceOperationCollisions": operation_collisions,
-            }
-        )
-        if post_pool_legacy_events:
-            errors.append(f"{post_pool_legacy_events} legacy paid-review event(s) landed after pool activation")
-        if post_pool_ledger:
-            errors.append(f"{post_pool_ledger} legacy compensation entry/entries landed after pool activation")
+        evidence["crossNamespaceOperationCollisions"] = operation_collisions
         if operation_collisions:
             errors.append(f"{operation_collisions} operation UUID(s) exist in both pool and legacy review namespaces")
+
+        uncredited, uncredited_warnings = _uncredited_second_pass_decisions(connection)
+        evidence["uncreditedSecondPassDecisions"] = uncredited
+        evidence["warnings"] = uncredited_warnings
+
+        events = {
+            int(row["id"]): row
+            for row in connection.execute(
+                """SELECT id, segment_id, reviewer, action, compensation_action, source, duration_ms,
+                          operation_id, operation_payload_hash
+                     FROM review_events
+                    WHERE id > ? AND source IN ('couch', 'couch_spot_check')
+                    ORDER BY id""",
+                (cutoff,),
+            )
+        }
+        all_ledger_rows = list(
+            connection.execute(
+                """SELECT id, entry_id, entry_key, source, policy_version, review_event_id,
+                          canonical_work_id, canonical_identity_kind, reviewer, segment_id,
+                          compensation_action, effective_decision, decision_revision, duration_ms,
+                          rate_basis_points, entitlement_micro_iqd, delta_micro_iqd,
+                          corrected_entitlement_ms, delta_corrected_ms, reverses_entry_id
+                     FROM review_compensation_ledger ORDER BY id"""
+            )
+        )
+        ledger_rows = [row for row in all_ledger_rows if row["policy_version"] == POLICY_VERSION]
+        foreign_policy_rows = [row for row in all_ledger_rows if row["policy_version"] != POLICY_VERSION]
+        evidence["rawPostCutoffEvents"] = len(events)
+        evidence["ledgerEntries"] = len(ledger_rows)
+        evidence["allPolicyLedgerEntries"] = len(all_ledger_rows)
+        for row in foreign_policy_rows:
+            if row["review_event_id"] is not None and int(row["review_event_id"]) in events:
+                errors.append(
+                    f"post-cutoff event {row['review_event_id']} has a foreign-policy ledger consequence "
+                    f"{row['policy_version']!r}"
+                )
+
+        event_entry_counts: dict[int, int] = {}
+        pool_entry_counts: dict[int, int] = {}
+        entry_by_id: dict[str, sqlite3.Row] = {}
+        reversed_entries: set[str] = set()
+        balances: dict[str, int] = {}
+        corrected_balances: dict[str, int] = {}
+        for row in ledger_rows:
+            entry_id = str(row["entry_id"])
+            work_id = str(row["canonical_work_id"])
+            prior = balances.get(work_id, 0)
+            prior_corrected = corrected_balances.get(work_id, 0)
+            action = str(row["compensation_action"])
+            source = str(row["source"])
+            entry_key = str(row["entry_key"])
+            if row["canonical_identity_kind"] != CANONICAL_IDENTITY_KIND:
+                errors.append(f"ledger entry {entry_id} does not carry the canonical audio identity kind")
+
+            if row["review_event_id"] is not None:
+                review_event_id = int(row["review_event_id"])
+                event_entry_counts[review_event_id] = event_entry_counts.get(review_event_id, 0) + 1
+                event = events.get(review_event_id)
+                if event is None:
+                    errors.append(f"ledger entry {entry_id} points outside the post-cutoff event range")
+                else:
+                    if (
+                        action != str(event["compensation_action"] or "")
+                        or row["effective_decision"] != event["action"]
+                        or source != event["source"]
+                        or entry_key != f"review-event:{review_event_id}"
+                        or row["reverses_entry_id"] is not None
+                    ):
+                        errors.append(f"ledger entry {entry_id} disagrees with review event {review_event_id}")
+                    if (
+                        row["segment_id"] != event["segment_id"]
+                        or str(row["reviewer"]).casefold() != str(event["reviewer"]).casefold()
+                    ):
+                        errors.append(f"ledger identity {entry_id} disagrees with review event {review_event_id}")
+                    if int(row["duration_ms"]) != int(event["duration_ms"]):
+                        errors.append(f"ledger duration {entry_id} disagrees with review event {review_event_id}")
+                    expected_work_id, identity_reason = _expected_reviewer_work_id(
+                        connection, event["reviewer"], event["segment_id"]
+                    )
+                    if expected_work_id is None or work_id != expected_work_id:
+                        errors.append(
+                            f"ledger canonical identity {entry_id} disagrees with event segment: "
+                            f"expected work={expected_work_id!r}; reason={identity_reason or 'none'}"
+                        )
+                _check_credit_arithmetic(row, action, prior, prior_corrected, errors)
+            elif source == "couch_pool":
+                # Owner canon 2026-09-04: a pool second opinion is paid like a first opinion. It has no
+                # review_events row; its provenance is the immutable review_pool_decisions row named by
+                # the entry key and its listening proof the `independent` policy-4 consumption bound to
+                # that row's operation id, session and receipt.
+                try:
+                    pool_decision_id = int(entry_key.split(":", 1)[1]) if entry_key.startswith("pool-decision:") else -1
+                except ValueError:
+                    pool_decision_id = -1
+                pool_entry_counts[pool_decision_id] = pool_entry_counts.get(pool_decision_id, 0) + 1
+                decision = connection.execute(
+                    """SELECT segment_id, reviewer, action, served_revision, duration_ms,
+                              audio_content_hash, source_start_ms, source_end_ms, operation_id
+                         FROM review_pool_decisions WHERE id = ?""",
+                    (pool_decision_id,),
+                ).fetchone()
+                if decision is None:
+                    errors.append(f"pool credit {entry_id} names a missing pool decision {pool_decision_id}")
+                else:
+                    if (
+                        str(decision["action"]) == "skip"
+                        or action != str(decision["action"])
+                        or row["effective_decision"] != decision["action"]
+                        or row["reverses_entry_id"] is not None
+                    ):
+                        errors.append(f"pool credit {entry_id} disagrees with pool decision {pool_decision_id}")
+                    if (
+                        row["segment_id"] != decision["segment_id"]
+                        or str(row["reviewer"]).casefold() != str(decision["reviewer"]).casefold()
+                    ):
+                        errors.append(f"pool credit identity {entry_id} disagrees with pool decision {pool_decision_id}")
+                    if int(row["duration_ms"]) != int(decision["duration_ms"]):
+                        errors.append(f"pool credit duration {entry_id} disagrees with pool decision {pool_decision_id}")
+                    if row["decision_revision"] != decision["served_revision"]:
+                        errors.append(f"pool credit revision {entry_id} disagrees with pool decision {pool_decision_id}")
+                    expected_work_id, identity_reason = _expected_reviewer_work_id(
+                        connection, decision["reviewer"], decision["segment_id"]
+                    )
+                    if expected_work_id is None or work_id != expected_work_id:
+                        errors.append(
+                            f"pool credit canonical identity {entry_id} disagrees with its segment: "
+                            f"expected work={expected_work_id!r}; reason={identity_reason or 'none'}"
+                        )
+                    span, _span_reason = canonical_source_span(
+                        connection.execute(
+                            "SELECT alignment_json FROM speech_segments WHERE id = ?", (decision["segment_id"],)
+                        ).fetchone()[0]
+                        if expected_work_id is not None
+                        else None
+                    )
+                    if span is None or (decision["source_start_ms"], decision["source_end_ms"]) != span:
+                        errors.append(f"pool credit {entry_id} was paid for audio other than decision {pool_decision_id} judged")
+                    listening = int(
+                        connection.execute(
+                            """SELECT COUNT(*)
+                                 FROM playback_receipts receipt
+                                 JOIN desktop_playback_sessions_v4 session
+                                   ON session.playback_receipt_id = receipt.authority_session_id
+                                  AND session.surface = 'couch'
+                                 JOIN playback_authority_consumptions_v4 consumption
+                                   ON consumption.playback_receipt_id = receipt.authority_session_id
+                                WHERE receipt.policy_version = ?
+                                  AND receipt.segment_id = ?
+                                  AND receipt.reviewer = ? COLLATE NOCASE
+                                  AND receipt.segment_revision = ?
+                                  AND receipt.audio_fingerprint = ?
+                                  AND receipt.source_start_ms = ?
+                                  AND receipt.source_end_ms = ?
+                                  AND receipt.clip_duration_ms = ?
+                                  AND receipt.coverage_ratio >= ?
+                                  AND session.reviewer = ? COLLATE NOCASE
+                                  AND session.segment_id = ?
+                                  AND session.segment_revision = ?
+                                  AND session.audio_content_hash = ?
+                                  AND consumption.namespace = 'independent'
+                                  AND consumption.operation_id = ?
+                                  AND consumption.reviewer = ? COLLATE NOCASE
+                                  AND consumption.segment_id = ?""",
+                            (
+                                COUCH_PLAYBACK_POLICY_VERSION,
+                                decision["segment_id"],
+                                decision["reviewer"],
+                                decision["served_revision"],
+                                decision["audio_content_hash"],
+                                decision["source_start_ms"],
+                                decision["source_end_ms"],
+                                decision["duration_ms"],
+                                MIN_PLAYBACK_COVERAGE,
+                                decision["reviewer"],
+                                decision["segment_id"],
+                                decision["served_revision"],
+                                decision["audio_content_hash"],
+                                decision["operation_id"],
+                                decision["reviewer"],
+                                decision["segment_id"],
+                            ),
+                        ).fetchone()[0]
+                    )
+                    if listening == 0:
+                        errors.append(
+                            f"pool credit {entry_id} has no exact consumed policy-4 playback authority for decision {pool_decision_id}"
+                        )
+                _check_credit_arithmetic(row, action, prior, prior_corrected, errors)
+            elif action == "undo":
+                reverses = row["reverses_entry_id"]
+                target = entry_by_id.get(str(reverses)) if reverses is not None else None
+                if target is None:
+                    errors.append(f"undo {entry_id} references a missing/later entry {reverses}")
+                    expected_delta = 0
+                    expected_corrected_delta = 0
+                else:
+                    expected_delta = -int(target["delta_micro_iqd"])
+                    expected_corrected_delta = -int(target["delta_corrected_ms"])
+                    if (
+                        str(target["compensation_action"]) == "undo"
+                        or str(target["canonical_work_id"]) != work_id
+                        or target["segment_id"] != row["segment_id"]
+                        or str(target["reviewer"]).casefold() != str(row["reviewer"]).casefold()
+                        or int(target["duration_ms"]) != int(row["duration_ms"])
+                        or target["decision_revision"] != row["decision_revision"]
+                        or str(reverses) in reversed_entries
+                    ):
+                        errors.append(f"undo {entry_id} does not exactly bind its earlier decision entry")
+                    reversed_entries.add(str(reverses))
+                    undo_operation = entry_key[len("undo:"):] if entry_key.startswith("undo:") else ""
+                    if str(target["source"]) == "couch_pool":
+                        target_key = str(target["entry_key"])
+                        try:
+                            target_decision_id = int(target_key.split(":", 1)[1])
+                        except (IndexError, ValueError):
+                            target_decision_id = -1
+                        reversal_rows = int(
+                            connection.execute(
+                                """SELECT COUNT(*) FROM review_pool_reversals
+                                    WHERE decision_id = ? AND operation_id = ? AND reviewer = ? COLLATE NOCASE""",
+                                (target_decision_id, undo_operation, row["reviewer"]),
+                            ).fetchone()[0]
+                        )
+                        if source != "couch_pool_undo" or reversal_rows != 1:
+                            errors.append(f"undo {entry_id} does not name the durable pool reversal it settles")
+                    elif source != "couch_undo":
+                        errors.append(f"undo {entry_id} of a first-opinion credit must be a couch_undo entry")
+                if row["effective_decision"] != "undo" or int(row["rate_basis_points"]) != 0 or int(row["entitlement_micro_iqd"]) != 0:
+                    errors.append(f"undo {entry_id} has invalid fixed semantics")
+                if int(row["delta_micro_iqd"]) != expected_delta:
+                    errors.append(f"undo delta mismatch at {entry_id}: {row['delta_micro_iqd']} != {expected_delta}")
+                if int(row["delta_corrected_ms"]) != expected_corrected_delta:
+                    errors.append(
+                        f"undo corrected delta mismatch at {entry_id}: "
+                        f"{row['delta_corrected_ms']} != {expected_corrected_delta}"
+                    )
+                if int(row["corrected_entitlement_ms"]) != prior_corrected + expected_corrected_delta:
+                    errors.append(
+                        f"undo corrected entitlement mismatch at {entry_id}: "
+                        f"{row['corrected_entitlement_ms']} != {prior_corrected + expected_corrected_delta}"
+                    )
+            else:
+                errors.append(f"ledger entry {entry_id} has neither review event, pool decision nor undo semantics")
+
+            entry_by_id[entry_id] = row
+            balances[work_id] = prior + int(row["delta_micro_iqd"])
+            corrected_balances[work_id] = prior_corrected + int(row["delta_corrected_ms"])
+            if balances[work_id] < 0:
+                errors.append(f"canonical work {work_id} has a negative running entitlement")
+            if corrected_balances[work_id] < 0:
+                errors.append(f"canonical work {work_id} has a negative corrected-audio entitlement")
+
+        for event_id, event in events.items():
+            if str(event["compensation_action"] or "") not in BASIS_POINTS:
+                errors.append(f"post-cutoff event {event_id} lacks a valid compensation_action")
+            if event_entry_counts.get(event_id, 0) != 1:
+                errors.append(f"post-cutoff event {event_id} has {event_entry_counts.get(event_id, 0)} ledger entries")
+        paid_pool_decisions = connection.execute(
+            "SELECT id, action FROM review_pool_decisions WHERE action <> 'skip' ORDER BY id"
+        ).fetchall()
+        for pool_decision in paid_pool_decisions:
+            credits = pool_entry_counts.get(int(pool_decision["id"]), 0)
+            if credits != 1:
+                errors.append(
+                    f"pool decision {pool_decision['id']} ({pool_decision['action']}) has {credits} ledger credits; "
+                    "required exactly one"
+                )
+        evidence["postCutoffEvents"] = len(events)
+        evidence["paidPoolDecisions"] = len(paid_pool_decisions)
+        evidence["poolDecisionCredits"] = sum(pool_entry_counts.values())
+        evidence["reversalEntries"] = len(reversed_entries)
+
+        evidence.update(_audit_settlements(connection, ledger_rows, errors))
 
         fk_violations = 0
         for table in (
@@ -252,8 +606,12 @@ def audit_flexible_deferred(db_path: Path) -> dict[str, Any] | None:
         evidence["compensationForeignKeyViolations"] = fk_violations
         if fk_violations:
             errors.append(f"compensation tables have {fk_violations} foreign-key violation(s)")
+
+        evidence["totalEarnedMicroIqd"] = sum(int(row["delta_micro_iqd"]) for row in ledger_rows)
+        evidence["correctedAudioMs"] = sum(corrected_balances.values())
+        evidence["activeWorkBalances"] = sum(1 for value in balances.values() if value)
     except (sqlite3.Error, PolicyBroken, TypeError, ValueError) as error:
-        errors.append(f"flexible deferred-compensation authority cannot be proved: {error}")
+        errors.append(f"flexible paid-compensation authority cannot be proved: {error}")
     finally:
         connection.close()
     return {**evidence, "ok": not errors, "errors": errors}
@@ -289,23 +647,22 @@ def _uncredited_second_pass_decisions(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Count durable, playback-evidenced second-pass decisions that carry no ledger credit.
 
-    Reported, never failed.  Whether a pool/blinded second pass is payable at all is an OWNER
-    decision under `review-iqd-v1-2026-08-21`, and the rate table is canon: this gate may not mint,
-    backfill, or reprice a single micro-IQD.  Failing here would leave the sweep permanently RED with
-    no canon-legal remedy, which is exactly the pressure that gets gates weakened.  So it warns
-    loudly instead — the ledger's own arithmetic contract, which this gate does enforce fail-closed,
-    is untouched by this section.
+    Reported, never failed here.  Pool second opinions are paid since owner canon 2026-09-04 and the
+    flexible paid audit fails closed on any unpaid non-skip pool decision; the blinded second pass
+    (independent_review_decisions) is still unpriced, and this gate may not mint, backfill, or reprice
+    a single micro-IQD, so that work is surfaced as a warning rather than a failure with no
+    canon-legal remedy.
 
-    The only linkage a credit could ever have to one of these decisions is the shared operation id,
-    so that is what is joined; a decision reversed by its append-only reversal table is not
-    outstanding work.
+    A pool credit is keyed on its decision (`pool-decision:<id>`, owner canon 2026-09-04); the legacy
+    shared-operation-id linkage is still recognised. A decision reversed by its append-only reversal
+    table is not outstanding work.
     """
     tables = {
         str(row["name"]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
     uncredited: list[dict[str, Any]] = []
     warnings: list[str] = []
-    for table, reversals in UNPAID_DECISION_TABLES:
+    for table, reversals, credit_link in UNPAID_DECISION_TABLES:
         if table not in tables or reversals not in tables:
             continue
         placeholders = ",".join("?" for _ in PAYABLE_WEIGHT_ACTIONS)
@@ -318,8 +675,7 @@ def _uncredited_second_pass_decisions(
                    AND NOT EXISTS (SELECT 1 FROM {reversals} reversal
                                     WHERE reversal.decision_id = decision.id)
                    AND NOT EXISTS (SELECT 1 FROM review_compensation_ledger ledger
-                                     JOIN review_events event ON event.id = ledger.review_event_id
-                                    WHERE event.operation_id = decision.operation_id)
+                                    WHERE {credit_link})
                  GROUP BY 1
                  ORDER BY 1""",
             (*PAYABLE_WEIGHT_ACTIONS, PLAYBACK_GUARD_VERSION),
@@ -776,41 +1132,7 @@ def audit(db_path: Path, focus_path: Path) -> dict[str, Any]:
         if fallback_entries:
             errors.append(f"ledger contains {fallback_entries} fallback-identity entries")
 
-        settlements = list(
-            connection.execute(
-                """SELECT settlement_id, reviewer, from_ledger_id_exclusive,
-                          through_ledger_id_inclusive, allocated_micro_iqd, payout_reference
-                     FROM review_compensation_settlements
-                    WHERE policy_version = ?
-                    ORDER BY reviewer COLLATE NOCASE, through_ledger_id_inclusive""",
-                (POLICY_VERSION,),
-            )
-        )
-        last_boundary: dict[str, int] = {}
-        payout_references: set[str] = set()
-        for settlement in settlements:
-            reviewer_key = str(settlement["reviewer"]).strip().casefold()
-            expected_from = last_boundary.get(reviewer_key, 0)
-            observed_from = int(settlement["from_ledger_id_exclusive"])
-            through = int(settlement["through_ledger_id_inclusive"])
-            if observed_from != expected_from or through <= observed_from:
-                errors.append(f"settlement {settlement['settlement_id']} has a non-contiguous range")
-            exact = sum(
-                int(row["delta_micro_iqd"])
-                for row in ledger_rows
-                if str(row["reviewer"]).strip().casefold() == reviewer_key
-                and int(row["id"]) > observed_from
-                and int(row["id"]) <= through
-            )
-            if exact != int(settlement["allocated_micro_iqd"]):
-                errors.append(f"settlement {settlement['settlement_id']} amount differs from immutable ledger range")
-            reference = str(settlement["payout_reference"]).strip()
-            if not reference or reference in payout_references:
-                errors.append(f"settlement {settlement['settlement_id']} has an empty/duplicate payout reference")
-            payout_references.add(reference)
-            last_boundary[reviewer_key] = through
-        evidence["settlements"] = len(settlements)
-        evidence["settledMicroIqd"] = sum(int(row["allocated_micro_iqd"]) for row in settlements)
+        evidence.update(_audit_settlements(connection, ledger_rows, errors))
 
         focus_rows: dict[str, sqlite3.Row] = {}
         for offset in range(0, len(focus_ids), 900):
@@ -878,7 +1200,7 @@ def main(argv: list[str] | None = None) -> int:
         data_dir = _default_data_dir()
     db_path = args.db or data_dir / "cortex-speech.db"
     focus_path = args.focus or data_dir / "voice_focus.json"
-    result = audit_flexible_deferred(db_path)
+    result = audit_flexible_paid(db_path)
     if result is None:
         result = audit(db_path, focus_path)
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
