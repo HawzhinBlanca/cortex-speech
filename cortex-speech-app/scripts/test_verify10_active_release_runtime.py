@@ -52,6 +52,7 @@ def seed_source(root: Path) -> None:
     migrations = root / "src-tauri" / "src" / "migrations"
     migrations.mkdir(parents=True)
     shutil.copy2(APP / "src-tauri" / "src" / "migrations" / "mod.rs", migrations / "mod.rs")
+    shutil.copy2(APP / "src-tauri" / "src" / "dialect.rs", migrations.parent / "dialect.rs")
     dedup: dict[str, object] = {
         "manifestSchema": 1,
         "summary": {"unconfirmedRiskGroups": 0},

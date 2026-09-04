@@ -84,6 +84,7 @@ def seed_source(root: Path) -> None:
     migrations = root / "src-tauri" / "src" / "migrations"
     migrations.mkdir(parents=True)
     shutil.copy2(APP / "src-tauri" / "src" / "migrations" / "mod.rs", migrations / "mod.rs")
+    shutil.copy2(APP / "src-tauri" / "src" / "dialect.rs", migrations.parent / "dialect.rs")
     dedup = {
         "manifestSchema": 1,
         "summary": {"unconfirmedRiskGroups": 0},
@@ -215,6 +216,9 @@ def test_stage_is_atomic_versioned_and_hash_bound() -> None:
         assert manifest["schemaContractSha256"] == release.sha256_file(Path(manifest["schemaContract"]))
         assert manifest["appSha256"] == release.sha256_file(candidate / "cortex-speech-app.exe")
         assert manifest["poolAdminSha256"] == release.sha256_file(candidate / "pool_admin.exe")
+        assert (final / "src-tauri" / "src" / "dialect.rs").read_bytes() == (
+            source / "src-tauri" / "src" / "dialect.rs"
+        ).read_bytes()
         assert not list(releases.glob(".*.staging-*"))
         assert release.validate_manifest(
             json.loads((final / release.RELEASE_MANIFEST_FILE).read_text()),
@@ -286,6 +290,61 @@ def test_operations_bundle_is_part_of_identity_and_tampering_is_refused() -> Non
             assert "operations bundle" in str(error)
         else:
             raise AssertionError("changed recovery/controller bytes must invalidate the immutable release")
+
+
+def test_operations_bundle_binds_runtime_dialect_authority() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        source, candidate, releases = base / "source", base / "candidate", base / "releases"
+        seed_source(source)
+        seed_candidate(candidate, git_sha="8" * 40)
+        manifest = release.stage_release(candidate, source, releases, "8" * 40)
+        staged_dialects = Path(manifest["directory"]) / "src-tauri" / "src" / "dialect.rs"
+        staged_dialects.write_text("// tampered dialect authority\n", encoding="utf-8")
+        try:
+            release.validate_manifest(manifest, expected_root=releases)
+        except release.ReleaseError as error:
+            assert "operations bundle" in str(error)
+        else:
+            raise AssertionError("changed dialect authority must invalidate the immutable release")
+
+
+def test_only_a_previous_release_may_use_the_legacy_operations_digest() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        source, candidate, releases = base / "source", base / "candidate", base / "releases"
+        seed_source(source)
+        seed_candidate(candidate, git_sha="7" * 40)
+        manifest = release.stage_release(candidate, source, releases, "7" * 40)
+        final = Path(manifest["directory"])
+        (final / "src-tauri" / "src" / "dialect.rs").unlink()
+        legacy_digest = release.operations_bundle_sha256(final, allow_legacy_missing_dialect=True)
+        manifest["operationsSha256"] = legacy_digest
+
+        assert release.validate_manifest(
+            manifest,
+            expected_root=releases,
+            allow_compatible_previous=True,
+        ) == manifest
+        try:
+            release.validate_manifest(manifest, expected_root=releases)
+        except release.ReleaseError as error:
+            assert "dialect authority" in str(error)
+        else:
+            raise AssertionError("a new candidate accepted the legacy operations digest")
+
+        staged_controller = final / "scripts" / "release_private_production.py"
+        staged_controller.write_text("# tampered legacy controller\n", encoding="utf-8")
+        try:
+            release.validate_manifest(
+                manifest,
+                expected_root=releases,
+                allow_compatible_previous=True,
+            )
+        except release.ReleaseError as error:
+            assert "operations bundle" in str(error)
+        else:
+            raise AssertionError("legacy compatibility accepted changed operational bytes")
 
 
 def test_tampered_release_is_refused_and_never_replaced() -> None:
@@ -1213,6 +1272,10 @@ def test_watchdog_refuses_contract_drift_and_schema_mismatch_before_process_cont
         shutil.copy2(
             APP / "src-tauri" / "src" / "migrations" / "mod.rs",
             immutable / "src-tauri" / "src" / "migrations" / "mod.rs",
+        )
+        shutil.copy2(
+            APP / "src-tauri" / "src" / "dialect.rs",
+            immutable / "src-tauri" / "src" / "dialect.rs",
         )
         build_marker = b"\0CORTEX_BUILD_SHA:" + ("a" * 40).encode("ascii") + b"\0"
         (immutable / "cortex-speech-app.exe").write_bytes(b"app" + build_marker)
