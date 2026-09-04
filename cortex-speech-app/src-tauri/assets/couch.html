@@ -658,6 +658,7 @@
   // be refused (its rowVersion predates the re-decision) — that is not lost work, the newer verdict
   // landed, and the refused banner must not say otherwise (2026-08-20 hunt).
   const decidedHere = new Set();
+  const decidedHereKey = (id, reviewer) => JSON.stringify([reviewer || null, id]);
   // OUTBOX is the one-release legacy ARRAY key. Every current operation owns a different key, so
   // two tabs can interleave read/write/remove freely without either tab rewriting the other's work.
   const OUTBOX = 'cortex.couch.outbox';
@@ -1089,7 +1090,7 @@
         // land — but the reviewer's TYPED TEXT is not the server's to discard. Deleting the draft here
         // destroyed the one copy of a correction they had already been told was saved. Keep it, and
         // say what happened.
-        if (!decidedHere.has(item.id)) noteRefused(item.id, submissionReviewer);
+        if (!decidedHere.has(decidedHereKey(item.id, submissionReviewer))) noteRefused(item.id, submissionReviewer);
         removeSubmission(item.operationId);
         continue;
       }
@@ -1121,7 +1122,8 @@
   let playbackPreparation = null;
   let playbackPreparationSerial = 0;
   let playbackPreparationAutoplay = false;
-  const playbackIdentity = (seg) => seg ? String(seg.id) + '\u0000' + String(seg.rowVersion ?? '') : null;
+  // A matching clip/revision is still a NEW listening identity when this tab changes reviewers.
+  const playbackIdentity = (seg) => seg ? String(me) + '\u0000' + String(seg.id) + '\u0000' + String(seg.rowVersion ?? '') : null;
   const plainAudioUrl = (seg) => '/api/audio/' + encodeURIComponent(seg.id);
   const proofAudioUrl = (seg, receiptId) => plainAudioUrl(seg) + '?playbackAttemptId=' + encodeURIComponent(receiptId);
   function playerCarriesAttempt(seg, receiptId) {
@@ -1408,6 +1410,7 @@
       // are gone.
       const prevWho = sessionStorage.getItem('cortex.couch.who');
       if (prevWho !== null && prevWho !== me) {
+        doneThisSession = 0;
         for (let k = sessionStorage.length - 1; k >= 0; k--) {
           const key = sessionStorage.key(k);
           if (key && key.startsWith('cortex.couch.draft.')) sessionStorage.removeItem(key);
@@ -1658,7 +1661,7 @@
           sessionStorage.removeItem(draftKey(submission.id));
         }
         clearRefused(submission.id, submission.reviewer); // retract only this author's refusal
-        decidedHere.add(submission.id); // so a STALE outbox replay of this clip cannot claim work was lost
+        decidedHere.add(decidedHereKey(submission.id, submission.reviewer)); // suppress only this author's stale replay
         toast(action === 'bad' ? t('markedBad') : t('saved'));
         doneThisSession += 1;
       }
