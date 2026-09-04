@@ -1086,7 +1086,7 @@ pub fn pending_segment_ids(
     let mut statement = db
         .connection()
         .prepare(
-            "SELECT segment.id, segment.audio_path, COALESCE(segment.created_at, ''),
+            "SELECT segment.id, segment.audio_path,
                     (segment.verified=1 AND segment.human_decision IS NOT NULL)
                FROM review_pool_members member
                JOIN speech_segments segment ON segment.id=member.segment_id
@@ -1101,12 +1101,12 @@ pub fn pending_segment_ids(
         .map_err(|error| format!("review pool queue cannot be prepared: {error}"))?;
     let rows = statement
         .query_map([&pool.pool_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, bool>(3)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
         })
         .map_err(|error| format!("review pool queue cannot be read: {error}"))?;
-    let mut pending: Vec<(usize, String, String)> = Vec::new();
+    let mut pending: Vec<(usize, [u8; 32], String)> = Vec::new();
     for row in rows {
-        let (segment_id, audio_path, created_at, already_canonical) =
+        let (segment_id, audio_path, already_canonical) =
             row.map_err(|error| format!("review pool row is unreadable: {error}"))?;
         // PAY-FENCE MIRROR (decisions.rs `already_canonical` → 503 PAY_POLICY_REQUIRED): production
         // refuses a pool observation on a clip that already carries a canonical human answer, because
@@ -1153,7 +1153,15 @@ pub fn pending_segment_ids(
             0 => 2,
             _ => 3,
         };
-        pending.push((distance_to_decision, created_at, segment_id));
+        // Preserve decision proximity as the first authority, but do not make a reviewer listen to
+        // one import/podcast sequence for hours. `created_at` is source-ingest order, and the Lamo
+        // corpus was imported file-by-file; sorting by it produced runs such as 011978, 011979,
+        // 011981, 011982. They are distinct clips but sound repetitious and amplify shared background
+        // imperfections. A content-independent stable digest scatters each priority tier across the
+        // frozen pool, remains identical after restart, and cannot make lower-priority work jump a
+        // clip that is nearer consensus.
+        let spread_key: [u8; 32] = Sha256::digest(segment_id.as_bytes()).into();
+        pending.push((distance_to_decision, spread_key, segment_id));
     }
     pending.sort_unstable();
     Ok(pending.into_iter().map(|(_, _, segment_id)| segment_id).collect())
@@ -2084,6 +2092,55 @@ mod tests {
         let kept = crate::export::exclude_unexportable_segments(&db, vec![segment]).unwrap();
         let ids: Vec<&str> = kept.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["clip"], "a decided sentence must ship: {ids:?}");
+    }
+
+    #[test]
+    fn pool_spreads_equal_priority_work_instead_of_replaying_import_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        seed_champion(&db);
+        rollback_fixture_to(&db, 59);
+        for id in ["oldest", "middle", "newest"] {
+            let audio = dir.path().join(format!("{id}.wav"));
+            std::fs::write(&audio, b"wav").unwrap();
+            db.insert_segment_full(&segment(id, &audio, None)).unwrap();
+        }
+        upgrade_fixture_from(&db, 59);
+        for (id, byte, created_at) in [
+            ("oldest", "a", "2026-01-01 00:00:01"),
+            ("middle", "b", "2026-01-01 00:00:02"),
+            ("newest", "c", "2026-01-01 00:00:03"),
+        ] {
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments SET audio_content_hash=?2, created_at=?3 WHERE id=?1",
+                    rusqlite::params![id, byte.repeat(64), created_at],
+                )
+                .unwrap();
+        }
+        let pool = activate(
+            &db,
+            "123e4567-e89b-42d3-a456-426614174070",
+            &[
+                PoolMemberInput { segment_id: "oldest".into(), voice_name: "Lamo".into() },
+                PoolMemberInput { segment_id: "middle".into(), voice_name: "Lamo".into() },
+                PoolMemberInput { segment_id: "newest".into(), voice_name: "Lamo".into() },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            pending_segment_ids(&db, &pool, "Hemn", None).unwrap(),
+            vec!["newest", "middle", "oldest"],
+            "equal-priority work follows the pinned SHA-256 spread, not chronological import order"
+        );
+        let reloaded = load(&db).unwrap().expect("active pool reload");
+        assert_eq!(
+            pending_segment_ids(&db, &reloaded, "Hemn", None).unwrap(),
+            vec!["newest", "middle", "oldest"],
+            "the spread must survive an authority reload, not depend on runtime randomness"
+        );
     }
 
     #[test]

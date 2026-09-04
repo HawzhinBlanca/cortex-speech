@@ -14296,6 +14296,15 @@ reviewer. Queue construction now rebuilds each reviewer's skip set from append-o
 before leasing; a fresh-state regression test proves the skip remains reviewer-local and survives a
 restart.
 
+The complaints also exposed a non-duplicate repetition source: equal-priority pool work was ordered
+by import timestamp, and the Lamo files were imported sequentially. The next live candidates were
+`012209`, `012210`, `012212`, `012216`... with a median adjacent file-number gap of 2, so reviewers
+heard one recording sequence for long runs. The queue now retains decision-distance as its first sort
+authority but uses a stable SHA-256 segment spread inside each tier. On the same live pending snapshot,
+the first 25 span Lamo/Kawa files 536-28157 with a median adjacent gap of 8,529; the order is identical
+after restart and cannot promote work that is farther from consensus. A reload regression pins both
+the spread and the higher-priority-first contract.
+
 The active-pool media inventory is physically intact: 16,801 distinct expected WAV paths across the
 four dataset directories, zero missing files, zero unreadable WAV headers, zero source spans past EOF;
 all are mono signed-16-bit PCM at 24 kHz. All 16,990 members have measured RMS/SNR/clipping fields;
