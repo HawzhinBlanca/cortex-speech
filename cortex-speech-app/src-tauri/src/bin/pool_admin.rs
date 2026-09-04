@@ -98,18 +98,18 @@ fn first_overlapping_window(spans: &mut [(i64, i64, String)]) -> Option<(String,
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  pool_admin migrate --db <cortex-speech.db>\n  pool_admin inventory --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...]\n  pool_admin activate --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...] [--pool-id <uuid>]\n  pool_admin apply-dedup --db <cortex-speech.db> --manifest <review-pool-dedup.json>\n  pool_admin status --db <cortex-speech.db>\n  pool_admin certify --db <cortex-speech.db> [--full-integrity] [--require-review-ready | --require-final-ready]\n  pool_admin probe --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...]\n  pool_admin benchmark --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...] [--iterations <1..100>]\n  pool_admin benchmark-commit --db <DISPOSABLE-clone.db> --iterations <1..500> --confirm-disposable\n  pool_admin stamp-rights --db <cortex-speech.db>\n  pool_admin adjudicate --db <cortex-speech.db> --segment <id> (--retain-text <text> | --reject) --operation-id <uuid>\n  pool_admin export --db <cortex-speech.db> --voice-name <Name> --output <directory>"
+    "Usage:\n  pool_admin migrate --db <cortex-speech.db>\n  pool_admin inventory --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...]\n  pool_admin activate --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...] [--pool-id <uuid>]\n  pool_admin apply-dedup --db <cortex-speech.db> --manifest <review-pool-dedup.json>\n  pool_admin status --db <cortex-speech.db>\n  pool_admin certify --db <cortex-speech.db> [--full-integrity] [--require-review-ready | --require-final-ready]\n  pool_admin probe --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...]\n  pool_admin benchmark --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...] [--iterations <1..100>]\n  pool_admin benchmark-commit --db <read-only-source.db> --iterations <1..500> --confirm-disposable\n    Synthetic commits use an internally owned temporary clone, never the supplied source.\n  pool_admin stamp-rights --db <cortex-speech.db>\n  pool_admin adjudicate --db <cortex-speech.db> --segment <id> (--retain-text <text> | --reject) --operation-id <uuid>\n  pool_admin export --db <cortex-speech.db> --voice-name <Name> --output <directory>"
 }
 
 const DETACHED_READ_COMMANDS: &[&str] = &["certify"];
 const DIRECT_READ_COMMANDS: &[&str] = &["inventory", "status", "probe", "benchmark"];
-const WRITE_COMMANDS: &[&str] =
-    &["migrate", "activate", "apply-dedup", "benchmark-commit", "stamp-rights", "adjudicate", "export"];
+const WRITE_COMMANDS: &[&str] = &["migrate", "activate", "apply-dedup", "stamp-rights", "adjudicate", "export"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DatabaseAccess {
     DetachedRead,
     DirectRead,
+    DisposableWrite,
     LockedWrite,
 }
 
@@ -118,11 +118,75 @@ fn command_database_access(command: &str) -> Result<DatabaseAccess, String> {
         Ok(DatabaseAccess::DetachedRead)
     } else if DIRECT_READ_COMMANDS.contains(&command) {
         Ok(DatabaseAccess::DirectRead)
+    } else if command == "benchmark-commit" {
+        Ok(DatabaseAccess::DisposableWrite)
     } else if WRITE_COMMANDS.contains(&command) {
         Ok(DatabaseAccess::LockedWrite)
     } else {
         Err(usage().to_string())
     }
+}
+
+/// Only this owned, WAL-consistent clone is writable during a synthetic commit benchmark.
+/// The source handle is READ_ONLY, never the startup/recovery opener; callers cannot supply a
+/// destination that aliases the live database. Declare this guard before every clone connection
+/// and join all workers before dropping it, including error paths.
+#[derive(Debug)]
+struct DisposableBenchmarkDatabase {
+    path: PathBuf,
+    _directory: tempfile::TempDir,
+}
+
+impl DisposableBenchmarkDatabase {
+    fn create(source_path: &Path, budget: std::time::Duration) -> Result<Self, Box<dyn std::error::Error>> {
+        let started = std::time::Instant::now();
+        if budget.is_zero() {
+            return Err("benchmark clone deadline exceeded before opening source".into());
+        }
+        let source = rusqlite::Connection::open_with_flags(
+            source_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        source.busy_timeout(std::time::Duration::from_millis(250))?;
+        source.execute_batch("PRAGMA query_only=ON; BEGIN DEFERRED;")?;
+        // Bind the read generation, so concurrent reviewer commits cannot restart the backup.
+        source.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get::<_, i64>(0))?;
+        let directory = tempfile::Builder::new().prefix("cortex-commit-benchmark-").tempdir()?;
+        let path = directory.path().join("benchmark.sqlite");
+        let mut target = rusqlite::Connection::open(&path)?;
+        {
+            let backup = rusqlite::backup::Backup::new(&source, &mut target)?;
+            loop {
+                if started.elapsed() >= budget {
+                    return Err("benchmark clone deadline exceeded; source database remains read-only".into());
+                }
+                match backup.step(128)? {
+                    rusqlite::backup::StepResult::Done => break,
+                    rusqlite::backup::StepResult::More => {}
+                    rusqlite::backup::StepResult::Busy | rusqlite::backup::StepResult::Locked => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    _ => return Err("benchmark clone returned an unsupported backup state".into()),
+                }
+            }
+        }
+        drop(target);
+        Ok(Self { path, _directory: directory })
+    }
+}
+
+type CommitBenchmarkWorker = std::thread::JoinHandle<Result<Vec<f64>, String>>;
+
+fn join_commit_benchmark_workers(
+    left: CommitBenchmarkWorker,
+    right: CommitBenchmarkWorker,
+) -> Result<Vec<f64>, String> {
+    // Do not propagate one failure while the other worker still holds a scratch DB connection.
+    let left_result = left.join();
+    let right_result = right.join();
+    let mut samples = left_result.map_err(|_| "left commit benchmark thread panicked".to_string())??;
+    samples.extend(right_result.map_err(|_| "right commit benchmark thread panicked".to_string())??);
+    Ok(samples)
 }
 
 fn value_after(args: &[String], flag: &str) -> Result<String, String> {
@@ -262,6 +326,10 @@ fn commit_benchmark_worker(
     let mut commits = Vec::with_capacity(iterations);
     for index in 0..iterations {
         let operation_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        // Synthetic listening on the CLI-owned temporary clone only; minted outside the timed
+        // window so the sample is the commit alone, not production end-to-end reviewer latency.
+        let authority =
+            review_pool::mint_synthetic_playback_authority(&db, &reviewer, &clip.segment_id, &"b".repeat(64))?;
         let started = std::time::Instant::now();
         let decision_id = review_pool::record_decision(
             &db,
@@ -282,6 +350,7 @@ fn commit_benchmark_worker(
                 operation_id: &operation_id,
                 operation_payload_hash: &if reviewer.ends_with('A') { "a".repeat(64) } else { "b".repeat(64) },
                 created_at_ms: 1_000_000_i64.saturating_add(index as i64),
+                playback_authority_session_id: Some(&authority),
             },
         )?
         .ok_or_else(|| "commit benchmark decision unexpectedly changed zero rows".to_string())?;
@@ -801,9 +870,22 @@ fn certification_outcome(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    run(args)
+}
+
+fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let command = args.first().map(String::as_str).ok_or_else(|| usage().to_string())?;
     let database_access = command_database_access(command)?;
-    let db_path = PathBuf::from(value_after(&args, "--db")?);
+    let source_db_path = PathBuf::from(value_after(&args, "--db")?);
+    if database_access == DatabaseAccess::DisposableWrite && !args.iter().any(|arg| arg == "--confirm-disposable") {
+        return Err("benchmark-commit requires --confirm-disposable to authorize synthetic work on an internally owned temporary clone; the supplied source is never modified".into());
+    }
+    let disposable = if database_access == DatabaseAccess::DisposableWrite {
+        Some(DisposableBenchmarkDatabase::create(&source_db_path, std::time::Duration::from_secs(30))?)
+    } else {
+        None
+    };
+    let db_path = disposable.as_ref().map_or(source_db_path, |clone| clone.path.clone());
     if !db_path.is_file() {
         return Err(format!("database does not exist: {}", db_path.display()).into());
     }
@@ -827,6 +909,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = match database_access {
         DatabaseAccess::DetachedRead => Database::open_detached_read_snapshot(&db_path.to_string_lossy())?,
         DatabaseAccess::DirectRead => Database::open_read_only(&db_path.to_string_lossy())?,
+        DatabaseAccess::DisposableWrite => Database::open_with_retry(&db_path.to_string_lossy())?,
         DatabaseAccess::LockedWrite => Database::open_with_retry(&db_path.to_string_lossy())?,
     };
     if command == "migrate" {
@@ -1034,12 +1117,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "benchmark-commit" => {
-            if !args.iter().any(|arg| arg == "--confirm-disposable") {
-                return Err(
-                    "benchmark-commit appends test decisions; pass --confirm-disposable only for an isolated clone"
-                        .into(),
-                );
-            }
             let iterations = optional_value_after(&args, "--iterations")?
                 .map(|value| value.parse::<usize>().map_err(|_| "--iterations must be an integer".to_string()))
                 .transpose()?
@@ -1061,14 +1138,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let left_pool = review_pool::load(&left_db)?.ok_or("review pool is not active")?;
             let right_db = Database::open_with_retry(&db_path.to_string_lossy())?;
             let right_pool = review_pool::load(&right_db)?.ok_or("review pool is not active")?;
-            let left = std::thread::spawn(move || {
+            let left = std::thread::Builder::new().name("commit-bench-left".into()).spawn(move || {
                 commit_benchmark_worker(left_db, left_pool, left_clip, "CommitBenchA".to_string(), iterations)
-            });
-            let right = std::thread::spawn(move || {
+            })?;
+            let right = std::thread::Builder::new().name("commit-bench-right".into()).spawn(move || {
                 commit_benchmark_worker(right_db, right_pool, right_clip, "CommitBenchB".to_string(), iterations)
             });
-            let mut samples_ms = left.join().map_err(|_| "left commit benchmark thread panicked")??;
-            samples_ms.extend(right.join().map_err(|_| "right commit benchmark thread panicked")??);
+            let right = match right {
+                Ok(worker) => worker,
+                Err(error) => {
+                    // A failed second spawn must not detach the first worker from its scratch DB.
+                    let _ = left.join();
+                    return Err(error.into());
+                }
+            };
+            let mut samples_ms = join_commit_benchmark_workers(left, right)?;
             samples_ms.sort_by(f64::total_cmp);
             let percentile_index = (samples_ms.len() * 95).div_ceil(100) - 1;
             let p95_ms = samples_ms[percentile_index];
@@ -1076,6 +1160,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "simultaneousReviewers": 2,
+                    "syntheticEvidence": true,
+                    "sourceDatabaseAccess": "read-only",
+                    "benchmarkDatabase": "owned temporary clone on system temp volume",
+                    "certifiesProduction": false,
                     "commits": samples_ms.len(),
                     "p95Ms": p95_ms,
                     "maxMs": samples_ms.last(),
@@ -1225,6 +1313,8 @@ mod tests {
             assert_eq!(command_database_access(command), Ok(DatabaseAccess::LockedWrite), "{command}");
         }
         assert!(command_database_access("unknown").is_err());
+        assert_eq!(command_database_access("benchmark-commit"), Ok(DatabaseAccess::DisposableWrite));
+        assert!(!WRITE_COMMANDS.contains(&"benchmark-commit"));
         assert!(DETACHED_READ_COMMANDS.iter().all(|command| !DIRECT_READ_COMMANDS.contains(command)));
         assert!(DETACHED_READ_COMMANDS.iter().all(|command| !WRITE_COMMANDS.contains(command)));
         assert!(DIRECT_READ_COMMANDS.iter().all(|command| !WRITE_COMMANDS.contains(command)));
@@ -1322,8 +1412,36 @@ mod tests {
         }
     }
 
+    thread_local! {
+        static CLIP_HASH_SCRATCH: tempfile::TempDir = tempfile::tempdir().expect("clip identity scratch directory");
+    }
+
+    /// A real 16 kHz mono WAV whose decoded PCM depends only on `seed`, so a fixture clip's stored
+    /// identity (`clip_hash(seed)`) is the file's TRUE PCM hash and policy-4 finalization verifies
+    /// the source lease exactly as it does for a phone reviewer.
+    fn write_clip_wav(path: &Path, seed: usize) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        let salt = (seed % 100) as i16;
+        for n in 0..16_000_usize {
+            writer.write_sample(((n % 1000) as i16).wrapping_mul(30).wrapping_add(salt)).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
     fn clip_hash(index: usize) -> String {
-        format!("{:064x}", index + 1)
+        CLIP_HASH_SCRATCH.with(|dir| {
+            let path = dir.path().join(format!("{index}.wav"));
+            if !path.exists() {
+                write_clip_wav(&path, index);
+            }
+            cortex_speech_app_lib::export_bundle::current_canonical_pcm_blake3(&path).unwrap()
+        })
     }
 
     const FIXTURE_POOL_ID: &str = "123e4567-e89b-42d3-a456-426614174060";
@@ -1336,9 +1454,10 @@ mod tests {
         seed_champion(&db);
         let rows: Vec<_> = clips
             .iter()
-            .map(|(id, reviewed)| {
+            .enumerate()
+            .map(|(index, (id, reviewed))| {
                 let audio = data_dir.join(format!("{id}.wav"));
-                std::fs::write(&audio, b"wav").unwrap();
+                write_clip_wav(&audio, index);
                 fixture_segment(id, &audio, reviewed.then_some("ReviewerA"))
             })
             .collect();
@@ -1373,6 +1492,9 @@ mod tests {
         let (reviewer, action, text) = verdict;
         let (_, revision) = db.get_segment_by_id_with_revision(segment_id).unwrap().unwrap();
         let skip = action == "skip";
+        let authority = (!skip).then(|| {
+            review_pool::mint_synthetic_playback_authority(db, reviewer, segment_id, &"b".repeat(64)).unwrap()
+        });
         review_pool::record_decision(
             db,
             pool,
@@ -1392,6 +1514,7 @@ mod tests {
                 operation_id: &uuid::Uuid::new_v4().hyphenated().to_string(),
                 operation_payload_hash: &"b".repeat(64),
                 created_at_ms: at,
+                playback_authority_session_id: authority.as_deref(),
             },
         )
         .unwrap()
@@ -1633,6 +1756,124 @@ mod tests {
     }
 
     // ── Pool-backed helpers ──────────────────────────────────────────────────────────────────────
+
+    fn database_file_bytes(path: &Path) -> (Vec<u8>, Option<Vec<u8>>) {
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        (std::fs::read(path).unwrap(), wal.exists().then(|| std::fs::read(wal).unwrap()))
+    }
+
+    #[test]
+    fn commit_benchmark_clone_includes_wal_and_never_mutates_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.sqlite");
+        let source = rusqlite::Connection::open(&path).unwrap();
+        source
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES ('committed-in-wal');",
+            )
+            .unwrap();
+        let before = database_file_bytes(&path);
+        assert!(!before.1.as_ref().unwrap().is_empty(), "fixture must have uncheckpointed WAL");
+        let clone = DisposableBenchmarkDatabase::create(&path, std::time::Duration::from_secs(5)).unwrap();
+        let clone_path = clone.path.clone();
+        assert_ne!(clone_path, path);
+        let cloned = rusqlite::Connection::open(&clone_path).unwrap();
+        assert_eq!(
+            cloned.query_row("SELECT value FROM sentinel", [], |row| row.get::<_, String>(0)).unwrap(),
+            "committed-in-wal"
+        );
+        cloned.execute("UPDATE sentinel SET value='synthetic'", []).unwrap();
+        assert_eq!(
+            source.query_row("SELECT value FROM sentinel", [], |row| row.get::<_, String>(0)).unwrap(),
+            "committed-in-wal"
+        );
+        assert!(database_file_bytes(&path) == before, "source DB and WAL must be byte-identical");
+        drop(cloned);
+        drop(clone);
+        assert!(!clone_path.parent().unwrap().exists(), "owned scratch directory is removed");
+    }
+
+    #[test]
+    fn commit_benchmark_clone_refuses_missing_corrupt_and_expired_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.sqlite");
+        assert!(DisposableBenchmarkDatabase::create(&missing, std::time::Duration::from_secs(1)).is_err());
+        assert!(!missing.exists(), "read-only open must not create a missing source");
+        let corrupt = dir.path().join("corrupt.sqlite");
+        std::fs::write(&corrupt, b"not a sqlite database").unwrap();
+        assert!(DisposableBenchmarkDatabase::create(&corrupt, std::time::Duration::from_secs(1)).is_err());
+        assert_eq!(std::fs::read(&corrupt).unwrap(), b"not a sqlite database");
+        let error = DisposableBenchmarkDatabase::create(&missing, std::time::Duration::ZERO).unwrap_err();
+        assert!(error.to_string().contains("deadline exceeded before opening source"));
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn commit_benchmark_clone_refuses_busy_source_with_bounded_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.sqlite");
+        let source = rusqlite::Connection::open(&path).unwrap();
+        source.execute_batch("CREATE TABLE sentinel(value TEXT); BEGIN EXCLUSIVE;").unwrap();
+        let started = std::time::Instant::now();
+        assert!(DisposableBenchmarkDatabase::create(&path, std::time::Duration::from_secs(1)).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        source.execute_batch("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn commit_benchmark_joins_both_workers_on_error_and_panic() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        for panic in [false, true] {
+            let finished = Arc::new(AtomicBool::new(false));
+            let worker_finished = Arc::clone(&finished);
+            let left = std::thread::spawn(move || {
+                assert!(!panic, "injected worker panic");
+                Err("injected worker failure".to_string())
+            });
+            let right = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                worker_finished.store(true, Ordering::SeqCst);
+                Ok(vec![1.0])
+            });
+            assert!(join_commit_benchmark_workers(left, right).is_err());
+            assert!(finished.load(Ordering::SeqCst), "no worker may outlive scratch DB ownership");
+        }
+    }
+
+    #[test]
+    fn commit_benchmark_cli_isolates_success_and_failure_while_source_is_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cortex-speech.db");
+        let (source, _pool) = pool_fixture(dir.path(), &[("a", true), ("b", true)]);
+        source.connection().execute_batch("PRAGMA wal_autocheckpoint=0;").unwrap();
+        let _live_instance = cortex_speech_app_lib::flock::InstanceLock::try_lock(dir.path()).unwrap();
+        let before = database_file_bytes(&path);
+        let args = |iterations: &str| {
+            vec![
+                "benchmark-commit".to_string(),
+                "--db".to_string(),
+                path.to_string_lossy().into_owned(),
+                "--iterations".to_string(),
+                iterations.to_string(),
+                "--confirm-disposable".to_string(),
+            ]
+        };
+        run(args("2")).unwrap();
+        assert!(
+            database_file_bytes(&path) == before,
+            "successful CLI must not change source decisions, receipts or ledger"
+        );
+        assert!(run(args("0")).unwrap_err().to_string().contains("between 1 and 500"));
+        assert!(database_file_bytes(&path) == before, "error path must not change source");
+        let mut unconfirmed = args("2");
+        unconfirmed.pop();
+        assert!(run(unconfirmed).unwrap_err().to_string().contains("requires --confirm-disposable"));
+        assert!(database_file_bytes(&path) == before, "confirmation refusal must precede writable open");
+    }
 
     #[test]
     fn commit_benchmark_clip_loads_only_verified_human_decided_pool_members() {

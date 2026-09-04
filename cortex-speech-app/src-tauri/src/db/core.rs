@@ -102,6 +102,10 @@ pub(super) fn validate_policy4_effect_authority(conn: &Connection) -> AppResult<
              SELECT operation_id FROM independent_review_decisions
              UNION ALL
              SELECT operation_id FROM independent_review_reversals
+             UNION ALL
+             SELECT operation_id FROM review_pool_decisions
+             UNION ALL
+             SELECT operation_id FROM review_pool_reversals
          )
          SELECT
              (SELECT COUNT(*) FROM independent_operations independent
@@ -221,11 +225,22 @@ pub(super) fn validate_policy4_effect_authority(conn: &Connection) -> AppResult<
                        AND event.reviewer=consumption.reviewer COLLATE NOCASE
                        AND event.source='couch_spot_check'
                  ))
-                 OR (consumption.namespace='independent' AND EXISTS (
-                    SELECT 1 FROM independent_review_decisions decision
-                     WHERE decision.operation_id=consumption.operation_id
-                       AND decision.segment_id=consumption.segment_id
-                       AND decision.reviewer=consumption.reviewer COLLATE NOCASE
+                 OR (consumption.namespace='independent' AND (
+                    EXISTS (
+                        SELECT 1 FROM independent_review_decisions decision
+                         WHERE decision.operation_id=consumption.operation_id
+                           AND decision.segment_id=consumption.segment_id
+                           AND decision.reviewer=consumption.reviewer COLLATE NOCASE
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM review_pool_decisions decision
+                         WHERE decision.operation_id=consumption.operation_id
+                           AND decision.segment_id=consumption.segment_id
+                           AND decision.reviewer=consumption.reviewer COLLATE NOCASE
+                           AND decision.action<>'skip'
+                           AND decision.served_revision=session.segment_revision
+                           AND decision.audio_content_hash=session.audio_content_hash
+                    )
                  ))
              )",
         [],
@@ -858,6 +873,53 @@ pub(crate) fn consume_couch_playback_authority_on(
         params![playback_receipt_id, namespace, operation_id, reviewer, segment_id, created_at_ms],
     )?;
     Ok(())
+}
+
+/// Owner canon 2026-09-04: a paid pool second opinion proves the same policy-4 listening as a first
+/// opinion, inside the transaction that commits and pays it. The live evidence predicate re-checks
+/// reviewer, clip, revision, audio identity, span, coverage and interval sum against the current
+/// row; the consumption then binds the receipt to exactly this pool operation. The namespace is
+/// `independent` (the table's CHECK admits canonical | spot_check | independent): a pool judgement IS
+/// an independent second opinion, and the startup/restore audit links the row back through
+/// `review_pool_decisions.operation_id`, served revision and audio identity.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn consume_couch_playback_authority_for_pool_decision_on(
+    conn: &Connection,
+    playback_receipt_id: &str,
+    reviewer: &str,
+    segment_id: &str,
+    revision: i64,
+    content_hash: &str,
+    source_start_ms: i64,
+    source_end_ms: i64,
+    operation_id: &str,
+    created_at_ms: i64,
+) -> AppResult<()> {
+    let sufficient = has_sufficient_desktop_playback_evidence_v4_on(
+        conn,
+        segment_id,
+        revision,
+        content_hash,
+        source_start_ms,
+        source_end_ms,
+        Some(reviewer),
+        playback_receipt_id,
+    )?;
+    if !sufficient {
+        return Err(AppError::Validation(
+            "E_NO_PLAYBACK_EVIDENCE: a paid pool judgement must be bound to this reviewer's verified policy-4 traversal of exactly this clip revision"
+                .into(),
+        ));
+    }
+    consume_couch_playback_authority_on(
+        conn,
+        playback_receipt_id,
+        "independent",
+        operation_id,
+        reviewer,
+        segment_id,
+        created_at_ms,
+    )
 }
 
 /// Re-derive one historical policy-4 authority without consulting the mutable current segment row.

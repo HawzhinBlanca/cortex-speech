@@ -1021,6 +1021,8 @@ impl Database {
                  SELECT 1 FROM independent_review_decisions WHERE operation_id=?1
                  UNION ALL
                  SELECT 1 FROM independent_review_reversals WHERE operation_id=?1
+                 UNION ALL
+                 SELECT 1 FROM review_pool_reversals WHERE operation_id=?1
              )",
             [operation_id],
             |row| row.get(0),

@@ -592,7 +592,18 @@ impl Database {
                 params![effect.segment_id, effect.decision_revision],
                 |row| row.get(0),
             )?;
-            if current.1 < effect.decision_revision || later_review_mutation {
+            // Owner canon 2026-09-04: a pool second opinion is paid work built on this first opinion,
+            // and `review_pool::load` refuses to START over a pool decision that sits on an unverified
+            // clip — a restart would take every reviewer's link down. Once another reviewer has judged
+            // the clip, the first opinion can no longer be retracted; the owner's adjudication path
+            // exists for that.
+            let second_opinions_recorded: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM effective_review_pool_decisions_v62
+                  WHERE segment_id = ?1 AND action <> 'skip'",
+                params![effect.segment_id],
+                |row| row.get(0),
+            )?;
+            if current.1 < effect.decision_revision || later_review_mutation || second_opinions_recorded > 0 {
                 tx.rollback()?;
                 return Ok(HumanDecisionUndoOutcome::Conflict { segment: current.0 });
             }

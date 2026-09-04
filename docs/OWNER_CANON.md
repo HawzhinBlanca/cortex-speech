@@ -66,6 +66,21 @@ if a checkable pin drifts from what is written here.
   same person may never be two of its opinions), never per person, so throughput scales with however
   many reviewers are working. This supersedes the sequential single-reviewer campaign model for
   deciding sentences.
+- **Pool second opinions are paid (owner "change canon: pool second opinions are paid at the same
+  weights as first opinions (edit 100%, accept 10%, reject 10%)", 2026-09-04).** A flexible-pool
+  observation earns exactly what a first opinion earns for the same action on the same audio, under the
+  same immutable policy `review-iqd-v1-2026-08-21`, with the same canonical work identity, so one
+  reviewer is never paid twice for one clip. The credit is minted in the pool decision's own
+  transaction and reversed on undo; the `PAY_POLICY_REQUIRED` fence and its queue mirror are retired.
+  A paid pool judgement requires the reviewer's own finalized policy-4 listening of exactly that clip
+  revision, verified and consumed inside the same transaction (namespace `independent`, linked back
+  through the pool decision's operation id); no proof, a spent receipt, or a failed credit rolls the
+  judgement back whole. Startup and staged restore re-prove every pool consumption and credit; the
+  compensation readiness gate audits the paid flexible pool on the exact deployed schema.
+  Measured before the change: 1,451 one-opinion clips, zero two-opinion, ten active reviewers. Enforced:
+  `test_pool_pay_fence_scope_policy.py`, `review_pool.rs` tests, `db/core.rs` startup audit,
+  `restore_service/compensation.rs`, `check_review_compensation_readiness.py` (+ its pins). The blinded
+  second-pass CAMPAIGN stays fenced until priced separately.
 - Max 10 named reviewers (owner "change canon: raise max reviewers 8 → 10", 2026-08-31 — was 8);
   per-reviewer tokens; Stop revokes durably.
 - Dialect routing: **KBHP = Hawleri** (all 32 episodes, owner-confirmed). The organized corpus tree

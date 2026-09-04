@@ -1393,6 +1393,41 @@ mod tests {
         guard.served_work.insert((id.to_string(), reviewer.to_string()));
     }
 
+    /// A finalized policy-4 receipt for `reviewer` on `id`, bound to `binding`, minted through the same
+    /// DB-level finalization the HTTP route ends in (the route's wall-clock rate bound is a property of
+    /// real playback time, not of the contract under test).
+    fn policy4_pool_receipt(db: &Database, reviewer: &str, id: &str, binding: &str) -> String {
+        let revision = db.segment_review_revision(id).unwrap().expect("fixture revision");
+        let segment = db.get_segment_by_id(id).unwrap().expect("fixture segment");
+        let audio_content_hash = db.segment_audio_content_hash(id).unwrap().expect("fixture PCM identity");
+        let (source_start_ms, source_end_ms) = db.segment_source_span(id).unwrap().expect("fixture span");
+        let now_ms =
+            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(10_000).max(10_000);
+        let authority = CouchPlaybackAttemptAuthority {
+            playback_receipt_id: uuid::Uuid::new_v4().to_string(),
+            media_grant_id: uuid::Uuid::new_v4().to_string(),
+            client_attempt_id: uuid::Uuid::new_v4().to_string(),
+            session_binding_sha256: binding.to_string(),
+            reviewer: reviewer.to_string(),
+            segment_id: id.to_string(),
+            segment_revision: revision,
+            audio_content_hash,
+            source_path: std::path::PathBuf::from(segment.audio_path),
+            clip_duration_ms: segment.duration_ms,
+            source_start_ms,
+            source_end_ms,
+            issued_at_ms: now_ms,
+            expires_at_ms: now_ms + 60_000,
+        };
+        db.finalize_couch_playback_attempt_v1(
+            &authority,
+            &[crate::db::DesktopPlaybackInterval { start_ms: 0, end_ms: segment.duration_ms }],
+            segment.duration_ms,
+        )
+        .expect("fixture policy-4 playback finalizes")
+        .playback_receipt_id
+    }
+
     fn start_policy4_attempt(
         db: &Database,
         state: &Mutex<CouchState>,
@@ -1712,15 +1747,22 @@ mod tests {
         // refuse verified work outright, which 403'd the player's arming call on exactly this
         // fixture shape: the phone showed 00:00/00:00 forever and every save died on mustListen.
         // This is the arming call the page performs before it will set the <audio> src at all.
+        // The attempt is bound to the same cookie session `api_decision` decides under, because a pool
+        // second opinion now carries the same policy-4 proof as a first opinion (owner canon 2026-09-04).
+        let pool_binding = couch_session_binding_sha256("couch-test-session");
         let attempt = start_policy4_attempt(
             &db,
             &state,
             "pool-reviewed",
             "Alle",
-            "test-session-binding-pool",
+            &pool_binding,
             "40000000-0000-4000-8000-0000000000aa",
         );
         assert_eq!(attempt["segmentId"], "pool-reviewed", "playback authority must bind the served pool clip");
+        // The HTTP finalize route enforces the wall-clock rate bound (a 1,500 ms union needs real
+        // seconds to elapse); the decisions tests mint their proof through the same DB-level
+        // finalization the route ends in, and so does this one.
+        let pool_receipt_id = policy4_pool_receipt(&db, "Alle", "pool-reviewed", &pool_binding);
 
         let row_version = queue["items"][0]["rowVersion"].as_str().unwrap();
         let pool_operation_id = "30000000-0000-4000-8000-000000000002";
@@ -1731,8 +1773,7 @@ mod tests {
             "text": "Alle independent truth",
             "reviewer": "Alle",
             "rowVersion": row_version,
-            "heardMs": 1_500,
-            "clipDurationMs": 1_500,
+            "playbackReceiptId": pool_receipt_id,
         });
         let (code, _, body, ..) = api_decision(&db, decision.to_string().as_bytes(), "Alle", &state);
         assert_eq!(code, 200, "pool decision failed: {}", String::from_utf8_lossy(&body));
@@ -1785,7 +1826,14 @@ mod tests {
         let mut changed_reviewer = decision.clone();
         changed_reviewer["reviewer"] = serde_json::json!("Hemn");
         let changed_reviewer: DecisionBody = serde_json::from_value(changed_reviewer).unwrap();
-        let (code, ..) = api_pool_decision(&db, &changed_reviewer, "Hemn", &restarted_state, &pool);
+        let (code, ..) = api_pool_decision(
+            &db,
+            &changed_reviewer,
+            "Hemn",
+            &couch_session_binding_sha256("couch-test-session"),
+            &restarted_state,
+            &pool,
+        );
         assert_eq!(code, 409, "a different reviewer must not inherit the pool receipt");
         assert_eq!(pool_decision_count(), 1);
 

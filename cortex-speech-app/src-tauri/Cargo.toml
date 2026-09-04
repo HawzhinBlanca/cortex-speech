@@ -45,6 +45,8 @@ csv = "1"
 
 # Database
 rusqlite = { version = "0.31", features = ["bundled", "backup"] }
+# Runtime-owned scratch databases keep synthetic commit benchmarks off the source library.
+tempfile = "3"
 
 # Utilities
 uuid = { version = "1", features = ["v4"] }
@@ -111,7 +113,6 @@ libc = "0.2"
 # the release build (verified: `cargo tree -e normal,features` shows no tauri "test" feature).
 tauri = { version = "2", features = ["test"] }
 proptest = "1"
-tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 assert_cmd = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
