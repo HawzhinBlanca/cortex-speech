@@ -993,16 +993,24 @@
   // FOLLOW THROUGH ON WHAT THE BANNER ASKS (R4.3). The message says "find those clips and review them
   // again" and then offered no way to find them — the reviewer was told to search a queue by eye, on a
   // phone, for ids they were never shown. If any refused clip IS in the batch they are holding, tapping
-  // the banner goes to it. If none is (the usual case after a refusal — someone else took it), the tap
-  // does nothing rather than lying about having moved: a jump to the wrong clip would be worse than no
-  // jump, because the reviewer would trust it. No new string; the banner itself is the affordance.
+  // the banner goes to it. If none is (the usual case after a refusal — someone else took it, or the
+  // entry predates this reviewer on a shared phone), there is nothing this reviewer can do about it:
+  // the tap used to do nothing, so the banner stayed for the life of the browser profile. Measured
+  // 2026-09-04 on the owner's phone: "187 decisions could not be saved" — entries from weeks of opening
+  // links on one device, none of them actionable. A tap with nothing to jump to now DISMISSES the
+  // entries this reviewer can see (their own and the unstamped legacy ones); other reviewers' stamped
+  // entries stay for them. The server already holds every decision that landed; this list is only the
+  // phone's memory of refusals, and dropping it loses no work.
   $('err').addEventListener('click', () => {
     if (errKind !== 'refused') return;
     const refused = refusedMine();
     const pos = queue.findIndex((s) => refused.some((x) => x.id === s.id));
-    if (pos < 0) return;
-    i = pos;
-    show();
+    if (pos >= 0) { i = pos; show(); return; }
+    const dismissed = new Set(refused.map((x) => x.id));
+    const left = readRefused().filter((x) => !dismissed.has(x.id));
+    if (left.length) localStorage.setItem(REFUSED, JSON.stringify(left));
+    else localStorage.removeItem(REFUSED);
+    clearErr('refused');
   });
   // ONE flush at a time. Three things call this now — the `online` event, load(), and the 30s retry
   // timer — and an overlapping run re-POSTs items another is already sending. The server dedups, so
