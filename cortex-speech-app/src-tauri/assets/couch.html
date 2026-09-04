@@ -1100,7 +1100,11 @@
       // never told it was saved, the clip is still pending, and their text is the only copy. Clearing
       // the refused banner would be worse than useless — a skip does not make the earlier work land.
       if (item.action !== 'skip') {
-        sessionStorage.removeItem(draftKey(item.id));
+        // A queue refresh can change the tab's reviewer while the ACK is in flight. Even for the
+        // same reviewer, later typing is not part of this acknowledged immutable submission.
+        if (submissionReviewer === me && sessionStorage.getItem(draftKey(item.id)) === item.text) {
+          sessionStorage.removeItem(draftKey(item.id));
+        }
         clearRefused(item.id, submissionReviewer); // it landed after all
       }
     }
@@ -1594,6 +1598,12 @@
 
   async function decide(action) {
     if (busy || !queue[i]) return;
+    // Capture the click, not whatever a queue refresh displays after finalization or the POST.
+    const submittedSegment = { ...queue[i] };
+    const submittedReviewer = me;
+    const submittedText = $('text').value;
+    const submissionStillCurrent = () => me === submittedReviewer
+      && playbackIdentity(queue[i]) === playbackIdentity(submittedSegment);
     // A skip is the ABSENCE of a verdict, so none of what follows a decision applies to it: it is not
     // work done (counting it would inflate the ✓ tally with clips nobody judged), it must not toast
     // "Saved" over something that saved nothing, and it must NOT clear the draft — whatever the
@@ -1607,9 +1617,14 @@
     // Finalization failure creates no outbox verdict, advances nowhere, and leaves the draft intact.
     let submission;
     try {
-      const playbackReceiptId = isSkip ? undefined : await finalizePlaybackForDecision(queue[i]);
-      submission = { operationId: newOperationId(), id: queue[i].id, action, text: $('text').value, reviewer: me, rowVersion: queue[i].rowVersion,
-                     pilotAfterReviewEventId: queue[i].pilotAfterReviewEventId,
+      const playbackReceiptId = isSkip ? undefined : await finalizePlaybackForDecision(submittedSegment);
+      if (!submissionStillCurrent()) {
+        busy = false;
+        btns.forEach(b => b.disabled = false);
+        return; // no outbox record or POST may bind an old receipt to a new reviewer/revision
+      }
+      submission = { operationId: newOperationId(), id: submittedSegment.id, action, text: submittedText, reviewer: submittedReviewer, rowVersion: submittedSegment.rowVersion,
+                     pilotAfterReviewEventId: submittedSegment.pilotAfterReviewEventId,
                      playbackReceiptId };
       // The durable write MUST precede the first network byte. If localStorage is unavailable/full,
       // do not submit: a server commit followed by a dropped response would otherwise have no stable
@@ -1618,8 +1633,10 @@
     } catch (error) {
       // A persistence failure is NOT an offline/queued decision. Stay on the clip, keep the draft,
       // and never tell the reviewer work is durable when no outbox entry exists.
-      if (error.status === 428) toast(t('mustListen'), true);
-      else toast(t('saveFailed', { err: error.status || '—' }), true);
+      if (submissionStillCurrent()) {
+        if (error.status === 428) toast(t('mustListen'), true);
+        else toast(t('saveFailed', { err: error.status || '—' }), true);
+      }
       busy = false;
       btns.forEach(b => b.disabled = false);
       return;
@@ -1630,10 +1647,16 @@
       });
       rememberPoolUndoTarget(submission, saved);
       removeSubmission(submission.operationId);
+      if (!submissionStillCurrent()) {
+        if (!isSkip) clearRefused(submission.id, submission.reviewer);
+        return; // the old operation landed; the new reviewer's draft/progress/playback is unrelated
+      }
       // Both judged-audio progress and weighted earnings come back WITH the committed decision.
       applyAccounting(saved);
       if (!isSkip) {
-        sessionStorage.removeItem(draftKey(submission.id));
+        if (sessionStorage.getItem(draftKey(submission.id)) === submission.text) {
+          sessionStorage.removeItem(draftKey(submission.id));
+        }
         clearRefused(submission.id, submission.reviewer); // retract only this author's refusal
         decidedHere.add(submission.id); // so a STALE outbox replay of this clip cannot claim work was lost
         toast(action === 'bad' ? t('markedBad') : t('saved'));
@@ -1644,6 +1667,9 @@
       // of what they need. The clip loads and waits for them.
       i += 1; show(!isSkip);
     } catch (e) {
+      // Resolve this operation when its author returns. A delayed refusal must not advance or
+      // re-arm another reviewer's clip, and retryable work must keep its original durable UUID.
+      if (!submissionStillCurrent()) return;
       // HOLD, and move on. None of these is a verdict on the decision itself, so the reviewer must
       // not lose it and must not be stranded on the clip:
       //   no status  — the request never reached the server (offline).
