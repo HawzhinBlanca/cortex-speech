@@ -52,6 +52,15 @@ def test_playwright_targets_the_fixed_vite_server() -> None:
     assert_contains(playwright, "timeout: 120000", "playwright.config.ts")
 
 
+def test_cold_dependency_scan_includes_lazy_workspaces() -> None:
+    vite = read("vite.config.ts")
+    assert_regex(
+        vite,
+        r"optimizeDeps:\s*\{[^}]*entries:\s*\[\s*'index\.html',\s*'src/\*\*/\*\.svelte',\s*'src/\*\*/\*\.ts'\s*\]",
+        "cold-start dependency scan must cover HTML and lazy Svelte/TypeScript workspaces",
+    )
+
+
 def test_tauri_dev_config_targets_the_fixed_vite_server() -> None:
     build = tauri_config()["build"]
 
@@ -77,6 +86,7 @@ def test_package_scripts_do_not_bypass_vite_config() -> None:
 def main() -> None:
     test_vite_dev_server_uses_fixed_strict_port()
     test_playwright_targets_the_fixed_vite_server()
+    test_cold_dependency_scan_includes_lazy_workspaces()
     test_tauri_dev_config_targets_the_fixed_vite_server()
     test_package_scripts_do_not_bypass_vite_config()
     print("dev server policy regression passed")
