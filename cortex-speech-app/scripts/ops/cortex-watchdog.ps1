@@ -193,13 +193,19 @@ public static class CortexOperationsDigest {
         List<Entry> entries = new List<Entry>();
         AddTree(root, scripts, entries);
         string migration = Path.Combine(root, "src-tauri", "src", "migrations", "mod.rs");
+        string dialect = Path.Combine(root, "src-tauri", "src", "dialect.rs");
         FileInfo migrationInfo = new FileInfo(migration);
-        if (!migrationInfo.Exists || entries.Count == 0)
-            throw new IOException("operations bundle is missing scripts or the canonical migration ledger");
+        FileInfo dialectInfo = new FileInfo(dialect);
+        if (!migrationInfo.Exists || !dialectInfo.Exists || entries.Count == 0)
+            throw new IOException("operations bundle is missing scripts, the canonical migration ledger, or dialect authority");
         if ((migrationInfo.Attributes & FileAttributes.ReparsePoint) != 0)
             throw new IOException("canonical migration ledger is a reparse point");
+        if ((dialectInfo.Attributes & FileAttributes.ReparsePoint) != 0)
+            throw new IOException("dialect authority is a reparse point");
         RequireContainedDirectoryChain(root, migrationInfo);
+        RequireContainedDirectoryChain(root, dialectInfo);
         entries.Add(new Entry("src-tauri/src/migrations/mod.rs", migrationInfo.FullName));
+        entries.Add(new Entry("src-tauri/src/dialect.rs", dialectInfo.FullName));
         entries.Sort(delegate(Entry left, Entry right) {
             return StringComparer.Ordinal.Compare(left.Relative, right.Relative);
         });

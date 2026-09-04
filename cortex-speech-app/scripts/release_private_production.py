@@ -505,17 +505,26 @@ def validate_dedup_manifest(path: Path) -> tuple[Path, str]:
     return resolved, claimed
 
 
-def operations_bundle_sha256(root: Path) -> str:
-    """Bind every staged operational script plus the canonical migration ledger."""
+def operations_bundle_sha256(root: Path, *, allow_legacy_missing_dialect: bool = False) -> str:
+    """Bind staged operations, optionally recognizing the prior release digest shape."""
     files = [
         path
         for path in (root / "scripts").rglob("*")
         if path.is_file() and "__pycache__" not in path.parts and path.suffix.lower() != ".pyc"
     ]
     migrations = root / "src-tauri" / "src" / "migrations" / "mod.rs"
-    if not migrations.is_file() or not files:
-        raise ReleaseError("operations bundle is missing scripts or the canonical migration ledger")
+    dialects = root / "src-tauri" / "src" / "dialect.rs"
+    if (
+        not migrations.is_file()
+        or not files
+        or (not dialects.is_file() and not allow_legacy_missing_dialect)
+    ):
+        raise ReleaseError(
+            "operations bundle is missing scripts, the canonical migration ledger, or dialect authority"
+        )
     files.append(migrations)
+    if dialects.is_file():
+        files.append(dialects)
     digest = hashlib.sha256()
     for path in sorted(files, key=lambda value: value.relative_to(root).as_posix()):
         relative = path.relative_to(root).as_posix().encode("utf-8")
@@ -571,7 +580,10 @@ def validate_manifest(
     operations_sha = value["operationsSha256"]
     if not isinstance(operations_sha, str) or not SHA64.fullmatch(operations_sha):
         raise ReleaseError("operationsSha256 is invalid")
-    if operations_bundle_sha256(directory) != operations_sha:
+    if (
+        operations_bundle_sha256(directory, allow_legacy_missing_dialect=allow_compatible_previous)
+        != operations_sha
+    ):
         raise ReleaseError("the staged operations bundle does not match its release SHA-256")
     dedup_path = Path(str(value["dedupManifest"]))
     if not is_within(dedup_path, directory):
@@ -598,8 +610,11 @@ def validate_manifest(
 def copy_source_bundle(source_root: Path, stage: Path) -> None:
     scripts = source_root / "scripts"
     migrations = source_root / "src-tauri" / "src" / "migrations" / "mod.rs"
-    if not scripts.is_dir() or not migrations.is_file():
-        raise ReleaseError("source root is missing scripts or the canonical migration ledger")
+    dialects = source_root / "src-tauri" / "src" / "dialect.rs"
+    if not scripts.is_dir() or not migrations.is_file() or not dialects.is_file():
+        raise ReleaseError(
+            "source root is missing scripts, the canonical migration ledger, or dialect authority"
+        )
     shutil.copytree(
         scripts,
         stage / "scripts",
@@ -608,6 +623,7 @@ def copy_source_bundle(source_root: Path, stage: Path) -> None:
     migration_target = stage / "src-tauri" / "src" / "migrations"
     migration_target.mkdir(parents=True)
     shutil.copy2(migrations, migration_target / "mod.rs")
+    shutil.copy2(dialects, migration_target.parent / "dialect.rs")
 
 
 def stage_release(
