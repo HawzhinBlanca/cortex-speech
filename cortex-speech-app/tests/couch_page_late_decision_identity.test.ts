@@ -84,6 +84,59 @@ afterEach(() => {
 });
 
 describe('couch.html — delayed decisions across a shared-phone identity change', () => {
+  it('a new reviewer obtains a fresh playback grant even for the same clip revision', async () => {
+    const dom = await bootPage();
+    dom.window.eval(`
+      playbackAttempt = { identity: playbackIdentity(queue[i]), playbackReceiptId: 'Sara-old-grant' };
+      playbackTraversalIdentity = playbackIdentity(queue[i]);
+      $('player').src = proofAudioUrl(queue[i], 'Sara-old-grant');
+      window.playbackStarts = 0;
+      const previousApi = api;
+      api = async (path, options) => {
+        if (path === '/api/playback/start') {
+          window.playbackStarts += 1;
+          return new Promise(() => {}); // fresh grant deliberately pending; no physical playback
+        }
+        return previousApi(path, options);
+      };
+      window.nextReviewer = 'Hemn';
+    `);
+    await dom.window.eval('load()');
+    expect(dom.window.eval('window.playbackStarts')).toBe(1);
+    expect(dom.window.document.getElementById('player')!.getAttribute('src')).toBeNull();
+  });
+
+  it('a new reviewer does not inherit the previous reviewer session progress', async () => {
+    const dom = await bootPage();
+    await startPendingDecision(dom, 'online');
+    dom.window.eval('window.resolveDecision({})');
+    await dom.window.eval('window.pendingDecision');
+    expect(dom.window.eval('doneThisSession')).toBe(1);
+    dom.window.eval("window.nextReviewer = 'Hemn'");
+    await dom.window.eval('load()');
+    expect(dom.window.eval('doneThisSession')).toBe(0);
+    expect(dom.window.document.getElementById('progress')!.textContent).not.toContain('✓1');
+  });
+
+  it('a previous reviewer success cannot suppress the new reviewer refused-work warning', async () => {
+    const dom = await bootPage();
+    await startPendingDecision(dom, 'online');
+    dom.window.eval('window.resolveDecision({})');
+    await dom.window.eval('window.pendingDecision');
+    dom.window.eval("window.nextReviewer = 'Hemn'; window.items = [window.items[0]]");
+    await dom.window.eval('load()');
+    dom.window.eval(`
+      queueSubmission({ operationId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', id: 'shared',
+        action: 'edit', text: 'Hemn correction', reviewer: 'Hemn', rowVersion: '1',
+        playbackReceiptId: 'Hemn-finalized-receipt' });
+      api = async () => { throw Object.assign(new Error('invalid submission'), { status: 400 }); };
+    `);
+    await dom.window.eval('flushOutbox()');
+    expect(JSON.parse(dom.window.localStorage.getItem('cortex.couch.refused') || '[]')).toEqual([
+      { id: 'shared', by: 'Hemn' },
+    ]);
+  });
+
   it('a failed finalization for the previous reviewer leaves the new reviewer screen untouched', async () => {
     const dom = await bootPage();
     dom.window.eval(`
