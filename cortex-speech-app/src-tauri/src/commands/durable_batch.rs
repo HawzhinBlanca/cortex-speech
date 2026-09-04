@@ -429,3 +429,270 @@ impl<R: tauri::Runtime> Drop for DurableBatchWorkerGuard<R> {
         }
     }
 }
+
+#[cfg(test)]
+mod durable_batch_contract_tests {
+    use super::*;
+    use crate::db::{BatchItemCountsV1, BatchJobKindV1, BatchJobLifecycleV1, BatchJobStatusV1};
+    use tauri::Manager;
+
+    fn status(
+        operation_id: &str,
+        kind: BatchJobKindV1,
+        state: BatchJobLifecycleV1,
+        total: i64,
+        counts: BatchItemCountsV1,
+        error_code: Option<&str>,
+    ) -> BatchJobStatusV1 {
+        BatchJobStatusV1 {
+            operation_id: operation_id.to_string(),
+            kind,
+            state,
+            total,
+            completed: counts.applied + counts.skipped + counts.failed + counts.abandoned,
+            progress: 0.0,
+            counts,
+            request_sha256: "1".repeat(64),
+            config_sha256: "2".repeat(64),
+            error_code: error_code.map(str::to_string),
+            started_at: Some("2026-09-04T00:00:00Z".to_string()),
+            finished_at: None,
+        }
+    }
+
+    fn counts(applied: i64, failed: i64, skipped: i64, abandoned: i64) -> BatchItemCountsV1 {
+        BatchItemCountsV1 { pending: 0, applied, skipped, failed, abandoned }
+    }
+
+    fn outcome(total: usize, succeeded: u32, abandoned: u32) -> BatchRunOutcome {
+        BatchRunOutcome {
+            disposition: BatchRunDisposition::Completed,
+            total,
+            succeeded,
+            failed: 0,
+            skipped: 0,
+            abandoned,
+            cancelled: false,
+            error_code: None,
+        }
+    }
+
+    #[test]
+    fn durable_outcome_maps_every_lifecycle_and_sanitizes_failure_codes() {
+        for lifecycle in [BatchJobLifecycleV1::Queued, BatchJobLifecycleV1::Running] {
+            let live = status("live", BatchJobKindV1::Normalize, lifecycle, 2, counts(0, 0, 0, 0), None);
+            assert_eq!(durable_batch_outcome(&live).expect("live status is valid"), None);
+        }
+
+        let cases = [
+            (BatchJobLifecycleV1::Succeeded, None, BatchRunDisposition::Completed, false, None),
+            (BatchJobLifecycleV1::Cancelled, None, BatchRunDisposition::Cancelled, true, None),
+            (
+                BatchJobLifecycleV1::Failed,
+                Some("BATCH_WORKER_PANICKED"),
+                BatchRunDisposition::Panicked,
+                false,
+                Some("BATCH_WORKER_PANICKED"),
+            ),
+            (
+                BatchJobLifecycleV1::Failed,
+                Some("AUDIO_DECODE_FAILED"),
+                BatchRunDisposition::Halted,
+                false,
+                Some("AUDIO_DECODE_FAILED"),
+            ),
+            (
+                BatchJobLifecycleV1::Failed,
+                Some("private sqlite detail"),
+                BatchRunDisposition::Halted,
+                false,
+                Some("BATCH_EVIDENCE_INVALID"),
+            ),
+            (BatchJobLifecycleV1::Failed, None, BatchRunDisposition::Halted, false, Some("BATCH_EVIDENCE_INVALID")),
+        ];
+        for (lifecycle, error_code, disposition, cancelled, public_error) in cases {
+            let terminal = status("terminal", BatchJobKindV1::Transcribe, lifecycle, 4, counts(1, 1, 1, 1), error_code);
+            let actual = durable_batch_outcome(&terminal)
+                .expect("terminal evidence is internally consistent")
+                .expect("terminal state has an outcome");
+            assert_eq!(actual.disposition, disposition);
+            assert_eq!(
+                (actual.total, actual.succeeded, actual.failed, actual.skipped, actual.abandoned),
+                (4, 1, 1, 1, 1)
+            );
+            assert_eq!(actual.cancelled, cancelled);
+            assert_eq!(actual.error_code.as_deref(), public_error);
+        }
+
+        let allowed = [
+            "CHAMPION_UNAVAILABLE",
+            "CHAMPION_IDENTITY_MISMATCH",
+            "MODEL_IDENTITY_CHANGED",
+            "TRANSCRIPTION_SOURCE_CHANGED",
+            "AUDIO_DECODE_FAILED",
+            "BATCH_SEGMENT_MISSING",
+            "BATCH_TRANSCRIPT_WRITE_FAILED",
+            "BATCH_NORMALIZATION_FAILED",
+            "BATCH_REFINEMENT_FAILED",
+            "BATCH_JURY_FAILED",
+            "BATCH_TRANSCRIPTION_FAILED",
+            "BATCH_WORKER_START_FAILED",
+            "BATCH_WORKER_PANICKED",
+            "PROCESS_INTERRUPTED",
+        ];
+        for code in allowed {
+            assert_eq!(public_durable_batch_error_code(Some(code)), code);
+        }
+    }
+
+    #[test]
+    fn durable_outcome_rejects_negative_overflowing_and_unaccounted_counts() {
+        let invalid_cases = [
+            ("total", -1, counts(0, 0, 0, 0)),
+            ("applied", 0, counts(-1, 0, 0, 1)),
+            ("failed", 0, counts(0, -1, 0, 1)),
+            ("skipped", 0, counts(0, 0, -1, 1)),
+            ("abandoned", 0, counts(0, 0, 0, -1)),
+            ("applied", i64::from(u32::MAX) + 1, counts(i64::from(u32::MAX) + 1, 0, 0, 0)),
+            ("do not equal total", 2, counts(1, 0, 0, 0)),
+        ];
+        for (needle, total, item_counts) in invalid_cases {
+            let malformed = status(
+                "malformed",
+                BatchJobKindV1::Normalize,
+                BatchJobLifecycleV1::Succeeded,
+                total,
+                item_counts,
+                None,
+            );
+            let error = durable_batch_outcome(&malformed).expect_err("malformed durable evidence must fail closed");
+            assert!(error.to_string().contains(needle), "unexpected error for {needle}: {error}");
+        }
+
+        let negative_live_total = status(
+            "negative-live-total",
+            BatchJobKindV1::Normalize,
+            BatchJobLifecycleV1::Running,
+            -1,
+            counts(0, 0, 0, 0),
+            None,
+        );
+        assert!(
+            durable_batch_status_response(negative_live_total).is_err(),
+            "the public response must reject a negative total even while a batch is live"
+        );
+    }
+
+    #[test]
+    fn durable_status_response_exposes_only_running_or_exactly_settled_truth() {
+        let live = durable_batch_status_response(status(
+            "response-live",
+            BatchJobKindV1::Normalize,
+            BatchJobLifecycleV1::Queued,
+            3,
+            counts(0, 0, 0, 0),
+            None,
+        ))
+        .expect("queued response");
+        assert_eq!(live.status, crate::ipc_contract::BatchRunStatusV1::Running);
+        assert_eq!(live.operation, Some(crate::ipc_contract::BatchOperationV1::Normalize));
+        assert_eq!(live.total, Some(3));
+        assert_eq!(live.outcome, None);
+
+        let settled = durable_batch_status_response(status(
+            "response-settled",
+            BatchJobKindV1::Transcribe,
+            BatchJobLifecycleV1::Cancelled,
+            3,
+            counts(1, 0, 1, 1),
+            None,
+        ))
+        .expect("cancelled response");
+        assert_eq!(settled.status, crate::ipc_contract::BatchRunStatusV1::Settled);
+        assert_eq!(settled.operation, Some(crate::ipc_contract::BatchOperationV1::Transcribe));
+        assert!(settled.outcome.expect("terminal outcome").cancelled);
+    }
+
+    #[test]
+    fn publication_refuses_untracked_live_truth_and_process_identity_disagreement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = crate::test_support::managed_app_state(tmp.path());
+        let state = app.state::<AppState>();
+
+        let untracked = status(
+            "untracked-live",
+            BatchJobKindV1::Normalize,
+            BatchJobLifecycleV1::Running,
+            1,
+            counts(0, 0, 0, 0),
+            None,
+        );
+        assert!(publishable_durable_batch_status(&state, untracked).is_err());
+
+        let operation_id = uuid::Uuid::from_u128(0xd001).to_string();
+        state
+            .try_start_batch_for_run(&operation_id, crate::BatchOperation::Normalize, 2)
+            .expect("admit process-local normalize identity");
+        let wrong_kind = status(
+            &operation_id,
+            BatchJobKindV1::Transcribe,
+            BatchJobLifecycleV1::Running,
+            2,
+            counts(0, 0, 0, 0),
+            None,
+        );
+        let error = publishable_durable_batch_status(&state, wrong_kind)
+            .expect_err("a process/durable kind disagreement must fail closed");
+        assert!(error.to_string().contains("identity disagrees"));
+
+        let terminal_header = status(
+            &operation_id,
+            BatchJobKindV1::Normalize,
+            BatchJobLifecycleV1::Succeeded,
+            2,
+            counts(2, 0, 0, 0),
+            None,
+        );
+        let hidden = publishable_durable_batch_status(&state, terminal_header)
+            .expect("a matching but physically live process remains publishable as running");
+        assert_eq!(hidden.status, crate::ipc_contract::BatchRunStatusV1::Running);
+        assert_eq!(hidden.outcome, None, "durable completion stays hidden until the process gate settles");
+    }
+
+    #[test]
+    fn publication_requires_settled_ram_outcome_to_equal_durable_truth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = crate::test_support::managed_app_state(tmp.path());
+        let state = app.state::<AppState>();
+        let operation_id = uuid::Uuid::from_u128(0xd002).to_string();
+        state
+            .try_start_batch_for_run(&operation_id, crate::BatchOperation::Normalize, 2)
+            .expect("admit process-local identity");
+        assert!(state.record_batch_outcome(&operation_id, crate::BatchOperation::Normalize, outcome(2, 2, 0),));
+        assert!(state.finish_batch_for_run(&operation_id, crate::BatchOperation::Normalize));
+
+        let matching = status(
+            &operation_id,
+            BatchJobKindV1::Normalize,
+            BatchJobLifecycleV1::Succeeded,
+            2,
+            counts(2, 0, 0, 0),
+            None,
+        );
+        let response = publishable_durable_batch_status(&state, matching)
+            .expect("matching process and durable outcomes are publishable");
+        assert_eq!(response.status, crate::ipc_contract::BatchRunStatusV1::Settled);
+
+        let mismatched = status(
+            &operation_id,
+            BatchJobKindV1::Normalize,
+            BatchJobLifecycleV1::Succeeded,
+            2,
+            counts(1, 0, 0, 1),
+            None,
+        );
+        let error = publishable_durable_batch_status(&state, mismatched)
+            .expect_err("RAM and durable outcomes must agree exactly");
+        assert!(error.to_string().contains("outcome disagrees"));
+    }
+}
