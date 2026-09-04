@@ -1104,7 +1104,7 @@ pub fn pending_segment_ids(
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
         })
         .map_err(|error| format!("review pool queue cannot be read: {error}"))?;
-    let mut pending: Vec<(usize, [u8; 32], String)> = Vec::new();
+    let mut pending: Vec<PendingVoiceCandidate> = Vec::new();
     for row in rows {
         let (segment_id, audio_path, already_canonical) =
             row.map_err(|error| format!("review pool row is unreadable: {error}"))?;
@@ -1154,17 +1154,140 @@ pub fn pending_segment_ids(
             _ => 3,
         };
         // Preserve decision proximity as the first authority, but do not make a reviewer listen to
-        // one import/podcast sequence for hours. `created_at` is source-ingest order, and the Lamo
-        // corpus was imported file-by-file; sorting by it produced runs such as 011978, 011979,
-        // 011981, 011982. They are distinct clips but sound repetitious and amplify shared background
-        // imperfections. A content-independent stable digest scatters each priority tier across the
-        // frozen pool, remains identical after restart, and cannot make lower-priority work jump a
-        // clip that is nearer consensus.
+        // one import/podcast sequence or one voice for hours. `created_at` is source-ingest order, and
+        // the Lamo corpus was imported file-by-file; sorting by it produced runs such as 011978,
+        // 011979, 011981, 011982. A digest alone scattered source files, but a pool that is ~70% Lamo
+        // still produced thousands of adjacent same-voice transitions and reviewers reasonably
+        // described that as hearing "the same sound" again. Keep a content-independent stable digest
+        // within each voice, then smoothly interleave the frozen voice buckets inside each priority tier.
+        // This remains identical after restart and never lets lower-priority work jump a clip nearer
+        // consensus.
         let spread_key: [u8; 32] = Sha256::digest(segment_id.as_bytes()).into();
-        pending.push((distance_to_decision, spread_key, segment_id));
+        let voice_name = pool
+            .members
+            .get(&segment_id)
+            .map(|member| member.voice_name.clone())
+            .ok_or_else(|| format!("review pool clip {segment_id} has no frozen voice identity"))?;
+        pending.push((distance_to_decision, voice_name, spread_key, segment_id));
     }
-    pending.sort_unstable();
-    Ok(pending.into_iter().map(|(_, _, segment_id)| segment_id).collect())
+    interleave_pending_voices(pending)
+}
+
+type PendingVoiceCandidate = (usize, String, [u8; 32], String);
+type PendingVoiceItem = ([u8; 32], String);
+
+struct PendingVoiceBucket {
+    items: Vec<PendingVoiceItem>,
+    weight: i128,
+    credit: i128,
+}
+
+type PendingVoiceTier = BTreeMap<String, PendingVoiceBucket>;
+
+/// Deterministically spread voices without weakening decision proximity.
+///
+/// Each tier is independent: a fresh clip can never jump work one opinion from resolution. Smooth
+/// weighted round-robin retains the real corpus proportions while spreading minority voices across
+/// the whole tier instead of consuming them at the front and leaving one enormous same-voice tail.
+/// The streak ceiling is the mathematical lower bound `ceil(largest / (all_other + 1))`, so it never
+/// promises a mix the corpus cannot supply. Before choosing a voice, a feasibility check proves the
+/// remainder can still meet that ceiling; this prevents a superficially balanced prefix followed by
+/// an oversized one-voice tail. The BTreeMap makes ties stable, and reverse-sorted voice vectors let
+/// `pop` emit the smallest SHA-256 key in O(1).
+fn interleave_pending_voices(candidates: Vec<PendingVoiceCandidate>) -> Result<Vec<String>, String> {
+    let mut tiers: BTreeMap<usize, PendingVoiceTier> = BTreeMap::new();
+    for (distance, voice_name, spread_key, segment_id) in candidates {
+        tiers
+            .entry(distance)
+            .or_default()
+            .entry(voice_name)
+            .or_insert_with(|| PendingVoiceBucket { items: Vec::new(), weight: 0, credit: 0 })
+            .items
+            .push((spread_key, segment_id));
+    }
+
+    let mut ordered = Vec::new();
+    for voices in tiers.values_mut() {
+        for bucket in voices.values_mut() {
+            bucket.items.sort_unstable_by(|left, right| right.cmp(left));
+            bucket.weight = bucket.items.len() as i128;
+        }
+
+        let total: usize = voices.values().map(|bucket| bucket.items.len()).sum();
+        let largest = voices.values().map(|bucket| bucket.items.len()).max().unwrap_or(0);
+        let alternatives = total.saturating_sub(largest);
+        let max_streak = largest.div_ceil(alternatives + 1).max(1);
+        let total_weight = total as i128;
+        let mut last_voice: Option<String> = None;
+        let mut streak = 0usize;
+
+        for _ in 0..total {
+            let mut active: Vec<String> =
+                voices.iter().filter(|(_, bucket)| !bucket.items.is_empty()).map(|(voice, _)| voice.clone()).collect();
+            if active.is_empty() {
+                return Err("review pool voice scheduler exhausted before its measured tier".to_string());
+            }
+            for voice in &active {
+                let Some(bucket) = voices.get_mut(voice) else {
+                    return Err("review pool voice scheduler lost an active bucket".to_string());
+                };
+                bucket.credit += bucket.weight;
+            }
+            active.sort_by(|left, right| {
+                let left_credit = voices.get(left).map_or(i128::MIN, |bucket| bucket.credit);
+                let right_credit = voices.get(right).map_or(i128::MIN, |bucket| bucket.credit);
+                right_credit.cmp(&left_credit).then_with(|| left.cmp(right))
+            });
+            let mut selected: Option<String> = None;
+            for voice in &active {
+                let next_streak = if last_voice.as_ref() == Some(voice) { streak + 1 } else { 1 };
+                if next_streak > max_streak
+                    || !remaining_voice_schedule_is_feasible(voices, voice, next_streak, max_streak)
+                {
+                    continue;
+                }
+                selected = Some(voice.clone());
+                break;
+            }
+            let Some(voice) = selected else {
+                return Err("review pool voice scheduler cannot satisfy its feasible streak bound".to_string());
+            };
+            let Some(bucket) = voices.get_mut(&voice) else {
+                return Err("review pool voice scheduler lost the selected bucket".to_string());
+            };
+            let Some((_, segment_id)) = bucket.items.pop() else {
+                return Err("review pool voice scheduler selected an empty bucket".to_string());
+            };
+            bucket.credit -= total_weight;
+            if last_voice.as_ref() == Some(&voice) {
+                streak += 1;
+            } else {
+                last_voice = Some(voice);
+                streak = 1;
+            }
+            ordered.push(segment_id);
+        }
+    }
+    Ok(ordered)
+}
+
+fn remaining_voice_schedule_is_feasible(
+    voices: &PendingVoiceTier,
+    selected_voice: &str,
+    selected_streak: usize,
+    max_streak: usize,
+) -> bool {
+    let total_remaining = voices.values().map(|bucket| bucket.items.len()).sum::<usize>().saturating_sub(1);
+    voices.iter().all(|(voice, bucket)| {
+        let remaining = bucket.items.len().saturating_sub(usize::from(voice == selected_voice));
+        let others = total_remaining.saturating_sub(remaining);
+        let capacity = if voice == selected_voice {
+            max_streak.saturating_sub(selected_streak).saturating_add(max_streak.saturating_mul(others))
+        } else {
+            max_streak.saturating_mul(others.saturating_add(1))
+        };
+        remaining <= capacity
+    })
 }
 
 pub fn coverage_by_voice(db: &Database) -> Result<Vec<VoiceCoverage>, String> {
@@ -2141,6 +2264,132 @@ mod tests {
             vec!["newest", "middle", "oldest"],
             "the spread must survive an authority reload, not depend on runtime randomness"
         );
+    }
+
+    #[test]
+    fn pool_interleaves_voices_deterministically_without_crossing_priority_tiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        seed_champion(&db);
+        rollback_fixture_to(&db, 59);
+        let assignments = [
+            ("halwest-a", "Halwest", 'a'),
+            ("halwest-b", "Halwest", 'b'),
+            ("kawa-a", "Kawa", 'c'),
+            ("kawa-b", "Kawa", 'd'),
+            ("lamo-a", "Lamo", 'e'),
+            ("lamo-b", "Lamo", 'f'),
+        ];
+        for (id, _, _) in assignments {
+            let audio = dir.path().join(format!("{id}.wav"));
+            std::fs::write(&audio, b"wav").unwrap();
+            db.insert_segment_full(&segment(id, &audio, None)).unwrap();
+        }
+        upgrade_fixture_from(&db, 59);
+        for (id, _, hex) in assignments {
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+                    rusqlite::params![id, hex.to_string().repeat(64)],
+                )
+                .unwrap();
+        }
+        let inputs: Vec<PoolMemberInput> = assignments
+            .iter()
+            .map(|(id, voice, _)| PoolMemberInput { segment_id: (*id).into(), voice_name: (*voice).into() })
+            .collect();
+        let pool = activate(&db, "123e4567-e89b-42d3-a456-426614174071", &inputs).unwrap();
+
+        let first = pending_segment_ids(&db, &pool, "Hemn", None).unwrap();
+        let voices: Vec<&str> = first.iter().map(|id| pool.voice_for(id).unwrap()).collect();
+        assert_eq!(
+            voices,
+            vec!["Halwest", "Kawa", "Lamo", "Halwest", "Kawa", "Lamo"],
+            "equal-priority work must alternate available voices instead of clustering the largest corpus"
+        );
+        let reloaded = load(&db).unwrap().expect("active pool reload");
+        assert_eq!(
+            pending_segment_ids(&db, &reloaded, "Hemn", None).unwrap(),
+            first,
+            "voice interleaving must remain stable across authority reloads"
+        );
+
+        let nearer = interleave_pending_voices(vec![
+            (1, "Halwest".into(), [0; 32], "far-halwest".into()),
+            (0, "Lamo".into(), [u8::MAX; 32], "near-lamo".into()),
+            (1, "Kawa".into(), [u8::MAX; 32], "far-kawa".into()),
+        ])
+        .unwrap();
+        assert_eq!(
+            nearer.first().map(String::as_str),
+            Some("near-lamo"),
+            "voice variety must never let a lower-priority clip jump work nearer consensus"
+        );
+
+        let mut skewed = Vec::new();
+        for (voice, count, prefix) in [("Halwest", 1, "h"), ("Kawa", 2, "k"), ("Lamo", 8, "l")] {
+            for index in 0..count {
+                skewed.push((0, voice.to_string(), [u8::try_from(index).unwrap(); 32], format!("{prefix}{index}")));
+            }
+        }
+        let skewed = interleave_pending_voices(skewed).unwrap();
+        let skewed_voices: Vec<&str> = skewed
+            .iter()
+            .map(|id| match id.as_bytes()[0] {
+                b'h' => "Halwest",
+                b'k' => "Kawa",
+                b'l' => "Lamo",
+                _ => unreachable!("fixture has an unknown voice"),
+            })
+            .collect();
+        assert_eq!(
+            skewed_voices,
+            vec!["Lamo", "Lamo", "Kawa", "Lamo", "Lamo", "Halwest", "Lamo", "Lamo", "Kawa", "Lamo", "Lamo"],
+            "minority voices must be spread across a skewed tier and the feasible maximum streak must be two"
+        );
+    }
+
+    #[test]
+    fn voice_interleave_meets_the_feasible_streak_bound_across_skew_shapes() {
+        for a in 1usize..=8 {
+            for b in 1usize..=8 {
+                for c in 1usize..=8 {
+                    let mut candidates = Vec::new();
+                    for (voice, count) in [("A", a), ("B", b), ("C", c)] {
+                        for index in 0..count {
+                            candidates.push((
+                                0,
+                                voice.to_string(),
+                                [u8::try_from(index).unwrap(); 32],
+                                format!("{voice}{index}"),
+                            ));
+                        }
+                    }
+                    let ordered = interleave_pending_voices(candidates).unwrap();
+                    let total = a + b + c;
+                    let largest = a.max(b).max(c);
+                    let feasible_bound = largest.div_ceil(total - largest + 1).max(1);
+                    let mut maximum_run = 0usize;
+                    let mut current_run = 0usize;
+                    let mut previous_voice = None;
+                    for segment_id in ordered {
+                        let voice = segment_id.as_bytes()[0];
+                        if previous_voice == Some(voice) {
+                            current_run += 1;
+                        } else {
+                            previous_voice = Some(voice);
+                            current_run = 1;
+                        }
+                        maximum_run = maximum_run.max(current_run);
+                    }
+                    assert!(
+                        maximum_run <= feasible_bound,
+                        "counts ({a}, {b}, {c}) produced run {maximum_run} above feasible bound {feasible_bound}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
