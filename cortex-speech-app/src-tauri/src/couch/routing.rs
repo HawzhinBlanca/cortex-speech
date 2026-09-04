@@ -7,12 +7,15 @@ pub(super) type Reply = (u16, &'static str, Vec<u8>, Vec<(&'static str, String)>
 ///
 /// `HttpOnly` is the point — the SERVER sets it, so page JavaScript can never read the token back
 /// out. `Secure` is mandatory because Couch Review now serves TLS on every interface;
-/// `SameSite=Strict` keeps it off cross-site requests and a 24-hour sliding lifetime narrows exposure
-/// from a lost phone without interrupting an active reviewer.
+/// `SameSite=Strict` keeps it off cross-site requests, and the sliding lifetime is `COUCH_SESSION_TTL`
+/// — derived here, never hand-written, so the browser and the server cannot disagree about when a
+/// session ends (a hand-written 86400 beside a longer server lifetime made browsers drop cookies the
+/// server still honoured, and the page reads that 401 as the terminal "link expired").
 pub(super) fn page_reply_with_cookie(token: &str, body: Vec<u8>) -> (Reply, Option<String>) {
+    let max_age = super::COUCH_SESSION_TTL.as_secs();
     (
         (200, "text/html; charset=utf-8", body, vec![]),
-        Some(format!("{COUCH_COOKIE}={token}; Path=/; Max-Age=86400; SameSite=Strict; Secure; HttpOnly")),
+        Some(format!("{COUCH_COOKIE}={token}; Path=/; Max-Age={max_age}; SameSite=Strict; Secure; HttpOnly")),
     )
 }
 
@@ -25,6 +28,7 @@ pub(super) fn page_reply_with_cookie(token: &str, body: Vec<u8>) -> (Reply, Opti
 /// mint a fresh session (preview bots never see fragments), but the secret itself never rides on audio
 /// or decision requests and can be revoked independently of every already-issued cookie.
 pub(super) fn api_claim(body: &[u8], state: &Mutex<CouchState>) -> (Reply, Option<String>) {
+    let max_age = super::COUCH_SESSION_TTL.as_secs();
     #[derive(serde::Deserialize)]
     struct ClaimBody {
         token: String,
@@ -108,7 +112,7 @@ pub(super) fn api_claim(body: &[u8], state: &Mutex<CouchState>) -> (Reply, Optio
             serde_json::json!({ "ok": true, "reviewer": reviewer }).to_string().into_bytes(),
             vec![],
         ),
-        Some(format!("{COUCH_COOKIE}={session_token}; Path=/; Max-Age=86400; SameSite=Strict; Secure; HttpOnly")),
+        Some(format!("{COUCH_COOKIE}={session_token}; Path=/; Max-Age={max_age}; SameSite=Strict; Secure; HttpOnly")),
     )
 }
 

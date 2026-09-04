@@ -1137,6 +1137,38 @@
     }
     return started;
   }
+  // A playback attempt is process-local on the server (30-minute TTL, never across a restart) while
+  // this page keeps its id in `<audio src>` and `playbackAttempt`. Once the server has forgotten it,
+  // media answers 409 (a silent player) and finalize answers 409 (a save that can never land), and
+  // `preparePlayback` would hand the same dead attempt back forever. Measured 2026-09-04: two app
+  // restarts in one afternoon, each one leaving every phone mid-clip stuck until a manual reload.
+  // Re-arm instead: drop the dead attempt, request a fresh one, and require the clip to be heard again.
+  let playbackRecovery = null;
+  function rearmPlayback(seg) {
+    const identity = playbackIdentity(seg);
+    // Snapshot the visible editor synchronously before the queue refresh can call show(). The normal
+    // input handler already keeps this draft current, but recovery is a data-loss boundary and must
+    // not depend on a final DOM input event having fired (IME composition and programmatic assistive
+    // input can leave the textarea newer than sessionStorage for a brief window).
+    if (playbackIdentity(queue[i]) === identity) {
+      sessionStorage.setItem(draftKey(seg.id), $('text').value);
+    }
+    invalidatePlaybackPreparation();
+    resetPlaybackTraversalCoverage(identity);
+    $('player').pause();
+    $('player').removeAttribute('src');
+    // A restart forgets BOTH the attempt and the in-memory queue assignment that authorizes a new
+    // attempt. Asking /playback/start again without first refreshing /api/queue therefore meets a
+    // second 409 and only changes a silent player into a warning. Re-fetch the queue to re-establish
+    // the server-owned lease/served-work proof; doLoad keeps this clip selected when it is still
+    // available and show() restores its sessionStorage draft before arming the new attempt.
+    if (!playbackRecovery) {
+      playbackRecovery = load()
+        .then(() => playbackIdentity(queue[i]) === identity ? preparePlayback(queue[i], false) : null)
+        .finally(() => { playbackRecovery = null; });
+    }
+    return playbackRecovery;
+  }
   async function preparePlayback(seg, autoplay) {
     const identity = playbackIdentity(seg);
     if (playbackAttempt && playbackAttempt.identity === identity
@@ -1511,14 +1543,29 @@
     if (!$('player').paused) observePlaybackTraversal($('player'));
     if (playbackAttempt.finalized) return playbackAttempt.playbackReceiptId;
     const expectedAttempt = playbackAttempt;
-    const finalized = await api('/api/playback/finalize', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        playbackReceiptId: expectedAttempt.playbackReceiptId,
-        clientAttemptId: expectedAttempt.clientAttemptId,
-        intervals: playbackTraversalIntervals.map((interval) => ({ ...interval })),
-      }),
-    });
+    let finalized;
+    try {
+      finalized = await api('/api/playback/finalize', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          playbackReceiptId: expectedAttempt.playbackReceiptId,
+          clientAttemptId: expectedAttempt.clientAttemptId,
+          intervals: playbackTraversalIntervals.map((interval) => ({ ...interval })),
+        }),
+      });
+    } catch (error) {
+      // 409: the server no longer holds this attempt (restart, TTL, moved revision). The verdict was
+      // not refused — the AUTHORITY is gone — so re-arm and ask for another listen, exactly as a 428
+      // does. Never advance and never touch the draft: same reviewer, same clip.
+      if (error && error.status === 409 && playbackAttempt === expectedAttempt
+          && playbackIdentity(queue[i]) === identity) {
+        await rearmPlayback(seg);
+        const stale = new Error('playback attempt was lost — listen again');
+        stale.status = 428;
+        throw stale;
+      }
+      throw error;
+    }
     if (playbackIdentity(queue[i]) !== identity || playbackAttempt !== expectedAttempt
         || finalized.playbackContractVersion !== 4
         || finalized.playbackReceiptId !== expectedAttempt.playbackReceiptId
@@ -1640,11 +1687,7 @@
           // Finalization succeeded, so a 428 here means the durable authority no longer matches the
           // decision coordinates. It cannot be repaired by resending the same receipt: retire the
           // local attempt, request a fresh exact grant, and require traversal again on this clip.
-          invalidatePlaybackPreparation();
-          resetPlaybackTraversalCoverage(playbackIdentity(queue[i]));
-          $('player').pause();
-          $('player').removeAttribute('src');
-          void preparePlayback(queue[i], false);
+          void rearmPlayback(queue[i]);
           toast(t('mustListen'), true);
         } else toast(t('saveFailed', { err: e.status || '—' }), true);
         // The server refused because someone else has this clip (409). Staying here would keep
@@ -1804,9 +1847,21 @@
   // because the queue only advances on a DECISION. Both available exits write a verdict they cannot
   // justify: accept promotes an unverified ASR draft to gold, reject permanently excludes a clip that may
   // be fine. Say what happened, and offer the one honest action: move on without judging it.
+  let rearmedAfterMediaError = null;
   $('player').addEventListener('error', () => {
     resetPlaybackTraversalBaseline();
-    if (!queue[i]) return;
+    const seg = queue[i];
+    if (!seg) return;
+    // An attempt-carrying source that fails is, first of all, a FORGOTTEN attempt (server restart or
+    // the 30-minute TTL): re-arm once before calling the audio broken. A second failure on the fresh
+    // attempt is the audio itself.
+    const identity = playbackIdentity(seg);
+    if (rearmedAfterMediaError !== identity && playbackAttempt && playbackAttempt.identity === identity
+        && playerCarriesAttempt(seg, playbackAttempt.playbackReceiptId)) {
+      rearmedAfterMediaError = identity;
+      void rearmPlayback(seg);
+      return;
+    }
     // The skip button is always on screen now; this only NAMES the reason the reviewer is stuck, so
     // they do not sit waiting for audio that is never going to arrive.
     showPlaybackWarning('audioMissing');

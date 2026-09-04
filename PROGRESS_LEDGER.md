@@ -14185,6 +14185,144 @@ because their bodies take a Tauri `AppHandle`/`State`, so the AppHandle-testabil
 functions campaign are the same work — extract each body into an `_on(&store, …)` inner function, the
 pattern `mark_segment_unusable_v1_on` already follows, and test the inner function.
 tiny_http fork, the policy-runner rewrite, and the self-signed TLS hop behind the Funnel.
+## 2026-09-04 — Reviewer links and silent audio: the server forgets a playback attempt, the phone never lets go of it
+
+The owner reported dead reviewer links, sessions with no audible sound, a corrected transcript that
+"came back", and asked that no more "flawless/10/10" language be used without live evidence. Every
+number below was measured read-only on the live library (`mode=ro`), the live logs, or the live
+release directory before a single line changed; nothing in production was modified in this entry.
+
+**Live state at the start (15:12 local).** Release `a6de3c17e7ee-373ce78a01a8-a591ada04b3f-876715ee80e9-363def17e69f`
+(commit `a6de3c17`, 2026-08-31): `cortex-speech-app.exe`, `pool_admin.exe` and the watchdog script all
+re-hashed equal to the pointer, the baked SHA is present in the running image, pid 55460 listens on
+`0.0.0.0:8737` (TLS) behind the Tailscale Funnel. Database at schema 69, 74 tables, 228 MB + 11.5 MB
+WAL, `quick_check` ok. Ten named pairing tokens; all ten authenticate through the Funnel via the
+read-only claim probe, the continuity baseline (2026-08-31) is unchanged, the link vault is intact,
+every reviewer has a non-empty queue (unrestricted 15,549; Sorani-only 12,600), and provenance holds
+on all three invariants. Ledger: 1,470 credits under `review-iqd-v1-2026-08-21`, zero settlements,
+zero double credits per (reviewer, clip), and every one of the 1,042 non-skip phone decisions since
+the live build has a same-reviewer receipt on the same clip. Local snapshots every ~9 min (newest
+15:39), offsite `F:\cortex-backups\snapshots` current, the daily restore drill passed at 03:00 (RTO 2.6 s).
+
+**What actually broke.**
+
+1. *The app died twice today, and every death strands every phone mid-clip.* The machine was
+   restarted from the Start menu at 14:50:35 (System 1074); the app exited orderly (a harmless tao
+   panic on window destroy), the watchdog relaunched it at 14:55:11 after logon. At 15:12:25 the
+   watchdog relaunched it again with NO exit marker — no Windows Error Reporting event, no kill
+   command in the concurrent Codex transcript, cause unattributed. The watchdog runs every 5 minutes,
+   so each exit is up to 5 minutes of dead links. Worse: a Couch playback attempt is process-local
+   (`COUCH_PLAYBACK_ATTEMPT_TTL` 30 min, never across a restart) while the phone keeps its id in
+   `<audio src>` and `playbackAttempt`. After a restart — or a 30-minute pause on one clip — media
+   answers 409 "playback attempt is missing or expired", the element fires `error`, the page shows
+   "this clip's audio will not play — skip it", and `preparePlayback` hands the SAME dead attempt back
+   on every retry, so play never recovers and Save meets the same 409 at finalize forever until a
+   manual reload. That is "no sound" and "my save does not work", reproduced in jsdom against the
+   real page (`tests/couch_page_lost_playback_attempt.test.ts`, failing first on exactly the re-arm
+   assertions). The first fix attempted to re-arm directly through `/api/playback/start`, but an app
+   restart also forgets the in-memory queue assignment that authorizes that request. The completed
+   `rearmPlayback` snapshots the visible draft, refreshes `/api/queue` to reconstruct the server-owned
+   assignment, and only then obtains a fresh attempt; a 409 at finalize asks for another listen (428
+   path), never advancing or losing the correction. The Playwright suite's "audio will not load offers a skip"
+   still holds (43/43) because a plain source has no attempt to re-arm.
+
+2. *"Link expired" after a day away.* `COUCH_SESSION_TTL` was 24 h and both cookie sites hand-wrote
+   `Max-Age=86400`. Only Rubar held live sessions (8, all issued today); every other reviewer's phone
+   had to re-claim from the original chat message, and a home-screen shortcut carries no `#t=` so it
+   lands on the terminal "link expired" page. The 2026-08-28 hotfix that raised this to 7 days on the
+   `deploy/link-health` line never reached `main`. Ported: 7 days, and both `Max-Age` values are now
+   derived from the constant; the claim/renewal test asserts the derived value and was confirmed
+   failing-first against the hardcoded 86400 (`the_shell_is_public_the_data_is_not_and_a_fragment_claim_mints_the_cookie`).
+
+3. *The playback-readiness gate could not read the live library.* `check_playback_enforcement_readiness.py`
+   knew receipt policies 1–3 while the phone has written policy 4 since 2026-08-31 (1,104 of 1,812
+   receipts → all reported as contract violations), and in flexible-pool mode it counted only
+   `review_pool_decisions` — the SECOND-opinion table, empty — so a window holding 1,042 phone
+   decisions read as "0 decision(s)". Fixed: policy 4 accepted under the same raw-counter formula and
+   exact-span rule (all 1,121 live v4 rows recompute exactly, 0 mismatches), and pool mode counts
+   canonical first opinions from `review_events` plus pool second opinions. Three new pins, failing
+   first; the fixed gate against the live library: 1,830 receipts audited, 1,043 decisions by 7
+   reviewers, all covered — READY.
+
+4. *Consensus cannot converge in production — owner decision required, nothing changed.*
+   `review_pool::pending_segment_ids` skips every clip that already carries a canonical answer (the
+   PAY-FENCE MIRROR of the 503 `PAY_POLICY_REQUIRED` fence) BEFORE the 2026-08-30 distance-to-decision
+   ordering runs. Measured: 1,451 pool clips hold exactly one opinion, ZERO hold two,
+   `review_pool_decisions` is empty, with ten reviewers active this week. The fence is by design (a
+   second opinion is unpriced and the ledger never credits it), and the queue gate mirrors it
+   (`WHERE verified = 0`), so both stay green while the canon's "decided by any two different
+   reviewers" is unreachable. Lifting it needs a literal `change canon:` pricing pool second opinions.
+
+**Also measured, not changed.** 508 `ReadIoError` warnings today (os error 10060 / unexpected EOF) —
+connections that open and never send a request, ~14/h background rising with reviewer activity; the
+roster holds ten named reviewers while `docs/OWNER_CANON.md` still says eight; PR #91's Windows gate
+failed in `npm audit` because the runner's npm 10 fell back from a failed bulk advisory request to the
+retired `/audits/quick` endpoint, whose 400 reads "Invalid package tree" — the tree is valid (`npm ls
+--all` and `npm audit --omit=dev` both exit 0 locally, PR #91 touches no package file), npm 11 has
+no quick fallback at all, and the prepared retry helper would not retry a 400.
+
+**Live state moved while this branch was verified.** A concurrent Codex session working the same
+brief merged PR #92 (`a2044b95`, "surface blocked phone autoplay") at 17:20 and deployed it as release
+`a2044b957cd1-e7309ff9b414-c1eeef8470c2-876715ee80e9-363def17e69f` at 17:53 (pointer re-hashed exact, pid
+61644 on the pointer path) — a third app restart of the day, and one more time every phone mid-clip met the
+forgotten-attempt trap the first commit here closes. Against that release, read-only: supervision, ten
+links via the Funnel, continuity, queues and provenance all OK; the fixed playback gate reads one decision
+since the restart (window too fresh for its 20/2 bar); the owner-identity Funnel probe served a clip
+HEAD 200 / Range 206 with exact `Content-Range` / full 200, decoded to 8,180 ms exactly as the server said,
+RMS -21.4 dBFS. This branch was rebased onto `a2044b95`; the one conflict (both PRs edited the phone
+page's playback helpers) keeps #92's `requestPlayback`/`showPlaybackWarning` and adds `rearmPlayback`.
+The live handover of THIS branch's staged release was refused by the session's permission classifier
+and is handed to the owner — nothing here was deployed by this session.
+
+**Verification on this branch.** `cargo test --lib couch::` 179/179; `cargo test --test
+reviewer_serving_path` 1 passed (1 ignored); `cargo clippy --all-targets --all-features -- -D warnings`
+clean; `cargo fmt --check` clean;
+vitest 130 files / 1,013 tests pass; `tsc --noEmit` and `eslint` clean; Playwright `couch-page.spec.ts`
+43/43; policy pins: playback readiness 38, couch i18n/storage/TLS, canon 12, consensus, rust-tests-
+registered, all-policy-tests-execute all green. The full locked policy suite (145 files) run in the
+scratch worktree: 142 pass; `test_couch_storage_policy` caught a greppable anchor my multi-line
+`format!` had moved (kept single-line, pin green); `test_tauri_security_policy` and
+`test_prepare_owner_proof_inputs` fail there only because `models/` and `.policy-python/` are
+directory junctions into the main worktree (alias detection), and both pass on the identical files
+in the junction-free main worktree (63/63 and "regression passed"). CI runs the suite on a clean
+checkout.
+
+**Independent incident follow-up (Codex, 19:07 local).** The initial duplicate count was not a count
+of replayed clips: `audio_content_hash` identifies a source recording, so multiple non-overlapping
+spans legitimately share it. Across all 16,990 active members there are zero repeated exact
+path+source-span identities and zero overlapping active spans. A second real repeat path did exist:
+`CouchState::skipped` was explicitly memory-only, so a restart handed a declined clip back to the same
+reviewer. Queue construction now rebuilds each reviewer's skip set from append-only `review_events`
+before leasing; a fresh-state regression test proves the skip remains reviewer-local and survives a
+restart.
+
+The complaints also exposed a non-duplicate repetition source: equal-priority pool work was ordered
+by import timestamp, and the Lamo files were imported sequentially. The next live candidates were
+`012209`, `012210`, `012212`, `012216`... with a median adjacent file-number gap of 2, so reviewers
+heard one recording sequence for long runs. The queue now retains decision-distance as its first sort
+authority but uses a stable SHA-256 segment spread inside each tier. On the same live pending snapshot,
+the first 25 span Lamo/Kawa files 536-28157 with a median adjacent gap of 8,529; the order is identical
+after restart and cannot promote work that is farther from consensus. A reload regression pins both
+the spread and the higher-priority-first contract.
+
+The active-pool media inventory is physically intact: 16,801 distinct expected WAV paths across the
+four dataset directories, zero missing files, zero unreadable WAV headers, zero source spans past EOF;
+all are mono signed-16-bit PCM at 24 kHz. All 16,990 members have measured RMS/SNR/clipping fields;
+none breach the existing -45 dBFS / 10 dB / 1% coarse gates. This does not certify perceptual quality,
+but it rules out absent files, corrupt containers, out-of-range slices, and digital silence as the
+explanation for the reported no-sound incidents.
+
+The deeper audio check found a separate false-green inference defect. The bundled Silero v4 ONNX
+wrapper requires 64 previous samples prepended to every 512-sample 16 kHz frame. The Rust path sent
+only 512; the dynamic input accepted it but drove real speech probabilities almost entirely below
+threshold, after which the whole-buffer safety fallback made `detect()` appear successful. On five
+recent accepted Lamo clips the old path found 0 positive frames; correct framing found 176-243 per
+clip with maxima near 1.0. The attributed Sorani FLEURS fixture moved from 0/256 to 161/256. The Rust
+implementation now resets recurrent state/context per independent buffer, supplies 576-sample model
+input, and has a raw-probability real-Sorani regression test that cannot pass through the fallback.
+Targeted evidence: VAD tests 13/13, restart/skip Rust contract 1/1, restart browser harness 5/5,
+playback-readiness policy 38 pins, frontend guard policy 33 pins, format and clippy clean.
+
 ## 2026-09-03 — Durable batch guard and both batch bodies testable through a mock app; a normalization batch proven end to end
 
 Follow-up to the ingest harness: `DurableBatchWorkerGuard` and its owner enum are generic over

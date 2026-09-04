@@ -196,7 +196,15 @@ def _insert_receipt(
     )
 
 
-def _activate_pool_with_decision(db_path: Path, *, guard: str = gate.PLAYBACK_GUARD_VERSION) -> None:
+def _activate_pool_with_decision(
+    db_path: Path, *, guard: str = gate.PLAYBACK_GUARD_VERSION, with_pool_decision: bool = True
+) -> None:
+    """Activate the flexible pool over the seeded library.
+
+    The seeded canonical first opinion (`s1` by Sara, ledger revision 1) is what the paid path writes
+    for a pool clip nobody has judged yet, so it is covered here by a revision-0 receipt taken before
+    the event. The optional pool row is the SECOND opinion, the only thing the pool table ever holds.
+    """
     conn = sqlite3.connect(db_path)
     conn.executescript(
         """
@@ -222,6 +230,11 @@ def _activate_pool_with_decision(db_path: Path, *, guard: str = gate.PLAYBACK_GU
             ('123e4567-e89b-42d3-a456-426614174000', 's1');
         """
     )
+    _insert_receipt(conn, "s1", 0, CONTENT_HASH, 0.97, "2023-11-14 22:13:20", "Sara")
+    if not with_pool_decision:
+        conn.commit()
+        conn.close()
+        return
     conn.execute(
         """INSERT INTO review_pool_decisions VALUES(
                1, '123e4567-e89b-42d3-a456-426614174000', 's1', 'Sara', 'accept',
@@ -361,7 +374,9 @@ def test_flexible_pool_counts_its_own_decisions_and_exact_playback_identity() ->
         )
         assert result.returncode == 0, result.stdout + result.stderr
         assert "review mode: flexible-pool" in result.stdout
-        assert "all 1 decision(s) carry a receipt" in result.stdout
+        # One canonical first opinion (review_events, the paid path) plus one pool second opinion.
+        assert "phone decisions in window: 2" in result.stdout
+        assert "all 2 decision(s) carry a receipt" in result.stdout
 
 
 def test_flexible_pool_refuses_a_decision_from_another_playback_guard() -> None:
@@ -392,6 +407,73 @@ def test_flexible_pool_refuses_a_decision_from_another_playback_guard() -> None:
         )
         assert result.returncode == 1
         assert "obsolete-guard" in result.stdout
+
+
+def test_the_couch_policy_version_matches_the_rust_constant() -> None:
+    """The phone writes policy-4 receipts (`COUCH_PLAYBACK_POLICY_VERSION`); the gate must know them.
+
+    Measured 2026-09-04 on the live library: 1,104 of 1,812 receipts were policy 4 and every one was
+    reported as violating the contract, because this gate only knew policies 1-3.
+    """
+    match = re.search(
+        r"const COUCH_PLAYBACK_POLICY_VERSION:\s*i64\s*=\s*(\d+);",
+        couch_surface(REPO_ROOT / "src-tauri" / "src"),
+    )
+    assert match, "COUCH_PLAYBACK_POLICY_VERSION is gone from couch.rs"
+    assert int(match.group(1)) == gate.COUCH_PLAYBACK_POLICY_VERSION == 4
+
+
+def test_flexible_pool_counts_canonical_first_opinions_from_review_events() -> None:
+    """A pool clip nobody has judged is decided through the PAID canonical path (`review_events`).
+
+    `review_pool_decisions` holds only second opinions. Measured 2026-09-04: 1,042 phone decisions
+    since the live build and zero pool rows, and the gate said "0 decision(s)" — a window full of
+    evidence read as empty.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        db_path = tmp / "t.db"
+        _seed(db_path)
+        _activate_pool_with_decision(db_path, with_pool_decision=False)
+        exe = tmp / "cortex-speech-app.exe"
+        exe.write_bytes(b"\x00" + gate.ENFORCE_MARKER + b"\x00")
+        result = subprocess.run(
+            [sys.executable, str(GATE), "--db", str(db_path), "--exe", str(exe),
+             "--since", "2023-01-01 00:00:00", "--min-decisions", "1", "--min-reviewers", "1"],
+            capture_output=True, text=True,
+        )
+        assert "review mode: flexible-pool" in result.stdout
+        assert "phone decisions in window: 1" in result.stdout, result.stdout
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "all 1 decision(s) carry a receipt" in result.stdout
+
+
+def test_policy_four_receipt_evidences_a_decision_only_with_the_exact_span() -> None:
+    for source_end_ms, ready in ((1000, True), (1500, False)):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            db_path = tmp / "t.db"
+            _seed(db_path)
+            conn = sqlite3.connect(db_path)
+            _insert_receipt(
+                conn, "s1", 0, CONTENT_HASH, 0.97, "2026-08-18 21:19:20", "Sara",
+                policy_version=gate.COUCH_PLAYBACK_POLICY_VERSION, source_end_ms=source_end_ms,
+            )
+            conn.commit()
+            conn.close()
+            exe = tmp / "cortex-speech-app.exe"
+            exe.write_bytes(b"\x00" + gate.ENFORCE_MARKER + b"\x00")
+            result = subprocess.run(
+                [sys.executable, str(GATE), "--db", str(db_path), "--exe", str(exe),
+                 "--since", "2020-01-01 00:00:00", "--min-decisions", "1", "--min-reviewers", "1"],
+                capture_output=True, text=True,
+            )
+            if ready:
+                assert result.returncode == 0, f"a policy-4 receipt with the exact span is evidence:\n{result.stdout}"
+                assert "all 1 decision(s) carry a receipt" in result.stdout
+            else:
+                assert result.returncode == 1, result.stdout
+                assert "FAIL [receipt integrity]" in result.stdout, result.stdout
 
 
 def test_verify_10_keeps_the_current_build_empty_canary_red() -> None:

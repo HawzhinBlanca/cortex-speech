@@ -1428,6 +1428,24 @@ impl Database {
         Ok(self.conn.query_row("SELECT COALESCE(MAX(id), 0) FROM review_events", [], |row| row.get(0))?)
     }
 
+    /// Pending clips this reviewer has explicitly declined to judge.
+    ///
+    /// `CouchState::skipped` makes the response immediate inside one process, but the audit event is
+    /// the durable authority. Rebuilding this set from SQLite stops an app restart from handing the
+    /// same no-audio/unclear clip back to the same paid reviewer. The row remains pending and is still
+    /// available to every other reviewer; a skip is not a corpus decision or paid work.
+    pub fn reviewer_skipped_segment_ids(&self, reviewer: &str) -> AppResult<HashSet<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT segment_id
+               FROM review_events
+              WHERE reviewer = ?1 COLLATE NOCASE
+                AND source = 'couch'
+                AND action = 'skip'",
+        )?;
+        let rows = statement.query_map(params![reviewer.trim()], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<HashSet<_>, _>>()?)
+    }
+
     /// Read the controlled-pilot counter with the same event predicate the write transaction uses.
     /// Unauthorized names and already-overrun history are errors, never ignored rows.
     pub fn review_decision_progress(&self, limit: &ReviewDecisionLimit) -> AppResult<ReviewDecisionProgress> {

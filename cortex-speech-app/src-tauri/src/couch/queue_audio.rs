@@ -405,6 +405,17 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
         Ok(ids) => ids,
         Err(e) => return err_reply(500, &e.to_string()),
     };
+    // A skip is durable audit truth, not merely a process-local navigation hint. The old queue kept
+    // this set only in `CouchState`; every app restart erased it and offered each declined clip once
+    // more to the same reviewer. Rehydrate before assigning anything. Failing to read the authority
+    // pauses the queue instead of spending paid reviewer time on work we cannot prove is new to them.
+    let durable_skipped = match db.reviewer_skipped_segment_ids(reviewer) {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::error!("Couch Review durable skip history cannot be read: {error}");
+            return err_reply(503, "Review is temporarily paused: skip history is unavailable");
+        }
+    };
     let pending_total = pilot_slots.map_or(pending_ids.len(), |remaining| pending_ids.len().min(remaining));
     // An empty queue means two very different things, and the page must not say "all clips reviewed"
     // for the second: everything really is done, OR this reviewer is restricted to a dialect that has
@@ -416,6 +427,7 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
     let restricted_and_empty =
         (allowed_dialects.is_some() || focus.is_some() || pilot_slots.is_some()) && pending_total == 0;
     let mut guard = lock_state(state);
+    guard.skipped.entry(reviewer.to_string()).or_default().extend(durable_skipped);
     let now = guard.now();
     let mut serving: Vec<String> = Vec::new();
     let mut held_by_others = 0usize;
