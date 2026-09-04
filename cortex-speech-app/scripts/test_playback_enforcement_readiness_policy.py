@@ -644,6 +644,44 @@ def test_one_device_is_not_enough_to_enforce_on_eight() -> None:
         assert "only 1 reviewer(s)" in result.stdout, result.stdout
 
 
+def test_iso_cutoffs_count_the_same_canonical_and_pool_decisions() -> None:
+    """The advertised T/Z format must not hide real work or disagree across namespaces."""
+    with sqlite3.connect(":memory:") as conn:
+        conn.executescript("""
+            CREATE TABLE review_events(id, segment_id, reviewer, created_at, timestamp_ms, source, action);
+            INSERT INTO review_events VALUES
+                (1, 'before', 'reviewer-a', '2026-09-04 20:27:46', 1788553666000, 'couch', 'accept'),
+                (2, 'boundary', 'reviewer-a', '2026-09-04 20:27:47', 1788553667000, 'couch', 'accept'),
+                (3, 'later', 'reviewer-b', '2026-09-04 20:27:48', 1788553668000, 'couch', 'accept');
+            CREATE TABLE effective_review_pool_decisions_v62(
+                id, segment_id, reviewer, created_at_ms, served_revision, audio_content_hash,
+                source_start_ms, source_end_ms, duration_ms, playback_guard_version, action);
+            INSERT INTO effective_review_pool_decisions_v62
+                SELECT id, segment_id, reviewer, timestamp_ms, 1, 'hash', 0, 1000, 1000, 'guard', action
+                FROM review_events;
+        """)
+        for cutoff in (
+            '2026-09-04 20:27:47', '2026-09-04T20:27:47Z',
+            '2026-09-04T23:27:47+03:00', '2026-09-04T15:27:47-05:00',
+            '2026-09-05T00:27:47+04:00',
+        ):
+            assert [row[0] for row in gate.decisions_since(conn, cutoff)] == [2, 3], cutoff
+            assert [row[0] for row in gate.pool_decisions_since(conn, cutoff)] == [2, 3], cutoff
+        for cutoff in ('2026-09-04T20:27:47.000001Z', '2026-09-04T23:27:47.500000+03:00'):
+            assert [row[0] for row in gate.decisions_since(conn, cutoff)] == [3], cutoff
+            assert [row[0] for row in gate.pool_decisions_since(conn, cutoff)] == [3], cutoff
+
+
+def test_invalid_cutoffs_fail_before_reading_any_database() -> None:
+    for cutoff in ('invalid', '2026-09-04', '2026-02-30T20:27:47Z'):
+        result = subprocess.run(
+            [sys.executable, str(GATE), '--since', cutoff], capture_output=True, text=True,
+        )
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert 'cutoff must be an ISO date and time' in result.stderr
+        assert 'PLAYBACK ENFORCEMENT READINESS' not in result.stdout
+
+
 def test_the_default_window_is_utc_like_the_rows_it_filters() -> None:
     """A local-time cutoff against UTC rows hides exactly the most recent work.
 

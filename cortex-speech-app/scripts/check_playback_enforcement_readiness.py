@@ -136,6 +136,20 @@ def receipt_source_span_issue(
     return None
 
 
+def normalized_cutoff(value: str) -> str:
+    """Use one UTC representation for CLI and direct callers; naive timestamps mean UTC."""
+    try:
+        if len(value) < 19 or value[10] not in ("T", " "):
+            raise ValueError("a date and time are required")
+        instant = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if instant.tzinfo is None:
+            instant = instant.replace(tzinfo=dt.timezone.utc)
+        instant = instant.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        return instant.isoformat(sep=" ", timespec="microseconds" if instant.microsecond else "seconds")
+    except (ValueError, OverflowError) as error:
+        raise argparse.ArgumentTypeError("cutoff must be an ISO date and time; timezone defaults to UTC") from error
+
+
 def decisions_since(conn: sqlite3.Connection, since: str) -> list[tuple[int, str, str, str, object]]:
     """Phone decisions in the window. `skip` writes no verdict and the guard does not gate it."""
     return conn.execute(
@@ -145,7 +159,7 @@ def decisions_since(conn: sqlite3.Connection, since: str) -> list[tuple[int, str
         WHERE source = 'couch' AND action <> 'skip' AND created_at >= ?
         ORDER BY created_at
         """,
-        (since,),
+        (normalized_cutoff(since),),
     ).fetchall()
 
 
@@ -154,7 +168,11 @@ def pool_decisions_since(
     since: str,
 ) -> list[tuple[object, ...]]:
     """Effective non-skip schema-63 pool decisions in the exact deployed-binary window."""
-
+    instant = dt.datetime.fromisoformat(normalized_cutoff(since)).replace(tzinfo=dt.timezone.utc)
+    elapsed = instant - dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+    cutoff_us = (elapsed.days * 86400 + elapsed.seconds) * 1_000_000 + elapsed.microseconds
+    # Integer ceiling preserves an inclusive boundary without admitting a millisecond before it.
+    cutoff_ms = -(-cutoff_us // 1000)
     return conn.execute(
         """
         SELECT id, segment_id, reviewer, datetime(created_at_ms / 1000, 'unixepoch'),
@@ -162,10 +180,10 @@ def pool_decisions_since(
                source_end_ms, duration_ms, playback_guard_version
           FROM effective_review_pool_decisions_v62
          WHERE action <> 'skip'
-           AND datetime(created_at_ms / 1000, 'unixepoch') >= datetime(?)
+           AND created_at_ms >= ?
          ORDER BY created_at_ms, id
         """,
-        (since,),
+        (cutoff_ms,),
     ).fetchall()
 
 
@@ -547,6 +565,7 @@ def main() -> int:
     parser.add_argument(
         "--since",
         default=None,
+        type=normalized_cutoff,
         help="ISO timestamp; defaults to the binary's build time, which is when it could first warn",
     )
     parser.add_argument("--min-decisions", type=int, default=20)
