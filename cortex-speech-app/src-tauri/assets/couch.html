@@ -960,18 +960,23 @@
   // The entries that concern the CURRENT reviewer: their own, the unstamped legacy ones, and — while
   // identity is still unknown — everything, since hiding a warning is worse than over-showing it.
   const refusedMine = () => readRefused().filter((x) => !x.by || !me || x.by === me);
-  function noteRefused(id) {
+  function noteRefused(id, reviewer = me) {
     const r = readRefused();
-    if (!r.some((x) => x.id === id)) localStorage.setItem(REFUSED, JSON.stringify([...r, { id, by: me || null }]));
+    const by = reviewer || null;
+    if (!r.some((x) => x.id === id && (x.by || null) === by)) {
+      localStorage.setItem(REFUSED, JSON.stringify([...r, { id, by }]));
+    }
   }
   // ...and RETRACTED when that clip's decision finally lands. Nothing cleared this list, so a single
   // refusal pinned the banner for the life of the browser profile — it kept telling the reviewer work
   // had failed after they had already gone back and re-reviewed it, which is the same class of lie the
   // banner exists to prevent, pointing the other way.
-  function clearRefused(id) {
+  function clearRefused(id, reviewer = me) {
+    // An unknown identity may acknowledge legacy entries, never another stamped reviewer's record.
     const r = readRefused();
-    if (!r.some((x) => x.id === id)) return;
-    const left = r.filter((x) => x.id !== id);
+    const mine = (x) => x.id === id && (!x.by || x.by === reviewer);
+    if (!r.some(mine)) return;
+    const left = r.filter((x) => !mine(x));
     if (left.length) {
       localStorage.setItem(REFUSED, JSON.stringify(left));
       if (errKind === 'refused') renderRefused(); // recount, still showing
@@ -1006,11 +1011,10 @@
     const refused = refusedMine();
     const pos = queue.findIndex((s) => refused.some((x) => x.id === s.id));
     if (pos >= 0) { i = pos; show(); return; }
-    const dismissed = new Set(refused.map((x) => x.id));
-    const left = readRefused().filter((x) => !dismissed.has(x.id));
+    const left = readRefused().filter((x) => x.by && x.by !== me);
     if (left.length) localStorage.setItem(REFUSED, JSON.stringify(left));
     else localStorage.removeItem(REFUSED);
-    clearErr('refused');
+    renderRefused();
   });
   // ONE flush at a time. Three things call this now — the `online` event, load(), and the 30s retry
   // timer — and an overlapping run re-POSTs items another is already sending. The server dedups, so
@@ -1045,6 +1049,9 @@
       // whichever cookie loaded first. Held items go out moments later: load() re-flushes as soon as
       // the server says who this link belongs to.
       if (item.reviewer && item.reviewer !== me) continue;
+      // The queue response may change `me` while this request is pending. Retain the sending
+      // identity for warning ownership instead of attributing its eventual reply to the new user.
+      const submissionReviewer = item.reviewer || me || null;
       try {
         const saved = await api('/api/decision', {
           method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(item),
@@ -1074,7 +1081,7 @@
         // reconnect timers do not retry a permanently insufficient proof every thirty seconds.
         if (e.status === 428 && item.action !== 'skip' && !item.playbackReceiptId) {
           localStorage.setItem(playbackUpgradeHoldKey(item.operationId), 'policy-4-playback-required');
-          noteRefused(item.id);
+          noteRefused(item.id, submissionReviewer);
           continue;
         }
         // Everything else (409 taken, 400 invalid) IS a real answer about this decision. Retrying can
@@ -1082,7 +1089,7 @@
         // land — but the reviewer's TYPED TEXT is not the server's to discard. Deleting the draft here
         // destroyed the one copy of a correction they had already been told was saved. Keep it, and
         // say what happened.
-        if (!decidedHere.has(item.id)) noteRefused(item.id);
+        if (!decidedHere.has(item.id)) noteRefused(item.id, submissionReviewer);
         removeSubmission(item.operationId);
         continue;
       }
@@ -1094,7 +1101,7 @@
       // the refused banner would be worse than useless — a skip does not make the earlier work land.
       if (item.action !== 'skip') {
         sessionStorage.removeItem(draftKey(item.id));
-        clearRefused(item.id); // it landed after all
+        clearRefused(item.id, submissionReviewer); // it landed after all
       }
     }
     renderRefused();
@@ -1627,7 +1634,7 @@
       applyAccounting(saved);
       if (!isSkip) {
         sessionStorage.removeItem(draftKey(submission.id));
-        clearRefused(submission.id); // re-reviewing a refused clip must retract the warning about it
+        clearRefused(submission.id, submission.reviewer); // retract only this author's refusal
         decidedHere.add(submission.id); // so a STALE outbox replay of this clip cannot claim work was lost
         toast(action === 'bad' ? t('markedBad') : t('saved'));
         doneThisSession += 1;

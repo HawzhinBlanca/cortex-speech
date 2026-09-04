@@ -27,6 +27,9 @@ async function bootPage(): Promise<JSDOM> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     beforeParse(win: any) {
       win.fetch = () => Promise.reject(new Error('offline refused-banner test'));
+      // This suite verifies storage/ownership, not physical playback in jsdom.
+      win.HTMLMediaElement.prototype.pause = () => {};
+      win.HTMLMediaElement.prototype.load = () => {};
       win.HTMLCanvasElement.prototype.getContext = () => ({
         clearRect: () => {},
         fillRect: () => {},
@@ -50,6 +53,131 @@ afterEach(() => {
 });
 
 describe('couch.html — the refused-decisions banner', () => {
+  it('records separate refusals for two reviewers of the same clip', async () => {
+    const dom = await bootPage();
+    dom.window.eval(
+      "noteRefused('shared'); me = 'Hemn'; noteRefused('shared'); noteRefused('shared');",
+    );
+    expect(JSON.parse(dom.window.localStorage.getItem(REFUSED) || '[]')).toEqual([
+      { id: 'shared', by: 'Sara' },
+      { id: 'shared', by: 'Hemn' },
+    ]);
+  });
+
+  it('a successful save clears only that reviewer and explicit legacy records for the clip', async () => {
+    const dom = await bootPage();
+    dom.window.localStorage.setItem(
+      REFUSED,
+      JSON.stringify([
+        { id: 'shared', by: 'Sara' },
+        { id: 'shared', by: 'Hemn' },
+        'shared',
+        { id: 'another', by: 'Sara' },
+      ]),
+    );
+    dom.window.eval("clearRefused('shared')");
+    expect(JSON.parse(dom.window.localStorage.getItem(REFUSED) || '[]')).toEqual([
+      { id: 'shared', by: 'Hemn' },
+      { id: 'another', by: 'Sara' },
+    ]);
+  });
+
+  it("dismissal keeps a colleague's refusal even for the identical clip ID", async () => {
+    const dom = await bootPage();
+    dom.window.localStorage.setItem(
+      REFUSED,
+      JSON.stringify([{ id: 'gone', by: 'Sara' }, { id: 'gone', by: 'Hemn' }, 'legacy']),
+    );
+    const pendingKey = dom.window.eval(
+      "outboxOperationKey('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')",
+    );
+    dom.window.localStorage.setItem(pendingKey, 'pending-work-must-remain');
+    dom.window.sessionStorage.setItem(dom.window.eval("draftKey('gone')"), 'typed correction');
+    dom.window.eval('renderRefused()');
+    dom.window.document.getElementById('err')!.click();
+    expect(JSON.parse(dom.window.localStorage.getItem(REFUSED) || '[]')).toEqual([
+      { id: 'gone', by: 'Hemn' },
+    ]);
+    expect(dom.window.localStorage.getItem(pendingKey)).toBe('pending-work-must-remain');
+    expect(dom.window.sessionStorage.getItem(dom.window.eval("draftKey('gone')"))).toBe(
+      'typed correction',
+    );
+    dom.window.eval("me = 'Hemn'; renderRefused()");
+    expect((dom.window.document.getElementById('err') as HTMLElement).hidden).toBe(false);
+  });
+
+  it("unknown identity cannot clear another stamped reviewer's warning", async () => {
+    const dom = await bootPage();
+    dom.window.localStorage.setItem(REFUSED, JSON.stringify([{ id: 'gone', by: 'Hemn' }]));
+    dom.window.eval("me = ''; renderRefused(); clearRefused('gone')");
+    dom.window.document.getElementById('err')!.click();
+    expect(JSON.parse(dom.window.localStorage.getItem(REFUSED) || '[]')).toEqual([
+      { id: 'gone', by: 'Hemn' },
+    ]);
+    expect((dom.window.document.getElementById('err') as HTMLElement).hidden).toBe(false);
+  });
+
+  it('late replies keep the submitting reviewer identity after the displayed identity changes', async () => {
+    const dom = await bootPage();
+    dom.window.localStorage.setItem(
+      REFUSED,
+      JSON.stringify([
+        { id: 'gone', by: 'Sara' },
+        { id: 'gone', by: 'Hemn' },
+      ]),
+    );
+    dom.window.eval("me = 'Hemn'; clearRefused('gone', 'Sara'); noteRefused('other', 'Sara')");
+    expect(JSON.parse(dom.window.localStorage.getItem(REFUSED) || '[]')).toEqual([
+      { id: 'gone', by: 'Hemn' },
+      { id: 'other', by: 'Sara' },
+    ]);
+  });
+
+  it('unknown identity can acknowledge legacy entries without dismissing named reviewers', async () => {
+    const dom = await bootPage();
+    dom.window.localStorage.setItem(
+      REFUSED,
+      JSON.stringify(['legacy', { id: 'gone', by: 'Hemn' }]),
+    );
+    dom.window.eval("me = ''; renderRefused()");
+    dom.window.document.getElementById('err')!.click();
+    expect(JSON.parse(dom.window.localStorage.getItem(REFUSED) || '[]')).toEqual([
+      { id: 'gone', by: 'Hemn' },
+    ]);
+    expect((dom.window.document.getElementById('err') as HTMLElement).hidden).toBe(false);
+  });
+
+  it.each([false, true])(
+    'outbox replies retain their author across an identity change (refused=%s)',
+    async (refused) => {
+      const dom = await bootPage();
+      const before = [{ id: 'shared', by: 'Hemn' }];
+      if (!refused) before.push({ id: 'shared', by: 'Sara' });
+      dom.window.localStorage.setItem(REFUSED, JSON.stringify(before));
+      dom.window.eval(
+        "writeOperationRecord({ operationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', " +
+          "id: 'shared', action: 'edit', text: 'ڕاستکراوە', reviewer: 'Sara', heardMs: 1500, clipDurationMs: 1500 }, Date.now(), 0)",
+      );
+      // The page's actual flush awaits a response after the displayed reviewer has changed.
+      dom.window.eval(
+        "api = async () => { me = 'Hemn'; " +
+          (refused
+            ? "throw Object.assign(new Error('invalid decision'), { status: 400 });"
+            : 'return {};') +
+          ' }',
+      );
+      await dom.window.eval('flushOutboxOnce()');
+      expect(JSON.parse(dom.window.localStorage.getItem(REFUSED) || '[]')).toEqual(
+        refused
+          ? [
+              { id: 'shared', by: 'Hemn' },
+              { id: 'shared', by: 'Sara' },
+            ]
+          : [{ id: 'shared', by: 'Hemn' }],
+      );
+    },
+  );
+
   it('a tap with a refused clip in the batch jumps to it and keeps the list', async () => {
     const dom = await bootPage();
     dom.window.localStorage.setItem(REFUSED, JSON.stringify([{ id: 'c2', by: 'Sara' }]));
@@ -61,11 +189,15 @@ describe('couch.html — the refused-decisions banner', () => {
     expect(dom.window.localStorage.getItem(REFUSED)).not.toBeNull();
   });
 
-  it('a tap with nothing to jump to dismisses my entries and the legacy ones, not a colleague\'s', async () => {
+  it("a tap with nothing to jump to dismisses my entries and the legacy ones, not a colleague's", async () => {
     const dom = await bootPage();
     dom.window.localStorage.setItem(
       REFUSED,
-      JSON.stringify([{ id: 'gone-1', by: 'Sara' }, 'legacy-plain-id', { id: 'theirs', by: 'Hemn' }]),
+      JSON.stringify([
+        { id: 'gone-1', by: 'Sara' },
+        'legacy-plain-id',
+        { id: 'theirs', by: 'Hemn' },
+      ]),
     );
     dom.window.eval('renderRefused()');
     const err = dom.window.document.getElementById('err') as HTMLElement;
@@ -76,6 +208,8 @@ describe('couch.html — the refused-decisions banner', () => {
     expect(dom.window.eval('i'), 'no jump to a wrong clip').toBe(0);
     expect(err.hidden, 'the banner comes down').toBe(true);
     const left = JSON.parse(dom.window.localStorage.getItem(REFUSED) || '[]');
-    expect(left, "a colleague's stamped refusal survives for them").toEqual([{ id: 'theirs', by: 'Hemn' }]);
+    expect(left, "a colleague's stamped refusal survives for them").toEqual([
+      { id: 'theirs', by: 'Hemn' },
+    ]);
   });
 });
