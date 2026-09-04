@@ -1,5 +1,24 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-05 — Consolidated reviewer release integration on current main
+
+PR101 is merged as `e2774ec8`; PR96's `119c9193` already includes that main update.
+Merged the tested candidate `761391a3` into that newer PR96 history in an isolated
+worktree. Integration commit `db239af1` has a byte-identical tracked tree to `761391a3`
+and contains current main; this entry is the only subsequent file change. It records
+the integration rather than weakening the ledger-lag gate, which correctly reported
+five commits since the preceding entry (limit three).
+
+The consolidated PR retains reviewer-local refusal/draft/playback safeguards, PR99's
+health-reporting repairs, and the dependency/cold-workspace fixes documented below.
+Exact tested source: frontend **1040/1040**, browser **121/121**, zero retries; Rust
+src/tests/Cargo files match the completed all-target baseline `41a07da9`. The full
+locked policy run against unchanged `761391a3` is still running at this checkpoint.
+Its outcome, exact-head protected CI, native release identity and actual field acceptance
+remain separate requirements. No deployment, physical audibility, paid-pool field or
+training-dataset certification is claimed. One consolidated handover preserves active
+reviewer work; the merged payment change is not a reason to restart once per PR.
+
 ## 2026-09-05 — Dependency security and cold-workspace release-gate repair
 
 The combined local baseline `41a07da9` joins payment `538e1044`, reviewer UI `b9e29c52`,
