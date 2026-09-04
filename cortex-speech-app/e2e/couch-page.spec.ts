@@ -1718,6 +1718,51 @@ test.describe('Couch Review phone page', () => {
     expect(await page.evaluate(`window.__plays[0].includes('two')`)).toBe(true);
   });
 
+  test('a blocked autoplay is visible and clears only after playback starts', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.HTMLMediaElement.prototype.play = function play() {
+        return Promise.reject(new DOMException('autoplay denied', 'NotAllowedError'));
+      };
+      window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes('/api/playback/start')) {
+          const body = JSON.parse(String(init?.body ?? '{}')) as {
+            id: string;
+            rowVersion: string;
+            clientAttemptId: string;
+          };
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              clientAttemptId: body.clientAttemptId,
+              playbackReceiptId: '11111111-1111-4111-8111-111111111111',
+              segmentId: body.id,
+              segmentRevision: body.rowVersion,
+              clipDurationMs: 4200,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        return new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await showAClip(page);
+
+    await page.evaluate(`preparePlayback(queue[i], true)`);
+    await expect(page.locator('#warn')).toBeVisible();
+    expect(
+      [
+        'لێدان ڕێگەی پێنەدرا یان فایلەکە نەدۆزرایەوە',
+        'دەنگی ئەم پارچەیە لێ نادرێت، بۆیە شتێک نییە بڕیاری لەسەر بدرێت. تێیپەڕێنە — خاوەنەکە ئاگادار دەکرێتەوە.',
+      ],
+      'a play rejection or the resulting media error must be visible, never swallowed',
+    ).toContain(await page.locator('#warn').textContent());
+
+    await page.evaluate(`document.getElementById('player').dispatchEvent(new Event('playing'))`);
+    await expect(page.locator('#warn')).toBeHidden();
+  });
+
   test('navigation never starts audio — only a decision does', async ({ page }) => {
     // The other half of the same rule. A skip is the reviewer saying "I cannot judge this", and an undo
     // is them going back to look; both deserve a loaded clip and silence, not a burst of sound.

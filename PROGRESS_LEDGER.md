@@ -14202,3 +14202,29 @@ last, and a fresh identity admitted afterwards; (3) the normalization refusal ar
 rejection. Mutation bite-proof: stamping the committed rows with a wrong normalizer version reds the
 end-to-end test. `commands/batch.rs` was the lowest-covered command file (30 % lines); no policy pin
 greps the changed shapes. Coverage stays a standing campaign: no re-measurement, no attestation.
+
+## 2026-09-04 — Phone autoplay failures are visible and recoverable; live reviewer paths independently probed
+
+Incident reality-check against immutable private-production release `a6de3c17e7ee` found all ten
+distributed pairing credentials unchanged and authenticating through the Funnel, exact queues totaling
+140,682 eligible pending clips, the watchdog running, and a Guest claim → queue → playback/start →
+byte-range audio path answering 200/206 with a valid non-silent mono 16-bit 16 kHz WAV. The active
+review pool has 16,990 exportable clips with no missing RMS, no <= -60 dB RMS, and no invalid duration.
+This proves the server, credentials and sampled audio bytes, not a human phone speaker; twenty fresh
+post-release phone decisions remain the separate owner acceptance proof.
+
+The browser page did contain one concrete silence defect: both decision-triggered autoplay paths
+discarded a rejected `HTMLMediaElement.play()` promise with `catch(() => {})`. Mobile autoplay policy
+could therefore advance to a healthy-looking card that made no sound and gave no recovery instruction.
+`couch.html` now centralizes programmatic playback, displays the reviewed localized warning when play
+is rejected, keeps the native Play control available, and clears the warning only on an actual
+`playing` event. Replay and playback-preparation failure use the same recovery path; media load errors
+retain their stronger skip guidance.
+
+Measured on branch `codex/reviewer-live-reliability-20260904` before commit: phone-page Playwright
+44/44 (including WCAG 2.2 AA light/dark), frontend unit tests 1,011/1,011, Rust couch-filtered library
+tests 182/182, frontend review guards 33/33, couch i18n 29 strings, TypeScript typecheck, ESLint,
+production Vite build and bundle budget, and Tauri security policy all green. The full Python policy
+sweep's reviewer-related scripts were green; one unrelated pre-existing owner-proof helper test still
+fails because it receives an alias/change locking error where its timeout test expects “could not
+complete.” No live deployment was performed from this branch; the active release remains unchanged.

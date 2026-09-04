@@ -696,6 +696,32 @@ def test_a_skip_never_clears_the_reviewers_draft_on_either_route() -> None:
             )
 
 
+def test_couch_autoplay_failure_is_visible_and_recoverable() -> None:
+    """The phone page must never turn a rejected ``HTMLMediaElement.play()`` into silent audio.
+
+    Mobile browsers may reject programmatic playback after the decision POST has consumed the user
+    gesture.  The old page deliberately swallowed both play-promise rejections with
+    ``catch(() => {})``.  The next card looked healthy but made no sound, which is indistinguishable
+    from a broken clip to a reviewer.  Keep the native Play control as the recovery action, surface a
+    localized warning when autoplay is blocked, and clear that warning only after playback really
+    starts.
+    """
+    page = _read("src-tauri/assets/couch.html")
+    if "started.catch(() => {});" in page:
+        raise AssertionError(
+            "couch.html still swallows a rejected audio.play() promise; a reviewer can advance to a "
+            "normal-looking card with no sound and no recovery guidance"
+        )
+    for marker, purpose in (
+        ("function requestPlayback()", "centralize programmatic play-promise handling"),
+        ("showPlaybackWarning('playbackFailed')", "tell the reviewer to use the visible Play control"),
+        ("addEventListener('playing'", "clear the warning only when media playback actually begins"),
+        ("clearPlaybackWarning()", "remove a recovered transient playback warning"),
+    ):
+        if marker not in page:
+            raise AssertionError(f"couch.html must {purpose}; missing source marker {marker!r}")
+
+
 def test_post_jury_cer_uses_the_independently_persisted_jury_transcript() -> None:
     """Do not revive the legacy verdict-vs-itself suppression.
 

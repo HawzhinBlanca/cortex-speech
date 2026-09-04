@@ -64,6 +64,7 @@
     "loadingMore": "Loading clips…",
     "queued": "Queued — it will send when you are back online",
     "audioMissing": "This clip's audio will not play, so there is nothing to judge. Skip it — the owner will be told.",
+    "playbackFailed": "Playback was blocked or the file could not be found",
     "skip": "Skip this clip",
     "skippedByYou": "You skipped {n} clip(s) — they are still waiting for someone else.",
     "speakerChange": "more than one speaker",
@@ -94,6 +95,7 @@
     "loadingMore": "بارکردنی پارچەکان…",
     "queued": "لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت",
     "audioMissing": "دەنگی ئەم پارچەیە لێ نادرێت، بۆیە شتێک نییە بڕیاری لەسەر بدرێت. تێیپەڕێنە — خاوەنەکە ئاگادار دەکرێتەوە.",
+    "playbackFailed": "لێدان ڕێگەی پێنەدرا یان فایلەکە نەدۆزرایەوە",
     "skip": "تێپەڕاندنی ئەم پارچەیە",
     "skippedByYou": "{n} پارچەت تێپەڕاند — هێشتا چاوەڕێی کەسێکی ترن.",
     "speakerChange": "زیاتر لە یەک قسەکەر",
@@ -124,6 +126,7 @@
     "loadingMore": null,
     "queued": null,
     "audioMissing": null,
+    "playbackFailed": "audio.playbackFailed",
     "skip": null,
     "skippedByYou": null,
     "speakerChange": null,
@@ -1115,13 +1118,31 @@
     playbackPreparationAutoplay = false;
     playbackAttempt = null;
   }
+  function showPlaybackWarning(key) {
+    if (!queue[i]) return;
+    $('warn').dataset.audioIssue = 'true';
+    $('warn').textContent = t(key);
+    $('warn').hidden = false;
+  }
+  function clearPlaybackWarning() {
+    if ($('warn').dataset.audioIssue !== 'true') return;
+    delete $('warn').dataset.audioIssue;
+    $('warn').textContent = '';
+    $('warn').hidden = true;
+  }
+  function requestPlayback() {
+    const started = $('player').play();
+    if (started && typeof started.catch === 'function') {
+      started.catch(() => showPlaybackWarning('playbackFailed'));
+    }
+    return started;
+  }
   async function preparePlayback(seg, autoplay) {
     const identity = playbackIdentity(seg);
     if (playbackAttempt && playbackAttempt.identity === identity
         && playerCarriesAttempt(seg, playbackAttempt.playbackReceiptId)) {
       if (autoplay) {
-        const started = $('player').play();
-        if (started && typeof started.catch === 'function') started.catch(() => {});
+        requestPlayback();
       }
       return playbackAttempt;
     }
@@ -1158,8 +1179,7 @@
       $('player').src = source;
       void loadWave(plainAudioUrl(seg));
       if (playbackPreparationAutoplay) {
-        const started = $('player').play();
-        if (started && typeof started.catch === 'function') started.catch(() => {});
+        requestPlayback();
       }
       return playbackAttempt;
     })().catch((error) => {
@@ -1169,7 +1189,7 @@
         // navigation needs no toast at that point, and touching the destroyed DOM creates an unhandled
         // rejection that hides the original network outcome.
         if (typeof document !== 'undefined' && document.getElementById('toast')) {
-          toast(t('saveFailed', { err: error.status || '—' }), true);
+          showPlaybackWarning('playbackFailed');
         }
       }
       return null;
@@ -1657,7 +1677,7 @@
     pausedByEdit = false;
     resetPlaybackTraversalBaseline();
     $('player').currentTime = Math.max(0, $('player').currentTime - 2);
-    void $('player').play();
+    void requestPlayback();
   };
 
   // ── pause to type, and replay the run-up on resume (R2.3) ──────────────────
@@ -1777,6 +1797,7 @@
   }
   $('player').addEventListener('timeupdate', () => void drawWave());
   $('player').addEventListener('loadedmetadata', () => void drawWave());
+  $('player').addEventListener('playing', () => clearPlaybackWarning());
   // A clip whose file has moved off disk answers 500 into <audio src>, and nothing surfaced it: the
   // element has no error handler, loadWave swallows the body in a bare catch, and show() hides #warn
   // on every clip. The reviewer saw a normal card with a player that did nothing — and no way past it,
@@ -1788,8 +1809,7 @@
     if (!queue[i]) return;
     // The skip button is always on screen now; this only NAMES the reason the reviewer is stuck, so
     // they do not sit waiting for audio that is never going to arrive.
-    $('warn').textContent = t('audioMissing');
-    $('warn').hidden = false;
+    showPlaybackWarning('audioMissing');
   });
   // Deliberately writes NOTHING to the corpus — no decision, no verdict, no attribution. It goes to the
   // server all the same (rather than just advancing locally, which is what it used to do): only the
