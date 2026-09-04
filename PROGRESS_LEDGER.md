@@ -14225,6 +14225,8 @@ Measured on branch `codex/reviewer-live-reliability-20260904` before commit: pho
 44/44 (including WCAG 2.2 AA light/dark), frontend unit tests 1,011/1,011, Rust couch-filtered library
 tests 182/182, frontend review guards 33/33, couch i18n 29 strings, TypeScript typecheck, ESLint,
 production Vite build and bundle budget, and Tauri security policy all green. The full Python policy
-sweep's reviewer-related scripts were green; one unrelated pre-existing owner-proof helper test still
-fails because it receives an alias/change locking error where its timeout test expects “could not
-complete.” No live deployment was performed from this branch; the active release remains unchanged.
+sweep's reviewer-related scripts were green. Its initial two failures were verification-worktree
+artifacts: the fresh worktree omitted the gitignored runtime model, and its temporary junctioned
+`.policy-python` made the owner-proof identity lock correctly reject the aliased `python.exe`. The
+security policy and exact owner-proof test both passed after supplying a real local directory and
+environment. No live deployment was performed from this branch; the active release remains unchanged.
