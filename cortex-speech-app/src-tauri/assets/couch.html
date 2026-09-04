@@ -1143,12 +1143,31 @@
   // `preparePlayback` would hand the same dead attempt back forever. Measured 2026-09-04: two app
   // restarts in one afternoon, each one leaving every phone mid-clip stuck until a manual reload.
   // Re-arm instead: drop the dead attempt, request a fresh one, and require the clip to be heard again.
+  let playbackRecovery = null;
   function rearmPlayback(seg) {
+    const identity = playbackIdentity(seg);
+    // Snapshot the visible editor synchronously before the queue refresh can call show(). The normal
+    // input handler already keeps this draft current, but recovery is a data-loss boundary and must
+    // not depend on a final DOM input event having fired (IME composition and programmatic assistive
+    // input can leave the textarea newer than sessionStorage for a brief window).
+    if (playbackIdentity(queue[i]) === identity) {
+      sessionStorage.setItem(draftKey(seg.id), $('text').value);
+    }
     invalidatePlaybackPreparation();
-    resetPlaybackTraversalCoverage(playbackIdentity(seg));
+    resetPlaybackTraversalCoverage(identity);
     $('player').pause();
     $('player').removeAttribute('src');
-    void preparePlayback(seg, false);
+    // A restart forgets BOTH the attempt and the in-memory queue assignment that authorizes a new
+    // attempt. Asking /playback/start again without first refreshing /api/queue therefore meets a
+    // second 409 and only changes a silent player into a warning. Re-fetch the queue to re-establish
+    // the server-owned lease/served-work proof; doLoad keeps this clip selected when it is still
+    // available and show() restores its sessionStorage draft before arming the new attempt.
+    if (!playbackRecovery) {
+      playbackRecovery = load()
+        .then(() => playbackIdentity(queue[i]) === identity ? preparePlayback(queue[i], false) : null)
+        .finally(() => { playbackRecovery = null; });
+    }
+    return playbackRecovery;
   }
   async function preparePlayback(seg, autoplay) {
     const identity = playbackIdentity(seg);
@@ -1540,7 +1559,7 @@
       // does. Never advance and never touch the draft: same reviewer, same clip.
       if (error && error.status === 409 && playbackAttempt === expectedAttempt
           && playbackIdentity(queue[i]) === identity) {
-        rearmPlayback(seg);
+        await rearmPlayback(seg);
         const stale = new Error('playback attempt was lost — listen again');
         stale.status = 428;
         throw stale;
@@ -1668,7 +1687,7 @@
           // Finalization succeeded, so a 428 here means the durable authority no longer matches the
           // decision coordinates. It cannot be repaired by resending the same receipt: retire the
           // local attempt, request a fresh exact grant, and require traversal again on this clip.
-          rearmPlayback(queue[i]);
+          void rearmPlayback(queue[i]);
           toast(t('mustListen'), true);
         } else toast(t('saveFailed', { err: e.status || '—' }), true);
         // The server refused because someone else has this clip (409). Staying here would keep
@@ -1840,7 +1859,7 @@
     if (rearmedAfterMediaError !== identity && playbackAttempt && playbackAttempt.identity === identity
         && playerCarriesAttempt(seg, playbackAttempt.playbackReceiptId)) {
       rearmedAfterMediaError = identity;
-      rearmPlayback(seg);
+      void rearmPlayback(seg);
       return;
     }
     // The skip button is always on screen now; this only NAMES the reason the reviewer is stuck, so

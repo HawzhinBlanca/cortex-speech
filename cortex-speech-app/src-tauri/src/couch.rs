@@ -293,11 +293,10 @@ struct CouchState {
     /// button is a treadmill: the clip is still pending, so the very next refill serves it straight
     /// back, and the only way past it remains a verdict the reviewer cannot stand behind.
     ///
-    /// ponytail: memory only, deliberately. A restart offers the clip once more, which costs one
-    /// repeated clip — unlike `spot_checks`, where losing an entry MIS-SCORES a reviewer, and which is
-    /// why that one is persisted and this is not. Never pruned either: it is bounded by the pending
-    /// backlog, and the count reported to the page is derived from the live pending rows rather than
-    /// from this map's size, so a stale entry cannot inflate anything.
+    /// This map is a hot cache only. Every queue request merges the durable `review_events` skip
+    /// authority before assigning work, so a restart cannot offer the same declined clip once more.
+    /// Never pruned: it is bounded by the pending backlog, and the count reported to the page is
+    /// derived from live pending rows rather than this map's size, so a stale entry cannot inflate it.
     skipped: HashMap<String, HashSet<String>>,
     /// The exact operating policy this session was started under. A file edit never hot-resets a
     /// paid counter: any mismatch pauses requests until the owner explicitly stops and restarts.
@@ -5263,6 +5262,13 @@ mod tests {
         // ...and it goes to somebody who CAN judge it, immediately: the lease is released with the
         // skip rather than left to expire, so the next reviewer does not wait out the TTL.
         assert_eq!(queue_ids(&db, "Hemn", &state), vec!["sk1"], "the clip is still everyone else's work");
+
+        // A process restart used to erase the in-memory skip set and hand `sk1` straight back to
+        // Sara. The append-only event is the durable authority: a fresh state must reconstruct it,
+        // while Hemn remains eligible for exactly the same pending clip.
+        let restarted = Mutex::new(CouchState::default());
+        assert_eq!(queue_ids(&db, "Sara", &restarted), vec!["sk2"], "a skip survives an app restart");
+        assert_eq!(queue_ids(&db, "Hemn", &restarted), vec!["sk1"], "a skip remains reviewer-local");
 
         // The owner can see that a human met this clip and could not call it. That is the signal —
         // a clip several people skip is telling you something about the clip.

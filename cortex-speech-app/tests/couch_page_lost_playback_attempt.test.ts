@@ -33,6 +33,7 @@ interface Harness {
   calls: string[];
   attemptIds: string[];
   finalize: { status: number };
+  restart(): void;
   player: HTMLAudioElement;
   settle(): Promise<void>;
   startCalls(): number;
@@ -51,6 +52,7 @@ async function bootPage(): Promise<Harness> {
   const calls: string[] = [];
   const attemptIds: string[] = [];
   const finalize = { status: 200 };
+  let assignmentLive = false;
   let minted = 0;
   const dom = new JSDOM(readFileSync(PAGE, 'utf-8'), {
     runScripts: 'dangerously',
@@ -61,6 +63,14 @@ async function bootPage(): Promise<Harness> {
         clearRect: () => {},
         fillRect: () => {},
         fillStyle: '',
+      });
+      Object.defineProperty(win.HTMLMediaElement.prototype, 'pause', {
+        configurable: true,
+        value: () => {},
+      });
+      Object.defineProperty(win.HTMLMediaElement.prototype, 'play', {
+        configurable: true,
+        value: () => Promise.resolve(),
       });
       if (!win.crypto || typeof win.crypto.randomUUID !== 'function') {
         Object.defineProperty(win, 'crypto', {
@@ -74,7 +84,27 @@ async function bootPage(): Promise<Harness> {
       win.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         calls.push(url.split('?')[0]);
+        if (url.includes('/api/queue')) {
+          // A successful queue read is the server-owned assignment boundary. After a process restart
+          // playback/start must refuse until the phone refreshes this exact authority.
+          assignmentLive = true;
+          return json({
+            reviewer: 'Rubar',
+            playbackContractVersion: 4,
+            items: [CLIP],
+            heldByOthers: 0,
+            skippedByYou: 0,
+            pendingTotal: 1,
+            reviewPool: true,
+          });
+        }
         if (url.includes('/api/playback/start')) {
+          if (!assignmentLive) {
+            return new Response('this clip was not served to this reviewer — reload your queue', {
+              status: 409,
+              headers: { 'content-type': 'text/plain' },
+            });
+          }
           const request = JSON.parse(String(init?.body ?? '{}'));
           minted += 1;
           const id = '20000000-0000-4000-8000-' + String(minted).padStart(12, '0');
@@ -90,6 +120,7 @@ async function bootPage(): Promise<Harness> {
         }
         if (url.includes('/api/playback/finalize')) {
           if (finalize.status !== 200) {
+            assignmentLive = false;
             return new Response('playback attempt is missing or expired — reload this clip', {
               status: finalize.status,
               headers: { 'content-type': 'text/plain' },
@@ -114,7 +145,6 @@ async function bootPage(): Promise<Harness> {
     for (let tick = 0; tick < 5; tick += 1) await new Promise((resolve) => setTimeout(resolve, 5));
   };
   await dom.window.eval('load()');
-  dom.window.eval('queue = [' + JSON.stringify(CLIP) + ']; i = 0; exhausted = true; show(false);');
   await settle();
   const player = dom.window.document.getElementById('player') as HTMLAudioElement;
   const harness: Harness = {
@@ -122,6 +152,7 @@ async function bootPage(): Promise<Harness> {
     calls,
     attemptIds,
     finalize,
+    restart: () => { assignmentLive = false; },
     player,
     settle,
     startCalls: () => calls.filter((c) => c.endsWith('/api/playback/start')).length,
@@ -143,6 +174,7 @@ describe('couch.html — a playback attempt the server has forgotten', () => {
     const warn = page.dom.window.document.getElementById('warn') as HTMLElement;
 
     // The server restarted: its reply to this attempt id is 409, which the element reports as `error`.
+    page.restart();
     page.player.dispatchEvent(new page.dom.window.Event('error'));
     await page.settle();
     expect(page.startCalls(), 'a dead attempt must be replaced, not reused').toBe(2);

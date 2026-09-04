@@ -28,6 +28,10 @@ async function runningPage(clipId = 'coverage-1', durationMs = 10_000): Promise<
         fillRect: () => {},
         fillStyle: '',
       });
+      Object.defineProperty(win.HTMLMediaElement.prototype, 'pause', {
+        configurable: true,
+        value: () => {},
+      });
     },
   });
   await dom.window.eval('load()');
