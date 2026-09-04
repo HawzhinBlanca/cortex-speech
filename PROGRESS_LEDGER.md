@@ -1,5 +1,67 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-05 — Dependency security and cold-workspace release-gate repair
+
+The combined local baseline `41a07da9` joins payment `538e1044`, reviewer UI `b9e29c52`,
+and health reporting `578337cd`. Its locked Python sweep finished with **one failure
+among 146 scripts**: this ledger was 15 commits behind (limit 3). This evidence-bearing
+entry addresses the documentation failure; the threshold and policy are unchanged.
+The original full Rust command has completed with exit 0 against the unchanged baseline.
+Neither result certifies the final integrated release. UI follow-up `f17a1122` remains
+separate and must be included before the final release is verified.
+
+A fresh isolated `npm ci --no-audit` followed by `npm ls --all` passed, while
+`npm audit --audit-level=high` failed on `fast-uri` 3.1.5 and `qs` 6.15.2. This
+distinguishes the genuine locked-dependency advisories from a separate invalid shared
+local installation. Dependency paths are development tooling: AJV via commitlint/Stryker,
+and typed-rest-client via Stryker. No live Rust reviewer-server exploit is asserted.
+
+Repair: pin `fast-uri` 3.1.6 and advance the existing `qs` override to 6.16.0; regenerate
+the lock with `npm install --package-lock-only --ignore-scripts --no-audit`. Only those
+two package entries changed. The new `tests/dependency_security.test.ts` runs in the
+normal frontend gate and exercises IDN URL canonicalization, bracket-key comma limits,
+and safe serialization of parsed `constructor.isBuffer` data, with benign controls.
+An initial incompatible Node-only test environment failed during shared browser setup
+before executing tests; it was corrected to use the suite's normal environment.
+All **three regressions then genuinely failed on the clean old dependencies** and all
+**three passed after a second clean install of the patched lock**.
+
+Completed patched checks: `npm ci --no-audit` exit 0; `npm ls --all` exit 0;
+`npm audit --audit-level=moderate` exit 0, **0 vulnerabilities**;
+`node node_modules/vitest/vitest.mjs run tests/dependency_security.test.ts` **3/3**.
+Full frontend **1037/1037 in 133 files** passed, as did `npm run typecheck` (zero Svelte
+errors/warnings), `npm run lint`, explicit lint of the new test, and `npm run build`
+including its unchanged bundle budget. These counts are baseline UI plus three dependency
+tests, not the separate f17a1122 reviewer-scope follow-up. Production, paid decisions, credentials, original
+media, model selection and the shared dependency installation remain unchanged.
+
+The initial full browser run failed **2/121**: Settings/Export controls disappeared when
+the overflow workspace could not load. After moving only the owned Vite cache aside,
+the accessibility subset reproduced exactly **2/9** failures. A captured network trace
+proved `504 Outdated Optimize Dep` on the deep `square-terminal` icon dependency.
+Configured Vite's development optimizer to scan `index.html` and all source Svelte/TS
+workspaces before serving, and extended the existing dev-server policy to pin that scan.
+Production lazy imports and bundle limits remain unchanged. From another empty Vite cache,
+`CORTEX_GATE=1 npm run test:e2e -- --reporter=line --retries=0 --trace=on` passed
+**121/121 in 54.5s**, including the unchanged failing assertions. All **121 network
+traces** were inspected: **0 Outdated Optimize Dep responses**. Dev-server and bundle
+architecture policies pass; the production build/budget was rerun after the Vite change
+and passes. This is a measured cold-start repair, not a successful warm-cache retry.
+
+The original combined Rust run completed with exit 0: **2634 library tests, 0 failed,
+8 ignored, 1250.76s**, followed by successful remaining binary/integration targets and
+benchmark test-mode smoke. Log SHA-256:
+`39a6339ae9f1114401c8ce4ef01a4a19c804435efd19b96f3eb736054278d2dd`.
+The original Python sweep remains FAILED; the ledger-staleness test now passes against
+this meaningful pending entry, and final combined-source verification is still required.
+The dependency updates and dev-server repair do not certify physical phone audio or
+paid-pool production acceptance. [Vite's documented scan behavior](https://vite.dev/config/dep-optimization-options)
+explains the development-only boundary; the observed trace is the failure evidence.
+
+Maintainer/advisory references: [fast-uri IDN repair](https://github.com/fastify/fast-uri/security/advisories/GHSA-5jgf-p345-68v8),
+[qs array-limit repair](https://github.com/advisories/GHSA-x5fp-wj9c-mxmx),
+[qs constructor guard](https://github.com/advisories/GHSA-4mjr-xmp4-gh2g).
+
 > **CURRENT PRIVATE-PRODUCTION AUTHORITY — 2026-08-24:** The June Wave-0 scorecard and “Current
 > Focus” sections immediately below are historical charter lineage, not the live reviewer-system
 > verdict. Current operational authority is
