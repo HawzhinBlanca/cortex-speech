@@ -134,7 +134,14 @@ const TLS_IDENTITY_FILE: &str = "couch_tls_identity.json";
 /// decision, or undo route is exposed until the release controller removes this file after all gates
 /// pass. Reading it per request makes exposure an atomic filesystem decision with no restart race.
 const PRIVATE_PRODUCTION_MAINTENANCE_FILE: &str = "private-production-maintenance.json";
-const COUCH_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Sliding lifetime of a phone cookie session, and the `Max-Age` the browser is told: both cookie
+/// sites in routing.rs derive from this constant so the two sides can never disagree. Raised from
+/// 24 h to 7 days on 2026-09-04. The cookie is DERIVED from a pairing token that is already
+/// indefinite, so the short lifetime bought little, while a reviewer away for a day met the terminal
+/// "link expired" page (a home-screen shortcut carries no `#t=` to re-claim with) and read it as a
+/// dead link. With the sliding renewal on every authenticated page load, a reviewer who works at
+/// least weekly never re-claims.
+const COUCH_SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Flexible-pool observations are deliberately disabled until the owner approves an exact prospective
 /// compensation contract for that authority. This stable token is consumed by IPC/runbook callers and
 /// must remain machine-searchable; startup returns it before creating credentials, TLS material, a
@@ -4912,6 +4919,15 @@ mod tests {
             .expect("a valid claim succeeds");
         let cookie = claim.header("set-cookie").expect("the claim mints the cookie").to_string();
         assert!(cookie.contains("HttpOnly"), "the minted cookie must stay unreadable to page JS");
+        // The browser's Max-Age and the server's session lifetime are ONE number, `COUCH_SESSION_TTL`.
+        // A hand-written 86400 beside a 7-day server lifetime would let a browser drop a cookie the
+        // server still honours — the same "expired" verdict on a link nothing had expired.
+        let expected_max_age = format!("Max-Age={}", COUCH_SESSION_TTL.as_secs());
+        // The cookie value is a credential shape even in a fixture: assert on it, never print it.
+        assert!(
+            cookie.contains(&expected_max_age),
+            "the claim cookie's Max-Age must be derived from COUCH_SESSION_TTL"
+        );
         let cookie_pair = cookie.split(';').next().unwrap().to_string();
 
         // A wrong token gets the same flat refusal as everywhere else.
@@ -4928,8 +4944,8 @@ mod tests {
         // must never die of a Max-Age counted from the first claim.
         let revisit = agent.get(&format!("{base}/")).set("Cookie", &cookie_pair).call().unwrap();
         assert!(
-            revisit.header("set-cookie").is_some_and(|c| c.contains("Max-Age")),
-            "an authenticated page load must refresh the cookie's lifetime"
+            revisit.header("set-cookie").is_some_and(|c| c.contains(&expected_max_age)),
+            "an authenticated page load must refresh the cookie's lifetime to COUCH_SESSION_TTL"
         );
 
         shutdown.store(true, Ordering::SeqCst);
