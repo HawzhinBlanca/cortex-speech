@@ -14219,9 +14219,11 @@ the live build has a same-reviewer receipt on the same clip. Local snapshots eve
    on every retry, so play never recovers and Save meets the same 409 at finalize forever until a
    manual reload. That is "no sound" and "my save does not work", reproduced in jsdom against the
    real page (`tests/couch_page_lost_playback_attempt.test.ts`, failing first on exactly the re-arm
-   assertions). Fix: `rearmPlayback` — a media error on an attempt-carrying source re-arms ONCE via a
-   fresh `/api/playback/start`; a 409 at finalize re-arms and asks for another listen (428 path), never
-   advancing and never touching the draft. The Playwright suite's "audio will not load offers a skip"
+   assertions). The first fix attempted to re-arm directly through `/api/playback/start`, but an app
+   restart also forgets the in-memory queue assignment that authorizes that request. The completed
+   `rearmPlayback` snapshots the visible draft, refreshes `/api/queue` to reconstruct the server-owned
+   assignment, and only then obtains a fresh attempt; a 409 at finalize asks for another listen (428
+   path), never advancing or losing the correction. The Playwright suite's "audio will not load offers a skip"
    still holds (43/43) because a plain source has no attempt to re-arm.
 
 2. *"Link expired" after a day away.* `COUCH_SESSION_TTL` was 24 h and both cookie sites hand-wrote
@@ -14284,6 +14286,33 @@ scratch worktree: 142 pass; `test_couch_storage_policy` caught a greppable ancho
 directory junctions into the main worktree (alias detection), and both pass on the identical files
 in the junction-free main worktree (63/63 and "regression passed"). CI runs the suite on a clean
 checkout.
+
+**Independent incident follow-up (Codex, 19:07 local).** The initial duplicate count was not a count
+of replayed clips: `audio_content_hash` identifies a source recording, so multiple non-overlapping
+spans legitimately share it. Across all 16,990 active members there are zero repeated exact
+path+source-span identities and zero overlapping active spans. A second real repeat path did exist:
+`CouchState::skipped` was explicitly memory-only, so a restart handed a declined clip back to the same
+reviewer. Queue construction now rebuilds each reviewer's skip set from append-only `review_events`
+before leasing; a fresh-state regression test proves the skip remains reviewer-local and survives a
+restart.
+
+The active-pool media inventory is physically intact: 16,801 distinct expected WAV paths across the
+four dataset directories, zero missing files, zero unreadable WAV headers, zero source spans past EOF;
+all are mono signed-16-bit PCM at 24 kHz. All 16,990 members have measured RMS/SNR/clipping fields;
+none breach the existing -45 dBFS / 10 dB / 1% coarse gates. This does not certify perceptual quality,
+but it rules out absent files, corrupt containers, out-of-range slices, and digital silence as the
+explanation for the reported no-sound incidents.
+
+The deeper audio check found a separate false-green inference defect. The bundled Silero v4 ONNX
+wrapper requires 64 previous samples prepended to every 512-sample 16 kHz frame. The Rust path sent
+only 512; the dynamic input accepted it but drove real speech probabilities almost entirely below
+threshold, after which the whole-buffer safety fallback made `detect()` appear successful. On five
+recent accepted Lamo clips the old path found 0 positive frames; correct framing found 176-243 per
+clip with maxima near 1.0. The attributed Sorani FLEURS fixture moved from 0/256 to 161/256. The Rust
+implementation now resets recurrent state/context per independent buffer, supplies 576-sample model
+input, and has a raw-probability real-Sorani regression test that cannot pass through the fallback.
+Targeted evidence: VAD tests 13/13, restart/skip Rust contract 1/1, restart browser harness 5/5,
+playback-readiness policy 38 pins, frontend guard policy 33 pins, format and clippy clean.
 
 ## 2026-09-03 — Durable batch guard and both batch bodies testable through a mock app; a normalization batch proven end to end
 
