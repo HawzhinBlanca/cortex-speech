@@ -844,7 +844,6 @@ pub(crate) fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32
 
 pub struct SileroVad {
     session: std::sync::Arc<std::sync::Mutex<Session>>,
-    state: Vec<f32>,
     state_dims: (usize, usize, usize),
     sample_rate: u32,
     frame_size: usize,
@@ -878,11 +877,8 @@ impl SileroVad {
             }
         }
 
-        let state_size = state_dims.0 * state_dims.1 * state_dims.2;
-
         Ok(Self {
             session: std::sync::Arc::new(std::sync::Mutex::new(session)),
-            state: vec![0.0; state_size],
             state_dims,
             sample_rate,
             frame_size: 512,
@@ -917,11 +913,8 @@ impl SileroVad {
             }
         }
 
-        let state_size = state_dims.0 * state_dims.1 * state_dims.2;
-
         Ok(Self {
             session,
-            state: vec![0.0; state_size],
             state_dims,
             sample_rate,
             frame_size: 512,
@@ -944,12 +937,8 @@ impl SileroVad {
         state_dims: (usize, usize, usize),
     ) -> AppResult<Self> {
         let session = cached_session.clone();
-        let state_size = state_dims.0 * state_dims.1 * state_dims.2;
-
         Ok(Self {
             session,
-            // Reuse cached state if the sample rate matches and state_dims are identical.
-            state: vec![0.0; state_size],
             state_dims,
             sample_rate,
             frame_size: 512,
@@ -965,7 +954,6 @@ impl SileroVad {
 
     pub fn detect(&mut self, pcm: &[i16]) -> AppResult<Vec<(usize, usize)>> {
         let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
-        let sr_val = 16000i64;
 
         let (vad_pcm, sample_ratio) = if self.sample_rate != 16000 {
             let resampled = resample(&f32_pcm, self.sample_rate, 16000);
@@ -974,20 +962,62 @@ impl SileroVad {
             (f32_pcm, 1.0)
         };
 
+        let speech_probs = self.infer_speech_probabilities(&vad_pcm)?;
+
+        let segments = self.probs_to_segments(&speech_probs, vad_pcm.len())?;
+
+        if (sample_ratio - 1.0).abs() > 0.01 {
+            let mapped: Vec<(usize, usize)> = segments
+                .into_iter()
+                .map(|(start, end)| {
+                    let mapped_start = (start as f64 * sample_ratio) as usize;
+                    let mapped_end = (end as f64 * sample_ratio) as usize;
+                    (mapped_start, mapped_end)
+                })
+                .map(|(s, e)| {
+                    let capped_end = e.min(pcm.len());
+                    let capped_start = s.min(capped_end);
+                    (capped_start, capped_end)
+                })
+                .collect();
+            Ok(mapped)
+        } else {
+            let capped: Vec<(usize, usize)> = segments.into_iter().map(|(s, e)| (s, e.min(pcm.len()))).collect();
+            Ok(capped)
+        }
+    }
+
+    /// Run Silero's recurrent model on one complete, independent audio buffer.
+    ///
+    /// Silero v4 requires 64 samples of left context in addition to each 512-sample frame at
+    /// 16 kHz. The context and recurrent state both start at zero for every new buffer, matching
+    /// the upstream wrapper's `reset_states()` boundary. Feeding only 512 samples does not fail
+    /// ONNX shape validation because the model input is dynamic, but it suppresses real-speech
+    /// probabilities to nearly zero and turns `probs_to_segments`' safety fallback into a false
+    /// positive "successful VAD" result.
+    fn infer_speech_probabilities(&mut self, vad_pcm: &[f32]) -> AppResult<Vec<f32>> {
+        const CONTEXT_SIZE_16K: usize = 64;
+        const SILERO_SAMPLE_RATE: i64 = 16_000;
+
         let mut speech_probs = Vec::new();
-        let mut state = self.state.clone();
+        let state_size = self.state_dims.0 * self.state_dims.1 * self.state_dims.2;
+        let mut state = vec![0.0; state_size];
+        let mut context = vec![0.0f32; CONTEXT_SIZE_16K];
 
         for chunk in vad_pcm.chunks(self.frame_size) {
             if chunk.len() < self.frame_size {
                 break;
             }
 
-            let input_nd = ndarray::Array2::from_shape_vec((1, self.frame_size), chunk.to_vec())
+            let mut framed = Vec::with_capacity(CONTEXT_SIZE_16K + self.frame_size);
+            framed.extend_from_slice(&context);
+            framed.extend_from_slice(chunk);
+            let input_nd = ndarray::Array2::from_shape_vec((1, framed.len()), framed)
                 .map_err(|e| AppError::Onnx(format!("VAD input reshape: {e}")))?;
             let input_tensor =
                 Tensor::from_array(input_nd).map_err(|e| AppError::Onnx(format!("VAD input tensor: {e}")))?;
 
-            let sr_arr = ndarray::arr0(sr_val);
+            let sr_arr = ndarray::arr0(SILERO_SAMPLE_RATE);
             let sr_tensor = Tensor::from_array(sr_arr).map_err(|e| AppError::Onnx(format!("VAD sr tensor: {e}")))?;
 
             let (d0, d1, d2) = self.state_dims;
@@ -1018,31 +1048,10 @@ impl SileroVad {
 
             drop(outputs);
             speech_probs.push(prob);
+            context.copy_from_slice(&chunk[self.frame_size - CONTEXT_SIZE_16K..]);
         }
 
-        self.state = state;
-
-        let segments = self.probs_to_segments(&speech_probs, vad_pcm.len())?;
-
-        if (sample_ratio - 1.0).abs() > 0.01 {
-            let mapped: Vec<(usize, usize)> = segments
-                .into_iter()
-                .map(|(start, end)| {
-                    let mapped_start = (start as f64 * sample_ratio) as usize;
-                    let mapped_end = (end as f64 * sample_ratio) as usize;
-                    (mapped_start, mapped_end)
-                })
-                .map(|(s, e)| {
-                    let capped_end = e.min(pcm.len());
-                    let capped_start = s.min(capped_end);
-                    (capped_start, capped_end)
-                })
-                .collect();
-            Ok(mapped)
-        } else {
-            let capped: Vec<(usize, usize)> = segments.into_iter().map(|(s, e)| (s, e.min(pcm.len()))).collect();
-            Ok(capped)
-        }
+        Ok(speech_probs)
     }
 
     fn probs_to_segments(&self, probs: &[f32], total_samples: usize) -> AppResult<Vec<(usize, usize)>> {
@@ -1795,10 +1804,49 @@ mod tests {
         assert!(!regions.is_empty(), "a 1 s tone must produce at least one region");
         assert!(regions.iter().all(|(s, e)| s < e && *e <= pcm.len()), "regions must be well formed");
 
-        // The same instance must be reusable - `detect` carries recurrent state between calls, and a
-        // second call must not error or return garbage indices.
+        // The same instance must be reusable. Each call is an independent audio buffer, so detect
+        // resets recurrent state and left context at the call boundary.
         let again = vad.detect(&pcm).expect("second detect on the same instance");
         assert!(again.iter().all(|(s, e)| s < e && *e <= pcm.len()));
+    }
+
+    /// A non-empty segment is not proof that Silero detected speech: `probs_to_segments` deliberately
+    /// returns the whole buffer when every probability is below threshold. Pin the raw neural evidence
+    /// on the repository's attributed, real Sorani FLEURS fixture so a wrong model framing contract
+    /// cannot hide behind that fallback again.
+    #[test]
+    fn silero_vad_real_sorani_fixture_has_positive_neural_detections() {
+        let model_path = crate::models::resolve_model_file("silero_vad_v4.onnx");
+        if !model_path.exists() {
+            println!("SKIP: silero_vad_v4.onnx not present at {model_path:?} - run npm run fetch-models");
+            return;
+        }
+        crate::models::init_ort_dylib_path();
+
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fleurs_ckb_sample.wav");
+        let mut reader = hound::WavReader::open(&fixture).expect("open attributed Sorani speech fixture");
+        let spec = reader.spec();
+        assert_eq!(spec.sample_rate, TARGET_SAMPLE_RATE, "fixture must exercise native 16 kHz framing");
+        assert_eq!(spec.channels, 1, "fixture must be mono");
+        assert_eq!(spec.bits_per_sample, 16, "fixture must contain signed 16-bit PCM");
+        let pcm: Vec<f32> =
+            reader.samples::<i16>().map(|sample| sample.expect("read fixture sample") as f32 / 32768.0).collect();
+
+        let mut vad = SileroVad::new(&model_path, TARGET_SAMPLE_RATE, 0.5).expect("construct bundled Silero VAD");
+        let probabilities = vad.infer_speech_probabilities(&pcm).expect("infer real Sorani speech probabilities");
+        let positive_frames = probabilities.iter().filter(|&&probability| probability >= 0.5).count();
+        let max_probability = probabilities.iter().copied().fold(0.0f32, f32::max);
+
+        assert!(
+            positive_frames >= 3,
+            "real Sorani speech must produce positive neural detections before fallback; \
+             got {positive_frames}/{} frames, max={max_probability}",
+            probabilities.len()
+        );
+        assert!(
+            max_probability >= 0.9,
+            "real Sorani speech should strongly activate the bundled model; max={max_probability}"
+        );
     }
 
     #[test]
