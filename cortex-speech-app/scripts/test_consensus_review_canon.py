@@ -123,8 +123,23 @@ def test_the_queue_serves_what_is_nearest_a_decision() -> None:
     )
     require(
         POOL,
-        "pending.push((distance_to_decision, spread_key, segment_id));",
-        "decision proximity stays authoritative while stable spreading prevents import-order replay",
+        "pending.push((distance_to_decision, voice_name, spread_key, segment_id));",
+        "each queue candidate carries decision priority, frozen voice identity, and stable spread identity",
+    )
+    require(
+        POOL,
+        "for voices in tiers.values_mut() {",
+        "voice spreading runs inside each decision-distance tier, so a fresh clip cannot jump nearer consensus work",
+    )
+    require(
+        POOL,
+        "let max_streak = largest.div_ceil(alternatives + 1).max(1);",
+        "the queue derives the tightest same-voice streak bound that the remaining corpus can actually satisfy",
+    )
+    require(
+        POOL,
+        "!remaining_voice_schedule_is_feasible(voices, voice, next_streak, max_streak)",
+        "every selection preserves a feasible bounded-streak schedule for the complete tier, including its tail",
     )
 
 
