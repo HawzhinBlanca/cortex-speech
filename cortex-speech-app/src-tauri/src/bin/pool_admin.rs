@@ -282,6 +282,7 @@ fn commit_benchmark_worker(
                 operation_id: &operation_id,
                 operation_payload_hash: &if reviewer.ends_with('A') { "a".repeat(64) } else { "b".repeat(64) },
                 created_at_ms: 1_000_000_i64.saturating_add(index as i64),
+                playback_authority_session_id: None,
             },
         )?
         .ok_or_else(|| "commit benchmark decision unexpectedly changed zero rows".to_string())?;
@@ -1392,6 +1393,7 @@ mod tests {
                 operation_id: &uuid::Uuid::new_v4().hyphenated().to_string(),
                 operation_payload_hash: &"b".repeat(64),
                 created_at_ms: at,
+                playback_authority_session_id: None,
             },
         )
         .unwrap()

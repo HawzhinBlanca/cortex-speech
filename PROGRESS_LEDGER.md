@@ -14185,6 +14185,46 @@ because their bodies take a Tauri `AppHandle`/`State`, so the AppHandle-testabil
 functions campaign are the same work — extract each body into an `_on(&store, …)` inner function, the
 pattern `mark_segment_unusable_v1_on` already follows, and test the inner function.
 tiny_http fork, the policy-runner rewrite, and the self-signed TLS hop behind the Funnel.
+## 2026-09-04 — Pool second opinions are paid: the fence and its mirror retire together (owner canon change)
+
+The owner wrote, in his own words: `change canon: pool second opinions are paid at the same weights as
+first opinions (edit 100%, accept 10%, reject 10%)`. Measured immediately before, read-only on the live
+library: 1,451 pool clips held exactly one human opinion, zero held two, `review_pool_decisions` was
+empty, ten reviewers were active, and the export gate refused every pack for want of consensus. The
+cause was by design: `couch/decisions.rs` refused a second opinion with 503 `PAY_POLICY_REQUIRED`
+because `review_pool::record_decision` never wrote the ledger, and `pending_segment_ids` mirrored the
+fence by skipping every one-opinion clip before the distance-to-decision ordering ran.
+
+**What changed.** `db/review.rs` gains `append_review_pool_compensation_tx` — the same policy row
+(`review-iqd-v1-2026-08-21`), the same basis points and the same canonical work identity
+(`reviewer-work-v1:<reviewer>:<audio>`) as a first opinion, keyed on the immutable pool decision id
+(`pool-decision:<id>`, source `couch_pool`, no `review_events` row), plus
+`append_review_pool_compensation_reversal_tx` (source `couch_pool_undo`). `record_decision` consumes the
+policy-4 playback authority (namespace `pool`) and mints the credit inside its own transaction; both
+reversal paths append the signed inverse; the queue mirror is gone. `api_pool_decision` now demands the
+same policy-4 proof as the canonical path — the legacy `heardMs` counter it still accepted would have
+turned every real second opinion into a 428 the moment the fence lifted — and the routing lets a KNOWN
+canonical operation fall through to its duplicate acknowledgement: a lost-response replay of a first
+opinion arrives after its own commit made the clip canonical, and diverting it into the pool path
+answered 409, which the phone reports as "could not be saved". The blinded second-pass CAMPAIGN pays
+nothing and keeps its fence.
+
+**Pins.** `test_pool_pay_fence_scope_policy.py` re-pinned to the new contract (production routing, no
+`cfg(not(test))` refusal, credit before commit, reversal on both undo paths, mirror gone, campaign
+still fenced). `check_review_compensation_readiness.py` validates every `couch_pool` row against its
+`review_pool_decisions` row (action, reviewer, clip, duration, served revision, canonical identity,
+weight, delta) and requires exactly one credit per non-skip pool decision. `docs/OWNER_CANON.md`
+carries the change. Rust: `a_pool_second_opinion_is_paid_once_at_the_first_opinion_weight_and_undo_reverses_it`
+(review_pool) — one credit of 5,000,000 micro-IQD for a 1,000 ms edit, nothing on replay, exact
+inverse on undo, nothing on a replayed undo, the first opinion's owner untouched;
+`a_second_reviewer_is_paid_for_a_proven_pool_opinion_after_a_real_canonical_accept` (couch) — the
+integration flow in miniature with clause-level diagnostics; `reviewer_serving_path` now proves the
+one-opinion clip leads the second reviewer's queue, streams its audio, refuses an unproven second
+opinion with 428, lands a proven one exactly once at 750,000 micro-IQD for a 1,500 ms accept, and
+consumes the second reviewer's authority exactly once.
+
+**Measured after.** RESULTS_PLACEHOLDER
+
 ## 2026-09-04 — Reviewer links and silent audio: the server forgets a playback attempt, the phone never lets go of it
 
 The owner reported dead reviewer links, sessions with no audible sound, a corrected transcript that

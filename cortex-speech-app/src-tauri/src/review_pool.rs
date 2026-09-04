@@ -160,6 +160,9 @@ pub struct PoolDecisionInput<'a> {
     pub operation_id: &'a str,
     pub operation_payload_hash: &'a str,
     pub created_at_ms: i64,
+    /// The exact policy-4 playback authority this judgement rides on (`None` only for a skip). It is
+    /// consumed in the same transaction as the decision, so one listen authorizes one judgement.
+    pub playback_authority_session_id: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1086,8 +1089,7 @@ pub fn pending_segment_ids(
     let mut statement = db
         .connection()
         .prepare(
-            "SELECT segment.id, segment.audio_path,
-                    (segment.verified=1 AND segment.human_decision IS NOT NULL)
+            "SELECT segment.id, segment.audio_path
                FROM review_pool_members member
                JOIN speech_segments segment ON segment.id=member.segment_id
               WHERE member.pool_id=?1
@@ -1100,26 +1102,16 @@ pub fn pending_segment_ids(
         )
         .map_err(|error| format!("review pool queue cannot be prepared: {error}"))?;
     let rows = statement
-        .query_map([&pool.pool_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
-        })
+        .query_map([&pool.pool_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
         .map_err(|error| format!("review pool queue cannot be read: {error}"))?;
     let mut pending: Vec<PendingVoiceCandidate> = Vec::new();
     for row in rows {
-        let (segment_id, audio_path, already_canonical) =
-            row.map_err(|error| format!("review pool row is unreadable: {error}"))?;
-        // PAY-FENCE MIRROR (decisions.rs `already_canonical` → 503 PAY_POLICY_REQUIRED): production
-        // refuses a pool observation on a clip that already carries a canonical human answer, because
-        // `record_decision` never writes `review_compensation_ledger` and evidenced work must never
-        // be taken for free. The queue must therefore never SERVE such a clip — 2026-08-31 the three
-        // oldest fenced clips sat at every queue's front and skip routes into the same fence, walling
-        // all ten reviewers out of a 19,905-clip savable backlog. `cfg!(not(test))` keeps the mirror
-        // exactly as wide as the fence itself (tests decide pool clips via `api_pool_decision`). The
-        // day an owner pay contract prices pool work, lift this mirror WITH the fence — the scope
-        // pin in test_pool_pay_fence_scope_policy.py ties them together.
-        if cfg!(not(test)) && already_canonical {
-            continue;
-        }
+        let (segment_id, audio_path) = row.map_err(|error| format!("review pool row is unreadable: {error}"))?;
+        // A clip that already carries one canonical opinion IS the work the consensus canon wants
+        // served next. Until 2026-09-04 a PAY-FENCE MIRROR skipped it here because a pool second
+        // opinion was unpaid (measured that day: 1,451 one-opinion clips, zero two-opinion, ten
+        // active reviewers). The owner priced second opinions at the first-opinion weights, so
+        // `record_decision` now mints the credit and the mirror is gone together with the fence.
         let coverage = reviewers.get(&segment_id);
         if coverage.is_some_and(|coverage| coverage.seen.contains(&reviewer)) {
             continue;
@@ -1607,6 +1599,36 @@ pub fn record_decision(db: &Database, pool: &ReviewPool, input: &PoolDecisionInp
             )
             .map_err(|error| format!("review pool decision cannot be written: {error}"))?;
         let decision_id = tx.last_insert_rowid();
+        if changed == 1 && input.action != "skip" {
+            // Owner canon 2026-09-04: a second opinion is paid exactly like a first one. Consume the
+            // playback authority and mint the credit in THIS transaction, so no committed judgement
+            // can exist unpaid and no lost response can pay twice.
+            if let Some(authority_id) = input.playback_authority_session_id {
+                // `playback_authority_consumptions_v4.namespace` is CHECK-constrained to
+                // canonical | spot_check | independent (schema 67). A pool second opinion is an
+                // independent second opinion, and its operation id names the exact
+                // review_pool_decisions row, so no new namespace (and no schema 70) is needed.
+                crate::db::consume_couch_playback_authority_on(
+                    &tx,
+                    authority_id,
+                    "independent",
+                    input.operation_id,
+                    input.reviewer,
+                    input.segment_id,
+                    input.created_at_ms,
+                )
+                .map_err(|error| format!("review pool playback authority cannot be consumed: {error}"))?;
+            }
+            Database::append_review_pool_compensation_tx(
+                &tx,
+                decision_id,
+                input.segment_id,
+                input.reviewer,
+                input.action,
+                input.served_revision,
+            )
+            .map_err(|error| format!("review pool compensation cannot be written: {error}"))?;
+        }
         tx.commit().map_err(|error| format!("review pool decision cannot commit: {error}"))?;
         Ok((changed, decision_id))
     })
@@ -1659,16 +1681,25 @@ pub fn reverse_decision(
         }
         return Err("review pool decision already has another reversal identity".to_string());
     }
-    let changed = db
-        .with_full_sync(|| {
-            Ok(db.connection().execute(
+    let changed = with_pool_full_sync(db, || {
+        let tx = rusqlite::Transaction::new_unchecked(db.connection(), rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("review pool reversal cannot lock the database: {error}"))?;
+        let changed = tx
+            .execute(
                 "INSERT INTO review_pool_reversals(decision_id, operation_id, reviewer, created_at_ms)
              SELECT decision.id, ?2, ?3, ?4 FROM review_pool_decisions decision
               WHERE decision.id=?1 AND decision.pool_id=?5 AND decision.reviewer=?3 COLLATE NOCASE",
                 rusqlite::params![decision_id, operation_id, reviewer, created_at_ms, pool.pool_id],
-            )?)
-        })
-        .map_err(|error| format!("review pool decision cannot be reversed: {error}"))?;
+            )
+            .map_err(|error| format!("review pool reversal cannot be written: {error}"))?;
+        if changed == 1 {
+            Database::append_review_pool_compensation_reversal_tx(&tx, decision_id, operation_id)
+                .map_err(|error| format!("review pool compensation cannot be reversed: {error}"))?;
+        }
+        tx.commit().map_err(|error| format!("review pool reversal cannot commit: {error}"))?;
+        Ok(changed)
+    })
+    .map_err(|error| format!("review pool decision cannot be reversed: {error}"))?;
     if changed != 1 {
         return Err("review pool reversal target is missing or belongs to another reviewer".to_string());
     }
@@ -1748,6 +1779,8 @@ pub fn reverse_decision_addressed(
             rusqlite::params![decision_id, reversal_operation_id, reviewer, created_at_ms],
         )
         .map_err(|error| format!("addressed review pool reversal cannot be written: {error}"))?;
+        Database::append_review_pool_compensation_reversal_tx(&tx, decision_id, reversal_operation_id)
+            .map_err(|error| format!("addressed review pool compensation cannot be reversed: {error}"))?;
         tx.commit().map_err(|error| format!("addressed review pool reversal cannot commit: {error}"))?;
         Ok(Some(segment_id))
     })
@@ -1986,6 +2019,7 @@ mod tests {
                 operation_id,
                 operation_payload_hash: &"b".repeat(64),
                 created_at_ms: at,
+                playback_authority_session_id: None,
             },
         )
         .unwrap()
@@ -2059,6 +2093,7 @@ mod tests {
                 operation_id: "123e4567-e89b-42d3-a456-426614174052",
                 operation_payload_hash: &"c".repeat(64),
                 created_at_ms: 2_000,
+                playback_authority_session_id: None,
             },
         )
         .unwrap_err()
@@ -2464,6 +2499,7 @@ mod tests {
                 operation_id: "123e4567-e89b-42d3-a456-426614174001",
                 operation_payload_hash: &operation_payload_hash,
                 created_at_ms: 1,
+                playback_authority_session_id: None,
             },
         )
         .unwrap()
@@ -2541,6 +2577,7 @@ mod tests {
                     operation_id,
                     operation_payload_hash: &"e".repeat(64),
                     created_at_ms,
+                    playback_authority_session_id: None,
                 },
             )
             .unwrap()
@@ -3099,6 +3136,7 @@ mod tests {
             operation_id: "123e4567-e89b-42d3-a456-426614174920",
             operation_payload_hash: &payload,
             created_at_ms: 9,
+            playback_authority_session_id: None,
         };
 
         let mut input = base.clone();
@@ -3459,6 +3497,7 @@ mod tests {
                     operation_id,
                     operation_payload_hash: &"e".repeat(64),
                     created_at_ms: at,
+                    playback_authority_session_id: None,
                 },
             )
             .unwrap()
@@ -4019,6 +4058,7 @@ mod tests {
                 operation_id: "123e4567-e89b-42d3-a456-426614174060",
                 operation_payload_hash: &"b".repeat(64),
                 created_at_ms: 1,
+                playback_authority_session_id: None,
             },
         )
         .unwrap()
@@ -4049,6 +4089,127 @@ mod tests {
             pending_segment_ids(&db, &pool, "  nEcHiR  ", None).unwrap(),
             vec!["untouched"],
             "the canonical answer is that reviewer's judgement, and identity is trim/case normalized"
+        );
+    }
+
+    /// Owner canon 2026-09-04: "pool second opinions are paid at the same weights as first opinions
+    /// (edit 100%, accept 10%, reject 10%)". Pinned as money: one committed pool judgement mints exactly
+    /// one ledger credit at the first-opinion weight, a replay mints nothing, the reviewer's undo
+    /// appends the exact signed inverse, and a replayed undo appends nothing.
+    #[test]
+    fn a_pool_second_opinion_is_paid_once_at_the_first_opinion_weight_and_undo_reverses_it() {
+        let (_dir, db, pool) = two_clip_pool(None);
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET verified=1, human_decision='edit', verdict='human_edit',
+                        verdict_transcript='دەقی دروست', annotated_transcript='دەقی دروست',
+                        reviewed_by='Rubar', review_revision=review_revision+1
+                  WHERE id IN ('a','b')",
+                [],
+            )
+            .unwrap();
+        let (_, revision) = db.get_segment_by_id_with_revision("a").unwrap().unwrap();
+        let audio_hash = "a".repeat(64);
+        let decision_operation = "123e4567-e89b-42d3-a456-426614174901";
+        let input = PoolDecisionInput {
+            segment_id: "a",
+            reviewer: "Alle",
+            action: "edit",
+            submitted_transcript: Some("دەقی ئەلە"),
+            served_transcript: "دەقی چامپیۆن",
+            served_revision: revision,
+            audio_content_hash: Some(&audio_hash),
+            source_start_ms: Some(0),
+            source_end_ms: Some(1_000),
+            duration_ms: 1_000,
+            requested_action: "edit",
+            requested_transcript: "دەقی ئەلە",
+            operation_id: decision_operation,
+            operation_payload_hash: &"e".repeat(64),
+            created_at_ms: 1_000,
+            playback_authority_session_id: None,
+        };
+        let decision_id = record_decision(&db, &pool, &input).unwrap().expect("the second opinion commits");
+
+        type LedgerRow = (String, String, String, Option<i64>, i64, i64, i64, Option<String>);
+        let ledger = |reviewer: &str| -> Vec<LedgerRow> {
+            let mut statement = db
+                .connection()
+                .prepare(
+                    "SELECT entry_id, entry_key, source, review_event_id, rate_basis_points,
+                            entitlement_micro_iqd, delta_micro_iqd, reverses_entry_id
+                       FROM review_compensation_ledger
+                      WHERE reviewer=?1 COLLATE NOCASE ORDER BY id",
+                )
+                .unwrap();
+            statement
+                .query_map([reviewer], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let credited = ledger("Alle");
+        assert_eq!(credited.len(), 1, "exactly one credit for one committed pool judgement: {credited:?}");
+        let (entry_id, entry_key, source, review_event_id, bps, entitlement, delta, reverses) = &credited[0];
+        assert_eq!(
+            entry_key,
+            &format!("pool-decision:{decision_id}"),
+            "the credit is keyed on the immutable pool decision"
+        );
+        assert_eq!(source, "couch_pool");
+        assert_eq!(*review_event_id, None, "a pool judgement has no review_events row");
+        assert_eq!(*bps, 10_000, "an edit earns 100%, exactly like a first-opinion edit");
+        // 18,000 IQD per audio hour = 18_000_000_000 micro-IQD/h; a 1,000 ms edit is 5,000,000 micro-IQD.
+        assert_eq!((*entitlement, *delta), (5_000_000, 5_000_000));
+        assert_eq!(*reverses, None);
+
+        let replay = record_decision(&db, &pool, &input).unwrap_err();
+        assert!(replay.contains("duplicated"), "a replayed second opinion is refused, not re-recorded: {replay}");
+        assert_eq!(ledger("Alle").len(), 1, "a replay mints nothing");
+
+        let reversal_operation = "123e4567-e89b-42d3-a456-426614174902";
+        let reversed =
+            reverse_decision_addressed(&db, &pool, decision_id, "Alle", decision_operation, reversal_operation, 2_000)
+                .unwrap();
+        assert_eq!(reversed.as_deref(), Some("a"));
+        let after_undo = ledger("Alle");
+        assert_eq!(after_undo.len(), 2, "undo appends exactly one reversal: {after_undo:?}");
+        let (_, undo_key, undo_source, _, _, _, undo_delta, undo_reverses) = &after_undo[1];
+        assert_eq!(undo_key, &format!("undo:{reversal_operation}"));
+        assert_eq!(undo_source, "couch_pool_undo");
+        assert_eq!(*undo_delta, -5_000_000, "the reversal is the exact signed inverse");
+        assert_eq!(undo_reverses.as_deref(), Some(entry_id.as_str()));
+        let balance: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COALESCE(SUM(delta_micro_iqd),0) FROM review_compensation_ledger WHERE reviewer='Alle'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(balance, 0, "an undone second opinion owes nothing");
+
+        let replayed_undo =
+            reverse_decision_addressed(&db, &pool, decision_id, "Alle", decision_operation, reversal_operation, 3_000)
+                .unwrap();
+        assert_eq!(replayed_undo.as_deref(), Some("a"), "a replayed undo is acknowledged");
+        assert_eq!(ledger("Alle").len(), 2, "a replayed undo appends nothing");
+        assert!(
+            ledger("Rubar").is_empty(),
+            "the first opinion's owner is untouched by the second opinion's money: {:?}",
+            ledger("Rubar")
         );
     }
 }

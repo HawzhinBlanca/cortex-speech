@@ -1100,6 +1100,7 @@ mod tests {
                     operation_id: &format!("123e4567-e89b-42d3-a456-42661417407{}", index + 1),
                     operation_payload_hash: &format!("{}", index + 1).repeat(64),
                     created_at_ms: (index + 1) as i64,
+                    playback_authority_session_id: None,
                 },
             )
             .unwrap()
@@ -1451,6 +1452,7 @@ mod tests {
                 operation_id: "123e4567-e89b-42d3-a456-426614174201",
                 operation_payload_hash: &"9".repeat(64),
                 created_at_ms: 5,
+                playback_authority_session_id: None,
             },
         )
         .unwrap()

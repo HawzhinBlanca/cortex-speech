@@ -10,14 +10,14 @@
 //! serving path can be asked to prove, and each is asserted here rather than worked around:
 //!
 //!   1. A pool clip that is NOT yet canonical is decided through the ordinary, PAID canonical path.
-//!      Only a clip that already carries a canonical human answer routes to the pool branch, which
-//!      production refuses with `PAY_POLICY_REQUIRED` (`decisions.rs`).  `review_pool.rs`'s PAY-FENCE
-//!      MIRROR keeps such a clip out of the queue so nobody is served work the fence will refuse.
-//!      This test pins the fence and the mirror TOGETHER, in both directions: while a clip is fenced
-//!      it is neither served nor decidable, and the moment an Undo makes it savable again it returns
-//!      to the queue.  The consequence for the owner is asserted explicitly: while the fence stands,
-//!      no pool clip can reach `resolved` through the phone, because the second opinion the consensus
-//!      canon requires is exactly the judgement the fence refuses.
+//!      A clip that already carries a canonical human answer routes to the pool branch, which — since
+//!      the owner's canon change of 2026-09-04 ("pool second opinions are paid at the same weights as
+//!      first opinions") — records a paid pool observation instead of refusing with
+//!      `PAY_POLICY_REQUIRED`. This test pins that a lost-response replay of the canonical decision is
+//!      still acknowledged (not diverted into the pool path), that the one-opinion clip is served
+//!      FIRST to a different reviewer, that the second opinion needs the same policy-4 listening proof,
+//!      lands exactly once however often it is replayed, and earns exactly one credit at the same
+//!      weight as a first opinion.
 //!   2. A new verdict needs a server-issued, cookie-session-bound policy-4 playback receipt.  Legacy
 //!      `heardMs`/`clipDurationMs` counters never authorize one, so every judgement below earns its
 //!      receipt through the real endpoints against real WAV bytes.
@@ -25,7 +25,7 @@
 //!      restart-safe Undo target here is the reviewer's canonical judgement, recovered from the
 //!      database after the in-memory stack died with its process.
 
-use cortex_speech_app_lib::couch::{self, PAY_POLICY_REQUIRED};
+use cortex_speech_app_lib::couch;
 use cortex_speech_app_lib::db::{Database, SpeechSegment};
 use cortex_speech_app_lib::deployment::OMNIASR_7B_FAMILY;
 use cortex_speech_app_lib::fingerprint::AudioFingerprint;
@@ -157,7 +157,7 @@ fn spawn_server_child(
         .env("CORTEX_SERVING_PROBE_READY", &ready_path)
         .env("CORTEX_SERVING_PROBE_CONTROL", &control_path)
         .env("CORTEX_COUCH_PORT", port.to_string())
-        .env("RUST_LOG", "error")
+        .env("RUST_LOG", "warn")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -487,23 +487,19 @@ fn reviewer_flow_survives_real_https_retries_and_restarts() {
         concurrent.iter().all(|(status, _)| matches!(*status, 200 | 409 | 428 | 503)),
         "a racing duplicate may only commit, replay, or ask for a safe retry: {concurrent:?}",
     );
-    // KNOWN GAP, PINNED DELIBERATELY — do not "fix" this expectation, fix the server.
-    //
-    // Committing the judgement makes the clip `already_canonical`, and the pool fence in
-    // `api_decision_authenticated` tests that BEFORE `review_operation_state` can recognise an exact
-    // durable receipt. So the author's own lost-response retry — byte-identical operation UUID, work
-    // already saved and already PAID on the canonical path — is answered 503 PAY_POLICY_REQUIRED
-    // instead of the `duplicate` ACK it earns. couch.html treats every 5xx as "the server is unwell,
-    // not disagreeing": it keeps the outbox record, stops the flush, and retries every 60 s forever,
-    // so one lost response wedges everything queued behind it.
-    //
-    // The correct answer is 200 with `duplicate: true`, reached by letting an exact canonical replay
-    // through before the `already_canonical` branch (the branch guards against taking a SECOND
-    // judgement for free; acknowledging the first one takes nothing). When that lands, this assertion
-    // must be changed to the 200/duplicate pair below it, not deleted.
+    // Committing the judgement makes the clip `already_canonical`. A lost-response replay of that
+    // same operation must still be acknowledged as the canonical duplicate it is, never diverted
+    // into the pool path and answered 409 (owner canon 2026-09-04 retired the 503 fence here).
     let (replay_status, replay_body) = post_decision(&agent, &base, &one_cookie, &first_body);
-    assert_eq!(replay_status, 503, "lost-response replay answer changed: {replay_body}");
-    assert!(replay_body.contains(PAY_POLICY_REQUIRED), "the replay refusal is the pay fence: {replay_body}");
+    assert_eq!(
+        replay_status, 200,
+        "a lost-response replay of a canonical decision must be acknowledged: {replay_body}"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&replay_body).expect("parse replay")["duplicate"],
+        true,
+        "the replay must be the canonical duplicate acknowledgement, never a pool 409: {replay_body}",
+    );
 
     // ── Skip: the explicit NO-VERDICT. It writes nothing to the corpus and needs no playback proof ─
     // It also releases the lease, which is what lets the second reviewer below be offered this clip —
@@ -530,22 +526,22 @@ fn reviewer_flow_survives_real_https_retries_and_restarts() {
     // The second half matters just as much. The mirror must be exactly as WIDE as the fence and no
     // wider: the skipped clip is still savable, still unfenced, and must still be served — refusing
     // it here would kill the paid canonical path, which is the only path anyone is actually using.
+    // Owner canon 2026-09-04: a second opinion is paid like a first one, so the clip that already
+    // holds one canonical opinion is served FIRST to a different reviewer (it is the work nearest a
+    // decision), its audio streams, and the judgement lands as a pool decision with its own credit.
     let second_queue = queue(&agent, &base, &two_cookie);
-    assert!(
-        find_item(&second_queue, FIRST_ID).is_none(),
-        "the pay-fence mirror must not serve a clip the fence refuses: {second_queue}",
-    );
-    assert!(
-        find_item(&second_queue, SKIP_ID).is_some(),
-        "savable pool work must still be served — the mirror is no wider than the fence: {second_queue}",
-    );
+    let second_first = item(&second_queue, FIRST_ID);
     assert_eq!(
-        second_queue["pendingTotal"], 1,
-        "only the fenced clip may be dropped from the pending count: {second_queue}",
+        second_queue["items"][0]["id"], FIRST_ID,
+        "the one-opinion clip is nearest a decision and must lead the second reviewer's queue: {second_queue}",
     );
-    let (fenced_audio_status, _) = get_audio(&agent, &base, &two_cookie, FIRST_ID, None);
-    assert_eq!(fenced_audio_status, 403, "a clip the queue never leased must not stream its audio either");
-    let (fenced_status, fenced_body) = post_decision(
+    assert!(find_item(&second_queue, SKIP_ID).is_some(), "untouched pool work is still served: {second_queue}");
+    assert_eq!(second_queue["pendingTotal"], 2, "nothing is fenced out of the pending count any more: {second_queue}");
+    let (second_audio_status, second_bytes) = get_audio(&agent, &base, &two_cookie, FIRST_ID, None);
+    assert_eq!(second_audio_status, 200, "a served one-opinion clip must stream its audio to the second reviewer");
+    assert!(second_bytes.starts_with(b"RIFF"), "the second reviewer receives the real WAV bytes");
+    let second_row_version = second_first["rowVersion"].as_str().expect("served revision").to_string();
+    let (unproven_pool_status, unproven_pool_body) = post_decision(
         &agent,
         &base,
         &two_cookie,
@@ -554,13 +550,55 @@ fn reviewer_flow_survives_real_https_retries_and_restarts() {
             "id": FIRST_ID,
             "action": "accept",
             "text": first["text"],
-            "rowVersion": first_row_version,
+            "rowVersion": second_row_version,
         }),
     );
-    assert_eq!(fenced_status, 503, "an external pool decision must fail closed: {fenced_body}");
-    assert!(
-        fenced_body.contains(PAY_POLICY_REQUIRED),
-        "the refusal must name the pay policy so the page can explain it: {fenced_body}",
+    assert_eq!(
+        unproven_pool_status, 428,
+        "a pool second opinion needs the same policy-4 listening proof as a first opinion: {unproven_pool_body}",
+    );
+    let second_receipt = earn_playback_receipt(
+        &agent,
+        &base,
+        &two_cookie,
+        FIRST_ID,
+        &second_row_version,
+        "00000000-0000-4000-8000-0000000002b2",
+    );
+    let (pool_status, pool_body) = post_decision(
+        &agent,
+        &base,
+        &two_cookie,
+        &json!({
+            "operationId": FENCED_OPERATION,
+            "id": FIRST_ID,
+            "action": "accept",
+            "text": first["text"],
+            "rowVersion": second_row_version,
+            "playbackReceiptId": second_receipt,
+        }),
+    );
+    assert_eq!(pool_status, 200, "a proven pool second opinion must land: {pool_body}");
+    let pool_reply = serde_json::from_str::<Value>(&pool_body).expect("parse pool decision");
+    assert!(pool_reply["poolDecisionId"].is_i64(), "the pool judgement must name its durable id: {pool_body}");
+    let (pool_replay_status, pool_replay_body) = post_decision(
+        &agent,
+        &base,
+        &two_cookie,
+        &json!({
+            "operationId": FENCED_OPERATION,
+            "id": FIRST_ID,
+            "action": "accept",
+            "text": first["text"],
+            "rowVersion": second_row_version,
+            "playbackReceiptId": second_receipt,
+        }),
+    );
+    assert_eq!(pool_replay_status, 200, "a lost-response pool replay is acknowledged: {pool_replay_body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&pool_replay_body).expect("parse pool replay")["duplicate"],
+        true,
+        "the pool replay must be a duplicate acknowledgement, not a second judgement",
     );
 
     // ── Restart boundary: the session, its cookies and the undo authority must survive a kill ─────
@@ -614,13 +652,13 @@ fn reviewer_flow_survives_real_https_retries_and_restarts() {
     );
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM review_pool_decisions", &[]),
-        0,
-        "the pay fence must let no unpaid pool observation reach the database",
+        1,
+        "the second reviewer's proven judgement is exactly one pool decision, however often it was replayed",
     );
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM effective_review_pool_decisions_v62", &[]),
-        0,
-        "no pool judgement may exist while external pool decisions are refused",
+        1,
+        "the pool judgement is effective (never reversed)",
     );
     assert_eq!(
         count(
@@ -647,8 +685,27 @@ fn reviewer_flow_survives_real_https_retries_and_restarts() {
             "SELECT COUNT(*) FROM review_compensation_ledger WHERE reviewer=?1 COLLATE NOCASE",
             &[&REVIEWER_TWO],
         ),
-        0,
-        "a reviewer the fence refused must earn nothing, because nothing of theirs was recorded",
+        1,
+        "the second opinion earns exactly one credit (owner canon 2026-09-04), replay or not",
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COALESCE(SUM(delta_micro_iqd),0) FROM review_compensation_ledger
+              WHERE reviewer=?1 COLLATE NOCASE AND source='couch_pool' AND compensation_action='accept'",
+            &[&REVIEWER_TWO],
+        ),
+        750_000,
+        "an unchanged pool accept earns the same 10% weight as a first-opinion accept",
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM playback_authority_consumptions_v4 WHERE namespace='independent' AND reviewer=?1 COLLATE NOCASE",
+            &[&REVIEWER_TWO],
+        ),
+        1,
+        "the second reviewer's listening authority was consumed exactly once by the pool judgement",
     );
     // Review compensation canon revision 2 (`review-iqd-v1-2026-08-21`): 18,000 IQD per full-
     // equivalent audio hour, and an unchanged `accept` earns 10% of it. A 1,500 ms clip is therefore

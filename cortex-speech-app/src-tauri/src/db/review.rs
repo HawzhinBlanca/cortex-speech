@@ -652,6 +652,176 @@ impl Database {
                 "new review event {review_event_id} did not fall after policy cutoff {cutoff}"
             )));
         }
+        Self::append_review_compensation_entry_tx(
+            tx,
+            &format!("review-event:{review_event_id}"),
+            Some(review_event_id),
+            segment_id,
+            reviewer,
+            source,
+            compensation_action,
+            effective_decision,
+            decision_revision,
+        )
+    }
+
+    /// Owner canon 2026-09-04 ("pool second opinions are paid at the same weights as first
+    /// opinions"): a flexible-pool observation earns exactly what the canonical path earns for the
+    /// same action on the same audio — same policy row, same basis points, same canonical work
+    /// identity (`reviewer-work-v1:<reviewer>:<audio>`), so one reviewer can never be paid twice for
+    /// one clip whichever path recorded it. The entry is keyed on the immutable pool decision id, so a
+    /// replayed request mints nothing. Pool decisions have no `review_events` row and sit outside the
+    /// event-id cutoff by construction; the policy row itself is still verified.
+    pub(crate) fn append_review_pool_compensation_tx(
+        tx: &rusqlite::Transaction<'_>,
+        pool_decision_id: i64,
+        segment_id: &str,
+        reviewer: &str,
+        compensation_action: &str,
+        served_revision: i64,
+    ) -> AppResult<()> {
+        if pool_decision_id <= 0 {
+            return Err(AppError::Validation("pool compensation requires a committed pool decision id".into()));
+        }
+        Self::verify_review_pay_policy_tx(tx)?;
+        Self::append_review_compensation_entry_tx(
+            tx,
+            &format!("pool-decision:{pool_decision_id}"),
+            None,
+            segment_id,
+            reviewer,
+            "couch_pool",
+            compensation_action,
+            compensation_action,
+            Some(served_revision),
+        )
+    }
+
+    /// Signed inverse of the credit a pool decision minted, appended when that decision is reversed.
+    /// A decision that minted nothing (a skip) reverses nothing. Idempotent on the reversal operation.
+    pub(crate) fn append_review_pool_compensation_reversal_tx(
+        tx: &rusqlite::Transaction<'_>,
+        pool_decision_id: i64,
+        reversal_operation_id: &str,
+    ) -> AppResult<()> {
+        Self::verify_review_pay_policy_tx(tx)?;
+        let reversal_key = format!("undo:{reversal_operation_id}");
+        let already: Option<String> = tx
+            .query_row(
+                "SELECT entry_id FROM review_compensation_ledger WHERE entry_key = ?1",
+                params![reversal_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if already.is_some() {
+            return Ok(());
+        }
+        type PoolCredit = (String, String, String, String, String, String, Option<i64>, i64, i64, i64);
+        let original: Option<PoolCredit> = tx
+            .query_row(
+                "SELECT entry_id, policy_version, canonical_work_id, canonical_identity_kind, reviewer,
+                        segment_id, decision_revision, duration_ms, delta_micro_iqd, delta_corrected_ms
+                   FROM review_compensation_ledger
+                  WHERE entry_key = ?1 AND reverses_entry_id IS NULL",
+                params![format!("pool-decision:{pool_decision_id}")],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some(original) = original else {
+            return Ok(());
+        };
+        let latest_unreversed_entry: Option<String> = tx
+            .query_row(
+                "SELECT candidate.entry_id
+                   FROM review_compensation_ledger candidate
+                  WHERE candidate.policy_version = ?1
+                    AND candidate.canonical_work_id = ?2
+                    AND candidate.reverses_entry_id IS NULL
+                    AND NOT EXISTS (
+                         SELECT 1 FROM review_compensation_ledger reversal
+                          WHERE reversal.reverses_entry_id = candidate.entry_id
+                    )
+                  ORDER BY candidate.id DESC
+                  LIMIT 1",
+                params![original.1, original.2],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if latest_unreversed_entry.as_deref() != Some(original.0.as_str()) {
+            return Err(AppError::Validation(
+                "pool undo refused: a newer active entitlement mutation owns this canonical audio work".into(),
+            ));
+        }
+        let current_corrected_ms: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(delta_corrected_ms), 0)
+               FROM review_compensation_ledger
+              WHERE policy_version = ?1 AND canonical_work_id = ?2",
+            params![original.1, original.2],
+            |row| row.get(0),
+        )?;
+        let reversal_delta =
+            original.8.checked_neg().ok_or_else(|| AppError::Other("pool reversal overflow".into()))?;
+        let reversal_corrected_delta =
+            original.9.checked_neg().ok_or_else(|| AppError::Other("pool corrected-audio reversal overflow".into()))?;
+        let corrected_entitlement_ms = current_corrected_ms
+            .checked_add(reversal_corrected_delta)
+            .ok_or_else(|| AppError::Other("pool corrected-audio reversal balance overflow".into()))?;
+        if corrected_entitlement_ms < 0 {
+            return Err(AppError::Other("pool reversal would produce a negative corrected entitlement".into()));
+        }
+        tx.execute(
+            "INSERT INTO review_compensation_ledger
+                (entry_id, entry_key, policy_version, canonical_work_id, canonical_identity_kind,
+                 reviewer, segment_id, source, compensation_action, effective_decision,
+                 decision_revision, duration_ms, rate_basis_points, entitlement_micro_iqd,
+                 delta_micro_iqd, corrected_entitlement_ms, delta_corrected_ms,
+                 reverses_entry_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'couch_pool_undo', 'undo', 'undo',
+                     ?8, ?9, 0, 0, ?10, ?11, ?12, ?13)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                reversal_key,
+                original.1,
+                original.2,
+                original.3,
+                original.4,
+                original.5,
+                original.6,
+                original.7,
+                reversal_delta,
+                corrected_entitlement_ms,
+                reversal_corrected_delta,
+                original.0,
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_review_compensation_entry_tx(
+        tx: &rusqlite::Transaction<'_>,
+        entry_key: &str,
+        review_event_id: Option<i64>,
+        segment_id: &str,
+        reviewer: &str,
+        source: &str,
+        compensation_action: &str,
+        effective_decision: &str,
+        decision_revision: Option<i64>,
+    ) -> AppResult<()> {
         let basis_points = review_pay_basis_points(compensation_action)?;
         let (audio_work_id, identity_kind, duration_ms) = Self::compensation_audio_identity_tx(tx, segment_id)?;
         let reviewer_key = reviewer.trim().to_lowercase();
@@ -706,7 +876,7 @@ impl Database {
                      ?15, ?16, ?17, ?18)",
             params![
                 entry_id,
-                format!("review-event:{review_event_id}"),
+                entry_key,
                 REVIEW_PAY_POLICY_VERSION,
                 review_event_id,
                 canonical_work_id,

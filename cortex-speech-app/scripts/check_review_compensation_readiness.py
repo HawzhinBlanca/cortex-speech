@@ -575,9 +575,9 @@ def audit(db_path: Path, focus_path: Path) -> dict[str, Any]:
         }
         all_ledger_rows = list(
             connection.execute(
-                """SELECT id, entry_id, policy_version, review_event_id, canonical_work_id,
-                          canonical_identity_kind, reviewer, segment_id, compensation_action,
-                          effective_decision, duration_ms, rate_basis_points,
+                """SELECT id, entry_id, entry_key, source, policy_version, review_event_id,
+                          canonical_work_id, canonical_identity_kind, reviewer, segment_id,
+                          compensation_action, effective_decision, duration_ms, rate_basis_points,
                           entitlement_micro_iqd, delta_micro_iqd,
                           corrected_entitlement_ms, delta_corrected_ms, reverses_entry_id
                      FROM review_compensation_ledger ORDER BY id"""
@@ -603,6 +603,7 @@ def audit(db_path: Path, focus_path: Path) -> dict[str, Any]:
         evidence["allPolicyLedgerEntries"] = len(all_ledger_rows)
 
         event_entry_counts: dict[int, int] = {}
+        pool_entry_counts: dict[int, int] = {}
         all_policy_event_entry_counts: dict[int, int] = {}
         entry_by_id: dict[str, sqlite3.Row] = {}
         balances: dict[str, int] = {}
@@ -730,8 +731,63 @@ def audit(db_path: Path, focus_path: Path) -> dict[str, Any]:
                         f"undo corrected entitlement mismatch at {entry_id}: "
                         f"{row['corrected_entitlement_ms']} != {expected_corrected_entitlement}"
                     )
+            elif str(row["source"]) == "couch_pool" and str(row["entry_key"]).startswith("pool-decision:"):
+                try:
+                    pool_decision_id = int(str(row["entry_key"]).split(":", 1)[1])
+                except ValueError:
+                    pool_decision_id = -1
+                pool_entry_counts[pool_decision_id] = pool_entry_counts.get(pool_decision_id, 0) + 1
+                pool_decision = connection.execute(
+                    """SELECT decision.segment_id, decision.reviewer, decision.action, decision.duration_ms,
+                              decision.served_revision, segment.audio_content_hash, segment.alignment_json
+                         FROM review_pool_decisions decision
+                         LEFT JOIN speech_segments segment ON segment.id = decision.segment_id
+                        WHERE decision.id = ?""",
+                    (pool_decision_id,),
+                ).fetchone()
+                if pool_decision is None:
+                    errors.append(f"pool ledger entry {entry_id} names a missing pool decision {pool_decision_id}")
+                else:
+                    if action != str(pool_decision["action"]) or str(row["effective_decision"]) != str(pool_decision["action"]):
+                        errors.append(f"pool ledger entry {entry_id} disagrees with pool decision {pool_decision_id}")
+                    if (
+                        row["segment_id"] != pool_decision["segment_id"]
+                        or str(row["reviewer"]).casefold() != str(pool_decision["reviewer"]).casefold()
+                    ):
+                        errors.append(f"pool ledger identity {entry_id} disagrees with pool decision {pool_decision_id}")
+                    if int(row["duration_ms"]) != int(pool_decision["duration_ms"]):
+                        errors.append(f"pool ledger duration {entry_id} disagrees with pool decision {pool_decision_id}")
+                    if row["decision_revision"] != pool_decision["served_revision"]:
+                        errors.append(f"pool ledger revision {entry_id} disagrees with pool decision {pool_decision_id}")
+                    expected_work_id, reviewer_reason = canonical_reviewer_work_id(
+                        pool_decision["reviewer"],
+                        pool_decision["audio_content_hash"],
+                        pool_decision["alignment_json"],
+                    )
+                    if (
+                        expected_work_id is None
+                        or row["canonical_identity_kind"] != CANONICAL_IDENTITY_KIND
+                        or row["canonical_work_id"] != expected_work_id
+                    ):
+                        errors.append(
+                            f"pool ledger canonical identity {entry_id} disagrees with its segment: "
+                            f"expected kind={CANONICAL_IDENTITY_KIND!r}, work={expected_work_id!r}; "
+                            f"reason={reviewer_reason or 'none'}"
+                        )
+                expected_bps = BASIS_POINTS.get(action)
+                if expected_bps is None or action == "skip":
+                    errors.append(f"pool ledger entry {entry_id} has unsupported action {action!r}")
+                else:
+                    entitlement = _exact_entitlement(int(row["duration_ms"]), expected_bps)
+                    if int(row["rate_basis_points"]) != expected_bps or int(row["entitlement_micro_iqd"]) != entitlement:
+                        errors.append(f"pool ledger rate/entitlement mismatch at {entry_id}")
+                    if delta != entitlement - prior:
+                        errors.append(f"pool ledger delta mismatch at {entry_id}: {delta} != {entitlement - prior}")
+                    target_corrected = int(row["duration_ms"]) if action == "edit" else 0
+                    if int(row["corrected_entitlement_ms"]) != target_corrected or delta_corrected != target_corrected - prior_corrected:
+                        errors.append(f"pool ledger corrected-audio mismatch at {entry_id}")
             else:
-                errors.append(f"ledger entry {entry_id} has neither review event nor undo semantics")
+                errors.append(f"ledger entry {entry_id} has neither review event, pool decision nor undo semantics")
 
             balances[work_id] = prior + delta
             corrected_balances[work_id] = prior_corrected + delta_corrected
@@ -739,6 +795,16 @@ def audit(db_path: Path, focus_path: Path) -> dict[str, Any]:
                 errors.append(f"canonical work {work_id} has a negative running entitlement")
             if corrected_balances[work_id] < 0:
                 errors.append(f"canonical work {work_id} has a negative corrected-audio entitlement")
+
+        for pool_decision_id, pool_action in connection.execute(
+            "SELECT id, action FROM review_pool_decisions WHERE action <> 'skip' ORDER BY id"
+        ).fetchall():
+            entries = pool_entry_counts.get(int(pool_decision_id), 0)
+            if entries != 1:
+                errors.append(
+                    f"pool decision {pool_decision_id} ({pool_action}) has {entries} ledger entries; required exactly one"
+                )
+        evidence["poolDecisionCredits"] = sum(pool_entry_counts.values())
 
         for event_id, event in events.items():
             action = str(event["compensation_action"] or "")
