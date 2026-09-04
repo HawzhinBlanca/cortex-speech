@@ -598,7 +598,8 @@ impl Database {
             // the clip, the first opinion can no longer be retracted; the owner's adjudication path
             // exists for that.
             let second_opinions_recorded: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM effective_review_pool_decisions_v62 WHERE segment_id = ?1",
+                "SELECT COUNT(*) FROM effective_review_pool_decisions_v62
+                  WHERE segment_id = ?1 AND action <> 'skip'",
                 params![effect.segment_id],
                 |row| row.get(0),
             )?;

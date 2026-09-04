@@ -940,6 +940,8 @@ fn require_live_member_identity(db: &Database, pool: &ReviewPool) -> Result<(), 
             "review pool clip {segment_id} changed after activation; review is paused to protect repeated-review identity"
         ));
     }
+    // Skips retain exact served identity and seen history, but are not judgements. Only an
+    // effective non-skip opinion depends on the canonical row still holding its first judgement.
     let invalid_history: bool = db
         .connection()
         .query_row(
@@ -972,7 +974,7 @@ fn require_live_member_identity(db: &Database, pool: &ReviewPool) -> Result<(), 
              ) OR EXISTS(
                  SELECT 1 FROM effective_review_pool_decisions_v62 decision
                  JOIN speech_segments segment ON segment.id=decision.segment_id
-                WHERE decision.pool_id=?1 AND (
+                WHERE decision.pool_id=?1 AND decision.action<>'skip' AND (
                       segment.verified<>1
                    OR segment.human_decision NOT IN ('accept','edit','reject')
                    OR lower(trim(COALESCE(segment.reviewed_by, '@desktop-owner')))

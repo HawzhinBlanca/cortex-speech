@@ -1810,7 +1810,8 @@ pub(super) fn api_undo_with_body(db: &Database, body: &[u8], reviewer: &str, sta
             let second_opinions: i64 = db
                 .connection()
                 .query_row(
-                    "SELECT COUNT(*) FROM effective_review_pool_decisions_v62 WHERE segment_id = ?1",
+                    "SELECT COUNT(*) FROM effective_review_pool_decisions_v62
+                      WHERE segment_id = ?1 AND action <> 'skip'",
                     [&segment.id],
                     |row| row.get(0),
                 )
@@ -3232,6 +3233,87 @@ mod tests {
             .unwrap();
         assert_eq!(reversals, 0, "a refused undo writes no reversal");
         crate::review_pool::load(&db).unwrap().expect("the pool still starts over this history");
+    }
+
+    #[test]
+    fn a_pool_skip_does_not_lock_the_first_reviewers_undo() {
+        assert_first_opinion_undo_after_no_remaining_pool_judgement("skip");
+    }
+
+    #[test]
+    fn an_undone_pool_judgement_does_not_lock_the_first_reviewers_undo() {
+        assert_first_opinion_undo_after_no_remaining_pool_judgement("accept");
+    }
+
+    fn assert_first_opinion_undo_after_no_remaining_pool_judgement(second_action: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, pool) = pool_fixture(tmp.path());
+        let st = Mutex::new(CouchState { pool_policy: Some(pool), ..CouchState::default() });
+        lock_state(&st).served_work.insert(("in-pool".into(), "Sara".into()));
+        let (code, body) = decide(
+            &db,
+            &st,
+            "Sara",
+            &serde_json::json!({
+                "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa61",
+                "id": "in-pool", "action": "accept", "text": "دەقی چامپیۆن",
+                "rowVersion": stamp(&db, "in-pool"),
+                "playbackReceiptId": policy4_receipt(&db, "Sara", "in-pool"),
+            }),
+        );
+        assert_eq!(code, 200, "first judgement: {body}");
+        lock_state(&st).served_work.insert(("in-pool".into(), "Hemn".into()));
+        let second_operation = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa62";
+        let mut request = serde_json::json!({
+            "operationId": second_operation,
+            "id": "in-pool", "action": second_action,
+            "text": if second_action == "skip" { "" } else { "دەقی چامپیۆن" },
+            "rowVersion": stamp(&db, "in-pool"),
+        });
+        if second_action != "skip" {
+            request["playbackReceiptId"] = serde_json::json!(policy4_receipt(&db, "Hemn", "in-pool"));
+        }
+        let (code, body) = decide(&db, &st, "Hemn", &request);
+        assert_eq!(code, 200, "second reviewer {second_action}: {body}");
+        if second_action != "skip" {
+            let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let target = serde_json::json!({
+                "poolDecisionId": response["poolDecisionId"].as_i64().unwrap().to_string(),
+                "decisionOperationId": second_operation,
+                "reversalOperationId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbb63",
+            });
+            let (code, body) = undo_raw(&db, &st, "Hemn", target.to_string().as_bytes());
+            assert_eq!(code, 200, "second opinion must first be undone: {body}");
+        }
+        let effective_judgements: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM effective_review_pool_decisions_v62 WHERE action <> 'skip'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(effective_judgements, 0);
+        let (code, body) = undo_raw(&db, &st, "Sara", &[]);
+        assert_eq!(code, 200, "no other effective judgement may lock the first opinion: {body}");
+        let canonical = row(&db, "in-pool");
+        assert!(!canonical.verified && canonical.human_decision.is_none());
+        db.initialize().expect("canonical undo must leave a valid startup state");
+        crate::review_pool::load(&db).unwrap().expect("unpaid skips and reversed judgements cannot break pool startup");
+        crate::restore_service::validate_review_compensation_semantics(&db).unwrap();
+        if second_action == "skip" {
+            assert!(
+                crate::review_pool::reviewer_already_saw(&db, "in-pool", "Hemn").unwrap(),
+                "allowing canonical undo must not erase the other reviewer's skip history"
+            );
+            let credits: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM review_compensation_ledger WHERE reviewer='Hemn' COLLATE NOCASE",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(credits, 0, "a skipped clip earns no credit");
+        }
     }
 
     #[test]
