@@ -13,7 +13,12 @@ def export_surface() -> str:
     # Several assertions below pin #[test] fn NAMES (the HuggingFace skip/write regressions) that now
     # live in export_tests.rs — so the gate must scan the whole export SURFACE. Reading only export.rs
     # would let a moved regression vanish and this policy pass vacuously.
-    parts = [read("src-tauri/src/export.rs")]
+    production = read("src-tauri/src/export.rs")
+    # The export-only DTO/privacy adapter is a compiled child module, not renderer/import data.
+    # Require both its wiring and its source; a missing/disconnected module must not be skipped.
+    if '#[path = "export_records.rs"]' not in production or "mod records;" not in production:
+        raise AssertionError("export-only record module is disconnected from the production exporter")
+    parts = [production, read("src-tauri/src/export_records.rs")]
     tests = ROOT / "src-tauri/src/export_tests.rs"
     if tests.is_file():
         parts.append(tests.read_text(encoding="utf-8"))

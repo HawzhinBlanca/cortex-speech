@@ -1,5 +1,46 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-05 — Combine filename-independent audio validation with the export follow-up
+
+Integrated the exact tested `technical_audio_probe.rs` patch from the isolated audio audit.
+The same one-byte-truncated PCM WAV previously became `healthy` when renamed from `.wav`
+to `.bin`, `.mp3` or an extensionless name. Exact WAVE frame validation now follows the
+detected container, not the filename; compressed containers do not acquire that rule by
+being named `.wav`. Containment, deadlines, source hashes and write leases are unchanged.
+
+The isolated source passed 18 focused tests, including 144 WAV combinations and four FLAC
+filename cases, plus 20 actual rebuilt-worker cases and its contained-worker self-test.
+Its completed full-run log records 2,636 library tests passed, zero failed, eight ignored;
+all 46 test-result summaries report zero failures. All 146 policy scripts passed, including
+actual IPC regeneration. The original session handle expired before terminal collection;
+these are durable log results, not a recovered terminal exit receipt. Frozen source hashes
+and the complete two-file inventory were rechecked unchanged before integration.
+
+The exact combined export/audio revision still requires architecture, formatting, strict
+Clippy, full Rust and full policy/IPC verification before a normal PR102 follow-up push.
+Separate prior results are not combined proof. No production deployment, coverage gain,
+real-corpus prevalence, paid-pool field acceptance or resolution of all complaints is claimed.
+
+## 2026-09-05 — Restore the export module architecture gate without changing serialization
+
+PR102 at `5a24591a` passed its 146 policy scripts in Windows CI, then failed the separate
+production-module-size gate: `export.rs` measured **2,037** production lines against the
+strict below-2,000 limit. The same gate reproduced that failure locally. Earlier local
+format/lint/policy/Rust results did not cover this actual architecture measurement.
+
+Extracted the cohesive export-only record adapter, privacy-safe audio reference and tri-state
+speaker-turn serialization into `export_records.rs`, retaining the parent module's names and
+existing callers. The moved bodies compare exactly with their originals after visibility-only
+adjustments. No transcript, authority, privacy or dataset-field behavior was intentionally changed.
+The training-grade source policy now requires the compiled child-module wiring and reads its
+source; an explicit disconnected-module check proves it refuses missing wiring.
+
+Actual architecture rerun: **PASS**, `export.rs` **1,963** production lines and the new module
+**86**; thresholds and exceptions unchanged. Formatting, diff checks, training-grade export
+policy and Rust test-registration checks pass. Rust/export/IPC regressions and the full local
+checks must still be rerun before this follow-up is committed/pushed. The independent audio
+repair currently owns the shared build target; no competing heavy build was started.
+
 ## 2026-09-05 — Publication collision closed; export authority isolated from IPC
 
 A deterministic Windows reproduction showed the HF move's absent-target check followed by

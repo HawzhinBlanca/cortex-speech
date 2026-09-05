@@ -161,7 +161,11 @@ def test_final_pool_outcomes_reach_every_export_boundary() -> None:
             assert marker in source, f"{path} lost final-review authority guard {marker}"
     db_source = (REPO_ROOT / "src-tauri/src/db.rs").read_text(encoding="utf-8")
     assert '#[serde(skip)]\n    #[specta(skip)]\n    pub export_review:' in db_source, "ordinary IPC/import must exclude export authority"
-    assert "export_review: segment.export_review.clone()" in _read("src-tauri/src/export.rs"), "the export-only record must retain final authority"
+    export_source = _read("src-tauri/src/export.rs")
+    assert '#[path = "export_records.rs"]' in export_source, "the export-only record module must be wired into the exporter"
+    assert "mod records;" in export_source, "the export-only record module must be compiled"
+    assert "use records::{export_records, speaker_turn_csv, ExportSegmentRecord};" in export_source, "the exporter must use the guarded record adapter"
+    assert "export_review: segment.export_review.clone()" in _read("src-tauri/src/export_records.rs"), "the export-only record must retain final authority"
     assert "shared_export_authority_cannot_be_imported_or_reused_after_undo" in _read("src-tauri/src/review_pool.rs")
 
 
