@@ -2427,13 +2427,13 @@ class Verify10SupervisorTests(unittest.TestCase):
             paths = self._write_owner_proof_fixture(root / "owner-proof", sha)
             truth = "d" * 64
             schema_pairs = {
-                "fresh-schema69-install": (0, 69),
-                "schema65-to69-live-sized-clone": (65, 69),
-                "schema69-reopen": (69, 69),
-                "interrupted-migration-recovery": (65, 69),
-                "future-schema-refusal": (70, 70),
-                "local-snapshot-isolated-restore": (69, 69),
-                "offsite-snapshot-isolated-restore": (69, 69),
+                "fresh-schema70-install": (0, 70),
+                "schema65-to70-live-sized-clone": (65, 70),
+                "schema70-reopen": (70, 70),
+                "interrupted-migration-recovery": (65, 70),
+                "future-schema-refusal": (71, 71),
+                "local-snapshot-isolated-restore": (70, 70),
+                "offsite-snapshot-isolated-restore": (70, 70),
             }
             segment_count = 43_774
             phases = []
@@ -2451,10 +2451,10 @@ class Verify10SupervisorTests(unittest.TestCase):
                         "quickCheck": "ok",
                         "integrityCheck": "ok",
                         "foreignKeyViolations": 0,
-                        "segmentCount": 0 if phase_id == "fresh-schema69-install" else segment_count,
+                        "segmentCount": 0 if phase_id == "fresh-schema70-install" else segment_count,
                         "truthDigest": (
                             hashlib.sha256(b"").hexdigest()
-                            if phase_id == "fresh-schema69-install"
+                            if phase_id == "fresh-schema70-install"
                             else truth
                         ),
                         "restoreGeneration": (
@@ -2474,7 +2474,7 @@ class Verify10SupervisorTests(unittest.TestCase):
                 "retryCount": 0,
                 "skipCount": 0,
                 "sourceSchema": 65,
-                "targetSchema": 69,
+                "targetSchema": 70,
                 "sourceSegmentCount": segment_count,
                 "cloneSegmentCount": segment_count,
                 "authoritativeTruthDigest": truth,
@@ -2485,7 +2485,7 @@ class Verify10SupervisorTests(unittest.TestCase):
                         "volumeIdentitySha256": volume,
                         "manifestSha256": hashlib.sha256((kind + "m").encode()).hexdigest(),
                         "databaseSha256": hashlib.sha256((kind + "d").encode()).hexdigest(),
-                        "schema": 69,
+                        "schema": 70,
                         "segmentCount": segment_count,
                         "truthDigest": truth,
                     }
@@ -2525,7 +2525,7 @@ class Verify10SupervisorTests(unittest.TestCase):
             future = next(
                 item for item in accepted_future["phases"] if item["id"] == "future-schema-refusal"
             )
-            future["schemaAfter"] = 69
+            future["schemaAfter"] = 70
             mutations["future-schema-accepted"] = accepted_future
             same_volume = json.loads(json.dumps(report))
             same_volume["snapshots"][1]["volumeIdentitySha256"] = "a" * 64
@@ -2660,7 +2660,7 @@ class Verify10SupervisorTests(unittest.TestCase):
                 "retryCount": 0,
                 "skipCount": 0,
                 "executable": {"sha256": "a" * 64, "bytes": 1_000, "buildGitSha": sha},
-                "databaseSchema": 69,
+                "databaseSchema": 70,
                 "champion": {
                     "modelId": "omniasr-7b",
                     "deploymentSha256": "b" * 64,
@@ -2774,7 +2774,7 @@ class Verify10SupervisorTests(unittest.TestCase):
                     "ordinal": ordinal,
                     "fullGitSha": sha,
                     "executableSha256": "a" * 64,
-                    "databaseSchema": 69,
+                    "databaseSchema": 70,
                     "startedAt": self.verify._format_utc(started),
                     "endedAt": self.verify._format_utc(ended),
                     "durableDecisionCount": 3,
@@ -2807,7 +2807,7 @@ class Verify10SupervisorTests(unittest.TestCase):
                 "lastEndedAt": records[-1]["endedAt"],
                 "totalDurableDecisions": 90,
                 "executableSha256": "a" * 64,
-                "databaseSchema": 69,
+                "databaseSchema": 70,
                 "finalRecordHash": previous,
                 "passed": True,
                 "failures": [],
@@ -2904,7 +2904,7 @@ class Verify10SupervisorTests(unittest.TestCase):
                 "skipCount": 0,
                 "executableSha256": "c" * 64,
                 "executableBytes": 1_000,
-                "databaseSchema": 69,
+                "databaseSchema": 70,
                 "phases": phases,
                 "passed": True,
                 "failures": [],
@@ -3021,7 +3021,7 @@ class Verify10SupervisorTests(unittest.TestCase):
                 "staleTakeover": {"occurred": False, "abandonedRunToken": None},
                 "runAuthority": run_authority,
                 "evidenceContractHash": self.verify.evidence_contract_hash(),
-                "schemaAuthority": {"latestVersion": 69},
+                "schemaAuthority": {"latestVersion": 70},
                 "releaseArtifacts": [application],
                 "results": results,
             }

@@ -209,7 +209,7 @@ def _validated_private_release_manifest(
     *,
     expected_sha: str | None = None,
 ) -> tuple[dict[str, object], Path, dict[str, object]]:
-    """Validate one exact schema-69 release and derive its immutable candidate identity."""
+    """Validate one exact schema-70 release and derive its immutable candidate identity."""
 
     release = _private_production_release_module()
     if not isinstance(manifest, dict):
@@ -221,9 +221,9 @@ def _validated_private_release_manifest(
         raise ValueError(f"private-production release manifest is invalid: {error}") from error
 
     if not _is_exact_integer(manifest.get("schema"), 2) or not _is_exact_integer(
-        manifest.get("expectedDatabaseSchema"), 69
+        manifest.get("expectedDatabaseSchema"), 70
     ):
-        raise ValueError("private-production release is not the exact schema-2/schema-69 contract")
+        raise ValueError("private-production release is not the exact schema-2/schema-70 contract")
     source_sha = manifest.get("appGitSha")
     if not isinstance(source_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", source_sha):
         raise ValueError("private-production release source SHA is not canonical")
@@ -285,7 +285,7 @@ def _validated_private_release_manifest(
         "releaseId": release_id,
         "manifestRelativePath": f"{release_id}/{release.RELEASE_MANIFEST_FILE}",
         "sourceGitSha": source_sha,
-        "expectedDatabaseSchema": 69,
+        "expectedDatabaseSchema": 70,
         "schemaContractId": manifest.get("schemaContractId"),
         "artifacts": {
             "applicationExecutable": {
@@ -331,7 +331,7 @@ def validate_active_release_runtime(
     *,
     expected_sha: str | None = None,
 ) -> Path:
-    """Return the exact schema-69 active app binary, or fail closed on any release drift."""
+    """Return the exact schema-70 active app binary, or fail closed on any release drift."""
 
     validated, executable, _candidate = _validated_private_release_manifest(
         manifest,
@@ -2018,9 +2018,9 @@ def _validate_staged_candidate_authority(value: object) -> dict[str, object]:
         or not isinstance(manifest_bytes, int)
         or isinstance(manifest_bytes, bool)
         or manifest_bytes <= 0
-        or not _is_exact_integer(value.get("expectedDatabaseSchema"), 69)
+        or not _is_exact_integer(value.get("expectedDatabaseSchema"), 70)
         or value.get("schemaContractId")
-        != "cortex-private-production-schema-65-to-69-v1"
+        != "cortex-private-production-schema-65-to-70-v1"
         or value.get("manifestRelativePath")
         != f"{release_id}/release-manifest.json"
     ):
@@ -2504,7 +2504,7 @@ OWNER_PROOF_BUNDLE_ARTIFACTS = (
     "owner-proof/audiobook/audiobook-long.mp3",
     "owner-proof/db-authorities/scale-production-derived-schema60.db",
     "owner-proof/db-authorities/current-campaign-exact-schema65.db",
-    "owner-proof/db-derived/scale-current-schema69.db",
+    "owner-proof/db-derived/scale-current-schema70.db",
     "owner-proof/tools/owner_proof_db.exe",
     "owner-proof/tools/owner_proof_db.rs",
 )
@@ -6424,13 +6424,13 @@ def _validate_owner_proof_binding(
     if (
         not isinstance(database_contracts, dict)
         or not _is_exact_integer(
-            database_contracts.get("scale", {}).get("targetSchemaVersion"), 69
+            database_contracts.get("scale", {}).get("targetSchemaVersion"), 70
         )
         or not _is_exact_integer(
             database_contracts.get("campaignExact", {}).get("schemaVersion"), 65
         )
     ):
-        raise EvidenceError("owner proof-input database contract is not schema 65→69")
+        raise EvidenceError("owner proof-input database contract is not schema 65→70")
     return {
         "bundleManifestSha256": sha256_file(manifest_path),
         "contractSha256": sha256_file(contract_path),
@@ -6442,9 +6442,9 @@ def _validate_owner_proof_binding(
 
 
 SCHEMA_CAMPAIGN_PHASES = (
-    "fresh-schema69-install",
-    "schema65-to69-live-sized-clone",
-    "schema69-reopen",
+    "fresh-schema70-install",
+    "schema65-to70-live-sized-clone",
+    "schema70-reopen",
     "interrupted-migration-recovery",
     "future-schema-refusal",
     "local-snapshot-isolated-restore",
@@ -6499,7 +6499,7 @@ def _validate_schema_restore_semantics(
         or not _is_exact_integer(report.get("retryCount"), 0)
         or not _is_exact_integer(report.get("skipCount"), 0)
         or not _is_exact_integer(report.get("sourceSchema"), 65)
-        or not _is_exact_integer(report.get("targetSchema"), 69)
+        or not _is_exact_integer(report.get("targetSchema"), 70)
         or source_segments != proof["campaignSegments"]
         or clone_segments != source_segments
         or not isinstance(truth_digest, str)
@@ -6533,15 +6533,15 @@ def _validate_schema_restore_semantics(
         schema_before = _exact_nonnegative_int(phase.get("schemaBefore"), f"{expected_id}.schemaBefore")
         schema_after = _exact_nonnegative_int(phase.get("schemaAfter"), f"{expected_id}.schemaAfter")
         expected_schemas = {
-            "fresh-schema69-install": (0, 69),
-            "schema65-to69-live-sized-clone": (65, 69),
-            "schema69-reopen": (69, 69),
-            "interrupted-migration-recovery": (65, 69),
+            "fresh-schema70-install": (0, 70),
+            "schema65-to70-live-sized-clone": (65, 70),
+            "schema70-reopen": (70, 70),
+            "interrupted-migration-recovery": (65, 70),
             "future-schema-refusal": (70, 70),
-            "local-snapshot-isolated-restore": (69, 69),
-            "offsite-snapshot-isolated-restore": (69, 69),
+            "local-snapshot-isolated-restore": (70, 70),
+            "offsite-snapshot-isolated-restore": (70, 70),
         }[expected_id]
-        expected_segments = 0 if expected_id == "fresh-schema69-install" else report["sourceSegmentCount"]
+        expected_segments = 0 if expected_id == "fresh-schema70-install" else report["sourceSegmentCount"]
         if (
             phase.get("id") != expected_id
             or phase.get("status") != "PASS"
@@ -6556,7 +6556,7 @@ def _validate_schema_restore_semantics(
             or not re.fullmatch(r"[0-9a-f]{64}", str(phase.get("databaseSha256", "")))
         ):
             raise EvidenceError(f"schema clone/restore phase {expected_id} failed its exact contract")
-        if expected_id == "fresh-schema69-install":
+        if expected_id == "fresh-schema70-install":
             if phase.get("truthDigest") != hashlib.sha256(b"").hexdigest():
                 raise EvidenceError("fresh schema phase published non-empty human truth")
         elif phase.get("truthDigest") != truth_digest:
@@ -6592,7 +6592,7 @@ def _validate_schema_restore_semantics(
             or volume in volume_ids
             or not re.fullmatch(r"[0-9a-f]{64}", str(snapshot.get("manifestSha256", "")))
             or not re.fullmatch(r"[0-9a-f]{64}", str(snapshot.get("databaseSha256", "")))
-            or not _is_exact_integer(snapshot.get("schema"), 69)
+            or not _is_exact_integer(snapshot.get("schema"), 70)
             or not _is_exact_integer(snapshot.get("segmentCount"), source_segments)
             or snapshot.get("truthDigest") != truth_digest
         ):
@@ -6605,7 +6605,7 @@ def _validate_schema_restore_semantics(
     return {
         "ownerProof": proof,
         "sourceSchema": 65,
-        "targetSchema": 69,
+        "targetSchema": 70,
         "segmentCount": report["sourceSegmentCount"],
         "truthDigest": truth_digest,
         "phases": normalized,
@@ -6926,7 +6926,7 @@ def _validate_owner_workflow_semantics(
         or not _is_exact_integer(report.get("attemptCount"), 1)
         or not _is_exact_integer(report.get("retryCount"), 0)
         or not _is_exact_integer(report.get("skipCount"), 0)
-        or not _is_exact_integer(report.get("databaseSchema"), 69)
+        or not _is_exact_integer(report.get("databaseSchema"), 70)
         or report.get("passed") is not True
         or report.get("failures") != []
         or not isinstance(executable, dict)
@@ -7038,7 +7038,7 @@ def _validate_owner_workflow_semantics(
     return {
         "ownerProof": proof,
         "executable": executable,
-        "databaseSchema": 69,
+        "databaseSchema": 70,
         "champion": champion,
         "workflowStepIds": list(OWNER_WORKFLOW_STEPS),
         "recoveryDrillIds": list(OWNER_RECOVERY_DRILLS),
@@ -7111,7 +7111,7 @@ def _validate_owner_field_session_semantics(
             or session_id in session_ids
             or not isinstance(current_executable, str)
             or not re.fullmatch(r"[0-9a-f]{64}", current_executable)
-            or not _is_exact_integer(record.get("databaseSchema"), 69)
+            or not _is_exact_integer(record.get("databaseSchema"), 70)
             or ended <= started
             or (prior_end is not None and started < prior_end)
             or not _is_exact_integer(record.get("retryCount"), 0)
@@ -7159,7 +7159,7 @@ def _validate_owner_field_session_semantics(
         "lastEndedAt": last_end,
         "totalDurableDecisions": total_decisions,
         "executableSha256": executable_sha,
-        "databaseSchema": 69,
+        "databaseSchema": 70,
         "finalRecordHash": previous_hash,
         "passed": True,
         "failures": [],
@@ -7170,7 +7170,7 @@ def _validate_owner_field_session_semantics(
         or not _is_exact_integer(summary.get("sessionCount"), 30)
         or not _is_exact_integer(summary.get("distinctUtcDates"), 30)
         or not _is_exact_integer(summary.get("totalDurableDecisions"), total_decisions)
-        or not _is_exact_integer(summary.get("databaseSchema"), 69)
+        or not _is_exact_integer(summary.get("databaseSchema"), 70)
         or summary != expected_summary
     ):
         raise EvidenceError("owner field session summary is not derivable from its hash-chained ledger")
@@ -7185,7 +7185,7 @@ def _validate_owner_field_session_semantics(
         "lastEndedAt": last_end,
         "totalDurableDecisions": total_decisions,
         "executableSha256": executable_sha,
-        "databaseSchema": 69,
+        "databaseSchema": 70,
         "finalRecordHash": previous_hash,
     }
 
@@ -7264,9 +7264,9 @@ def _validate_deployment_phase_control(
     _validate_product_attestation(attestation_path, manifest_path, manifest)
     schema_authority = manifest.get("schemaAuthority")
     if not isinstance(schema_authority, dict) or not _is_exact_integer(
-        schema_authority.get("latestVersion"), 69
+        schema_authority.get("latestVersion"), 70
     ):
-        raise EvidenceError(f"deployment phase {phase_id} is not schema-69 compatible")
+        raise EvidenceError(f"deployment phase {phase_id} is not schema-70 compatible")
     release_artifacts = manifest.get("releaseArtifacts")
     if not isinstance(release_artifacts, list):
         raise EvidenceError(f"deployment phase {phase_id} omits release artifacts")
@@ -7400,7 +7400,7 @@ def _validate_owner_deployment_semantics(
         or not _is_exact_integer(report.get("skipCount"), 0)
         or not isinstance(executable_sha, str)
         or not re.fullmatch(r"[0-9a-f]{64}", executable_sha)
-        or not _is_exact_integer(report.get("databaseSchema"), 69)
+        or not _is_exact_integer(report.get("databaseSchema"), 70)
         or report.get("passed") is not True
         or report.get("failures") != []
     ):
@@ -7484,7 +7484,7 @@ def _validate_owner_deployment_semantics(
     return {
         "executableSha256": executable_sha,
         "executableBytes": executable_bytes,
-        "databaseSchema": 69,
+        "databaseSchema": 70,
         "phases": normalized,
     }
 
@@ -11472,7 +11472,7 @@ def _validate_release_artifacts(
             "releasePhase": RELEASE_PHASE_PREDEPLOYMENT,
             "stagedReleaseId": staged_candidate["releaseId"],
             "stagedReleaseManifestSha256": staged_candidate["manifestSha256"],
-            "expectedDatabaseSchema": 69,
+            "expectedDatabaseSchema": 70,
             "schemaContractId": staged_candidate["schemaContractId"],
             "schemaContractSha256": staged_candidate["artifacts"]["schemaContract"][
                 "sha256"
