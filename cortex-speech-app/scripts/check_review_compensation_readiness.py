@@ -53,7 +53,7 @@ BASIS_POINTS = {"edit": 10_000, "accept": 1_000, "reject": 1_000, "skip": 0}
 # The flexible paid audit reads schema-specific evidence tables (policy-4 sessions/receipts/consumptions,
 # pool decisions/reversals) and is pinned to the exact deployed schema on purpose: a migration must
 # re-earn this gate, never inherit it.
-FLEXIBLE_PAID_SCHEMA_VERSIONS = (69,)
+FLEXIBLE_PAID_SCHEMA_VERSIONS = (69, 70)
 # Mirrors src-tauri/src/db/core.rs MIN_PLAYBACK_COVERAGE / DESKTOP_PLAYBACK_POLICY_VERSION.
 MIN_PLAYBACK_COVERAGE = 0.85
 COUCH_PLAYBACK_POLICY_VERSION = 4

@@ -29,7 +29,7 @@ MIGRATION_HEADER = re.compile(
     re.MULTILINE,
 )
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-LOCKED_VERSIONS = [66, 67, 68, 69]
+LOCKED_VERSIONS = [66, 67, 68, 69, 70]
 TOP_LEVEL_KEYS = {"schema", "source", "normalization", "algorithm", "migrations"}
 MIGRATION_KEYS = {"version", "description", "sourceBlockSha256"}
 
@@ -162,7 +162,7 @@ def _assert_rejected(source: str, contract: dict[str, Any]) -> None:
     raise AssertionError("mutated migration source unexpectedly satisfied the immutable contract")
 
 
-def test_append_only_migrations_66_through_69_match_individual_source_hashes() -> None:
+def test_append_only_migrations_66_through_70_match_individual_source_hashes() -> None:
     contract = load_contract()
     assert (APP_ROOT / contract["source"]).resolve() == MIGRATIONS.resolve()
     validate_contract(_current_source(), contract)
@@ -212,7 +212,7 @@ def test_future_append_does_not_redefine_locked_migration_blocks() -> None:
     assert catalog_end is not None
     future = (
         "    Migration {\n"
-        "        version: 70,\n"
+        "        version: 71,\n"
         '        description: "Append-only parser sentinel",\n'
         '        up_sql: "SELECT 1;",\n'
         '        down_sql: Some("SELECT 1;"),\n'
@@ -220,11 +220,11 @@ def test_future_append_does_not_redefine_locked_migration_blocks() -> None:
     )
     appended = source[: catalog_end.start()] + future + source[catalog_end.start() :]
     migrations = validate_contract(appended, contract)
-    assert migrations[-1].version == 70
+    assert migrations[-1].version == 71
 
 
 def main() -> None:
-    test_append_only_migrations_66_through_69_match_individual_source_hashes()
+    test_append_only_migrations_66_through_70_match_individual_source_hashes()
     test_contract_rejects_body_description_and_order_mutation()
     test_future_append_does_not_redefine_locked_migration_blocks()
     hashes = {
@@ -232,7 +232,7 @@ def main() -> None:
         for migration in extract_source_migrations(_current_source())
         if migration.version in LOCKED_VERSIONS
     }
-    print(f"append-only migration source blocks 66-69 are immutable: {hashes}")
+    print(f"append-only migration source blocks 66-70 are immutable: {hashes}")
 
 
 if __name__ == "__main__":

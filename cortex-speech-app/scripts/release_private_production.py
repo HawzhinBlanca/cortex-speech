@@ -90,7 +90,15 @@ SCHEMA_CONTRACT_FIELDS = {
     "appendOnlyContract",
     "appendOnlyContractSha256",
 }
-SCHEMA_CONTRACT_ID = "cortex-private-production-schema-65-to-69-v1"
+SCHEMA_CONTRACT_ID = "cortex-private-production-schema-65-to-70-v1"
+SCHEMA_CONTRACT_TARGET = 70
+# Migration sources this controller has proven on a live-sized clone: the schema-65 legacy boundary
+# (v1 pointer) and the schema-69 line that served until the dedup-supersession release.
+SCHEMA_CONTRACT_SOURCES = [65, 69]
+# Contracts a COMPATIBLE PREVIOUS release (schema-2 pointer) may still carry: id -> (target, sources).
+# A 69 pointer is the last-known-good during a 69->70 handover and is validated against its own
+# contract, never against the current one.
+PREVIOUS_SCHEMA_CONTRACTS = {"cortex-private-production-schema-65-to-69-v1": (69, [65])}
 PRODUCTION_SCHEMA_BOUNDARY = 65
 HISTORICAL_PREFIX_START = "pub static MIGRATIONS: &[Migration] = &["
 FIRST_POST_PRODUCTION_MIGRATION = "    Migration {\n        version: 66,"
@@ -402,9 +410,21 @@ def _normalized_lf_bytes(path: Path, label: str) -> bytes:
     return normalized.encode("utf-8")
 
 
-def validate_schema_contract(path: Path) -> tuple[Path, dict[str, Any], str]:
-    """Validate the one release/migration authority and every source identity it pins."""
+def validate_schema_contract(
+    path: Path,
+    *,
+    expected_id: str = SCHEMA_CONTRACT_ID,
+    expected_target: int = SCHEMA_CONTRACT_TARGET,
+    expected_sources: list[int] | None = None,
+) -> tuple[Path, dict[str, Any], str]:
+    """Validate the one release/migration authority and every source identity it pins.
 
+    Defaults pin the CURRENT contract. A compatible previous release passes its own (older)
+    expectations so its pointer stays a valid last-known-good during a handover.
+    """
+
+    if expected_sources is None:
+        expected_sources = SCHEMA_CONTRACT_SOURCES
     resolved = validate_artifact(path, "private-production schema contract")
     value = load_json(resolved)
     if set(value) != SCHEMA_CONTRACT_FIELDS:
@@ -415,15 +435,17 @@ def validate_schema_contract(path: Path) -> tuple[Path, dict[str, Any], str]:
         )
     if type(value["schema"]) is not int or value["schema"] != 1:
         raise ReleaseError("schema contract schema must be integer 1")
-    if value["contractId"] != SCHEMA_CONTRACT_ID:
-        raise ReleaseError("schema contract identity is not the approved 65-to-69 authority")
-    if type(value["targetSchema"]) is not int or value["targetSchema"] != 69:
-        raise ReleaseError("schema contract target must be exactly 69")
+    if value["contractId"] != expected_id:
+        raise ReleaseError(f"schema contract identity is not the approved {expected_id} authority")
+    if type(value["targetSchema"]) is not int or value["targetSchema"] != expected_target:
+        raise ReleaseError(f"schema contract target must be exactly {expected_target}")
     sources = value["supportedMigrationSources"]
-    if sources != [PRODUCTION_SCHEMA_BOUNDARY] or any(type(item) is not int for item in sources):
-        raise ReleaseError("schema contract supports exactly one migration source: schema 65")
+    if sources != expected_sources or any(type(item) is not int for item in sources):
+        raise ReleaseError(
+            f"schema contract must support exactly the proven migration sources {expected_sources}"
+        )
     if value["sameSchemaRecovery"] is not True:
-        raise ReleaseError("schema contract must explicitly permit same-schema 69 recovery")
+        raise ReleaseError(f"schema contract must explicitly permit same-schema {expected_target} recovery")
     if value["normalization"] != "utf8-lf" or value["algorithm"] != "sha256":
         raise ReleaseError("schema contract hash algorithm/normalization is unsupported")
     if value["migrationSource"] != "src-tauri/src/migrations/mod.rs":
@@ -553,7 +575,19 @@ def validate_manifest(
     if type(value["schema"]) is not int or value["schema"] != expected_manifest_schema:
         raise ReleaseError(f"release manifest schema must be integer {expected_manifest_schema}")
     expected_database_schema = EXPECTED_SCHEMA if current else PRODUCTION_SCHEMA_BOUNDARY
-    if type(value["expectedDatabaseSchema"]) is not int or value["expectedDatabaseSchema"] != expected_database_schema:
+    declared_schema = value["expectedDatabaseSchema"]
+    # A compatible previous release may sit on a proven migration source below the current
+    # target (the schema-69 line during the 69->70 handover). Only when the caller asked for
+    # previous-compatibility, only for a versioned schema-2 pointer, never for the legacy boundary.
+    previous_source = (
+        current
+        and allow_compatible_previous
+        and type(declared_schema) is int
+        and declared_schema in SUPPORTED_MIGRATION_SOURCES
+        and declared_schema != PRODUCTION_SCHEMA_BOUNDARY
+        and declared_schema != EXPECTED_SCHEMA
+    )
+    if not previous_source and (type(declared_schema) is not int or declared_schema != expected_database_schema):
         raise ReleaseError(f"release manifest must require database schema {expected_database_schema}")
     if not isinstance(value["appGitSha"], str) or not SHA40.fullmatch(value["appGitSha"]):
         raise ReleaseError("release manifest appGitSha is invalid")
@@ -596,7 +630,18 @@ def validate_manifest(
         contract_path = Path(str(value["schemaContract"])).resolve(strict=True)
         if contract_path != expected_contract_path:
             raise ReleaseError("schemaContract is not the canonical contract inside the immutable release")
-        _, contract, contract_sha = validate_schema_contract(contract_path)
+        if previous_source:
+            previous = PREVIOUS_SCHEMA_CONTRACTS.get(str(value["schemaContractId"]))
+            if previous is None or previous[0] != declared_schema:
+                raise ReleaseError("previous release schema contract is not a proven migration-source authority")
+            _, contract, contract_sha = validate_schema_contract(
+                contract_path,
+                expected_id=str(value["schemaContractId"]),
+                expected_target=previous[0],
+                expected_sources=previous[1],
+            )
+        else:
+            _, contract, contract_sha = validate_schema_contract(contract_path)
         if value["schemaContractId"] != contract["contractId"]:
             raise ReleaseError("release schema contract identity does not match its staged authority")
         claimed_contract_sha = value["schemaContractSha256"]
@@ -800,7 +845,7 @@ def preflight_clone(data_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         allowed = SUPPORTED_MIGRATION_SOURCES | {EXPECTED_SCHEMA}
         if source_schema not in allowed:
             raise ReleaseError(
-                f"clone preflight accepts only schema {PRODUCTION_SCHEMA_BOUNDARY}->schema {EXPECTED_SCHEMA} "
+                f"clone preflight accepts only schema {sorted(SUPPORTED_MIGRATION_SOURCES)}->schema {EXPECTED_SCHEMA} "
                 f"or same-schema {EXPECTED_SCHEMA}, not schema {source_schema}"
             )
         for name in PROFILE_STATE:
@@ -1265,7 +1310,7 @@ def validate_release_journal(
     source_schema = journal["sourceSchema"]
     if type(source_schema) is not int or source_schema not in (SUPPORTED_MIGRATION_SOURCES | {EXPECTED_SCHEMA}):
         raise ReleaseError(
-            f"release journal source must be schema {PRODUCTION_SCHEMA_BOUNDARY} or {EXPECTED_SCHEMA}"
+            f"release journal source must be a proven schema {sorted(SUPPORTED_MIGRATION_SOURCES)} or {EXPECTED_SCHEMA}"
         )
     baseline = journal["baselinePoolDecisionId"]
     if type(baseline) is not int or baseline < 0:
@@ -1283,8 +1328,10 @@ def validate_release_journal(
     if source_schema == PRODUCTION_SCHEMA_BOUNDARY:
         if previous is not None and int(previous["expectedDatabaseSchema"]) != PRODUCTION_SCHEMA_BOUNDARY:
             raise ReleaseError("schema-65 handover previous release is not a schema-65 legacy boundary")
-    elif previous is None or int(previous["expectedDatabaseSchema"]) != EXPECTED_SCHEMA:
-        raise ReleaseError(f"schema-{EXPECTED_SCHEMA} handover requires a schema-{EXPECTED_SCHEMA} previous release")
+    elif previous is None or int(previous["expectedDatabaseSchema"]) != source_schema:
+        # Same-schema recovery and every versioned migration source alike: the last-known-good must
+        # be the exact release that served the pre-handover database.
+        raise ReleaseError(f"schema-{source_schema} handover requires a schema-{source_schema} previous release")
 
     digest = journal["targetDatabaseSha256"]
     if digest is not None and (not isinstance(digest, str) or not SHA64.fullmatch(digest)):
@@ -1301,14 +1348,14 @@ def validate_release_journal(
         raise ReleaseError("release journal snapshot manifest authority is invalid")
     if (journal["snapshotDir"] is None) != (snapshot_digest is None):
         raise ReleaseError("release journal snapshot directory and manifest authority must be paired")
-    if source_schema == PRODUCTION_SCHEMA_BOUNDARY and journal["phase"] in {
+    if source_schema != EXPECTED_SCHEMA and journal["phase"] in {
         "snapshotted",
         "candidate-certified",
         "candidate-active",
         "exposed",
     }:
         if journal["snapshotDir"] is None:
-            raise ReleaseError("schema-65 handover journal lost its bound rollback snapshot")
+            raise ReleaseError(f"schema-{source_schema} handover journal lost its bound rollback snapshot")
     return journal, candidate, previous
 
 
@@ -1479,7 +1526,7 @@ def deploy(args: argparse.Namespace) -> int:
     source_schema = database_schema(db)
     if source_schema not in (SUPPORTED_MIGRATION_SOURCES | {EXPECTED_SCHEMA}):
         raise ReleaseError(
-            f"deployment accepts only the proven v{PRODUCTION_SCHEMA_BOUNDARY}->v{EXPECTED_SCHEMA} "
+            f"deployment accepts only the proven v{sorted(SUPPORTED_MIGRATION_SOURCES)}->v{EXPECTED_SCHEMA} "
             f"or same-schema v{EXPECTED_SCHEMA} path, not schema v{source_schema}"
         )
     session_reviewers(data_dir)

@@ -1,6 +1,6 @@
 //! Monotonic review, payment, and consent authority for restore admission.
 
-const DURABLE_REVIEW_RESTORE_TABLES: [&str; 34] = [
+const DURABLE_REVIEW_RESTORE_TABLES: [&str; 35] = [
     "review_pilot_hidden_keys",
     "review_events",
     "spot_checks",
@@ -34,6 +34,7 @@ const DURABLE_REVIEW_RESTORE_TABLES: [&str; 34] = [
     "review_pool_voice_certificates",
     "review_pool_dedup_manifests",
     "review_pool_duplicate_exclusions",
+    "review_pool_dedup_supersessions",
     "desktop_review_action_events_v1",
 ];
 
@@ -457,6 +458,7 @@ pub(crate) fn has_durable_review_activity(db: &crate::db::Database) -> Result<bo
         "review_pool_voice_certificates",
         "review_pool_dedup_manifests",
         "review_pool_duplicate_exclusions",
+        "review_pool_dedup_supersessions",
         "desktop_review_legacy_actions_v1",
         "desktop_review_action_events_v1",
     ] {

@@ -1,5 +1,81 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-06 — Duplicates v2 (lag-tolerant, superseding manifest, schema 70) and the Lamo-first queue
+
+**Owner direction (not canon):** finish one voice's dataset before the next — Lamo, then Kawa, then Halwest — and
+make sure no duplicate recordings reach reviewers or the datasets ("earlier reviewers reported some duplicates").
+
+**What was wrong (measured 2026-09-06, live library, read-only).** `check_dataset_duplicates.py` confirmed a
+text-matched pair only when the two waveforms correlated ≥ 0.98 at ZERO lag and differed by ≤ 120 ms in
+duration. A twin cut a few milliseconds differently scores ≈ 0 at zero lag, so the gate *cleared* it as "the same
+sentence read twice" — and the v1 dedup manifest (2,903 families, 3,333 exclusions) inherited the same
+blindness. At the best lag inside ±1.5 s: 2,513 exact-text cross-file pairs → 88% ≥ 0.6; 6,396 near-text pairs
+(similarity 0.85–0.99) → 88% ≥ 0.6; 597 same-voice different-sentence controls → max 0.20 (the four "controls"
+above 0.5 were near-text twins that leaked into the control sample). A windowed drift-robust metric tracked the
+global one, so the 0.4–0.9 spread is codec/bandwidth, not clock drift. The v2 gate on the untouched live
+library: FAIL, 5,746 confirmed redundant clips across 3,283 groups, 244 probable pairs, 194 genuine repeats.
+
+**Verdict v2** (`check_dataset_duplicates.py`): `audio_alignment` = FFT cross-correlation, best lag inside
+±`AUDIO_MAX_LAG_MS` 1500, normalised over the overlapping span (≥ `AUDIO_MIN_OVERLAP_RATIO` 0.60 of the shorter
+clip), `AUDIO_DURATION_TOLERANCE_MS` 1500, confirmed at `AUDIO_DUPLICATE_CORRELATION` 0.40 (twice the control
+ceiling); `[AUDIO_PROBABLE_CORRELATION 0.20, 0.40)` is reported as probable — listed for a human ear, never
+excluded by machine. RULE A′ adds near-text candidates (SequenceMatcher ≥ 0.70 through a word-trigram index,
+durations within the tolerance); the audio still decides. `load_audit_rows` reads the latest superseding
+manifest when schema 70 exists. Pins rebuilt on speech-like fixtures (seeded band-limited noise under a syllabic
+envelope): a tone with a phase offset is not a second take once lags are searched. Tests: shifted cut (300 ms)
+confirmed with its lag reported, longer cut inside the tolerance confirmed, beyond it refused before decode,
+fragment under 60% overlap refused, probable band surfaced not confirmed, mixed-rate pins kept.
+
+**Superseding manifest (schema 2) + migration 70.** `review_pool_dedup_supersessions` (append-only chain,
+`supersedes_manifest_sha256` = v1 base or latest v2, algorithm `cortex-cross-file-waveform-correlation-v2`,
+counts validated by trigger against the registry and the manifest JSON, immutable), `review_pool_duplicate_
+exclusions.manifest_sha256` ('' = v1 base) and a rewritten insert guard: a base exclusion may never carry review
+authority; a superseding one may, but only under a durable supersession row. `dedup.rs::apply_superseding_
+manifest` re-derives everything: algorithm pins, pool identity, every frozen member (retired members are re-proven
+through `ReviewPool::retired_member`), every applied exclusion restated inside the family that holds its
+canonical, canonical selection (applied canonical → most human evidence → audio-quality key; two applied v1
+canonicals that prove to be one recording merge, the one with more evidence stays and the other retires — its own
+exclusion rows chain one hop to the live root, which `load_dedup_binding` now resolves and refuses to cycle),
+v2 proof edges (correlation ≥ 400 000 ppm, |lag| ≤ 1500 ms, overlap ≥ 600 000 ppm, digest-bound), summary
+arithmetic (excluded, canonical, newlyExcluded, excludedReviewed, retiredAppliedCanonicals, reviewedCanonical),
+then one transaction: supersession row + new exclusion rows. `registry_matches` and `dedup_status` follow the
+latest authority; `PoolDedupStatus.supersession_count` reports the chain length. Rust tests: retire a reviewed
+twin and restate the applied family (reopen, serving, export, registry proof, stale-chain refusal), merge two
+applied families by retiring one applied canonical (row chain asserted), refusals for drop/separate/misjudge/
+unproven edge/miscount, schema 2 without a base. `build_review_pool_dedup_manifest.py` is now v2-only and
+writes a sidecar (`*.review.json`) with the probable pairs, cross-voice groups and retired reviewed members.
+
+**Queue.** `review_pool::VOICE_PRIORITY = ["Lamo", "Kawa", "Halwest"]`: inside each decision-distance tier the
+owner's voice order, then TTS-admissible clips (measured single-voice, `tts_admission` ok) before the rest, then
+the SHA-256 spread key — one lexicographic sort of frozen facts. Replaces the proportional voice interleave of
+2026-09-04 (which kept every voice from ever finishing). Pins: `test_consensus_review_canon.py`,
+`test_pool_pay_fence_scope_policy.py`; Rust `pool_serves_voices_in_owner_priority_and_measured_single_voice_
+clips_first`.
+
+**Schema-70 ripple.** `private_production_schema_contract.v1.json` → `cortex-private-production-schema-65-to-70-v1`,
+target 70, sources [65, 69], digests re-pinned; `append_only_migration_contract.v1.json` locks v70;
+`release_private_production.py` validates a schema-69 previous pointer against its own 65-to-69 contract
+(`PREVIOUS_SCHEMA_CONTRACTS`), a handover's previous release must sit on the exact source schema, every
+migration source binds its rollback snapshot; watchdog pins 70 / sources [65, 69]; `FLEXIBLE_PAID_SCHEMA_VERSIONS
+= (69, 70)`; pilot certification accepts algorithm v1|v2; snapshot/restore/owner-proof table registries include
+the new table; owner-proof contract fingerprint for schema 70 (`f542f433eb5f…`), `rust_module_size_exceptions.json`
+re-pinned; release tests renumbered (future = 71) plus `test_schema69_previous_pointer_is_compatible_but_never_a_
+candidate`; Rust rollback/step pins bumped across migrations, restore_service, snapshot, db tests.
+
+**Live-built v2 manifest** (`2c260072055f…`, supersedes `363def17e69f…`, built read-only in 19 min): 4,352
+families; excluded 9,079 of 20,323 (5,746 new; 587 reviewed twins retired with their evidence kept; 232 applied
+v1 canonicals retired under a better twin); canonical after = 11,244 (Lamo 7,352 · Kawa 2,949 · Halwest 943);
+555 probable pairs and one cross-voice group (two Lamo + two Halwest clips of one recording — a labelling fault
+for the owner) surfaced in the sidecar; resolved clips visible 150 → 123. **Clone proof** on a fresh SQLite
+backup of the live library with the release `pool_admin`: `migrate` 69→70 (pre-migration pin written),
+`apply-dedup` in 3.7 s, idempotent re-apply, `certify --full-integrity` healthy (audio all available, rights
+exact, FK 0), `status` per voice as above.
+
+**Not done here.** Twins whose champion text differs below 0.70 similarity are not candidates (v3: text-independent
+fingerprinting); fragments under 60% overlap are not duplicates by this rule; the cross-voice recording needs the
+owner's voice decision; the live library's duplicates gate stays honestly RED until the release applies the
+manifest. Deploy is the owner's command: stage with `--dedup-manifest <v2 json>`, then `deploy`.
+
 ## 2026-09-05 — Combine filename-independent audio validation with the export follow-up
 
 Integrated the exact tested `technical_audio_probe.rs` patch from the isolated audio audit.

@@ -23,6 +23,11 @@
       "version": 69,
       "description": "Add exact global desktop review action order for restart-safe Undo",
       "sourceBlockSha256": "23c04628748c09175f1307299be3b697ce77ea1c14589551ae3e7d1281a6441d"
+    },
+    {
+      "version": 70,
+      "description": "Add superseding lag-tolerant review-pool dedup manifests that may retire reviewed twins",
+      "sourceBlockSha256": "d0b40840d123c5d68ecdcf386f0593175bb6744aacb698be2ef74f7f16682c67"
     }
   ]
 }

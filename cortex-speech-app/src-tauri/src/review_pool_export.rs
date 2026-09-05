@@ -86,7 +86,7 @@ struct PoolExportRow {
 /// misclassified on the owner's blind listening pass). An unmeasured clip is not clean, it is unknown,
 /// and unknown is excluded by name. Simultaneous overlap is invisible to this score; reviewers mark it
 /// BAD, and a BAD consensus never reaches this function.
-fn tts_admission(speaker_change_score: Option<f64>) -> Result<(), &'static str> {
+pub(crate) fn tts_admission(speaker_change_score: Option<f64>) -> Result<(), &'static str> {
     match speaker_change_score {
         None => Err("tts_speaker_change_unmeasured"),
         Some(score) if score.is_finite() && score >= tts_speaker_change_threshold() => Ok(()),

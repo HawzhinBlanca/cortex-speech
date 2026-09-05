@@ -1668,9 +1668,9 @@ mod restore_generation_tests {
         let path = directory.path().join("journal-late-barrier.db");
         let source = Database::open(path.to_string_lossy().as_ref()).unwrap();
         source.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&source, 1).unwrap(), vec![69]);
+        assert_eq!(crate::migrations::rollback(&source, 2).unwrap(), vec![70, 69]);
         append_desktop_decision(&source, "legacy-before-barrier");
-        assert_eq!(crate::migrations::run_migrations(&source).unwrap(), vec![69]);
+        assert_eq!(crate::migrations::run_migrations(&source).unwrap(), vec![69, 70]);
         append_desktop_decision(&source, "post-boundary-after-barrier");
         source
             .connection()
