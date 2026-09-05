@@ -274,6 +274,49 @@ Acceptance checklist for the corrective implementation:
 This is a dataset/training correctness blocker, not evidence of already-trained contamination.
 Separate TTS acoustic/speaker qualification and actual paid reviewer field acceptance remain open.
 No active-release, reviewer-database, payment or source-audio mutation occurred.
+## 2026-09-05 — Pool pay live; TTS admits only measured single-voice clips (owner direction)
+
+**Field evidence for the paid second opinion (release `5b54f00c`, deployed by the owner 09:48 AST).** Within
+the first hour, 22 pool second opinions landed from two different reviewers (Iftikhar 1, the owner 21),
+each with exactly one `couch_pool` credit at the first-opinion weight (608,738,000 micro-IQD in total,
+e.g. a 4,500 ms accept = 2,250,000; a 9,428 ms edit = 47,140,000) and exactly one consumed
+`independent` policy-4 receipt; zero anomalies over 22 rows (`credits != 1` count 0). Agreement: 5 clips
+DECIDED by two different reviewers agreeing, 17 sent to a third reviewer because the second opinion
+edited or rejected a first-opinion ACCEPT. Every first opinion in the sample was Rubar's.
+
+**Reviewer quality, measured read-only.** Rubar: 2,124 durable events, 284.2 audio minutes, ~984 active
+phone minutes across 19 days, 23,785 IQD credited since the policy (72.5 pre-policy minutes settled by
+the owner directly); listening coverage median 99% (min 86%); pace ~130 clips per active hour; accept
+rate 66% (other volume reviewers 12–54%); edit depth median 4.8% of characters; second-opinion
+disagreement 17/22; 10% of her accepts are speaker-change candidates; reject rate 1%. Verdict: diligent
+and honest, lenient on small errors and on second voices — exactly what the two-reviewer rule corrects.
+
+**Speaker-change measurement (read-only, `speaker_change_probe` at 5b54f00c, CAM++ half-vs-half).**
+32,241 of 32,322 library clips measured; 5,825 (18.1%) score below 0.59. Pool: 3,263 of 20,323 members
+(16.1%) — Lamo 1,871/15,636 (12.0%), Kawa 1,194/2,949 (40.5%), Halwest 198/1,738 (11.4%). Of the 22
+clips decided by two reviewers today, 4 are candidates; of 17 human-rejected pool clips, 9 are. The
+owner's earlier 15-clip blind pass still calibrates the threshold (0/15 misclassified at 0.59) and
+showed that simultaneous OVERLAP scores as single-speaker — invisible to this method. Owner listened
+again 2026-09-05: "still hear two voices and small overlaps", and directed a clean per-speaker TTS set
+for Lamo, Halwest, Kawa. A 15-clip blind listening set (5 low / 5 median / 5 high) was handed to him.
+
+**What changed (`review_pool_export.rs`).** TTS admission is now separate from ASR admission: a retained
+clip enters `tts/` only with a MEASURED `speaker_change_score >= 0.59` (`tts_admission`); an unmeasured
+clip is unknown, not clean, and is excluded BY NAME (`exclusions.jsonl` reason
+`tts_speaker_change_unmeasured` / `tts_speaker_change_candidate`, `scope: tts`, `asrRetained: true`).
+The ASR row and 16 kHz audio ship for every retained clip either way. Manifest and certificate carry
+`ttsRetainedSegments` / `ttsExcludedSegments`; the manifest states the admission rule and the threshold
+as the exact decimal 0.59 (widening the f32 would have published 0.5899999737739563). The audio digest
+records `tts-excluded` in place of the absent TTS hash. Because no score is persisted yet (all 32,322
+are NULL), the next export ships ZERO TTS rows until the probe's `--persist` runs during an app-closed
+window — fail-closed by design. Reviewer rule issued by the owner: any second voice or overlap = BAD.
+
+**Measured.** `cargo test --lib -- review_pool_export` 12/0 (new:
+`tts_admission_requires_a_measured_speaker_change_score_at_or_above_the_threshold` — threshold admitted,
+0.5899/NaN/None refused; export of two decided clips with one candidate and one unmeasured → ASR 2 rows,
+TTS 0 rows, 0 TTS audio files, exclusions name both with reasons, SHA256SUMS lists no TTS audio);
+`cargo test --bin pool_admin` 38/0; `cargo clippy --all-targets -- -D warnings` clean; `cargo fmt --check`
+clean; `test_review_draft_authority_policy` PASS, `rust_quality_gate architecture` PASS.
 
 ## 2026-09-05 — Consolidated reviewer release integration on current main
 
