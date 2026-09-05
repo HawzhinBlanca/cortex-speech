@@ -1949,7 +1949,7 @@ test.describe('Couch Review phone page', () => {
     expect(text).not.toMatch(/[a-z]{4,}/i); // ...with no English word in it
   });
 
-  test('tapping the refused banner goes to a refused clip, or honestly does nothing', async ({
+  test('tapping the refused banner goes to a refused clip, or dismisses what cannot be acted on', async ({
     page,
   }) => {
     // The banner says "find those clips and review them again" and gave the reviewer no way to find
@@ -1967,7 +1967,9 @@ test.describe('Couch Review phone page', () => {
 
     // A refusal for a clip NOT in this batch — the usual case, since someone else took it — must not
     // jump anywhere. Landing on the wrong clip would be worse than not moving: the reviewer would
-    // trust it and re-review the wrong audio.
+    // trust it and re-review the wrong audio. Nothing can be done about such an entry, so the tap
+    // DISMISSES it instead of leaving the banner up for the life of the profile (2026-09-04: an owner
+    // phone carried 187 of them).
     await page.evaluate(`
       i = 0; show();
       localStorage.setItem('cortex.couch.refused', JSON.stringify(['not-in-this-batch']));
@@ -1975,8 +1977,9 @@ test.describe('Couch Review phone page', () => {
     `);
     await expect(page.locator('#text')).toHaveValue(/نموونەیی/);
     await page.locator('#err').click();
-    await page.waitForTimeout(200);
+    await expect(page.locator('#err')).toBeHidden();
     await expect(page.locator('#text')).toHaveValue(/نموونەیی/);
+    expect(await page.evaluate(`localStorage.getItem('cortex.couch.refused')`)).toBeNull();
   });
 
   test('everything that changes on its own is announced to a screen reader', async ({ page }) => {

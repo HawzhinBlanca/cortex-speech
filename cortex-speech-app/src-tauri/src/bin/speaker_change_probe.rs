@@ -62,6 +62,42 @@ fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
     Some(dot / (na.sqrt() * nb.sqrt()))
 }
 
+/// Model-derived labels are descriptive groups, never independent ground truth. In particular,
+/// a missing comparison group cannot establish either separation or equality of distributions.
+fn comparison_summary(same: &[f32], different: &[f32]) -> String {
+    if same.is_empty() || different.is_empty() || same.iter().chain(different).any(|score| !score.is_finite()) {
+        return format!(
+            "Comparison unavailable: same-label pairs={}, different-label pairs={}; both finite groups are required. \
+             No speaker-separation conclusion is supported by these controls.",
+            same.len(),
+            different.len()
+        );
+    }
+    let median = |values: &[f32]| {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f32::total_cmp);
+        // Match the empirical 50th-percentile definition used in the distribution table below.
+        sorted[(sorted.len() - 1) / 2]
+    };
+    format!(
+        "Model-derived label-group medians differ by {:.3}. These groups are not independent human labels; \
+         their difference alone does not establish speaker separation or equal distributions.",
+        (median(same) - median(different)).abs()
+    )
+}
+
+fn screening_summary(flagged: usize, measured: usize) -> String {
+    if measured == 0 {
+        return "No clips measured; speaker-change prevalence is unknown.".to_string();
+    }
+    format!(
+        "MEASURED SET: {flagged} / {measured} clips ({:.1}%) fall below {SPEAKER_CHANGE_THRESHOLD}: \
+         speaker-change candidates for listening review, not confirmed changes. \
+         This describes only the measured set, not unsampled clips. Simultaneous overlap is not detected.",
+        100.0 * flagged as f64 / measured as f64
+    )
+}
+
 /// The positional db path: the first argument that is neither a flag nor the value of `--export`.
 fn db_path_arg(args: &[String]) -> Option<String> {
     args.iter()
@@ -220,12 +256,8 @@ fn main() -> Result<(), String> {
     // `online_cluster`, where 0.85 compares a chunk against an AVERAGED, re-normalised centroid — not two
     // raw 6-second embeddings against each other. Raw same-speaker pairs simply do not score that high.
     //
-    // So measure two reference distributions from the same embeddings and let them set the scale:
-    //   SAME  — halves of DIFFERENT clips that CAM++ already gave the SAME label. Same person, different
-    //           moment: this is the ceiling a single-speaker clip can realistically hit.
-    //   DIFF  — halves of clips CAM++ gave DIFFERENT labels. Genuinely two people: the floor.
-    // If the within-clip distribution sits with SAME, the clips are single-speaker and the first result
-    // was an artefact. If it sits with DIFF, the clips really do straddle turns.
+    // These descriptive groups use existing model-derived labels, not independently verified people.
+    // SAME and DIFF labels can both contain mixed-speaker clips; neither establishes a true baseline.
     let mut within: Vec<f32> = sims.iter().map(|(_, s, _)| *s).collect();
     let mut same: Vec<f32> = Vec::new();
     let mut diff: Vec<f32> = Vec::new();
@@ -262,14 +294,12 @@ fn main() -> Result<(), String> {
         );
     };
 
-    println!("\ncosine similarity distributions (the controls are what make the first line meaningful)");
+    println!("\ncosine similarity distributions (label groups are descriptive, not independent controls)");
     stats("WITHIN-clip (half vs half)", &mut within);
-    stats("SAME speaker, other clip", &mut same);
-    stats("DIFFERENT speaker, other clip", &mut diff);
+    stats("SAME label, other clip", &mut same);
+    stats("DIFFERENT label, other clip", &mut diff);
 
-    // The verdict is relative, never against a borrowed absolute. Compare the within-clip median to the
-    // two controls and report which it resembles — and say so plainly when the controls overlap so much
-    // that nothing can be concluded.
+    // Report group availability and descriptive differences without inferring verified speaker identity.
     // ── optional: export a listening set ──────────────────────────────────────
     // The probe cannot settle this on its own (see the verdict above): it uses CAM++'s own labels as
     // ground truth for CAM++. Only a human ear can break that circle. `--export <dir>` writes a
@@ -280,15 +310,7 @@ fn main() -> Result<(), String> {
         export_listening_set(dir, &sims, &segments)?;
     }
 
-    let med = |v: &[f32]| if v.is_empty() { f32::NAN } else { v[v.len() / 2] };
-    let (mw, ms, md) = (med(&within), med(&same), med(&diff));
-    println!("\nmedians: within {mw:.3}   same-speaker {ms:.3}   different-speaker {md:.3}");
-    println!(
-        "  the two CONTROLS are {:.3} apart - they are the same distribution, because they are built \n  \
-         from CAM++'s own chunk labels and those label mixed-speaker chunks with one name. The control \n  \
-         is broken, NOT the signal; see the ground truth below.",
-        (ms - md).abs()
-    );
+    println!("\n{}", comparison_summary(&same, &diff));
 
     // ── GROUND TRUTH ──────────────────────────────────────────────────────────
     report_against_ground_truth(&within, &sims, &segments);
@@ -434,7 +456,8 @@ fn report_against_ground_truth(within: &[f32], sims: &[(String, f32, i64)], segm
     };
     let multi_max = GROUND_TRUTH.iter().filter(|(_, a, _)| *a == "multi").map(|(_, _, s)| *s).fold(f32::MIN, f32::max);
     let single_min = GROUND_TRUTH.iter().filter(|(_, a, _)| *a != "multi").map(|(_, _, s)| *s).fold(f32::MAX, f32::min);
-    println!("\nGROUND TRUTH (owner's blind listening pass, {} clips)", GROUND_TRUTH.len());
+    println!("\nHISTORICAL CALIBRATION (owner's blind listening pass, {} clips)", GROUND_TRUTH.len());
+    println!("  These stored calibration labels are not new listening judgments of the current measured set.");
     println!("  turn-taking clips   max similarity {multi_max:.3}");
     println!("  single-speaker      min similarity {single_min:.3}");
     println!("  separation gap      {:.3} wide, threshold {SPEAKER_CHANGE_THRESHOLD}", single_min - multi_max);
@@ -450,13 +473,7 @@ fn report_against_ground_truth(within: &[f32], sims: &[(String, f32, i64)], segm
     );
 
     let flagged = within.iter().filter(|s| **s < SPEAKER_CHANGE_THRESHOLD).count();
-    println!(
-        "\nAPPLIED TO THE WHOLE LIBRARY: {} / {} clips ({:.1}%) score below {SPEAKER_CHANGE_THRESHOLD} \
-         and therefore hold a speaker change.",
-        flagged,
-        within.len(),
-        100.0 * flagged as f64 / within.len() as f64
-    );
+    println!("\n{}", screening_summary(flagged, within.len()));
     println!("(Turn-taking only. Overlap is a separate, unmeasured problem this cannot see.)");
     let mut worst = sims.to_vec();
     worst.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -466,7 +483,9 @@ fn report_against_ground_truth(within: &[f32], sims: &[(String, f32, i64)], segm
     // the field this measurement contradicts: a clip holding a turn between two people still carries one
     // authoritative SPEAKER_xx in the DB and in every export column.
     // CSV-ish and greppable on purpose — this output is the deliverable, not a debug aid.
-    println!("\nflagged clips (cosine < {SPEAKER_CHANGE_THRESHOLD}) — id,cosine,seconds,storedSpeaker,pending");
+    println!(
+        "\nspeaker-change candidates (cosine < {SPEAKER_CHANGE_THRESHOLD}) — id,cosine,seconds,storedSpeaker,pending"
+    );
     for (id, sim, dur) in worst.iter().filter(|(_, s, _)| *s < SPEAKER_CHANGE_THRESHOLD) {
         let (speaker, pending) = meta(id);
         println!(
@@ -558,6 +577,35 @@ fn export_listening_set(dir: &str, sims: &[(String, f32, i64)], segments: &[SegR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_or_invalid_controls_cannot_claim_a_distribution_match() {
+        for (same, different) in
+            [(vec![0.64], vec![]), (vec![], vec![0.31]), (vec![], vec![]), (vec![f32::NAN], vec![0.31])]
+        {
+            let report = comparison_summary(&same, &different);
+            assert!(report.contains("Comparison unavailable"), "{report}");
+            assert!(report.contains("No speaker-separation conclusion"), "{report}");
+            assert!(!report.contains("NaN"), "missing evidence is named, not printed as a numeric result");
+        }
+        let report = comparison_summary(&[0.7, 0.9, 0.8], &[0.4, 0.2, 0.3]);
+        assert!(report.contains("0.500"), "the reported descriptive difference must use actual medians: {report}");
+        assert!(report.contains("not independent human labels"), "{report}");
+        let even = comparison_summary(&[0.9, 0.7], &[0.3, 0.4]);
+        assert!(even.contains("0.400"), "summary must match distribution-table percentiles: {even}");
+    }
+
+    #[test]
+    fn screening_reports_only_candidates_in_the_measured_population() {
+        let report = screening_summary(8, 48);
+        assert!(report.contains("8 / 48 clips (16.7%)"), "{report}");
+        assert!(report.contains("not confirmed changes"), "{report}");
+        assert!(report.contains("not unsampled clips"), "{report}");
+        assert!(report.contains("Simultaneous overlap is not detected"), "{report}");
+        let empty = screening_summary(0, 0);
+        assert!(empty.contains("unknown"), "empty measurements cannot certify a clean corpus: {empty}");
+        assert!(!empty.contains("NaN"), "{empty}");
+    }
     use cortex_speech_app_lib::db::SpeechSegment;
     use std::collections::HashSet;
 
