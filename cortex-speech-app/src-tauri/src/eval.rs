@@ -599,6 +599,10 @@ struct FinetuneRow<'a> {
     /// holding one row per clip; this pins WHICH state of it was trained on, so a later edit is
     /// visibly a different snapshot rather than a silent change.
     decision_revision: i64,
+    /// A pool decision is bound by its own evidence hash, not the first opinion's revision.
+    decision_revision_scope: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    review_authority: Option<&'a crate::export_review::ExportReviewAuthority>,
     /// GOLD (human-decided) or SILVER (machine, training-ready) — the rubric's own verdict, so the
     /// trainer can weight or filter without re-deriving it.
     grade: &'a str,
@@ -634,6 +638,22 @@ pub fn export_finetune_pack(
 struct FinetunePackBuild {
     result: FinetunePackResult,
     corpus_ledger_line: String,
+    review_authorities: Vec<crate::export_review::ExportReviewAuthority>,
+    review_boundary: crate::export_review::ExportReviewBoundary,
+}
+
+#[cfg(test)]
+pub(crate) fn export_finetune_pack_with_review_test_hook(
+    db: &Database,
+    out_dir: &std::path::Path,
+    mut hook: impl FnMut() -> AppResult<()>,
+) -> AppResult<FinetunePackResult> {
+    export_finetune_pack_with_publish_hook(db, out_dir, None, |point, _, _| {
+        if point == ExportPublishPoint::StagedAndSynced {
+            hook()?;
+        }
+        Ok(())
+    })
 }
 
 fn safe_nested_ledger_relative_path(
@@ -714,17 +734,21 @@ fn export_finetune_pack_with_publish_hook<Hook>(
     db: &Database,
     out_dir: &std::path::Path,
     corpus_ledger_path: Option<&std::path::Path>,
-    hook: Hook,
+    mut hook: Hook,
 ) -> AppResult<FinetunePackResult>
 where
     Hook: FnMut(ExportPublishPoint, &std::path::Path, Option<&std::path::Path>) -> AppResult<()>,
 {
     let nested_ledger =
         corpus_ledger_path.map(|ledger| safe_nested_ledger_relative_path(out_dir, ledger)).transpose()?.flatten();
+    let captured_reviews = std::cell::RefCell::new(Vec::new());
+    let captured_boundary = std::cell::RefCell::new(None::<crate::export_review::ExportReviewBoundary>);
     let mut build = publish_export_generation(
         out_dir,
         |stage| {
             let built = export_finetune_pack_inner(db, stage)?;
+            captured_reviews.replace(built.review_authorities.clone());
+            captured_boundary.replace(Some(built.review_boundary.clone()));
             if let (Some(ledger), Some(relative)) = (corpus_ledger_path, nested_ledger.as_deref()) {
                 let previous = match std::fs::read(ledger) {
                     Ok(bytes) => bytes,
@@ -736,7 +760,14 @@ where
             crate::export::write_sha256sums(stage)?;
             Ok(built)
         },
-        hook,
+        |point, stage, previous| {
+            hook(point, stage, previous)?;
+            captured_boundary
+                .borrow()
+                .as_ref()
+                .ok_or_else(|| AppError::Validation("export review scope was not captured".into()))?
+                .verify_authorities(db, captured_reviews.borrow().iter())
+        },
     )?;
     build.result.manifest_path = out_dir.join("finetune_manifest.jsonl").to_string_lossy().into_owned();
     if let Some(ledger) = corpus_ledger_path.filter(|_| nested_ledger.is_none()) {
@@ -747,6 +778,7 @@ where
 
 fn export_finetune_pack_inner(db: &Database, out_dir: &std::path::Path) -> AppResult<FinetunePackBuild> {
     crate::review_campaign::require_export_unblocked(db, "fine-tune training export")?;
+    let review_boundary = crate::export_review::ExportReviewBoundary::capture(db)?;
     use std::io::Write as _;
     let verified = db.get_segments(Some(true))?;
     let total_verified = verified.len();
@@ -972,7 +1004,7 @@ fn export_finetune_pack_inner(db: &Database, out_dir: &std::path::Path) -> AppRe
         // mislabeled; what was missing is the NUMBER. An undone verdict quietly becoming machine
         // training data is exactly the kind of thing that must appear in the pack's own record
         // instead of being discovered later by an auditor.
-        if seg.human_decision.is_none() {
+        if seg.human_decision.is_none() && seg.export_review.is_none() {
             emitted_without_human_decision += 1;
         }
         let row = FinetuneRow {
@@ -984,8 +1016,18 @@ fn export_finetune_pack_inner(db: &Database, out_dir: &std::path::Path) -> AppRe
             // A row with no split assignment would be a silent hole in the leakage guarantee, so
             // fall back to `train` — the split that can never leak INTO evaluation.
             split: splits.get(&seg.id).copied().unwrap_or("train"),
-            decision: seg.human_decision.as_deref(),
+            decision: seg
+                .export_review
+                .as_ref()
+                .map(|authority| authority.decision())
+                .or(seg.human_decision.as_deref()),
             decision_revision: db.segment_review_revision(&seg.id)?.unwrap_or(0),
+            decision_revision_scope: if seg.export_review.is_some() {
+                "canonical_first_opinion"
+            } else {
+                "human_decision"
+            },
+            review_authority: seg.export_review.as_ref(),
             grade: report.grade.as_str(),
             audio_processed: processed_sources.contains_key(&seg.audio_path),
         };
@@ -1024,11 +1066,13 @@ fn export_finetune_pack_inner(db: &Database, out_dir: &std::path::Path) -> AppRe
         // speaker-union step links nothing. Sealing a guarantee the data cannot support is the exact
         // failure this provenance record exists to prevent.
         "splitPolicy": "assign_splits 80/10/10 over AUDIO-CONTENT groups (audio_content_hash, else full path) — every clip sharing audio content lands in one split, so a re-encode cannot straddle. NOT speaker-disjoint: diarizer labels are per-recording indices, not identities, so two recordings of one person may land in different splits.",
-        "rowSchema": "audio_path, sentence, duration_seconds, segment_id, source_recording, split, decision, decision_revision, grade, audio_processed",
-        "selectionPolicy": "training_ready (GOLD/SILVER) via quality::training_grade_for_segment; holdout-excluded; exact Verbatim-Law label; variant-aware dedup key only; one row per (recording, span, text) at its LATEST review_revision",
+        "rowSchema": "audio_path, sentence, duration_seconds, segment_id, source_recording, split, decision, decision_revision, decision_revision_scope, review_authority (when pool-resolved), grade, audio_processed",
+        "selectionPolicy": "training_ready (GOLD/SILVER) via quality::training_grade_for_segment; holdout-excluded; exact Verbatim-Law label; variant-aware dedup key only; one row per (recording, span, text); current final pool outcome carries independent review_authority, while decision_revision is scoped to the canonical first opinion",
     });
     // Seal it. INSERT OR IGNORE: re-exporting identical data is a no-op and an existing snapshot is
     // never rewritten, so a training run can cite `snapshotId` and trust it did not move.
+    crate::export_review::verify_current(db, kept.iter())?;
+    review_boundary.verify(db)?;
     let newly_sealed = db.seal_dataset_snapshot(&snapshot_id, "finetune-pack", &selection.to_string())?;
     if newly_sealed {
         tracing::info!("sealed dataset snapshot {snapshot_id} ({emitted} rows)");
@@ -1060,6 +1104,8 @@ fn export_finetune_pack_inner(db: &Database, out_dir: &std::path::Path) -> AppRe
             newly_sealed,
         },
         corpus_ledger_line,
+        review_authorities: kept.iter().filter_map(|seg| seg.export_review.clone()).collect(),
+        review_boundary,
     })
 }
 

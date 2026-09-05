@@ -7,6 +7,8 @@ pub struct Database {
     /// intentionally not durable: after a restart an unfinalized renderer counter cannot mint proof,
     /// while an already-durable exact receipt remains replayable from SQLite.
     pub(super) playback_live_sessions: Mutex<HashMap<String, u64>>,
+    /// Only immutable pool identity is cached; few-shot decisions are always read fresh.
+    pub(crate) learning_pool_cache: Mutex<Option<crate::review_pool::LearningPoolCache>>,
     #[cfg(test)]
     pub(super) playback_test_clock: Mutex<Option<(i64, u64)>>,
 }
@@ -14,12 +16,18 @@ pub struct Database {
 impl Database {
     #[cfg(not(test))]
     pub(super) fn from_connection(conn: Connection, path: String) -> Self {
-        Self { conn, path, playback_live_sessions: Mutex::new(HashMap::new()) }
+        Self { conn, path, playback_live_sessions: Mutex::new(HashMap::new()), learning_pool_cache: Mutex::new(None) }
     }
 
     #[cfg(test)]
     pub(super) fn from_connection(conn: Connection, path: String) -> Self {
-        Self { conn, path, playback_live_sessions: Mutex::new(HashMap::new()), playback_test_clock: Mutex::new(None) }
+        Self {
+            conn,
+            path,
+            playback_live_sessions: Mutex::new(HashMap::new()),
+            learning_pool_cache: Mutex::new(None),
+            playback_test_clock: Mutex::new(None),
+        }
     }
 }
 

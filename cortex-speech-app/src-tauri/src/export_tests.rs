@@ -1325,6 +1325,16 @@ fn export_huggingface_writes_dataset_files() {
     assert!(metadata.contains("training_grade"));
     assert!(metadata.contains("gold"));
 
+    let schema: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out_dir.path().join("dataset_infos.json")).unwrap()).unwrap();
+    let features = schema["cortex-kurdish-split-speech"]["features"].as_object().unwrap();
+    let mut reader = csv::Reader::from_path(out_dir.path().join("data/train/metadata.csv")).unwrap();
+    let csv_fields: std::collections::BTreeSet<String> = reader.headers().unwrap().iter().map(str::to_owned).collect();
+    let declared_fields: std::collections::BTreeSet<String> = features.keys().cloned().collect();
+    assert_eq!(csv_fields, declared_fields, "HF feature declarations must match every written CSV column");
+    assert_eq!(features.get("review_authority").unwrap()["dtype"], "string");
+    println!("HF schema parity: {} CSV columns and {} declared features", csv_fields.len(), declared_fields.len());
+
     // The real export emits a correct integrity manifest covering every artifact.
     let sums = std::fs::read_to_string(out_dir.path().join("SHA256SUMS")).unwrap();
     assert!(sums.lines().any(|l| l.ends_with("  README.md")));
@@ -2309,6 +2319,262 @@ fn hf_export_failure_midway_preserves_the_prior_dataset() {
         !out_dir.path().join(".data-staging").exists(),
         "a failed export must clean up its staging tree, not litter the user's export directory"
     );
+}
+
+fn assert_hf_late_publication_failure_preserves_previous_generation(fault: super::HuggingFacePublishPoint) {
+    assert_hf_publication_failure_preserves_previous_generation(fault, false);
+}
+
+fn snapshot_hf_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            snapshot_hf_files(root, &path, files);
+        } else {
+            files.insert(path.strip_prefix(root).unwrap().to_path_buf(), std::fs::read(&path).unwrap());
+        }
+    }
+}
+
+fn assert_hf_publication_failure_preserves_previous_generation(
+    fault: super::HuggingFacePublishPoint,
+    fail_split_write: bool,
+) {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let wav_path = source.path().join("late-publication.wav");
+    write_silent_wav(&wav_path);
+    let mut segment = sample_segment("late-publication");
+    segment.audio_path = wav_path.to_string_lossy().to_string();
+    db.insert_legacy_segment_fixture(&segment).unwrap();
+
+    let output = tempfile::tempdir().unwrap();
+    // This is a user-selected directory, not necessarily a wholly owned export root.
+    std::fs::write(output.path().join("operator-notes.txt"), b"Keep this unrelated file unchanged.\n").unwrap();
+    let settings = crate::settings::AppSettings::default();
+    export_huggingface_dataset(&db, output.path(), &settings).unwrap();
+    let mut previous = std::collections::BTreeMap::new();
+    snapshot_hf_files(output.path(), output.path(), &mut previous);
+    assert!(previous.contains_key(std::path::Path::new("SHA256SUMS")));
+    assert!(previous.keys().any(|path| path.extension().is_some_and(|extension| extension == "wav")));
+    let previous_splits: Vec<_> = db.get_segments(None).unwrap().into_iter().map(|s| (s.id, s.split)).collect();
+
+    // Make the new generation observably different, without changing any production data.
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET raw_transcript = ?1 WHERE id = ?2",
+            rusqlite::params!["دەقی نوێ", segment.id],
+        )
+        .unwrap();
+    if fail_split_write {
+        db.connection()
+            .execute_batch(
+                "CREATE TRIGGER injected_hf_split_failure BEFORE UPDATE OF split ON speech_segments
+             BEGIN SELECT RAISE(ABORT, 'injected HF publication failure during split write'); END;",
+            )
+            .unwrap();
+    }
+    let mut injected = false;
+    let error = super::export_huggingface_dataset_with_hook(&db, output.path(), &settings, |point| {
+        if point == fault {
+            injected = true;
+            if !fail_split_write {
+                return Err(AppError::Other(format!("injected HF publication failure at {point:?}")));
+            }
+        }
+        Ok(())
+    })
+    .expect_err("the selected late publication fault must fail the real exporter");
+    assert!(injected, "the test must reach its selected failure boundary");
+    assert!(error.to_string().contains("injected HF publication failure"));
+    for (relative, bytes) in previous {
+        let current = std::fs::read(output.path().join(&relative));
+        assert!(current.is_ok(), "failed HF publication lost previous artifact {relative:?}: {current:?}");
+        assert_eq!(current.unwrap(), bytes, "failed HF publication changed previous artifact {relative:?}");
+    }
+    let current_splits: Vec<_> = db.get_segments(None).unwrap().into_iter().map(|s| (s.id, s.split)).collect();
+    assert_eq!(current_splits, previous_splits, "failed publication must not change persisted split assignments");
+}
+
+#[test]
+fn hf_late_publication_failure_before_data_promotion_preserves_previous_generation() {
+    assert_hf_late_publication_failure_preserves_previous_generation(
+        super::HuggingFacePublishPoint::BeforeDataPromotion,
+    );
+}
+
+#[test]
+fn hf_late_publication_failure_before_metadata_write_preserves_previous_generation() {
+    assert_hf_late_publication_failure_preserves_previous_generation(
+        super::HuggingFacePublishPoint::BeforeMetadataWrite,
+    );
+}
+
+#[test]
+fn hf_late_publication_failure_after_data_promotion_restores_previous_generation() {
+    assert_hf_late_publication_failure_preserves_previous_generation(
+        super::HuggingFacePublishPoint::AfterDataPromotion,
+    );
+}
+
+#[test]
+fn hf_late_publication_failure_after_metadata_promotion_restores_previous_generation() {
+    assert_hf_late_publication_failure_preserves_previous_generation(
+        super::HuggingFacePublishPoint::AfterMetadataPromotion,
+    );
+}
+
+#[test]
+fn hf_late_publication_failure_before_commit_restores_previous_generation() {
+    assert_hf_late_publication_failure_preserves_previous_generation(
+        super::HuggingFacePublishPoint::BeforePublicationCommit,
+    );
+}
+
+#[test]
+fn hf_late_publication_failure_after_files_committed_restores_previous_generation() {
+    assert_hf_late_publication_failure_preserves_previous_generation(
+        super::HuggingFacePublishPoint::AfterFilesCommitted,
+    );
+}
+
+#[test]
+fn hf_late_publication_failure_during_real_split_write_restores_previous_generation() {
+    assert_hf_publication_failure_preserves_previous_generation(
+        super::HuggingFacePublishPoint::BeforePublicationCommit,
+        true,
+    );
+}
+
+#[test]
+fn hf_publication_competing_export_is_refused_without_touching_the_first_stage() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let wav = source.path().join("competing.wav");
+    write_silent_wav(&wav);
+    let mut segment = sample_segment("hf-competing");
+    segment.audio_path = wav.to_string_lossy().into_owned();
+    db.insert_legacy_segment_fixture(&segment).unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let settings = crate::settings::AppSettings::default();
+    export_huggingface_dataset(&db, output.path(), &settings).unwrap();
+    let mut competed = false;
+    super::export_huggingface_dataset_with_hook(&db, output.path(), &settings, |point| {
+        if point == super::HuggingFacePublishPoint::BeforeDataPromotion {
+            let error = super::export_huggingface_dataset(&db, output.path(), &settings).unwrap_err();
+            assert!(error.to_string().contains("another HF export"), "{error}");
+            competed = true;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert!(competed);
+    assert!(all_huggingface_metadata(output.path()).contains("hf-competing"));
+    // Closing the first lock re-admits the next real export; no stale-lock cleanup race.
+    super::export_huggingface_dataset(&db, output.path(), &settings).unwrap();
+}
+
+#[test]
+fn hf_publication_process_exit_helper() {
+    let Some(fixture) = std::env::var_os("CORTEX_HF_PUBLICATION_EXIT_FIXTURE") else {
+        return; // Invoked with fixture authority only by the parent crash-recovery regression.
+    };
+    let root = std::path::PathBuf::from(fixture);
+    let db = Database::open(root.join("fixture.db").to_str().unwrap()).unwrap();
+    let boundary = std::env::var("CORTEX_HF_PUBLICATION_EXIT_BOUNDARY").unwrap();
+    let result = super::export_huggingface_dataset_with_hook(
+        &db,
+        &root.join("output"),
+        &crate::settings::AppSettings::default(),
+        |point| {
+            if format!("{point:?}") == boundary {
+                // Exit without stack unwinding: Drop cannot restore or clean up the journal.
+                std::process::exit(86);
+            }
+            Ok(())
+        },
+    );
+    panic!("crash helper did not reach the requested boundary: {result:?}");
+}
+
+#[test]
+fn hf_publication_process_exit_restores_prior_generation_and_releases_lock() {
+    for boundary in [
+        "BeforeDataPromotion",
+        "AfterDataPromotion",
+        "AfterMetadataPromotion",
+        "BeforePublicationCommit",
+        "AfterFilesCommitted",
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        let db = Database::open(fixture.path().join("fixture.db").to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        let wav = fixture.path().join("recording.wav");
+        write_silent_wav(&wav);
+        let mut segment = sample_segment("hf-process-exit");
+        segment.audio_path = wav.to_string_lossy().into_owned();
+        db.insert_legacy_segment_fixture(&segment).unwrap();
+        let output = fixture.path().join("output");
+        std::fs::create_dir(&output).unwrap();
+        std::fs::write(output.join("operator-notes.txt"), b"unrelated owner file").unwrap();
+        export_huggingface_dataset(&db, &output, &crate::settings::AppSettings::default()).unwrap();
+        let mut previous = std::collections::BTreeMap::new();
+        snapshot_hf_files(&output, &output, &mut previous);
+        db.connection().execute("UPDATE speech_segments SET raw_transcript = 'دەقی نوێ'", []).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "export::tests::hf_publication_process_exit_helper", "--nocapture"])
+            .env("CORTEX_HF_PUBLICATION_EXIT_FIXTURE", fixture.path())
+            .env("CORTEX_HF_PUBLICATION_EXIT_BOUNDARY", boundary)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill(); // Only this test's exact owned child; never a console control event.
+                let output = child.wait_with_output().unwrap();
+                panic!("HF crash helper timed out at {boundary}: {}", String::from_utf8_lossy(&output.stderr));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let child = child.wait_with_output().unwrap();
+        assert_eq!(child.status.code(), Some(86), "{boundary}: {}", String::from_utf8_lossy(&child.stderr));
+        // Begin runs recovery BEFORE creating a new generation. Dropping here exports nothing.
+        drop(super::hf_publication::Publication::begin(&output).unwrap());
+        let mut recovered = std::collections::BTreeMap::new();
+        snapshot_hf_files(&output, &output, &mut recovered);
+        if boundary == "AfterFilesCommitted" {
+            assert!(
+                all_huggingface_metadata(&output).contains("دەقی نوێ"),
+                "a committed complete file generation must survive process exit"
+            );
+            assert_eq!(std::fs::read(output.join("operator-notes.txt")).unwrap(), b"unrelated owner file");
+            for line in std::fs::read_to_string(output.join("SHA256SUMS")).unwrap().lines() {
+                let (hash, relative) = line.split_once("  ").unwrap();
+                assert_eq!(super::sha256_hex(&std::fs::read(output.join(relative)).unwrap()), hash);
+            }
+        } else {
+            assert_eq!(
+                recovered, previous,
+                "{boundary}: recovery must restore the entire old generation and user file"
+            );
+        }
+        super::export_huggingface_dataset(&db, &output, &crate::settings::AppSettings::default()).unwrap();
+        assert!(
+            all_huggingface_metadata(&output).contains("دەقی نوێ"),
+            "next export must be admitted after {boundary}"
+        );
+    }
 }
 
 #[test]

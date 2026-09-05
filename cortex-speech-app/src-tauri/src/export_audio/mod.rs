@@ -104,6 +104,9 @@ struct ExportedAudioFile {
 /// export. `verified` is intentionally absent: bulk verification and rejected rows can both carry
 /// that flag, so it is not evidence that a person accepted the audio↔text pair.
 fn human_decision_for_export(seg: &SpeechSegment) -> Option<&str> {
+    if let Some(authority) = &seg.export_review {
+        return Some(authority.decision());
+    }
     let is_accept_or_edit = |value: &str| {
         ["accept", "edit", "human_accept", "human_edit"].iter().any(|candidate| value.eq_ignore_ascii_case(candidate))
     };
@@ -598,6 +601,7 @@ fn export_audio_segments_inner(
     }
 
     verify_complete_audio_export_dir(&staging_dir, Some(&files))?;
+    crate::export_review::verify_current(db, exported.iter().map(|item| &item.segment))?;
     crate::atomic_file::fsync_parent_dir(&staging_dir.join(".directory-sync"));
     publish_staged_audio_export(&staging_dir, output_dir, &files)?;
     staging.disarm();
@@ -623,11 +627,11 @@ fn export_single_segment(
     // Defense in depth: this function is intentionally private today, but it owns the actual bytes on
     // disk. Re-run the central rights/holdout/withdrawal policy on the exact row it will decode so a
     // future caller—or any batch-preflight regression—cannot bypass the policy boundary.
-    if crate::export::exclude_unexportable_segments(db, vec![seg.clone()])?.len() != 1 {
-        return Err(AppError::Validation(format!(
+    let seg = crate::export::exclude_unexportable_segments(db, vec![seg])?.pop().ok_or_else(|| {
+        AppError::Validation(format!(
             "Segment {segment_id}: export blocked by rights, holdout, withdrawal, or quality policy"
-        )));
-    }
+        ))
+    })?;
     // Defense in depth against a future caller bypassing export_audio_segments' batch filter. It
     // also guarantees write_metadata_csv never has to guess which transcript or decision was human.
     let (effective_transcript, _) = human_export_label(&seg).ok_or_else(|| {
@@ -788,6 +792,8 @@ fn write_metadata_jsonl(
                     "transcript_source": "human_verified",
                     "human_decision": decision,
                     "review_revision": item.review_revision,
+                    "review_revision_scope": if item.segment.export_review.is_some() { "canonical_first_opinion" } else { "human_decision" },
+                    "review_authority": item.segment.export_review,
                     "duration_ms": item.clip_duration_ms,
                     "export_sample_rate": options.sample_rate,
                     "export_format": export_format,
@@ -837,6 +843,8 @@ fn write_metadata_csv(
                 "verdict",
                 "human_decision",
                 "review_revision",
+                "review_revision_scope",
+                "review_authority",
                 "alignment_quality",
                 "export_sample_rate",
                 "export_format",
@@ -873,6 +881,10 @@ fn write_metadata_csv(
                 })?;
                 let human_decision_t = crate::export::csv_safe_cell(human_decision);
                 let review_revision = item.review_revision.to_string();
+                let review_revision_scope =
+                    if seg.export_review.is_some() { "canonical_first_opinion" } else { "human_decision" };
+                let review_authority =
+                    seg.export_review.as_ref().map(serde_json::to_string).transpose()?.unwrap_or_default();
                 wtr.write_record([
                     item.filename.as_str(),
                     seg.id.as_str(),
@@ -900,6 +912,8 @@ fn write_metadata_csv(
                     verdict_t.as_ref(),
                     human_decision_t.as_ref(),
                     review_revision.as_str(),
+                    review_revision_scope,
+                    review_authority.as_str(),
                     seg.alignment_quality.as_deref().unwrap_or(""),
                     export_sample_rate.as_str(),
                     export_format,

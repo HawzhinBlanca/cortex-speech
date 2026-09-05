@@ -15,6 +15,9 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::sync::Arc;
 
+#[path = "hf_publication.rs"]
+mod hf_publication;
+
 #[derive(serde::Serialize)]
 pub struct DatasetMetadata {
     pub name: String,
@@ -188,6 +191,9 @@ pub(crate) fn processed_audio_markdown(notices: &[ProcessedAudioNotice]) -> Stri
 struct ExportSegmentRecord {
     #[serde(flatten)]
     segment: SpeechSegment,
+    /// Final consensus belongs to the dataset record, never to a renderer/import DTO.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    export_review: Option<crate::export_review::ExportReviewAuthority>,
     training_transcript: String,
     transcript_source: String,
     training_grade: String,
@@ -221,6 +227,7 @@ impl ExportSegmentRecord {
         sanitized.reviewed_by = None;
         Self {
             segment: sanitized,
+            export_review: segment.export_review.clone(),
             // Verbatim Law: the primary training label is the exact stored authority selected by the
             // grade (human verdict > annotation > champion raw). Orthographic normalization is useful
             // as explicitly labeled derived evidence and as a dedup key, never as a replacement label
@@ -511,22 +518,38 @@ fn exclude_unexportable_segments_with_holdout_policy(
     // shipped. Only a clip two distinct reviewers agreed on (or one the owner adjudicated) may
     // leave. `NeedsThird` and `OwnerConflict` are unresolved disagreements and are held back.
     let consensus = match pool_scope {
-        Some(_) => Some(crate::review_pool::consensus_resolved_segment_ids(db).map_err(AppError::Validation)?),
+        Some(_) => Some(
+            crate::review_pool::segment_resolutions(db, None)
+                .map_err(AppError::Validation)?
+                .into_iter()
+                .map(|resolution| (resolution.segment_id.clone(), resolution))
+                .collect::<std::collections::HashMap<_, _>>(),
+        ),
         None => None,
     };
     let mut kept = Vec::with_capacity(segments.len());
     let mut in_pool = 0usize;
     let mut undecided = 0usize;
-    for seg in segments {
+    for mut seg in segments {
+        // Never trust a projection supplied by a caller or retained from an earlier export.
+        seg.export_review = None;
         if pool_scope.as_ref().is_some_and(|scope| !scope.contains(&seg.id)) {
             tracing::info!(segment_id = %seg.id, "export: dropping segment outside the active review pool");
             continue;
         }
         in_pool += 1;
-        if consensus.as_ref().is_some_and(|resolved| !resolved.contains(&seg.id)) {
+        if consensus.as_ref().is_some_and(|resolved| {
+            !resolved.get(&seg.id).is_some_and(|row| matches!(row.status.as_str(), "resolved" | "ownerResolved"))
+        }) {
             undecided += 1;
             tracing::info!(segment_id = %seg.id, "export: dropping segment no two reviewers have decided");
             continue;
+        }
+        if let Some(resolution) = consensus.as_ref().and_then(|rows| rows.get(&seg.id)) {
+            if resolution.final_action.as_deref() == Some("reject") {
+                continue;
+            }
+            seg.export_review = Some(crate::export_review::ExportReviewAuthority::retained(resolution)?);
         }
         if db.rights_for_segment(&seg.id)?.is_revoked() {
             tracing::info!(segment_id = %seg.id, "export: dropping segment with withdrawn consent");
@@ -673,7 +696,19 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
         tracing::warn!("dataset export excluded {revoked_excluded} segment(s) whose consent was withdrawn");
     }
 
-    export_dataset_from_segments(db, path, format, &segments)
+    // Keep the prior artifact intact until the captured final decisions are re-proven.
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let pending = parent.join(format!(".review-export-{}.tmp", uuid::Uuid::new_v4().simple()));
+    remove_file_on_error(
+        &pending,
+        (|| -> AppResult<()> {
+            export_dataset_from_segments(db, &pending, format, &segments)?;
+            crate::export_review::verify_current(db, &segments)?;
+            crate::atomic_file::replace_file(&pending, path)?;
+            Ok(())
+        })(),
+    )
 }
 
 /// Write one tabular dataset format from an already-selected immutable row snapshot.
@@ -1125,16 +1160,34 @@ pub fn export_huggingface_dataset(
     dir: &std::path::Path,
     settings: &crate::settings::AppSettings,
 ) -> AppResult<()> {
+    export_huggingface_dataset_with_hook(db, dir, settings, |_| Ok(()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HuggingFacePublishPoint {
+    BeforeDataPromotion,
+    BeforeMetadataWrite,
+    AfterDataPromotion,
+    AfterMetadataPromotion,
+    BeforePublicationCommit,
+    AfterFilesCommitted,
+}
+
+fn export_huggingface_dataset_with_hook(
+    db: &Database,
+    dir: &std::path::Path,
+    settings: &crate::settings::AppSettings,
+    mut hook: impl FnMut(HuggingFacePublishPoint) -> AppResult<()>,
+) -> AppResult<()> {
     crate::review_campaign::require_export_unblocked(db, "Hugging Face dataset export")?;
     // Telemetry (Week-1 "measure first"): real HuggingFace-export wall-clock (audio copy + shard writes).
     let _span = crate::telemetry::TRACER.start_span("export.huggingface", crate::telemetry::Tracer::metadata(vec![]));
-    std::fs::create_dir_all(dir)?;
+    let publication = hf_publication::Publication::begin(dir)?;
+    let staged_root = publication.staging();
     let data_dir = dir.join("data");
-    // Splits are STAGED in a sibling directory and swapped in only once every split has written
-    // successfully. Rebuilding in place (remove_dir_all(data) up front, then write) meant ANY mid-export
-    // failure — a full disk, a failed rename, an unwritable clip name — destroyed the prior good dataset
-    // and left the replacement partial, with nothing to recover.
-    let staging_dir = dir.join(".data-staging");
+    // Stage the complete managed generation privately. Publication preserves and journals only
+    // data/ plus the three HF sidecars, leaving unrelated files in the chosen directory untouched.
+    let staging_dir = staged_root.join("data");
     let train_dir = staging_dir.join("train");
     let val_dir = staging_dir.join("validation");
     let test_dir = staging_dir.join("test");
@@ -1178,14 +1231,7 @@ pub fn export_huggingface_dataset(
         return Ok(());
     }
 
-    // There IS something to export. Stage into a FRESH tree: a leftover staging dir from a crashed run
-    // is discarded first, and because every clip lands in an empty tree there are no orphan WAVs and no
-    // stale metadata.csv for a now-empty split to prune — the round-12 hazard (an orphan getting hashed
-    // into SHA256SUMS and disagreeing with metadata.csv / dataset_infos.json) is now structurally
-    // impossible rather than cleaned up after the fact. data/ is left untouched until the swap below.
-    if staging_dir.exists() {
-        std::fs::remove_dir_all(&staging_dir)?;
-    }
+    // This invocation owns a fresh unique staging tree. Never delete another invocation's stage.
     std::fs::create_dir_all(&train_dir)?;
     std::fs::create_dir_all(&val_dir)?;
     std::fs::create_dir_all(&test_dir)?;
@@ -1291,6 +1337,7 @@ pub fn export_huggingface_dataset(
                     "training_reasons",
                     "dialect",
                     "speaker_turn",
+                    "review_authority",
                 ])?;
 
                 let mut total_exported_dur = 0.0;
@@ -1454,6 +1501,8 @@ pub fn export_huggingface_dataset(
                         let hf_transcript = csv_safe_cell(&grade.transcript);
                         let hf_speaker = csv_safe_cell(seg.speaker_id.as_deref().unwrap_or(""));
                         let hf_reasons = csv_safe_cell(reasons.as_str());
+                        let review_authority =
+                            seg.export_review.as_ref().map(serde_json::to_string).transpose()?.unwrap_or_default();
 
                         csv_wtr.write_record([
                             hf_filename.as_ref(),
@@ -1467,6 +1516,7 @@ pub fn export_huggingface_dataset(
                             hf_reasons.as_ref(),
                             crate::dialect::dialect_of(&seg.audio_path).unwrap_or(""),
                             speaker_turn_csv(seg),
+                            review_authority.as_str(),
                         ])?;
 
                         total_exported_dur += clip_dur_ms as f64 / 1000.0;
@@ -1475,11 +1525,8 @@ pub fn export_huggingface_dataset(
                     }
                 }
 
-                // No orphan-prune here: each run stages into a FRESH tree (staging_dir is wiped + recreated
-                // at the top of the export), so this split dir only ever contains the clips written just
-                // above — there is never a stale clip from a prior, larger export to prune. Old clips are
-                // removed wholesale by the atomic data/ ← staging swap at commit, so the on-disk *.wav set
-                // always matches this run's metadata.csv (and SHA256SUMS) by construction.
+                // A fresh private split contains only this generation's clips. The old generation
+                // remains recoverable until all new data and sidecars are published and verified.
                 csv_wtr.flush()?;
                 drop(csv_wtr);
                 replace_file(&csv_tmp, &csv_path)?;
@@ -1500,15 +1547,7 @@ pub fn export_huggingface_dataset(
         (train_count, train_secs, train_dropped, train_ids),
         (val_count, val_secs, val_dropped, val_ids),
         (test_count, test_secs, test_dropped, test_ids),
-    ) = match staged_splits {
-        Ok(splits) => splits,
-        Err(error) => {
-            if let Err(cleanup) = std::fs::remove_dir_all(&staging_dir) {
-                tracing::warn!("HF export: failed to remove staging dir after an export error: {cleanup}");
-            }
-            return Err(error);
-        }
-    };
+    ) = staged_splits?;
 
     let total_count = train_count + val_count + test_count;
     let total_secs = train_secs + val_secs + test_secs;
@@ -1525,9 +1564,6 @@ pub fn export_huggingface_dataset(
     // Gated on data_dir.exists() so a FIRST-ever export with all sources unavailable still writes an empty,
     // honestly-documented dataset (droppedUnavailableAudio in dataset_infos.json) — there is nothing to lose.
     if total_count == 0 && data_dir.exists() {
-        if let Err(cleanup) = std::fs::remove_dir_all(&staging_dir) {
-            tracing::warn!("HF export: failed to remove staging dir after a zero-clip run: {cleanup}");
-        }
         tracing::warn!(
             "HF export: 0 clips written ({dropped_unavailable} training-ready segment(s) had \
              unavailable/undecodable source audio or an out-of-range alignment window) — preserving \
@@ -1535,15 +1571,6 @@ pub fn export_huggingface_dataset(
         );
         return Ok(());
     }
-
-    // COMMIT: every split wrote successfully and at least one clip exists, so replace the previous dataset
-    // now. The rename is atomic within the directory; if the remove succeeds but the rename fails, the
-    // fully-written new dataset is still on disk at .data-staging and is recoverable by hand (the prior
-    // in-place rebuild left nothing at all).
-    if data_dir.exists() {
-        std::fs::remove_dir_all(&data_dir)?;
-    }
-    std::fs::rename(&staging_dir, &data_dir)?;
 
     if dropped_unavailable > 0 {
         tracing::warn!(
@@ -1648,7 +1675,8 @@ view explicitly; the source label and its codepoints remain recoverable unchange
             composition_markdown(&compute_composition(&exported))
         }
     );
-    write_text_atomic(&dir.join("README.md"), &readme)?;
+    hook(HuggingFacePublishPoint::BeforeMetadataWrite)?;
+    write_text_atomic(&staged_root.join("README.md"), &readme)?;
 
     // Write dataset_infos.json
     let info = serde_json::json!({
@@ -1669,6 +1697,7 @@ view explicitly; the source label and its codepoints remain recoverable unchange
                 "dialect": {"dtype": "string", "_type": "Value"},
                 "speaker_turn": {"dtype": "string", "_type": "Value"},
                 "training_reasons": {"dtype": "string", "_type": "Value"},
+                "review_authority": {"dtype": "string", "_type": "Value"},
             },
             "splits": {
                 "train": {"num_examples": train_count},
@@ -1678,11 +1707,11 @@ view explicitly; the source label and its codepoints remain recoverable unchange
             "droppedUnavailableAudio": dropped_unavailable
         }
     });
-    write_text_atomic(&dir.join("dataset_infos.json"), &serde_json::to_string_pretty(&info)?)?;
+    write_text_atomic(&staged_root.join("dataset_infos.json"), &serde_json::to_string_pretty(&info)?)?;
 
     // Integrity manifest, written last so it covers every artifact: a consumer can run
     // `sha256sum -c SHA256SUMS` to detect any corrupted / truncated / partially-copied file.
-    write_sha256sums(dir)?;
+    write_sha256sums(&staged_root)?;
 
     // Every on-disk artifact is now written — persist the split columns LAST so that any failure
     // above returned Err with the DB unchanged, never leaving splits that describe an unwritten set.
@@ -1692,15 +1721,33 @@ view explicitly; the source label and its codepoints remain recoverable unchange
     // dataset does not contain and disagree with dataset_infos.json's num_examples.
     let exported_ids: std::collections::HashSet<&str> =
         train_ids.iter().chain(val_ids.iter()).chain(test_ids.iter()).map(String::as_str).collect();
-    for (id, split) in &pending_splits {
-        if !exported_ids.contains(id.as_str()) {
-            continue;
-        }
-        db.update_segment_split(id, split)
-            .map_err(|error| AppError::Other(format!("Failed to persist split {split} for {id}: {error}")))?;
-    }
-
-    Ok(())
+    publication.publish(
+        |point| {
+            hook(point)?;
+            if point == HuggingFacePublishPoint::BeforeDataPromotion {
+                crate::export_review::verify_current(db, &segments)?;
+            }
+            Ok(())
+        },
+        || {
+            // Keep the DB write lock short: audio staging and filesystem verification run before
+            // this transaction. Ordinary split-write/commit failures roll back both DB rows and
+            // the managed files; an abrupt process death may leave DB split hints lagging the
+            // sealed export, whose own split metadata is the training consumer's authority.
+            let transaction =
+                rusqlite::Transaction::new_unchecked(db.connection(), rusqlite::TransactionBehavior::Immediate)?;
+            crate::export_review::verify_current(db, &segments)?;
+            for (id, split) in &pending_splits {
+                if exported_ids.contains(id.as_str()) {
+                    db.update_segment_split(id, split).map_err(|error| {
+                        AppError::Other(format!("Failed to persist split {split} for {id}: {error}"))
+                    })?;
+                }
+            }
+            transaction.commit()?;
+            Ok(())
+        },
+    )
 }
 
 fn export_json(path: &std::path::Path, metadata: &DatasetMetadata, segments: &[SpeechSegment]) -> AppResult<()> {
@@ -1783,6 +1830,7 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
                 "training_reasons",
                 "dialect",
                 "speaker_turn",
+                "review_authority",
             ])?;
 
             for seg in segments {
@@ -1803,6 +1851,8 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
                 let training = csv_safe_cell(&grade.transcript);
                 let speaker = csv_safe_cell(seg.speaker_id.as_deref().unwrap_or(""));
                 let reasons_cell = csv_safe_cell(reasons.as_str());
+                let review_authority =
+                    seg.export_review.as_ref().map(serde_json::to_string).transpose()?.unwrap_or_default();
                 wtr.write_record([
                     id_cell.as_ref(),
                     audio_ref.as_ref(),
@@ -1819,6 +1869,7 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
                     reasons_cell.as_ref(),
                     crate::dialect::dialect_of(&seg.audio_path).unwrap_or(""),
                     speaker_turn_csv(seg),
+                    review_authority.as_str(),
                 ])?;
             }
             wtr.flush()?;
@@ -1905,6 +1956,7 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
         // Nullable on purpose: an unmeasured clip is NULL, never false — absence of a measurement is
         // not evidence of a single speaker (same honesty rule as the couch badge and the CSV column).
         Field::new("speaker_turn", DataType::Boolean, true),
+        Field::new("review_authority", DataType::Utf8, true),
     ]));
 
     let grade_reports: Vec<TrainingGradeReport> = segments.iter().map(quality::training_grade_for_segment).collect();
@@ -1934,6 +1986,11 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
         .map(|s| s.speaker_change_score.map(|v| (v as f32) < crate::diarization::SPEAKER_CHANGE_THRESHOLD))
         .collect();
 
+    let review_authority_values = segments
+        .iter()
+        .map(|seg| seg.export_review.as_ref().map(serde_json::to_string).transpose())
+        .collect::<Result<Vec<_>, _>>()?;
+    let review_authority: StringArray = review_authority_values.iter().map(|value| value.as_deref()).collect();
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
@@ -1954,6 +2011,7 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
             Arc::new(training_reasons),
             Arc::new(dialect),
             Arc::new(speaker_turn),
+            Arc::new(review_authority),
         ],
     )
     .map_err(|e| crate::error::AppError::Other(format!("Parquet batch build failed: {e}")))?;

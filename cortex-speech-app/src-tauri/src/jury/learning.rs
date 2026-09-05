@@ -9,6 +9,7 @@
 
 use crate::db::{Database, SourceTranscriptRecord};
 use crate::error::AppResult;
+use crate::export_review::{ExportReviewAuthority, LearningReviewScope};
 use crate::pipeline::SourceAudioIdentity;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -25,6 +26,12 @@ pub struct DpoPair {
     pub chosen: String,
     /// The "rejected" (agent-proposed wrong) response.
     pub rejected: String,
+    /// Identity of the original example, not a claim that its author wrote the final outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_example_id: Option<String>,
+    /// Independent current human authority; imported JSON cannot manufacture this proof.
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub review_authority: Option<ExportReviewAuthority>,
 }
 
 /// Result of a DPO export run.
@@ -38,6 +45,7 @@ pub struct DpoExportResult {
 
 #[derive(Debug)]
 struct LearningRow {
+    source_example_id: String,
     segment_id: String,
     wrong_transcript: String,
     human_fix: String,
@@ -87,6 +95,7 @@ fn build_dpo_dataset_filtered(
     // the training file is gone.
     let holdout_hashes = holdout_content_hashes(db)?;
     let holdout_paths = holdout_audio_paths(db)?;
+    let review_scope = LearningReviewScope::capture(db)?;
 
     let mut stmt = db.connection().prepare(
         "SELECT ae.segment_id,
@@ -104,12 +113,13 @@ fn build_dpo_dataset_filtered(
                 ss.agreement_score,
                 ae.effect_event_id,
                 COALESCE(NULLIF(TRIM(ss.verdict_transcript), ''),
-                         NULLIF(TRIM(ss.annotated_transcript), '')) AS retained_human_text
+                         NULLIF(TRIM(ss.annotated_transcript), '')) AS retained_human_text,
+                ae.id
          FROM agent_examples ae
          JOIN speech_segments ss ON ae.segment_id = ss.id
          WHERE ss.is_gold = 0 AND ae.verified_by_human = 1
            AND ss.rights_revoked_at IS NULL
-           AND (
+           AND (?1 = 1 OR
                 (ae.effect_event_id IS NOT NULL AND EXISTS (
                      SELECT 1
                        FROM effective_human_decision_effects_v60 effect
@@ -125,8 +135,9 @@ fn build_dpo_dataset_filtered(
          ORDER BY ae.created_at DESC, ae.id ASC",
     )?;
 
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([review_scope.is_active()], |row| {
         Ok(LearningRow {
+            source_example_id: row.get(15)?,
             segment_id: row.get(0)?,
             wrong_transcript: row.get(1)?,
             human_fix: row.get(2)?,
@@ -147,20 +158,29 @@ fn build_dpo_dataset_filtered(
 
     let mut pairs: Vec<DpoPair> = Vec::new();
     for r in rows {
-        let row = r?;
+        let mut row = r?;
         if allowed_segment_ids.is_some_and(|allowed| !allowed.contains(&row.segment_id)) {
             continue;
         }
+        if !review_scope.includes(&row.segment_id) {
+            continue;
+        }
+        let review_authority = review_scope.authority(&row.segment_id);
         if crate::quality::technical_unusable_reason_from_rationale(row.rationale.as_deref()).is_some() {
             tracing::info!(segment_id = %row.segment_id, "Excluding technically unusable segment from DPO export");
             continue;
         }
-        let wrong = row.wrong_transcript.trim();
-        let fix = row.human_fix.trim();
-        if row.effect_event_id.is_none() && !super::legacy_human_fix_is_current(row.retained_human_text.as_deref(), fix)
+        if let Some(authority) = review_authority {
+            // Projection only: do not rewrite the stored first opinion or attribute this final
+            // correction to that worker. Preserve the authoritative text byte-for-byte.
+            row.human_fix = authority.transcript().to_string();
+        } else if row.effect_event_id.is_none()
+            && !super::legacy_human_fix_is_current(row.retained_human_text.as_deref(), &row.human_fix)
         {
             continue;
         }
+        let wrong = row.wrong_transcript.trim();
+        let fix = row.human_fix.trim();
         if wrong.is_empty() || fix.is_empty() || learning_text_key(wrong) == learning_text_key(fix) {
             continue;
         }
@@ -201,10 +221,17 @@ fn build_dpo_dataset_filtered(
         // pair preserves the stored evidence byte-for-byte. In particular, `chosen` is the human's
         // authoritative correction; silently trimming or canonicalizing it would manufacture a
         // different label while still calling it human-approved.
-        pairs.push(DpoPair { prompt, chosen: row.human_fix, rejected: row.wrong_transcript });
+        pairs.push(DpoPair {
+            prompt,
+            chosen: row.human_fix,
+            rejected: row.wrong_transcript,
+            source_example_id: review_authority.map(|_| row.source_example_id),
+            review_authority: review_authority.cloned(),
+        });
     }
 
     let jsonl = pairs.iter().map(serde_json::to_string).collect::<Result<Vec<_>, _>>()?.join("\n");
+    review_scope.verify_authorities(db, pairs.iter().filter_map(|pair| pair.review_authority.as_ref()))?;
 
     Ok(DpoExportResult { pair_count: pairs.len(), jsonl })
 }
@@ -262,6 +289,7 @@ pub(crate) fn holdout_audio_paths(db: &Database) -> AppResult<std::collections::
 pub fn export_lm_corpus(db: &Database) -> AppResult<Vec<String>> {
     let holdout = holdout_content_hashes(db)?;
     let holdout_paths = holdout_audio_paths(db)?;
+    let review_scope = LearningReviewScope::capture(db)?;
 
     // Priority mirrors the codebase's canonical "text the human confirmed": the committed
     // verdict_transcript first, then the human's typed annotation, then the VERBATIM raw draft.
@@ -274,19 +302,30 @@ pub fn export_lm_corpus(db: &Database) -> AppResult<Vec<String>> {
     // (annotated ▸ raw) and quality.rs's training_transcript_with_source.
     let mut stmt = db.connection().prepare(
         "SELECT COALESCE(NULLIF(verdict_transcript, ''), NULLIF(annotated_transcript, ''), raw_transcript),
-                audio_path, rationale
+                audio_path, rationale, id
          FROM speech_segments
          WHERE is_gold = 0 AND rights_revoked_at IS NULL
-           AND human_decision IN ('accept', 'edit')
+           AND (?1 = 1 OR human_decision IN ('accept', 'edit'))
          ORDER BY created_at DESC",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
+    let rows = stmt.query_map([review_scope.is_active()], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+        ))
     })?;
 
     let mut corpus = Vec::new();
+    let mut authorities = Vec::new();
     for row_res in rows {
-        let (text, audio_path, rationale) = row_res?;
+        let (text, audio_path, rationale, segment_id) = row_res?;
+        if !review_scope.includes(&segment_id) {
+            continue;
+        }
+        let review_authority = review_scope.authority(&segment_id);
+        let text = review_authority.map(|authority| authority.transcript().to_string()).or(text);
         let Some(text) = text.filter(|t| !t.trim().is_empty()) else { continue };
         if crate::quality::technical_unusable_reason_from_rationale(rationale.as_deref()).is_some() {
             continue;
@@ -321,7 +360,11 @@ pub fn export_lm_corpus(db: &Database) -> AppResult<Vec<String>> {
         // above may inspect a trimmed view for emptiness/placeholders, but no transformation is
         // permitted on the emitted value.
         corpus.push(text);
+        if let Some(authority) = review_authority {
+            authorities.push(authority);
+        }
     }
+    review_scope.verify_authorities(db, authorities)?;
     Ok(corpus)
 }
 

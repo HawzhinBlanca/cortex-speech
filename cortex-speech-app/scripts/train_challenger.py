@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import sqlite3
@@ -218,7 +219,26 @@ def inspect_pack(pack_dir: Path, snapshot_id: str, sealed: dict[str, Any]) -> tu
             problems.append(f"{MANIFEST_NAME}:{line_no} has invalid duration_seconds {duration!r}")
         if not isinstance(row.get("source_recording"), str) or not row["source_recording"]:
             problems.append(f"{MANIFEST_NAME}:{line_no} has no source_recording")
-        if row.get("decision") not in TRAINING_DECISIONS:
+        authority = row.get("review_authority")
+        if authority is not None or row.get("decision") == "retain":
+            valid_authority = (
+                isinstance(authority, dict)
+                and type(authority.get("schemaVersion")) is int
+                and authority.get("schemaVersion") == 1
+                and authority.get("segmentId") == row.get("segment_id")
+                and authority.get("resolutionStatus") in {"resolved", "ownerResolved"}
+                and authority.get("finalAction") == "retain"
+                and authority.get("finalTranscript") == sentence
+                and isinstance(authority.get("evidenceSha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", authority["evidenceSha256"]) is not None
+                and type(authority.get("reviewerCount")) is int
+                and authority["reviewerCount"] >= 2
+                and row.get("decision") == "retain"
+                and row.get("decision_revision_scope") == "canonical_first_opinion"
+            )
+            if not valid_authority:
+                problems.append(f"{MANIFEST_NAME}:{line_no} has invalid final-review authority")
+        elif row.get("decision") not in TRAINING_DECISIONS:
             problems.append(f"{MANIFEST_NAME}:{line_no} carries non-training decision {row.get('decision')!r}")
         revision = row.get("decision_revision")
         if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:

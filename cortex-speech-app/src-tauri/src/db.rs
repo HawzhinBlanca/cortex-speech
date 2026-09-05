@@ -115,6 +115,12 @@ pub struct SpeechSegment {
     /// import path does not run it). Filled by `src/bin/speaker_change_probe.rs --persist`. Compare
     /// against [`crate::diarization::SPEAKER_CHANGE_THRESHOLD`], where the calibration is documented.
     pub speaker_change_score: Option<f64>,
+    /// Read-only export projection of the final pool decision, not a stored first opinion.
+    /// IPC/import JSON cannot carry this field; database reads always initialize it to None.
+    /// Dataset serializers explicitly include it through their export-only record.
+    #[serde(skip)]
+    #[specta(skip)]
+    pub export_review: Option<crate::export_review::ExportReviewAuthority>,
 }
 
 /// Minimal server-owned inverse for a speaker metadata change. Keeping only the changed column and

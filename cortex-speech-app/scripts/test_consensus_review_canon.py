@@ -75,9 +75,13 @@ def test_only_decided_sentences_may_be_exported() -> None:
     )
     require(
         EXPORT,
-        "crate::review_pool::consensus_resolved_segment_ids(db)",
-        "the shared export root consults consensus, so no export path can skip it",
+        "crate::review_pool::segment_resolutions(db, None)",
+        "the shared export root reads final outcomes, not merely resolved membership",
     )
+    require(EXPORT, 'resolution.final_action.as_deref() == Some("reject")',
+            "a final rejection overrides the original retained opinion")
+    require(EXPORT, "ExportReviewAuthority::retained(resolution)",
+            "final retained text carries separate proven human authority")
     require(
         EXPORT,
         "export: dropping segment no two reviewers have decided",
