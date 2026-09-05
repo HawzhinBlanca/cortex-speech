@@ -89,44 +89,57 @@ def test_ready_transfer_keeps_the_child_until_its_normal_exit() -> None:
         root = Path(name)
         state = root / "state"
         completed = root / "completed.txt"
+        release_child = root / "release-child"
         token = "2" * 32
         environment = os.environ.copy()
         environment[STATE_DIR_ENV] = str(state)
         child_code = (
-            "import pathlib,time;"
-            "time.sleep(0.7);"
-            f"pathlib.Path({str(completed)!r}).write_text('complete',encoding='utf-8')"
+            "import pathlib,time\n"
+            f"release = pathlib.Path({str(release_child)!r})\n"
+            "deadline = time.monotonic() + 15.0\n"
+            "while not release.exists():\n"
+            "    if time.monotonic() >= deadline: raise RuntimeError('test did not release child')\n"
+            "    time.sleep(0.02)\n"
+            "time.sleep(0.7)\n"
+            f"pathlib.Path({str(completed)!r}).write_text('complete',encoding='utf-8')\n"
         )
         guard = subprocess.Popen(
-            _guard_command(token, 0.3, child_code),
+            # READY is an ownership test, not a race against interpreter startup. The separate
+            # stale-heartbeat test retains its strict expiry; use the real startup budget here.
+            _guard_command(token, launch_guard.DEFAULT_HEARTBEAT_TIMEOUT_SECONDS, child_code),
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
-        _wait_for(state / f"{token}.pid")
-        signal_result = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "signal",
-                "--token",
-                token,
-                "--state",
-                "ready",
-            ],
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        assert signal_result.returncode == 0, signal_result.stderr
-        stdout, stderr = guard.communicate(timeout=5)
-        assert guard.returncode == 0, (stdout, stderr)
-        assert completed.read_text(encoding="utf-8") == "complete"
-        assert "READY ownership transferred" in (state / f"{token}.log").read_text(encoding="utf-8")
-        assert not (state / f"{token}.pid").exists()
+        log_path = state / f"{token}.log"
+        try:
+            _wait_for(state / f"{token}.pid")
+            signal_result = _signal(environment, token, "ready")
+            assert signal_result.returncode == 0, signal_result.stderr
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if log_path.exists() and "READY ownership transferred" in log_path.read_text(encoding="utf-8"):
+                    break
+                if guard.poll() is not None:
+                    break
+                time.sleep(0.02)
+            diagnostic = log_path.read_text(encoding="utf-8") if log_path.exists() else "no guard log"
+            assert "READY ownership transferred" in diagnostic, (guard.poll(), diagnostic)
+            assert guard.poll() is None, (guard.returncode, diagnostic)
+            # Missing heartbeat has infinite age. The live child must nevertheless finish normally
+            # after acknowledged transfer; merely disabling expiry is caught by the stale test.
+            assert not (state / f"{token}.heartbeat").exists()
+            assert not completed.exists(), "child exited before the ownership transfer was observed"
+            release_child.write_text("release", encoding="ascii")
+            stdout, stderr = guard.communicate(timeout=5)
+            assert guard.returncode == 0, (guard.returncode, stdout, stderr, log_path.read_text(encoding="utf-8"))
+            assert completed.read_text(encoding="utf-8") == "complete"
+            assert not (state / f"{token}.pid").exists()
+        finally:
+            if guard.poll() is None:
+                _signal(environment, token, "stop")
+            guard.communicate(timeout=20)
 
 
 def test_ready_without_a_live_guard_fails_closed() -> None:

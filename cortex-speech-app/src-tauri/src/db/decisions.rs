@@ -70,6 +70,7 @@ impl Database {
             // Speaker-change score — Migration v47; nullable REAL. None (absent/NULL) means NOT
             // MEASURED and must never be read as "measured, one speaker".
             speaker_change_score: Self::optional_col(row, 36)?,
+            export_review: None,
         })
     }
 

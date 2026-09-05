@@ -559,6 +559,11 @@ fn legacy_human_fix_is_current(retained_human_text: Option<&str>, human_fix: &st
 /// already returns newest-first and the sort is stable). The doc's §2.4 upgrade over the old
 /// recency-only retrieval that ignored its segment_id.
 pub fn get_few_shot_examples(db: &Database, segment_id: &str, k: usize) -> AppResult<Vec<FewShotExample>> {
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+    let initial_stamp = crate::review_pool::learning_data_stamp(db).map_err(crate::error::AppError::Validation)?;
+    let review_pool = crate::review_pool::learning_pool(db).map_err(crate::error::AppError::Validation)?;
     // The current segment's canonical text (prefer normalized), if present.
     let segment_text: Option<String> = db
         .connection()
@@ -571,7 +576,8 @@ pub fn get_few_shot_examples(db: &Database, segment_id: &str, k: usize) -> AppRe
         .ok()
         .flatten();
 
-    // Re-rank a bounded recent pool (keeps cost flat as the example store grows).
+    // Re-rank a bounded retained candidate set. Keyset pages replace ineligible examples;
+    // memory is bounded, though scanning an all-ineligible history can require multiple pages.
     let pool = 200usize.max(k);
     let mut stmt = db.connection().prepare(
         // Only human-verified examples seed the LLM corrector's few-shot context; model pseudo-labels
@@ -586,13 +592,20 @@ pub fn get_few_shot_examples(db: &Database, segment_id: &str, k: usize) -> AppRe
         "SELECT ae.id, ae.segment_id, ae.wrong_transcript, ae.human_fix, ae.created_at,
                 ae.effect_event_id,
                 COALESCE(NULLIF(TRIM(ss.verdict_transcript), ''),
-                         NULLIF(TRIM(ss.annotated_transcript), '')) AS retained_human_text
+                         NULLIF(TRIM(ss.annotated_transcript), '')) AS retained_human_text,
+                ss.rationale
          FROM agent_examples ae
          JOIN speech_segments ss ON ae.segment_id = ss.id
          WHERE ae.verified_by_human = 1
            AND ss.is_gold = 0
+           AND ss.rights_revoked_at IS NULL
+           AND ae.segment_id <> ?5
            AND ss.audio_path NOT IN (SELECT audio_path FROM gold_segments WHERE is_holdout = 1)
-           AND (
+           AND NOT EXISTS (
+               SELECT 1 FROM gold_segments gold WHERE gold.is_holdout = 1
+               AND ss.audio_content_hash IS NOT NULL AND gold.audio_content_hash = ss.audio_content_hash
+           )
+           AND (?4 = 1 OR
                 (ae.effect_event_id IS NOT NULL AND EXISTS (
                      SELECT 1
                        FROM effective_human_decision_effects_v60 effect
@@ -616,28 +629,66 @@ pub fn get_few_shot_examples(db: &Database, segment_id: &str, k: usize) -> AppRe
     let mut cursor_created_at: Option<String> = None;
     let mut cursor_id = String::new();
     while examples.len() < pool {
-        let rows = stmt.query_map(params![page_size, cursor_created_at.as_deref(), cursor_id], |row| {
-            Ok((
-                FewShotExample {
-                    id: row.get(0)?,
-                    segment_id: row.get(1)?,
-                    wrong_transcript: row.get(2)?,
-                    human_fix: row.get(3)?,
-                    created_at: row.get(4)?,
-                },
-                row.get::<_, Option<i64>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![page_size, cursor_created_at.as_deref(), cursor_id, review_pool.is_some(), segment_id],
+            |row| {
+                Ok((
+                    FewShotExample {
+                        id: row.get(0)?,
+                        segment_id: row.get(1)?,
+                        wrong_transcript: row.get(2)?,
+                        human_fix: row.get(3)?,
+                        created_at: row.get(4)?,
+                        review_authority: None,
+                    },
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )?;
         let candidates = rows.collect::<Result<Vec<_>, _>>()?;
-        let Some((last_example, _, _)) = candidates.last() else {
+        let Some((last_example, _, _, _)) = candidates.last() else {
             break;
         };
         cursor_created_at = last_example.created_at.clone();
         cursor_id.clone_from(&last_example.id);
-        for (example, effect_event_id, retained_human_text) in candidates {
-            if effect_event_id.is_none()
+        let resolutions = if let Some(pool) = &review_pool {
+            let ids = candidates.iter().map(|(example, _, _, _)| example.segment_id.clone()).collect::<Vec<_>>();
+            crate::review_pool::learning_resolutions(db, pool, &ids)
+                .map_err(crate::error::AppError::Validation)?
+                .into_iter()
+                .map(|resolution| (resolution.segment_id.clone(), resolution))
+                .collect::<std::collections::HashMap<_, _>>()
+        } else {
+            std::collections::HashMap::new()
+        };
+        for (mut example, effect_event_id, retained_human_text, rationale) in candidates {
+            if crate::quality::technical_unusable_reason_from_rationale(rationale.as_deref()).is_some() {
+                continue;
+            }
+            if review_pool.is_some() {
+                let Some(resolution) = resolutions.get(&example.segment_id) else {
+                    continue;
+                };
+                if !matches!(resolution.status.as_str(), "resolved" | "ownerResolved")
+                    || resolution.final_action.as_deref() != Some("retain")
+                {
+                    continue;
+                }
+                let authority = crate::export_review::ExportReviewAuthority::retained(resolution)?;
+                example.human_fix = authority.transcript().to_string();
+                example.review_authority = Some(authority);
+            } else if effect_event_id.is_none()
                 && !legacy_human_fix_is_current(retained_human_text.as_deref(), &example.human_fix)
+            {
+                continue;
+            }
+            if crate::quality::is_placeholder_transcript(&example.human_fix)
+                || example.human_fix.trim().is_empty()
+                || example.wrong_transcript.trim().is_empty()
+                || crate::normalizer::learning_text_key(&example.human_fix)
+                    == crate::normalizer::learning_text_key(&example.wrong_transcript)
             {
                 continue;
             }
@@ -665,6 +716,9 @@ pub fn get_few_shot_examples(db: &Database, segment_id: &str, k: usize) -> AppRe
     }
 
     examples.truncate(k);
+    if crate::review_pool::learning_data_stamp(db).map_err(crate::error::AppError::Validation)? != initial_stamp {
+        return Err(crate::error::AppError::Validation("learning authority changed during retrieval; retry".into()));
+    }
     Ok(examples)
 }
 
@@ -736,6 +790,9 @@ pub struct FewShotExample {
     pub wrong_transcript: String,
     pub human_fix: String,
     pub created_at: Option<String>,
+    /// The source example ID above remains historical; this is separate final-outcome authority.
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub review_authority: Option<crate::export_review::ExportReviewAuthority>,
 }
 
 #[cfg(test)]

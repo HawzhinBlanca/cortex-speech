@@ -26,9 +26,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-const REVIEW_POOL_BASE_SCHEMA_VERSION: i64 = 62;
+pub(crate) const REVIEW_POOL_BASE_SCHEMA_VERSION: i64 = 62;
 pub const REVIEW_POOL_SCHEMA_VERSION: i64 = 63;
-const REVIEW_POOL_DEDUP_SCHEMA_VERSION: i64 = 64;
+pub(crate) const REVIEW_POOL_DEDUP_SCHEMA_VERSION: i64 = 64;
 pub const REVIEW_POOL_PLAYBACK_GUARD: &str = "content-hash-raw-counter-v3";
 const DESKTOP_REVIEWER_KEY: &str = "@desktop-owner";
 
@@ -738,9 +738,20 @@ fn insert_judgement(
 }
 
 fn reviewer_sets_on(conn: &rusqlite::Connection) -> Result<HashMap<String, SegmentReviewers>, String> {
+    reviewer_sets_for_ids_on(conn, None)
+}
+
+fn reviewer_sets_for_ids_on(
+    conn: &rusqlite::Connection,
+    segment_ids_json: Option<&str>,
+) -> Result<HashMap<String, SegmentReviewers>, String> {
     let mut result: HashMap<String, SegmentReviewers> = HashMap::new();
+    let canonical_filter =
+        if segment_ids_json.is_some() { "AND member.segment_id IN (SELECT value FROM json_each(?1))" } else { "" };
+    let independent_filter =
+        if segment_ids_json.is_some() { "WHERE decision.segment_id IN (SELECT value FROM json_each(?1))" } else { "" };
     let mut canonical = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT member.segment_id,
                     COALESCE(segment.reviewed_by, '@desktop-owner'),
                     segment.human_decision,
@@ -753,11 +764,12 @@ fn reviewer_sets_on(conn: &rusqlite::Connection) -> Result<HashMap<String, Segme
                FROM review_pool_members member
                JOIN speech_segments segment ON segment.id=member.segment_id
               WHERE segment.verified=1
-                AND segment.human_decision IN ('accept','edit','reject','human_accept','human_edit','human_reject')",
-        )
+                AND segment.human_decision IN ('accept','edit','reject','human_accept','human_edit','human_reject')
+                {canonical_filter}",
+        ))
         .map_err(|error| format!("canonical review coverage cannot be read: {error}"))?;
     let rows = canonical
-        .query_map([], |row| {
+        .query_map(rusqlite::params_from_iter(segment_ids_json), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -774,14 +786,14 @@ fn reviewer_sets_on(conn: &rusqlite::Connection) -> Result<HashMap<String, Segme
     }
 
     let mut independent = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT decision.segment_id, decision.reviewer, decision.id,
                     decision.action, decision.submitted_transcript
-               FROM effective_review_pool_decisions_v62 decision",
-        )
+               FROM effective_review_pool_decisions_v62 decision {independent_filter}",
+        ))
         .map_err(|error| format!("independent pool coverage cannot be read: {error}"))?;
     let rows = independent
-        .query_map([], |row| {
+        .query_map(rusqlite::params_from_iter(segment_ids_json), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -800,15 +812,15 @@ fn reviewer_sets_on(conn: &rusqlite::Connection) -> Result<HashMap<String, Segme
     // Preserve any already-committed v61 blinded judgements if the old sequential campaign was used
     // before this pool superseded its serving policy.
     let mut legacy = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT decision.segment_id, decision.reviewer, decision.id,
                     decision.action, decision.submitted_transcript
                FROM effective_independent_review_decisions_v61 decision
-               JOIN review_pool_members member ON member.segment_id=decision.segment_id",
-        )
+               JOIN review_pool_members member ON member.segment_id=decision.segment_id {independent_filter}",
+        ))
         .map_err(|error| format!("legacy independent coverage cannot be read: {error}"))?;
     let rows = legacy
-        .query_map([], |row| {
+        .query_map(rusqlite::params_from_iter(segment_ids_json), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -831,20 +843,28 @@ fn reviewer_sets(db: &Database) -> Result<HashMap<String, SegmentReviewers>, Str
 }
 
 fn owner_adjudications_on(conn: &rusqlite::Connection) -> Result<HashMap<String, Vec<OwnerAdjudication>>, String> {
+    owner_adjudications_for_ids_on(conn, None)
+}
+
+fn owner_adjudications_for_ids_on(
+    conn: &rusqlite::Connection,
+    segment_ids_json: Option<&str>,
+) -> Result<HashMap<String, Vec<OwnerAdjudication>>, String> {
     let schema_version: i64 = conn
         .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |row| row.get(0))
         .map_err(|error| format!("review-pool schema authority cannot be read: {error}"))?;
     if schema_version < REVIEW_POOL_SCHEMA_VERSION {
         return Ok(HashMap::new());
     }
+    let filter = if segment_ids_json.is_some() { "WHERE segment_id IN (SELECT value FROM json_each(?1))" } else { "" };
     let mut statement = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT segment_id, final_action, final_transcript, evidence_sha256
-               FROM review_pool_owner_adjudications ORDER BY id DESC",
-        )
+               FROM review_pool_owner_adjudications {filter} ORDER BY id DESC",
+        ))
         .map_err(|error| format!("owner adjudications cannot be read: {error}"))?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map(rusqlite::params_from_iter(segment_ids_json), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1332,35 +1352,109 @@ pub fn segment_resolutions(db: &Database, voice_name: Option<&str>) -> Result<Ve
         if requested_voice.is_some_and(|voice| voice != member.voice_name) {
             continue;
         }
-        let reviewer_count = reviewers.get(segment_id).map_or(0, |value| value.judged.len());
-        let (resolution, evidence_sha256) =
-            derive_resolution(segment_id, reviewers.get(segment_id), adjudications.get(segment_id));
-        let (status, final_action, final_transcript, agreeing_reviewers) = match resolution {
-            DerivedResolution::Pending => ("pending", None, None, Vec::new()),
-            DerivedResolution::NeedsThird => ("needsThirdReview", None, None, Vec::new()),
-            DerivedResolution::OwnerConflict => ("ownerConflict", None, None, Vec::new()),
-            DerivedResolution::Resolved { outcome, agreeing_reviewers, owner } => (
-                if owner { "ownerResolved" } else { "resolved" },
-                Some(outcome.final_action().to_string()),
-                outcome.final_transcript().map(str::to_string),
-                agreeing_reviewers,
-            ),
-        };
-        rows.push(SegmentResolution {
-            segment_id: segment_id.clone(),
-            voice_name: member.voice_name.clone(),
-            status: status.to_string(),
-            final_action,
-            final_transcript,
-            evidence_sha256,
-            reviewer_count,
-            agreeing_reviewers,
-        });
+        rows.push(describe_resolution(segment_id, member, reviewers.get(segment_id), adjudications.get(segment_id)));
     }
     rows.sort_unstable_by(|left, right| {
         left.voice_name.cmp(&right.voice_name).then(left.segment_id.cmp(&right.segment_id))
     });
     Ok(rows)
+}
+
+fn describe_resolution(
+    segment_id: &str,
+    member: &PoolMemberEvidence,
+    reviewers: Option<&SegmentReviewers>,
+    adjudications: Option<&Vec<OwnerAdjudication>>,
+) -> SegmentResolution {
+    let reviewer_count = reviewers.map_or(0, |value| value.judged.len());
+    let (resolution, evidence_sha256) = derive_resolution(segment_id, reviewers, adjudications);
+    let (status, final_action, final_transcript, agreeing_reviewers) = match resolution {
+        DerivedResolution::Pending => ("pending", None, None, Vec::new()),
+        DerivedResolution::NeedsThird => ("needsThirdReview", None, None, Vec::new()),
+        DerivedResolution::OwnerConflict => ("ownerConflict", None, None, Vec::new()),
+        DerivedResolution::Resolved { outcome, agreeing_reviewers, owner } => (
+            if owner { "ownerResolved" } else { "resolved" },
+            Some(outcome.final_action().to_string()),
+            outcome.final_transcript().map(str::to_string),
+            agreeing_reviewers,
+        ),
+    };
+    SegmentResolution {
+        segment_id: segment_id.to_string(),
+        voice_name: member.voice_name.clone(),
+        status: status.to_string(),
+        final_action,
+        final_transcript,
+        evidence_sha256,
+        reviewer_count,
+        agreeing_reviewers,
+    }
+}
+
+/// Connection-local stamp: external commits and schema changes invalidate immutable identity
+/// reuse. Ordinary same-connection review writes need not rebuild the immutable membership proof;
+/// their outcomes are NEVER cached. Explicit transactions bypass this cache entirely.
+pub(crate) fn learning_data_stamp(db: &Database) -> Result<(i64, i64), String> {
+    let data_version = db
+        .connection()
+        .query_row("PRAGMA data_version", [], |row| row.get(0))
+        .map_err(|error| format!("learning data version cannot be read: {error}"))?;
+    let schema_version = db
+        .connection()
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .map_err(|error| format!("learning schema version cannot be read: {error}"))?;
+    Ok((data_version, schema_version))
+}
+
+pub(crate) struct LearningPoolCache {
+    pool: ReviewPool,
+    stamp: (i64, i64),
+}
+
+/// The same full immutable identity proof as the serving path, reused only on this connection.
+/// A changed registry/champion, external commit, or schema change requires a fresh full proof.
+pub(crate) fn learning_pool(db: &Database) -> Result<Option<ReviewPool>, String> {
+    let stamp = learning_data_stamp(db)?;
+    if !db.connection().is_autocommit() {
+        return load(db);
+    }
+    let mut cache = db.learning_pool_cache.lock().map_err(|_| "learning identity cache poisoned".to_string())?;
+    if let Some(cached) = cache.as_ref() {
+        if cached.stamp == stamp && registry_matches(db, &cached.pool)? {
+            return Ok(Some(cached.pool.clone()));
+        }
+    }
+    *cache = None;
+    let pool = load(db)?;
+    if learning_data_stamp(db)? != stamp {
+        return Err("review-pool identity changed while preparing learning retrieval".to_string());
+    }
+    if let Some(pool) = &pool {
+        *cache = Some(LearningPoolCache { pool: pool.clone(), stamp });
+    }
+    Ok(pool)
+}
+
+/// Fresh mutable opinions for one candidate page; shares the exact judgement parser and resolver
+/// with certification. Out-of-pool/duplicate IDs never gain authority. No all-pool opinion scan.
+pub(crate) fn learning_resolutions(
+    db: &Database,
+    pool: &ReviewPool,
+    segment_ids: &[String],
+) -> Result<Vec<SegmentResolution>, String> {
+    let ids: Vec<_> = segment_ids.iter().filter(|id| pool.members.contains_key(*id)).collect();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let json = serde_json::to_string(&ids).map_err(|error| error.to_string())?;
+    let reviewers = reviewer_sets_for_ids_on(db.connection(), Some(&json))?;
+    let adjudications = owner_adjudications_for_ids_on(db.connection(), Some(&json))?;
+    Ok(ids
+        .into_iter()
+        .filter_map(|id| {
+            pool.members.get(id).map(|member| describe_resolution(id, member, reviewers.get(id), adjudications.get(id)))
+        })
+        .collect())
 }
 
 pub fn resolution_summary(db: &Database) -> Result<PoolResolutionSummary, String> {
@@ -1952,7 +2046,15 @@ mod tests {
             verified: reviewed_by.is_some(),
             duration_ms: 1_000,
             model_version_id: Some(TEST_CHAMPION.to_string()),
-            alignment_json: Some(r#"{"source_start_ms":0,"source_end_ms":1000}"#.to_string()),
+            alignment_json: Some(
+                crate::chunking::SegmentSourceMeta {
+                    source_start_ms: 0,
+                    source_end_ms: 1000,
+                    chunk_index: 0,
+                    chunk_count: 1,
+                }
+                .to_alignment_json(),
+            ),
             ..crate::db::SpeechSegment::default()
         }
     }
@@ -2003,18 +2105,22 @@ mod tests {
     }
 
     fn one_clip_pool(first_text: &str) -> (tempfile::TempDir, Database, ReviewPool) {
-        let dir = tempfile::tempdir().unwrap();
-        let audio = dir.path().join("clip.wav");
-        write_clip_wav(&audio, "a");
-        let db = Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
-        seed_champion(&db);
-        rollback_fixture_to(&db, 59);
-        db.insert_segment_full(&reviewed_segment("clip", &audio, "Rubar", first_text)).unwrap();
-        upgrade_fixture_from(&db, 59);
-        db.connection()
-            .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='clip'", [clip_hash("a")])
-            .unwrap();
+        one_clip_pool_with_first_rejection(first_text, false)
+    }
+
+    fn one_clip_pool_with_first_rejection(
+        first_text: &str,
+        rejected: bool,
+    ) -> (tempfile::TempDir, Database, ReviewPool) {
+        one_clip_pool_fixture(first_text, rejected, false)
+    }
+
+    fn one_clip_pool_fixture(
+        first_text: &str,
+        rejected: bool,
+        learning_example: bool,
+    ) -> (tempfile::TempDir, Database, ReviewPool) {
+        let (dir, db) = one_clip_database(first_text, rejected, learning_example);
         let pool = activate(
             &db,
             "123e4567-e89b-42d3-a456-426614174050",
@@ -2022,6 +2128,39 @@ mod tests {
         )
         .unwrap();
         (dir, db, pool)
+    }
+
+    fn one_clip_database(first_text: &str, rejected: bool, learning_example: bool) -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("clip.wav");
+        write_clip_wav(&audio, "a");
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        seed_champion(&db);
+        rollback_fixture_to(&db, 59);
+        let mut first = reviewed_segment("clip", &audio, "Rubar", first_text);
+        if rejected {
+            first.human_decision = Some("reject".into());
+            first.verdict = Some("human_reject".into());
+            first.verdict_transcript = None;
+            first.annotated_transcript = None;
+        }
+        db.insert_segment_full(&first).unwrap();
+        if learning_example {
+            // A genuine legacy human example, retained unchanged through migration/consensus.
+            db.connection()
+                .execute(
+                    "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
+                 VALUES ('first-example', 'clip', 'دەقی چامپیۆن', ?1)",
+                    [first_text],
+                )
+                .unwrap();
+        }
+        upgrade_fixture_from(&db, 59);
+        db.connection()
+            .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='clip'", [clip_hash("a")])
+            .unwrap();
+        (dir, db)
     }
 
     fn two_clip_pool(reviewed_segment_id: Option<&str>) -> (tempfile::TempDir, Database, ReviewPool) {
@@ -2398,6 +2537,614 @@ mod tests {
         let kept = crate::export::exclude_unexportable_segments(&db, vec![segment]).unwrap();
         let ids: Vec<&str> = kept.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["clip"], "a decided sentence must ship: {ids:?}");
+    }
+
+    #[test]
+    fn pool_few_shot_uses_the_final_matching_pair() {
+        let (_dir, db, pool) = one_clip_pool_fixture("دەقی یەکەم", false, true);
+        decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-000000000301", 2_000);
+        decide(&db, &pool, "Sewa", "دەقی دووەم", "60000000-0000-4000-8000-000000000302", 3_000);
+        let examples = crate::jury::get_few_shot_examples(&db, "query-other", 3).unwrap();
+        assert_eq!(examples.len(), 1);
+        assert_eq!(examples[0].human_fix, "دەقی دووەم");
+        let projected = serde_json::to_value(&examples[0]).unwrap();
+        assert_eq!(projected["reviewAuthority"]["finalTranscript"], "دەقی دووەم");
+        let original: String = db
+            .connection()
+            .query_row("SELECT human_fix FROM agent_examples WHERE id='first-example'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(original, "دەقی یەکەم");
+    }
+
+    #[test]
+    fn pool_few_shot_excludes_unresolved_first_opinions() {
+        let (_dir, db, _pool) = one_clip_pool_fixture("دەقی یەکەم", false, true);
+        assert!(crate::jury::get_few_shot_examples(&db, "query-other", 3).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pool_few_shot_excludes_owner_rejection() {
+        let (_dir, db, pool) = one_clip_pool_fixture("دەقی یەکەم", false, true);
+        decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-000000000311", 2_000);
+        decide(&db, &pool, "Sewa", "دەقی سێیەم", "60000000-0000-4000-8000-000000000312", 3_000);
+        record_owner_adjudication(
+            &db,
+            &pool,
+            &OwnerAdjudicationInput {
+                segment_id: "clip",
+                final_action: "reject",
+                final_transcript: None,
+                operation_id: "60000000-0000-4000-8000-000000000313",
+                created_at_ms: 4_000,
+            },
+        )
+        .unwrap();
+        assert!(crate::jury::get_few_shot_examples(&db, "query-other", 3).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pool_few_shot_reuses_only_identity_and_refreshes_retention_and_undo() {
+        let (_dir, db, pool) = one_clip_pool_fixture("دەقی یەکەم", true, true);
+        assert!(crate::jury::get_few_shot_examples(&db, "query-other", 3).unwrap().is_empty());
+        let first = learning_pool(&db).unwrap().unwrap();
+        decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-000000000321", 2_000);
+        let third = decide(&db, &pool, "Sewa", "دەقی دووەم", "60000000-0000-4000-8000-000000000322", 3_000);
+        let examples = crate::jury::get_few_shot_examples(&db, "query-other", 3).unwrap();
+        assert_eq!(examples.len(), 1);
+        assert_eq!(examples[0].human_fix, "دەقی دووەم");
+        let second = learning_pool(&db).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first.members, &second.members), "a review write must not reload immutable membership");
+        let scoped = learning_resolutions(&db, &second, &["clip".into(), "outside-pool".into()]).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&scoped[0]).unwrap(),
+            serde_json::to_value(&segment_resolutions(&db, None).unwrap()[0]).unwrap()
+        );
+        let imported: crate::jury::FewShotExample =
+            serde_json::from_value(serde_json::to_value(&examples[0]).unwrap()).unwrap();
+        assert!(imported.review_authority.is_none(), "deserialization cannot mint live review authority");
+        reverse_decision(&db, &pool, third, "Sewa", "60000000-0000-4000-8000-000000000323", 4_000).unwrap();
+        assert!(crate::jury::get_few_shot_examples(&db, "query-other", 3).unwrap().is_empty());
+        assert!(Arc::ptr_eq(&first.members, &learning_pool(&db).unwrap().unwrap().members));
+    }
+
+    #[test]
+    fn pool_few_shot_identity_cache_invalidates_external_and_schema_changes() {
+        let (dir, db, _pool) = disk_one_clip_pool("123e4567-e89b-42d3-a456-4266141740d0", "دەقی یەکەم");
+        let first = learning_pool(&db).unwrap().unwrap();
+        let external = rusqlite::Connection::open(dir.path().join("pool-fixture.db")).unwrap();
+        external.execute("UPDATE speech_segments SET rights_revoked_at='2026-09-05' WHERE id='clip'", []).unwrap();
+        let second = learning_pool(&db).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first.members, &second.members), "external commits require a fresh full identity proof");
+        db.connection().execute_batch("CREATE TABLE learning_cache_fixture (id INTEGER)").unwrap();
+        let third = learning_pool(&db).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&second.members, &third.members), "schema changes invalidate the proof");
+        db.connection().execute_batch("BEGIN DEFERRED").unwrap();
+        let transaction = learning_pool(&db).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&third.members, &transaction.members), "explicit snapshots bypass the cache");
+        db.connection().execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn pool_few_shot_identity_cache_respects_new_duplicate_exclusions() {
+        let (_dir, db, pool) = two_clip_pool(None);
+        let before = learning_pool(&db).unwrap().unwrap();
+        assert_eq!(before.members.len(), 2);
+        apply_dedup_manifest(&db, &dedup_manifest(&pool, "a", None, 1_000)).unwrap();
+        let after = learning_pool(&db).unwrap().unwrap();
+        assert_eq!(after.members.len(), 1);
+        assert!(!Arc::ptr_eq(&before.members, &after.members));
+        assert!(learning_resolutions(&db, &after, &["b".into()]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pool_few_shot_owner_text_is_current_and_never_its_own_example() {
+        let (_dir, db, pool) = one_clip_pool_fixture("دەقی یەکەم", false, true);
+        decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-000000000331", 2_000);
+        decide(&db, &pool, "Sewa", "دەقی سێیەم", "60000000-0000-4000-8000-000000000332", 3_000);
+        record_owner_adjudication(
+            &db,
+            &pool,
+            &OwnerAdjudicationInput {
+                segment_id: "clip",
+                final_action: "retain",
+                final_transcript: Some("دەقی کۆتایی"),
+                operation_id: "60000000-0000-4000-8000-000000000333",
+                created_at_ms: 4_000,
+            },
+        )
+        .unwrap();
+        let examples = crate::jury::get_few_shot_examples(&db, "query-other", 3).unwrap();
+        assert_eq!(examples.len(), 1);
+        assert_eq!(examples[0].human_fix, "دەقی کۆتایی");
+        assert!(crate::jury::get_few_shot_examples(&db, "clip", 3).unwrap().is_empty());
+        assert!(crate::jury::get_few_shot_examples(&db, "query-other", 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pool_few_shot_final_authority_cannot_bypass_rights_gold_hash_or_unusable_audio() {
+        for guard in ["withdrawn", "gold", "holdout-hash", "technical"] {
+            let (_dir, db, pool) = one_clip_pool_fixture("دەقی یەکەم", false, true);
+            decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-000000000341", 2_000);
+            decide(&db, &pool, "Sewa", "دەقی دووەم", "60000000-0000-4000-8000-000000000342", 3_000);
+            assert_eq!(crate::jury::get_few_shot_examples(&db, "query-other", 3).unwrap().len(), 1);
+            match guard {
+                "withdrawn" => {
+                    db.connection()
+                        .execute("UPDATE speech_segments SET rights_revoked_at='2026-09-05' WHERE id='clip'", [])
+                        .unwrap();
+                }
+                "gold" => {
+                    db.connection().execute("UPDATE speech_segments SET is_gold=1 WHERE id='clip'", []).unwrap();
+                }
+                "holdout-hash" => {
+                    db.connection()
+                        .execute(
+                            "INSERT INTO gold_segments (id, audio_path, reference, is_holdout, audio_content_hash)
+                     SELECT 'held-out-copy', 'different-missing-path.wav', 'answer', 1, audio_content_hash
+                     FROM speech_segments WHERE id='clip'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "technical" => {
+                    let rationale = crate::quality::canonical_technical_unusable_rationale(
+                        "decodeFailed",
+                        &"a".repeat(64),
+                        None,
+                        0,
+                    )
+                    .unwrap();
+                    db.connection()
+                        .execute("UPDATE speech_segments SET rationale=?1 WHERE id='clip'", [rationale])
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(crate::jury::get_few_shot_examples(&db, "query-other", 3).unwrap().is_empty(), "{guard}");
+        }
+    }
+
+    #[test]
+    fn pool_learning_dpo_uses_the_final_matching_pair() {
+        let (_dir, db, pool) = one_clip_pool_fixture("دەقی یەکەم", false, true);
+        decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-000000000201", 2_000);
+        decide(&db, &pool, "Sewa", "دەقی دووەم", "60000000-0000-4000-8000-000000000202", 3_000);
+        let result = crate::jury::learning::build_dpo_dataset(&db).unwrap();
+        assert_eq!(result.pair_count, 1);
+        let row: serde_json::Value = serde_json::from_str(&result.jsonl).unwrap();
+        assert_eq!(row["chosen"], "دەقی دووەم");
+        assert_eq!(row["rejected"], "دەقی چامپیۆن");
+        assert_eq!(row["review_authority"]["finalTranscript"], row["chosen"]);
+        assert_eq!(row["source_example_id"], "first-example");
+        let old: String = db
+            .connection()
+            .query_row("SELECT human_fix FROM agent_examples WHERE id='first-example'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(old, "دەقی یەکەم");
+    }
+
+    #[test]
+    fn pool_learning_lm_uses_the_final_matching_pair() {
+        let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-000000000211", 2_000);
+        decide(&db, &pool, "Sewa", "دەقی دووەم", "60000000-0000-4000-8000-000000000212", 3_000);
+        assert_eq!(crate::jury::learning::export_lm_corpus(&db).unwrap(), vec!["دەقی دووەم"]);
+        assert_eq!(crate::quality::effective_transcript(&db.get_segment_by_id("clip").unwrap().unwrap()), "دەقی یەکەم");
+    }
+
+    #[test]
+    fn pool_learning_dpo_and_lm_exclude_unresolved_first_opinions() {
+        let (_dir, db, _pool) = one_clip_pool_fixture("دەقی یەکەم", false, true);
+        assert_eq!(crate::jury::learning::build_dpo_dataset(&db).unwrap().pair_count, 0);
+        assert!(crate::jury::learning::export_lm_corpus(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pool_learning_dpo_and_lm_refuse_owner_rejection() {
+        let (_dir, db, pool) = one_clip_pool_fixture("دەقی یەکەم", false, true);
+        decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-000000000221", 2_000);
+        decide(&db, &pool, "Sewa", "دەقی سێیەم", "60000000-0000-4000-8000-000000000222", 3_000);
+        record_owner_adjudication(
+            &db,
+            &pool,
+            &OwnerAdjudicationInput {
+                segment_id: "clip",
+                final_action: "reject",
+                final_transcript: None,
+                operation_id: "60000000-0000-4000-8000-000000000223",
+                created_at_ms: 4_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "ownerResolved");
+        assert_eq!(crate::jury::learning::build_dpo_dataset(&db).unwrap().pair_count, 0);
+        assert!(crate::jury::learning::export_lm_corpus(&db).unwrap().is_empty());
+        assert_eq!(crate::quality::effective_transcript(&db.get_segment_by_id("clip").unwrap().unwrap()), "دەقی یەکەم");
+    }
+
+    #[test]
+    fn pool_learning_later_retention_survives_first_reject_but_not_undo() {
+        let (_dir, db, pool) = one_clip_pool_fixture("دەقی یەکەم", true, true);
+        decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-000000000231", 2_000);
+        let third = decide(&db, &pool, "Sewa", "دەقی دووەم", "60000000-0000-4000-8000-000000000232", 3_000);
+        let before = serde_json::to_value(db.get_segment_by_id("clip").unwrap().unwrap()).unwrap();
+        let result = crate::jury::learning::build_dpo_dataset(&db).unwrap();
+        assert_eq!(result.pair_count, 1);
+        let row: serde_json::Value = serde_json::from_str(&result.jsonl).unwrap();
+        assert_eq!(row["chosen"], "دەقی دووەم");
+        assert_eq!(crate::jury::learning::export_lm_corpus(&db).unwrap(), vec!["دەقی دووەم"]);
+        assert_eq!(serde_json::to_value(db.get_segment_by_id("clip").unwrap().unwrap()).unwrap(), before);
+        reverse_decision(&db, &pool, third, "Sewa", "60000000-0000-4000-8000-000000000233", 4_000).unwrap();
+        assert_eq!(crate::jury::learning::build_dpo_dataset(&db).unwrap().pair_count, 0);
+        assert!(crate::jury::learning::export_lm_corpus(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pool_learning_owner_text_replaces_the_example_without_fabricated_authorship() {
+        let (_dir, db, pool) = one_clip_pool_fixture("دەقی یەکەم", false, true);
+        decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-000000000241", 2_000);
+        decide(&db, &pool, "Sewa", "دەقی سێیەم", "60000000-0000-4000-8000-000000000242", 3_000);
+        record_owner_adjudication(
+            &db,
+            &pool,
+            &OwnerAdjudicationInput {
+                segment_id: "clip",
+                final_action: "retain",
+                final_transcript: Some("دەقی کۆتایی"),
+                operation_id: "60000000-0000-4000-8000-000000000243",
+                created_at_ms: 4_000,
+            },
+        )
+        .unwrap();
+        let result = crate::jury::learning::build_dpo_dataset(&db).unwrap();
+        assert_eq!(result.pair_count, 1);
+        let row: serde_json::Value = serde_json::from_str(&result.jsonl).unwrap();
+        assert_eq!(row["chosen"], "دەقی کۆتایی");
+        assert_eq!(row["review_authority"]["resolutionStatus"], "ownerResolved");
+        assert_eq!(crate::jury::learning::export_lm_corpus(&db).unwrap(), vec!["دەقی کۆتایی"]);
+    }
+
+    #[test]
+    fn pool_learning_final_authority_cannot_bypass_rights_gold_or_holdouts() {
+        for guard in ["withdrawn", "gold", "holdout"] {
+            let (_dir, db, pool) = one_clip_pool_fixture("دەقی یەکەم", false, true);
+            decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-000000000251", 2_000);
+            decide(&db, &pool, "Sewa", "دەقی دووەم", "60000000-0000-4000-8000-000000000252", 3_000);
+            assert_eq!(crate::jury::learning::build_dpo_dataset(&db).unwrap().pair_count, 1);
+            assert_eq!(crate::jury::learning::export_lm_corpus(&db).unwrap().len(), 1);
+            let sql = match guard {
+                "withdrawn" => "UPDATE speech_segments SET rights_revoked_at='2026-09-05' WHERE id='clip'",
+                "gold" => "UPDATE speech_segments SET is_gold=1 WHERE id='clip'",
+                "holdout" => "INSERT INTO gold_segments (id, audio_path, reference, is_holdout)
+                              SELECT 'held-out-clip', audio_path, 'held-out answer', 1 FROM speech_segments WHERE id='clip'",
+                _ => unreachable!(),
+            };
+            db.connection().execute(sql, []).unwrap();
+            assert_eq!(crate::jury::learning::build_dpo_dataset(&db).unwrap().pair_count, 0, "{guard}");
+            assert!(crate::jury::learning::export_lm_corpus(&db).unwrap().is_empty(), "{guard}");
+        }
+    }
+
+    #[test]
+    fn shared_export_uses_the_matching_pair_text_not_the_first_opinion() {
+        let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-0000000000b1", 2_000);
+        decide(&db, &pool, "Sewa", "دەقی دووەم", "60000000-0000-4000-8000-0000000000b2", 3_000);
+        let resolution = segment_resolutions(&db, None).unwrap().pop().unwrap();
+        assert_eq!(resolution.final_transcript.as_deref(), Some("دەقی دووەم"));
+        let canonical = db.get_segment_by_id("clip").unwrap().unwrap();
+        assert_eq!(crate::quality::effective_transcript(&canonical), "دەقی یەکەم");
+        let exported = crate::export::exclude_unexportable_segments(&db, vec![canonical]).unwrap();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(crate::quality::effective_transcript(&exported[0]), "دەقی دووەم");
+        assert_eq!(
+            crate::quality::effective_transcript(&db.get_segment_by_id("clip").unwrap().unwrap()),
+            "دەقی یەکەم",
+            "export must preserve the original paid opinion in the database"
+        );
+    }
+
+    #[test]
+    fn shared_export_excludes_owner_rejection_of_the_first_retained_opinion() {
+        let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-0000000000c1", 2_000);
+        decide(&db, &pool, "Sewa", "دەقی سێیەم", "60000000-0000-4000-8000-0000000000c2", 3_000);
+        record_owner_adjudication(
+            &db,
+            &pool,
+            &OwnerAdjudicationInput {
+                segment_id: "clip",
+                final_action: "reject",
+                final_transcript: None,
+                operation_id: "60000000-0000-4000-8000-0000000000c3",
+                created_at_ms: 4_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(segment_resolutions(&db, None).unwrap()[0].final_action.as_deref(), Some("reject"));
+        let canonical = db.get_segment_by_id("clip").unwrap().unwrap();
+        assert!(!crate::quality::is_human_rejected(&canonical));
+        let exported = crate::export::exclude_unexportable_segments(&db, vec![canonical]).unwrap();
+        assert!(exported.is_empty(), "consensus resolution must control the exported action, not just membership");
+    }
+
+    #[test]
+    fn shared_export_actual_writers_use_final_text_and_separate_provenance() {
+        let (dir, db, pool) = one_clip_pool_fixture("دەقی یەکەم", false, true);
+        // Rights setup advances the canonical revision. Finish fixture setup before freezing
+        // expected review evidence, just as production rights are established before export.
+        stamp_owner_supplied_pool_rights(&db).unwrap();
+        decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-0000000000d1", 2_000);
+        decide(&db, &pool, "Sewa", "دەقی دووەم", "60000000-0000-4000-8000-0000000000d2", 3_000);
+        let before = serde_json::to_value(db.get_segment_by_id("clip").unwrap().unwrap()).unwrap();
+        let resolution = segment_resolutions(&db, None).unwrap().pop().unwrap();
+        let jsonl = dir.path().join("rows.jsonl");
+        crate::export::export_dataset(&db, &jsonl, &crate::settings::ExportFormat::Jsonl).unwrap();
+        let row: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(jsonl).unwrap()).unwrap();
+        assert_eq!(row["trainingTranscript"], "دەقی دووەم");
+        assert_eq!(row["verdictTranscript"], "دەقی یەکەم", "the first opinion stays original evidence");
+        assert_eq!(row["exportReview"]["evidenceSha256"], resolution.evidence_sha256);
+        assert!(row["exportReview"].get("agreeingReviewers").is_none());
+
+        let csv = dir.path().join("rows.csv");
+        crate::export::export_dataset(&db, &csv, &crate::settings::ExportFormat::Csv).unwrap();
+        let mut reader = csv::Reader::from_path(csv).unwrap();
+        let headers = reader.headers().unwrap().clone();
+        let record = reader.records().next().unwrap().unwrap();
+        assert_eq!(&record[headers.iter().position(|v| v == "training_transcript").unwrap()], "دەقی دووەم");
+        let authority: serde_json::Value =
+            serde_json::from_str(&record[headers.iter().position(|v| v == "review_authority").unwrap()]).unwrap();
+        assert_eq!(authority["evidenceSha256"], resolution.evidence_sha256);
+
+        let parquet = dir.path().join("rows.parquet");
+        crate::export::export_dataset(&db, &parquet, &crate::settings::ExportFormat::Parquet).unwrap();
+        let batch = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(parquet).unwrap(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+        let text = batch
+            .column_by_name("training_transcript")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(text.value(0), "دەقی دووەم");
+        assert!(batch.column_by_name("review_authority").is_some());
+
+        let audio_output = dir.path().join("audio");
+        let result = crate::export_audio::export_audio_segments(
+            &db,
+            &["clip".into()],
+            &crate::export_audio::AudioExportOptions {
+                output_dir: audio_output.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.succeeded, 1, "{:?}", result.errors);
+        let audio: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(audio_output.join("metadata.jsonl")).unwrap()).unwrap();
+        assert_eq!(audio["effective_transcript"], "دەقی دووەم");
+        assert_eq!(audio["human_decision"], "retain");
+        assert_eq!(audio["review_revision_scope"], "canonical_first_opinion");
+        assert_eq!(audio["review_authority"]["evidenceSha256"], resolution.evidence_sha256);
+
+        let pack_dir = dir.path().join("pack");
+        let pack = crate::eval::export_finetune_pack(&db, &pack_dir, None).unwrap();
+        assert_eq!(pack.emitted, 1);
+        let training: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(pack.manifest_path).unwrap()).unwrap();
+        assert_eq!(training["sentence"], "دەقی دووەم");
+        assert_eq!(training["decision"], "retain");
+        assert_eq!(training["review_authority"]["evidenceSha256"], resolution.evidence_sha256);
+        assert_eq!(serde_json::to_value(db.get_segment_by_id("clip").unwrap().unwrap()).unwrap(), before);
+
+        let bundle = dir.path().join("bundle");
+        let models = crate::models::ModelManager::new(dir.path().join("models"));
+        crate::export_bundle::export_dataset_bundle(
+            &db,
+            &models,
+            &bundle,
+            &crate::settings::AppSettings::default(),
+            true,
+            usize::MAX,
+        )
+        .unwrap();
+        let bundle_row: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(bundle.join("dataset.jsonl")).unwrap()).unwrap();
+        assert_eq!(bundle_row["trainingTranscript"], "دەقی دووەم");
+        assert_eq!(bundle_row["exportReview"]["evidenceSha256"], resolution.evidence_sha256);
+        let preference: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(bundle.join("learning_preferences.jsonl")).unwrap()).unwrap();
+        assert_eq!(preference["chosen"], "دەقی دووەم");
+        assert_eq!(preference["rejected"], "دەقی چامپیۆن");
+        assert_eq!(preference["review_authority"]["evidenceSha256"], resolution.evidence_sha256);
+        assert_eq!(preference["source_example_id"], "first-example");
+
+        let hf = dir.path().join("hf");
+        crate::export::export_huggingface_dataset(&db, &hf, &crate::settings::AppSettings::default()).unwrap();
+        let mut found = 0;
+        for split in ["train", "validation", "test"] {
+            let mut reader = csv::Reader::from_path(hf.join("data").join(split).join("metadata.csv")).unwrap();
+            let headers = reader.headers().unwrap().clone();
+            for record in reader.records() {
+                let record = record.unwrap();
+                assert_eq!(&record[1], "دەقی دووەم");
+                let value: serde_json::Value =
+                    serde_json::from_str(&record[headers.iter().position(|v| v == "review_authority").unwrap()])
+                        .unwrap();
+                assert_eq!(value["evidenceSha256"], resolution.evidence_sha256);
+                found += 1;
+            }
+        }
+        assert_eq!(found, 1);
+        let current = db.get_segment_by_id("clip").unwrap().unwrap();
+        assert_eq!(current.verdict_transcript.as_deref(), Some("دەقی یەکەم"));
+        assert_eq!(current.reviewed_by.as_deref(), Some("Rubar"));
+        assert!(current.export_review.is_none());
+    }
+
+    #[test]
+    fn shared_export_authority_cannot_be_imported_or_reused_after_undo() {
+        let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-0000000000e1", 2_000);
+        let third = decide(&db, &pool, "Sewa", "دەقی دووەم", "60000000-0000-4000-8000-0000000000e2", 3_000);
+        let captured = crate::export::exclude_unexportable_segments(&db, db.get_segments(None).unwrap()).unwrap();
+        crate::export_review::verify_current(&db, &captured).unwrap();
+        let mut serialized = serde_json::to_value(&captured[0]).unwrap();
+        assert!(serialized.get("exportReview").is_none(), "ordinary IPC must not carry export-only authority");
+        serialized["exportReview"] = serde_json::to_value(captured[0].export_review.as_ref().unwrap()).unwrap();
+        let imported: crate::db::SpeechSegment = serde_json::from_value(serialized).unwrap();
+        assert!(imported.export_review.is_none(), "IPC/import cannot create export authority");
+        for supplied in [serde_json::json!(["forged"]), serde_json::Value::Null] {
+            let mut input = serde_json::to_value(&captured[0]).unwrap();
+            input["exportReview"] = supplied;
+            assert!(serde_json::from_value::<crate::db::SpeechSegment>(input).unwrap().export_review.is_none());
+        }
+        reverse_decision(&db, &pool, third, "Sewa", "60000000-0000-4000-8000-0000000000e3", 4_000).unwrap();
+        assert!(crate::export_review::verify_current(&db, &captured).is_err());
+        assert!(crate::export::exclude_unexportable_segments(&db, captured).is_err());
+    }
+
+    #[test]
+    fn shared_export_later_retention_does_not_inherit_the_first_rejection() {
+        let (dir, db, pool) = one_clip_pool_with_first_rejection("دەقی یەکەم", true);
+        decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-0000000000f1", 2_000);
+        decide(&db, &pool, "Sewa", "دەقی دووەم", "60000000-0000-4000-8000-0000000000f2", 3_000);
+        let before = serde_json::to_value(db.get_segment_by_id("clip").unwrap().unwrap()).unwrap();
+        let selected = crate::export::exclude_unexportable_segments(&db, db.get_segments(None).unwrap()).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert!(crate::quality::training_grade_for_segment(&selected[0]).training_ready);
+        assert_eq!(crate::quality::effective_transcript(&selected[0]), "دەقی دووەم");
+        assert_eq!(selected[0].human_decision.as_deref(), Some("reject"), "first paid opinion is never rewritten");
+        let pack = crate::eval::export_finetune_pack(&db, &dir.path().join("pack"), None).unwrap();
+        assert_eq!(pack.emitted, 1);
+        let row: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(pack.manifest_path).unwrap()).unwrap();
+        assert_eq!(row["sentence"], "دەقی دووەم");
+        assert_eq!(row["decision"], "retain");
+        assert_eq!(serde_json::to_value(db.get_segment_by_id("clip").unwrap().unwrap()).unwrap(), before);
+    }
+
+    #[test]
+    fn shared_export_owner_text_has_its_own_authority() {
+        let (dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-000000000101", 2_000);
+        decide(&db, &pool, "Sewa", "دەقی سێیەم", "60000000-0000-4000-8000-000000000102", 3_000);
+        record_owner_adjudication(
+            &db,
+            &pool,
+            &OwnerAdjudicationInput {
+                segment_id: "clip",
+                final_action: "retain",
+                final_transcript: Some("دەقی کۆتایی"),
+                operation_id: "60000000-0000-4000-8000-000000000103",
+                created_at_ms: 4_000,
+            },
+        )
+        .unwrap();
+        let output = dir.path().join("owner.jsonl");
+        crate::export::export_dataset(&db, &output, &crate::settings::ExportFormat::Jsonl).unwrap();
+        let row: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(output).unwrap()).unwrap();
+        assert_eq!(row["trainingTranscript"], "دەقی کۆتایی");
+        assert_eq!(row["exportReview"]["resolutionStatus"], "ownerResolved");
+        assert_eq!(row["verdictTranscript"], "دەقی یەکەم");
+    }
+
+    #[test]
+    fn shared_export_pool_activation_invalidates_a_legacy_projection() {
+        let (_dir, db) = one_clip_database("دەقی یەکەم", false, false);
+        let selected = crate::export::exclude_unexportable_segments(&db, db.get_segments(None).unwrap()).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].export_review.is_none());
+        crate::export_review::verify_current(&db, &selected).unwrap();
+        activate(
+            &db,
+            "123e4567-e89b-42d3-a456-4266141740e0",
+            &[PoolMemberInput { segment_id: "clip".into(), voice_name: "Lamo".into() }],
+        )
+        .unwrap();
+        assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "pending");
+        assert!(
+            crate::export_review::verify_current(&db, &selected).is_err(),
+            "the prior no-pool opinion cannot publish after independent consensus becomes required"
+        );
+    }
+
+    #[test]
+    fn shared_export_pool_activation_at_pack_publication_preserves_previous_generation() {
+        let (dir, db) = one_clip_database("دەقی یەکەم", false, false);
+        let output = dir.path().join("pack");
+        let initial = crate::eval::export_finetune_pack(&db, &output, None).unwrap();
+        assert_eq!(initial.emitted, 1);
+        let previous = std::fs::read(output.join("finetune_manifest.jsonl")).unwrap();
+        let previous_provenance = std::fs::read(output.join("pack_provenance.json")).unwrap();
+        let previous_checksums = std::fs::read(output.join("SHA256SUMS")).unwrap();
+        let result = crate::eval::export_finetune_pack_with_review_test_hook(&db, &output, || {
+            activate(
+                &db,
+                "123e4567-e89b-42d3-a456-4266141740e1",
+                &[PoolMemberInput { segment_id: "clip".into(), voice_name: "Lamo".into() }],
+            )
+            .map_err(crate::error::AppError::Validation)?;
+            Ok(())
+        });
+        assert!(result.is_err(), "pool activation must invalidate a staged legacy pack");
+        assert_eq!(std::fs::read(output.join("finetune_manifest.jsonl")).unwrap(), previous);
+        assert_eq!(std::fs::read(output.join("pack_provenance.json")).unwrap(), previous_provenance);
+        assert_eq!(std::fs::read(output.join("SHA256SUMS")).unwrap(), previous_checksums);
+    }
+
+    #[test]
+    fn shared_export_pool_activation_invalidates_even_empty_learning_authority() {
+        let (_dir, db) = one_clip_database("دەقی یەکەم", false, true);
+        let scope = crate::export_review::LearningReviewScope::capture(&db).unwrap();
+        assert!(!scope.is_active());
+        scope.verify_authorities(&db, []).unwrap();
+        activate(
+            &db,
+            "123e4567-e89b-42d3-a456-4266141740e2",
+            &[PoolMemberInput { segment_id: "clip".into(), voice_name: "Lamo".into() }],
+        )
+        .unwrap();
+        assert!(scope.verify_authorities(&db, []).is_err(), "zero captured pairs cannot bypass scope validation");
+        let active = crate::export_review::LearningReviewScope::capture(&db).unwrap();
+        assert!(active.is_active());
+        active.verify_authorities(&db, []).unwrap();
+    }
+
+    #[test]
+    fn shared_export_publication_boundary_detects_new_duplicate_binding() {
+        let (_dir, db, pool) = two_clip_pool(None);
+        let boundary = crate::export_review::ExportReviewBoundary::capture(&db).unwrap();
+        boundary.verify(&db).unwrap();
+        apply_dedup_manifest(&db, &dedup_manifest(&pool, "a", None, 1_000)).unwrap();
+        assert!(boundary.verify(&db).is_err());
+        crate::export_review::ExportReviewBoundary::capture(&db).unwrap().verify(&db).unwrap();
+    }
+
+    #[test]
+    fn shared_export_undo_at_pack_publication_preserves_the_previous_generation() {
+        let (dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-000000000111", 2_000);
+        let third = decide(&db, &pool, "Sewa", "دەقی دووەم", "60000000-0000-4000-8000-000000000112", 3_000);
+        let output = dir.path().join("pack");
+        crate::eval::export_finetune_pack(&db, &output, None).unwrap();
+        let prior = std::fs::read(output.join("finetune_manifest.jsonl")).unwrap();
+        let error = crate::eval::export_finetune_pack_with_review_test_hook(&db, &output, || {
+            reverse_decision(&db, &pool, third, "Sewa", "60000000-0000-4000-8000-000000000113", 4_000)
+                .map_err(crate::error::AppError::Validation)?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("consensus authority"), "{error}");
+        assert_eq!(std::fs::read(output.join("finetune_manifest.jsonl")).unwrap(), prior);
     }
 
     #[test]

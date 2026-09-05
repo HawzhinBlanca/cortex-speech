@@ -118,7 +118,88 @@ def main() -> None:
     test_the_split_cannot_leak_a_voice_across_splits()
     test_the_snapshot_is_sealed_and_immutable()
     test_the_regression_test_exists()
-    print("training snapshot policy passed (4 assertions)")
+    test_final_pool_outcomes_reach_every_export_boundary()
+    test_hf_publication_preserves_managed_generations()
+    print("training snapshot policy passed (6 checks)")
+
+
+def test_final_pool_outcomes_reach_every_export_boundary() -> None:
+    expected = {
+        "src-tauri/src/export.rs": ("ExportReviewAuthority::retained", "export_review::verify_current", '"review_authority"'),
+        "src-tauri/src/export_audio/mod.rs": ("export_review::verify_current", '"review_authority"'),
+        "src-tauri/src/export_bundle.rs": ("export_review::verify_current",),
+        "src-tauri/src/eval.rs": ("review_authority:", "decision_revision_scope:", "captured_boundary", ".verify_authorities(db, captured_reviews.borrow().iter())"),
+        "src-tauri/src/jury/learning.rs": ("LearningReviewScope::capture", "review_scope.includes", "source_example_id:", "review_scope.verify_authorities"),
+        "src-tauri/src/export_review.rs": ("struct ExportReviewBoundary", "self.boundary.verify_authorities(db, authorities)", "current.authority(&segment.id) != segment.export_review.as_ref()"),
+        "src-tauri/src/jury/mod.rs": ("review_pool::learning_pool", "review_pool::learning_resolutions", "ExportReviewAuthority::retained", "review_authority:", "initial_stamp"),
+        "src-tauri/src/review_pool.rs": (
+            "shared_export_uses_the_matching_pair_text_not_the_first_opinion",
+            "shared_export_excludes_owner_rejection_of_the_first_retained_opinion",
+            "shared_export_actual_writers_use_final_text_and_separate_provenance",
+            "shared_export_authority_cannot_be_imported_or_reused_after_undo",
+            "shared_export_later_retention_does_not_inherit_the_first_rejection",
+            "pool_learning_dpo_uses_the_final_matching_pair",
+            "pool_learning_lm_uses_the_final_matching_pair",
+            "pool_learning_dpo_and_lm_exclude_unresolved_first_opinions",
+            "pool_learning_dpo_and_lm_refuse_owner_rejection",
+            "pool_learning_later_retention_survives_first_reject_but_not_undo",
+            "pool_few_shot_uses_the_final_matching_pair",
+            "pool_few_shot_excludes_owner_rejection",
+            "pool_few_shot_reuses_only_identity_and_refreshes_retention_and_undo",
+            "pool_few_shot_identity_cache_invalidates_external_and_schema_changes",
+            "pool_few_shot_final_authority_cannot_bypass_rights_gold_hash_or_unusable_audio",
+            "shared_export_pool_activation_invalidates_a_legacy_projection",
+            "shared_export_pool_activation_at_pack_publication_preserves_previous_generation",
+            "shared_export_pool_activation_invalidates_even_empty_learning_authority",
+            "shared_export_publication_boundary_detects_new_duplicate_binding",
+        ),
+        "scripts/train_challenger.py": ("invalid final-review authority", "canonical_first_opinion"),
+    }
+    for path, markers in expected.items():
+        source = _read(path)
+        for marker in markers:
+            assert marker in source, f"{path} lost final-review authority guard {marker}"
+    db_source = (REPO_ROOT / "src-tauri/src/db.rs").read_text(encoding="utf-8")
+    assert '#[serde(skip)]\n    #[specta(skip)]\n    pub export_review:' in db_source, "ordinary IPC/import must exclude export authority"
+    export_source = _read("src-tauri/src/export.rs")
+    assert '#[path = "export_records.rs"]' in export_source, "the export-only record module must be wired into the exporter"
+    assert "mod records;" in export_source, "the export-only record module must be compiled"
+    assert "use records::{export_records, speaker_turn_csv, ExportSegmentRecord};" in export_source, "the exporter must use the guarded record adapter"
+    assert "export_review: segment.export_review.clone()" in _read("src-tauri/src/export_records.rs"), "the export-only record must retain final authority"
+    assert "shared_export_authority_cannot_be_imported_or_reused_after_undo" in _read("src-tauri/src/review_pool.rs")
+
+
+def test_hf_publication_preserves_managed_generations() -> None:
+    export = _read("src-tauri/src/export.rs")
+    publisher = _read("src-tauri/src/hf_publication.rs")
+    regressions = _read("src-tauri/src/export_tests.rs")
+    assert '"review_authority": {"dtype": "string", "_type": "Value"}' in export, "HF schema must declare serialized review authority as a string"
+    assert "HF feature declarations must match every written CSV column" in regressions, "keep generated schema/header parity coverage"
+    for marker in ("hf_publication::Publication::begin", "publication.publish(", "write_sha256sums(&staged_root)", "TransactionBehavior::Immediate"):
+        assert marker in export, f"HF exporter lost managed-generation publication guard: {marker}"
+    assert "std::fs::remove_dir_all(&data_dir)?" not in export, "HF publication must never delete the previous data before promotion"
+    for marker in ("lock_destination", "owned_stage", "validate_inventory", "verify_checksums", "journal.json", "COMMITTED", "self.preserve = true", "rollback(&self.root", "recover(&root)", "fsync_directory_strict"):
+        assert marker in publisher, f"HF publisher lost recovery authority: {marker}"
+    for name in (
+        "hf_late_publication_failure_before_data_promotion_preserves_previous_generation",
+        "hf_late_publication_failure_before_metadata_write_preserves_previous_generation",
+        "hf_late_publication_failure_during_real_split_write_restores_previous_generation",
+        "hf_publication_competing_export_is_refused_without_touching_the_first_stage",
+        "hf_publication_process_exit_restores_prior_generation_and_releases_lock",
+    ):
+        assert name in regressions, f"HF exporter lost its behavioral regression: {name}"
+    for name in (
+        "staged_substitution_is_refused_and_the_previous_generation_is_restored",
+        "external_destination_edits_during_staging_are_not_overwritten",
+        "unexpected_target_change_preserves_both_the_foreign_bytes_and_the_prior_backup",
+        "partial_rollback_can_resume_without_losing_an_already_restored_artifact",
+        "corrupted_recovery_journal_is_refused_without_changing_any_artifact",
+        "racing_file_after_move_precheck_preserves_both_artifacts",
+        "racing_empty_directory_after_move_precheck_preserves_both_artifacts",
+    ):
+        assert name in publisher, f"HF publisher lost its adversarial regression: {name}"
+    assert "rename_no_replace_write_through(source, destination)?" in publisher
+    assert "fs::rename(source, destination)?" not in publisher, "an absence precheck cannot make ordinary rename no-clobber"
 
 
 if __name__ == "__main__":

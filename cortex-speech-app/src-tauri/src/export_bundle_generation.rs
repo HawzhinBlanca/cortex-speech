@@ -1,4 +1,4 @@
-use crate::atomic_file::{fsync_directory_strict, fsync_parent_dir_strict};
+use crate::atomic_file::{fsync_directory_strict, fsync_parent_dir_strict, rename_no_replace_write_through};
 use crate::error::{AppError, AppResult};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -275,79 +275,6 @@ fn sync_generation_tree(directory: &Path) -> AppResult<()> {
     fsync_directory_strict(directory).map_err(AppError::Io)
 }
 
-#[cfg(target_os = "windows")]
-fn rename_generation_no_replace_write_through(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt as _;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
-    }
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    // SAFETY: both buffers are NUL-terminated and remain live for the call. MOVEFILE_REPLACE_EXISTING
-    // is deliberately absent: a racing destination makes publication fail instead of overwriting it.
-    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn rename_generation_no_replace_write_through(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    const RENAME_NOREPLACE_FLAG: libc::c_uint = 1;
-    let source = CString::new(source.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "source path contains NUL"))?;
-    let destination = CString::new(destination.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "destination path contains NUL"))?;
-    // renameat2(RENAME_NOREPLACE) is the Linux atomic no-clobber primitive. The strict parent
-    // fsync below is the durability barrier on Unix.
-    let status = unsafe {
-        libc::renameat2(libc::AT_FDCWD, source.as_ptr(), libc::AT_FDCWD, destination.as_ptr(), RENAME_NOREPLACE_FLAG)
-    };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn rename_generation_no_replace_write_through(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let source = CString::new(source.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "source path contains NUL"))?;
-    let destination = CString::new(destination.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "destination path contains NUL"))?;
-    let status = unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(any(
-    target_os = "windows",
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-)))]
-fn rename_generation_no_replace_write_through(_source: &Path, _destination: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "atomic no-replace directory publication is unsupported on this platform",
-    ))
-}
-
 fn validate_initial_target(output_dir: &Path) -> AppResult<bool> {
     match std::fs::symlink_metadata(output_dir) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(AppError::Validation(format!(
@@ -487,7 +414,7 @@ where
         ));
     }
     require_absent_target(output_dir)?;
-    rename_generation_no_replace_write_through(&staging_dir, output_dir)?;
+    rename_no_replace_write_through(&staging_dir, output_dir)?;
     hook(ProductionBundlePublishPoint::RenamedBeforeParentBarrier, output_dir)?;
 
     fsync_parent_dir_strict(output_dir).map_err(AppError::Io)?;

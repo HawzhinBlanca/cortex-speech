@@ -306,6 +306,9 @@ pub fn training_grade_breakdown(segments: &[SpeechSegment]) -> TrainingGradeBrea
 /// path already drops it via [`training_grade_for_segment`]; this shared predicate lets the plain
 /// JSON/JSONL/CSV/Parquet exports and quality counts honor a reject exactly the same way.
 pub fn is_human_rejected(seg: &SpeechSegment) -> bool {
+    if seg.export_review.is_some() {
+        return false; // Only a proven final retain can construct this export-only authority.
+    }
     decision_is(seg.human_decision.as_deref(), &["reject", "human_reject"])
         || decision_is(seg.verdict.as_deref(), &["human_reject"])
 }
@@ -524,6 +527,9 @@ pub fn human_verified_text(seg: &SpeechSegment) -> Option<&str> {
 /// EVIDENCE (hypotheses, retrieval), never the transcript. "human_verified" requires a real human
 /// decision — the `verified` flag alone proves a click, not a reading (audit defects #7/#8/#15).
 fn training_transcript_with_source(seg: &SpeechSegment) -> (&str, &'static str) {
+    if let Some(authority) = &seg.export_review {
+        return (authority.transcript(), "human_verified");
+    }
     let human_decided = has_human_transcript_decision(seg);
 
     if human_decided {

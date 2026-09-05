@@ -1443,6 +1443,7 @@ impl ProcessingPipeline {
                 // planner emits would be a threshold used outside the range it was measured on.
                 // `src/bin/speaker_change_probe.rs --persist` fills it for the whole library at once.
                 speaker_change_score: None,
+                export_review: None,
             });
         }
 

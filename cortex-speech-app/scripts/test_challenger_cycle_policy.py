@@ -132,6 +132,58 @@ def test_a_human_rejection_is_still_refused() -> None:
         assert any("non-training decision" in p for p in problems), problems
 
 
+def _consensus_row() -> dict:
+    row = _row(0)
+    row["decision"] = "retain"
+    row["decision_revision_scope"] = "canonical_first_opinion"
+    row["review_authority"] = {
+        "schemaVersion": 1,
+        "segmentId": row["segment_id"],
+        "resolutionStatus": "resolved",
+        "finalAction": "retain",
+        "finalTranscript": row["sentence"],
+        "evidenceSha256": "a" * 64,
+        "reviewerCount": 2,
+    }
+    return row
+
+
+def test_final_human_outcome_is_training_data_with_its_own_authority() -> None:
+    for status in ("resolved", "ownerResolved"):
+        with tempfile.TemporaryDirectory() as raw:
+            row = _consensus_row()
+            row["review_authority"]["resolutionStatus"] = status
+            pack, snapshot = _pack(Path(raw), [row])
+            assert verify_pack(pack, snapshot, {"status": "sealed"}) == []
+
+
+def test_final_outcome_cannot_borrow_the_first_opinion_or_another_clip() -> None:
+    changes = [
+        ("finalTranscript", "a different first opinion"),
+        ("finalAction", "reject"),
+        ("segmentId", "another clip"),
+        ("evidenceSha256", "invalid"),
+        ("reviewerCount", 1),
+        ("reviewerCount", True),
+        ("schemaVersion", True),
+        ("resolutionStatus", "needsThirdReview"),
+    ]
+    for field, value in changes:
+        with tempfile.TemporaryDirectory() as raw:
+            row = _consensus_row()
+            row["review_authority"][field] = value
+            pack, snapshot = _pack(Path(raw), [row])
+            problems = verify_pack(pack, snapshot, {"status": "sealed"})
+            assert any("invalid final-review authority" in p for p in problems), (field, problems)
+    for field, value in (("review_authority", None), ("decision", "edit"), ("decision_revision_scope", "human_decision")):
+        with tempfile.TemporaryDirectory() as raw:
+            row = _consensus_row()
+            row[field] = value
+            pack, snapshot = _pack(Path(raw), [row])
+            problems = verify_pack(pack, snapshot, {"status": "sealed"})
+            assert any("invalid final-review authority" in p for p in problems), (field, problems)
+
+
 def test_a_pack_with_no_train_split_is_refused() -> None:
     """Training on validation/test is the leak the whole split exists to prevent."""
     with tempfile.TemporaryDirectory() as raw:

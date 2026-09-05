@@ -108,6 +108,7 @@ fn probe_decode_streaming_capped(
     use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::codecs::CodecParameters;
     use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::well_known::FORMAT_ID_WAVE;
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
@@ -144,14 +145,10 @@ fn probe_decode_streaming_capped(
         _ => return TechnicalAudioProbeObservation::CorruptContainer,
     };
     // PCM WAV has no codec checksum, but its RIFF data extent gives an exact per-channel frame
-    // count. Do not apply this equality rule to compressed/gapless formats whose declared duration
-    // may legitimately include encoder padding.
-    let exact_declared_frames = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav") || extension.eq_ignore_ascii_case("wave"))
-        .then_some(track.num_frames)
-        .flatten();
+    // count. Use the probed container identity, never the filename hint: identical truncated WAV
+    // bytes must not become Healthy when renamed, nor should a compressed file named .wav acquire
+    // a false exact-duration requirement. Other containers may legitimately include encoder padding.
+    let exact_declared_frames = (format.format_info().format == FORMAT_ID_WAVE).then_some(track.num_frames).flatten();
     let mut decoder = match symphonia::default::get_codecs()
         .make_audio_decoder(&audio_params, &AudioDecoderOptions::default().verify(true))
     {
@@ -671,6 +668,81 @@ mod tests {
             !technical_audio_failure_evidence_is_current(&audio, &evidence),
             "healthy evidence can never be current failure authority"
         );
+    }
+
+    fn worker_observation(path: &Path) -> TechnicalAudioFailureEvidence {
+        let request =
+            serde_json::to_vec(&ProbeRequestV1 { schema: PROTOCOL_SCHEMA, path: path.to_path_buf() }).unwrap();
+        let mut output = Vec::new();
+        run_worker(request.as_slice(), &mut output).unwrap();
+        assert!(output.len() <= WORKER_OUTPUT_LIMIT_BYTES);
+        parse_worker_response(&output).unwrap()
+    }
+
+    #[test]
+    fn wav_truncation_evidence_follows_container_bytes_not_filename() {
+        let directory = tempfile::tempdir().unwrap();
+        for channels in [1, 2] {
+            for bits_per_sample in [16, 24, 32] {
+                let original = directory.path().join("source.wav");
+                let spec = hound::WavSpec {
+                    channels,
+                    sample_rate: 16_000,
+                    bits_per_sample,
+                    sample_format: hound::SampleFormat::Int,
+                };
+                let mut writer = hound::WavWriter::create(&original, spec).unwrap();
+                for sample in 0..(2_000 * channels as i32) {
+                    writer.write_sample(sample - 1_000).unwrap();
+                }
+                writer.finalize().unwrap();
+                settle_written_file(&original);
+                let complete = std::fs::read(&original).unwrap();
+                for missing_bytes in [0, 1, 2, 100] {
+                    let bytes = &complete[..complete.len() - missing_bytes];
+                    for name in ["audio.wav", "audio.WAVE", "audio.bin", "audio", "audio.mp3", "audio.flac"] {
+                        let path = directory.path().join(name);
+                        std::fs::write(&path, bytes).unwrap();
+                        settle_written_file(&path);
+                        let observed = worker_observation(&path);
+                        let context = format!("{channels}ch/{bits_per_sample}bit/{missing_bytes}bytes/{name}");
+                        if missing_bytes == 0 {
+                            assert_eq!(observed.observation, TechnicalAudioProbeObservation::Healthy, "{context}");
+                            assert!(observed.source_blake3.is_none(), "{context}");
+                        } else {
+                            assert_eq!(observed.observation, TechnicalAudioProbeObservation::DecodeFailed, "{context}");
+                            assert_eq!(
+                                observed.source_blake3,
+                                Some(blake3::hash(bytes).to_hex().to_string()),
+                                "{context}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_wave_container_remains_healthy_under_a_wave_filename_hint() {
+        use flacenc::component::BitRepr;
+        use flacenc::error::Verify;
+
+        let directory = tempfile::tempdir().unwrap();
+        let samples: Vec<i32> = (0..2_000).map(|index| index - 1_000).collect();
+        let config = flacenc::config::Encoder::default().into_verified().unwrap();
+        let source = flacenc::source::MemSource::from_samples(&samples, 1, 16, 16_000);
+        let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size).unwrap();
+        let mut sink = flacenc::bitsink::ByteSink::new();
+        stream.write(&mut sink).unwrap();
+        for name in ["audio.flac", "audio.wav", "audio.WAVE", "audio"] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, sink.as_slice()).unwrap();
+            settle_written_file(&path);
+            let observed = worker_observation(&path);
+            assert_eq!(observed.observation, TechnicalAudioProbeObservation::Healthy, "{name}");
+            assert!(observed.source_blake3.is_none());
+        }
     }
 
     #[test]

@@ -1,5 +1,280 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-05 — Combine filename-independent audio validation with the export follow-up
+
+Integrated the exact tested `technical_audio_probe.rs` patch from the isolated audio audit.
+The same one-byte-truncated PCM WAV previously became `healthy` when renamed from `.wav`
+to `.bin`, `.mp3` or an extensionless name. Exact WAVE frame validation now follows the
+detected container, not the filename; compressed containers do not acquire that rule by
+being named `.wav`. Containment, deadlines, source hashes and write leases are unchanged.
+
+The isolated source passed 18 focused tests, including 144 WAV combinations and four FLAC
+filename cases, plus 20 actual rebuilt-worker cases and its contained-worker self-test.
+Its completed full-run log records 2,636 library tests passed, zero failed, eight ignored;
+all 46 test-result summaries report zero failures. All 146 policy scripts passed, including
+actual IPC regeneration. The original session handle expired before terminal collection;
+these are durable log results, not a recovered terminal exit receipt. Frozen source hashes
+and the complete two-file inventory were rechecked unchanged before integration.
+
+The exact combined export/audio revision still requires architecture, formatting, strict
+Clippy, full Rust and full policy/IPC verification before a normal PR102 follow-up push.
+Separate prior results are not combined proof. No production deployment, coverage gain,
+real-corpus prevalence, paid-pool field acceptance or resolution of all complaints is claimed.
+
+## 2026-09-05 — Restore the export module architecture gate without changing serialization
+
+PR102 at `5a24591a` passed its 146 policy scripts in Windows CI, then failed the separate
+production-module-size gate: `export.rs` measured **2,037** production lines against the
+strict below-2,000 limit. The same gate reproduced that failure locally. Earlier local
+format/lint/policy/Rust results did not cover this actual architecture measurement.
+
+Extracted the cohesive export-only record adapter, privacy-safe audio reference and tri-state
+speaker-turn serialization into `export_records.rs`, retaining the parent module's names and
+existing callers. The moved bodies compare exactly with their originals after visibility-only
+adjustments. No transcript, authority, privacy or dataset-field behavior was intentionally changed.
+The training-grade source policy now requires the compiled child-module wiring and reads its
+source; an explicit disconnected-module check proves it refuses missing wiring.
+
+Actual architecture rerun: **PASS**, `export.rs` **1,963** production lines and the new module
+**86**; thresholds and exceptions unchanged. Formatting, diff checks, training-grade export
+policy and Rust test-registration checks pass. Rust/export/IPC regressions and the full local
+checks must still be rerun before this follow-up is committed/pushed. The independent audio
+repair currently owns the shared build target; no competing heavy build was started.
+
+## 2026-09-05 — Publication collision closed; export authority isolated from IPC
+
+A deterministic Windows reproduction showed the HF move's absent-target check followed by
+ordinary rename could overwrite a racing file. Reused the existing platform no-replace move
+through a common atomic-file helper for both HF and bundle publication, preserving explicit
+durability barriers. Added actual application regressions for a racing file and empty directory.
+
+The next full policy run exposed generated IPC drift. It completed exit 1: one of 146 scripts
+failed, so its chained Rust suite never started. Strict Clippy passed. Importantly, the earlier
+aggregate 146-script success below included an explicit IPC-generation skip on a cold target;
+it was not proof that every check executed. No skipped gate is claimed as exercised.
+
+The initial custom-discard candidate still split generated DTOs and was removed. Final authority
+now stays out of ordinary `SpeechSegment` serde/Specta entirely; the existing export-only record
+explicitly serializes it into dataset JSON/JSONL/bundle output. Actual IPC generation now matches
+the checked-in contract byte-for-byte, SHA256
+`3473a34d37961f1fdff0659f9ebf9816074cdee205d94359d2327db13f612ed0`.
+No renderer binding rewrite or weakening of incoming-authority rejection was needed.
+
+Integrated HF, bundle, collision, authority/undo and actual-writer run: **150 passed, 0 failed,
+1 existing scale test ignored**, 2536 filtered, 61.53 seconds, exit 0. Evidence
+`hf-collision-ipc-export-integration-v2-20260905.log`, SHA256
+`5a17d80f4369227603e1fca1c008b600d8b2f9f7970194971f3c56c219a77d1f`.
+An initial CLI filter-placement error ran no tests; the corrected command is the result above.
+Snapshot policy six checks, registration across 177 Rust sources and formatting pass.
+
+Next: strict final Clippy, full locked policies with the warm generator target, then all-target/
+all-feature Rust on frozen source. Cross-platform CI, real-corpus scale, physical phone audibility,
+paid-pool field acceptance and deployment remain separate and unproven. No readiness certification.
+
+## 2026-09-05 — Strict lint and locked policies passed; HF schema parity closed
+
+Strict locked Clippy passed for all targets/features with warnings denied. It first caught
+`Option::is_none_or` exceeding the declared Rust 1.81 minimum; the equivalent `map_or` repair
+passed without a lint waiver or MSRV change. The complete locked Python run then passed
+**146 policy scripts**, exit 0. Evidence `pool-authority-hf-final-policies-20260905.log`,
+SHA256 `f4b0c4a58cbeccde863ea57360cbbe91db68a62b72dacfa0e7b3301c162baa8c`.
+
+A subsequent read-only schema comparison found 12 HF CSV columns but 11 declared features:
+the new `review_authority` column lacked its string declaration. Added that declaration and
+strengthened the actual export test to compare generated headers with generated feature keys.
+The parity and final-authority writer tests both passed: **2 passed, 0 failed**, 2683 filtered,
+1.21 seconds; actual output confirms **12 CSV columns / 12 declared features**. Evidence
+`hf-schema-authority-parity-20260905.log`. The permanent snapshot policy also checks this
+regression; its six checks pass. This proves the owned artifact contract, not an external
+datasets-loader integration run.
+
+Final exact-source verification is next: strict Clippy, full locked policies and all-target/
+all-feature Rust in one sequential run, with the tested worktree frozen. Prior passing results
+remain scoped to their recorded revisions. No commit/PR/deployment or full field certification
+is claimed, and ignored real-model/scale campaigns remain outstanding.
+
+## 2026-09-05 — HF late-publication recovery repaired and regression-verified
+
+The two demonstrated late failures are repaired by a private managed-entry publisher: stage
+data plus all HF sidecars together, lock the destination, preserve the previous entries, journal
+the transition, verify exact bytes, and recover an interrupted publication before the next run.
+Files outside `data`, `README.md`, `dataset_infos.json` and `SHA256SUMS` are left untouched.
+Unexpected external edits or invalid journals preserve recovery evidence and refuse unsafe
+automatic changes. This is recoverable publication, not a single atomic multi-entry rename.
+
+Focused real-export suite: **10 passed**, including five child-process exits without destructor
+cleanup, competing-export refusal and a real SQLite split-write refusal. Evidence
+`hf-late-publication-after-v2-20260905.log`, SHA256
+`5ade2367caf2c0783dd6a335eb340b31ae54ee5b4a6eb97f292f3dbf0b9aa882`.
+The first attempted after-run failed compilation on aggregate digest formatting; no tests ran
+there. It was corrected to the existing bytewise hex idiom, not counted as a pass.
+
+Expanded export/publisher run: **98 passed, 0 failed, 1 existing scale test ignored**, 2586
+filtered, 49.53 seconds, exit 0. Command `cargo test --quiet --locked --manifest-path
+src-tauri/Cargo.toml --all-features --lib -- export::tests:: export::hf_publication:: --nocapture`.
+Evidence `hf-publication-export-integration-20260905.log`, SHA256
+`0dc6c12abe0bafb0460e7e9a2ed119ecc3f993e1af2df27607ec75a33f882418`.
+Adds staged/destination substitution, preserved backups on unsafe rollback, first-export
+failure, partial-rollback resumption, corrupt journals and wrong-type targets. The Unix symlink
+case still needs its platform run; no Windows symlink-test claim is made.
+
+The permanent snapshot policy now checks the recovery path and required behavioral tests;
+six checks pass. Rust test registration passes across 177 source files. Verify-10's existing
+python-policies stage invokes the locked policy runner that includes this policy. Current-source
+strict Clippy and full locked policies are next, along with final integrated verification.
+DB split hints may lag after abrupt process death; sealed export metadata remains the training
+authority. Reviewer-device acceptance, TTS acoustic qualification, PR/CI and deployment are not
+certified by this bounded export result.
+
+## 2026-09-05 — Full audit Rust run passed; late HF publication regression started
+
+Late-failure reproduction has now completed: the real exporter failed both new regressions,
+**0 passed, 2 failed**, 2668 filtered, 0.59 seconds, exit 101. Failure before data promotion
+lost a previous data artifact; failure before metadata writing replaced the prior training CSV
+while leaving the old top-level generation. Evidence `hf-late-publication-before-20260905.log`,
+SHA256 `d618ad4540c8a6e1a24b2d108193eaca00ba5c07488d3c3cd28c7fe60b89a46f`.
+This is a disposable regression result, not a live data-loss claim. Repair is next; current
+source deliberately contains these failing regressions and is not ready to merge.
+
+Completed `cargo test --quiet --locked --manifest-path src-tauri/Cargo.toml --all-targets
+--all-features` on merged `5b54f00c` plus the unchanged downstream-authority audit edits:
+exit 0. Library: **2660 passed, 0 failed, 8 ignored**, 1281.24 seconds. The 46 literal
+test-result summaries total 2884 passed, 0 failed, 43 ignored and 1 filtered; those totals
+include helper-process summaries and do not certify the ignored real-model/field campaigns.
+Evidence `pool-authority-full-rust-20260905.log`, SHA256
+`e073695b41dfae1ffa52cdd03f086adc7326dcf7e723a99ad3d6c3b201e02cbc`.
+
+Read-only review found a separate late HF export publication gap: old data is deleted before
+staging promotion, and metadata/checksums are written after promotion. Existing midway-failure
+coverage does not reach those boundaries. After collecting the full run, added deterministic
+failure hooks and two real-export regressions requiring prior audio/metadata/checksums,
+unrelated operator notes and persisted splits to survive failure. Fail-before run is in progress;
+no repair or pass claimed yet. The full pass above predates these new test hooks. Current-source
+strict Clippy, locked policies, HF recovery repair, PR/CI and field acceptance remain open.
+
+## 2026-09-05 — Publication authority boundary closed; integrated verification next
+
+Two new regressions genuinely failed before repair: a legacy projection remained publishable
+after pool activation, and a staged fine-tune pack was allowed to replace the prior generation.
+Command `cargo test --quiet --locked --manifest-path src-tauri/Cargo.toml --lib
+shared_export_pool_activation_ -- --nocapture`: 0 passed, 2 failed, exit101.
+Private evidence basename `pool-activation-publication-before-20260905.log`, SHA256
+`10dc2b2bc8fa0f463c403bdc2ae99a06167de6432338f429f1f16e5815c923a7`.
+
+Repair captures absence/presence plus schema, frozen pool/champion identity and dedup binding.
+Publication checks pair that boundary with retained outcome verification; the old unpaired
+authority-only helper is private. DPO/LM retain a scope snapshot even for empty authority sets.
+Actual failed pack publication now preserves manifest, provenance and checksums byte-for-byte.
+Additional positive/refusal tests cover empty learning output and changed dedup binding.
+
+Integrated command `cargo test --quiet --locked --manifest-path src-tauri/Cargo.toml --lib --
+shared_export_ pool_learning_ pool_few_shot_ jury::learning:: --nocapture` completed exit0:
+**53 passed, 0 failed, 0 ignored, 2615 filtered**, 60.55s. Log
+`pool-authority-integrated-final-20260905.log`, SHA256
+`0e23bbd4bc0322a2e98af81a784b986c9f19a8be691084ac89274d5cda77d75c`.
+Snapshot/verbatim/consensus/test-registration checks pass. Full all-target Rust, Clippy and
+the complete locked Python policy sweep remain to be run against the integrated source.
+
+The unpublished audit branch now bases on merged PR96 commit `5b54f00c`, not its superseded
+head13 history. Verified both baseline tree IDs equal `5cba9e4bb4c4b89a0f2aa82017e6a591b0e44b9a`,
+no remote audit branch exists, then atomically advanced only the owned branch ref with an expected
+old-SHA check. The complete tracked binary diff and new authority file hash stayed unchanged.
+This was not a deployment or relabeling of a built executable. Changes remain uncommitted.
+
+## 2026-09-05 — Few-shot final-outcome and cache verification
+
+The actual few-shot consumer now uses current retained pool outcomes with independent
+`reviewAuthority`; the original example ID/text stay historical in storage. Unresolved and
+owner-rejected examples are excluded. Immutable membership alone is cached per connection;
+mutable opinions are freshly loaded for each candidate page through the same resolver as
+certification. Registry/champion checks, external-commit/schema invalidation, explicit-transaction
+bypass and new duplicate-exclusion invalidation protect that reuse. No latency claim is made.
+
+Fail-before command `cargo test --quiet --locked --manifest-path src-tauri/Cargo.toml --lib
+pool_few_shot_ -- --nocapture`: **0 passed, 3 failed**, exit101. Private evidence basename
+`pool-few-shot-before-20260905.log`, SHA256
+`454a8846e6cf3b1421d9f77bd1918a188d1fdb40089bf3e95c8d09cb2699f817`.
+After repair those three passed. Added five more regression cases; combined command
+`cargo test --quiet --locked --manifest-path src-tauri/Cargo.toml --lib -- review_pool:: jury::
+--nocapture` completed exit0: **148 passed, 0 failed, 0 ignored, 2516 filtered**, 162.20s.
+Log `pool-few-shot-broad-20260905.log`, SHA256
+`ddbc7a1173ed003acb8d4e12566a7fa411c599407107ef345510d55b93682c8e`.
+This includes all eight new few-shot tests, existing pool/jury tests and the earlier export/DPO/LM
+regressions located in those modules. Gold/hash holdout, rights withdrawal, technical-unusable,
+self-example, undo and import-authority guards are exercised from positive controls.
+
+Consensus, snapshot, verbatim, registration and IPC contract checks passed. A mistyped IPC script
+path failed; the existing `test_ipc_contract_policy.py` was then located and passed. Formatting
+and diff checks passed. Full all-target Rust/Clippy/full-policy reruns remain required after the
+publication boundary work below. This is not a release certification or an accuracy benchmark.
+
+Next: reproduce no-pool -> active-pool publication transition and close the missing scope check;
+then run full integrated verification and prepare a reviewable commit/PR. All audit changes remain
+uncommitted and undeployed. Real reviewer-device and ASR/TTS acoustic qualification remain open.
+
+## 2026-09-05 — Final-human-outcome export and DPO/LM implementation
+
+On isolated branch `codex/pool-export-outcome-audit-20260905` (base `13bfe851`),
+primary table/audio/HF/bundle/fine-tune writers now use export-only final-outcome authority.
+Original paid opinions, revisions and audio remain unchanged. Final retain/text/evidence is
+separate provenance, never falsely attributed to the first worker. DPO and LM corpus consumers
+now use the current final outcome too; rejected, unresolved and out-of-pool rows are excluded.
+
+Actual evidence, retained in the private local evidence store:
+
+- Initial shared-export regressions: 2 new failures (2 existing passes), exit101.
+- Primary export suite: 197 passed, 0 failed, 1 existing ignored, exit0. This and the first strict
+  all-target/all-feature Clippy pass predate the DPO/LM extension; not full-app certification.
+- DPO/LM fail-before: `cargo test --quiet --locked --manifest-path src-tauri/Cargo.toml --lib
+  pool_learning_ -- --nocapture`: 0 passed, 3 failed, exit101.
+  Log `pool-learning-before-20260905.log`, SHA256
+  `1ac39d5e591eee793cea4e63857f11d03da79a18795bf86cecdb8935ae111805`.
+- Corrected six lifecycle cases: 6 passed; existing learning module: 25 passed.
+- Expanded integration: `cargo test --quiet --locked --manifest-path src-tauri/Cargo.toml --lib
+  -- pool_learning_ shared_export_ jury::learning:: --nocapture`: **41 passed, 0 failed,
+  0 ignored, 2615 filtered**, exit0, 37.25s. Includes seven new DPO/LM cases plus an actual
+  bundle carrying `learning_preferences.jsonl` with the final label and independent provenance.
+  Rights withdrawal, gold/holdout exclusion, first-reject/later-retain and undo are exercised.
+  Log `pool-learning-writer-integration-20260905.log`, SHA256
+  `0b2de62f7d5d2b7c2a51cc7e3f4c5d9f4061200a4173bec787f8df9b08d9003a`.
+- Full Python sweep initially failed 2/146 scripts: obsolete ID-only consensus source pin and
+  a private profile path in this ledger. Strengthened the pin to final action/authority and
+  removed the private path. Both scripts subsequently pass individually, as do snapshot,
+  verbatim and test-registration policies. Full sweep rerun remains required.
+
+Remaining: few-shot retrieval still reads old examples directly; implement fresh final-outcome
+admission with honest provenance and bounded work, then full integrated Rust/Clippy/policy checks.
+Also test no-pool-to-active-pool publication transitions (captured-authority checks alone do not
+prove that transition), and preserve bundle snapshot identity. TTS acoustic qualification and
+real-device reviewer acceptance remain separate. No commit or deployment of this audit branch.
+
+## 2026-09-05 — Shared export final-outcome regression investigation
+
+Isolated from frozen reviewer release13bfe851 on branch
+`codex/pool-export-outcome-audit-20260905`. The shared export gate currently checks only
+resolved segment IDs and passes on canonical first-opinion rows. Two new disposable
+pool regressions genuinely reproduce wrong output: later matching-pair text is ignored;
+an owner's final rejection still exports the first retained row. Command:
+`cargo test --quiet --locked --manifest-path src-tauri/Cargo.toml --lib shared_export_ -- --nocapture`.
+Actual result:4 tests ran,2 passed,2 failed,0 ignored, exit101. No fix is claimed.
+Before log: `pool-export-outcome-before-20260905.log` in the private local evidence store, SHA256
+`01f8d7780c2d766edcaafeba79de62784e9024daf33df9a605eea6c33ca4bce5`.
+
+Acceptance checklist for the corrective implementation:
+
+- [ ] Exact current consensus/owner text and final retain/reject control every relevant writer.
+- [ ] First-opinion, payment and original audio history remain unchanged; final-outcome
+      provenance must not be falsely attributed to the first reviewer/action/revision.
+- [ ] Cover reviewed audio as well as shared JSON/HF/bundle/fine-tune paths. The audio
+      exporter currently discards filtered row contents and retains only IDs.
+- [ ] Reversal/reopened conflict and stale snapshots cannot publish superseded outcomes.
+- [ ] Preserve no-pool compatibility, holdouts, deduplication, rights and audio-byte identity.
+- [ ] Regression gates and affected/full Rust tests pass before committing a completed fix.
+
+This is a dataset/training correctness blocker, not evidence of already-trained contamination.
+Separate TTS acoustic/speaker qualification and actual paid reviewer field acceptance remain open.
+No active-release, reviewer-database, payment or source-audio mutation occurred.
+
 ## 2026-09-05 — Consolidated reviewer release integration on current main
 
 PR101 is merged as `e2774ec8`; PR96's `119c9193` already includes that main update.

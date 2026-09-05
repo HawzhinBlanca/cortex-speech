@@ -222,6 +222,7 @@ fn verify_segment_snapshot_at_commit(
     // SpeechSegment. Re-run the shared fail-closed policy and require identical membership so a gold
     // holdout registration during export cannot be sealed into training data.
     let current_selected = export::exclude_unexportable_segments(db, current)?;
+    crate::export_review::verify_current(db, expected_selected)?;
     let expected_ids = expected_selected.iter().map(|segment| segment.id.as_str()).collect::<BTreeSet<_>>();
     let current_ids = current_selected.iter().map(|segment| segment.id.as_str()).collect::<BTreeSet<_>>();
     if current_ids != expected_ids {
