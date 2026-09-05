@@ -55,13 +55,17 @@ pub struct PoolDatasetResult {
     pub voice_name: String,
     pub retained_segments: usize,
     pub rejected_segments: usize,
+    /// Retained clips that also entered the TTS set (measured single-voice score at or above the bar).
+    pub tts_retained_segments: usize,
+    /// Retained clips kept for ASR but excluded from TTS by name (unmeasured or speaker-change candidate).
+    pub tts_excluded_segments: usize,
     pub total_duration_ms: i64,
     pub manifest_sha256: String,
     pub sha256sums_sha256: String,
     pub certificate_sha256: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct PoolExportRow {
     segment_id: String,
     audio_path: String,
@@ -73,6 +77,27 @@ struct PoolExportRow {
     duration_ms: i64,
     rights: RecordingRights,
     resolution: SegmentResolution,
+    /// CAM++ half-vs-half cosine of the clip, persisted by the speaker-change probe; NULL = never measured.
+    speaker_change_score: Option<f64>,
+}
+
+/// TTS admission (owner direction 2026-09-05: a clean single-voice set per speaker). A clip enters the
+/// TTS set only with a MEASURED speaker-change score at or above the calibrated threshold (0/15
+/// misclassified on the owner's blind listening pass). An unmeasured clip is not clean, it is unknown,
+/// and unknown is excluded by name. Simultaneous overlap is invisible to this score; reviewers mark it
+/// BAD, and a BAD consensus never reaches this function.
+fn tts_admission(speaker_change_score: Option<f64>) -> Result<(), &'static str> {
+    match speaker_change_score {
+        None => Err("tts_speaker_change_unmeasured"),
+        Some(score) if score.is_finite() && score >= tts_speaker_change_threshold() => Ok(()),
+        Some(_) => Err("tts_speaker_change_candidate"),
+    }
+}
+
+/// The calibrated f32 threshold as the exact decimal the manifest publishes (widening 0.59f32 to f64
+/// yields 0.5899999737739563, which would make the artifact and the rule disagree by a hair).
+fn tts_speaker_change_threshold() -> f64 {
+    (f64::from(crate::diarization::SPEAKER_CHANGE_THRESHOLD) * 10_000.0).round() / 10_000.0
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -127,7 +152,8 @@ fn load_rows(db: &Database, pool_id: &str, voice_name: &str) -> AppResult<Vec<Po
                 member.model_version_id, member.audio_content_hash, member.source_start_ms,
                 member.source_end_ms, member.duration_ms, segment.rights_license,
                 segment.rights_consent_basis, segment.rights_permitted_use,
-                segment.rights_attribution, segment.rights_source, segment.rights_revoked_at
+                segment.rights_attribution, segment.rights_source, segment.rights_revoked_at,
+                segment.speaker_change_score
            FROM review_pool_members member
            JOIN speech_segments segment ON segment.id=member.segment_id
           WHERE member.pool_id=?1 AND member.voice_name=?2 COLLATE BINARY
@@ -156,12 +182,23 @@ fn load_rows(db: &Database, pool_id: &str, voice_name: &str) -> AppResult<Vec<Po
                     source: row.get(12)?,
                     revoked_at: row.get(13)?,
                 },
+                row.get::<_, Option<f64>>(14)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut result = Vec::with_capacity(rows.len());
-    for (segment_id, audio_path, raw_transcript, model_version_id, audio_content_hash, start, end, duration, rights) in
-        rows
+    for (
+        segment_id,
+        audio_path,
+        raw_transcript,
+        model_version_id,
+        audio_content_hash,
+        start,
+        end,
+        duration,
+        rights,
+        speaker_change_score,
+    ) in rows
     {
         let resolution = resolutions.get(&segment_id).cloned().ok_or_else(|| {
             AppError::Validation(format!("{segment_id}: resolution authority disappeared during export setup"))
@@ -177,6 +214,7 @@ fn load_rows(db: &Database, pool_id: &str, voice_name: &str) -> AppResult<Vec<Po
             duration_ms: duration,
             rights,
             resolution,
+            speaker_change_score,
         });
     }
     if result.len() != resolutions.len() {
@@ -476,6 +514,8 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
         hash_field(&mut audio_digest, voice_name.as_bytes());
         let mut source_sha_by_path = HashMap::new();
         let mut total_duration_ms = 0_i64;
+        let mut tts_retained = 0_usize;
+        let mut tts_excluded = 0_usize;
         for (source_value, source_rows) in by_source {
             let source = Path::new(source_value);
             if !source.is_file() {
@@ -518,20 +558,26 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
                 })?;
                 let file_name = format!("{ordinal:06}.wav");
                 let tts_relative = format!("tts/audio_24k/{file_name}");
-                let tts_path = staging.join(&tts_relative);
                 let source_bytes_preserved = start == 0 && end == master.len();
-                if source_bytes_preserved {
-                    fs::copy(source, &tts_path)?;
+                let tts_admitted = tts_admission(row.speaker_change_score);
+                let tts_sha = if tts_admitted.is_ok() {
+                    let tts_path = staging.join(&tts_relative);
+                    if source_bytes_preserved {
+                        fs::copy(source, &tts_path)?;
+                    } else {
+                        write_pcm16_wav(&tts_path, TTS_SAMPLE_RATE, clip)?;
+                    }
+                    let tts_sha = sha256_file(&tts_path)?;
+                    if source_bytes_preserved && tts_sha != source_sha {
+                        return Err(AppError::Validation(format!(
+                            "{}: byte-preserved TTS copy differs from its source master",
+                            row.segment_id
+                        )));
+                    }
+                    Some(tts_sha)
                 } else {
-                    write_pcm16_wav(&tts_path, TTS_SAMPLE_RATE, clip)?;
-                }
-                let tts_sha = sha256_file(&tts_path)?;
-                if source_bytes_preserved && tts_sha != source_sha {
-                    return Err(AppError::Validation(format!(
-                        "{}: byte-preserved TTS copy differs from its source master",
-                        row.segment_id
-                    )));
-                }
+                    None
+                };
                 let (_, asr_pcm) = crate::audio::ensure_pcm_16khz(TTS_SAMPLE_RATE, clip.to_vec())?;
                 let asr_relative = format!("asr/audio_16k/{file_name}");
                 let asr_path = staging.join(&asr_relative);
@@ -564,28 +610,52 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
                         "sourceEndMs": row.source_end_ms,
                     }),
                 )?;
-                write_jsonl(
-                    &mut tts_meta,
-                    &serde_json::json!({
-                        "id": row.segment_id,
-                        "audio": format!("audio_24k/{file_name}"),
-                        "verbatimText": text,
-                        "normalizedText": crate::normalizer::canonical_training_text(text),
-                        "speaker": voice_name,
-                        "durationMs": row.duration_ms,
-                        "sampleRate": TTS_SAMPLE_RATE,
-                        "sourceBytesPreserved": source_bytes_preserved,
-                        "audioSha256": tts_sha,
-                        "sourceMasterSha256": source_sha,
-                        "sourceStartMs": row.source_start_ms,
-                        "sourceEndMs": row.source_end_ms,
-                    }),
-                )?;
-                hash_field(&mut audio_digest, tts_sha.as_bytes());
+                match (&tts_sha, tts_admitted) {
+                    (Some(tts_sha), Ok(())) => {
+                        write_jsonl(
+                            &mut tts_meta,
+                            &serde_json::json!({
+                                "id": row.segment_id,
+                                "audio": format!("audio_24k/{file_name}"),
+                                "verbatimText": text,
+                                "normalizedText": crate::normalizer::canonical_training_text(text),
+                                "speaker": voice_name,
+                                "durationMs": row.duration_ms,
+                                "sampleRate": TTS_SAMPLE_RATE,
+                                "sourceBytesPreserved": source_bytes_preserved,
+                                "speakerChangeScore": row.speaker_change_score,
+                                "audioSha256": tts_sha,
+                                "sourceMasterSha256": source_sha,
+                                "sourceStartMs": row.source_start_ms,
+                                "sourceEndMs": row.source_end_ms,
+                            }),
+                        )?;
+                        hash_field(&mut audio_digest, tts_sha.as_bytes());
+                        files.push(tts_relative);
+                        tts_retained += 1;
+                    }
+                    (_, tts_refusal) => {
+                        // The words are decided and the ASR row ships; the AUDIO is not proven single-voice,
+                        // so the TTS set names the clip and the reason instead of silently containing it.
+                        write_jsonl(
+                            &mut exclusions,
+                            &serde_json::json!({
+                                "id": row.segment_id,
+                                "reason": tts_refusal.err().unwrap_or("tts_speaker_change_unmeasured"),
+                                "scope": "tts",
+                                "asrRetained": true,
+                                "speakerChangeScore": row.speaker_change_score,
+                                "speakerChangeThreshold": tts_speaker_change_threshold(),
+                                "ttsAudioCopied": false,
+                            }),
+                        )?;
+                        hash_field(&mut audio_digest, b"tts-excluded");
+                        tts_excluded += 1;
+                    }
+                }
                 hash_field(&mut audio_digest, asr_sha.as_bytes());
                 hash_field(&mut audio_digest, if source_bytes_preserved { b"preserved" } else { b"extracted" });
                 total_duration_ms = total_duration_ms.saturating_add(row.duration_ms);
-                files.push(tts_relative);
                 files.push(asr_relative);
             }
         }
@@ -632,12 +702,16 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
             "audioSha256": audio_sha256,
             "retainedSegments": retained_rows.len(),
             "rejectedSegments": rejected_rows.len(),
+            "ttsRetainedSegments": tts_retained,
+            "ttsExcludedSegments": tts_excluded,
             "totalDurationMs": total_duration_ms,
             "transcriptAuthority": "two matching independent reviewers, matching pair among three, or owner adjudication",
             "asr": {"directory": "asr", "sampleRate": ASR_SAMPLE_RATE, "audio": "mono PCM16 WAV"},
             "tts": {"directory": "tts", "sampleRate": TTS_SAMPLE_RATE,
-                    "audio": "byte-preserved masters or exact-sample bounded PCM16 extraction"},
-            "exclusions": {"file": "exclusions.jsonl", "rejectedAudioCopied": false},
+                    "audio": "byte-preserved masters or exact-sample bounded PCM16 extraction",
+                    "admission": "measured speaker-change score at or above the threshold; unmeasured or candidate clips are excluded by name",
+                    "speakerChangeThreshold": tts_speaker_change_threshold()},
+            "exclusions": {"file": "exclusions.jsonl", "rejectedAudioCopied": false, "ttsAudioCopied": false},
         });
         let manifest_bytes =
             serde_json::to_vec_pretty(&manifest).map_err(|error| AppError::Other(error.to_string()))?;
@@ -691,6 +765,8 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
                 "exportSha256sumsSha256": sha256sums_sha256,
                 "retainedSegments": retained_rows.len(),
                 "rejectedSegments": rejected_rows.len(),
+                "ttsRetainedSegments": tts_retained,
+                "ttsExcludedSegments": tts_excluded,
                 "totalDurationMs": total_duration_ms,
                 "appGitSha": app_git_sha,
                 "createdAtMs": created_at_ms,
@@ -822,6 +898,8 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
             voice_name: voice_name.to_string(),
             retained_segments: retained_rows.len(),
             rejected_segments: rejected_rows.len(),
+            tts_retained_segments: tts_retained,
+            tts_excluded_segments: tts_excluded,
             total_duration_ms,
             manifest_sha256,
             sha256sums_sha256,
@@ -975,6 +1053,10 @@ mod tests {
         )
         .unwrap();
         review_pool::stamp_owner_supplied_pool_rights(&db).unwrap();
+        // Measured single-voice scores: the TTS set admits only measured clips at or above the bar.
+        for id in ["bounded", "full", "rejected", "duplicate"] {
+            db.set_speaker_change_score(id, 0.81).unwrap();
+        }
         let segment_ids = vec!["bounded".to_string(), "duplicate".to_string()];
         let proof_edges = vec![serde_json::json!({
             "leftSegmentId": "bounded",
@@ -1115,6 +1197,58 @@ mod tests {
         std::fs::read_to_string(path).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect()
     }
 
+    /// Owner direction 2026-09-05: the TTS set for a voice must be clean single-speaker audio. Decided
+    /// words are not enough — a clip enters TTS only with a measured speaker-change score at or above the
+    /// calibrated threshold; an unmeasured clip is unknown and is excluded BY NAME. ASR keeps every
+    /// retained clip either way, because a correct transcript of a two-voice clip still teaches recognition.
+    #[test]
+    fn tts_admission_requires_a_measured_speaker_change_score_at_or_above_the_threshold() {
+        assert!(tts_admission(Some(0.59)).is_ok(), "the threshold itself is admitted");
+        assert!(tts_admission(Some(0.93)).is_ok());
+        assert_eq!(tts_admission(Some(0.5899)), Err("tts_speaker_change_candidate"));
+        assert_eq!(tts_admission(Some(f64::NAN)), Err("tts_speaker_change_candidate"));
+        assert_eq!(tts_admission(None), Err("tts_speaker_change_unmeasured"), "unknown is not clean");
+
+        let (directory, db) = fixture();
+        db.set_speaker_change_score("full", 0.31).unwrap(); // a turn-taking candidate
+        db.connection().execute("UPDATE speech_segments SET speaker_change_score=NULL WHERE id='bounded'", []).unwrap(); // never measured
+        let output = directory.path().join("export-tts");
+        let result = export_voice(
+            &db,
+            &PoolDatasetOptions { output_dir: output.to_string_lossy().to_string(), voice_name: "Lamo".into() },
+        )
+        .unwrap();
+        assert_eq!(
+            (result.retained_segments, result.tts_retained_segments, result.tts_excluded_segments),
+            (2, 0, 2),
+            "both decided clips stay retained for ASR; neither is proven single-voice for TTS"
+        );
+        assert_eq!(read_jsonl(&output.join("asr/metadata.jsonl")).len(), 2, "ASR keeps every retained clip");
+        assert!(read_jsonl(&output.join("tts/metadata.jsonl")).is_empty(), "TTS ships nothing unproven");
+        assert_eq!(fs::read_dir(output.join("tts/audio_24k")).unwrap().count(), 0, "no TTS audio is copied");
+        let exclusions = read_jsonl(&output.join("exclusions.jsonl"));
+        let reason = |id: &str| {
+            exclusions.iter().find(|row| row["id"] == id).map(|row| row["reason"].as_str().unwrap().to_string())
+        };
+        assert_eq!(reason("full").as_deref(), Some("tts_speaker_change_candidate"));
+        assert_eq!(reason("bounded").as_deref(), Some("tts_speaker_change_unmeasured"));
+        assert_eq!(reason("rejected").as_deref(), Some("human_reject_after_independent_review"));
+        let full_row = exclusions.iter().find(|row| row["id"] == "full").unwrap();
+        assert_eq!((full_row["scope"].as_str(), full_row["asrRetained"].as_bool()), (Some("tts"), Some(true)));
+        assert_eq!(full_row["speakerChangeScore"], 0.31);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(
+            (manifest["ttsRetainedSegments"].as_u64(), manifest["ttsExcludedSegments"].as_u64()),
+            (Some(0), Some(2))
+        );
+        assert_eq!(manifest["tts"]["speakerChangeThreshold"], 0.59);
+        // sha256sums covers exactly what exists: the ASR files, the metadata and exclusion files, no TTS audio.
+        let sums = fs::read_to_string(output.join("SHA256SUMS")).unwrap();
+        assert!(!sums.contains("tts/audio_24k/"), "{sums}");
+        assert!(sums.contains("asr/audio_16k/000001.wav"), "{sums}");
+    }
+
     #[test]
     fn pool_export_is_deterministic_excludes_rejects_and_preserves_exact_audio_contracts() {
         let (directory, db) = fixture();
@@ -1150,6 +1284,11 @@ mod tests {
             assert_eq!(value["decisionAndReviewerEvidenceSha256"], value["reviewerSha256"]);
         }
 
+        assert_eq!(
+            (manifest["ttsRetainedSegments"].as_u64(), manifest["ttsExcludedSegments"].as_u64()),
+            (Some(2), Some(0))
+        );
+        assert_eq!((first.tts_retained_segments, first.tts_excluded_segments), (2, 0));
         let tts = read_jsonl(&first_output.join("tts/metadata.jsonl"));
         assert_eq!(tts.len(), 2);
         let bounded = tts.iter().find(|row| row["id"] == "bounded").unwrap();
