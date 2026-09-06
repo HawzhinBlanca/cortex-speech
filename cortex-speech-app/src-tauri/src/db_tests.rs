@@ -7454,9 +7454,9 @@ fn restore_authority_requires_exact_legacy_baseline_and_append_only_desktop_jour
     assert!(error.contains("desktop review action journal"), "{error}");
 
     let baseline = make_db();
-    assert_eq!(crate::migrations::rollback(&baseline, 1).unwrap(), vec![69]);
+    assert_eq!(crate::migrations::rollback(&baseline, 2).unwrap(), vec![70, 69]);
     append_decision(&baseline, "legacy-baseline-decision");
-    assert_eq!(crate::migrations::run_migrations(&baseline).unwrap(), vec![69]);
+    assert_eq!(crate::migrations::run_migrations(&baseline).unwrap(), vec![69, 70]);
     let pseudo_legacy = clone_to(&baseline, &temp.path().join("pseudo-legacy.db"));
     pseudo_legacy
         .connection()
@@ -7534,16 +7534,16 @@ fn delayed_v68_clones_migrate_to_one_deterministic_legacy_barrier_and_remain_res
     let directory = tempfile::tempdir().unwrap();
     let floor_path = directory.path().join("legacy-floor.db");
     let floor = make_file_db(&floor_path);
-    assert_eq!(crate::migrations::rollback(&floor, 1).unwrap(), vec![69]);
+    assert_eq!(crate::migrations::rollback(&floor, 2).unwrap(), vec![70, 69]);
     seed_for_provenance(&floor, "legacy-delayed-restore", "served legacy text");
     floor.record_human_decision("legacy-delayed-restore", "accept", Some("served legacy text"), Some(1_000)).unwrap();
     let target_path = directory.path().join("legacy-target.db");
     floor.backup(&target_path).unwrap();
 
-    assert_eq!(crate::migrations::run_migrations(&floor).unwrap(), vec![69]);
+    assert_eq!(crate::migrations::run_migrations(&floor).unwrap(), vec![69, 70]);
     std::thread::sleep(std::time::Duration::from_millis(1_100));
     let target = Database::open(target_path.to_string_lossy().as_ref()).unwrap();
-    assert_eq!(crate::migrations::run_migrations(&target).unwrap(), vec![69]);
+    assert_eq!(crate::migrations::run_migrations(&target).unwrap(), vec![69, 70]);
 
     let floor_barrier: (i64, String) = floor
         .connection()

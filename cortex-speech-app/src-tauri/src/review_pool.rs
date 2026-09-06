@@ -29,6 +29,8 @@ use std::sync::Arc;
 pub(crate) const REVIEW_POOL_BASE_SCHEMA_VERSION: i64 = 62;
 pub const REVIEW_POOL_SCHEMA_VERSION: i64 = 63;
 pub(crate) const REVIEW_POOL_DEDUP_SCHEMA_VERSION: i64 = 64;
+/// Schema 70: superseding lag-tolerant dedup manifests that may retire reviewed twins.
+pub(crate) const REVIEW_POOL_DEDUP_SUPERSESSION_SCHEMA_VERSION: i64 = 70;
 pub const REVIEW_POOL_PLAYBACK_GUARD: &str = "content-hash-raw-counter-v3";
 const DESKTOP_REVIEWER_KEY: &str = "@desktop-owner";
 
@@ -47,6 +49,9 @@ pub struct ReviewPool {
     member_ids: Arc<HashSet<String>>,
     audio_paths: Arc<HashMap<String, String>>,
     playable_member_ids: Arc<HashSet<String>>,
+    /// Frozen identity of members retired by duplicate exclusion. Never served, resolved or
+    /// exported; kept so a superseding dedup manifest can re-prove every applied family.
+    retired_members: Arc<HashMap<String, PoolMemberEvidence>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +68,11 @@ struct PoolMemberEvidence {
 type PoolSourceRow = (String, String, Option<String>, Option<i64>, Option<i64>, i64);
 
 impl ReviewPool {
+    /// Frozen identity of a member retired by duplicate exclusion (None for a live or unknown clip).
+    fn retired_member(&self, segment_id: &str) -> Option<&PoolMemberEvidence> {
+        self.retired_members.get(segment_id)
+    }
+
     pub fn contains(&self, segment_id: &str) -> bool {
         self.members.contains_key(segment_id)
     }
@@ -425,7 +435,15 @@ pub fn load(db: &Database) -> Result<Option<ReviewPool>, String> {
         return Err("review pool contains a draft from outside its frozen champion identity".to_string());
     }
     let (dedup, excluded_member_ids) = load_dedup_binding(db, &pool_id, actual_count, &actual_sha256)?;
-    members.retain(|segment_id, _| !excluded_member_ids.contains(segment_id));
+    let mut retired_members = HashMap::new();
+    members.retain(|segment_id, member| {
+        if excluded_member_ids.contains(segment_id) {
+            retired_members.insert(segment_id.clone(), member.clone());
+            false
+        } else {
+            true
+        }
+    });
     audio_paths.retain(|segment_id, _| !excluded_member_ids.contains(segment_id));
     playable_member_ids.retain(|segment_id| !excluded_member_ids.contains(segment_id));
     let member_ids = Arc::new(members.keys().cloned().collect());
@@ -443,6 +461,7 @@ pub fn load(db: &Database) -> Result<Option<ReviewPool>, String> {
         member_ids,
         audio_paths: Arc::new(audio_paths),
         playable_member_ids: Arc::new(playable_member_ids),
+        retired_members: Arc::new(retired_members),
     };
     require_live_member_identity(db, &pool)?;
     Ok(Some(pool))
@@ -489,24 +508,34 @@ pub fn registry_matches(db: &Database, bound: &ReviewPool) -> Result<bool, Strin
                 && bound.review_segment_count == bound.focus_segment_count
         }));
     }
+    let authority_sha256 = if schema_version >= REVIEW_POOL_DEDUP_SUPERSESSION_SCHEMA_VERSION {
+        "COALESCE((SELECT manifest_sha256 FROM review_pool_dedup_supersessions
+                    WHERE pool_id=registry.pool_id ORDER BY sequence DESC LIMIT 1),
+                  (SELECT manifest_sha256 FROM review_pool_dedup_manifests
+                    WHERE pool_id=registry.pool_id))"
+    } else {
+        "(SELECT manifest_sha256 FROM review_pool_dedup_manifests
+           WHERE pool_id=registry.pool_id)"
+    };
     let current: Option<RegistryDedupRow> = db
         .connection()
         .query_row(
-            "SELECT registry.pool_id,
-                    registry.focus_segment_count,
-                    registry.focus_sha256,
-                    registry.champion_model_version_id,
-                    registry.champion_deployment_sha256,
-                    COUNT(member.segment_id),
-                    (SELECT manifest_sha256 FROM review_pool_dedup_manifests
-                      WHERE pool_id=registry.pool_id),
-                    (SELECT COUNT(*) FROM review_pool_duplicate_exclusions exclusion
-                      WHERE exclusion.pool_id=registry.pool_id)
-               FROM review_pool_registry registry
-               LEFT JOIN review_pool_members member ON member.pool_id=registry.pool_id
-              WHERE registry.singleton_key=1
-              GROUP BY registry.pool_id, registry.focus_segment_count, registry.focus_sha256,
-                       registry.champion_model_version_id, registry.champion_deployment_sha256",
+            &format!(
+                "SELECT registry.pool_id,
+                        registry.focus_segment_count,
+                        registry.focus_sha256,
+                        registry.champion_model_version_id,
+                        registry.champion_deployment_sha256,
+                        COUNT(member.segment_id),
+                        {authority_sha256},
+                        (SELECT COUNT(*) FROM review_pool_duplicate_exclusions exclusion
+                          WHERE exclusion.pool_id=registry.pool_id)
+                   FROM review_pool_registry registry
+                   LEFT JOIN review_pool_members member ON member.pool_id=registry.pool_id
+                  WHERE registry.singleton_key=1
+                  GROUP BY registry.pool_id, registry.focus_segment_count, registry.focus_sha256,
+                           registry.champion_model_version_id, registry.champion_deployment_sha256"
+            ),
             [],
             |row| {
                 Ok((
@@ -1111,7 +1140,7 @@ pub fn pending_segment_ids(
     let mut statement = db
         .connection()
         .prepare(
-            "SELECT segment.id, segment.audio_path
+            "SELECT segment.id, segment.audio_path, segment.speaker_change_score
                FROM review_pool_members member
                JOIN speech_segments segment ON segment.id=member.segment_id
               WHERE member.pool_id=?1
@@ -1124,11 +1153,14 @@ pub fn pending_segment_ids(
         )
         .map_err(|error| format!("review pool queue cannot be prepared: {error}"))?;
     let rows = statement
-        .query_map([&pool.pool_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .query_map([&pool.pool_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<f64>>(2)?))
+        })
         .map_err(|error| format!("review pool queue cannot be read: {error}"))?;
     let mut pending: Vec<PendingVoiceCandidate> = Vec::new();
     for row in rows {
-        let (segment_id, audio_path) = row.map_err(|error| format!("review pool row is unreadable: {error}"))?;
+        let (segment_id, audio_path, speaker_change_score) =
+            row.map_err(|error| format!("review pool row is unreadable: {error}"))?;
         // A clip that already carries one canonical opinion IS the work the consensus canon wants
         // served next. Until 2026-09-04 a PAY-FENCE MIRROR skipped it here because a pool second
         // opinion was unpaid (measured that day: 1,451 one-opinion clips, zero two-opinion, ten
@@ -1167,141 +1199,54 @@ pub fn pending_segment_ids(
             0 => 2,
             _ => 3,
         };
-        // Preserve decision proximity as the first authority, but do not make a reviewer listen to
-        // one import/podcast sequence or one voice for hours. `created_at` is source-ingest order, and
-        // the Lamo corpus was imported file-by-file; sorting by it produced runs such as 011978,
-        // 011979, 011981, 011982. A digest alone scattered source files, but a pool that is ~70% Lamo
-        // still produced thousands of adjacent same-voice transitions and reviewers reasonably
-        // described that as hearing "the same sound" again. Keep a content-independent stable digest
-        // within each voice, then smoothly interleave the frozen voice buckets inside each priority tier.
-        // This remains identical after restart and never lets lower-priority work jump a clip nearer
-        // consensus.
+        // Decision proximity stays the first authority. Inside a tier the OWNER DIRECTION of
+        // 2026-09-06 applies: finish one voice's dataset before the next (Lamo, then Kawa, then
+        // Halwest), and inside a voice serve the clips the speaker-change probe already measured as
+        // single-voice before the candidates and the unmeasured, because those are the clips the TTS
+        // set can admit (`review_pool_export::tts_admission`). The earlier proportional voice interleave
+        // (2026-09-04) spread every reviewer across all three voices, so no voice ever reached a
+        // usable TTS set. `created_at` is source-ingest order and produced runs such as 011978,
+        // 011979, 011981, so equal work still spreads on a content-independent SHA-256 of the clip id.
+        // The whole order is a plain lexicographic sort of frozen facts: identical after restart, and
+        // lower-priority work can never jump a clip nearer consensus.
         let spread_key: [u8; 32] = Sha256::digest(segment_id.as_bytes()).into();
         let voice_name = pool
             .members
             .get(&segment_id)
             .map(|member| member.voice_name.clone())
             .ok_or_else(|| format!("review pool clip {segment_id} has no frozen voice identity"))?;
-        pending.push((distance_to_decision, voice_name, spread_key, segment_id));
+        let tts_rank = u8::from(crate::review_pool_export::tts_admission(speaker_change_score).is_err());
+        pending.push((
+            distance_to_decision,
+            voice_priority_rank(&voice_name),
+            voice_name,
+            tts_rank,
+            spread_key,
+            segment_id,
+        ));
     }
-    interleave_pending_voices(pending)
+    Ok(order_pending_by_voice_priority(pending))
 }
 
-type PendingVoiceCandidate = (usize, String, [u8; 32], String);
-type PendingVoiceItem = ([u8; 32], String);
+/// Queue candidate: decision distance, voice priority rank, frozen voice name (orders voices the
+/// priority list does not name), TTS admission rank (0 = measured single-voice), spread key, clip id.
+type PendingVoiceCandidate = (usize, usize, String, u8, [u8; 32], String);
 
-struct PendingVoiceBucket {
-    items: Vec<PendingVoiceItem>,
-    weight: i128,
-    credit: i128,
+/// Owner direction 2026-09-06: reviewers finish one voice's dataset before starting the next, in
+/// this order. A voice the list does not name sorts after all of them, alphabetically, so a future
+/// import can never jump the line by accident.
+pub const VOICE_PRIORITY: [&str; 3] = ["Lamo", "Kawa", "Halwest"];
+
+fn voice_priority_rank(voice_name: &str) -> usize {
+    VOICE_PRIORITY.iter().position(|voice| *voice == voice_name).unwrap_or(VOICE_PRIORITY.len())
 }
 
-type PendingVoiceTier = BTreeMap<String, PendingVoiceBucket>;
-
-/// Deterministically spread voices without weakening decision proximity.
-///
-/// Each tier is independent: a fresh clip can never jump work one opinion from resolution. Smooth
-/// weighted round-robin retains the real corpus proportions while spreading minority voices across
-/// the whole tier instead of consuming them at the front and leaving one enormous same-voice tail.
-/// The streak ceiling is the mathematical lower bound `ceil(largest / (all_other + 1))`, so it never
-/// promises a mix the corpus cannot supply. Before choosing a voice, a feasibility check proves the
-/// remainder can still meet that ceiling; this prevents a superficially balanced prefix followed by
-/// an oversized one-voice tail. The BTreeMap makes ties stable, and reverse-sorted voice vectors let
-/// `pop` emit the smallest SHA-256 key in O(1).
-fn interleave_pending_voices(candidates: Vec<PendingVoiceCandidate>) -> Result<Vec<String>, String> {
-    let mut tiers: BTreeMap<usize, PendingVoiceTier> = BTreeMap::new();
-    for (distance, voice_name, spread_key, segment_id) in candidates {
-        tiers
-            .entry(distance)
-            .or_default()
-            .entry(voice_name)
-            .or_insert_with(|| PendingVoiceBucket { items: Vec::new(), weight: 0, credit: 0 })
-            .items
-            .push((spread_key, segment_id));
-    }
-
-    let mut ordered = Vec::new();
-    for voices in tiers.values_mut() {
-        for bucket in voices.values_mut() {
-            bucket.items.sort_unstable_by(|left, right| right.cmp(left));
-            bucket.weight = bucket.items.len() as i128;
-        }
-
-        let total: usize = voices.values().map(|bucket| bucket.items.len()).sum();
-        let largest = voices.values().map(|bucket| bucket.items.len()).max().unwrap_or(0);
-        let alternatives = total.saturating_sub(largest);
-        let max_streak = largest.div_ceil(alternatives + 1).max(1);
-        let total_weight = total as i128;
-        let mut last_voice: Option<String> = None;
-        let mut streak = 0usize;
-
-        for _ in 0..total {
-            let mut active: Vec<String> =
-                voices.iter().filter(|(_, bucket)| !bucket.items.is_empty()).map(|(voice, _)| voice.clone()).collect();
-            if active.is_empty() {
-                return Err("review pool voice scheduler exhausted before its measured tier".to_string());
-            }
-            for voice in &active {
-                let Some(bucket) = voices.get_mut(voice) else {
-                    return Err("review pool voice scheduler lost an active bucket".to_string());
-                };
-                bucket.credit += bucket.weight;
-            }
-            active.sort_by(|left, right| {
-                let left_credit = voices.get(left).map_or(i128::MIN, |bucket| bucket.credit);
-                let right_credit = voices.get(right).map_or(i128::MIN, |bucket| bucket.credit);
-                right_credit.cmp(&left_credit).then_with(|| left.cmp(right))
-            });
-            let mut selected: Option<String> = None;
-            for voice in &active {
-                let next_streak = if last_voice.as_ref() == Some(voice) { streak + 1 } else { 1 };
-                if next_streak > max_streak
-                    || !remaining_voice_schedule_is_feasible(voices, voice, next_streak, max_streak)
-                {
-                    continue;
-                }
-                selected = Some(voice.clone());
-                break;
-            }
-            let Some(voice) = selected else {
-                return Err("review pool voice scheduler cannot satisfy its feasible streak bound".to_string());
-            };
-            let Some(bucket) = voices.get_mut(&voice) else {
-                return Err("review pool voice scheduler lost the selected bucket".to_string());
-            };
-            let Some((_, segment_id)) = bucket.items.pop() else {
-                return Err("review pool voice scheduler selected an empty bucket".to_string());
-            };
-            bucket.credit -= total_weight;
-            if last_voice.as_ref() == Some(&voice) {
-                streak += 1;
-            } else {
-                last_voice = Some(voice);
-                streak = 1;
-            }
-            ordered.push(segment_id);
-        }
-    }
-    Ok(ordered)
-}
-
-fn remaining_voice_schedule_is_feasible(
-    voices: &PendingVoiceTier,
-    selected_voice: &str,
-    selected_streak: usize,
-    max_streak: usize,
-) -> bool {
-    let total_remaining = voices.values().map(|bucket| bucket.items.len()).sum::<usize>().saturating_sub(1);
-    voices.iter().all(|(voice, bucket)| {
-        let remaining = bucket.items.len().saturating_sub(usize::from(voice == selected_voice));
-        let others = total_remaining.saturating_sub(remaining);
-        let capacity = if voice == selected_voice {
-            max_streak.saturating_sub(selected_streak).saturating_add(max_streak.saturating_mul(others))
-        } else {
-            max_streak.saturating_mul(others.saturating_add(1))
-        };
-        remaining <= capacity
-    })
+/// Deterministic queue order: nearest to a decision, then the owner's voice priority, then the clips
+/// the TTS set can already admit, then a content-independent spread. A plain lexicographic sort of
+/// frozen facts, so two reviewers and two restarts always derive the same queue.
+fn order_pending_by_voice_priority(mut candidates: Vec<PendingVoiceCandidate>) -> Vec<String> {
+    candidates.sort_unstable();
+    candidates.into_iter().map(|(_, _, _, _, _, segment_id)| segment_id).collect()
 }
 
 pub fn coverage_by_voice(db: &Database) -> Result<Vec<VoiceCoverage>, String> {
@@ -3197,37 +3142,42 @@ mod tests {
     }
 
     #[test]
-    fn pool_interleaves_voices_deterministically_without_crossing_priority_tiers() {
+    fn pool_serves_voices_in_owner_priority_and_measured_single_voice_clips_first() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         seed_champion(&db);
         rollback_fixture_to(&db, 59);
+        // (clip, voice, hash byte, speaker-change score): Some(>= 0.59) is a measured single-voice
+        // clip the TTS set admits; a low score is a two-voice candidate; None was never measured.
         let assignments = [
-            ("halwest-a", "Halwest", 'a'),
-            ("halwest-b", "Halwest", 'b'),
-            ("kawa-a", "Kawa", 'c'),
-            ("kawa-b", "Kawa", 'd'),
-            ("lamo-a", "Lamo", 'e'),
-            ("lamo-b", "Lamo", 'f'),
+            ("halwest-a", "Halwest", 'a', Some(0.91)),
+            ("halwest-b", "Halwest", 'b', None),
+            ("kawa-a", "Kawa", 'c', None),
+            ("kawa-b", "Kawa", 'd', None),
+            ("lamo-a", "Lamo", 'e', Some(0.20)),
+            ("lamo-b", "Lamo", 'f', Some(0.81)),
         ];
-        for (id, _, _) in assignments {
+        for (id, _, _, _) in assignments {
             let audio = dir.path().join(format!("{id}.wav"));
             std::fs::write(&audio, b"wav").unwrap();
             db.insert_segment_full(&segment(id, &audio, None)).unwrap();
         }
         upgrade_fixture_from(&db, 59);
-        for (id, _, hex) in assignments {
+        for (id, _, hex, score) in assignments {
             db.connection()
                 .execute(
                     "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
                     rusqlite::params![id, hex.to_string().repeat(64)],
                 )
                 .unwrap();
+            if let Some(score) = score {
+                db.set_speaker_change_score(id, score).unwrap();
+            }
         }
         let inputs: Vec<PoolMemberInput> = assignments
             .iter()
-            .map(|(id, voice, _)| PoolMemberInput { segment_id: (*id).into(), voice_name: (*voice).into() })
+            .map(|(id, voice, _, _)| PoolMemberInput { segment_id: (*id).into(), voice_name: (*voice).into() })
             .collect();
         let pool = activate(&db, "123e4567-e89b-42d3-a456-426614174071", &inputs).unwrap();
 
@@ -3235,91 +3185,44 @@ mod tests {
         let voices: Vec<&str> = first.iter().map(|id| pool.voice_for(id).unwrap()).collect();
         assert_eq!(
             voices,
-            vec!["Halwest", "Kawa", "Lamo", "Halwest", "Kawa", "Lamo"],
-            "equal-priority work must alternate available voices instead of clustering the largest corpus"
+            vec!["Lamo", "Lamo", "Kawa", "Kawa", "Halwest", "Halwest"],
+            "equal-priority work follows the owner's voice order: finish Lamo, then Kawa, then Halwest"
         );
+        assert_eq!(first[0], "lamo-b", "the measured single-voice Lamo clip leads the two-voice candidate");
+        assert_eq!(first[1], "lamo-a");
+        assert_eq!(first[4], "halwest-a", "the measured single-voice Halwest clip leads the unmeasured one");
+        let kawa: Vec<&str> = first[2..4].iter().map(String::as_str).collect();
+        let mut kawa_by_spread = vec!["kawa-a", "kawa-b"];
+        kawa_by_spread.sort_by_key(|id| <[u8; 32]>::from(Sha256::digest(id.as_bytes())));
+        assert_eq!(kawa, kawa_by_spread, "unmeasured clips of one voice spread on the content-independent digest");
         let reloaded = load(&db).unwrap().expect("active pool reload");
         assert_eq!(
             pending_segment_ids(&db, &reloaded, "Hemn", None).unwrap(),
             first,
-            "voice interleaving must remain stable across authority reloads"
+            "voice-priority ordering must remain stable across authority reloads"
         );
 
-        let nearer = interleave_pending_voices(vec![
-            (1, "Halwest".into(), [0; 32], "far-halwest".into()),
-            (0, "Lamo".into(), [u8::MAX; 32], "near-lamo".into()),
-            (1, "Kawa".into(), [u8::MAX; 32], "far-kawa".into()),
-        ])
-        .unwrap();
+        let nearer = order_pending_by_voice_priority(vec![
+            (2, 0, "Lamo".into(), 0, [0; 32], "fresh-lamo".into()),
+            (0, 2, "Halwest".into(), 1, [u8::MAX; 32], "near-halwest".into()),
+            (1, 1, "Kawa".into(), 0, [0; 32], "disputed-kawa".into()),
+        ]);
         assert_eq!(
-            nearer.first().map(String::as_str),
-            Some("near-lamo"),
-            "voice variety must never let a lower-priority clip jump work nearer consensus"
+            nearer,
+            vec!["near-halwest", "disputed-kawa", "fresh-lamo"],
+            "voice priority never lets a lower-priority clip jump work nearer consensus"
         );
-
-        let mut skewed = Vec::new();
-        for (voice, count, prefix) in [("Halwest", 1, "h"), ("Kawa", 2, "k"), ("Lamo", 8, "l")] {
-            for index in 0..count {
-                skewed.push((0, voice.to_string(), [u8::try_from(index).unwrap(); 32], format!("{prefix}{index}")));
-            }
-        }
-        let skewed = interleave_pending_voices(skewed).unwrap();
-        let skewed_voices: Vec<&str> = skewed
-            .iter()
-            .map(|id| match id.as_bytes()[0] {
-                b'h' => "Halwest",
-                b'k' => "Kawa",
-                b'l' => "Lamo",
-                _ => unreachable!("fixture has an unknown voice"),
-            })
-            .collect();
         assert_eq!(
-            skewed_voices,
-            vec!["Lamo", "Lamo", "Kawa", "Lamo", "Lamo", "Halwest", "Lamo", "Lamo", "Kawa", "Lamo", "Lamo"],
-            "minority voices must be spread across a skewed tier and the feasible maximum streak must be two"
+            [voice_priority_rank("Lamo"), voice_priority_rank("Kawa"), voice_priority_rank("Halwest")],
+            [0, 1, 2]
         );
-    }
-
-    #[test]
-    fn voice_interleave_meets_the_feasible_streak_bound_across_skew_shapes() {
-        for a in 1usize..=8 {
-            for b in 1usize..=8 {
-                for c in 1usize..=8 {
-                    let mut candidates = Vec::new();
-                    for (voice, count) in [("A", a), ("B", b), ("C", c)] {
-                        for index in 0..count {
-                            candidates.push((
-                                0,
-                                voice.to_string(),
-                                [u8::try_from(index).unwrap(); 32],
-                                format!("{voice}{index}"),
-                            ));
-                        }
-                    }
-                    let ordered = interleave_pending_voices(candidates).unwrap();
-                    let total = a + b + c;
-                    let largest = a.max(b).max(c);
-                    let feasible_bound = largest.div_ceil(total - largest + 1).max(1);
-                    let mut maximum_run = 0usize;
-                    let mut current_run = 0usize;
-                    let mut previous_voice = None;
-                    for segment_id in ordered {
-                        let voice = segment_id.as_bytes()[0];
-                        if previous_voice == Some(voice) {
-                            current_run += 1;
-                        } else {
-                            previous_voice = Some(voice);
-                            current_run = 1;
-                        }
-                        maximum_run = maximum_run.max(current_run);
-                    }
-                    assert!(
-                        maximum_run <= feasible_bound,
-                        "counts ({a}, {b}, {c}) produced run {maximum_run} above feasible bound {feasible_bound}"
-                    );
-                }
-            }
-        }
+        assert_eq!(voice_priority_rank("Someone"), 3, "an unnamed voice sorts after every named one");
+        let unnamed = order_pending_by_voice_priority(vec![
+            (0, 3, "Zara".into(), 0, [0; 32], "zara".into()),
+            (0, 3, "Aram".into(), 0, [0; 32], "aram".into()),
+            (0, 2, "Halwest".into(), 1, [0; 32], "halwest".into()),
+        ]);
+        assert_eq!(unnamed, vec!["halwest", "aram", "zara"], "unnamed voices follow the named ones alphabetically");
     }
 
     #[test]
@@ -3760,6 +3663,7 @@ mod tests {
             member_ids: Arc::new(HashSet::new()),
             audio_paths: Arc::new(HashMap::new()),
             playable_member_ids: Arc::new(HashSet::new()),
+            retired_members: Arc::new(HashMap::new()),
         }
     }
 
@@ -4570,7 +4474,12 @@ mod tests {
         assert!(refuse(&unknown_field).starts_with("review-pool dedup manifest contract is invalid"));
 
         let canon = "review-pool dedup manifest does not match the frozen pool or algorithm canon";
-        assert_eq!(refuse(&mutated_manifest(&base, |value| value["manifestSchema"] = serde_json::json!(2))), canon);
+        // Schema 2 is the superseding contract: without an applied v1 base there is nothing to supersede.
+        assert_eq!(
+            refuse(&mutated_manifest(&base, |value| value["manifestSchema"] = serde_json::json!(2))),
+            "a superseding dedup manifest requires an applied base manifest"
+        );
+        assert_eq!(refuse(&mutated_manifest(&base, |value| value["manifestSchema"] = serde_json::json!(3))), canon);
         assert_eq!(
             refuse(&mutated_manifest(&base, |value| value["algorithm"]["id"] = serde_json::json!("other-algo"))),
             canon
@@ -4696,6 +4605,477 @@ mod tests {
         let error = apply_dedup_manifest(&db, &both_reviewed).unwrap_err();
         assert!(error.contains("would retire more than one reviewed clip"), "unexpected refusal: {error}");
         assert!(!dedup_status(&db).unwrap().applied);
+    }
+
+    /// Lamo pool of `ids` real-WAV clips, none reviewed. Sibling of `two_clip_pool` for the
+    /// superseding-manifest tests, which need a v1 family AND clips outside it.
+    fn clip_pool(ids: &[&str]) -> (tempfile::TempDir, Database, ReviewPool) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        seed_champion(&db);
+        rollback_fixture_to(&db, 59);
+        for id in ids {
+            let audio = dir.path().join(format!("{id}.wav"));
+            write_clip_wav(&audio, id);
+            db.insert_segment_full(&segment(id, &audio, None)).unwrap();
+        }
+        upgrade_fixture_from(&db, 59);
+        for id in ids {
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+                    rusqlite::params![id, clip_hash(id)],
+                )
+                .unwrap();
+        }
+        let inputs: Vec<PoolMemberInput> =
+            ids.iter().map(|id| PoolMemberInput { segment_id: (*id).into(), voice_name: "Lamo".into() }).collect();
+        let pool = activate(&db, "123e4567-e89b-42d3-a456-426614174091", &inputs).unwrap();
+        (dir, db, pool)
+    }
+
+    /// One canonical review on `id`, exactly as the phone's first opinion lands it.
+    fn review_canonically(db: &Database, id: &str) {
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET verified=1, human_decision='edit', verdict='human_edit',
+                        verdict_transcript='دەقی دروست', annotated_transcript='دەقی دروست',
+                        reviewed_by='Rubar', review_revision=review_revision+1
+                  WHERE id=?1",
+                [id],
+            )
+            .unwrap();
+    }
+
+    /// (members in any order, canonical, selection reason, review evidence per member).
+    type FamilySpec<'a> = (&'a [&'a str], &'a str, &'a str, &'a [(&'a str, usize)]);
+
+    /// A manifest over `families` for `pool`, schema 1 (v1 base) or schema 2 (superseding `supersedes`).
+    /// Every fact that `apply_dedup_manifest` re-derives is spelled out here so a test can mutate one.
+    fn family_manifest(
+        pool: &ReviewPool,
+        schema: u32,
+        supersedes: Option<&str>,
+        families: &[FamilySpec<'_>],
+        newly_excluded: usize,
+        generated_at_ms: i64,
+    ) -> String {
+        family_manifest_with(pool, schema, supersedes, families, newly_excluded, 0, generated_at_ms)
+    }
+
+    fn family_manifest_with(
+        pool: &ReviewPool,
+        schema: u32,
+        supersedes: Option<&str>,
+        families: &[FamilySpec<'_>],
+        newly_excluded: usize,
+        retired_applied: usize,
+        generated_at_ms: i64,
+    ) -> String {
+        let evidence_for = |spec: &FamilySpec<'_>, id: &str| {
+            spec.3.iter().find(|(member, _)| *member == id).map_or(0, |(_, count)| *count)
+        };
+        let mut excluded = 0usize;
+        let mut reviewed_canonical = 0usize;
+        let mut excluded_reviewed = 0usize;
+        let family_values: Vec<serde_json::Value> = families
+            .iter()
+            .map(|spec| {
+                let mut segment_ids: Vec<String> = spec.0.iter().map(|id| id.to_string()).collect();
+                segment_ids.sort_unstable();
+                let proof_edges: Vec<serde_json::Value> = segment_ids
+                    .windows(2)
+                    .map(|pair| {
+                        let mut edge = serde_json::json!({
+                            "leftSegmentId": pair[0],
+                            "rightSegmentId": pair[1],
+                            "correlationPpm": 1_000_000,
+                        });
+                        if schema == 2 {
+                            edge["lagMs"] = serde_json::json!(0);
+                            edge["overlapPpm"] = serde_json::json!(1_000_000);
+                        }
+                        edge
+                    })
+                    .collect();
+                let family_material = serde_json::json!({
+                    "poolId": &pool.pool_id,
+                    "proofEdges": &proof_edges,
+                    "segmentIds": &segment_ids,
+                });
+                let family_id: String = Sha256::digest(canonical_json_bytes(&family_material).unwrap())
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                let members: Vec<_> = segment_ids
+                    .iter()
+                    .map(|segment_id| {
+                        let frozen = pool
+                            .members
+                            .get(segment_id)
+                            .or_else(|| pool.retired_member(segment_id))
+                            .expect("fixture clip is a pool member");
+                        let evidence = evidence_for(spec, segment_id);
+                        let canonical = segment_id == spec.1;
+                        if !canonical {
+                            excluded += 1;
+                            if evidence > 0 {
+                                excluded_reviewed += 1;
+                            }
+                        } else if evidence > 0 {
+                            reviewed_canonical += 1;
+                        }
+                        serde_json::json!({
+                            "segmentId": segment_id,
+                            "voiceName": &frozen.voice_name,
+                            "sourceFileName": format!("{segment_id}.wav"),
+                            "rawTranscriptSha256": normalized_text_sha256(&frozen.raw_transcript),
+                            "audioContentHash": &frozen.audio_content_hash,
+                            "sourceStartMs": frozen.source_start_ms,
+                            "sourceEndMs": frozen.source_end_ms,
+                            "durationMs": frozen.duration_ms,
+                            "reviewEvidenceCount": evidence,
+                            "snrMilliDb": null,
+                            "clippingPpm": null,
+                            "signalAnomalyPpm": null,
+                            "confidencePpm": null,
+                            "canonical": canonical,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "familyId": family_id,
+                    "voiceName": "Lamo",
+                    "canonicalSegmentId": spec.1,
+                    "canonicalSelectionReason": spec.2,
+                    "members": members,
+                    "proofEdges": proof_edges,
+                })
+            })
+            .collect();
+        let mut algorithm = serde_json::json!({
+            "id": "cortex-cross-file-waveform-correlation-v1",
+            "minimumTextCharacters": 25,
+            "offsetToleranceMs": 500,
+            "minimumTextSimilarityPpm": 900_000,
+            "audioDurationToleranceMs": 120,
+            "minimumWaveformCorrelationPpm": 980_000,
+            "comparisonSampleRateHz": 16_000,
+        });
+        let mut summary = serde_json::json!({
+            "candidateTextGroups": families.len(),
+            "clearedRepeatedTextGroups": 0,
+            "duplicateFamilies": families.len(),
+            "excludedMembers": excluded,
+            "canonicalMembers": pool.focus_segment_count - excluded,
+            "unconfirmedRiskGroups": 0,
+            "reviewedCanonicalMembers": reviewed_canonical,
+        });
+        if schema == 2 {
+            algorithm["id"] = serde_json::json!("cortex-cross-file-waveform-correlation-v2");
+            algorithm["audioDurationToleranceMs"] = serde_json::json!(1_500);
+            algorithm["minimumWaveformCorrelationPpm"] = serde_json::json!(400_000);
+            algorithm["maximumLagMs"] = serde_json::json!(1_500);
+            algorithm["minimumOverlapPpm"] = serde_json::json!(600_000);
+            algorithm["textCandidateSimilarityPpm"] = serde_json::json!(700_000);
+            algorithm["probableWaveformCorrelationPpm"] = serde_json::json!(200_000);
+            summary["newlyExcludedMembers"] = serde_json::json!(newly_excluded);
+            summary["excludedReviewedMembers"] = serde_json::json!(excluded_reviewed);
+            summary["probableDuplicatePairs"] = serde_json::json!(0);
+            summary["crossVoiceRiskGroups"] = serde_json::json!(0);
+            summary["retiredAppliedCanonicals"] = serde_json::json!(retired_applied);
+        }
+        let mut value = serde_json::json!({
+            "manifestSchema": schema,
+            "algorithm": algorithm,
+            "pool": {
+                "poolId": &pool.pool_id,
+                "sourceFocusSegmentCount": pool.focus_segment_count,
+                "sourceFocusSha256": &pool.focus_sha256,
+                "championModelVersionId": &pool.champion_model_version_id,
+                "championDeploymentSha256": &pool.champion_deployment_sha256,
+            },
+            "summary": summary,
+            "families": family_values,
+            "generatedAtMs": generated_at_ms,
+        });
+        if let Some(supersedes) = supersedes {
+            value["supersedes"] = serde_json::json!({ "manifestSha256": supersedes });
+        }
+        let digest: String =
+            Sha256::digest(canonical_json_bytes(&value).unwrap()).iter().map(|byte| format!("{byte:02x}")).collect();
+        value.as_object_mut().unwrap().insert("manifestSha256".into(), serde_json::Value::String(digest));
+        String::from_utf8(canonical_json_bytes(&value).unwrap()).unwrap()
+    }
+
+    fn manifest_sha256(manifest: &str) -> String {
+        let value: serde_json::Value = serde_json::from_str(manifest).unwrap();
+        value["manifestSha256"].as_str().unwrap().to_string()
+    }
+
+    /// Owner direction 2026-09-06: a superseding (v2) manifest restates the applied v1 family under
+    /// its applied canonical, adds the newly found twin — here one that already carries a review — and
+    /// the retired twin's evidence stays durable while it leaves serving, resolution and export.
+    #[test]
+    fn a_superseding_manifest_retires_a_reviewed_twin_and_restates_the_applied_family() {
+        let (_dir, db, pool) = clip_pool(&["a", "b", "c"]);
+        let base = family_manifest(
+            &pool,
+            1,
+            None,
+            &[(&["a", "b"], "a", "best-measured-audio-quality-then-stable-identity", &[])],
+            0,
+            1_000,
+        );
+        let applied = apply_dedup_manifest(&db, &base).unwrap();
+        assert_eq!((applied.excluded_segment_count, applied.supersession_count), (1, 0));
+        let base_sha = manifest_sha256(&base);
+
+        // The twin found by the lag-tolerant verdict already holds a first opinion.
+        review_canonically(&db, "c");
+        let pool = load(&db).unwrap().unwrap();
+        assert_eq!(pool.review_segment_count, 2, "a and c are live; b is the applied exclusion");
+        let v2 = family_manifest(
+            &pool,
+            2,
+            Some(&base_sha),
+            &[(&["a", "b", "c"], "a", "preserve-applied-canonical", &[("c", 1)])],
+            1,
+            2_000,
+        );
+        let status = apply_dedup_manifest(&db, &v2).unwrap();
+        assert_eq!(status.algorithm_id.as_deref(), Some("cortex-cross-file-waveform-correlation-v2"));
+        assert_eq!(status.manifest_sha256.as_deref(), Some(manifest_sha256(&v2).as_str()));
+        assert_eq!(
+            (status.excluded_segment_count, status.canonical_segment_count, status.supersession_count),
+            (2, 1, 1)
+        );
+        assert_eq!(apply_dedup_manifest(&db, &v2).unwrap(), status, "exact retry is idempotent");
+        assert_eq!(apply_dedup_manifest(&db, &base).unwrap(), status, "re-applying the v1 base is also idempotent");
+
+        let (introduced_by, evidence_kept): (String, i64) = db
+            .connection()
+            .query_row(
+                "SELECT exclusion.manifest_sha256,
+                        (SELECT COUNT(*) FROM speech_segments WHERE id='c' AND verified=1 AND reviewed_by='Rubar')
+                   FROM review_pool_duplicate_exclusions exclusion WHERE exclusion.segment_id='c'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(introduced_by, manifest_sha256(&v2), "the exclusion names the manifest that introduced it");
+        assert_eq!(evidence_kept, 1, "the retired twin's review evidence is untouched");
+        let base_row: String = db
+            .connection()
+            .query_row("SELECT manifest_sha256 FROM review_pool_duplicate_exclusions WHERE segment_id='b'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(base_row, "", "the v1 exclusion keeps its base provenance");
+
+        // Reopen proves the chain, serving and export drop the retired twin, the applied one too.
+        let reopened = load(&db).unwrap().unwrap();
+        assert_eq!(reopened.review_segment_count, 1);
+        assert_eq!(reopened.dedup_manifest_sha256.as_deref(), Some(manifest_sha256(&v2).as_str()));
+        assert_eq!(pending_segment_ids(&db, &reopened, "Hemn", None).unwrap(), vec!["a".to_string()]);
+        assert_eq!(exportable_segment_ids(&db).unwrap().unwrap(), ["a".to_string()].into_iter().collect());
+        assert!(registry_matches(&db, &reopened).unwrap(), "request-boundary proof follows the latest authority");
+
+        // A third generation chains on the second, never on the base.
+        let stale = family_manifest(
+            &pool,
+            2,
+            Some(&base_sha),
+            &[(&["a", "b", "c"], "a", "preserve-applied-canonical", &[("c", 1)])],
+            1,
+            3_000,
+        );
+        assert_eq!(
+            apply_dedup_manifest(&db, &stale).unwrap_err(),
+            "superseding dedup manifest does not supersede the current dedup authority"
+        );
+    }
+
+    /// Two applied v1 families that the lag-tolerant verdict proves to be one recording merge: the
+    /// applied canonical with the most evidence (tie: stable quality key) stays, the other retires
+    /// under it, and the retired canonical's own applied exclusion keeps pointing at it — a chain the
+    /// binding resolves to one live root.
+    #[test]
+    fn a_superseding_manifest_merges_two_applied_families_by_retiring_one_applied_canonical() {
+        let (_dir, db, pool) = clip_pool(&["a", "b", "c", "d"]);
+        let base = family_manifest(
+            &pool,
+            1,
+            None,
+            &[
+                (&["a", "b"], "a", "best-measured-audio-quality-then-stable-identity", &[]),
+                (&["c", "d"], "c", "best-measured-audio-quality-then-stable-identity", &[]),
+            ],
+            0,
+            1_000,
+        );
+        apply_dedup_manifest(&db, &base).unwrap();
+        let base_sha = manifest_sha256(&base);
+        review_canonically(&db, "c");
+        let pool = load(&db).unwrap().unwrap();
+        assert_eq!(pool.review_segment_count, 2);
+
+        // c carries the evidence, so c stays and a (the other applied canonical) retires under it.
+        let merged_family: FamilySpec<'_> = (&["a", "b", "c", "d"], "c", "preserve-applied-canonical", &[("c", 1)]);
+        let wrong_family: FamilySpec<'_> = (&["a", "b", "c", "d"], "a", "preserve-applied-canonical", &[("c", 1)]);
+        let wrong = family_manifest_with(&pool, 2, Some(&base_sha), &[wrong_family], 1, 1, 2_000);
+        assert!(apply_dedup_manifest(&db, &wrong).unwrap_err().contains("canonical selection is not deterministic"));
+        let miscounted = family_manifest_with(&pool, 2, Some(&base_sha), &[merged_family], 1, 0, 2_000);
+        assert_eq!(
+            apply_dedup_manifest(&db, &miscounted).unwrap_err(),
+            "superseding dedup manifest summary does not match validated families"
+        );
+        let merged = family_manifest_with(&pool, 2, Some(&base_sha), &[merged_family], 1, 1, 2_000);
+        let status = apply_dedup_manifest(&db, &merged).unwrap();
+        assert_eq!(
+            (status.excluded_segment_count, status.canonical_segment_count, status.duplicate_family_count),
+            (3, 1, 1)
+        );
+
+        let rows: Vec<(String, String, String)> = db
+            .connection()
+            .prepare(
+                "SELECT segment_id, canonical_segment_id, manifest_sha256
+                   FROM review_pool_duplicate_exclusions ORDER BY segment_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("a".to_string(), "c".to_string(), manifest_sha256(&merged)),
+                ("b".to_string(), "a".to_string(), String::new()),
+                ("d".to_string(), "c".to_string(), String::new()),
+            ],
+            "b's applied row still points at a, which now points at c: one live root"
+        );
+        let reopened = load(&db).unwrap().unwrap();
+        assert_eq!(reopened.review_segment_count, 1);
+        assert_eq!(pending_segment_ids(&db, &reopened, "Hemn", None).unwrap(), vec!["c".to_string()]);
+        assert_eq!(exportable_segment_ids(&db).unwrap().unwrap(), ["c".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn a_superseding_manifest_is_refused_when_it_moves_drops_or_misjudges_a_family() {
+        let (_dir, db, pool) = clip_pool(&["a", "b", "c", "d"]);
+        let base = family_manifest(
+            &pool,
+            1,
+            None,
+            &[(&["a", "b"], "a", "best-measured-audio-quality-then-stable-identity", &[])],
+            0,
+            1_000,
+        );
+        apply_dedup_manifest(&db, &base).unwrap();
+        let base_sha = manifest_sha256(&base);
+        review_canonically(&db, "c");
+        let pool = load(&db).unwrap().unwrap();
+        let refuse = |manifest: &str| apply_dedup_manifest(&db, manifest).unwrap_err();
+        let untouched = dedup_status(&db).unwrap();
+
+        // Dropping the applied family.
+        let dropped = family_manifest(
+            &pool,
+            2,
+            Some(&base_sha),
+            &[(&["c", "d"], "c", "preserve-most-human-review-evidence", &[("c", 1)])],
+            1,
+            2_000,
+        );
+        assert_eq!(refuse(&dropped), "superseding manifest drops an applied duplicate exclusion");
+        // A reviewed newcomer never displaces the applied canonical: b's immutable exclusion row points at a.
+        let moved = family_manifest(
+            &pool,
+            2,
+            Some(&base_sha),
+            &[(&["a", "b", "c"], "c", "preserve-most-human-review-evidence", &[("c", 1)])],
+            1,
+            2_000,
+        );
+        assert!(refuse(&moved).contains("canonical selection is not deterministic"), "{}", refuse(&moved));
+        // ...and an applied exclusion can never leave the family that holds its canonical.
+        let separated = family_manifest(
+            &pool,
+            2,
+            Some(&base_sha),
+            &[(&["b", "c"], "c", "preserve-most-human-review-evidence", &[("c", 1)])],
+            1,
+            2_000,
+        );
+        assert_eq!(refuse(&separated), "superseding manifest separates applied exclusion b from its canonical");
+        // The reviewed twin must win over the unreviewed one in a fresh family...
+        let misjudged = family_manifest(
+            &pool,
+            2,
+            Some(&base_sha),
+            &[
+                (&["a", "b"], "a", "preserve-applied-canonical", &[]),
+                (&["c", "d"], "d", "best-measured-audio-quality-then-stable-identity", &[("c", 1)]),
+            ],
+            1,
+            2_000,
+        );
+        assert!(refuse(&misjudged).contains("canonical selection is not deterministic"));
+        // ...and does, once the manifest says so.
+        let correct = family_manifest(
+            &pool,
+            2,
+            Some(&base_sha),
+            &[
+                (&["a", "b"], "a", "preserve-applied-canonical", &[]),
+                (&["c", "d"], "c", "preserve-most-human-review-evidence", &[("c", 1)]),
+            ],
+            1,
+            2_000,
+        );
+        // A v2 edge without its lag/overlap proof is not a v2 proof.
+        let unproven = mutated_manifest(&correct, |value| {
+            value["families"][1]["proofEdges"][0].as_object_mut().unwrap().remove("lagMs");
+        });
+        assert!(
+            refuse(&unproven).contains("does not match its proof digest")
+                || refuse(&unproven).contains("invalid waveform proof")
+        );
+        // Miscounted summary.
+        let miscounted =
+            mutated_manifest(&correct, |value| value["summary"]["newlyExcludedMembers"] = serde_json::json!(2));
+        assert_eq!(refuse(&miscounted), "superseding dedup manifest summary does not match validated families");
+        assert_eq!(dedup_status(&db).unwrap(), untouched, "every refusal leaves the dedup authority untouched");
+
+        let status = apply_dedup_manifest(&db, &correct).unwrap();
+        assert_eq!(
+            (status.excluded_segment_count, status.duplicate_family_count, status.supersession_count),
+            (2, 2, 1)
+        );
+        let live = load(&db).unwrap().unwrap();
+        let mut served = pending_segment_ids(&db, &live, "Hemn", None).unwrap();
+        served.sort();
+        assert_eq!(served, vec!["a".to_string(), "c".to_string()], "c (reviewed) stays, d (its twin) retires");
+
+        // Schema 2 without any applied base is refused on a fresh pool.
+        let (_dir2, fresh_db, fresh_pool) = clip_pool(&["a", "b"]);
+        let orphan = family_manifest(
+            &fresh_pool,
+            2,
+            Some(&"0".repeat(64)),
+            &[(&["a", "b"], "a", "best-measured-audio-quality-then-stable-identity", &[])],
+            1,
+            2_000,
+        );
+        assert_eq!(
+            apply_dedup_manifest(&fresh_db, &orphan).unwrap_err(),
+            "a superseding dedup manifest requires an applied base manifest"
+        );
     }
 
     #[test]

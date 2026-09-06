@@ -47,6 +47,7 @@ const CAMPAIGN_TABLES: &[&str] = &[
     "review_pool_voice_certificates",
     "review_pool_dedup_manifests",
     "review_pool_duplicate_exclusions",
+    "review_pool_dedup_supersessions",
 ];
 
 #[cfg(windows)]

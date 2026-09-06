@@ -46,21 +46,29 @@ def _audio_or_skip():
         return None
 
 
-def _tone(seconds: float, rate: int, freq: float = 220.0, phase: float = 0.0, seed: int | None = None):
-    """One continuous signal sampled at `rate` — the SAME take when the arguments match.
+def _take(seconds: float, rate: int, seed: int = 0):
+    """One spoken take rendered from a 48 kHz master at `rate` — the SAME recording when `seed` matches.
 
-    Defined as a function of time, not of sample index, so the 48 kHz and 16 kHz renders are two
-    samplings of one recording rather than two unrelated arrays. `seed` adds a take's own noise,
-    which is what makes a genuinely different reading decorrelate.
+    A seeded band-limited noise process under a syllabic envelope, resampled from one master, so the
+    48 kHz and 16 kHz renders are two samplings of one recording; another seed is another take and
+    decorrelates at every lag (the v2 verdict searches lags, which is exactly what undoes the phase
+    offset the old tone fixture relied on).
     """
     import numpy as np
 
-    t = np.arange(int(rate * seconds), dtype="float64") / rate
-    contour = freq * (1.0 + 0.03 * np.sin(2 * np.pi * 0.7 * t))
-    sig = np.sin(2 * np.pi * contour * t + phase)
-    if seed is not None:
-        sig = sig + 0.15 * np.random.default_rng(seed).standard_normal(t.size)
-    return sig.astype("float32")
+    master_rate = 48000
+    n = int(master_rate * seconds)
+    noise = np.random.default_rng(seed).standard_normal(n)
+    shaped = np.convolve(noise, np.ones(24) / 24.0, mode="same")
+    t = np.arange(n, dtype="float64") / master_rate
+    shaped *= 0.55 + 0.45 * np.sin(2 * np.pi * 4.0 * t)
+    if rate != master_rate:
+        shaped = np.interp(
+            np.arange(int(rate * seconds), dtype="float64") * (master_rate / rate),
+            np.arange(n, dtype="float64"),
+            shaped,
+        )
+    return shaped.astype("float32")
 
 
 def _write_wav(sf, path: Path, data, rate: int) -> Path:
@@ -85,7 +93,7 @@ def test_the_same_sentence_at_48k_and_16k_is_a_duplicate() -> None:
     if _audio_or_skip() is None:
         print("    (skipped: numpy/soundfile absent — audio confirmation is optional)")
         return
-    a, b = _tone(1.5, 48000), _tone(1.5, 16000)
+    a, b = _take(1.5, 48000, seed=1), _take(1.5, 16000, seed=1)
     assert audio_says_duplicate(a, b, 48000, 16000) is True
 
 
@@ -94,11 +102,13 @@ def test_mixed_rate_durations_are_compared_in_true_milliseconds() -> None:
     if _audio_or_skip() is None:
         print("    (skipped: numpy/soundfile absent — audio confirmation is optional)")
         return
-    a, b = _tone(1.5, 48000), _tone(1.5, 16000)
+    a, b = _take(1.5, 48000, seed=1), _take(1.5, 16000, seed=1)
     # The old arithmetic: |72000 - 24000| / 16000 * 1000 = 3000 ms, way past the tolerance.
     assert abs(a.size - b.size) / 16000 * 1000 > AUDIO_DURATION_TOLERANCE_MS
-    # A genuinely longer take is still rejected on duration, at either rate.
-    assert audio_says_duplicate(_tone(1.5, 48000), _tone(1.9, 16000), 48000, 16000) is False
+    # v2: a longer CUT of the same recording inside the 1.5 s tolerance is the same recording at
+    # either rate; a take longer than the tolerance is still refused before any decode.
+    assert audio_says_duplicate(_take(1.5, 48000, seed=1), _take(1.9, 16000, seed=1), 48000, 16000) is True
+    assert audio_says_duplicate(_take(1.5, 48000, seed=1), _take(3.5, 16000, seed=1), 48000, 16000) is False
 
 
 def test_two_different_readings_at_mixed_rates_are_not_a_duplicate() -> None:
@@ -106,20 +116,10 @@ def test_two_different_readings_at_mixed_rates_are_not_a_duplicate() -> None:
     if _audio_or_skip() is None:
         print("    (skipped: numpy/soundfile absent — audio confirmation is optional)")
         return
-    assert (
-        audio_says_duplicate(
-            _tone(1.5, 48000, seed=1), _tone(1.5, 16000, freq=231.0, phase=1.1, seed=2), 48000, 16000
-        )
-        is False
-    )
-    # Same speaker, same words, same nominal pitch — a second take of the series intro, recorded at
-    # the other rate. Its own phase and noise still decorrelate it.
-    assert (
-        audio_says_duplicate(
-            _tone(1.5, 48000, seed=1), _tone(1.5, 16000, phase=1.1, seed=9), 48000, 16000
-        )
-        is False
-    )
+    assert audio_says_duplicate(_take(1.5, 48000, seed=1), _take(1.5, 16000, seed=2), 48000, 16000) is False
+    # Same speaker, same words, same length — a second take of the series intro, recorded at the
+    # other rate. A second take is its own signal at every lag.
+    assert audio_says_duplicate(_take(1.5, 48000, seed=1), _take(1.5, 16000, seed=9), 48000, 16000) is False
 
 
 def test_clip_pcm_carries_the_file_rate_end_to_end() -> None:
@@ -130,8 +130,8 @@ def test_clip_pcm_carries_the_file_rate_end_to_end() -> None:
     _np, sf = _audio_or_skip()
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
-        master = _write_wav(sf, d / "Lamofull2_00086400_A01.wav", _tone(1.5, 48000), 48000)
-        wav16 = _write_wav(sf, d / "A1-0032_PODCAST-001.wav", _tone(1.5, 16000), 16000)
+        master = _write_wav(sf, d / "Lamofull2_00086400_A01.wav", _take(1.5, 48000, seed=3), 48000)
+        wav16 = _write_wav(sf, d / "A1-0032_PODCAST-001.wav", _take(1.5, 16000, seed=3), 16000)
 
         assert _clip_pcm(str(master), ALIGN)[1] == 48000
         assert _clip_pcm(str(wav16), ALIGN)[1] == 16000
@@ -155,8 +155,8 @@ def test_a_genuine_repeat_across_rates_is_still_cleared() -> None:
     _np, sf = _audio_or_skip()
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
-        take1 = _write_wav(sf, d / "book_ep04.wav", _tone(1.5, 48000, seed=1), 48000)
-        take2 = _write_wav(sf, d / "book_ep08.wav", _tone(1.5, 16000, phase=1.1, seed=9), 16000)
+        take1 = _write_wav(sf, d / "book_ep04.wav", _take(1.5, 48000, seed=1), 48000)
+        take2 = _write_wav(sf, d / "book_ep08.wav", _take(1.5, 16000, seed=9), 16000)
         rows = [
             ("t1", str(take1), ALIGN, TEXT, 0),
             ("t2", str(take2), ALIGN, TEXT, 1),

@@ -66,12 +66,28 @@ RULE_B_COARSE_BINS = 20
 # differ everywhere; a duplicated import is the same samples. This STRENGTHENS the gate: every true
 # positive still fails it, and the false positives stop.
 #
-# Correlation of the two clips' normalised waveforms, compared at equal length. Identical audio
-# scores ~1.0; two separate readings of the same words score far below this even at the same tempo.
-AUDIO_DUPLICATE_CORRELATION = 0.98
-# Two readings almost never match to the millisecond; a duplicate does. Cheap pre-filter before the
-# decode, and the reason a missing/undecodable clip degrades to "unconfirmed" rather than "clean".
-AUDIO_DURATION_TOLERANCE_MS = 120
+# Correlation of the two clips' normalised waveforms at the BEST LAG inside ±AUDIO_MAX_LAG_MS, over
+# the overlapping span (v2, 2026-09-06). The v1 verdict compared at zero lag with a 0.98 bar: a twin
+# cut even a few milliseconds differently scored near zero and was "cleared" as a re-read sentence.
+# MEASURED on the live pool (16,990 canonical clips): 8,909 text-matched cross-file pairs, 88% at or
+# above 0.6 at the best lag; 597 same-voice DIFFERENT-sentence control pairs never exceeded 0.2. Same
+# recording through different encodes sits anywhere from 0.4 upward (a windowed drift-robust metric
+# tracked the global one, so the spread is codec/bandwidth, not clock drift). Confirmed at 0.40 =
+# twice the control ceiling; the 0.20..0.40 band is REPORTED as probable, never excluded.
+AUDIO_DUPLICATE_CORRELATION = 0.40
+AUDIO_PROBABLE_CORRELATION = 0.20
+AUDIO_MAX_LAG_MS = 1500
+# Two cuts of one recording may differ by whole words at either edge; compare the overlap, but only
+# when at least this share of the shorter clip is covered — below it the "duplicate" is a fragment.
+AUDIO_MIN_OVERLAP_RATIO = 0.60
+# Two readings almost never match to the millisecond, but two CUTS of one recording easily differ by
+# a second (measured: 6.6 s vs 6.4 s twins). Cheap pre-filter before the decode, and the reason a
+# missing/undecodable clip degrades to "unconfirmed" rather than "clean".
+AUDIO_DURATION_TOLERANCE_MS = 1500
+# RULE A' (v2): the champion transcribes one recording slightly differently per cut, so exact text
+# misses most twins. Measured: 6,396 near-text pairs (similarity 0.85..0.99) held 88% true duplicates,
+# more than the exact-text rule found. Candidates only — the audio still decides.
+TEXT_CANDIDATE_SIMILARITY = 0.70
 
 
 def _data_dir() -> Path:
@@ -94,14 +110,18 @@ def duplicate_groups(rows: list[tuple[str, str, str, str, int]]) -> list[list[tu
     import difflib
 
     parsed: list[tuple[str, str, str, int]] = []  # (id, file, normalized text, offset)
+    durations: dict[str, int] = {}
     for seg_id, path, alignment_json, raw, _verified in rows:
         text = " ".join((raw or "").split())
         if len(text) < MIN_TEXT_CHARS:
             continue
         try:
-            offset = int(json.loads(alignment_json or "{}").get("source_start_ms", -1))
-        except (ValueError, TypeError):
-            offset = -1
+            meta = json.loads(alignment_json or "{}")
+            offset = int(meta.get("source_start_ms", -1))
+            end = int(meta.get("source_end_ms", -1))
+        except (ValueError, TypeError, AttributeError):
+            offset, end = -1, -1
+        durations[seg_id] = end - offset if offset >= 0 and end > offset else -1
         # The library stores Windows drive paths; PureWindowsPath splits both separators, so the
         # basename is identical on Windows and deterministic when this audit runs on POSIX CI.
         parsed.append((seg_id, PureWindowsPath(path).name, text, offset))
@@ -129,6 +149,47 @@ def duplicate_groups(rows: list[tuple[str, str, str, str, int]]) -> list[list[tu
             first = members[0][0]
             for sid, _ in members[1:]:
                 union(first, sid)
+
+    # RULE A' (v2): NEAR-identical text across different files whose clip durations sit inside the
+    # audio tolerance. A word-trigram inverted index keeps this linear in the corpus; SequenceMatcher
+    # decides similarity only for pairs sharing enough trigrams. Pure candidate generation — a pair
+    # that is really two readings is cleared by the audio verdict, exactly like RULE A.
+    grams: dict[str, set[str]] = {}
+    postings: dict[str, list[str]] = defaultdict(list)
+    text_of: dict[str, str] = {}
+    file_of: dict[str, str] = {}
+    for sid, fname, text, _off in parsed:
+        words = text.split()
+        trigrams = {" ".join(words[i : i + 3]) for i in range(len(words) - 2)}
+        if not trigrams:
+            continue
+        grams[sid] = trigrams
+        text_of[sid] = text
+        file_of[sid] = fname
+        for gram in trigrams:
+            postings[gram].append(sid)
+    for sid, trigrams in grams.items():
+        shared: dict[str, int] = defaultdict(int)
+        for gram in trigrams:
+            bucket = postings[gram]
+            # A trigram shared by hundreds of clips (a series title, a filler) carries no identity.
+            if len(bucket) > 200:
+                continue
+            for other in bucket:
+                if other > sid:
+                    shared[other] += 1
+        for other, count in shared.items():
+            if file_of[other] == file_of[sid]:
+                continue
+            if count < 0.25 * min(len(trigrams), len(grams[other])):
+                continue
+            left_duration, right_duration = durations.get(sid, -1), durations.get(other, -1)
+            if left_duration >= 0 and right_duration >= 0 and abs(left_duration - right_duration) > AUDIO_DURATION_TOLERANCE_MS:
+                continue
+            matcher = difflib.SequenceMatcher(None, text_of[sid], text_of[other])
+            if matcher.quick_ratio() < TEXT_CANDIDATE_SIMILARITY or matcher.ratio() < TEXT_CANDIDATE_SIMILARITY:
+                continue
+            union(sid, other)
 
     # RULE B: same source-clock position (within the bucket), text >= 90% similar, different files.
     # Connected offset clusters limit the search surface without floor-bucket edge misses. Pair
@@ -348,8 +409,15 @@ def _resampled(x, src_rate: int, dst_rate: int, np):
     )
 
 
-def audio_correlation(a, b, a_rate: int = 16000, b_rate: int = 16000) -> float | None:
-    """The exact normalized waveform score used by the duplicate verdict, or no verdict."""
+def audio_alignment(a, b, a_rate: int = 16000, b_rate: int = 16000) -> tuple[float, int, float] | None:
+    """(correlation, lag_ms, overlap_ratio) at the best lag inside ±AUDIO_MAX_LAG_MS, or no verdict.
+
+    The lag is found by FFT cross-correlation; the reported correlation is the normalised dot product
+    of the two clips over their overlapping span at that lag, so an identical recording scores ~1.0
+    whether or not its cut boundaries agree. A candidate lag whose overlap covers less than
+    AUDIO_MIN_OVERLAP_RATIO of the shorter clip is ignored. Two clips whose durations differ by more
+    than AUDIO_DURATION_TOLERANCE_MS are declared unrelated (0.0) before any decode-heavy work.
+    """
     try:
         import numpy as np
     except ImportError:
@@ -357,17 +425,46 @@ def audio_correlation(a, b, a_rate: int = 16000, b_rate: int = 16000) -> float |
     if a is None or b is None or a.size == 0 or b.size == 0:
         return None
     if abs(a.size / a_rate - b.size / b_rate) * 1000 > AUDIO_DURATION_TOLERANCE_MS:
-        return 0.0
+        return 0.0, 0, 0.0
     rate = min(a_rate, b_rate)
-    a, b = _resampled(a, a_rate, rate, np), _resampled(b, b_rate, rate, np)
-    n = min(a.size, b.size)
-    x, y = a[:n].astype("float64"), b[:n].astype("float64")
+    x = _resampled(a, a_rate, rate, np).astype("float64")
+    y = _resampled(b, b_rate, rate, np).astype("float64")
     x -= x.mean()
     y -= y.mean()
-    denom = float(np.linalg.norm(x) * np.linalg.norm(y))
-    if denom == 0.0:
+    if float(np.linalg.norm(x)) == 0.0 or float(np.linalg.norm(y)) == 0.0:
         return None
-    return float(np.dot(x, y)) / denom
+    size = 1 << (x.size + y.size - 2).bit_length()
+    cross = np.fft.irfft(np.fft.rfft(x, size) * np.conj(np.fft.rfft(y, size)), size)
+    # lags -(len(y)-1) .. len(x)-1: positive lag means x starts later than y.
+    cross = np.concatenate([cross[-(y.size - 1) :], cross[: x.size]]) if y.size > 1 else cross[: x.size]
+    lags = np.arange(-(y.size - 1), x.size)
+    max_lag = int(AUDIO_MAX_LAG_MS * rate / 1000)
+    window = np.abs(lags) <= max_lag
+    if not window.any():
+        return None
+    shorter = min(x.size, y.size)
+    best: tuple[float, int, float] = (0.0, 0, 0.0)
+    # The raw cross-correlation peak is not normalised for overlap; score the few best candidates.
+    for index in np.argsort(cross[window])[::-1][:5]:
+        lag = int(lags[window][index])
+        xs, ys = (x[lag:], y) if lag >= 0 else (x, y[-lag:])
+        overlap = min(xs.size, ys.size)
+        if overlap < AUDIO_MIN_OVERLAP_RATIO * shorter or overlap == 0:
+            continue
+        xs, ys = xs[:overlap], ys[:overlap]
+        denom = float(np.linalg.norm(xs) * np.linalg.norm(ys))
+        if denom == 0.0:
+            continue
+        score = float(np.dot(xs, ys)) / denom
+        if score > best[0]:
+            best = (score, round(lag * 1000 / rate), overlap / shorter)
+    return best
+
+
+def audio_correlation(a, b, a_rate: int = 16000, b_rate: int = 16000) -> float | None:
+    """The exact normalised waveform score used by the duplicate verdict, or no verdict."""
+    alignment = audio_alignment(a, b, a_rate, b_rate)
+    return None if alignment is None else alignment[0]
 
 
 def audio_says_duplicate(a, b, a_rate: int = 16000, b_rate: int = 16000) -> bool | None:
@@ -380,12 +477,14 @@ def audio_says_duplicate(a, b, a_rate: int = 16000, b_rate: int = 16000) -> bool
     return None if correlation is None else correlation >= AUDIO_DUPLICATE_CORRELATION
 
 
-def confirm_groups_with_audio(groups, rows, *, include_proof: bool = False):
+def confirm_groups_with_audio(groups, rows, *, include_proof: bool = False, include_probable: bool = False):
     """Split candidates into exact duplicate components, unconfirmed risks, and clear repeats.
 
     Only cross-file pairs are relevant. A true pair joins just those waveform-connected members; it
     must not condemn every other reading in the same transcript group. Unreadable cross-file pairs
-    remain fail-closed as unconfirmed components.
+    remain fail-closed as unconfirmed components. With `include_probable`, pairs scoring inside
+    [AUDIO_PROBABLE_CORRELATION, AUDIO_DUPLICATE_CORRELATION) are returned as a trailing list of
+    (left_id, right_id, correlation) — surfaced for a human ear, never excluded by machine.
     """
     by_id = {r[0]: r for r in rows}
     def classify(group):
@@ -410,27 +509,28 @@ def confirm_groups_with_audio(groups, rows, *, include_proof: bool = False):
             if left_root != right_root:
                 parent[right_root] = left_root
 
-        true_edges: list[tuple[int, int, float | None]] = []
+        true_edges: list[tuple[int, int, object]] = []
         unknown_edges: list[tuple[int, int]] = []
+        probable_edges: list[tuple[str, str, float]] = []
         compared = 0
         for i in range(len(group)):
             for j in range(i + 1, len(group)):
                 if group[i][1] == group[j][1]:
                     continue
                 compared += 1
-                score = None
+                alignment = None
                 pa, pb = pcm_for(group[i][0]), pcm_for(group[j][0])
-                if include_proof:
-                    score = (
-                        audio_correlation(pa[0], pb[0], pa[1], pb[1]) if pa and pb else None
-                    )
-                    verdict = None if score is None else score >= AUDIO_DUPLICATE_CORRELATION
+                if include_proof or include_probable:
+                    alignment = audio_alignment(pa[0], pb[0], pa[1], pb[1]) if pa and pb else None
+                    verdict = None if alignment is None else alignment[0] >= AUDIO_DUPLICATE_CORRELATION
+                    if alignment is not None and AUDIO_PROBABLE_CORRELATION <= alignment[0] < AUDIO_DUPLICATE_CORRELATION:
+                        probable_edges.append((group[i][0], group[j][0], alignment[0]))
                 else:
                     verdict = (
                         audio_says_duplicate(pa[0], pb[0], pa[1], pb[1]) if pa and pb else None
                     )
                 if verdict is True:
-                    true_edges.append((i, j, score))
+                    true_edges.append((i, j, alignment))
                     union(i, j)
                 elif verdict is None:
                     unknown_edges.append((i, j))
@@ -485,36 +585,43 @@ def confirm_groups_with_audio(groups, rows, *, include_proof: bool = False):
                     {
                         "leftSegmentId": group[i][0],
                         "rightSegmentId": group[j][0],
-                        "correlationPpm": round(float(score) * 1_000_000),
+                        "correlationPpm": round(float(alignment[0]) * 1_000_000),
+                        "lagMs": int(alignment[1]),
+                        "overlapPpm": round(float(alignment[2]) * 1_000_000),
                     }
-                    for i, j, score in true_edges
-                    if group[i][0] in member_ids and group[j][0] in member_ids and score is not None
+                    for i, j, alignment in true_edges
+                    if group[i][0] in member_ids and group[j][0] in member_ids and alignment is not None
                 ]
                 proof.append({"members": component, "edges": edges})
-        return confirmed, unconfirmed, repeats, proof
+        return confirmed, unconfirmed, repeats, proof, probable_edges
 
-    confirmed, unconfirmed, repeats, proof = [], [], [], []
+    confirmed, unconfirmed, repeats, proof, probable = [], [], [], [], []
     # Each segment belongs to one text-candidate group, so per-group caches avoid retaining decoded
     # PCM for the entire corpus. A small bounded worker pool overlaps independent disk reads without
     # competing with the live application or consuming a GPU.
     if len(groups) >= 32:
         with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as executor:
             classified = executor.map(classify, groups)
-            for group_confirmed, group_unconfirmed, group_repeats, group_proof in classified:
+            for group_confirmed, group_unconfirmed, group_repeats, group_proof, group_probable in classified:
                 confirmed.extend(group_confirmed)
                 unconfirmed.extend(group_unconfirmed)
                 repeats.extend(group_repeats)
                 proof.extend(group_proof)
+                probable.extend(group_probable)
     else:
         for group in groups:
-            group_confirmed, group_unconfirmed, group_repeats, group_proof = classify(group)
+            group_confirmed, group_unconfirmed, group_repeats, group_proof, group_probable = classify(group)
             confirmed.extend(group_confirmed)
             unconfirmed.extend(group_unconfirmed)
             repeats.extend(group_repeats)
             proof.extend(group_proof)
+            probable.extend(group_probable)
+    result: tuple = (confirmed, unconfirmed, repeats)
     if include_proof:
-        return confirmed, unconfirmed, repeats, proof
-    return confirmed, unconfirmed, repeats
+        result += (proof,)
+    if include_probable:
+        result += (sorted(probable),)
+    return result
 
 
 def load_audit_rows(con: sqlite3.Connection) -> tuple[list[tuple[str, str, str, str, int]], str]:
@@ -571,6 +678,19 @@ def load_audit_rows(con: sqlite3.Connection) -> tuple[list[tuple[str, str, str, 
                 WHERE pool_id = ?""",
             (pool_id,),
         ).fetchone()
+        supersessions_table = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'review_pool_dedup_supersessions'"
+        ).fetchone()
+        if dedup and supersessions_table:
+            # Schema 70: a superseding (v2) manifest restates the whole dedup state; its counts win.
+            latest = con.execute(
+                """SELECT canonical_count, excluded_count, unconfirmed_risk_count
+                     FROM review_pool_dedup_supersessions WHERE pool_id = ?
+                    ORDER BY sequence DESC LIMIT 1""",
+                (pool_id,),
+            ).fetchone()
+            if latest:
+                dedup = (dedup[0], latest[0], latest[1], latest[2])
     if dedup:
         source_count, canonical_count, excluded_count, unconfirmed_risk_count = map(int, dedup)
         actual_excluded = int(
@@ -638,7 +758,14 @@ def main() -> int:
     candidates = duplicate_groups(rows)
     # RULE C: the audio decides. Text-matched groups whose clips are demonstrably DIFFERENT audio are
     # a narrator repeating a sentence, not a duplicated import.
-    groups, unconfirmed, repeats = confirm_groups_with_audio(candidates, rows)
+    groups, unconfirmed, repeats, probable = confirm_groups_with_audio(candidates, rows, include_probable=True)
+    if probable:
+        print(
+            f"  note: {len(probable)} cross-file pair(s) score between {AUDIO_PROBABLE_CORRELATION} and "
+            f"{AUDIO_DUPLICATE_CORRELATION} at the best lag — above the control ceiling, below the confirmed "
+            f"bar; listed for a human ear, never excluded by machine",
+            flush=True,
+        )
     confirmed_redundant = sum(len({source_file for _, source_file in group}) - 1 for group in groups)
     unconfirmed_risks = sum(
         len({source_file for _, source_file in group}) - 1 for group in unconfirmed

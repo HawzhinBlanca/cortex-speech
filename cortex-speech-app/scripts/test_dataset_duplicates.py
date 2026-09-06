@@ -12,7 +12,10 @@ from pathlib import Path, PureWindowsPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from check_dataset_duplicates import (  # noqa: E402
+from check_dataset_duplicates import (
+    # noqa: E402,
+    audio_alignment,
+    audio_correlation,
     audio_says_duplicate,
     confirm_groups_with_audio,
     duplicate_groups,
@@ -159,10 +162,12 @@ def test_transitive_offset_cluster_does_not_compare_pairs_more_than_500ms_apart(
     # position. The old all-pairs flush compared them anyway and could manufacture a false duplicate.
     near_but_not_exact = TEXT.replace("درێژییەکەی", "درێژییەکی")
     unrelated = "ئەم دەقە ناوەڕۆکێکی جیاوازی هەیە و تەنها بۆ پڕکردنەوەی تاقیکردنەوەکەیە"
+    # Durations 8.0 s and 10.2 s: outside the v2 near-text candidate tolerance (1.5 s), so RULE A'
+    # stays out of this pin and only RULE B's offset semantics are under test.
     rows = [
-        ("a", r"D:\x\one.flac", '{"source_start_ms": 0}', TEXT, 0),
-        ("bridge", r"D:\x\bridge.flac", '{"source_start_ms": 400}', unrelated, 0),
-        ("c", r"D:\x\three.flac", '{"source_start_ms": 800}', near_but_not_exact, 0),
+        ("a", r"D:\x\one.flac", '{"source_start_ms": 0, "source_end_ms": 8000}', TEXT, 0),
+        ("bridge", r"D:\x\bridge.flac", '{"source_start_ms": 400, "source_end_ms": 8400}', unrelated, 0),
+        ("c", r"D:\x\three.flac", '{"source_start_ms": 800, "source_end_ms": 11000}', near_but_not_exact, 0),
     ]
     assert duplicate_groups(rows) == []
 
@@ -264,20 +269,34 @@ def _numpy_or_skip():
         return None
 
 
-def _reading(seconds: float, freq: float, seed: int = 0, phase: float = 0.0):
-    """A stand-in for one spoken take.
+def _take(seconds: float, seed: int = 0, rate: int = 16000):
+    """A stand-in for one spoken take, rendered from a 48 kHz master.
 
-    Deliberately NOT a bare sine: two phase-aligned pure tones are genuinely near-identical signals,
-    so a fixture built from them would test nothing. A take carries its own phase, a wobbling pitch
-    contour, and its own noise — which is exactly what makes two readings of one sentence
-    decorrelate while a duplicated import stays identical.
+    Speech is a broadband process shaped by a syllabic envelope, not a tone: two human readings of one
+    sentence are statistically independent signals (correlation ~0 at EVERY lag), while one recording
+    stays itself however it is cut, shifted or resampled. So a take is a seeded band-limited noise
+    process under a 4 Hz envelope. The same seed is the same recording — at another rate, a longer
+    cut (the generator yields the same prefix), or an offset slice. A different seed is a second take.
+
+    The v1 fixtures were pure tones with a phase offset; the v2 verdict searches lags, and a lag is
+    exactly what undoes a phase offset, so a tone-based "second take" is not a second take at all.
     """
     import numpy as np
 
-    t = np.linspace(0.0, seconds, int(16000 * seconds), endpoint=False)
-    rng = np.random.default_rng(seed)
-    contour = freq * (1.0 + 0.03 * np.sin(2 * np.pi * (0.7 + 0.3 * seed) * t + seed))
-    return (np.sin(2 * np.pi * contour * t + phase) + 0.15 * rng.standard_normal(t.size)).astype("float32")
+    master_rate = 48000
+    n = int(master_rate * seconds)
+    noise = np.random.default_rng(seed).standard_normal(n)
+    kernel = np.ones(24) / 24.0
+    shaped = np.convolve(noise, kernel, mode="same")
+    t = np.arange(n, dtype="float64") / master_rate
+    shaped *= 0.55 + 0.45 * np.sin(2 * np.pi * 4.0 * t)
+    if rate != master_rate:
+        shaped = np.interp(
+            np.arange(int(rate * seconds), dtype="float64") * (master_rate / rate),
+            np.arange(n, dtype="float64"),
+            shaped,
+        )
+    return shaped.astype("float32")
 
 
 def test_identical_audio_is_still_a_duplicate() -> None:
@@ -285,7 +304,7 @@ def test_identical_audio_is_still_a_duplicate() -> None:
     if _numpy_or_skip() is None:
         print("    (skipped: numpy absent — audio confirmation is optional, the text rules above are not)")
         return
-    clip = _reading(1.5, 220.0, seed=1)
+    clip = _take(1.5, seed=1)
     assert audio_says_duplicate(clip, clip.copy()) is True
 
 
@@ -294,28 +313,89 @@ def test_two_readings_of_one_sentence_are_not_a_duplicate() -> None:
     if _numpy_or_skip() is None:
         print("    (skipped: numpy absent — audio confirmation is optional, the text rules above are not)")
         return
-    assert audio_says_duplicate(_reading(1.5, 220.0, seed=1), _reading(1.5, 231.0, seed=2)) is False
-    # Same speaker, same words, same nominal pitch — a second take still decorrelates, because its
-    # phase and contour are its own. This is the case the audiobook intros actually produce.
-    assert (
-        audio_says_duplicate(_reading(1.5, 220.0, seed=1), _reading(1.5, 220.0, seed=9, phase=1.1))
-        is False
-    )
+    assert audio_says_duplicate(_take(1.5, seed=1), _take(1.5, seed=2)) is False
+    # Same speaker, same words, same length to the millisecond — still a second take, still its own
+    # signal at every lag. Measured live: 597 same-voice control pairs never exceeded 0.2.
+    assert audio_correlation(_take(1.5, seed=1), _take(1.5, seed=9)) < 0.2
 
 
-def test_a_different_length_reading_is_not_a_duplicate() -> None:
-    """Two readings of one sentence never match to the millisecond; a duplicate does."""
+def test_a_longer_cut_of_the_same_take_is_a_duplicate_within_the_tolerance() -> None:
+    """v2 (2026-09-06): two CUTS of one recording differ by whole words at the edges.
+
+    Measured live twins ran 6.6 s against 6.4 s and 8.3 s against 8.5 s; the v1 120 ms duration
+    filter declared every one of them unrelated before decoding a sample. Inside the 1.5 s tolerance
+    the longer cut IS the same recording; beyond it the pair is not even compared.
+    """
     if _numpy_or_skip() is None:
         print("    (skipped: numpy absent — audio confirmation is optional, the text rules above are not)")
         return
-    assert audio_says_duplicate(_reading(1.5, 220.0, seed=1), _reading(1.9, 220.0, seed=1)) is False
+    assert audio_says_duplicate(_take(1.5, seed=1), _take(1.9, seed=1)) is True
+    assert audio_says_duplicate(_take(1.5, seed=1), _take(3.5, seed=1)) is False
+
+
+def test_a_shifted_cut_of_the_same_take_is_a_duplicate_and_reports_its_lag() -> None:
+    """The v1 blind spot itself: the same recording cut 300 ms later scored ~0 at zero lag."""
+    np = _numpy_or_skip()
+    if np is None:
+        print("    (skipped: numpy absent — audio confirmation is optional, the text rules above are not)")
+        return
+    take = _take(3.0, seed=4)
+    rate = 16000
+    early = take[: int(2.5 * rate)]
+    late = take[int(0.3 * rate) : int(2.8 * rate)]
+    alignment = audio_alignment(early, late)
+    assert alignment is not None
+    correlation, lag_ms, overlap = alignment
+    assert correlation > 0.95, alignment
+    assert abs(abs(lag_ms) - 300) <= 2, alignment
+    assert overlap > 0.85, alignment
+    assert audio_says_duplicate(early, late) is True
+
+
+def test_a_fragment_overlapping_less_than_the_floor_is_not_a_duplicate() -> None:
+    """Two cuts sharing under 60% of the shorter clip are two different sentences with a shared tail."""
+    if _numpy_or_skip() is None:
+        print("    (skipped: numpy absent — audio confirmation is optional, the text rules above are not)")
+        return
+    take = _take(4.0, seed=5)
+    rate = 16000
+    first = take[: int(2.5 * rate)]
+    second = take[int(1.2 * rate) : int(3.7 * rate)]
+    assert audio_says_duplicate(first, second) is False
+
+
+def test_the_probable_band_is_surfaced_but_never_confirmed() -> None:
+    """Between the control ceiling (0.2) and the confirmed bar (0.4) a pair is listed for a human ear."""
+    np = _numpy_or_skip()
+    if np is None:
+        print("    (skipped: numpy absent — audio confirmation is optional, the text rules above are not)")
+        return
+    base = _take(1.5, seed=1)
+    # 0.3·base + 1.0·other correlates with base at 0.3/sqrt(0.09 + 1) ≈ 0.29: inside the band.
+    blended = (0.3 * base + _take(1.5, seed=7)).astype("float32")
+    score = audio_correlation(base, blended)
+    assert 0.2 <= score < 0.4, score
+    rows = [
+        ("a", r"D:\x\one.wav", ALIGN, TEXT, 0),
+        ("b", r"D:\x\two.wav", ALIGN, TEXT, 0),
+    ]
+    with mock.patch(
+        "check_dataset_duplicates._clip_pcm",
+        side_effect=lambda path, _: (base, 16_000) if "one" in path else (blended, 16_000),
+    ):
+        confirmed, unconfirmed, repeats, probable = confirm_groups_with_audio(
+            duplicate_groups(rows), rows, include_probable=True
+        )
+    assert not confirmed and not unconfirmed, (confirmed, unconfirmed)
+    assert repeats == [[("a", "one.wav"), ("b", "two.wav")]], repeats
+    assert [(left, right) for left, right, _ in probable] == [("a", "b")], probable
 
 
 def test_unreadable_audio_is_never_declared_clean() -> None:
     """None, not False. A clip whose audio cannot be read keeps FAILING the gate."""
     if _numpy_or_skip() is not None:
-        assert audio_says_duplicate(None, _reading(1.0, 220.0)) is None
-        assert audio_says_duplicate(_reading(1.0, 220.0), None) is None
+        assert audio_says_duplicate(None, _take(1.0)) is None
+        assert audio_says_duplicate(_take(1.0), None) is None
 
     # And the group-level wiring keeps it in the failing set rather than the cleared one.
     rows = [

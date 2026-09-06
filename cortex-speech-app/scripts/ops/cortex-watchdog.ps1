@@ -343,11 +343,11 @@ function Get-VerifiedActiveRelease {
         if ($value.schema -isnot [int]) { throw 'release pointer schema is not an integer' }
         if ($value.schema -eq 2) {
             $expected = $currentExpected
-            if ($value.expectedDatabaseSchema -isnot [int] -or $value.expectedDatabaseSchema -ne 69) {
-                throw 'release pointer does not require private-production database schema 69'
+            if ($value.expectedDatabaseSchema -isnot [int] -or $value.expectedDatabaseSchema -ne 70) {
+                throw 'release pointer does not require private-production database schema 70'
             }
         } elseif ($value.schema -eq 1) {
-            # The only legacy boundary still safe for the 65->69 handover is the exact managed v65
+            # The only legacy boundary still safe for the 65->70 handover is the exact managed v65
             # pointer. Schema 63/64 releases are not migration authorities for this controller.
             $expected = $legacyExpected
             if ($value.expectedDatabaseSchema -isnot [int] -or $value.expectedDatabaseSchema -ne 65) {
@@ -389,7 +389,7 @@ function Get-VerifiedActiveRelease {
             if ([string]$value.schemaContract -cne $expectedContract) {
                 throw 'release schema contract is not at its canonical immutable path'
             }
-            if ([string]$value.schemaContractId -cne 'cortex-private-production-schema-65-to-69-v1') {
+            if ([string]$value.schemaContractId -cne 'cortex-private-production-schema-65-to-70-v1') {
                 throw 'release schema contract identity is invalid'
             }
             if ((Get-Sha256Hex ([string]$value.schemaContract)) -cne [string]$value.schemaContractSha256) {
@@ -408,9 +408,10 @@ function Get-VerifiedActiveRelease {
             if ($contractMissing.Count -or $contractExtra.Count) { throw 'release schema contract fields are invalid' }
             $sources = @($contract.supportedMigrationSources)
             if ($contract.schema -isnot [int] -or $contract.schema -ne 1 `
-                -or [string]$contract.contractId -cne 'cortex-private-production-schema-65-to-69-v1' `
-                -or $contract.targetSchema -isnot [int] -or $contract.targetSchema -ne 69 `
-                -or $sources.Count -ne 1 -or $sources[0] -isnot [int] -or $sources[0] -ne 65 `
+                -or [string]$contract.contractId -cne 'cortex-private-production-schema-65-to-70-v1' `
+                -or $contract.targetSchema -isnot [int] -or $contract.targetSchema -ne 70 `
+                -or $sources.Count -ne 2 -or $sources[0] -isnot [int] -or $sources[0] -ne 65 `
+                -or $sources[1] -isnot [int] -or $sources[1] -ne 69 `
                 -or $contract.sameSchemaRecovery -isnot [bool] -or $contract.sameSchemaRecovery -ne $true `
                 -or [string]$contract.normalization -cne 'utf8-lf' `
                 -or [string]$contract.algorithm -cne 'sha256' `

@@ -1327,7 +1327,7 @@ class CompensationReadinessGateTests(unittest.TestCase):
 
         self.assertEqual(code, 1, report)
         self.assertTrue(
-            any("requires exact schema (69,), found 68" in error for error in report["errors"]), report
+            any("requires exact schema (69, 70), found 68" in error for error in report["errors"]), report
         )
 
     def test_verify_10_runs_live_compensation_readiness_without_a_skip_probe(self):

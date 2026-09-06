@@ -2384,12 +2384,12 @@ proof.prepare_bundle(
             scale["sourceSchemaFingerprintSha256"],
             "80e88a4f9b40ecba46aaee933c98dc7aea54fe8ae58ea3178354409188759cd0",
         )
-        self.assertEqual(scale["targetSchemaVersion"], 69)
+        self.assertEqual(scale["targetSchemaVersion"], 70)
         self.assertEqual(
             scale["targetSchemaFingerprintSha256"],
-            "53b13a29c593b56078124914df0f043acad5e9bd0d267b7a0f5bcc8af2ce23dd",
+            "f542f433eb5f235369ed703d8231c9956f246a1e6470c7d1b46a79c29503257c",
         )
-        self.assertEqual(scale["derivedRelativePath"], "db-derived/scale-current-schema69.db")
+        self.assertEqual(scale["derivedRelativePath"], "db-derived/scale-current-schema70.db")
         self.assertEqual(scale["segmentCount"], 30373)
         self.assertEqual(campaign["schemaVersion"], 65)
         self.assertEqual(

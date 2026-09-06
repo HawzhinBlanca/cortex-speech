@@ -197,7 +197,8 @@ def flexible_report_issues(
     excluded_count = dedup.get("excludedSegmentCount")
     if (
         dedup.get("applied") is not True
-        or dedup.get("algorithmId") != "cortex-cross-file-waveform-correlation-v1"
+        or dedup.get("algorithmId")
+        not in ("cortex-cross-file-waveform-correlation-v1", "cortex-cross-file-waveform-correlation-v2")
         or dedup.get("manifestSha256") != manifest.get("dedupManifestSha256")
         or dedup.get("sourceSegmentCount") != clip_count
         or not _exact_nonnegative_int(canonical_count)

@@ -86,7 +86,7 @@ from owner_proof_transaction import (
 APP_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = APP_ROOT.parent
 DEFAULT_CONTRACT = Path(__file__).with_name("owner_proof_input_contract.v1.json")
-RELEASE_CONTRACT_SHA256 = "5e3154af1e42b3c26a8eaba5d9b5ad5ab89c50d4d116fa6be72e26c0e6b22451"
+RELEASE_CONTRACT_SHA256 = "ec4c5a26db969b7016fe738b0ee00e5426c81ddca5e5a50a831f893473f6ebb4"
 MANIFEST_NAME = "manifest.v1.json"
 CONTRACT_BUNDLE_PATH = "contract.v1.json"
 HELPER_BUNDLE_PATH = "tools/owner_proof_db.exe"

@@ -127,23 +127,23 @@ def test_the_queue_serves_what_is_nearest_a_decision() -> None:
     )
     require(
         POOL,
-        "pending.push((distance_to_decision, voice_name, spread_key, segment_id));",
-        "each queue candidate carries decision priority, frozen voice identity, and stable spread identity",
+        'pub const VOICE_PRIORITY: [&str; 3] = ["Lamo", "Kawa", "Halwest"];',
+        "owner direction 2026-09-06: reviewers finish one voice's dataset before the next, Lamo then Kawa then Halwest",
     )
     require(
         POOL,
-        "for voices in tiers.values_mut() {",
-        "voice spreading runs inside each decision-distance tier, so a fresh clip cannot jump nearer consensus work",
+        "let tts_rank = u8::from(crate::review_pool_export::tts_admission(speaker_change_score).is_err());",
+        "inside a voice, clips the TTS set can already admit (measured single-voice) are served first",
     )
     require(
         POOL,
-        "let max_streak = largest.div_ceil(alternatives + 1).max(1);",
-        "the queue derives the tightest same-voice streak bound that the remaining corpus can actually satisfy",
+        "type PendingVoiceCandidate = (usize, usize, String, u8, [u8; 32], String);",
+        "decision distance leads the candidate key, so voice priority can never jump work nearer consensus",
     )
     require(
         POOL,
-        "!remaining_voice_schedule_is_feasible(voices, voice, next_streak, max_streak)",
-        "every selection preserves a feasible bounded-streak schedule for the complete tier, including its tail",
+        "candidates.sort_unstable();",
+        "the queue is one lexicographic sort of frozen facts: identical for every reviewer and after every restart",
     )
 
 

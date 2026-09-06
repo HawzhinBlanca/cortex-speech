@@ -58,7 +58,7 @@ transcript, reviewer credential, or row content.
   authority is rehashed and re-characterized afterward; sibling SQLite journals are refused and
   cannot be consulted by the detached immutable opener.
 - The migrated scale baseline must retain exact segment and distinct-audio-path counts, reach schema
-  69 with the exact release migration prefix/schema contract, pass quick/full/FK integrity, and
+  70 with the exact release migration prefix/schema contract, pass quick/full/FK integrity, and
   retain zero sequential-campaign or flexible-pool authority.
 - The schema-65 campaign-exact authority is inspected through a detached in-memory snapshot while
   stable identity-checked handles deny replacement. A valid sequential campaign must remain
@@ -131,7 +131,7 @@ owner-product-v1/
       scale-production-derived-schema60.db
       current-campaign-exact-schema65.db
     db-derived/
-      scale-current-schema69.db
+      scale-current-schema70.db
     tools/
       owner_proof_db.exe
       owner_proof_db.rs
@@ -184,8 +184,8 @@ to force a green result.
 The release contract also pins these complete normalized schema-catalog fingerprints (FTS shadow
 SQL bodies are intentionally normalized while their catalog/name/table inventory remains bound): schema 60
 `80e88a4f9b40ecba46aaee933c98dc7aea54fe8ae58ea3178354409188759cd0`, schema 65
-`50b62000b8174323221c206bf747a1507cc5e88459bc16a25064ae09b06ecd66`, and current schema 69
-`53b13a29c593b56078124914df0f043acad5e9bd0d267b7a0f5bcc8af2ce23dd`.
+`50b62000b8174323221c206bf747a1507cc5e88459bc16a25064ae09b06ecd66`, and current schema 70
+`f542f433eb5f235369ed703d8231c9956f246a1e6470c7d1b46a79c29503257c`.
 
 These digests identify the already discovered disposable inputs. They are not evidence that a future
 copy still exists or is healthy; only a successful `prepare`, subsequent `validate`, and hash-bound
