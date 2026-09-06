@@ -18,7 +18,9 @@ function jsonResponse(body: unknown) {
   return {
     ok: true,
     status: 200,
-    headers: { get: (name: string) => (name.toLowerCase() === 'content-type' ? 'application/json' : null) },
+    headers: {
+      get: (name: string) => (name.toLowerCase() === 'content-type' ? 'application/json' : null),
+    },
     json: async () => body,
   };
 }
@@ -32,11 +34,20 @@ async function pageWithQueue(items: Array<{ id: string }>, seedOutboxFor: string
       win.fetch = async (input: string) => {
         const url = String(input);
         if (url.endsWith('/api/queue')) {
-          return jsonResponse({ playbackContractVersion: 4, reviewer: 'Sara', items, heldByOthers: 0 });
+          return jsonResponse({
+            playbackContractVersion: 4,
+            reviewer: 'Sara',
+            items,
+            heldByOthers: 0,
+          });
         }
         return jsonResponse({});
       };
-      win.HTMLCanvasElement.prototype.getContext = () => ({ clearRect: () => {}, fillRect: () => {}, fillStyle: '' });
+      win.HTMLCanvasElement.prototype.getContext = () => ({
+        clearRect: () => {},
+        fillRect: () => {},
+        fillStyle: '',
+      });
       win.HTMLMediaElement.prototype.play = async () => {};
       win.HTMLMediaElement.prototype.pause = () => {};
       win.HTMLMediaElement.prototype.load = () => {};
@@ -74,6 +85,50 @@ describe('couch page outbox', () => {
     expect(dom.window.eval('queue.map((s) => s.id)')).toEqual(['s1', 's2']);
   });
 
+  it.each(['E_REVIEW_FAMILY_ALREADY_SEEN', 'E_REVIEW_FAMILY_RETIRED'])(
+    'preserves the typed correction but does not retry a permanent %s refusal',
+    async (code) => {
+      const dom = await pageWithQueue(items, null);
+      let posts = 0;
+      dom.window.fetch = async () => {
+        posts += 1;
+        return { ok: false, status: 409, text: async () => code };
+      };
+      dom.window.eval(
+        `sessionStorage.setItem(draftKey('s1'), 'ڕاستکراوە'); ` +
+          `writeOperationRecord({ operationId: ${JSON.stringify(OP_QUEUED)}, id: 's1', ` +
+          `action: 'edit', text: 'ڕاستکراوە', reviewer: 'Sara', heardMs: 1500, clipDurationMs: 1500 }, Date.now(), 0)`,
+      );
+      const completedBefore = dom.window.eval('doneThisSession');
+      await dom.window.eval('flushOutbox()');
+      expect(posts).toBe(1);
+      expect(dom.window.eval('readOutbox()')).toEqual([]);
+      expect(dom.window.eval("sessionStorage.getItem(draftKey('s1'))")).toBe('ڕاستکراوە');
+      expect(dom.window.eval("refusedMine().some((entry) => entry.id === 's1')")).toBe(true);
+      expect(dom.window.eval('doneThisSession')).toBe(completedBefore);
+      await dom.window.eval('flushOutbox()');
+      expect(posts).toBe(1);
+    },
+  );
+
+  it('keeps retryable server failures queued with their typed correction', async () => {
+    const dom = await pageWithQueue(items, null);
+    dom.window.fetch = async () => ({
+      ok: false,
+      status: 503,
+      text: async () => 'temporarily unavailable',
+    });
+    dom.window.eval(
+      `sessionStorage.setItem(draftKey('s1'), 'ڕاستکراوە'); ` +
+        `writeOperationRecord({ operationId: ${JSON.stringify(OP_QUEUED)}, id: 's1', ` +
+        `action: 'edit', text: 'ڕاستکراوە', reviewer: 'Sara', heardMs: 1500, clipDurationMs: 1500 }, Date.now(), 0)`,
+    );
+    await dom.window.eval('flushOutbox()');
+    expect(dom.window.eval('readOutbox().map((entry) => entry.operationId)')).toEqual([OP_QUEUED]);
+    expect(dom.window.eval("sessionStorage.getItem(draftKey('s1'))")).toBe('ڕاستکراوە');
+    expect(dom.window.eval('refusedMine()')).toEqual([]);
+  });
+
   it('does not hide a clip queued by a different reviewer on a shared phone', async () => {
     const dom = new JSDOM(readFileSync(PAGE, 'utf-8'), {
       runScripts: 'dangerously',
@@ -84,7 +139,11 @@ describe('couch page outbox', () => {
           String(input).endsWith('/api/queue')
             ? jsonResponse({ playbackContractVersion: 4, reviewer: 'Sara', items, heldByOthers: 0 })
             : jsonResponse({});
-        win.HTMLCanvasElement.prototype.getContext = () => ({ clearRect: () => {}, fillRect: () => {}, fillStyle: '' });
+        win.HTMLCanvasElement.prototype.getContext = () => ({
+          clearRect: () => {},
+          fillRect: () => {},
+          fillStyle: '',
+        });
         win.HTMLMediaElement.prototype.play = async () => {};
         win.HTMLMediaElement.prototype.pause = () => {};
         win.HTMLMediaElement.prototype.load = () => {};
