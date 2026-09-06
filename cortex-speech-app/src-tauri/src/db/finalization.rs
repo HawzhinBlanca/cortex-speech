@@ -195,6 +195,10 @@ impl Database {
                 tx.rollback()?;
                 return Ok((None, false));
             }
+            if let (Some("couch"), Some(reviewer)) = (audit_source, annotator) {
+                crate::review_pool::require_unseen_pool_family_on(&tx, segment_id, reviewer)
+                    .map_err(AppError::Validation)?;
+            }
             // The legacy phone writers exist only in the test build. Keep their broad historical
             // characterization useful without weakening the production boundary: synthesize a
             // structurally exact policy-4 Couch authority inside THIS SAME transaction. A failing

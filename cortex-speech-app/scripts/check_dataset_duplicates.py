@@ -72,8 +72,9 @@ RULE_B_COARSE_BINS = 20
 # MEASURED on the live pool (16,990 canonical clips): 8,909 text-matched cross-file pairs, 88% at or
 # above 0.6 at the best lag; 597 same-voice DIFFERENT-sentence control pairs never exceeded 0.2. Same
 # recording through different encodes sits anywhere from 0.4 upward (a windowed drift-robust metric
-# tracked the global one, so the spread is codec/bandwidth, not clock drift). Confirmed at 0.40 =
-# twice the control ceiling; the 0.20..0.40 band is REPORTED as probable, never excluded.
+# tracked the global one, so the spread is codec/bandwidth, not clock drift). Candidate bar 0.40 =
+# twice the control ceiling. These are candidate bands, NOT sufficient exclusion authority.
+# Whole-clip PCM equivalence is required below; correlated non-identical cuts remain unresolved.
 AUDIO_DUPLICATE_CORRELATION = 0.40
 AUDIO_PROBABLE_CORRELATION = 0.20
 AUDIO_MAX_LAG_MS = 1500
@@ -468,13 +469,33 @@ def audio_correlation(a, b, a_rate: int = 16000, b_rate: int = 16000) -> float |
 
 
 def audio_says_duplicate(a, b, a_rate: int = 16000, b_rate: int = 16000) -> bool | None:
-    """True/False when the audio can decide, None when it cannot be read.
+    """True/False when the audio can decide, None when unreadable or inconclusive.
 
-    None is deliberately NOT False: a clip whose audio is missing must never be silently declared
-    clean — the caller reports it as unconfirmed and keeps failing on it.
+    None is deliberately NOT False: missing audio OR correlated but non-identical complete clips
+    remain unconfirmed. A high score cannot authorize discarding unique boundary content.
     """
-    correlation = audio_correlation(a, b, a_rate, b_rate)
-    return None if correlation is None else correlation >= AUDIO_DUPLICATE_CORRELATION
+    alignment = audio_alignment(a, b, a_rate, b_rate)
+    return whole_clip_verdict(a, b, a_rate, b_rate, alignment)
+
+
+def whole_clip_verdict(a, b, a_rate, b_rate, alignment):
+    """Correlation nominates candidates; only complete PCM equivalence authorizes retirement.
+
+    Ignore a constant DC offset, not gain, encoding noise, shifted boundaries, or differing words.
+    No new empirical cutoff is invented: non-identical candidates stay UNKNOWN for review.
+    This conservative rule intentionally trades automatic coverage for no unique-content loss.
+    """
+    if alignment is None:
+        return None
+    if alignment[0] < AUDIO_PROBABLE_CORRELATION:
+        return False
+    import numpy as np
+
+    if a_rate == b_rate and a.size == b.size and a.size:
+        left, right = a.astype("float64"), b.astype("float64")
+        if np.isfinite(left).all() and np.isfinite(right).all() and np.array_equal(left - left[0], right - right[0]):
+            return True
+    return None
 
 
 def confirm_groups_with_audio(groups, rows, *, include_proof: bool = False, include_probable: bool = False):
@@ -522,7 +543,7 @@ def confirm_groups_with_audio(groups, rows, *, include_proof: bool = False, incl
                 pa, pb = pcm_for(group[i][0]), pcm_for(group[j][0])
                 if include_proof or include_probable:
                     alignment = audio_alignment(pa[0], pb[0], pa[1], pb[1]) if pa and pb else None
-                    verdict = None if alignment is None else alignment[0] >= AUDIO_DUPLICATE_CORRELATION
+                    verdict = whole_clip_verdict(pa[0], pb[0], pa[1], pb[1], alignment) if pa and pb else None
                     if alignment is not None and AUDIO_PROBABLE_CORRELATION <= alignment[0] < AUDIO_DUPLICATE_CORRELATION:
                         probable_edges.append((group[i][0], group[j][0], alignment[0]))
                 else:
@@ -793,8 +814,8 @@ def main() -> int:
         if unconfirmed:
             print(
                 f"  {len(unconfirmed)} of those could NOT be confirmed from audio (missing file, "
-                f"unreadable span, or numpy/soundfile absent) — counted as duplicates, because an "
-                f"unreadable clip must never be waved through as clean",
+                f"unreadable span, missing dependencies, or non-identical full content) — unresolved "
+                f"risk keeps this gate closed; it is not permission to exclude a clip",
                 flush=True,
             )
         by_file: dict[frozenset, int] = defaultdict(int)

@@ -226,7 +226,7 @@ def build_manifest(database: Path) -> tuple[dict, dict]:
         candidates, audit_rows, include_proof=True, include_probable=True
     )
     if unconfirmed:
-        raise ValueError(f"duplicate audit has {len(unconfirmed)} unreadable cross-file risk groups")
+        raise ValueError(f"duplicate audit has {len(unconfirmed)} unresolved cross-file risk groups (missing audio or non-identical complete clips); keep these clips for review")
     if len(confirmed) != len(proof):
         raise ValueError("duplicate proof/component cardinality mismatch")
 

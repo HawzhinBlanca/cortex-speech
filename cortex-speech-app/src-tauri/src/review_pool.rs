@@ -871,6 +871,89 @@ fn reviewer_sets(db: &Database) -> Result<HashMap<String, SegmentReviewers>, Str
     reviewer_sets_on(db.connection())
 }
 
+/// Merge only exposure, NEVER transcript opinions, across the active acoustic family. Historical
+/// judgments/credits remain bound to the original clip. Effective views make undo reversible.
+fn family_seen_on(
+    conn: &rusqlite::Connection,
+    reviewers: &HashMap<String, SegmentReviewers>,
+) -> Result<HashMap<String, HashSet<String>>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT exclusion.segment_id, exclusion.canonical_segment_id
+           FROM review_pool_duplicate_exclusions exclusion
+           JOIN review_pool_registry registry ON registry.pool_id=exclusion.pool_id",
+        )
+        .map_err(|error| format!("duplicate family identity cannot be read: {error}"))?;
+    let edges: HashMap<String, String> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut roots: HashMap<String, String> = HashMap::new();
+    for id in edges.keys() {
+        let mut cursor = id;
+        let mut path = HashSet::new();
+        let root = loop {
+            if let Some(root) = roots.get(cursor) {
+                break root.clone();
+            }
+            if !path.insert(cursor.clone()) {
+                return Err("duplicate family identity contains a cycle".into());
+            }
+            match edges.get(cursor) {
+                Some(next) => cursor = next,
+                None => break cursor.clone(),
+            }
+        };
+        for member in path {
+            roots.insert(member, root.clone());
+        }
+    }
+    let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
+    for (id, coverage) in reviewers {
+        seen.entry(roots.get(id).unwrap_or(id).clone()).or_default().extend(coverage.seen.iter().cloned());
+    }
+    Ok(seen)
+}
+
+/// Transaction-bound guard shared by attributed first opinions and independent opinions. This is
+/// prospective: no rewritten judgments, transferred agreement, or retroactive payment reversal.
+pub(crate) fn require_unseen_pool_family_on(
+    conn: &rusqlite::Connection,
+    segment_id: &str,
+    reviewer: &str,
+) -> Result<(), String> {
+    let active: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM review_pool_members member
+          JOIN review_pool_registry registry ON registry.pool_id=member.pool_id WHERE member.segment_id=?1)",
+            [segment_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("review pool membership cannot be checked: {error}"))?;
+    if !active {
+        return Ok(());
+    }
+    let excluded: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM review_pool_duplicate_exclusions WHERE segment_id=?1)",
+            [segment_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if excluded {
+        return Err("E_REVIEW_FAMILY_RETIRED: this duplicate clip is no longer reviewable".into());
+    }
+    let seen = family_seen_on(conn, &reviewer_sets_on(conn)?)?;
+    if seen.get(segment_id).is_some_and(|members| members.contains(&reviewer_key(Some(reviewer)))) {
+        return Err(
+            "E_REVIEW_FAMILY_ALREADY_SEEN: review pool decision is duplicated for this reviewer (recording family)"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn owner_adjudications_on(conn: &rusqlite::Connection) -> Result<HashMap<String, Vec<OwnerAdjudication>>, String> {
     owner_adjudications_for_ids_on(conn, None)
 }
@@ -1137,6 +1220,8 @@ pub fn pending_segment_ids(
     let reviewers = reviewer_sets(db)?;
     let adjudications = owner_adjudications_on(db.connection())?;
     let reviewer = reviewer_key(Some(reviewer));
+    let family_seen = family_seen_on(db.connection(), &reviewers)
+        .map_err(|error| format!("review pool queue cannot be prepared: {error}"))?;
     let mut statement = db
         .connection()
         .prepare(
@@ -1167,7 +1252,7 @@ pub fn pending_segment_ids(
         // active reviewers). The owner priced second opinions at the first-opinion weights, so
         // `record_decision` now mints the credit and the mirror is gone together with the fence.
         let coverage = reviewers.get(&segment_id);
-        if coverage.is_some_and(|coverage| coverage.seen.contains(&reviewer)) {
+        if family_seen.get(&segment_id).is_some_and(|seen| seen.contains(&reviewer)) {
             continue;
         }
         let (resolution, _) = derive_resolution(&segment_id, coverage, adjudications.get(&segment_id));
@@ -1524,27 +1609,8 @@ pub fn operation(db: &Database, operation_id: &str) -> Result<Option<PoolOperati
 }
 
 pub fn reviewer_already_saw(db: &Database, segment_id: &str, reviewer: &str) -> Result<bool, String> {
-    let reviewer = reviewer_key(Some(reviewer));
-    let seen: i64 = db
-        .connection()
-        .query_row(
-            "SELECT CASE WHEN EXISTS (
-                    SELECT 1 FROM speech_segments segment
-                     WHERE segment.id=?1 AND segment.verified=1
-                       AND segment.human_decision IN ('accept','edit','reject')
-                       AND lower(trim(COALESCE(segment.reviewed_by, '@desktop-owner'))) = ?2
-                ) OR EXISTS (
-                    SELECT 1 FROM effective_review_pool_decisions_v62 decision
-                     WHERE decision.segment_id=?1 AND lower(trim(decision.reviewer))=?2
-                ) OR EXISTS (
-                    SELECT 1 FROM effective_independent_review_decisions_v61 decision
-                     WHERE decision.segment_id=?1 AND lower(trim(decision.reviewer))=?2
-                ) THEN 1 ELSE 0 END",
-            rusqlite::params![segment_id, reviewer],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("reviewer pool history cannot be checked: {error}"))?;
-    Ok(seen == 1)
+    let seen = family_seen_on(db.connection(), &reviewer_sets(db)?)?;
+    Ok(seen.get(segment_id).is_some_and(|members| members.contains(&reviewer_key(Some(reviewer)))))
 }
 
 /// Append an independent decision without touching the canonical corpus row.
@@ -1571,6 +1637,7 @@ pub fn record_decision(db: &Database, pool: &ReviewPool, input: &PoolDecisionInp
         let tx = rusqlite::Transaction::new_unchecked(db.connection(), rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("review pool decision cannot lock the database: {error}"))?;
         require_pool_operation_namespace_on(&tx, input.operation_id, false)?;
+        require_unseen_pool_family_on(&tx, input.segment_id, input.reviewer)?;
         let reviewers = reviewer_sets_on(&tx)?;
         let adjudications = owner_adjudications_on(&tx)?;
         let current = reviewers.get(input.segment_id);
@@ -2029,7 +2096,10 @@ mod tests {
         let seed = seed.as_bytes();
         for n in 0..16_000_usize {
             let salt = seed.get(n % seed.len().max(1)).copied().unwrap_or(128) as i16 - 128;
-            writer.write_sample(((n % 1000) as i16).wrapping_mul(30).wrapping_add(salt)).unwrap();
+            // Keep fixtures away from zero crossings: float->i16 truncation must not turn a
+            // constant source DC difference into a changing decoded difference. One-letter seeds
+            // are genuinely DC-equivalent after the production decoder; multi-letter seeds differ.
+            writer.write_sample(((n % 900) as i16 * 30) + 1_000 + salt).unwrap();
         }
         writer.finalize().unwrap();
     }
@@ -4880,6 +4950,39 @@ mod tests {
         assert_eq!(reopened.review_segment_count, 1);
         assert_eq!(reopened.dedup_manifest_sha256.as_deref(), Some(manifest_sha256(&v2).as_str()));
         assert_eq!(pending_segment_ids(&db, &reopened, "Hemn", None).unwrap(), vec!["a".to_string()]);
+        assert!(
+            pending_segment_ids(&db, &reopened, "Rubar", None).unwrap().is_empty(),
+            "a retired twin must not return under its canonical id"
+        );
+        assert!(reviewer_already_saw(&db, "a", "  RUBAR ").unwrap());
+        assert!(require_unseen_pool_family_on(db.connection(), "a", "Rubar")
+            .unwrap_err()
+            .contains("E_REVIEW_FAMILY_ALREADY_SEEN"));
+        assert!(require_unseen_pool_family_on(db.connection(), "c", "Hemn")
+            .unwrap_err()
+            .contains("E_REVIEW_FAMILY_RETIRED"));
+        let ledger_before: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM review_compensation_ledger", [], |row| row.get(0)).unwrap();
+        assert!(db
+            .record_phone_human_decision_by("a", "accept", None, "Rubar")
+            .unwrap_err()
+            .to_string()
+            .contains("E_REVIEW_FAMILY_ALREADY_SEEN"));
+        let writes_before = pool_write_counts(&db);
+        let audio_hash = clip_hash("a");
+        let (_, revision) = db.get_segment_by_id_with_revision("a").unwrap().unwrap();
+        let mut stale_submission = alle_edit_on_a(revision, &audio_hash, OPS[0], None);
+        stale_submission.reviewer = "Rubar";
+        assert!(record_decision(&db, &reopened, &stale_submission)
+            .unwrap_err()
+            .contains("E_REVIEW_FAMILY_ALREADY_SEEN"));
+        assert_eq!(pool_write_counts(&db), writes_before, "no decision, payment or playback consumption on refusal");
+        assert_eq!(
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM review_compensation_ledger", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            ledger_before
+        );
         assert_eq!(exportable_segment_ids(&db).unwrap().unwrap(), ["a".to_string()].into_iter().collect());
         assert!(registry_matches(&db, &reopened).unwrap(), "request-boundary proof follows the latest authority");
 
@@ -4962,7 +5065,57 @@ mod tests {
         let reopened = load(&db).unwrap().unwrap();
         assert_eq!(reopened.review_segment_count, 1);
         assert_eq!(pending_segment_ids(&db, &reopened, "Hemn", None).unwrap(), vec!["c".to_string()]);
+        let mut exposure = reviewer_sets(&db).unwrap();
+        exposure.entry("b".into()).or_default().seen.insert("retired-reviewer".into());
+        assert!(
+            family_seen_on(db.connection(), &exposure).unwrap()["c"].contains("retired-reviewer"),
+            "b -> a -> c must inherit exposure, not an opinion"
+        );
+        assert!(!exposure["c"].judged.contains_key("retired-reviewer"));
         assert_eq!(exportable_segment_ids(&db).unwrap().unwrap(), ["c".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn base_manifest_refuses_nonidentical_whole_audio_without_changing_pool_authority() {
+        let (_dir, db, pool) = clip_pool(&["a", "changed-tail"]);
+        let manifest = family_manifest(
+            &pool,
+            1,
+            None,
+            &[(&["a", "changed-tail"], "a", "best-measured-audio-quality-then-stable-identity", &[])],
+            0,
+            1_000,
+        );
+        let before = dedup_status(&db).unwrap();
+        assert!(apply_dedup_manifest(&db, &manifest).unwrap_err().contains("E_DEDUP_PARTIAL_CONTENT"));
+        assert_eq!(dedup_status(&db).unwrap(), before);
+        assert_eq!(load(&db).unwrap().unwrap().review_segment_count, 2);
+    }
+
+    #[test]
+    fn superseding_manifest_refuses_correlated_but_nonidentical_whole_audio() {
+        let (_dir, db, pool) = clip_pool(&["a", "b", "changed-tail"]);
+        let base = family_manifest(
+            &pool,
+            1,
+            None,
+            &[(&["a", "b"], "a", "best-measured-audio-quality-then-stable-identity", &[])],
+            0,
+            1_000,
+        );
+        apply_dedup_manifest(&db, &base).unwrap();
+        let pool = load(&db).unwrap().unwrap();
+        let next = family_manifest(
+            &pool,
+            2,
+            Some(&manifest_sha256(&base)),
+            &[(&["a", "b", "changed-tail"], "a", "preserve-applied-canonical", &[])],
+            1,
+            2_000,
+        );
+        let before = dedup_status(&db).unwrap();
+        assert!(apply_dedup_manifest(&db, &next).unwrap_err().contains("E_DEDUP_PARTIAL_CONTENT"));
+        assert_eq!(dedup_status(&db).unwrap(), before, "no exclusion or supersession may be committed");
     }
 
     #[test]

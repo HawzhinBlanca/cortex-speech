@@ -974,7 +974,11 @@ mod tests {
             verified: true,
             duration_ms: end_ms - start_ms,
             model_version_id: Some(TEST_CHAMPION.to_string()),
-            alignment_json: Some(format!("{{\"source_start_ms\":{start_ms},\"source_end_ms\":{end_ms}}}")),
+            // Use the complete source metadata consumed by the phone audio decoder, not only the
+            // two fields the export fixture historically needed. Dedup now verifies served PCM too.
+            alignment_json: Some(format!(
+                "{{\"source_start_ms\":{start_ms},\"source_end_ms\":{end_ms},\"chunk_index\":0,\"chunk_count\":1}}"
+            )),
             ..crate::db::SpeechSegment::default()
         }
     }

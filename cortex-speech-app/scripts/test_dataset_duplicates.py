@@ -319,7 +319,7 @@ def test_two_readings_of_one_sentence_are_not_a_duplicate() -> None:
     assert audio_correlation(_take(1.5, seed=1), _take(1.5, seed=9)) < 0.2
 
 
-def test_a_longer_cut_of_the_same_take_is_a_duplicate_within_the_tolerance() -> None:
+def test_a_longer_cut_of_the_same_take_requires_content_review() -> None:
     """v2 (2026-09-06): two CUTS of one recording differ by whole words at the edges.
 
     Measured live twins ran 6.6 s against 6.4 s and 8.3 s against 8.5 s; the v1 120 ms duration
@@ -329,11 +329,11 @@ def test_a_longer_cut_of_the_same_take_is_a_duplicate_within_the_tolerance() -> 
     if _numpy_or_skip() is None:
         print("    (skipped: numpy absent — audio confirmation is optional, the text rules above are not)")
         return
-    assert audio_says_duplicate(_take(1.5, seed=1), _take(1.9, seed=1)) is True
+    assert audio_says_duplicate(_take(1.5, seed=1), _take(1.9, seed=1)) is None
     assert audio_says_duplicate(_take(1.5, seed=1), _take(3.5, seed=1)) is False
 
 
-def test_a_shifted_cut_of_the_same_take_is_a_duplicate_and_reports_its_lag() -> None:
+def test_a_shifted_cut_reports_its_lag_but_requires_content_review() -> None:
     """The v1 blind spot itself: the same recording cut 300 ms later scored ~0 at zero lag."""
     np = _numpy_or_skip()
     if np is None:
@@ -349,7 +349,7 @@ def test_a_shifted_cut_of_the_same_take_is_a_duplicate_and_reports_its_lag() -> 
     assert correlation > 0.95, alignment
     assert abs(abs(lag_ms) - 300) <= 2, alignment
     assert overlap > 0.85, alignment
-    assert audio_says_duplicate(early, late) is True
+    assert audio_says_duplicate(early, late) is None, "shared recording is not identical full content"
 
 
 def test_a_fragment_overlapping_less_than_the_floor_is_not_a_duplicate() -> None:
@@ -386,8 +386,8 @@ def test_the_probable_band_is_surfaced_but_never_confirmed() -> None:
         confirmed, unconfirmed, repeats, probable = confirm_groups_with_audio(
             duplicate_groups(rows), rows, include_probable=True
         )
-    assert not confirmed and not unconfirmed, (confirmed, unconfirmed)
-    assert repeats == [[("a", "one.wav"), ("b", "two.wav")]], repeats
+    assert not confirmed and not repeats, (confirmed, repeats)
+    assert unconfirmed == [[("a", "one.wav"), ("b", "two.wav")]], unconfirmed
     assert [(left, right) for left, right, _ in probable] == [("a", "b")], probable
 
 
@@ -440,6 +440,33 @@ def test_audio_confirmation_ignores_same_file_pairs_and_splits_true_components()
     assert confirmed == [[("a1", "one.wav"), ("a2", "one.wav"), ("b", "two.wav")]], confirmed
     assert not unconfirmed and not repeats
     assert audio.call_count == 5  # six total pairs minus the one same-file pair
+
+
+def test_partial_matching_content_never_authorizes_whole_clip_exclusion() -> None:
+    np = _numpy_or_skip()
+    if np is None:
+        return
+    left = np.random.default_rng(20260906).normal(size=64000)
+    right = left.copy()
+    right[38400:] = np.random.default_rng(99).normal(size=25600)
+    assert audio_correlation(left, right) > 0.4
+    assert audio_says_duplicate(left, right) is None
+    rows = [("a", "one.wav", ALIGN, TEXT, 0), ("b", "two.wav", ALIGN, TEXT, 0)]
+    with mock.patch("check_dataset_duplicates._clip_pcm", side_effect=lambda path, _: (left if path == "one.wav" else right, 16000)):
+        for flags in ({}, {"include_proof": True}, {"include_probable": True}):
+            result = confirm_groups_with_audio(duplicate_groups(rows), rows, **flags)
+            assert not result[0] and result[1] and not result[2], result
+
+
+def test_full_pcm_equivalence_allows_only_constant_dc_offset() -> None:
+    np = _numpy_or_skip()
+    if np is None:
+        return
+    left = np.arange(16000, dtype="float64") % 97
+    assert audio_says_duplicate(left, left + 2) is True
+    changed = left.copy()
+    changed[-1] += 2
+    assert audio_says_duplicate(left, changed) is None, "even a one-sample changed edge is not full identity"
 
 
 def main() -> int:

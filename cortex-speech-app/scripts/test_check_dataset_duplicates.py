@@ -88,13 +88,13 @@ def _write_wav(sf, path: Path, data, rate: int) -> Path:
     raise AssertionError(f"fixture {path} never settled")
 
 
-def test_the_same_sentence_at_48k_and_16k_is_a_duplicate() -> None:
+def test_the_same_sentence_at_48k_and_16k_stays_an_unresolved_candidate() -> None:
     """The masters-vs-WAV case the gate was blind to. Same audio, two rates, MUST confirm."""
     if _audio_or_skip() is None:
         print("    (skipped: numpy/soundfile absent — audio confirmation is optional)")
         return
     a, b = _take(1.5, 48000, seed=1), _take(1.5, 16000, seed=1)
-    assert audio_says_duplicate(a, b, 48000, 16000) is True
+    assert audio_says_duplicate(a, b, 48000, 16000) is None
 
 
 def test_mixed_rate_durations_are_compared_in_true_milliseconds() -> None:
@@ -107,7 +107,7 @@ def test_mixed_rate_durations_are_compared_in_true_milliseconds() -> None:
     assert abs(a.size - b.size) / 16000 * 1000 > AUDIO_DURATION_TOLERANCE_MS
     # v2: a longer CUT of the same recording inside the 1.5 s tolerance is the same recording at
     # either rate; a take longer than the tolerance is still refused before any decode.
-    assert audio_says_duplicate(_take(1.5, 48000, seed=1), _take(1.9, 16000, seed=1), 48000, 16000) is True
+    assert audio_says_duplicate(_take(1.5, 48000, seed=1), _take(1.9, 16000, seed=1), 48000, 16000) is None
     assert audio_says_duplicate(_take(1.5, 48000, seed=1), _take(3.5, 16000, seed=1), 48000, 16000) is False
 
 
@@ -123,7 +123,7 @@ def test_two_different_readings_at_mixed_rates_are_not_a_duplicate() -> None:
 
 
 def test_clip_pcm_carries_the_file_rate_end_to_end() -> None:
-    """Whole path on real files: 48 kHz master + 16 kHz WAV of one sentence lands in `confirmed`."""
+    """Resampling nominates a likely twin but cannot authorize whole-clip exclusion."""
     if _audio_or_skip() is None:
         print("    (skipped: numpy/soundfile absent — audio confirmation is optional)")
         return
@@ -143,8 +143,8 @@ def test_clip_pcm_carries_the_file_rate_end_to_end() -> None:
         groups = duplicate_groups(rows)
         assert len(groups) == 1, groups
         confirmed, unconfirmed, repeats = confirm_groups_with_audio(groups, rows)
-        assert len(confirmed) == 1, (confirmed, unconfirmed, repeats)
-        assert not repeats and not unconfirmed, (repeats, unconfirmed)
+        assert len(unconfirmed) == 1, (confirmed, unconfirmed, repeats)
+        assert not repeats and not confirmed, (repeats, confirmed)
 
 
 def test_a_genuine_repeat_across_rates_is_still_cleared() -> None:
