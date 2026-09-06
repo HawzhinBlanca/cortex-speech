@@ -98,6 +98,8 @@ POOL_DEDUP_COUNT_TABLES = (
     "review_pool_dedup_manifests",
     "review_pool_duplicate_exclusions",
 )
+POOL_DEDUP_SUPERSESSION_SCHEMA_VERSION = 70
+POOL_DEDUP_SUPERSESSION_COUNT_TABLES = ("review_pool_dedup_supersessions",)
 MANIFEST_FIELDS = {
     "schema",
     "createdAtEpochSecs",
@@ -128,7 +130,7 @@ from policy_python import sha256_file
 
 
 def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
-    """Keep old evidence shapes exact while binding every review authority through v65."""
+    """Keep old evidence shapes exact while binding every review authority through v70."""
 
     tables = BASE_COUNT_TABLES
     if schema_version >= HIDDEN_KEY_SCHEMA_VERSION:
@@ -141,6 +143,8 @@ def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
         tables += POOL_RESOLUTION_COUNT_TABLES
     if schema_version >= POOL_DEDUP_SCHEMA_VERSION:
         tables += POOL_DEDUP_COUNT_TABLES
+    if schema_version >= POOL_DEDUP_SUPERSESSION_SCHEMA_VERSION:
+        tables += POOL_DEDUP_SUPERSESSION_COUNT_TABLES
     return tables
 
 

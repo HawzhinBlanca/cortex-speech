@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+from contextlib import closing
 import json
 import sqlite3
 import sys
@@ -701,6 +702,28 @@ def test_schema64_evidence_requires_duplicate_authority_only_at_v64() -> None:
         drill_module.POOL_DEDUP_EVIDENCE_TABLES
     )
     assert drill_module.evidence_tables_for_schema(65) == at_64
+
+
+def test_schema70_restore_requires_exact_supersession_count_and_preserves_schema69_shape() -> None:
+    table = "review_pool_dedup_supersessions"
+    assert drill_module.evidence_tables_for_schema(69) == drill_module.evidence_tables_for_schema(64)
+    assert drill_module.evidence_tables_for_schema(70) == drill_module.evidence_tables_for_schema(69) + (table,)
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        seed_tree(root, policy=False, db_schema=70)
+        with closing(sqlite3.connect(root / drill_module.DB_FILE)) as connection:
+            connection.execute(f"CREATE TABLE {table}(id INTEGER PRIMARY KEY)")
+            connection.execute(f"INSERT INTO {table} VALUES(1)")
+            connection.commit()
+        payload = write_manifest(root, 2)
+        assert payload["databaseEvidence"]["rowCounts"][table] == 1
+        assert drill_module.drill(root) == []
+        payload["databaseEvidence"]["rowCounts"][table] = 0
+        write_payload(root, payload)
+        assert_refused(root, "databaseEvidence does not exactly match")
+        del payload["databaseEvidence"]["rowCounts"][table]
+        write_payload(root, payload)
+        assert_refused(root, "rowCounts fields are invalid")
 
 
 def main() -> int:
