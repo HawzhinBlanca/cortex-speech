@@ -1,5 +1,33 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-06 — Dedup v2 release deployed (schema 70) after one rolled-back handover
+
+**First handover 09:51 AST (release `41ca1eccb6c3-…-2c260072055f`), rolled back.** Stage, clone preflight, app stop,
+bound snapshot, live migration 69→70, `apply-dedup` v2, `stamp-rights`, `certify --full-integrity` and all ten
+reviewer queue probes/benchmarks passed on the live database; the new app launched and Couch resumed for 10 reviewers
+at 09:53:42. `register_release_tasks` then ran the release watchdog's `-Register`, whose `Get-VerifiedActiveRelease`
+still pinned the dedup manifest to `manifestSchema -ne 1` and threw `release dedup manifest identity does not match
+the pointer`; the handover failed and `recover` restored the pre-migration snapshot, relaunched 96d8fc2e (09:54:31)
+and quarantined the schema-70 database. No decision, event or ledger row was lost (271/3,029/2,438 before and after).
+Root cause found offline by running the release watchdog in `-DryRun` with `CORTEX_WATCHDOG_DATA_DIR` pointed at the
+candidate pointer plus the quarantined database (queue probes and latency benchmarks replayed green against the same
+database first). Lesson recorded: the clone preflight never exercises the post-launch scripts; the staging script now
+dry-runs the release watchdog against the staged pointer and a migrated clone before a deploy command is handed over.
+
+**Fixes.** #105 `validate_dedup_manifest` accepts schema 2 (supersedes + v2 algorithm, digest-bound) — the first
+staging attempt had refused the v2 manifest; #106 watchdog `manifestSchema -notin @(1, 2)`, plus a Windows pin that runs
+the real watchdog on a staged schema-2 pointer (blocked one step later on the missing database, never on dedup identity)
+and refuses a self-consistent schema-3 manifest. Release suite 36 passed.
+
+**Second handover 11:46 AST (release `acf819f5ae96-1a1f62126035-f10b39b0539b-830d5f8ea072-2c260072055f`): READY.**
+Live, verified read-only: schema 70; `review_pool_dedup_supersessions` sequence 1 = `2c260072055f…` (excluded 9,079,
+canonical 11,244, newly excluded 5,746, reviewed twins retired 587); 9,079 exclusion rows of which 5,746 name the v2
+manifest; decisions/events/ledger unchanged; Couch resumed for 10 reviewers with their existing links; watchdog armed on
+the new exe, recovery arm unregistered; links (Funnel), queues, compensation readiness and supervision gates exit 0.
+`pool_admin status`: Lamo 7,352 clips (resolved 117, one opinion 1,211, untouched 5,939), Kawa 2,949, Halwest 943;
+resolved 123 (27 resolved twins retired behind their canonical). Owner follow-ups unchanged: the 555 probable pairs and
+the one cross-voice recording in the sidecar.
+
 ## 2026-09-06 — Duplicates v2 (lag-tolerant, superseding manifest, schema 70) and the Lamo-first queue
 
 **Owner direction (not canon):** finish one voice's dataset before the next — Lamo, then Kawa, then Halwest — and
