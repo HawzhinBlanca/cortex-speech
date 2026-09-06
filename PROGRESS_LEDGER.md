@@ -1,5 +1,29 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-06 — Spelling convention v1.1 (draft) and the machine second-look calibration plan
+
+**Why.** The owner asked a cloud model to review pool drafts and a 25-clip self-graded run claimed
+"single-pass gold review" quality. The run used the 25 shortest clips, had human text for 2 of 25, and
+on one of those moved the text further from the human than the raw draft. Before any machine reviews
+the pool, both humans and machines need one spelling rule and one honest calibration.
+
+**Measured first (read-only, 3,311 human verdict texts, 1,302 edits).** Reviewers disagree mostly on
+spacing/joining and vowel spelling (top inserted/deleted characters: space, ە, ی, ا, و, ئ, ێ); hamza
+and word-initial ڕ are already near-universal; digits appear in 2.8% and punctuation in 4.3% of
+verdicts; the elongated filler tokens of `ANNOTATION_GUIDELINES.md` occur zero times.
+
+**Contradiction found.** `ANNOTATION_GUIDELINES.md` (numbers as digits; elongated filler tokens) vs
+`SORANI_VERBATIM_CONVENTIONS_v1.md` (ACTIVE: numbers as spoken words; fillers as heard). Reviewers
+follow v1.0 in both cases, so the premium builder's filler filter currently filters nothing.
+
+**Drafted (owner approval pending, nothing in force).** `cortex-speech-app/docs/REVIEWER_SPELLING_
+CONVENTION.md` (v1.1 supplement: letters, the missing spacing rule, numbers resolved toward v1.0, no
+punctuation, forgiven-vs-counted table taken from `normalize_for_metrics`) and `cortex-speech-app/docs/
+MACHINE_SECOND_LOOK_CALIBRATION_PLAN.md` (keys: 188 finalizer-grade keeps, 273 two-human identical, 222
+two-human differing, 104 human rejects, the owner's 32-clip overlap set; frozen blind configuration;
+both candidate judge models on the identical set with a 30% hold-out; pass bar as a nominator only).
+Canon unchanged: a machine opinion is evidence, never one of the two agreeing reviewers.
+
 ## 2026-09-06 — Owner listen list, file-name search, and the overlap question
 
 **Owner listened to the cross-voice group** (`lamo_016604`, `lamo_016931`, `halwest_000971`, `halwest_003313`):
