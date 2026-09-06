@@ -380,7 +380,8 @@ function Get-VerifiedActiveRelease {
             $value.$field = $resolved
         }
         $dedup = Get-Content -LiteralPath ([string]$value.dedupManifest) -Raw | ConvertFrom-Json
-        if ($dedup.manifestSchema -ne 1 -or [string]$dedup.manifestSha256 -ne [string]$value.dedupManifestSha256) {
+        # Schema 1 = the v1 base manifest; schema 2 = a superseding lag-tolerant manifest (schema 70+).
+        if ($dedup.manifestSchema -notin @(1, 2) -or [string]$dedup.manifestSha256 -ne [string]$value.dedupManifestSha256) {
             throw 'release dedup manifest identity does not match the pointer'
         }
         if ($dedup.summary.unconfirmedRiskGroups -ne 0) { throw 'release dedup manifest has unresolved risk' }
