@@ -1206,9 +1206,9 @@ pub fn pending_segment_ids(
         };
         // Decision proximity stays the first authority. Inside a tier the OWNER DIRECTION of
         // 2026-09-06 applies: finish one voice's dataset before the next (Lamo, then Kawa, then
-        // Halwest), and inside a voice serve the clips the speaker-change probe already measured as
-        // single-voice before the candidates and the unmeasured, because those are the clips the TTS
-        // set can admit (`review_pool_export::tts_admission`). The earlier proportional voice interleave
+        // Halwest), and inside a voice prefer clips passing the calibrated turn-change screen.
+        // `review_pool_export::tts_admission` is the legacy screen name, NOT gold qualification:
+        // simultaneous overlap/target speaker still need separate proof. The earlier proportional voice interleave
         // (2026-09-04) spread every reviewer across all three voices, so no voice ever reached a
         // usable TTS set. `created_at` is source-ingest order and produced runs such as 011978,
         // 011979, 011981, so equal work still spreads on a content-independent SHA-256 of the clip id.
