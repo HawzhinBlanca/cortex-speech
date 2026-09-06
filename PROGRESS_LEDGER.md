@@ -1,5 +1,43 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-06 — Owner listen list, file-name search, and the overlap question
+
+**Owner listened to the cross-voice group** (`lamo_016604`, `lamo_016931`, `halwest_000971`, `halwest_003313`):
+Halwest speaking with Lamo overlapping — a labelling fault AND an overlap. He asked to reject all four and
+"just remove the bad overlapped voices" for a fully clean gold set.
+
+**What the machine already does, and what it may not.** All four score 0.52 on the speaker-change probe, below
+the 0.59 TTS bar, so the gold TTS set never admitted them (the overlap made the two halves differ). No learning
+export ships a clip without two agreeing reviewers. The probe is not an overlap detector, though: an overlap that
+keeps a high score passes it, and only a human ear catches it — the reviewers' "second voice or overlap is BAD"
+rule is the definitive gate. Owner adjudication (`pool_admin adjudicate --reject`) was tried on his instruction
+and REFUSED by canon: "owner adjudication is allowed only after three distinct outcomes"; the four have none.
+That refusal stood — the machine never writes a human verdict, including the owner's, outside a serving path
+with playback evidence. A snapshot was taken and nothing was written; the app was relaunched by the watchdog.
+
+**Owner listen list** (`listen_list.rs`, `<data_dir>/review_listen_list.json`): `{ "Hawzhin": ["lamo_016604", …] }`
+— clip ids or audio basenames (extension optional, ASCII case-insensitive), re-read per queue request like the
+dialect roster. `review_pool::pending_segment_ids_with_listen_list` puts the named clips FIRST for that reviewer
+only (leading key of the candidate sort), every other rule intact: membership, duplicate exclusion, dialect,
+resolution, and never a clip the reviewer already judged. Missing file = nothing prioritised; a broken file is
+logged and IGNORED (a priority hint cannot take work away or misroute dialects, so it fails open, unlike the
+roster). Couch `api_queue` loads it from the session data dir; `pool_admin probe` reports `listenListClips`.
+Pins: `test_consensus_review_canon.py` (listen rank is the only key ahead of decision distance),
+`test_pool_pay_fence_scope_policy.py`; Rust `the_owner_listen_list_brings_named_clips_to_that_reviewer_first_and_
+nobody_else` plus four `listen_list` unit tests. The live file for the owner's reviewer identity names the four
+clips; it takes effect with the next release.
+
+**Search by file name.** The desktop search ("search didn't find it") was scoped to transcript columns only
+(Round-23 #7 stopped folder words from matching) while its placeholder promised "files". Now a file-shaped token
+(ASCII with a digit and `_`/`-`/`.`, e.g. `lamo_016604`, `KBHP-EP08.wav`) additionally matches the `audio_path`
+column, and `file:<text>` searches paths only; plain words such as a folder name still never match. Placeholder
+corrected in both languages (and the e2e pins). Pin: `search_finds_a_clip_by_its_file_name_token_but_never_by_a_
+folder_word`, alongside the untouched Round-23 #7 pin.
+
+**Next research step (agreed with the owner):** evaluate a dedicated overlapped-speech detector as a further
+MEASURED gate for the TTS set; if it separates cleanly on this library, overlap becomes machine-excluded by
+measurement — never by guess.
+
 ## 2026-09-06 — Dedup v2 release deployed (schema 70) after one rolled-back handover
 
 **First handover 09:51 AST (release `41ca1eccb6c3-…-2c260072055f`), rolled back.** Stage, clone preflight, app stop,

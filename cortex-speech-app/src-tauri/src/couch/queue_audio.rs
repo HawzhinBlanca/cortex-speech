@@ -393,8 +393,22 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
         None
     };
     let pending_result = match pool_policy.as_ref() {
-        Some(pool) => crate::review_pool::pending_segment_ids(db, pool, reviewer, allowed_dialects.as_deref())
-            .map_err(crate::error::AppError::Validation),
+        Some(pool) => {
+            // Owner listen list (`review_listen_list.json`): re-read per request like the dialect roster,
+            // so naming a clip takes effect on this reviewer's next queue fetch without a restart.
+            let listen_first = {
+                let data_dir = lock_state(state).session_store.as_ref().map(|(data_dir, _db_path)| data_dir.clone());
+                data_dir.map(|dir| crate::listen_list::listen_first_for(&dir, reviewer, pool)).unwrap_or_default()
+            };
+            crate::review_pool::pending_segment_ids_with_listen_list(
+                db,
+                pool,
+                reviewer,
+                allowed_dialects.as_deref(),
+                &listen_first,
+            )
+            .map_err(crate::error::AppError::Validation)
+        }
         None => match campaign_policy.as_ref().filter(|policy| policy.is_blinded_second_pass()) {
             Some(policy) => crate::review_campaign::independent_pending_segment_ids(db, policy)
                 .map_err(crate::error::AppError::Validation),

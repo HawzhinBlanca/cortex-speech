@@ -1054,7 +1054,12 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             let dialects = repeated_values(&args, "--dialect")?;
             let pool = review_pool::load(&db)?.ok_or("review pool is not active")?;
             let allowed = (!dialects.is_empty()).then_some(dialects.as_slice());
-            let available = review_pool::pending_segment_ids(&db, &pool, &reviewer, allowed)?;
+            let listen_first = db_path
+                .parent()
+                .map(|data_dir| cortex_speech_app_lib::listen_list::listen_first_for(data_dir, &reviewer, &pool))
+                .unwrap_or_default();
+            let available =
+                review_pool::pending_segment_ids_with_listen_list(&db, &pool, &reviewer, allowed, &listen_first)?;
             let segment_id = available.first().ok_or("canonical queue has no audio sample for this reviewer")?;
             let segment = db.get_segment_by_id(segment_id)?.ok_or("canonical queue sample disappeared")?;
             let audio = cortex_speech_app_lib::agentic::segment_audio_as_wav_bytes(&segment)?;
@@ -1068,6 +1073,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                     "reviewer": reviewer,
                     "dialects": dialects,
                     "availableClips": available.len(),
+                    "listenListClips": listen_first.len(),
                     "sampleSegmentId": segment_id,
                     "sampleAudioBytes": audio.len(),
                     "sampleAudioValidWav": valid_wav,

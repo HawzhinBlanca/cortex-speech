@@ -27,13 +27,13 @@ test.describe('Navigation and panel interaction', () => {
     await page.goto('/');
 
     await expect(page.getByTestId('segments-empty-state')).not.toBeVisible({ timeout: 15_000 });
-    await expect(page.getByPlaceholder('Search transcripts, files, speakers...')).toBeVisible();
+    await expect(page.getByPlaceholder('Search transcripts, or a file name like lamo_016604')).toBeVisible();
   });
 
   test('search bar clear button appears on input', async ({ page }) => {
     await page.goto('/');
 
-    const searchInput = page.getByPlaceholder('Search transcripts, files, speakers...');
+    const searchInput = page.getByPlaceholder('Search transcripts, or a file name like lamo_016604');
     await expect(searchInput).toBeVisible();
 
     await expect(page.getByLabel('Clear search')).not.toBeVisible();
@@ -49,7 +49,7 @@ test.describe('Navigation and panel interaction', () => {
   test('search query persists across a restart (session restore)', async ({ page }) => {
     await page.goto('/');
 
-    const placeholder = 'Search transcripts, files, speakers...';
+    const placeholder = 'Search transcripts, or a file name like lamo_016604';
     const searchInput = page.getByPlaceholder(placeholder);
     await expect(searchInput).toBeVisible();
     await searchInput.fill('بەڕێوە');

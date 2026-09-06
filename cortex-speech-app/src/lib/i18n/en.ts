@@ -467,7 +467,7 @@ export const en = {
   'inference.p50': 'p50',
   'inference.p99': 'p99',
   'inference.modelLoad': 'Model load',
-  searchPlaceholder: 'Search transcripts, files, speakers...',
+  searchPlaceholder: 'Search transcripts, or a file name like lamo_016604',
   clearSearch: 'Clear search',
   searchFailed: 'Search failed',
   filterVerified: 'Verified',

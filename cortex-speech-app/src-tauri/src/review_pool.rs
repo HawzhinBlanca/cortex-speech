@@ -71,6 +71,11 @@ struct PoolMemberEvidence {
 type PoolSourceRow = (String, String, Option<String>, Option<i64>, Option<i64>, i64);
 
 impl ReviewPool {
+    /// Live (non-retired) members as `(clip id, audio path)`, for the owner listen list.
+    pub(crate) fn member_audio_paths(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.audio_paths.iter()
+    }
+
     /// Frozen identity of a member retired by duplicate exclusion (None for a live or unknown clip).
     fn retired_member(&self, segment_id: &str) -> Option<&PoolMemberEvidence> {
         self.retired_members.get(segment_id)
@@ -1128,6 +1133,19 @@ pub fn pending_segment_ids(
     reviewer: &str,
     allowed_dialects: Option<&[String]>,
 ) -> Result<Vec<String>, String> {
+    pending_segment_ids_with_listen_list(db, pool, reviewer, allowed_dialects, &HashSet::new())
+}
+
+/// `pending_segment_ids` with the owner listen list (`listen_list.rs`): the clips in `listen_first`
+/// that this reviewer may still judge come before everything else, in the same deterministic order
+/// among themselves. The list re-orders only; every filter below still applies to a listed clip.
+pub fn pending_segment_ids_with_listen_list(
+    db: &Database,
+    pool: &ReviewPool,
+    reviewer: &str,
+    allowed_dialects: Option<&[String]>,
+    listen_first: &HashSet<String>,
+) -> Result<Vec<String>, String> {
     // `load` performs the full O(pool) identity/history proof once at Start. Schema v62 then makes
     // membership and every clip identity field immutable, while each decision insert re-proves its
     // exact member/audio/reviewer boundary transactionally. Repeating the full 20k-row proof on every
@@ -1222,6 +1240,7 @@ pub fn pending_segment_ids(
             .ok_or_else(|| format!("review pool clip {segment_id} has no frozen voice identity"))?;
         let tts_rank = u8::from(crate::review_pool_export::tts_admission(speaker_change_score).is_err());
         pending.push((
+            u8::from(!listen_first.contains(&segment_id)),
             distance_to_decision,
             voice_priority_rank(&voice_name),
             voice_name,
@@ -1233,9 +1252,10 @@ pub fn pending_segment_ids(
     Ok(order_pending_by_voice_priority(pending))
 }
 
-/// Queue candidate: decision distance, voice priority rank, frozen voice name (orders voices the
-/// priority list does not name), TTS admission rank (0 = measured single-voice), spread key, clip id.
-type PendingVoiceCandidate = (usize, usize, String, u8, [u8; 32], String);
+/// Queue candidate: listen-list rank (0 = the owner asked this reviewer to hear it next), decision
+/// distance, voice priority rank, frozen voice name (orders voices the priority list does not name),
+/// TTS admission rank (0 = measured single-voice), spread key, clip id.
+type PendingVoiceCandidate = (u8, usize, usize, String, u8, [u8; 32], String);
 
 /// Owner direction 2026-09-06: reviewers finish one voice's dataset before starting the next, in
 /// this order. A voice the list does not name sorts after all of them, alphabetically, so a future
@@ -1251,7 +1271,7 @@ fn voice_priority_rank(voice_name: &str) -> usize {
 /// frozen facts, so two reviewers and two restarts always derive the same queue.
 fn order_pending_by_voice_priority(mut candidates: Vec<PendingVoiceCandidate>) -> Vec<String> {
     candidates.sort_unstable();
-    candidates.into_iter().map(|(_, _, _, _, _, segment_id)| segment_id).collect()
+    candidates.into_iter().map(|(_, _, _, _, _, _, segment_id)| segment_id).collect()
 }
 
 pub fn coverage_by_voice(db: &Database) -> Result<Vec<VoiceCoverage>, String> {
@@ -3193,9 +3213,9 @@ mod tests {
         );
 
         let nearer = order_pending_by_voice_priority(vec![
-            (2, 0, "Lamo".into(), 0, [0; 32], "fresh-lamo".into()),
-            (0, 2, "Halwest".into(), 1, [u8::MAX; 32], "near-halwest".into()),
-            (1, 1, "Kawa".into(), 0, [0; 32], "disputed-kawa".into()),
+            (1, 2, 0, "Lamo".into(), 0, [0; 32], "fresh-lamo".into()),
+            (1, 0, 2, "Halwest".into(), 1, [u8::MAX; 32], "near-halwest".into()),
+            (1, 1, 1, "Kawa".into(), 0, [0; 32], "disputed-kawa".into()),
         ]);
         assert_eq!(
             nearer,
@@ -3208,11 +3228,53 @@ mod tests {
         );
         assert_eq!(voice_priority_rank("Someone"), 3, "an unnamed voice sorts after every named one");
         let unnamed = order_pending_by_voice_priority(vec![
-            (0, 3, "Zara".into(), 0, [0; 32], "zara".into()),
-            (0, 3, "Aram".into(), 0, [0; 32], "aram".into()),
-            (0, 2, "Halwest".into(), 1, [0; 32], "halwest".into()),
+            (1, 0, 3, "Zara".into(), 0, [0; 32], "zara".into()),
+            (1, 0, 3, "Aram".into(), 0, [0; 32], "aram".into()),
+            (1, 0, 2, "Halwest".into(), 1, [0; 32], "halwest".into()),
         ]);
         assert_eq!(unnamed, vec!["halwest", "aram", "zara"], "unnamed voices follow the named ones alphabetically");
+    }
+
+    /// Owner direction 2026-09-06: a clip the owner names in `review_listen_list.json` is served to
+    /// THAT reviewer first, ahead of decision distance and voice priority; nobody else's queue moves,
+    /// and every other rule still applies (a listed clip the reviewer already judged stays gone).
+    #[test]
+    fn the_owner_listen_list_brings_named_clips_to_that_reviewer_first_and_nobody_else() {
+        let (_dir, db, pool) = clip_pool(&["a", "b", "c"]);
+        let data_dir = tempfile::tempdir().unwrap();
+        let baseline = pending_segment_ids(&db, &pool, "Hemn", None).unwrap();
+        assert_eq!(baseline.len(), 3);
+        let last = baseline[2].clone();
+        std::fs::write(
+            data_dir.path().join(crate::listen_list::FILE_NAME),
+            format!(r#"{{ "_comment": "owner", "hemn": ["{last}.WAV", "not-a-clip"] }}"#),
+        )
+        .unwrap();
+        let listed = crate::listen_list::listen_first_for(data_dir.path(), "Hemn", &pool);
+        assert_eq!(
+            listed,
+            [last.clone()].into_iter().collect(),
+            "basename match, extension optional, case-insensitive"
+        );
+        let served = pending_segment_ids_with_listen_list(&db, &pool, "Hemn", None, &listed).unwrap();
+        assert_eq!(served[0], last, "the listed clip leads this reviewer's queue");
+        assert_eq!(served[1..], baseline.iter().filter(|id| **id != last).cloned().collect::<Vec<_>>()[..]);
+        assert!(crate::listen_list::listen_first_for(data_dir.path(), "Rubar", &pool).is_empty());
+        assert_eq!(pending_segment_ids(&db, &pool, "Rubar", None).unwrap(), baseline, "other queues do not move");
+        // `review_canonically` records Rubar's first opinion on the listed clip.
+        review_canonically(&db, &last);
+        let after = pending_segment_ids_with_listen_list(&db, &pool, "Sara", None, &listed).unwrap();
+        assert_eq!(after[0], last, "one canonical opinion by someone else: still listed, now also nearest a decision");
+        let judged_by_listener = pending_segment_ids_with_listen_list(&db, &pool, "Rubar", None, &listed).unwrap();
+        assert!(!judged_by_listener.contains(&last), "the reviewer who judged a listed clip never sees it again");
+        // The reviewer who already judged a listed clip never sees it again, listed or not.
+        let (_dir2, db2, pool2) = clip_pool(&["a", "b"]);
+        review_canonically(&db2, "a");
+        let listed2: HashSet<String> = ["a".to_string()].into_iter().collect();
+        assert_eq!(
+            pending_segment_ids_with_listen_list(&db2, &pool2, "Rubar", None, &listed2).unwrap(),
+            vec!["b".to_string()]
+        );
     }
 
     #[test]
