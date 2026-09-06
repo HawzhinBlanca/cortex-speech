@@ -1163,6 +1163,7 @@ def test_watchdog_and_server_pin_the_release_boundary() -> None:
     assert release.SCHEMA_CONTRACT_FILE in watchdog
     assert "cortex-private-production-schema-65-to-70-v1" in watchdog
     assert "release pointer does not require private-production database schema 70" in watchdog
+    assert "$dedup.manifestSchema -notin @(1, 2)" in watchdog, "the watchdog must accept a superseding (schema-2) dedup manifest"
     assert "-or $sources[1] -isnot [int] -or $sources[1] -ne 69 `" in watchdog
     assert "legacy release pointer is not the exact schema-65 handover boundary" in watchdog
     assert "Test-ActiveReleaseDatabaseSchema $poolAdmin $dbPath" in watchdog
@@ -1288,6 +1289,52 @@ def test_watchdog_binds_a_live_responder_to_the_exact_supervised_process() -> No
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+
+def test_watchdog_accepts_a_schema2_dedup_manifest_pointer_and_refuses_schema3() -> None:
+    """2026-09-06 live handover rolled back: the watchdog pinned manifestSchema == 1 and refused the
+    schema-2 (superseding) manifest during task re-registration. Run the real watchdog on both."""
+    if os.name != "nt":
+        return
+
+    def dedup_json(schema: int) -> str:
+        payload = {
+            "manifestSchema": schema,
+            "supersedes": {"manifestSha256": "3" * 64},
+            "algorithm": {"id": "cortex-cross-file-waveform-correlation-v2"},
+            "summary": {"unconfirmedRiskGroups": 0},
+        }
+        payload["manifestSha256"] = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return json.dumps(payload)
+
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        source, candidate, releases, data = base / "source", base / "candidate", base / "releases", base / "data"
+        seed_source(source)
+        seed_candidate(candidate, git_sha="a" * 40)
+        dedup_v2 = base / "dedup-v2.json"
+        dedup_v2.write_text(dedup_json(2), encoding="utf-8")
+        manifest = release.stage_release(candidate, source, releases, "a" * 40, dedup_v2)
+        data.mkdir()
+        release.atomic_json(data / release.POINTER_FILE, manifest)
+        # No database in the data dir: a pointer that passes validation is blocked one step LATER, on the
+        # missing database, never on its dedup identity.
+        result = run_watchdog_with_pointer(data)
+        assert result.returncode != 0
+        assert "WATCHDOG-ACTION: blocked (active release database missing)" in result.stdout, result.stdout
+        log_path = data / "logs" / "watchdog.log"
+        assert "dedup manifest identity" not in (log_path.read_text(encoding="utf-8") if log_path.exists() else "")
+
+        # The same pointer over a schema-3 manifest (digest self-consistent) is refused as invalid.
+        staged_dedup = Path(str(manifest["dedupManifest"]))
+        staged_dedup.write_text(dedup_json(3), encoding="utf-8")
+        forged = dict(manifest, dedupManifestSha256=json.loads(staged_dedup.read_text(encoding="utf-8"))["manifestSha256"])
+        release.atomic_json(data / release.POINTER_FILE, forged)
+        result = run_watchdog_with_pointer(data)
+        assert result.returncode != 0
+        assert "WATCHDOG-ACTION: blocked (active release pointer invalid)" in result.stdout, result.stdout
 
 
 def test_watchdog_recomputes_operations_content_instead_of_trusting_pointer_text() -> None:
