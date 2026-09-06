@@ -798,7 +798,10 @@ fn certification_outcome(
     }
     let every_voice_certified =
         voice_outcomes.values().all(|row| row.get("certificate").is_some_and(|value| !value.is_null()));
-    let final_dataset_ready = review_ready && all_resolved && rights.all_exact && every_voice_certified;
+    let asr_dataset_ready = review_ready && all_resolved && rights.all_exact && every_voice_certified;
+    // A completed transcription/candidate artifact is not a clean-voice TTS qualification.
+    let tts_gold_ready = cortex_speech_app_lib::review_pool_export::gold_tts_qualification_supported();
+    let final_dataset_ready = asr_dataset_ready && tts_gold_ready;
     let last_decision_at_ms: Option<i64> = db.connection().query_row(
         "SELECT MAX(created_at_ms) FROM (
              SELECT decision.created_at_ms
@@ -862,6 +865,8 @@ fn certification_outcome(
             "allClipsResolved": all_resolved,
             "rightsComplete": rights.all_exact,
             "everyVoiceCertified": every_voice_certified,
+            "asrDatasetReady": asr_dataset_ready,
+            "ttsGoldReady": tts_gold_ready,
             "finalDatasetReady": final_dataset_ready,
         },
     });
@@ -2152,6 +2157,8 @@ mod tests {
         // how healthy everything else is.
         assert_eq!(report["gates"]["reviewReady"], serde_json::json!(false));
         assert_eq!(report["gates"]["finalDatasetReady"], serde_json::json!(false));
+        assert_eq!(report["gates"]["ttsGoldReady"], serde_json::json!(false));
+        assert_eq!(report["gates"]["asrDatasetReady"], serde_json::json!(false));
         assert!(!outcome.review_ready);
         assert!(!outcome.final_dataset_ready);
     }

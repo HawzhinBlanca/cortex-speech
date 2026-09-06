@@ -144,7 +144,7 @@ def test_the_queue_serves_what_is_nearest_a_decision() -> None:
     require(
         POOL,
         "let tts_rank = u8::from(crate::review_pool_export::tts_admission(speaker_change_score).is_err());",
-        "inside a voice, clips the TTS set can already admit (measured single-voice) are served first",
+        "inside a voice, the calibrated turn-change screen still ranks work; it does not certify gold TTS",
     )
     require(
         POOL,
