@@ -716,6 +716,10 @@ pub(super) fn api_pool_decision(
                 receipt.decision_id
             }
             Ok(Some(_)) => return err_reply(409, "operation UUID is already bound to another pool decision"),
+            Ok(None) if error.contains("E_REVIEW_FAMILY_") => {
+                forget_work_audio_assignment(state, &parsed.id, reviewer);
+                return err_reply(409, &error);
+            }
             Ok(None) if error.contains("duplicated") || error.contains("independent") => {
                 return err_reply(409, "this clip already has your review — reload for another one");
             }
@@ -1569,7 +1573,14 @@ pub(super) fn api_decision_authenticated(
                 return err_reply(409, "controlled review pilot complete — no more review actions are authorized");
             }
             lock_state(state).in_flight_operations.remove(operation_id);
-            return operation_result_after_write_failure(db, reviewer, &parsed, operation_id, 500, &error.to_string());
+            let message = error.to_string();
+            let status = if message.contains("E_REVIEW_FAMILY_") {
+                forget_work_audio_assignment(state, &parsed.id, reviewer);
+                409
+            } else {
+                500
+            };
+            return operation_result_after_write_failure(db, reviewer, &parsed, operation_id, status, &message);
         }
     };
     lock_state(state).in_flight_operations.remove(operation_id);

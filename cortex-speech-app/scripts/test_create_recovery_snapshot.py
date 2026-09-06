@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+from contextlib import closing
 import json
 import sqlite3
 import tempfile
@@ -887,6 +888,32 @@ def test_schema64_evidence_includes_duplicate_authority_only_at_v64() -> None:
     assert not set(snapshot.POOL_DEDUP_COUNT_TABLES) & set(at_63)
     assert at_64[-len(snapshot.POOL_DEDUP_COUNT_TABLES) :] == snapshot.POOL_DEDUP_COUNT_TABLES
     assert snapshot.evidence_tables_for_schema(65) == at_64
+
+
+def test_schema70_snapshot_binds_supersessions_and_preserves_schema69_shape() -> None:
+    table = "review_pool_dedup_supersessions"
+    assert snapshot.evidence_tables_for_schema(69) == snapshot.evidence_tables_for_schema(64)
+    assert snapshot.evidence_tables_for_schema(70) == snapshot.evidence_tables_for_schema(69) + (table,)
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        data = base / "data"
+        data.mkdir()
+        seed_profile(data, schema_version=70, policy=False)
+        with closing(sqlite3.connect(data / snapshot.DB_FILE)) as connection:
+            connection.execute(f"CREATE TABLE {table}(id INTEGER PRIMARY KEY)")
+            connection.execute(f"INSERT INTO {table} VALUES(1)")
+            connection.commit()
+        local, evidence = snapshot.promote_snapshot(
+            data, label="schema70", expected_foreign_keys=0, repo_root=base
+        )
+        assert evidence["rowCounts"][table] == 1
+        snapshot.verify_tree(local, expected_evidence=evidence, expected_foreign_keys=0)
+        remote = snapshot.mirror_offsite(local, base / "offsite", evidence=evidence, expected_foreign_keys=0)
+        snapshot.verify_tree(remote, expected_evidence=evidence, expected_foreign_keys=0)
+        payload = load_manifest(local)
+        del payload["databaseEvidence"]["rowCounts"][table]
+        write_manifest(local, payload)
+        assert_verify_refuses(local, evidence, "rowCounts fields are invalid")
 
 
 def main() -> int:

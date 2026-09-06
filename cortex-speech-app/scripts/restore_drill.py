@@ -76,6 +76,8 @@ POOL_DEDUP_EVIDENCE_TABLES = (
     "review_pool_dedup_manifests",
     "review_pool_duplicate_exclusions",
 )
+POOL_DEDUP_SUPERSESSION_SCHEMA_VERSION = 70
+POOL_DEDUP_SUPERSESSION_EVIDENCE_TABLES = ("review_pool_dedup_supersessions",)
 FILE_ROW_FIELDS = {"path", "sizeBytes", "sha256"}
 SCHEMA_FIELDS = {
     1: {"schema", "reviewPilotPolicyStateSchema", "createdAtEpochSecs", "appGitSha", "files"},
@@ -105,7 +107,7 @@ sha256_of = sha256_file
 
 
 def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
-    """Preserve old evidence shapes and bind every durable review authority through v65."""
+    """Preserve old evidence shapes and bind every durable review authority through v70."""
 
     tables = BASE_EVIDENCE_TABLES
     if schema_version >= HIDDEN_KEY_SCHEMA_VERSION:
@@ -118,6 +120,8 @@ def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
         tables += POOL_RESOLUTION_EVIDENCE_TABLES
     if schema_version >= POOL_DEDUP_SCHEMA_VERSION:
         tables += POOL_DEDUP_EVIDENCE_TABLES
+    if schema_version >= POOL_DEDUP_SUPERSESSION_SCHEMA_VERSION:
+        tables += POOL_DEDUP_SUPERSESSION_EVIDENCE_TABLES
     return tables
 
 

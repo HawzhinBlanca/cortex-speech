@@ -104,14 +104,25 @@ def test_any_reviewer_may_take_any_clip() -> None:
     """
     require(
         POOL,
-        "if coverage.is_some_and(|coverage| coverage.seen.contains(&reviewer)) {",
-        "a reviewer is never served a clip they already judged - independence is enforced PER CLIP",
+        "if family_seen.get(&segment_id).is_some_and(|seen| seen.contains(&reviewer)) {",
+        "a reviewer is never served a clip or retired acoustic twin they already judged - opinions remain per clip",
     )
     require(
         POOL,
         "pub fn pending_segment_ids(",
         "one queue function serves every reviewer; there is no per-reviewer assignment table",
     )
+    require(POOL, "require_unseen_pool_family_on(&tx, input.segment_id, input.reviewer)?;",
+            "independent submissions recheck family exposure under the write transaction")
+    require(APP / "src-tauri" / "src" / "db" / "finalization.rs",
+            "crate::review_pool::require_unseen_pool_family_on(&tx, segment_id, reviewer)",
+            "named first opinions cannot bypass the duplicate-family guard")
+    require(APP / "src-tauri" / "src" / "review_pool" / "dedup.rs",
+            "require_complete_clip_identity(db, &new_exclusions)?;",
+            "a superseding manifest cannot discard merely correlated partial content")
+    require(APP / "src-tauri" / "src" / "review_pool" / "dedup.rs",
+            "require_complete_clip_identity(db, &exclusions)?;",
+            "a new base manifest cannot bypass whole-clip verification")
 
 
 def test_the_queue_serves_what_is_nearest_a_decision() -> None:

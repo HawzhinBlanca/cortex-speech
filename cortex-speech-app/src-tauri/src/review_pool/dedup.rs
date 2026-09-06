@@ -7,11 +7,12 @@
 //! Why v2 exists (measured 2026-09-06 on the live pool): the v1 verdict compared two waveforms at
 //! zero lag with a 0.98 bar. A twin cut a few milliseconds differently scored near zero and was
 //! cleared as "the same sentence read twice". At the best lag inside 1.5 s, 88% of 8,909 text-matched
-//! cross-file pairs were the same recording while same-voice different-sentence controls never
+//! cross-file pairs were classified as candidates while same-voice different-sentence controls never
 //! exceeded 0.2. A superseding manifest states the COMPLETE dedup state (every applied family
 //! reproduced, new ones appended), may retire a reviewed twin (its evidence stays durable; the clip
-//! leaves serving, resolution, certification and export), and can never move an applied exclusion
-//! or retire an applied canonical.
+//! leaves serving, resolution, certification and export). Applied exclusion rows remain immutable;
+//! applied canonicals can retire through explicit chains. New exclusions additionally require
+//! independent full-clip PCM verification; historical correlation claims alone are insufficient.
 
 use super::{
     load, owner_adjudications_on, reviewer_sets, valid_lower_sha256, with_pool_full_sync, Database,
@@ -26,9 +27,48 @@ use std::path::Path;
 
 pub const DEDUP_ALGORITHM_V1: &str = "cortex-cross-file-waveform-correlation-v1";
 pub const DEDUP_ALGORITHM_V2: &str = "cortex-cross-file-waveform-correlation-v2";
+
+/// A manifest correlation is candidate evidence, not authority to discard unmatched words. New
+/// exclusions must independently prove COMPLETE decoded clip identity. Existing immutable rows
+/// and exact manifest retries remain readable; they are never silently rewritten or repriced.
+fn require_complete_clip_identity(db: &Database, exclusions: &[(String, String, String)]) -> Result<(), String> {
+    let mut identities: HashMap<String, (usize, Vec<u8>)> = HashMap::new();
+    for (member, canonical, _) in exclusions {
+        for id in [member, canonical] {
+            if identities.contains_key(id) {
+                continue;
+            }
+            let segment = db
+                .get_segment_by_id(id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("dedup audio member {id} is missing"))?;
+            let current_hash = crate::export_bundle::current_canonical_pcm_blake3(Path::new(&segment.audio_path))
+                .map_err(|error| format!("dedup source identity cannot be verified for {id}: {error}"))?;
+            if db.segment_audio_content_hash(id).map_err(|error| error.to_string())?.as_deref()
+                != Some(current_hash.as_str())
+            {
+                return Err(format!("dedup source audio changed for {id}"));
+            }
+            let wav = crate::agentic::segment_audio_as_wav_bytes(&segment).map_err(|error| error.to_string())?;
+            let mut reader = hound::WavReader::new(std::io::Cursor::new(wav)).map_err(|error| error.to_string())?;
+            let samples: Vec<i16> =
+                reader.samples::<i16>().collect::<Result<_, _>>().map_err(|error| error.to_string())?;
+            let first = *samples.first().ok_or_else(|| format!("dedup clip {id} is empty"))? as i32;
+            let mut hash = Sha256::new();
+            for sample in &samples {
+                hash.update((i32::from(*sample) - first).to_le_bytes());
+            }
+            identities.insert(id.clone(), (samples.len(), hash.finalize().to_vec()));
+        }
+        if identities[member] != identities[canonical] {
+            return Err(format!("E_DEDUP_PARTIAL_CONTENT: {member} and {canonical} lack complete PCM equivalence; retain both for review"));
+        }
+    }
+    Ok(())
+}
 /// v2 waveform verdict, pinned exactly as `scripts/check_dataset_duplicates.py` measures it: best lag
-/// inside ±1.5 s, at least 60% of the shorter clip overlapping, confirmed at correlation ≥ 0.40
-/// (same-voice different-sentence controls max 0.2; the 0.20..0.40 band is reported, never excluded).
+/// inside ±1.5 s, at least 60% of the shorter clip overlapping, candidate correlation ≥ 0.40.
+/// These preserve the manifest wire contract; complete-clip verification above is additional authority.
 const V2_MINIMUM_WAVEFORM_CORRELATION_PPM: i64 = 400_000;
 const V2_PROBABLE_WAVEFORM_CORRELATION_PPM: i64 = 200_000;
 const V2_MAXIMUM_LAG_MS: i64 = 1_500;
@@ -748,6 +788,8 @@ pub fn apply_dedup_manifest(db: &Database, manifest_json: &str) -> Result<PoolDe
         return Err("review-pool dedup manifest summary does not match validated families".to_string());
     }
 
+    require_complete_clip_identity(db, &exclusions)?;
+
     with_pool_full_sync(db, || {
         let tx = rusqlite::Transaction::new_unchecked(db.connection(), rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("review-pool dedup application cannot lock the database: {error}"))?;
@@ -1156,6 +1198,8 @@ fn apply_superseding_manifest(
     {
         return Err("superseding dedup manifest summary does not match validated families".to_string());
     }
+
+    require_complete_clip_identity(db, &new_exclusions)?;
 
     with_pool_full_sync(db, || {
         let tx = rusqlite::Transaction::new_unchecked(db.connection(), rusqlite::TransactionBehavior::Immediate)
