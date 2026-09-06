@@ -6537,7 +6537,7 @@ def _validate_schema_restore_semantics(
             "schema65-to70-live-sized-clone": (65, 70),
             "schema70-reopen": (70, 70),
             "interrupted-migration-recovery": (65, 70),
-            "future-schema-refusal": (70, 70),
+            "future-schema-refusal": (71, 71),
             "local-snapshot-isolated-restore": (70, 70),
             "offsite-snapshot-isolated-restore": (70, 70),
         }[expected_id]
