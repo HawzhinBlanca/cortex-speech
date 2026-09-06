@@ -1419,6 +1419,26 @@ fn search_does_not_match_the_audio_path_column() {
 }
 
 #[test]
+fn search_finds_a_clip_by_its_file_name_token_but_never_by_a_folder_word() {
+    // Owner 2026-09-06: "search didn't find it" — a file NAME is what a person reads off a report.
+    // Round-23 #7 still holds: a plain word that appears only in the path never matches.
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let mut clip = make_segment("l1", r"D:\ZAR_Lamo\kurdistan\lamo_016604.wav");
+    clip.raw_transcript = "hello world".to_string();
+    db.insert_segment(&clip).unwrap();
+    let ids = |query: &str| db.search_segments(query).unwrap().into_iter().map(|s| s.id).collect::<Vec<_>>();
+    assert_eq!(ids("lamo_016604"), vec!["l1".to_string()], "a file-shaped token matches the file name");
+    assert_eq!(ids("LAMO_016604.wav hello"), vec!["l1".to_string()], "case and extension do not matter");
+    assert_eq!(ids("kurdistan"), Vec::<String>::new(), "a folder word is not a file name (Round-23 #7)");
+    assert_eq!(ids("file:kurdistan"), vec!["l1".to_string()], "an explicit file: prefix searches paths only");
+    assert_eq!(ids("file:hello"), Vec::<String>::new(), "file: never matches transcript content");
+    assert!(
+        looks_like_file_token("KBHP-EP08.wav") && !looks_like_file_token("kurdistan") && !looks_like_file_token("2026")
+    );
+}
+
+#[test]
 fn transient_integrity_messages_are_not_classified_as_corruption() {
     // Round-20: a transient page-read message from PRAGMA integrity_check must NOT be treated as
     // corruption (which would quarantine a healthy db = silent data loss). It aborts startup instead.

@@ -1269,6 +1269,16 @@ pub(super) fn normalize_search_query(text: &str) -> String {
 /// FTS5 string (internal `"` doubled), which FTS5 reads as a literal term. Tokens are implicitly
 /// AND-ed (matching the previous behaviour for multi-word queries). Returns `""` for whitespace-only
 /// input so the caller can short-circuit to an empty result.
+/// A token a person read off a file listing: ASCII, at least one digit, and a `_`, `-` or `.`.
+/// `lamo_016604`, `KBHP-EP08.wav` — never a plain word such as a folder name (Round-23 #7).
+pub fn looks_like_file_token(token: &str) -> bool {
+    token.len() >= 4
+        && token.is_ascii()
+        && token.chars().any(|c| c.is_ascii_digit())
+        && token.chars().any(|c| matches!(c, '_' | '-' | '.'))
+        && token.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
 pub(super) fn to_fts5_match(query: &str) -> String {
     // Control characters (NUL and other C0/C1) are never meaningful search terms and an embedded
     // NUL makes SQLite/FTS5 raise a hard error (interior NUL in a bound string), so map every

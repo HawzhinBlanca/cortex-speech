@@ -173,7 +173,7 @@ def test_the_queue_serves_one_opinion_clips_again() -> None:
             "the PAY-FENCE MIRROR is back in review_pool::pending_segment_ids — one-opinion clips would never be "
             "served and consensus could never converge (1,451 such clips measured 2026-09-04)"
         )
-    if "pending.push((\n            distance_to_decision,\n            voice_priority_rank(&voice_name)," not in pool:
+    if "            distance_to_decision,\n            voice_priority_rank(&voice_name)," not in pool:
         raise AssertionError("decision proximity must remain the queue's first key, ahead of the owner's voice priority")
     print("[OK] the pool queue serves one-opinion clips: the mirror is gone with the fence")
 

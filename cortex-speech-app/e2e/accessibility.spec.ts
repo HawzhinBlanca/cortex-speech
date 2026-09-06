@@ -92,7 +92,7 @@ test.describe('Accessibility smoke tests', () => {
   test('SearchBar input is focusable', async ({ page }) => {
     await page.goto('/');
 
-    const search = page.getByPlaceholder('Search transcripts, files, speakers...');
+    const search = page.getByPlaceholder('Search transcripts, or a file name like lamo_016604');
     await search.focus();
     await expect(search).toBeFocused();
   });

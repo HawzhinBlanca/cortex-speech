@@ -148,8 +148,8 @@ def test_the_queue_serves_what_is_nearest_a_decision() -> None:
     )
     require(
         POOL,
-        "type PendingVoiceCandidate = (usize, usize, String, u8, [u8; 32], String);",
-        "decision distance leads the candidate key, so voice priority can never jump work nearer consensus",
+        "type PendingVoiceCandidate = (u8, usize, usize, String, u8, [u8; 32], String);",
+        "only the owner listen list (explicit, per reviewer) precedes decision distance; voice priority can never jump work nearer consensus",
     )
     require(
         POOL,

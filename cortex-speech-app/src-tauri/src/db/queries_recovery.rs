@@ -647,7 +647,13 @@ impl Database {
     }
 
     pub fn search_segments(&self, text: &str) -> AppResult<Vec<SpeechSegment>> {
-        let match_query = to_fts5_match(&normalize_search_query(text));
+        // `file:lamo_016604` searches file names only; otherwise transcript content, plus any token
+        // that is unmistakably a file name (ASCII with a digit and a `_`/`-`/`.`, e.g. `lamo_016604`).
+        let (file_only, body) = match text.trim().strip_prefix("file:") {
+            Some(rest) => (true, rest.trim()),
+            None => (false, text.trim()),
+        };
+        let match_query = to_fts5_match(&normalize_search_query(body));
         // Whitespace-only / empty input is an empty result, not an FTS5 `MATCH ""` error.
         if match_query.is_empty() {
             return Ok(Vec::new());
@@ -656,15 +662,40 @@ impl Database {
         // query against the FILE PATH too — a token that appears only in a folder/file name returned
         // false-positive segments whose transcript did not contain it. Restrict the match to the
         // transcript columns with an FTS5 column filter so only transcript content is searched.
+        // Owner 2026-09-06 ("search didn't find it"): a file NAME is still the one thing a person can
+        // read off a report, so file-shaped tokens additionally match the `audio_path` column — never
+        // plain words such as a folder name, which is what Round-23 #7 forbade.
         let scoped_query = format!("{{raw_transcript normalized_transcript annotated_transcript}} : ({match_query})");
+        let file_tokens: Vec<String> = body
+            .split_whitespace()
+            .filter(|token| crate::db::looks_like_file_token(token))
+            .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+            .collect();
+        let path_query = if file_only {
+            Some(format!("{{audio_path}} : ({match_query})"))
+        } else if file_tokens.is_empty() {
+            None
+        } else {
+            Some(format!("{{audio_path}} : ({})", file_tokens.join(" ")))
+        };
+        // Bind exactly the MATCH strings the clause names: rusqlite refuses a spare parameter.
+        let (clause, bindings): (&str, Vec<String>) = match (path_query, file_only) {
+            (Some(path), true) => ("id IN (SELECT id FROM segments_fts WHERE segments_fts MATCH ?1)", vec![path]),
+            (Some(path), false) => (
+                "(id IN (SELECT id FROM segments_fts WHERE segments_fts MATCH ?1)
+                  OR id IN (SELECT id FROM segments_fts WHERE segments_fts MATCH ?2))",
+                vec![scoped_query, path],
+            ),
+            (None, _) => ("id IN (SELECT id FROM segments_fts WHERE segments_fts MATCH ?1)", vec![scoped_query]),
+        };
         let query = format!(
             "SELECT {SEGMENT_SELECT_COLUMNS}
              FROM speech_segments
-             WHERE id IN (SELECT id FROM segments_fts WHERE segments_fts MATCH ?1)
+             WHERE {clause}
              ORDER BY created_at DESC, id ASC"
         );
         let mut stmt = self.conn.prepare(&query)?;
-        let rows = stmt.query_map(params![scoped_query], Self::map_row)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(bindings.iter()), Self::map_row)?;
         let mut segments = Vec::new();
         for row in rows {
             segments.push(row?);

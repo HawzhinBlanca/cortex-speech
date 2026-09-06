@@ -472,7 +472,7 @@ export const ckb = {
   'inference.p50': 'p50',
   'inference.p99': 'p99',
   'inference.modelLoad': 'بارکردنی مۆدێل',
-  searchPlaceholder: 'گەڕان لە دەق، فایل، قسەکەر...',
+  searchPlaceholder: 'گەڕان لە دەق، یان ناوی فایل وەک lamo_016604',
   clearSearch: 'پاککردنەوەی گەڕان',
   searchFailed: 'گەڕان سەرکەوتوو نەبوو',
   filterVerified: 'پشتڕاستکراو',
