@@ -227,6 +227,49 @@ def test_stage_is_atomic_versioned_and_hash_bound() -> None:
         assert release.stage_release(candidate, source, releases, git_sha) == manifest
 
 
+def test_stage_accepts_a_superseding_dedup_manifest_and_refuses_a_malformed_one() -> None:
+    """Schema 70 releases ship a schema-2 (superseding) dedup manifest; its identity is bound like v1."""
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        source, candidate, releases = base / "source", base / "candidate", base / "releases"
+        seed_source(source)
+        seed_candidate(candidate, git_sha="c" * 40)
+
+        def manifest_json(payload: dict) -> str:
+            payload = dict(payload)
+            payload.pop("manifestSha256", None)
+            payload["manifestSha256"] = hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            return json.dumps(payload)
+
+        good = {
+            "manifestSchema": 2,
+            "supersedes": {"manifestSha256": "3" * 64},
+            "algorithm": {"id": "cortex-cross-file-waveform-correlation-v2"},
+            "summary": {"unconfirmedRiskGroups": 0},
+        }
+        path = base / "dedup-v2.json"
+        path.write_text(manifest_json(good), encoding="utf-8")
+        manifest = release.stage_release(candidate, source, releases, "c" * 40, path)
+        assert manifest["dedupManifestSha256"] == json.loads(path.read_text(encoding="utf-8"))["manifestSha256"]
+
+        for label, broken in (
+            ("no supersedes", {**good, "supersedes": None}),
+            ("v1 algorithm", {**good, "algorithm": {"id": "cortex-cross-file-waveform-correlation-v1"}}),
+            ("schema 3", {**good, "manifestSchema": 3}),
+            ("unresolved risk", {**good, "summary": {"unconfirmedRiskGroups": 1}}),
+        ):
+            bad = base / f"bad-{label.replace(' ', '-')}.json"
+            bad.write_text(manifest_json(broken), encoding="utf-8")
+            try:
+                release.validate_dedup_manifest(bad)
+            except release.ReleaseError:
+                pass
+            else:
+                raise AssertionError(f"a dedup manifest with {label} was accepted")
+
+
 def test_stage_refuses_mismatched_or_ambiguous_embedded_build_identity() -> None:
     with tempfile.TemporaryDirectory() as raw:
         base = Path(raw)

@@ -513,8 +513,23 @@ def validate_dedup_manifest(path: Path) -> tuple[Path, str]:
     value = load_json(resolved)
     claimed = value.get("manifestSha256")
     summary = value.get("summary")
-    if value.get("manifestSchema") != 1 or not isinstance(claimed, str) or not SHA64.fullmatch(claimed):
+    schema = value.get("manifestSchema")
+    if schema not in (1, 2) or not isinstance(claimed, str) or not SHA64.fullmatch(claimed):
         raise ReleaseError("review-pool dedup manifest identity is invalid")
+    if schema == 2:
+        # A superseding manifest (schema 70+) names the exact dedup authority it replaces; pool_admin
+        # re-derives everything else during the clone preflight and the live handover.
+        supersedes = value.get("supersedes")
+        algorithm = value.get("algorithm")
+        if (
+            not isinstance(supersedes, dict)
+            or not isinstance(supersedes.get("manifestSha256"), str)
+            or not SHA64.fullmatch(supersedes["manifestSha256"])
+            or supersedes["manifestSha256"] == claimed
+            or not isinstance(algorithm, dict)
+            or algorithm.get("id") != "cortex-cross-file-waveform-correlation-v2"
+        ):
+            raise ReleaseError("review-pool superseding dedup manifest identity is invalid")
     if not isinstance(summary, dict) or summary.get("unconfirmedRiskGroups") != 0:
         raise ReleaseError("review-pool dedup manifest has unresolved risk")
     payload = dict(value)
