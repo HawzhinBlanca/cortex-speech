@@ -22,9 +22,10 @@ type Clip = {
   durationMs: number;
   speakerId: string;
   uncertainWords?: string[] | null;
+  redo?: boolean;
 };
 
-async function renderClip(clip: Clip): Promise<{ meta: string; hint: string | null }> {
+async function renderClip(clip: Clip): Promise<{ meta: string; hint: string | null; redo: string | null }> {
   const dom = new JSDOM(readFileSync(PAGE, 'utf-8'), {
     runScripts: 'dangerously',
     url: 'http://127.0.0.1:8737/',
@@ -42,7 +43,8 @@ async function renderClip(clip: Clip): Promise<{ meta: string; hint: string | nu
   dom.window.eval(`queue = [${JSON.stringify(clip)}]; i = 0; exhausted = true; show(false);`);
   const meta = dom.window.document.getElementById('meta');
   const hint = meta?.querySelector('.uncertain') ?? null;
-  const out = { meta: meta?.textContent ?? '', hint: hint ? hint.textContent : null };
+  const redo = meta?.querySelector('.redo') ?? null;
+  const out = { meta: meta?.textContent ?? '', hint: hint ? hint.textContent : null, redo: redo ? redo.textContent : null };
   dom.window.close();
   return out;
 }
@@ -60,6 +62,16 @@ describe('couch.html — the uncertain-words hint', () => {
   it('is appended as a text node, never interpreted as markup', async () => {
     const { hint } = await renderClip({ ...BASE, uncertainWords: ['<b>x</b>'] });
     expect(hint).toContain('<b>x</b>');
+  });
+
+  it('says plainly when a clip is the reviewer’s own redo, and stays silent otherwise', async () => {
+    const { redo } = await renderClip({ ...BASE, redo: true });
+    expect(redo, 'a redo clip must be labelled, so an earlier approval is not mistaken for a fresh draft').not.toBeNull();
+    expect(redo).toContain('دووبارە');
+    for (const flag of [false, undefined] as const) {
+      const { redo: none } = await renderClip({ ...BASE, redo: flag as Clip['redo'] });
+      expect(none, `redo=${String(flag)} draws nothing`).toBeNull();
+    }
   });
 
   it('draws nothing for a clip that was never aligned', async () => {

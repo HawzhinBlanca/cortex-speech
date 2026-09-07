@@ -1865,6 +1865,270 @@ mod tests {
         );
     }
 
+    /// Redo pass (owner, 2026-09-07, `review_redo.rs`): a reviewer named in `review_redo.json` is
+    /// served ONLY the clips they marked Looks good themselves, with the text they approved; each redo
+    /// verdict is recorded on the canonical path as their updated opinion (paid at the standard
+    /// weights, never a pool observation), and the clip then leaves their redo queue. Nobody else's
+    /// queue changes, and consensus still needs a DIFFERENT reviewer.
+    #[test]
+    fn redo_pass_serves_a_reviewer_their_own_looks_good_clips_and_records_corrections_canonically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        let champion_id = "omniasr-7b-redo-test";
+        crate::registry::register_candidate(
+            &db,
+            &crate::registry::NewModelVersion {
+                id: champion_id.into(),
+                family: crate::deployment::OMNIASR_7B_FAMILY.into(),
+                model_card_name: Some("redo test champion".into()),
+                checkpoint_sha256: "d".repeat(64),
+                checkpoint_path: "/test/redo-champion.json".into(),
+                source: "cortex-finetuned".into(),
+                license: "owner-full-rights".into(),
+            },
+        )
+        .unwrap();
+        db.connection().execute("UPDATE model_versions SET status='champion' WHERE id=?1", [champion_id]).unwrap();
+        let clips = [("redo-one", "دەقی یەکەم"), ("redo-two", "دەقی دووەم"), ("redo-other", "دەقی کەسێکی تر")];
+        for (id, draft) in clips {
+            let mut segment = seg(id, draft);
+            segment.model_version_id = Some(champion_id.into());
+            db.insert_segment(&segment).unwrap();
+        }
+        // Rubar's two canonical "Looks good" verdicts; the third clip is untouched.
+        for (n, (id, draft)) in clips[..2].iter().enumerate() {
+            let revision = db.segment_review_revision(id).unwrap().unwrap();
+            let operation = format!("50000000-0000-4000-8000-00000000000{n}");
+            let hash = crate::db::review_operation_payload_hash(id, "accept", draft, "Rubar");
+            db.record_phone_human_decision_by_at_revision_with_operation(
+                id,
+                "accept",
+                Some(draft),
+                "Rubar",
+                revision,
+                &operation,
+                &hash,
+            )
+            .unwrap()
+            .unwrap();
+        }
+        let pool = crate::review_pool::activate(
+            &db,
+            "123e4567-e89b-42d3-a456-426614174007",
+            &clips
+                .iter()
+                .map(|(id, _)| crate::review_pool::PoolMemberInput {
+                    segment_id: (*id).into(),
+                    voice_name: "Lamo".into(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        // The redo starts AFTER her original verdicts, so those do not count as redo work done.
+        let started_at_ms: i64 =
+            db.connection().query_row("SELECT MAX(timestamp_ms) + 1 FROM review_events", [], |row| row.get(0)).unwrap();
+        std::fs::write(
+            tmp.path().join(crate::review_redo::FILE_NAME),
+            format!(r#"{{ "_comment": "redo", "started_at_ms": {started_at_ms}, "redo": ["rubar"] }}"#),
+        )
+        .unwrap();
+        let state = Mutex::new(CouchState {
+            pairing_codes: HashMap::from([("pair-rubar".into(), "Rubar".into()), ("pair-alle".into(), "Alle".into())]),
+            session_store: Some((tmp.path().to_path_buf(), db_path)),
+            pool_policy: Some(pool.clone()),
+            ..CouchState::default()
+        });
+
+        let (code, _, body, ..) = api_queue(&db, "Rubar", &state);
+        assert_eq!(code, 200, "redo queue failed: {}", String::from_utf8_lossy(&body));
+        let queue: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let items = queue["items"].as_array().unwrap().clone();
+        let mut ids: Vec<&str> = items.iter().map(|item| item["id"].as_str().unwrap()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["redo-one", "redo-two"], "exactly her own Looks-good clips, nothing else");
+        assert!(items.iter().all(|item| item["redo"] == true), "{items:?}");
+        let one = items.iter().find(|item| item["id"] == "redo-one").unwrap().clone();
+        let two = items.iter().find(|item| item["id"] == "redo-two").unwrap().clone();
+        assert_eq!(one["text"], "دەقی یەکەم", "served with the text she approved, not blind");
+
+        // Everyone else's queue is the ordinary pool queue, untouched by her redo.
+        let (code, _, body, ..) = api_queue(&db, "Alle", &state);
+        assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+        let other: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let other_items = other["items"].as_array().unwrap();
+        // Her two clips are leased to her right now, so Alle is handed the third; none is a redo.
+        assert_eq!(other_items.iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["redo-other"]);
+        assert!(other_items.iter().all(|item| item["redo"] == false));
+
+        let binding = couch_session_binding_sha256("couch-test-session");
+        let events = |db: &Database| -> i64 {
+            db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |r| r.get(0)).unwrap()
+        };
+        let events_before = events(&db);
+        // A correction on the first clip lands as HER canonical verdict.
+        start_policy4_attempt(&db, &state, "redo-one", "Rubar", &binding, "50000000-0000-4000-8000-0000000000a1");
+        let receipt = policy4_pool_receipt(&db, "Rubar", "redo-one", &binding);
+        let correction = serde_json::json!({
+            "operationId": "50000000-0000-4000-8000-000000000011",
+            "id": "redo-one",
+            "action": "edit",
+            "text": "دەقی یەکەمی ڕاست",
+            "reviewer": "Rubar",
+            "rowVersion": one["rowVersion"],
+            "playbackReceiptId": receipt,
+        });
+        let (code, _, body, ..) = api_decision(&db, correction.to_string().as_bytes(), "Rubar", &state);
+        assert_eq!(code, 200, "redo correction failed: {}", String::from_utf8_lossy(&body));
+        let reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(reply["effectEventId"].is_i64(), "recorded on the canonical path, not as a pool observation: {reply}");
+        let row = db.get_segment_by_id("redo-one").unwrap().unwrap();
+        assert_eq!(row.reviewed_by.as_deref(), Some("Rubar"));
+        assert_eq!(row.human_decision.as_deref(), Some("edit"));
+        assert_eq!(row.annotated_transcript.as_deref(), Some("دەقی یەکەمی ڕاست"));
+
+        // "Looks good, again, after listening again" on the second clip is a NEW act, not a replay.
+        start_policy4_attempt(&db, &state, "redo-two", "Rubar", &binding, "50000000-0000-4000-8000-0000000000a2");
+        let receipt = policy4_pool_receipt(&db, "Rubar", "redo-two", &binding);
+        let again = serde_json::json!({
+            "operationId": "50000000-0000-4000-8000-000000000012",
+            "id": "redo-two",
+            "action": "accept",
+            "text": "دەقی دووەم",
+            "reviewer": "Rubar",
+            "rowVersion": two["rowVersion"],
+            "playbackReceiptId": receipt,
+        });
+        let (code, _, body, ..) = api_decision(&db, again.to_string().as_bytes(), "Rubar", &state);
+        assert_eq!(code, 200, "redo re-accept failed: {}", String::from_utf8_lossy(&body));
+        let reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_ne!(reply["duplicate"], true, "a redo accept is a new act, not a replay: {reply}");
+        assert_eq!(events(&db), events_before + 2, "both redo verdicts are durable review events");
+        let pool_rows: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM review_pool_decisions WHERE reviewer='Rubar'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pool_rows, 0, "a redo never becomes a pool observation");
+
+        // Both clips have left her redo queue and nothing else is offered to her.
+        let (code, _, body, ..) = api_queue(&db, "Rubar", &state);
+        assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+        let done: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(done["items"].as_array().unwrap().is_empty(), "{done}");
+        // Consensus still needs a DIFFERENT reviewer: her redo is one opinion, updated.
+        let coverage = || {
+            crate::review_pool::coverage_by_voice(&db)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.voice_name == "Lamo")
+                .unwrap()
+        };
+        assert_eq!((coverage().one_review, coverage().two_reviews), (2, 0));
+
+        // ── Send-back of a POOL "Looks good" (owner rule change 2026-09-07) ──────────────────────
+        // Before the redo pass existed, Alle judged "redo-other" first and Rubar gave it a pool accept.
+        std::fs::remove_file(tmp.path().join(crate::review_redo::FILE_NAME)).unwrap();
+        let other_revision = db.segment_review_revision("redo-other").unwrap().unwrap();
+        let alle_hash = crate::db::review_operation_payload_hash("redo-other", "edit", "دەقی ئەلێ", "Alle");
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "redo-other",
+            "edit",
+            Some("دەقی ئەلێ"),
+            "Alle",
+            other_revision,
+            "50000000-0000-4000-8000-000000000021",
+            &alle_hash,
+        )
+        .unwrap()
+        .unwrap();
+        // Alle's earlier queue fetch still holds the lease on this clip; let it lapse as time would.
+        lock_state(&state).leases.clear();
+        let (code, _, body, ..) = api_queue(&db, "Rubar", &state);
+        assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+        let normal: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let other = normal["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "redo-other")
+            .expect("the ordinary pool queue serves the one-opinion clip")
+            .clone();
+        assert_eq!(other["text"], "دەقی کەسێکی تر", "a pool second opinion is blind to Alle's text");
+        start_policy4_attempt(&db, &state, "redo-other", "Rubar", &binding, "50000000-0000-4000-8000-0000000000a3");
+        let receipt = policy4_pool_receipt(&db, "Rubar", "redo-other", &binding);
+        let pool_accept = serde_json::json!({
+            "operationId": "50000000-0000-4000-8000-000000000013",
+            "id": "redo-other",
+            "action": "accept",
+            "text": "دەقی کەسێکی تر",
+            "reviewer": "Rubar",
+            "rowVersion": other["rowVersion"],
+            "playbackReceiptId": receipt,
+        });
+        let (code, _, body, ..) = api_decision(&db, pool_accept.to_string().as_bytes(), "Rubar", &state);
+        assert_eq!(code, 200, "pool accept failed: {}", String::from_utf8_lossy(&body));
+        let accepted: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let pool_decision_id = accepted["poolDecisionId"].as_i64().expect("a pool observation, not canonical");
+        assert_eq!((coverage().one_review, coverage().two_reviews), (2, 1));
+
+        // The owner sends her pool accepts back: an append-only reversal with its pay reversal.
+        let accepts = ["accept".to_string()];
+        let candidates = crate::review_redo::send_back_candidates(&db, &pool, "rubar", &accepts).unwrap();
+        assert_eq!(candidates.iter().map(|c| c.decision_id).collect::<Vec<_>>(), vec![pool_decision_id]);
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(1).max(1);
+        crate::review_pool::reverse_decision(
+            &db,
+            &pool,
+            pool_decision_id,
+            "Rubar",
+            "50000000-0000-4000-8000-000000000031",
+            now_ms,
+        )
+        .unwrap();
+        assert!(crate::review_redo::send_back_candidates(&db, &pool, "Rubar", &accepts).unwrap().is_empty());
+        let reversals: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM review_pool_reversals", [], |r| r.get(0)).unwrap();
+        assert_eq!(reversals, 1, "reversed append-only, the original decision row stays");
+        assert_eq!((coverage().one_review, coverage().two_reviews), (3, 0), "a reversed decision never counts");
+
+        // Back in redo mode the sent-back clip is hers again — BLIND — and her new verdict is a fresh
+        // pool decision, never a rewrite of the reversed one.
+        std::fs::write(
+            tmp.path().join(crate::review_redo::FILE_NAME),
+            format!(r#"{{ "_comment": "redo", "started_at_ms": {started_at_ms}, "redo": ["rubar"] }}"#),
+        )
+        .unwrap();
+        let (code, _, body, ..) = api_queue(&db, "Rubar", &state);
+        assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+        let again: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sent_back = again["items"].as_array().unwrap();
+        assert_eq!(sent_back.iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["redo-other"]);
+        assert_eq!(sent_back[0]["redo"], true);
+        assert_eq!(sent_back[0]["text"], "دەقی کەسێکی تر", "still blind to Alle's text");
+        start_policy4_attempt(&db, &state, "redo-other", "Rubar", &binding, "50000000-0000-4000-8000-0000000000a4");
+        let receipt = policy4_pool_receipt(&db, "Rubar", "redo-other", &binding);
+        let redo_pool = serde_json::json!({
+            "operationId": "50000000-0000-4000-8000-000000000014",
+            "id": "redo-other",
+            "action": "edit",
+            "text": "دەقی ڕوباری دووەم",
+            "reviewer": "Rubar",
+            "rowVersion": sent_back[0]["rowVersion"],
+            "playbackReceiptId": receipt,
+        });
+        let (code, _, body, ..) = api_decision(&db, redo_pool.to_string().as_bytes(), "Rubar", &state);
+        assert_eq!(code, 200, "sent-back redo failed: {}", String::from_utf8_lossy(&body));
+        let redone: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let new_id = redone["poolDecisionId"].as_i64().expect("a fresh pool observation");
+        assert_ne!(new_id, pool_decision_id);
+        let (code, _, body, ..) = api_queue(&db, "Rubar", &state);
+        assert_eq!(code, 200);
+        let drained: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(drained["items"].as_array().unwrap().is_empty(), "{drained}");
+        // Alle and Rubar now disagree on the clip: two DIFFERENT opinions, a third is wanted.
+        let lamo = coverage();
+        assert_eq!((lamo.one_review, lamo.two_reviews, lamo.needs_third_review), (2, 1, 1));
+    }
+
     #[test]
     fn flexible_pool_accepts_the_first_review_after_activation() {
         let tmp = tempfile::tempdir().unwrap();

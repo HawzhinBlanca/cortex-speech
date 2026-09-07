@@ -77,6 +77,9 @@ UNREVIEWED_SORANI = {
     # goes there first. New Sorani ("وشە نادڵنیاکان: {words}"), NOT natively reviewed — on the owner's
     # read list with the speaker badge.
     "uncertainWords",
+    # Redo pass (owner, 2026-09-07): the reviewer re-judges a clip they marked Looks good. New Sorani,
+    # NOT natively reviewed — on the owner's read list.
+    "redoPass",
     # R4.4 explicit no-verdict. The BUTTON reuses the existing (already-listed) `skip` string; this is
     # the empty-state line that stops "🎉 all clips reviewed" appearing over clips the reviewer
     # skipped. One new string was the honest floor — the alternative was letting the page lie.

@@ -23,7 +23,7 @@ pub use dedup::{apply_dedup_manifest, dedup_status, PoolDedupStatus};
 pub(crate) use dedup::{canonical_json_bytes, normalized_text_sha256};
 use dedup::{load_dedup_binding, RegistryDedupRow};
 use family::family_seen_on;
-pub(crate) use family::require_unseen_pool_family_on;
+pub(crate) use family::{require_unseen_pool_family_on, require_unseen_pool_family_or_own_canonical_on};
 
 use crate::db::Database;
 use rusqlite::OptionalExtension;
@@ -94,6 +94,11 @@ impl ReviewPool {
 
     pub fn segment_ids(&self) -> Arc<HashSet<String>> {
         self.member_ids.clone()
+    }
+
+    /// Startup-verified audio availability of a live member (see `verify_audio_available`).
+    pub(crate) fn is_playable(&self, segment_id: &str) -> bool {
+        self.playable_member_ids.contains(segment_id)
     }
 
     /// Recheck only a clip that is actually about to be leased. Queue construction uses the
@@ -3339,6 +3344,24 @@ mod tests {
         let listed: HashSet<String> = ["b".to_string()].into_iter().collect();
         let listen = QueueHints { listen_first: &listed, difficulty: DifficultyOrder::HardFirst };
         assert_eq!(pending_segment_ids_with_hints(&db, &pool, "Hemn", None, &listen).unwrap(), vec!["b", "c", "a"]);
+    }
+
+    #[test]
+    fn a_reviewer_may_update_their_own_canonical_verdict_but_never_add_pool_evidence_to_it() {
+        let (_dir, db, _pool) = clip_pool(&["a", "b"]);
+        review_canonically(&db, "a"); // Rubar's canonical verdict on "a"
+        assert!(
+            require_unseen_pool_family_or_own_canonical_on(db.connection(), "a", " RUBAR ").is_ok(),
+            "the canonical writer lets a reviewer re-record their OWN canonical verdict (redo pass)"
+        );
+        assert!(
+            require_unseen_pool_family_on(db.connection(), "a", "Rubar")
+                .unwrap_err()
+                .contains("E_REVIEW_FAMILY_ALREADY_SEEN"),
+            "a pool recorder still refuses the same reviewer on the same clip"
+        );
+        assert!(require_unseen_pool_family_or_own_canonical_on(db.connection(), "b", "Rubar").is_ok());
+        assert!(require_unseen_pool_family_or_own_canonical_on(db.connection(), "a", "Hemn").is_ok());
     }
 
     #[test]

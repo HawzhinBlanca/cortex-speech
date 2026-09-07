@@ -740,6 +740,26 @@ pub(super) fn api_pool_decision(
 /// another reviewer currently holds.
 ///
 /// `action: "skip"` is the one path that writes NOTHING to the corpus — see the block that handles it.
+/// Is `segment_id` in `reviewer`'s redo pass right now (`review_redo.rs`): the redo file names
+/// them and the clip is their own canonical "Looks good"? A broken redo file is an error the caller
+/// answers 503 with, exactly like the queue.
+fn redo_pass_for_own_clip(
+    db: &Database,
+    reviewer: &str,
+    segment_id: &str,
+    state: &Mutex<CouchState>,
+) -> Result<bool, String> {
+    let data_dir = lock_state(state).session_store.as_ref().map(|(data_dir, _db_path)| data_dir.clone());
+    let Some(data_dir) = data_dir else {
+        return Ok(false);
+    };
+    let policy = crate::review_redo::load(&data_dir)?;
+    let Some(policy) = crate::review_redo::active_for(policy.as_ref(), reviewer) else {
+        return Ok(false);
+    };
+    crate::review_redo::is_own_canonical_verdict(db, segment_id, reviewer, &policy.actions)
+}
+
 pub(super) fn api_decision_authenticated(
     db: &Database,
     body: &[u8],
@@ -770,6 +790,7 @@ pub(super) fn api_decision_authenticated(
         Ok(policy) => policy,
         Err(error) => return err_reply(503, &error),
     };
+    let mut redo_pass = false;
     if let Some(pool) = early_pool.as_ref() {
         // Pool mode never mints synthetic hidden checks: every real judgement contributes to visible
         // coverage. A remembered pre-pool check on a verified clip therefore becomes an ordinary,
@@ -801,11 +822,22 @@ pub(super) fn api_decision_authenticated(
             Err(error) => return err_reply(500, &format!("operation receipt lookup failed: {error}")),
         };
         if (pool_replay || already_canonical) && !canonical_replay {
-            // A pool observation is a SECOND judgement on a clip that already carries a canonical
-            // human answer. Owner canon 2026-09-04 prices it at the first-opinion weights, and
-            // `review_pool::record_decision` mints that credit in its own transaction, so the
-            // PAY_POLICY_REQUIRED fence that used to stand here (and its queue mirror) is retired.
-            return api_pool_decision(db, &parsed, reviewer, session_binding_sha256, state, pool);
+            // Redo pass (owner 2026-09-07, `review_redo.rs`): a reviewer re-judging their OWN
+            // canonical "Looks good" stays on the canonical path below — it is their one opinion,
+            // updated, paid at the standard weights — and never becomes a pool observation, which
+            // would be a second piece of evidence from one reviewer.
+            redo_pass = !pool_replay
+                && match redo_pass_for_own_clip(db, reviewer, &parsed.id, state) {
+                    Ok(value) => value,
+                    Err(error) => return err_reply(503, &error),
+                };
+            if !redo_pass {
+                // A pool observation is a SECOND judgement on a clip that already carries a canonical
+                // human answer. Owner canon 2026-09-04 prices it at the first-opinion weights, and
+                // `review_pool::record_decision` mints that credit in its own transaction, so the
+                // PAY_POLICY_REQUIRED fence that used to stand here (and its queue mirror) is retired.
+                return api_pool_decision(db, &parsed, reviewer, session_binding_sha256, state, pool);
+            }
         }
     }
     let early_campaign = match active_campaign_policy(db, reviewer, state) {
@@ -966,8 +998,11 @@ pub(super) fn api_decision_authenticated(
     // upsert did not. That is not a duplicate to be waved through — the clip is still unverified, so it
     // would be served as pending work forever — and it is not new work either, because replaying write
     // one would double the learning pair. It is an interrupted write to be FINISHED, below.
-    let already_recorded =
-        parsed.action != "skip" && is_repeat_of_stored_decision(&prev, reviewer, decision, text.as_deref());
+    // A redo verdict is a NEW act even when it repeats the stored one: "Looks good, again, after
+    // listening again" must be recorded (and leave the redo queue), not acknowledged as a replay.
+    let already_recorded = !redo_pass
+        && parsed.action != "skip"
+        && is_repeat_of_stored_decision(&prev, reviewer, decision, text.as_deref());
     if already_recorded && prev.verified {
         // Policy-4 pages possessed a durable operation UUID before finalization. Their exact lost-
         // response retry was handled by `review_operation_state` above. A different UUID carrying a

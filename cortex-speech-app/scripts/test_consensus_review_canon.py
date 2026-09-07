@@ -115,8 +115,12 @@ def test_any_reviewer_may_take_any_clip() -> None:
     require(POOL, "require_unseen_pool_family_on(&tx, input.segment_id, input.reviewer)?;",
             "independent submissions recheck family exposure under the write transaction")
     require(APP / "src-tauri" / "src" / "db" / "finalization.rs",
-            "crate::review_pool::require_unseen_pool_family_on(&tx, segment_id, reviewer)",
-            "named first opinions cannot bypass the duplicate-family guard")
+            "crate::review_pool::require_unseen_pool_family_or_own_canonical_on(&tx, segment_id, reviewer)",
+            "named first opinions cannot bypass the duplicate-family guard; the canonical writer's only exception "
+            "is a reviewer re-recording their OWN canonical verdict (redo pass, owner 2026-09-07)")
+    require(APP / "src-tauri" / "src" / "review_pool" / "family.rs",
+            "if allow_own_canonical_update && only_own_canonical_verdict(conn, &reviewers, segment_id, &key)? {",
+            "the own-canonical exception is opt-in per caller: pool and legacy recorders keep the strict guard")
     require(APP / "src-tauri" / "src" / "review_pool" / "dedup.rs",
             "require_complete_clip_identity(db, &new_exclusions)?;",
             "a superseding manifest cannot discard merely correlated partial content")
