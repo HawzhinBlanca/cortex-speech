@@ -403,9 +403,9 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
                 Some(Ok(policy)) => policy,
                 None => None,
             };
-            if let Some(started_at_ms) = crate::review_redo::started_at_for(redo_policy.as_ref(), reviewer) {
-                redo_started_at_ms = Some(started_at_ms);
-                crate::review_redo::pending_segment_ids(db, pool, reviewer, started_at_ms, allowed_dialects.as_deref())
+            if let Some(policy) = crate::review_redo::active_for(redo_policy.as_ref(), reviewer) {
+                redo_started_at_ms = Some(policy.started_at_ms);
+                crate::review_redo::pending_segment_ids(db, pool, reviewer, policy, allowed_dialects.as_deref())
                     .map_err(crate::error::AppError::Validation)
             } else {
                 // Owner listen list (`review_listen_list.json`): re-read per request like the dialect
@@ -550,7 +550,13 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
             // draft even though speech_segments now contains Rubar's first-pass correction.
             // This is a data boundary, not a presentation hint. A redo pass is the opposite case:
             // the reviewer corrects their OWN approved text, so that text is what they see.
-            let served_text = if redo_started_at_ms.is_some() {
+            // A sent-back POOL clip in the redo queue stays blind (raw draft): the other reviewer's
+            // canonical text must not leak into a second opinion.
+            let own_canonical_redo = redo_started_at_ms.is_some()
+                && s.verified
+                && s.reviewed_by.as_deref().is_some_and(|stored| stored.trim().eq_ignore_ascii_case(reviewer.trim()))
+                && matches!(s.human_decision.as_deref(), Some("accept" | "human_accept" | "edit" | "human_edit"));
+            let served_text = if own_canonical_redo {
                 review_text(s)
             } else if pool_policy.is_some()
                 || campaign_policy.as_ref().is_some_and(|policy| policy.is_blinded_second_pass())

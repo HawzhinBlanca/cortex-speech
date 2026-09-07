@@ -98,12 +98,13 @@ fn first_overlapping_window(spans: &mut [(i64, i64, String)]) -> Option<(String,
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  pool_admin migrate --db <cortex-speech.db>\n  pool_admin inventory --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...]\n  pool_admin activate --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...] [--pool-id <uuid>]\n  pool_admin apply-dedup --db <cortex-speech.db> --manifest <review-pool-dedup.json>\n  pool_admin status --db <cortex-speech.db>\n  pool_admin certify --db <cortex-speech.db> [--full-integrity] [--require-review-ready | --require-final-ready]\n  pool_admin probe --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...]\n  pool_admin benchmark --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...] [--iterations <1..100>]\n  pool_admin benchmark-commit --db <read-only-source.db> --iterations <1..500> --confirm-disposable\n    Synthetic commits use an internally owned temporary clone, never the supplied source.\n  pool_admin stamp-rights --db <cortex-speech.db>\n  pool_admin adjudicate --db <cortex-speech.db> --segment <id> (--retain-text <text> | --reject) --operation-id <uuid>\n  pool_admin export --db <cortex-speech.db> --voice-name <Name> --output <directory>"
+    "Usage:\n  pool_admin migrate --db <cortex-speech.db>\n  pool_admin inventory --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...]\n  pool_admin activate --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...] [--pool-id <uuid>]\n  pool_admin apply-dedup --db <cortex-speech.db> --manifest <review-pool-dedup.json>\n  pool_admin status --db <cortex-speech.db>\n  pool_admin certify --db <cortex-speech.db> [--full-integrity] [--require-review-ready | --require-final-ready]\n  pool_admin probe --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...]\n  pool_admin benchmark --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...] [--iterations <1..100>]\n  pool_admin benchmark-commit --db <read-only-source.db> --iterations <1..500> --confirm-disposable\n    Synthetic commits use an internally owned temporary clone, never the supplied source.\n  pool_admin stamp-rights --db <cortex-speech.db>\n  pool_admin adjudicate --db <cortex-speech.db> --segment <id> (--retain-text <text> | --reject) --operation-id <uuid>\n  pool_admin send-back --db <cortex-speech.db> --reviewer <Name> [--action accept|edit ...] [--apply]\n    Owner rule 2026-09-07: reverses that reviewer's EFFECTIVE pool decisions of those kinds (default accept), each\n    append-only with its pay reversal, so the clips return to them through the redo queue. Dry run without --apply.\n  pool_admin export --db <cortex-speech.db> --voice-name <Name> --output <directory>"
 }
 
 const DETACHED_READ_COMMANDS: &[&str] = &["certify"];
 const DIRECT_READ_COMMANDS: &[&str] = &["inventory", "status", "probe", "benchmark"];
-const WRITE_COMMANDS: &[&str] = &["migrate", "activate", "apply-dedup", "stamp-rights", "adjudicate", "export"];
+const WRITE_COMMANDS: &[&str] =
+    &["migrate", "activate", "apply-dedup", "stamp-rights", "adjudicate", "send-back", "export"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DatabaseAccess {
@@ -1061,21 +1062,15 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 ),
                 None => (Default::default(), cortex_speech_app_lib::review_routing::DifficultyOrder::Unchanged),
             };
-            let redo_started_at_ms = match db_path.parent() {
-                Some(data_dir) => cortex_speech_app_lib::review_redo::started_at_for(
-                    cortex_speech_app_lib::review_redo::load(data_dir)?.as_ref(),
-                    &reviewer,
-                ),
+            let redo_policy = match db_path.parent() {
+                Some(data_dir) => cortex_speech_app_lib::review_redo::load(data_dir)?,
                 None => None,
             };
-            let available = match redo_started_at_ms {
-                Some(started_at_ms) => cortex_speech_app_lib::review_redo::pending_segment_ids(
-                    &db,
-                    &pool,
-                    &reviewer,
-                    started_at_ms,
-                    allowed,
-                )?,
+            let redo_policy = cortex_speech_app_lib::review_redo::active_for(redo_policy.as_ref(), &reviewer);
+            let available = match redo_policy {
+                Some(policy) => {
+                    cortex_speech_app_lib::review_redo::pending_segment_ids(&db, &pool, &reviewer, policy, allowed)?
+                }
                 None => review_pool::pending_segment_ids_with_hints(
                     &db,
                     &pool,
@@ -1099,7 +1094,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                     "availableClips": available.len(),
                     "listenListClips": listen_first.len(),
                     "difficultyOrder": format!("{difficulty:?}"),
-                    "redoPass": redo_started_at_ms.is_some(),
+                    "redoPass": redo_policy.is_some(),
                     "sampleSegmentId": segment_id,
                     "sampleAudioBytes": audio.len(),
                     "sampleAudioValidWav": valid_wav,
@@ -1208,6 +1203,54 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         "stamp-rights" => {
             let report = review_pool::stamp_owner_supplied_pool_rights(&db)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        "send-back" => {
+            // Owner rule change 2026-09-07 ("make rubar's work all second pass … even if we lose some of
+            // her work. change the rule now so we can have those flexibility"): the owner may send a
+            // reviewer's pool decisions back to them. Each is reversed exactly as the phone's own undo
+            // does — an append-only reversal row plus the pay reversal entry; nothing is deleted or
+            // rewritten — so the reviewer is no longer "seen" on the clip and `review_redo` serves it to
+            // them again as a fresh, blind pool judgement. Consensus canon untouched: two DIFFERENT
+            // reviewers still decide, and a reversed decision never counts.
+            let pool = review_pool::load(&db)?.ok_or("review pool is not active")?;
+            let reviewer = value_after(&args, "--reviewer")?;
+            let mut actions = repeated_values(&args, "--action")?;
+            if actions.is_empty() {
+                actions.push("accept".to_string());
+            }
+            if actions.iter().any(|action| !matches!(action.as_str(), "accept" | "edit")) {
+                return Err("send-back --action must be accept or edit".into());
+            }
+            let apply = args.iter().any(|arg| arg == "--apply");
+            let candidates = cortex_speech_app_lib::review_redo::send_back_candidates(&db, &pool, &reviewer, &actions)?;
+            let mut reversed = 0usize;
+            if apply {
+                for candidate in &candidates {
+                    let operation_id = uuid::Uuid::new_v4().to_string();
+                    review_pool::reverse_decision(
+                        &db,
+                        &pool,
+                        candidate.decision_id,
+                        &reviewer,
+                        &operation_id,
+                        unix_time_ms()?,
+                    )?;
+                    reversed += 1;
+                }
+            }
+            let remaining = cortex_speech_app_lib::review_redo::send_back_candidates(&db, &pool, &reviewer, &actions)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "reviewer": reviewer,
+                    "actions": actions,
+                    "dryRun": !apply,
+                    "candidates": candidates.len(),
+                    "reversed": reversed,
+                    "remainingEffective": remaining.len(),
+                    "decisions": candidates,
+                }))?
+            );
         }
         "adjudicate" => {
             let pool = review_pool::load(&db)?.ok_or("review pool is not active")?;

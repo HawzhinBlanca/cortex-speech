@@ -88,6 +88,16 @@ if a checkable pin drifts from what is written here.
   restricted reviewers. WHO may judge WHAT lives in `<data_dir>/reviewer_dialects.json` — names stay
   out of this public document by the repo's own hygiene law. Enforced:
   `check_reviewer_queues_live.py`, `dialect.rs` tests.
+- **Send-back / redo pass (owner rule change 2026-09-07, in the owner's words: "i want to make rubar's
+  work all second pass, starting with what she chose looks good, even if we lose some of her work.
+  change the rule now so we can have those flexibility").** The owner may name reviewers in
+  `<data_dir>/review_redo.json`; a named reviewer is served ONLY their own verdicts to re-judge. Their
+  canonical verdicts are re-recorded as their UPDATED opinion (paid at the standard weights — owner:
+  "its okay if the app says more payment and counts it"); their pool decisions may be sent back by
+  `pool_admin send-back`, which reverses each append-only with its pay reversal so they can judge the
+  clip again, blind. Consensus is still any two DIFFERENT reviewers; a reversed decision never counts;
+  nothing is deleted or rewritten. Enforced: `review_redo.rs`, `review_pool/family.rs`
+  (`require_unseen_pool_family_or_own_canonical_on` for the canonical writer only), couch redo tests.
 
 ## Calibrated numbers (measured, not chosen — recalibrate only with a new measurement)
 - `SPEAKER_CHANGE_THRESHOLD = 0.59` — within-clip half-vs-half; owner's blind 15-clip pass, 15/15.

@@ -1,5 +1,32 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-07 — Send-back: the owner's rule change for a reviewer's POOL "Looks good" decisions
+
+**Owner instruction (verbatim).** "i want to make rubar's work all second pass, starting with what she chose
+looks good, even if we lose some of her work. change the rule now so we can have those flexibility. since we
+cant trust her work and Iftikhar's work. we must send them back." Recorded in `docs/OWNER_CANON.md` (Review
+operation) in the owner's words.
+
+**What the rule change is, exactly.** Until now a reviewer's pool decision (a second opinion) was final for that
+reviewer: append-only evidence, one identity per reviewer per family. The owner may now SEND BACK a reviewer's
+pool decisions: `pool_admin send-back --reviewer <Name> [--action accept|edit ...] [--apply]` reverses each
+EFFECTIVE decision of those kinds through `review_pool::reverse_decision` — the same append-only reversal row
+plus pay-reversal ledger entry the phone's own undo writes; nothing deleted, nothing rewritten; dry run by
+default. A reversed decision never counts; the reviewer is no longer "seen" on the clip; `review_redo` then
+serves it to them again, BLIND (raw draft, never the other reviewer's text), as a fresh pool decision. The
+consensus canon is untouched: two DIFFERENT reviewers still decide.
+
+**Scope.** `review_redo.json` gains optional `"actions": ["accept"]` (default) or `["accept","edit"]`, for both
+the canonical redo and the send-back re-serve. Live counts (read-only): pool accepts sendable — one reviewer 101,
+the other 264; every one of them sits on a clip whose only other opinion is a canonical one, so a send-back
+returns the clip to one-opinion, not to zero.
+
+**Tests.** The couch redo test now continues into send-back: a normal blind pool accept, the owner's reversal
+(one reversal row, coverage drops the reversed vote), the clip back in the reviewer's redo queue blind, a fresh
+pool decision with a new id, queue drained, disagreement leaves the clip wanting a third. `review_redo` parse
+tests cover `actions`. Policy: the consensus canon gate now pins the canonical writer's own-verdict exception
+and the strict pool guard separately.
+
 ## 2026-09-07 — Redo pass for two reviewers' own "Looks good" clips (paid, canonical)
 
 **Owner instruction.** After the blind audits (one reviewer 15% letter-perfect on her accepts, the other 1 of 5)

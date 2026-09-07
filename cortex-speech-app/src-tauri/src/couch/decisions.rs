@@ -754,10 +754,10 @@ fn redo_pass_for_own_clip(
         return Ok(false);
     };
     let policy = crate::review_redo::load(&data_dir)?;
-    if crate::review_redo::started_at_for(policy.as_ref(), reviewer).is_none() {
+    let Some(policy) = crate::review_redo::active_for(policy.as_ref(), reviewer) else {
         return Ok(false);
-    }
-    crate::review_redo::is_own_canonical_accept(db, segment_id, reviewer)
+    };
+    crate::review_redo::is_own_canonical_verdict(db, segment_id, reviewer, &policy.actions)
 }
 
 pub(super) fn api_decision_authenticated(
