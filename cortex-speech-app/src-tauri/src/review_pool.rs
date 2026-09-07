@@ -1146,6 +1146,29 @@ pub fn pending_segment_ids_with_listen_list(
     allowed_dialects: Option<&[String]>,
     listen_first: &HashSet<String>,
 ) -> Result<Vec<String>, String> {
+    let hints = QueueHints { listen_first, difficulty: crate::review_routing::DifficultyOrder::Unchanged };
+    pending_segment_ids_with_hints(db, pool, reviewer, allowed_dialects, &hints)
+}
+
+/// Per-reviewer ordering hints. Both re-order only: neither adds a clip, removes one, or changes who
+/// may decide anything.
+pub struct QueueHints<'a> {
+    /// Owner listen list (`listen_list.rs`): these clips lead this reviewer's queue.
+    pub listen_first: &'a HashSet<String>,
+    /// Difficulty routing (`review_routing.rs`): hard clips first for the ears the owner named,
+    /// easy clips first for everyone else, unchanged without a routing file.
+    pub difficulty: crate::review_routing::DifficultyOrder,
+}
+
+/// `pending_segment_ids` with the owner listen list and the difficulty routing order.
+pub fn pending_segment_ids_with_hints(
+    db: &Database,
+    pool: &ReviewPool,
+    reviewer: &str,
+    allowed_dialects: Option<&[String]>,
+    hints: &QueueHints<'_>,
+) -> Result<Vec<String>, String> {
+    let listen_first = hints.listen_first;
     // `load` performs the full O(pool) identity/history proof once at Start. Schema v62 then makes
     // membership and every clip identity field immutable, while each decision insert re-proves its
     // exact member/audio/reviewer boundary transactionally. Repeating the full 20k-row proof on every
@@ -1163,7 +1186,8 @@ pub fn pending_segment_ids_with_listen_list(
     let mut statement = db
         .connection()
         .prepare(
-            "SELECT segment.id, segment.audio_path, segment.speaker_change_score
+            "SELECT segment.id, segment.audio_path, segment.speaker_change_score,
+                    member.raw_transcript, member.duration_ms, segment.alignment_json
                FROM review_pool_members member
                JOIN speech_segments segment ON segment.id=member.segment_id
               WHERE member.pool_id=?1
@@ -1177,12 +1201,19 @@ pub fn pending_segment_ids_with_listen_list(
         .map_err(|error| format!("review pool queue cannot be prepared: {error}"))?;
     let rows = statement
         .query_map([&pool.pool_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<f64>>(2)?))
+            Ok(PendingRow {
+                segment_id: row.get(0)?,
+                audio_path: row.get(1)?,
+                speaker_change_score: row.get(2)?,
+                raw_transcript: row.get(3)?,
+                duration_ms: row.get(4)?,
+                alignment_json: row.get(5)?,
+            })
         })
         .map_err(|error| format!("review pool queue cannot be read: {error}"))?;
     let mut pending: Vec<PendingVoiceCandidate> = Vec::new();
     for row in rows {
-        let (segment_id, audio_path, speaker_change_score) =
+        let PendingRow { segment_id, audio_path, speaker_change_score, raw_transcript, duration_ms, alignment_json } =
             row.map_err(|error| format!("review pool row is unreadable: {error}"))?;
         // A clip that already carries one canonical opinion IS the work the consensus canon wants
         // served next. Until 2026-09-04 a PAY-FENCE MIRROR skipped it here because a pool second
@@ -1239,12 +1270,32 @@ pub fn pending_segment_ids_with_listen_list(
             .map(|member| member.voice_name.clone())
             .ok_or_else(|| format!("review pool clip {segment_id} has no frozen voice identity"))?;
         let tts_rank = u8::from(crate::review_pool_export::tts_admission(speaker_change_score).is_err());
+        // Owner instruction 2026-09-07 (item 1): inside the same voice and TTS rank, the aligner's
+        // lowest word confidence and the speaking rate say how hard the clip is
+        // (`review_routing::difficulty_bucket`, thresholds measured on 2,350 verdicts). Reviewers the
+        // owner named hear hard clips first, everyone else easy clips first; without a routing file
+        // the key is constant and nothing moves. The alignment is parsed only when routing is on, so
+        // the unchanged path costs what it did before.
+        // ponytail: ~3k small JSON parses per request when routing is on; cache per pool if it shows.
+        let difficulty_rank = match hints.difficulty {
+            crate::review_routing::DifficultyOrder::Unchanged => {
+                crate::review_routing::difficulty_rank(hints.difficulty, 1)
+            }
+            order => {
+                let lowest = alignment_json.as_deref().and_then(crate::review_routing::min_word_confidence);
+                crate::review_routing::difficulty_rank(
+                    order,
+                    crate::review_routing::difficulty_bucket(&raw_transcript, duration_ms, lowest),
+                )
+            }
+        };
         pending.push((
             u8::from(!listen_first.contains(&segment_id)),
             distance_to_decision,
             voice_priority_rank(&voice_name),
             voice_name,
             tts_rank,
+            difficulty_rank,
             spread_key,
             segment_id,
         ));
@@ -1252,10 +1303,21 @@ pub fn pending_segment_ids_with_listen_list(
     Ok(order_pending_by_voice_priority(pending))
 }
 
+/// One queue-eligible pool row as read from the database.
+struct PendingRow {
+    segment_id: String,
+    audio_path: String,
+    speaker_change_score: Option<f64>,
+    raw_transcript: String,
+    duration_ms: i64,
+    alignment_json: Option<String>,
+}
+
 /// Queue candidate: listen-list rank (0 = the owner asked this reviewer to hear it next), decision
 /// distance, voice priority rank, frozen voice name (orders voices the priority list does not name),
-/// TTS admission rank (0 = measured single-voice), spread key, clip id.
-type PendingVoiceCandidate = (u8, usize, usize, String, u8, [u8; 32], String);
+/// TTS admission rank (0 = measured single-voice), difficulty rank (`review_routing`), spread key,
+/// clip id.
+type PendingVoiceCandidate = (u8, usize, usize, String, u8, u8, [u8; 32], String);
 
 /// Owner direction 2026-09-06: reviewers finish one voice's dataset before starting the next, in
 /// this order. A voice the list does not name sorts after all of them, alphabetically, so a future
@@ -1271,7 +1333,7 @@ fn voice_priority_rank(voice_name: &str) -> usize {
 /// frozen facts, so two reviewers and two restarts always derive the same queue.
 fn order_pending_by_voice_priority(mut candidates: Vec<PendingVoiceCandidate>) -> Vec<String> {
     candidates.sort_unstable();
-    candidates.into_iter().map(|(_, _, _, _, _, _, segment_id)| segment_id).collect()
+    candidates.into_iter().map(|(_, _, _, _, _, _, _, segment_id)| segment_id).collect()
 }
 
 pub fn coverage_by_voice(db: &Database) -> Result<Vec<VoiceCoverage>, String> {
@@ -3213,9 +3275,9 @@ mod tests {
         );
 
         let nearer = order_pending_by_voice_priority(vec![
-            (1, 2, 0, "Lamo".into(), 0, [0; 32], "fresh-lamo".into()),
-            (1, 0, 2, "Halwest".into(), 1, [u8::MAX; 32], "near-halwest".into()),
-            (1, 1, 1, "Kawa".into(), 0, [0; 32], "disputed-kawa".into()),
+            (1, 2, 0, "Lamo".into(), 0, 0, [0; 32], "fresh-lamo".into()),
+            (1, 0, 2, "Halwest".into(), 1, 2, [u8::MAX; 32], "near-halwest".into()),
+            (1, 1, 1, "Kawa".into(), 0, 0, [0; 32], "disputed-kawa".into()),
         ]);
         assert_eq!(
             nearer,
@@ -3228,9 +3290,9 @@ mod tests {
         );
         assert_eq!(voice_priority_rank("Someone"), 3, "an unnamed voice sorts after every named one");
         let unnamed = order_pending_by_voice_priority(vec![
-            (1, 0, 3, "Zara".into(), 0, [0; 32], "zara".into()),
-            (1, 0, 3, "Aram".into(), 0, [0; 32], "aram".into()),
-            (1, 0, 2, "Halwest".into(), 1, [0; 32], "halwest".into()),
+            (1, 0, 3, "Zara".into(), 0, 1, [0; 32], "zara".into()),
+            (1, 0, 3, "Aram".into(), 0, 1, [0; 32], "aram".into()),
+            (1, 0, 2, "Halwest".into(), 1, 2, [0; 32], "halwest".into()),
         ]);
         assert_eq!(unnamed, vec!["halwest", "aram", "zara"], "unnamed voices follow the named ones alphabetically");
     }
@@ -3275,6 +3337,57 @@ mod tests {
             pending_segment_ids_with_listen_list(&db2, &pool2, "Rubar", None, &listed2).unwrap(),
             vec!["b".to_string()]
         );
+    }
+
+    #[test]
+    fn difficulty_routing_serves_hard_clips_to_named_ears_first_and_easy_clips_to_the_rest() {
+        use crate::review_routing::DifficultyOrder;
+        let (_dir, db, pool) = clip_pool(&["a", "b", "c"]);
+        // Same draft, same rate (11 cps): only the aligner's lowest word confidence differs. The
+        // alignment keeps the frozen source span, so the v62 identity trigger accepts the update.
+        let aligned = |low: f64| {
+            format!(
+                r#"{{"chunk_count":1,"chunk_index":0,"source_start_ms":0,"source_end_ms":1000,"words":[{{"word":"دەقی","confidence":0.95,"start":0.0,"end":0.5}},{{"word":"چامپیۆن","confidence":{low},"start":0.5,"end":1.0}}]}}"#
+            )
+        };
+        for (id, low) in [("a", 0.3), ("c", 0.95)] {
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments SET alignment_json=?2 WHERE id=?1",
+                    rusqlite::params![id, aligned(low)],
+                )
+                .unwrap();
+        }
+        // "b" keeps the fixture's words-free alignment: unmeasured = medium, never easy.
+        let none = HashSet::new();
+        let hints = |difficulty| QueueHints { listen_first: &none, difficulty };
+        let unchanged = pending_segment_ids(&db, &pool, "Hemn", None).unwrap();
+        assert_eq!(
+            pending_segment_ids_with_hints(&db, &pool, "Hemn", None, &hints(DifficultyOrder::Unchanged)).unwrap(),
+            unchanged,
+            "no routing file: the order is exactly what it was"
+        );
+        assert_eq!(
+            pending_segment_ids_with_hints(&db, &pool, "Hemn", None, &hints(DifficultyOrder::HardFirst)).unwrap(),
+            vec!["a", "b", "c"],
+            "a named ear hears the hard clip first, the unmeasured one next, the easy one last"
+        );
+        assert_eq!(
+            pending_segment_ids_with_hints(&db, &pool, "Roza", None, &hints(DifficultyOrder::EasyFirst)).unwrap(),
+            vec!["c", "b", "a"],
+            "everyone else hears the easy clip first"
+        );
+        // Decision distance still outranks difficulty: one opinion on the easy clip leads even hard-first.
+        review_canonically(&db, "c");
+        assert_eq!(
+            pending_segment_ids_with_hints(&db, &pool, "Hemn", None, &hints(DifficultyOrder::HardFirst)).unwrap(),
+            vec!["c", "a", "b"],
+            "a clip one opinion from consensus is served before any fresh clip, whatever its difficulty"
+        );
+        // And the owner listen list still precedes everything.
+        let listed: HashSet<String> = ["b".to_string()].into_iter().collect();
+        let listen = QueueHints { listen_first: &listed, difficulty: DifficultyOrder::HardFirst };
+        assert_eq!(pending_segment_ids_with_hints(&db, &pool, "Hemn", None, &listen).unwrap(), vec!["b", "c", "a"]);
     }
 
     #[test]

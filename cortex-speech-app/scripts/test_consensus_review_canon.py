@@ -148,8 +148,18 @@ def test_the_queue_serves_what_is_nearest_a_decision() -> None:
     )
     require(
         POOL,
-        "type PendingVoiceCandidate = (u8, usize, usize, String, u8, [u8; 32], String);",
-        "only the owner listen list (explicit, per reviewer) precedes decision distance; voice priority can never jump work nearer consensus",
+        "type PendingVoiceCandidate = (u8, usize, usize, String, u8, u8, [u8; 32], String);",
+        "only the owner listen list (explicit, per reviewer) precedes decision distance; voice priority and difficulty can never jump work nearer consensus",
+    )
+    require(
+        POOL,
+        "crate::review_routing::difficulty_bucket(&raw_transcript, duration_ms, lowest),",
+        "owner item 1 (2026-09-07): difficulty is a measured fact (lowest aligned word confidence, speaking rate), ranked after voice and TTS admission",
+    )
+    require(
+        APP / "src-tauri" / "src" / "review_routing.rs",
+        "DifficultyOrder::Unchanged => 1,",
+        "without a routing file the difficulty key is constant: nothing moves for anyone",
     )
     require(
         POOL,

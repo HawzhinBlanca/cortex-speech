@@ -396,16 +396,24 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
         Some(pool) => {
             // Owner listen list (`review_listen_list.json`): re-read per request like the dialect roster,
             // so naming a clip takes effect on this reviewer's next queue fetch without a restart.
-            let listen_first = {
+            // Difficulty routing (`review_routing.json`, owner item 1 2026-09-07): same hot-reload,
+            // same fail-open; hard clips first for the named ears, easy first for everyone else.
+            let (listen_first, difficulty) = {
                 let data_dir = lock_state(state).session_store.as_ref().map(|(data_dir, _db_path)| data_dir.clone());
-                data_dir.map(|dir| crate::listen_list::listen_first_for(&dir, reviewer, pool)).unwrap_or_default()
+                match data_dir {
+                    Some(dir) => (
+                        crate::listen_list::listen_first_for(&dir, reviewer, pool),
+                        crate::review_routing::order_for(&dir, reviewer),
+                    ),
+                    None => (Default::default(), crate::review_routing::DifficultyOrder::Unchanged),
+                }
             };
-            crate::review_pool::pending_segment_ids_with_listen_list(
+            crate::review_pool::pending_segment_ids_with_hints(
                 db,
                 pool,
                 reviewer,
                 allowed_dialects.as_deref(),
-                &listen_first,
+                &crate::review_pool::QueueHints { listen_first: &listen_first, difficulty },
             )
             .map_err(crate::error::AppError::Validation)
         }
@@ -544,6 +552,21 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
                     .map(str::to_string)
                     .or_else(|| s.speaker_id.clone()),
                 "speakerChange": holds_a_speaker_change(s),
+                // Item 1 (owner, 2026-09-07): the aligner's least-certain words of the served DRAFT, so
+                // the reviewer's ear goes there first. Pool mode only, where the served text IS the raw
+                // draft the alignment describes; absent (null) when the clip was never aligned or the
+                // alignment no longer matches the draft. A hint about where to listen, never a verdict.
+                "uncertainWords": pool_policy
+                    .as_ref()
+                    .and(s.alignment_json.as_deref())
+                    .map(|alignment| {
+                        crate::review_routing::uncertain_words(
+                            &s.raw_transcript,
+                            alignment,
+                            crate::review_routing::UNCERTAIN_WORDS_LIMIT,
+                        )
+                    })
+                    .filter(|words| !words.is_empty()),
                 // The row's change-fingerprint at serve time; the page echoes it on the decision so
                 // a draft replaced by a background writer in between is refused, never recorded.
                 "rowVersion": revision.to_string(),

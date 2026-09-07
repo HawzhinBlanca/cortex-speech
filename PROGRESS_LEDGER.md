@@ -1,5 +1,43 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-07 — Difficulty routing and uncertain-word hints (owner item 1)
+
+**Why (measured, read-only, 2,350 human verdicts).** The champion draft carries no confidence, but
+3,286 of the 11,244 canonical pool clips already hold a CTC forced alignment with a per-word confidence.
+The LOWEST word confidence predicts the human verdict: under 0.6 the human edited 58% of clips (mean
+draft CER 5.5%); 0.6–0.8 43% (3.3%); 0.8 and above 33% (2.3%). Speaking rate does the same job at the
+extremes: under 8 or at/above 18 non-space characters per second, 57–59% edited with 3–4× the draft
+error. The machine knows which clips are hard before anyone listens. The machine second-look calibration
+(2026-09-06/07, both cloud judge candidates on 704 clips) failed the plan's bar on 4 of 5 counts — text
+CER 2.5× WORSE than the draft, 80–90% over-edit on clips two humans agreed on — so no machine writes text;
+this is the lawful use of what the machine measures well.
+
+**Routing (`review_routing.rs`, `<data_dir>/review_routing.json` `{ "hard_first": [names] }`).** Inside the
+same decision distance, voice and TTS rank, the reviewers the owner names hear HARD clips first (bucket 0:
+lowest word confidence < 0.6 or an extreme rate), then unmeasured (1), then easy (2: lowest ≥ 0.8); everyone
+else hears easy clips first. A missing file leaves the key constant — nothing moves for anyone; a broken file
+is logged and ignored (a priority hint fails open, like the listen list). Unaligned clips at a normal rate are
+medium, never easy: absence of evidence is not evidence of an easy clip. Queue key is now
+`(listen, distance, voice_rank, voice, tts_rank, difficulty, spread, id)`; `QueueHints` carries listen list +
+difficulty; `pending_segment_ids_with_listen_list` remains as the Unchanged wrapper. Couch `api_queue` and
+`pool_admin probe` (`difficultyOrder`) read the file per request. Canon untouched: decision distance still
+outranks difficulty, the listen list still precedes everything, no reviewer gains or loses decision authority.
+
+**Hint (`uncertainWords`).** In pool mode the served draft IS the aligned text, so the phone payload names up
+to six words the aligner scored under 0.6, in draft order, only when the alignment still matches the draft
+word-for-word; the page draws them under the clip meta as a text node (`وشە نادڵنیاکان: …`). Absent field =
+never aligned = nothing drawn. A hint about WHERE to listen, never a verdict.
+
+**Tests.** Rust: `review_routing` unit tests (thresholds, rank mirror, alignment parsing, stale-alignment
+refusal, file fail-open) and `difficulty_routing_serves_hard_clips_to_named_ears_first_and_easy_clips_to_the_
+rest` (Unchanged == baseline, hard-first / easy-first orders, distance outranks difficulty, listen list outranks
+all). Pins: `test_consensus_review_canon.py` (tuple shape, difficulty after TTS rank, Unchanged constant),
+`test_couch_page_i18n.py` (`uncertainWords` acknowledged as unreviewed Sorani — owner read list). Vitest:
+`couch_page_uncertain_words.test.ts` (drawn, text-node-not-markup, absent draws nothing).
+
+**Follow-up.** 7,958 pool clips have no alignment; `realign_segments --apply` (app closed, snapshot first) would
+extend routing and hints to the whole pool. Owner decision.
+
 ## 2026-09-06 — Spelling convention v1.1 (draft) and the machine second-look calibration plan
 
 **Why.** The owner asked a cloud model to review pool drafts and a 25-clip self-graded run claimed
