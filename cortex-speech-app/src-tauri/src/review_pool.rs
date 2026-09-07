@@ -9,6 +9,9 @@ mod authority;
 mod coverage;
 mod dedup;
 mod family;
+mod send_back;
+
+pub use send_back::{apply_send_back_plan, prepare_send_back_plan, SendBackPlan};
 
 pub use coverage::{coverage_by_voice, VoiceCoverage};
 
@@ -3723,6 +3726,112 @@ mod tests {
             vec!["clip"],
             "a skip may defer a clip, but it cannot certify that redo work is finished"
         );
+    }
+
+    #[test]
+    fn send_back_plan_is_atomic_revision_fenced_and_exactly_replayable() {
+        let (dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        let a = decide(&db, &pool, "Alle", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174081", 1);
+        let b = decide(&db, &pool, "Sewa", "دەقی سێیەم", "123e4567-e89b-42d3-a456-426614174082", 2);
+        let plan = prepare_send_back_plan(&db, &pool, &[b, a]).unwrap();
+        let revision = db.segment_review_revision("clip").unwrap().unwrap();
+        let ledger_rows = || {
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM review_compensation_ledger", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        let before = ledger_rows();
+        assert!(apply_send_back_plan(&db, &pool, &plan, 3, false).unwrap_err().contains("acknowledgment"));
+        db.connection()
+            .execute_batch(&format!(
+                "CREATE TEMP TRIGGER fail_batch BEFORE INSERT ON main.review_pool_reversals WHEN NEW.decision_id={b}
+             BEGIN SELECT RAISE(ABORT, 'injected second-item failure'); END;"
+            ))
+            .unwrap();
+        assert!(apply_send_back_plan(&db, &pool, &plan, 3, true).unwrap_err().contains("injected"));
+        assert_eq!(ledger_rows(), before, "no earlier item's pay adjustment may survive failure");
+        let reversals: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM review_pool_reversals", [], |r| r.get(0)).unwrap();
+        assert_eq!(reversals, 0);
+        assert_eq!(db.segment_review_revision("clip").unwrap(), Some(revision));
+        db.connection().execute_batch("DROP TRIGGER fail_batch").unwrap();
+        assert_eq!(apply_send_back_plan(&db, &pool, &plan, 3, true).unwrap(), 2);
+        assert_eq!(db.segment_review_revision("clip").unwrap(), Some(revision + 1), "one bump per clip");
+        assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "pending");
+        let after = ledger_rows();
+        assert_eq!(apply_send_back_plan(&db, &pool, &plan, 4, true).unwrap(), 2);
+        assert_eq!(ledger_rows(), after, "lost-response retry must not double-adjust pay");
+        assert_eq!(db.segment_review_revision("clip").unwrap(), Some(revision + 1));
+        let path = dir.path().join("send-back-restart.db");
+        {
+            let mut target = rusqlite::Connection::open(&path).unwrap();
+            rusqlite::backup::Backup::new(db.connection(), &mut target)
+                .unwrap()
+                .run_to_completion(128, std::time::Duration::from_millis(1), None)
+                .unwrap();
+        }
+        let restored = Database::open(path.to_str().unwrap()).unwrap();
+        restored.initialize().unwrap();
+        let restored_pool = load(&restored).unwrap().unwrap();
+        assert_eq!(apply_send_back_plan(&restored, &restored_pool, &plan, 5, true).unwrap(), 2);
+        assert_eq!(restored.segment_review_revision("clip").unwrap(), Some(revision + 1));
+    }
+
+    #[test]
+    fn send_back_plan_respects_read_only_snapshot_and_pay_failure_rollback() {
+        let (dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        let a = decide(&db, &pool, "Alle", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174085", 1);
+        let path = dir.path().join("send-back-preview.db");
+        {
+            let mut target = rusqlite::Connection::open(&path).unwrap();
+            rusqlite::backup::Backup::new(db.connection(), &mut target)
+                .unwrap()
+                .run_to_completion(128, std::time::Duration::from_millis(1), None)
+                .unwrap();
+        }
+        let reader = Database::open_read_only(path.to_str().unwrap()).unwrap();
+        let read_pool = load(&reader).unwrap().unwrap();
+        let plan = prepare_send_back_plan(&reader, &read_pool, &[a]).unwrap();
+        assert!(!reader.connection().is_autocommit(), "caller-owned snapshot must remain open");
+        assert_eq!(plan, prepare_send_back_plan(&db, &pool, &[a]).unwrap());
+        assert!(reader.connection().execute("DELETE FROM review_pool_decisions", []).is_err());
+        let revision = db.segment_review_revision("clip").unwrap();
+        db.connection()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_pay BEFORE INSERT ON main.review_compensation_ledger
+            BEGIN SELECT RAISE(ABORT, 'injected pay failure'); END;",
+            )
+            .unwrap();
+        assert!(apply_send_back_plan(&db, &pool, &plan, 2, true).unwrap_err().contains("injected pay"));
+        assert_eq!(
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM review_pool_reversals", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.segment_review_revision("clip").unwrap(), revision);
+        assert_eq!(prepare_send_back_plan(&db, &pool, &[a]).unwrap(), plan);
+    }
+
+    #[test]
+    fn send_back_plan_refuses_tampering_stale_evidence_and_duplicate_targets_without_writes() {
+        let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        let a = decide(&db, &pool, "Alle", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174083", 1);
+        assert!(prepare_send_back_plan(&db, &pool, &[a, a]).is_err());
+        let plan = prepare_send_back_plan(&db, &pool, &[a]).unwrap();
+        let mut tampered = plan.clone();
+        tampered.items[0].reviewer = "Other".into();
+        assert!(apply_send_back_plan(&db, &pool, &tampered, 2, true).unwrap_err().contains("digest"));
+        decide(&db, &pool, "Sewa", "دەقی سێیەم", "123e4567-e89b-42d3-a456-426614174084", 2);
+        assert!(apply_send_back_plan(&db, &pool, &plan, 3, true).unwrap_err().contains("stale"));
+        let count: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM review_pool_reversals", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        let revised = prepare_send_back_plan(&db, &pool, &[a]).unwrap();
+        db.connection()
+            .execute("UPDATE speech_segments SET review_revision=review_revision+1 WHERE id='clip'", [])
+            .unwrap();
+        assert!(apply_send_back_plan(&db, &pool, &revised, 4, true).unwrap_err().contains("stale"));
     }
 
     #[test]

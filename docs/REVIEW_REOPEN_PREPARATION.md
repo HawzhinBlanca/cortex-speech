@@ -1,7 +1,8 @@
 # Safe preparation for owner-directed re-review
 
-This is preparation tooling and incremental redo-queue hardening, not a completed general reopen
-workflow. It does not authorize production activation, change payment, or put any clip into gold.
+This is preparation tooling, incremental redo-queue hardening, and an offline atomic pool-only
+reversal primitive, not a completed general reopen workflow. It does not authorize production
+activation or put any clip into gold. The explicit apply command below appends signed pay adjustments.
 
 ## Read-only inventory
 
@@ -69,3 +70,33 @@ runner), `redo_reversal_reuses_consensus_authority_and_is_scoped_to_its_round`, 
 
 Repeated ordinary phone undo during the same timestamp interval is not yet distinguishable from
 owner send-back intent. Timestamp filtering alone is not a durable reopen-round design.
+
+## Atomic pool-only reversal primitive (not general reopen)
+
+The legacy `pool_admin send-back` is now a **read-only semantic-action inventory**. Its `--apply`
+option refuses before opening a database. It is not the exact historical Looks Good selection.
+
+The replacement requires explicit effective pool decision IDs (not canonical event IDs or clip IDs):
+
+```text
+pool_admin plan-send-back --db <existing-library.db> --decision-id <id> [--decision-id ...]
+pool_admin apply-send-back --db <offline-library.db> --manifest <owner-inspected-plan.json> --acknowledge-pay-adjustments
+```
+
+Save preview stdout privately and inspect it before any apply. Preview uses a consistent read-only
+snapshot and includes requested button, semantic action, reviewer, current revision, evidence hash,
+pool identity and a plan digest. It accepts only retained effective accept/edit pool observations;
+it does not automatically widen a reviewer filter or revive retired duplicates.
+
+Apply requires the instance lock (all writers stopped), exact plan validation and explicit pay
+acknowledgment. One IMMEDIATE/FULL-synchronous transaction rechecks current evidence, appends every
+reversal and its existing-policy compensation adjustment, and advances each affected clip revision
+once. A stale target or any reversal/pay failure rolls back the whole batch. Deterministic operation
+IDs make exact retries no-ops, including after restart; mixed/different reversal receipts refuse.
+No transcript, audio, prior decision, or financial history is deleted or restored to an older value.
+
+The inventory JSON above and this pool-only plan are intentionally different schemas: do not feed
+the inventory to apply. This primitive does **not** withdraw canonical approval, implement a durable
+shared round, certify pay-policy authorization, activate a queue, or certify the deployed UI. Do not
+use it to bypass the remaining rollout requirements. Revision fencing here must still be verified
+through the complete later-round HTTP/UI flow. Use only owned test clones until rollout is approved.

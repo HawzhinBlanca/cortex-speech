@@ -1,5 +1,25 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-07 — Atomic exact-plan pool reversals (Codex; not general reopen)
+
+Replaced the unsafe row-by-row operator send-back writer with an explicit retained-decision plan.
+The old `send-back --apply` refuses before DB open; legacy inventory is read-only. `plan-send-back`
+freezes exact IDs, revisions, requested/semantic actions and evidence. `apply-send-back` is instance
+locked, requires explicit signed-pay acknowledgment, and revalidates inside one IMMEDIATE/FULL
+transaction for all reversals/pay adjustments and one revision increment per affected clip.
+Deterministic operation receipts make exact retries idempotent, including after backup/reopen.
+Failure injection proves no earlier item survives a later reversal or payment-write failure.
+
+Windows checks: 277 reviewer-module Rust tests and 39 pool_admin tests passed; four focused checks
+are included in those counts, not additional. Consensus pins, 12 owner pins, format/whitespace and
+the 178-module architecture gate passed. Logs are private under `pool-reopen-20260907/atomic-*`.
+Clippy (`--lib --tests --bin pool_admin -- -D warnings`) passed in 1m10s.
+
+No live data, pay, queue, roster, audio, model or deployment changes. This is a pool-only primitive,
+not immediate canonical trust withdrawal or durable common reopen rounds. Production-sized clone,
+end-to-end later-round phone behavior and deployed reviewer acceptance remain required. Reviewers
+must not receive GO based on these test results or the separate PR113 merge/staging alone.
+
 ## 2026-09-07 — Exact reopen preparation and redo eligibility hardening (Codex)
 
 Owner requested implementation of the broader re-review workflow. This commit is a bounded safety
