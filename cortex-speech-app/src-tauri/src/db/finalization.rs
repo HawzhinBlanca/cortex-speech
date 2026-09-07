@@ -196,7 +196,9 @@ impl Database {
                 return Ok((None, false));
             }
             if let (Some("couch"), Some(reviewer)) = (audit_source, annotator) {
-                crate::review_pool::require_unseen_pool_family_on(&tx, segment_id, reviewer)
+                // The canonical writer lets a reviewer re-record their OWN canonical verdict (redo
+                // pass, owner 2026-09-07); every other "already seen" shape still refuses.
+                crate::review_pool::require_unseen_pool_family_or_own_canonical_on(&tx, segment_id, reviewer)
                     .map_err(AppError::Validation)?;
             }
             // The legacy phone writers exist only in the test build. Keep their broad historical

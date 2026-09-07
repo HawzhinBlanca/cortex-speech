@@ -1,5 +1,45 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-07 — Redo pass for two reviewers' own "Looks good" clips (paid, canonical)
+
+**Owner instruction.** After the blind audits (one reviewer 15% letter-perfect on her accepts, the other 1 of 5)
+the owner paused both reviewers' paid intake and asked that each be sent back EXACTLY the clips they marked
+"Looks good", to correct them, before any new work. Pause = one roster line each (`reviewer_dialects.json`
+→ `["badini"]`, a dialect no pool source maps to; probe: nothing served to them, others unaffected; backups in
+`reviewer_roster_backups/`).
+
+**Why the redo is paid and canonical (measured, not chosen).** Every review event after the pay cutoff must be a
+Couch event with exactly one ledger credit: `restore_service/compensation.rs` refuses a restore on any other
+post-cutoff event, and `check_review_compensation_readiness.py` demands one credit per event. An unpaid redo
+would therefore need a new evidence table and schema 71 (a full release ripple). The owner chose the paid path in
+his own words: "its okay if the app says more payment and counts it, but we wanna make sure we give them the
+exact set that they chose Looks Good". Pay rules are unchanged; a redo verdict is an ordinary canonical decision.
+
+**Design (`review_redo.rs`).** `<data_dir>/review_redo.json` `{ "started_at_ms", "redo": [names] }`, re-read per
+request; a present-but-broken file fails CLOSED (it is a restriction, like the dialect roster). A named reviewer's
+pool queue becomes only their own canonical accepts among live pool clips, hardest first, served with the text
+they approved (`redo: true` on the payload; the phone labels the clip as their own redo). Their verdict goes
+through the canonical writer as their UPDATED opinion — one reviewer, one opinion, never a second opinion for
+consensus — and a repeated "Looks good" is recorded as a new act, so the clip leaves the redo queue. Scope limit
+by design: a "Looks good" given as a POOL decision cannot be re-judged by the same reviewer (append-only pool
+evidence, one identity per reviewer per family): live scope 799 clips for one reviewer, 158 for the other;
+their pool accepts (101 / 264) are covered only by a second reviewer.
+
+**Family rule, split.** `require_unseen_pool_family_on` stays strict for pool and legacy recorders; the canonical
+writer uses `require_unseen_pool_family_or_own_canonical_on`, which passes only when every piece of the
+reviewer's evidence in the family is the canonical verdict on this very clip. Pinned by
+`a_reviewer_may_update_their_own_canonical_verdict_but_never_add_pool_evidence_to_it`.
+
+**Tests.** `redo_pass_serves_a_reviewer_their_own_looks_good_clips_and_records_corrections_canonically` (couch,
+end to end with policy-4 playback: exact scope, approved text served, correction lands canonically, re-accept is
+a new event, zero pool rows, queue drains, coverage stays one-review), `review_redo` parse/fail-closed tests,
+phone label vitest, `test_couch_page_i18n.py` acknowledges `redoPass`.
+
+**Also sent to the owner:** per-reviewer feedback CSVs (every accept a different reviewer later corrected or
+rejected, side by side with CER). Note for the record: when a lenient reviewer's accepts were judged by the other
+lenient reviewer they agreed 71% of the time, against 15% letter-perfect in the owner's blind audit — two lenient
+reviewers agreeing is not verification.
+
 ## 2026-09-07 — Difficulty routing and uncertain-word hints (owner item 1)
 
 **Why (measured, read-only, 2,350 human verdicts).** The champion draft carries no confidence, but

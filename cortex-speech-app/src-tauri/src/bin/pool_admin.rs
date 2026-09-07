@@ -1061,13 +1061,29 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 ),
                 None => (Default::default(), cortex_speech_app_lib::review_routing::DifficultyOrder::Unchanged),
             };
-            let available = review_pool::pending_segment_ids_with_hints(
-                &db,
-                &pool,
-                &reviewer,
-                allowed,
-                &review_pool::QueueHints { listen_first: &listen_first, difficulty },
-            )?;
+            let redo_started_at_ms = match db_path.parent() {
+                Some(data_dir) => cortex_speech_app_lib::review_redo::started_at_for(
+                    cortex_speech_app_lib::review_redo::load(data_dir)?.as_ref(),
+                    &reviewer,
+                ),
+                None => None,
+            };
+            let available = match redo_started_at_ms {
+                Some(started_at_ms) => cortex_speech_app_lib::review_redo::pending_segment_ids(
+                    &db,
+                    &pool,
+                    &reviewer,
+                    started_at_ms,
+                    allowed,
+                )?,
+                None => review_pool::pending_segment_ids_with_hints(
+                    &db,
+                    &pool,
+                    &reviewer,
+                    allowed,
+                    &review_pool::QueueHints { listen_first: &listen_first, difficulty },
+                )?,
+            };
             let segment_id = available.first().ok_or("canonical queue has no audio sample for this reviewer")?;
             let segment = db.get_segment_by_id(segment_id)?.ok_or("canonical queue sample disappeared")?;
             let audio = cortex_speech_app_lib::agentic::segment_audio_as_wav_bytes(&segment)?;
@@ -1083,6 +1099,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                     "availableClips": available.len(),
                     "listenListClips": listen_first.len(),
                     "difficultyOrder": format!("{difficulty:?}"),
+                    "redoPass": redo_started_at_ms.is_some(),
                     "sampleSegmentId": segment_id,
                     "sampleAudioBytes": audio.len(),
                     "sampleAudioValidWav": valid_wav,

@@ -69,6 +69,7 @@
     "skippedByYou": "You skipped {n} clip(s) — they are still waiting for someone else.",
     "speakerChange": "more than one speaker",
     "uncertainWords": "unsure words: {words}",
+    "redoPass": "redo: you marked this clip Looks good — listen again and correct it",
     "stillSending": "{n} decision(s) have not been sent yet. Keep this page open until they go through.",
     "refused": "{n} decision(s) could not be saved: another reviewer got there first, or the link changed. Your typed text is kept — find those clips and review them again.",
     "mustListen": "Not saved: the server could not verify enough renderer-reported playback traversal for this clip. Replay it, then try again.",
@@ -101,6 +102,7 @@
     "skippedByYou": "{n} پارچەت تێپەڕاند — هێشتا چاوەڕێی کەسێکی ترن.",
     "speakerChange": "زیاتر لە یەک قسەکەر",
     "uncertainWords": "وشە نادڵنیاکان: {words}",
+    "redoPass": "دووبارە: ئەم پارچەیە خۆت «دروستە»ت لێدابوو — دووبارە گوێ بگرە و ڕاستی بکەرەوە",
     "stillSending": "{n} بڕیار هێشتا نەنێردراون. ئەم پەڕەیە کراوە بهێڵەوە تا دەنێردرێن.",
     "refused": "{n} بڕیار پاشەکەوت نەکران: پێداچوونەوەرێکی تر پێشتر کردوویەتی، یان بەستەرەکە گۆڕاوە. دەقە نووسراوەکەت پارێزراوە — ئەو پارچانە بدۆزەرەوە و دووبارە پێداچوونەوەیان بۆ بکە.",
     "mustListen": "پاشەکەوت نەکرا: ڕاژەکار نەیتوانی گەڕانی پەخشکردنی ڕاپۆرتکراو بۆ ئەم پارچەیە بە ڕادەی پێویست بسەلمێنێت. دووبارە پەخشی بکە و هەوڵ بدەرەوە.",
@@ -133,6 +135,7 @@
     "skippedByYou": null,
     "speakerChange": null,
     "uncertainWords": null,
+    "redoPass": null,
     "stillSending": null,
     "refused": null,
     "mustListen": null,
@@ -1319,6 +1322,14 @@
       hint.className = 'flag uncertain';
       hint.textContent = ' · ' + t('uncertainWords', { words: seg.uncertainWords.join('، ') });
       $('meta').appendChild(hint);
+    }
+    // Redo pass (owner, 2026-09-07): the reviewer is correcting a clip THEY marked Looks good. Said
+    // plainly, so nobody mistakes their own earlier approval for a fresh draft.
+    if (seg.redo === true) {
+      const redo = document.createElement('span');
+      redo.className = 'flag redo';
+      redo.textContent = ' · ' + t('redoPass');
+      $('meta').appendChild(redo);
     }
     prefetchNext();
     // ONE TAP PER CLIP (R2.2). Deciding a clip is the reviewer saying "next", so the next clip should

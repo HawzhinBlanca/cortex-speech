@@ -392,30 +392,42 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
     } else {
         None
     };
+    // Redo pass (`review_redo.json`, owner 2026-09-07): when the file names this reviewer, their
+    // queue is ONLY their own canonical "Looks good" clips, served with the text they approved.
+    let mut redo_started_at_ms: Option<i64> = None;
     let pending_result = match pool_policy.as_ref() {
         Some(pool) => {
-            // Owner listen list (`review_listen_list.json`): re-read per request like the dialect roster,
-            // so naming a clip takes effect on this reviewer's next queue fetch without a restart.
-            // Difficulty routing (`review_routing.json`, owner item 1 2026-09-07): same hot-reload,
-            // same fail-open; hard clips first for the named ears, easy first for everyone else.
-            let (listen_first, difficulty) = {
-                let data_dir = lock_state(state).session_store.as_ref().map(|(data_dir, _db_path)| data_dir.clone());
-                match data_dir {
+            let data_dir = lock_state(state).session_store.as_ref().map(|(data_dir, _db_path)| data_dir.clone());
+            let redo_policy = match data_dir.as_deref().map(crate::review_redo::load) {
+                Some(Err(error)) => return err_reply(503, &format!("Review is temporarily paused: {error}")),
+                Some(Ok(policy)) => policy,
+                None => None,
+            };
+            if let Some(started_at_ms) = crate::review_redo::started_at_for(redo_policy.as_ref(), reviewer) {
+                redo_started_at_ms = Some(started_at_ms);
+                crate::review_redo::pending_segment_ids(db, pool, reviewer, started_at_ms, allowed_dialects.as_deref())
+                    .map_err(crate::error::AppError::Validation)
+            } else {
+                // Owner listen list (`review_listen_list.json`): re-read per request like the dialect
+                // roster, so naming a clip takes effect on this reviewer's next queue fetch without a
+                // restart. Difficulty routing (`review_routing.json`, owner item 1 2026-09-07): same
+                // hot-reload, same fail-open; hard clips first for the named ears, easy first for the rest.
+                let (listen_first, difficulty) = match data_dir {
                     Some(dir) => (
                         crate::listen_list::listen_first_for(&dir, reviewer, pool),
                         crate::review_routing::order_for(&dir, reviewer),
                     ),
                     None => (Default::default(), crate::review_routing::DifficultyOrder::Unchanged),
-                }
-            };
-            crate::review_pool::pending_segment_ids_with_hints(
-                db,
-                pool,
-                reviewer,
-                allowed_dialects.as_deref(),
-                &crate::review_pool::QueueHints { listen_first: &listen_first, difficulty },
-            )
-            .map_err(crate::error::AppError::Validation)
+                };
+                crate::review_pool::pending_segment_ids_with_hints(
+                    db,
+                    pool,
+                    reviewer,
+                    allowed_dialects.as_deref(),
+                    &crate::review_pool::QueueHints { listen_first: &listen_first, difficulty },
+                )
+                .map_err(crate::error::AppError::Validation)
+            }
         }
         None => match campaign_policy.as_ref().filter(|policy| policy.is_blinded_second_pass()) {
             Some(policy) => crate::review_campaign::independent_pending_segment_ids(db, policy)
@@ -534,17 +546,23 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
         .iter()
         .filter_map(|id| by_id.get(id.as_str()))
         .map(|(s, revision)| {
+            // Alle's independent pass is genuinely blind: the backend serves the champion raw
+            // draft even though speech_segments now contains Rubar's first-pass correction.
+            // This is a data boundary, not a presentation hint. A redo pass is the opposite case:
+            // the reviewer corrects their OWN approved text, so that text is what they see.
+            let served_text = if redo_started_at_ms.is_some() {
+                review_text(s)
+            } else if pool_policy.is_some()
+                || campaign_policy.as_ref().is_some_and(|policy| policy.is_blinded_second_pass())
+            {
+                s.raw_transcript.clone()
+            } else {
+                review_text(s)
+            };
             serde_json::json!({
                 "id": s.id,
-                // Alle's independent pass is genuinely blind: the backend serves the champion raw
-                // draft even though speech_segments now contains Rubar's first-pass correction.
-                // This is a data boundary, not a presentation hint.
-                "text": if pool_policy.is_some()
-                    || campaign_policy.as_ref().is_some_and(|policy| policy.is_blinded_second_pass()) {
-                    s.raw_transcript.clone()
-                } else {
-                    review_text(s)
-                },
+                "text": served_text,
+                "redo": redo_started_at_ms.is_some(),
                 "durationMs": s.duration_ms,
                 "speakerId": pool_policy
                     .as_ref()
@@ -561,7 +579,7 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
                     .and(s.alignment_json.as_deref())
                     .map(|alignment| {
                         crate::review_routing::uncertain_words(
-                            &s.raw_transcript,
+                            &served_text,
                             alignment,
                             crate::review_routing::UNCERTAIN_WORDS_LIMIT,
                         )
@@ -760,6 +778,8 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
                             // The RAW draft — the known-wrong one. Serving the corrected text would
                             // make the check unpassable-by-failing: there would be nothing to catch.
                             "text": seg.raw_transcript,
+                            // Same key as work clips; a spot check is never a redo clip.
+                            "redo": false,
                             "durationMs": seg.duration_ms,
                             "speakerId": pool_policy
                                 .as_ref()
