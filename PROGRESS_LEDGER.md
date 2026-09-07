@@ -1,5 +1,26 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-07 — Schema71 shared reopen deployed and reviewer access restored
+
+Production build `7397c1f21b68b4f7dc32c8b92a03a4e1f2f72558` deployed through the protected controller;
+exact clone preflight and live certification passed for all 11,244 retained audio clips. The exact
+1,064-clip Looks Good batch is in a durable shared round. Independent live/snapshot comparison
+confirmed prior review/payment/effect history and returned text/audio preserved; old pool votes: 0.
+Targeted roster holds lifted only after verification; existing links, all 10 queues and continuity pass.
+Activated round state is in verified local and second-drive snapshots. This is a reviewer-work GO,
+not certification of human accuracy, completed re-review, or gold TTS quality.
+
+Final checks: 2,709 library tests and 39 admin tests passed; 8 special-purpose library tests skipped in the
+ordinary run, with the isolated durability benchmark subsequently executed and passing. Clippy,
+lint, typecheck, architecture, 40 release-policy tests, 44 phone unit tests and 45 browser tests passed.
+Two-reviewer clone benchmark: 60 commits, p95 78.217ms. No synthetic production submissions.
+
+Operations: existing health task was rebound to the immutable release and stable Python runtime,
+preserving its schedule/log directory. Future rollouts must rebind that task alongside the controller's
+watchdog/restore-drill handover; an old controller import had caused false schema-version alarms.
+Unknown historical-button and corrected-later groups remain separate. Private inventories, identities,
+exact production paths, backup hashes and handover evidence are recorded in the owner's vault/audit.
+
 ## 2026-09-07 — Shared owner quality rounds (schema71; rollout verification in progress)
 
 Added exact digest/revision-bound owner reopen rounds, fresh independent opinions for any eligible
