@@ -1,5 +1,67 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-07 — Difficulty routing and uncertain-word hints (owner item 1)
+
+**Why (measured, read-only, 2,350 human verdicts).** The champion draft carries no confidence, but
+3,286 of the 11,244 canonical pool clips already hold a CTC forced alignment with a per-word confidence.
+The LOWEST word confidence predicts the human verdict: under 0.6 the human edited 58% of clips (mean
+draft CER 5.5%); 0.6–0.8 43% (3.3%); 0.8 and above 33% (2.3%). Speaking rate does the same job at the
+extremes: under 8 or at/above 18 non-space characters per second, 57–59% edited with 3–4× the draft
+error. The machine knows which clips are hard before anyone listens. The machine second-look calibration
+(2026-09-06/07, both cloud judge candidates on 704 clips) failed the plan's bar on 4 of 5 counts — text
+CER 2.5× WORSE than the draft, 80–90% over-edit on clips two humans agreed on — so no machine writes text;
+this is the lawful use of what the machine measures well.
+
+**Routing (`review_routing.rs`, `<data_dir>/review_routing.json` `{ "hard_first": [names] }`).** Inside the
+same decision distance, voice and TTS rank, the reviewers the owner names hear HARD clips first (bucket 0:
+lowest word confidence < 0.6 or an extreme rate), then unmeasured (1), then easy (2: lowest ≥ 0.8); everyone
+else hears easy clips first. A missing file leaves the key constant — nothing moves for anyone; a broken file
+is logged and ignored (a priority hint fails open, like the listen list). Unaligned clips at a normal rate are
+medium, never easy: absence of evidence is not evidence of an easy clip. Queue key is now
+`(listen, distance, voice_rank, voice, tts_rank, difficulty, spread, id)`; `QueueHints` carries listen list +
+difficulty; `pending_segment_ids_with_listen_list` remains as the Unchanged wrapper. Couch `api_queue` and
+`pool_admin probe` (`difficultyOrder`) read the file per request. Canon untouched: decision distance still
+outranks difficulty, the listen list still precedes everything, no reviewer gains or loses decision authority.
+
+**Hint (`uncertainWords`).** In pool mode the served draft IS the aligned text, so the phone payload names up
+to six words the aligner scored under 0.6, in draft order, only when the alignment still matches the draft
+word-for-word; the page draws them under the clip meta as a text node (`وشە نادڵنیاکان: …`). Absent field =
+never aligned = nothing drawn. A hint about WHERE to listen, never a verdict.
+
+**Tests.** Rust: `review_routing` unit tests (thresholds, rank mirror, alignment parsing, stale-alignment
+refusal, file fail-open) and `difficulty_routing_serves_hard_clips_to_named_ears_first_and_easy_clips_to_the_
+rest` (Unchanged == baseline, hard-first / easy-first orders, distance outranks difficulty, listen list outranks
+all). Pins: `test_consensus_review_canon.py` (tuple shape, difficulty after TTS rank, Unchanged constant),
+`test_couch_page_i18n.py` (`uncertainWords` acknowledged as unreviewed Sorani — owner read list). Vitest:
+`couch_page_uncertain_words.test.ts` (drawn, text-node-not-markup, absent draws nothing).
+
+**Follow-up.** 7,958 pool clips have no alignment; `realign_segments --apply` (app closed, snapshot first) would
+extend routing and hints to the whole pool. Owner decision.
+
+## 2026-09-06 — Spelling convention v1.1 (draft) and the machine second-look calibration plan
+
+**Why.** The owner asked a cloud model to review pool drafts and a 25-clip self-graded run claimed
+"single-pass gold review" quality. The run used the 25 shortest clips, had human text for 2 of 25, and
+on one of those moved the text further from the human than the raw draft. Before any machine reviews
+the pool, both humans and machines need one spelling rule and one honest calibration.
+
+**Measured first (read-only, 3,311 human verdict texts, 1,302 edits).** Reviewers disagree mostly on
+spacing/joining and vowel spelling (top inserted/deleted characters: space, ە, ی, ا, و, ئ, ێ); hamza
+and word-initial ڕ are already near-universal; digits appear in 2.8% and punctuation in 4.3% of
+verdicts; the elongated filler tokens of `ANNOTATION_GUIDELINES.md` occur zero times.
+
+**Contradiction found.** `ANNOTATION_GUIDELINES.md` (numbers as digits; elongated filler tokens) vs
+`SORANI_VERBATIM_CONVENTIONS_v1.md` (ACTIVE: numbers as spoken words; fillers as heard). Reviewers
+follow v1.0 in both cases, so the premium builder's filler filter currently filters nothing.
+
+**Drafted (owner approval pending, nothing in force).** `cortex-speech-app/docs/REVIEWER_SPELLING_
+CONVENTION.md` (v1.1 supplement: letters, the missing spacing rule, numbers resolved toward v1.0, no
+punctuation, forgiven-vs-counted table taken from `normalize_for_metrics`) and `cortex-speech-app/docs/
+MACHINE_SECOND_LOOK_CALIBRATION_PLAN.md` (keys: 188 finalizer-grade keeps, 273 two-human identical, 222
+two-human differing, 104 human rejects, the owner's 32-clip overlap set; frozen blind configuration;
+both candidate judge models on the identical set with a 30% hold-out; pass bar as a nominator only).
+Canon unchanged: a machine opinion is evidence, never one of the two agreeing reviewers.
+
 ## 2026-09-06 — Owner listen list, file-name search, and the overlap question
 
 **Owner listened to the cross-voice group** (`lamo_016604`, `lamo_016931`, `halwest_000971`, `halwest_003313`):

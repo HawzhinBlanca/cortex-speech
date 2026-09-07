@@ -73,6 +73,10 @@ UNREVIEWED_SORANI = {
     # v47 speaker-change badge. New Sorani, NOT yet natively reviewed — it goes on the owner's list
     # with the other seven.
     "speakerChange",
+    # Item 1 (owner, 2026-09-07): the aligner's least-certain draft words, shown so the reviewer's ear
+    # goes there first. New Sorani ("وشە نادڵنیاکان: {words}"), NOT natively reviewed — on the owner's
+    # read list with the speaker badge.
+    "uncertainWords",
     # R4.4 explicit no-verdict. The BUTTON reuses the existing (already-listed) `skip` string; this is
     # the empty-state line that stops "🎉 all clips reviewed" appearing over clips the reviewer
     # skipped. One new string was the honest floor — the alternative was letting the page lie.
