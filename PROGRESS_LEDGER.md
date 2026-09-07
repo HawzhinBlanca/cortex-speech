@@ -1,5 +1,34 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-07 — Exact reopen preparation and redo eligibility hardening (Codex)
+
+Owner requested implementation of the broader re-review workflow. This commit is a bounded safety
+increment atop `6fad008e`, NOT general reopen completion or deployment approval. Private reviewer
+counts and inventories stay outside Git. See `docs/REVIEW_REOPEN_PREPARATION.md` for the rollout gaps.
+
+`prepare_review_reopen.py` reads a single read-only SQLite snapshot and freezes requested-button
+versus semantic action, current revision/text hashes, history, duplicate exclusions, other reviewers'
+authority and schema identity. Existing output is never overwritten. `--verify-against` rejects
+tampering or changed evidence. Unknown clicks and later edits stay separate. No apply/pay/roster/
+audio/model/queue mutation exists in this tool. The existing Python runner automatically discovers
+its 16 regression tests.
+
+Returned pool opinions now use the ordinary pool queue's eligibility. Two disagreeing opinions no
+longer strand a returned third; resolved clips/family restrictions remain excluded. Earlier reversals
+do not automatically enter later timestamp rounds; skips do not complete canonical redo work.
+
+Measured on Windows: 16 Python tests passed; focused Rust redo 10/10; reviewer main modules 222/222;
+expanded `cargo test --lib -- couch:: review_pool:: review_redo:: --test-threads=4` 274/274 (100.34s).
+Consensus policy pins, 12 owner pins, cargo fmt, git diff whitespace and architecture gate passed
+(177 Rust modules). Private raw test logs live under the local `pool-reopen-20260907` audit directory.
+`cargo clippy --lib --tests -- -D warnings` passed (2m35s).
+No cloud/ASR calls, production writes, paid synthetic reviews, or deployment were performed.
+
+Still required: durable owner reopen round and immutable preview/apply target, immediate withdrawal
+of disputed canonical approval from resolution/export/learning, shared eligible-reviewer pickup,
+stale submission/playback fences, explicit compensation handling and clone/restore/rollout proof.
+Timestamp scoping alone cannot distinguish ordinary undo from owner send-back within a round.
+
 ## 2026-09-07 — Send-back: the owner's rule change for a reviewer's POOL "Looks good" decisions
 
 **Owner instruction (verbatim).** "i want to make rubar's work all second pass, starting with what she chose

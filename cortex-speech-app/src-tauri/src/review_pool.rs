@@ -3678,6 +3678,54 @@ mod tests {
     }
 
     #[test]
+    fn redo_reversal_reuses_consensus_authority_and_is_scoped_to_its_round() {
+        let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        decide(&db, &pool, "Alle", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174071", 1);
+        let third = decide(&db, &pool, "Sewa", "دەقی سێیەم", "123e4567-e89b-42d3-a456-426614174072", 2);
+        let policy = crate::review_redo::RedoPolicy {
+            started_at_ms: 3,
+            reviewers: vec!["Sewa".into()],
+            actions: vec!["edit".into()],
+        };
+        assert!(crate::review_redo::pending_segment_ids(&db, &pool, "Sewa", &policy, None).unwrap().is_empty());
+        reverse_decision(&db, &pool, third, "Sewa", "123e4567-e89b-42d3-a456-426614174073", 4).unwrap();
+        assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "needsThirdReview");
+        assert_eq!(
+            crate::review_redo::pending_segment_ids(&db, &pool, "Sewa", &policy, None).unwrap(),
+            vec!["clip"],
+            "two disagreeing opinions must not strand the returned third opinion"
+        );
+        let later = crate::review_redo::RedoPolicy { started_at_ms: 5, ..policy.clone() };
+        assert!(
+            crate::review_redo::pending_segment_ids(&db, &pool, "Sewa", &later, None).unwrap().is_empty(),
+            "an earlier undo must not silently join a new redo round"
+        );
+        decide(&db, &pool, "Roza", "دەقی یەکەم", "123e4567-e89b-42d3-a456-426614174074", 5);
+        assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "resolved");
+        assert!(
+            crate::review_redo::pending_segment_ids(&db, &pool, "Sewa", &policy, None).unwrap().is_empty(),
+            "new agreement must close the queue just as it closes the writer"
+        );
+    }
+
+    #[test]
+    fn redo_skip_is_not_a_completed_canonical_correction() {
+        let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        let policy = crate::review_redo::RedoPolicy {
+            started_at_ms: 1,
+            reviewers: vec!["Rubar".into()],
+            actions: vec!["accept".into(), "edit".into()],
+        };
+        assert_eq!(crate::review_redo::pending_segment_ids(&db, &pool, "Rubar", &policy, None).unwrap(), vec!["clip"]);
+        db.record_review_event("clip", "Rubar", "skip", "couch", 2).unwrap();
+        assert_eq!(
+            crate::review_redo::pending_segment_ids(&db, &pool, "Rubar", &policy, None).unwrap(),
+            vec!["clip"],
+            "a skip may defer a clip, but it cannot certify that redo work is finished"
+        );
+    }
+
+    #[test]
     fn three_distinct_outcomes_require_owner_and_owner_ruling_is_evidence_bound() {
         let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
         decide(&db, &pool, "Alle", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174054", 1);
