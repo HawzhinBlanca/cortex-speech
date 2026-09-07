@@ -98,13 +98,14 @@ fn first_overlapping_window(spans: &mut [(i64, i64, String)]) -> Option<(String,
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  pool_admin migrate --db <cortex-speech.db>\n  pool_admin inventory --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...]\n  pool_admin activate --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...] [--pool-id <uuid>]\n  pool_admin apply-dedup --db <cortex-speech.db> --manifest <review-pool-dedup.json>\n  pool_admin status --db <cortex-speech.db>\n  pool_admin certify --db <cortex-speech.db> [--full-integrity] [--require-review-ready | --require-final-ready]\n  pool_admin probe --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...]\n  pool_admin benchmark --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...] [--iterations <1..100>]\n  pool_admin benchmark-commit --db <read-only-source.db> --iterations <1..500> --confirm-disposable\n    Synthetic commits use an internally owned temporary clone, never the supplied source.\n  pool_admin stamp-rights --db <cortex-speech.db>\n  pool_admin adjudicate --db <cortex-speech.db> --segment <id> (--retain-text <text> | --reject) --operation-id <uuid>\n  pool_admin send-back --db <cortex-speech.db> --reviewer <Name> [--action accept|edit ...]\n    Read-only semantic-action inventory; not exact clicked-button selection. --apply is disabled.\n  pool_admin plan-send-back --db <cortex-speech.db> --decision-id <id> [--decision-id ...]\n    Outputs an exact retained-pool plan for owner inspection; does not change the database.\n  pool_admin apply-send-back --db <cortex-speech.db> --manifest <plan.json> --acknowledge-pay-adjustments\n    Offline atomic pool reversal only; NOT canonical trust withdrawal or general re-review activation.\n  pool_admin export --db <cortex-speech.db> --voice-name <Name> --output <directory>"
+    "Usage:\n  pool_admin migrate --db <cortex-speech.db>\n  pool_admin inventory --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...]\n  pool_admin activate --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...] [--pool-id <uuid>]\n  pool_admin apply-dedup --db <cortex-speech.db> --manifest <review-pool-dedup.json>\n  pool_admin status --db <cortex-speech.db>\n  pool_admin certify --db <cortex-speech.db> [--full-integrity] [--require-review-ready | --require-final-ready]\n  pool_admin probe --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...]\n  pool_admin benchmark --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...] [--iterations <1..100>]\n  pool_admin benchmark-commit --db <read-only-source.db> --iterations <1..500> --confirm-disposable\n    Synthetic commits use an internally owned temporary clone, never the supplied source.\n  pool_admin stamp-rights --db <cortex-speech.db>\n  pool_admin adjudicate --db <cortex-speech.db> --segment <id> (--retain-text <text> | --reject) --operation-id <uuid>\n  pool_admin send-back --db <cortex-speech.db> --reviewer <Name> [--action accept|edit ...]\n    Read-only semantic-action inventory; not exact clicked-button selection. --apply is disabled.\n  pool_admin plan-send-back --db <cortex-speech.db> --decision-id <id> [--decision-id ...]\n    Outputs an exact retained-pool plan for owner inspection; does not change the database.\n  pool_admin apply-send-back --db <cortex-speech.db> --manifest <plan.json> --acknowledge-pay-adjustments\n    Offline atomic pool reversal only; NOT canonical trust withdrawal or general re-review activation.\n  pool_admin plan-reopen --db <library.db> (--segment-list <ids.json> | --segment-id <id> ...) --reason <text> [--priority 0..2]\n    Read-only exact preview; retained canonical clips only. Save and inspect stdout privately.\n  pool_admin apply-reopen --db <offline-library.db> --manifest <plan.json> --confirm-quality-hold\n    Atomic trust withdrawal and shared fresh-review round; preserves prior transcripts and pay.\n  pool_admin export --db <cortex-speech.db> --voice-name <Name> --output <directory>"
 }
 
 const DETACHED_READ_COMMANDS: &[&str] = &["certify"];
-const DIRECT_READ_COMMANDS: &[&str] = &["inventory", "status", "probe", "benchmark", "send-back", "plan-send-back"];
+const DIRECT_READ_COMMANDS: &[&str] =
+    &["inventory", "status", "probe", "benchmark", "send-back", "plan-send-back", "plan-reopen"];
 const WRITE_COMMANDS: &[&str] =
-    &["migrate", "activate", "apply-dedup", "stamp-rights", "adjudicate", "apply-send-back", "export"];
+    &["migrate", "activate", "apply-dedup", "stamp-rights", "adjudicate", "apply-send-back", "apply-reopen", "export"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DatabaseAccess {
@@ -876,6 +877,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let command = args.first().map(String::as_str).ok_or_else(|| usage().to_string())?;
+    if command == "apply-reopen" && !args.iter().any(|arg| arg == "--confirm-quality-hold") {
+        return Err("apply-reopen requires --confirm-quality-hold: this withdraws all prior approvals for the exact clips, preserves history/pay, and requires fresh review".into());
+    }
     // Refuse the former per-row writer before opening any DB (including recovery/startup writes).
     if command == "send-back" && args.iter().any(|arg| arg == "--apply") {
         return Err("send-back --apply is disabled: prepare exact decision IDs with plan-send-back, inspect the saved plan, then use apply-send-back --manifest with explicit --acknowledge-pay-adjustments; this alone does not activate general re-review".into());
@@ -1073,7 +1077,9 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 Some(data_dir) => cortex_speech_app_lib::review_redo::load(data_dir)?,
                 None => None,
             };
-            let redo_policy = cortex_speech_app_lib::review_redo::active_for(redo_policy.as_ref(), &reviewer);
+            let shared_rounds = review_pool::reopen::has_rounds(&db)?;
+            let redo_policy = cortex_speech_app_lib::review_redo::active_for(redo_policy.as_ref(), &reviewer)
+                .filter(|_| !shared_rounds);
             let available = match redo_policy {
                 Some(policy) => {
                     cortex_speech_app_lib::review_redo::pending_segment_ids(&db, &pool, &reviewer, policy, allowed)?
@@ -1102,6 +1108,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                     "listenListClips": listen_first.len(),
                     "difficultyOrder": format!("{difficulty:?}"),
                     "redoPass": redo_policy.is_some(),
+                    "sharedReopenRounds": shared_rounds,
                     "sampleSegmentId": segment_id,
                     "sampleAudioBytes": audio.len(),
                     "sampleAudioValidWav": valid_wav,
@@ -1219,6 +1226,65 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             let pool = review_pool::load(&db)?.ok_or("review pool is not active")?;
             let plan = review_pool::prepare_send_back_plan(&db, &pool, &ids)?;
             println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
+        "plan-reopen" => {
+            let mut ids = repeated_values(&args, "--segment-id")?;
+            if let Some(path) = optional_value_after(&args, "--segment-list")? {
+                if !ids.is_empty() {
+                    return Err("use either --segment-id or --segment-list, not both".into());
+                }
+                let file = std::fs::File::open(path)?;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut std::io::Read::take(file, 8_000_001), &mut bytes)?;
+                if bytes.len() > 8_000_000 {
+                    return Err("reopen segment list exceeds 8 MB".into());
+                }
+                ids = serde_json::from_slice(&bytes)?;
+            }
+            let reason = value_after(&args, "--reason")?;
+            let priority =
+                optional_value_after(&args, "--priority")?.map(|v| v.parse::<u8>()).transpose()?.unwrap_or(0);
+            let pool = review_pool::load(&db)?.ok_or("review pool is not active")?;
+            let plan = review_pool::reopen::prepare(&db, &pool, &ids, &reason, priority)?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
+        "apply-reopen" => {
+            let file = std::fs::File::open(value_after(&args, "--manifest")?)?;
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::Read::take(file, 8_000_001), &mut bytes)?;
+            if bytes.len() > 8_000_000 {
+                return Err("reopen manifest exceeds 8 MB".into());
+            }
+            let plan: review_pool::reopen::ReopenPlan = serde_json::from_slice(&bytes)?;
+            let pool = review_pool::load(&db)?.ok_or("review pool is not active")?;
+            let already_applied: bool = db.connection().query_row(
+                "SELECT EXISTS(SELECT 1 FROM review_reopen_rounds WHERE round_id=?1)",
+                [&plan.round_id],
+                |r| r.get(0),
+            )?;
+            let pin = if already_applied {
+                None
+            } else {
+                // Unique per-round label: preserve every older pin, and certify recovery before
+                // the first quality withdrawal. Instance lock is already held by this command.
+                let uuid = uuid::Uuid::parse_str(&plan.round_id)?;
+                let directory = db_path.parent().ok_or("database parent missing")?;
+                Some(cortex_speech_app_lib::snapshot::take_pinned_snapshot(
+                    &db,
+                    directory,
+                    &format!("pre_reopen_{uuid}"),
+                    1,
+                )?)
+            };
+            let reopened = review_pool::reopen::apply(&db, &pool, &plan, unix_time_ms()?)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "roundId":plan.round_id,"planSha256":plan.plan_sha256,"reopenedOrAlreadyApplied":reopened,
+                    "preReopenPinnedSnapshot":pin,
+                    "paymentHistoryChanged":false,"requiresFreshDistinctReviewers":true
+                }))?
+            );
         }
         "apply-send-back" => {
             // Bound memory even if a malformed or growing file is supplied.
@@ -1676,6 +1742,9 @@ mod tests {
         assert!(old.contains("is disabled"), "{old}");
         let missing_ack = run(args(&["apply-send-back"])).unwrap_err().to_string();
         assert!(missing_ack.contains("acknowledge-pay-adjustments"), "{missing_ack}");
+        assert_eq!(command_database_access("plan-reopen"), Ok(DatabaseAccess::DirectRead));
+        assert_eq!(command_database_access("apply-reopen"), Ok(DatabaseAccess::LockedWrite));
+        assert!(run(args(&["apply-reopen"])).unwrap_err().to_string().contains("confirm-quality-hold"));
     }
 
     #[test]

@@ -521,6 +521,13 @@ pub(super) fn api_pool_decision(
                     reviewer,
                 ) =>
         {
+            match crate::review_pool::reopen::decision_is_current(db, &receipt.segment_id, receipt.decision_id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return err_reply(409, "this receipt belongs to an earlier review round — refresh and listen again")
+                }
+                Err(error) => return err_reply(503, &format!("reopen authority unavailable: {error}")),
+            }
             remember_pool_undo(state, reviewer, operation_id, &receipt.segment_id, receipt.decision_id);
             forget_work_audio_assignment(state, &parsed.id, reviewer);
             return json_reply_with_accounting(
@@ -821,6 +828,15 @@ pub(super) fn api_decision_authenticated(
             Ok(receipt) => receipt.flatten().is_some(),
             Err(error) => return err_reply(500, &format!("operation receipt lookup failed: {error}")),
         };
+        let reopened = match crate::review_pool::reopen::revision(db, &parsed.id) {
+            Ok(value) => value.is_some(),
+            Err(error) => return err_reply(503, &format!("reopen authority unavailable: {error}")),
+        };
+        if reopened {
+            // Never overwrite the held canonical record, even for its original author or an old
+            // canonical UUID replay. The shared pool writer enforces current revision/playback.
+            return api_pool_decision(db, &parsed, reviewer, session_binding_sha256, state, pool);
+        }
         if (pool_replay || already_canonical) && !canonical_replay {
             // Redo pass (owner 2026-09-07, `review_redo.rs`): a reviewer re-judging their OWN
             // canonical "Looks good" stays on the canonical path below — it is their one opinion,

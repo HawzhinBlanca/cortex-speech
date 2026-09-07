@@ -2130,6 +2130,105 @@ mod tests {
     }
 
     #[test]
+    fn shared_reopen_phone_roundtrip_saves_looks_good_corrections_and_fences_old_rounds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        let champion = "omniasr-7b-shared-reopen-test";
+        crate::registry::register_candidate(
+            &db,
+            &crate::registry::NewModelVersion {
+                id: champion.into(),
+                family: crate::deployment::OMNIASR_7B_FAMILY.into(),
+                model_card_name: None,
+                checkpoint_sha256: "d".repeat(64),
+                checkpoint_path: "/test/reopen.json".into(),
+                source: "cortex-finetuned".into(),
+                license: "owner-full-rights".into(),
+            },
+        )
+        .unwrap();
+        db.connection().execute("UPDATE model_versions SET status='champion' WHERE id=?1", [champion]).unwrap();
+        let draft = "دەقی چامپیۆن";
+        let fixed = "دەقی ڕاستکراوە";
+        let mut segment = seg("round-clip", draft);
+        segment.model_version_id = Some(champion.into());
+        db.insert_segment(&segment).unwrap();
+        let revision = db.segment_review_revision("round-clip").unwrap().unwrap();
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "round-clip",
+            "edit",
+            Some("دەقی کۆن"),
+            "Rubar",
+            revision,
+            "51000000-0000-4000-8000-000000000001",
+            &crate::db::review_operation_payload_hash("round-clip", "edit", "دەقی کۆن", "Rubar"),
+        )
+        .unwrap()
+        .unwrap();
+        let pool = crate::review_pool::activate(
+            &db,
+            "51000000-0000-4000-8000-000000000002",
+            &[crate::review_pool::PoolMemberInput { segment_id: "round-clip".into(), voice_name: "Lamo".into() }],
+        )
+        .unwrap();
+        let stale_revision = db.segment_review_revision("round-clip").unwrap().unwrap();
+        let ids = vec!["round-clip".to_string()];
+        let plan = crate::review_pool::reopen::prepare(&db, &pool, &ids, "Owner disputed approval", 0).unwrap();
+        crate::review_pool::reopen::apply(&db, &pool, &plan, 10).unwrap();
+        let state = Mutex::new(CouchState {
+            pairing_codes: HashMap::from([
+                ("pair-rubar".into(), "Rubar".into()),
+                ("pair-iftikhar".into(), "Iftikhar".into()),
+            ]),
+            session_store: Some((tmp.path().to_path_buf(), db_path)),
+            pool_policy: Some(pool.clone()),
+            ..CouchState::default()
+        });
+        let stale = serde_json::json!({"operationId":"51000000-0000-4000-8000-000000000003","id":"round-clip",
+            "action":"accept","text":draft,"reviewer":"Rubar","rowVersion":stale_revision.to_string()});
+        assert_eq!(api_decision(&db, stale.to_string().as_bytes(), "Rubar", &state).0, 409);
+        let binding = couch_session_binding_sha256("couch-test-session");
+        let mut saved = None;
+        for (index, name) in ["Rubar", "Iftikhar"].iter().enumerate() {
+            let (code, _, body, ..) = api_queue(&db, name, &state);
+            assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+            let queue: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let item = &queue["items"][0];
+            assert_eq!(item["id"], "round-clip");
+            assert_eq!(item["text"], draft, "prior corrected answers must stay blind");
+            assert_eq!(item["redo"], true);
+            let attempt = format!("51000000-0000-4000-8000-00000000001{index}");
+            start_policy4_attempt(&db, &state, "round-clip", name, &binding, &attempt);
+            let receipt = policy4_pool_receipt(&db, name, "round-clip", &binding);
+            let request = serde_json::json!({"operationId":format!("51000000-0000-4000-8000-00000000002{index}"),
+                "id":"round-clip","action":"accept","text":fixed,"reviewer":name,
+                "rowVersion":item["rowVersion"],"playbackReceiptId":receipt});
+            let (code, _, body, ..) = api_decision(&db, request.to_string().as_bytes(), name, &state);
+            assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+            let action:(String,String,String)=db.connection().query_row(
+                "SELECT action,requested_action,submitted_transcript FROM review_pool_decisions WHERE reviewer=?1 ORDER BY id DESC LIMIT 1",
+                [name],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            assert_eq!(action, ("edit".into(), "accept".into(), fixed.into()));
+            assert_eq!(
+                api_decision(&db, request.to_string().as_bytes(), name, &state).0,
+                200,
+                "lost response retry is acknowledged"
+            );
+            if index == 0 {
+                saved = Some(request);
+                assert_eq!(crate::review_pool::segment_resolutions(&db, None).unwrap()[0].status, "pending");
+            }
+        }
+        assert_eq!(crate::review_pool::segment_resolutions(&db, None).unwrap()[0].status, "resolved");
+        let another = crate::review_pool::reopen::prepare(&db, &pool, &ids, "Owner requests later pass", 0).unwrap();
+        crate::review_pool::reopen::apply(&db, &pool, &another, 20).unwrap();
+        let old = saved.unwrap();
+        let (code, _, body, ..) = api_decision(&db, old.to_string().as_bytes(), "Rubar", &state);
+        assert_eq!(code, 409, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(crate::review_pool::segment_resolutions(&db, None).unwrap()[0].status, "pending");
+    }
+
+    #[test]
     fn flexible_pool_accepts_the_first_review_after_activation() {
         let tmp = tempfile::tempdir().unwrap();
         let (db, db_path) = test_db(tmp.path());

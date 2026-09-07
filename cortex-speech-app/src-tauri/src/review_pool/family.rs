@@ -14,8 +14,21 @@ pub(super) fn family_seen_on(
     reviewers: &HashMap<String, SegmentReviewers>,
 ) -> Result<HashMap<String, HashSet<String>>, String> {
     let roots = family_roots(conn)?;
+    let reopened: HashSet<String> = if super::reopen::supported_on(conn)? {
+        let mut statement =
+            conn.prepare("SELECT segment_id FROM current_review_reopen_members_v71").map_err(|e| e.to_string())?;
+        let rows = statement.query_map([], |r| r.get(0)).map_err(|e| e.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
+    } else {
+        HashSet::new()
+    };
     let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
     for (id, coverage) in reviewers {
+        // Reopening the retained family root authorizes fresh listening even after exposure to a
+        // retired twin. The twin itself remains excluded and never contributes a transferred vote.
+        if roots.get(id).is_some_and(|root| reopened.contains(root)) {
+            continue;
+        }
         seen.entry(roots.get(id).unwrap_or(id).clone()).or_default().extend(coverage.seen.iter().cloned());
     }
     Ok(seen)

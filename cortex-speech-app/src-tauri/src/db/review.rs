@@ -1605,13 +1605,18 @@ impl Database {
     /// same no-audio/unclear clip back to the same paid reviewer. The row remains pending and is still
     /// available to every other reviewer; a skip is not a corpus decision or paid work.
     pub fn reviewer_skipped_segment_ids(&self, reviewer: &str) -> AppResult<HashSet<String>> {
-        let mut statement = self.conn.prepare(
+        let round_filter = if crate::review_pool::reopen::supported_on(&self.conn).map_err(AppError::Validation)? {
+            "AND id>COALESCE((SELECT review_event_floor FROM current_review_reopen_members_v71 round WHERE round.segment_id=review_events.segment_id),0)"
+        } else {
+            ""
+        };
+        let mut statement = self.conn.prepare(&format!(
             "SELECT DISTINCT segment_id
                FROM review_events
               WHERE reviewer = ?1 COLLATE NOCASE
                 AND source = 'couch'
-                AND action = 'skip'",
-        )?;
+                AND action = 'skip' {round_filter}"
+        ))?;
         let rows = statement.query_map(params![reviewer.trim()], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<Result<HashSet<_>, _>>()?)
     }

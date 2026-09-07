@@ -52,7 +52,7 @@ Tests are `test_prepare_review_reopen.py` (automatically discovered by the exist
 runner), `redo_reversal_reuses_consensus_authority_and_is_scoped_to_its_round`, and
 `redo_skip_is_not_a_completed_canonical_correction`, plus the existing end-to-end Couch redo test.
 
-## Still required before a general reopen rollout
+## Earlier preparation checklist (superseded by schema 71 implementation below)
 
 1. An owner-reviewed, exact manifest and durable round identity; preview/apply must target the same
    frozen evidence, rather than recomputing a changing reviewer-wide filter.
@@ -100,3 +100,36 @@ the inventory to apply. This primitive does **not** withdraw canonical approval,
 shared round, certify pay-policy authorization, activate a queue, or certify the deployed UI. Do not
 use it to bypass the remaining rollout requirements. Revision fencing here must still be verified
 through the complete later-round HTTP/UI flow. Use only owned test clones until rollout is approved.
+
+## Schema 71: shared owner quality rounds
+
+`pool_admin plan-reopen --db <library.db> --segment-list <exact-ids.json> --reason <reason> --priority 0`
+produces a digest-bound plan. `apply-reopen --db <offline-library.db> --manifest <plan.json>
+--confirm-quality-hold` takes a uniquely pinned certified snapshot and applies one FULL/IMMEDIATE
+transaction. Unlike pool-only reversal, this changes no compensation rows. Historical canonical
+text and decisions are retained; old canonical, pool, legacy, and owner-adjudication authority is
+held from consensus, learning and exports immediately. Existing published files are historical
+artifacts, not retroactively erased or certified anew.
+
+Any dialect-eligible reviewer, including an original reviewer, can take the shared priority batch.
+Only fresh distinct people count toward agreement; one person cannot cast two current opinions.
+Later owner rounds are supported. Retired acoustic duplicates remain excluded. Previously certified
+voices refuse reopening until an explicit certificate-revocation workflow exists. Unknown-button and
+corrected-later groups are not silently included in a Looks Good batch.
+
+Round/revision boundaries reject old offline submissions and require fresh playback. Exact retries
+do not advance revisions or duplicate payment. Reopened text is blind to the previous correction.
+Restore admission preserves the immutable round/member rows so older backups cannot resurrect held
+approvals. Populated schema-71 rounds cannot be rolled back through ordinary migration rollback.
+
+The real-library rehearsal (`scripts/rehearse_review_reopen.py`) is source-read-only and operates on
+a new owned clone. The 2026-09-07 rehearsal selected 1,064 distinct retained Looks Good clips;
+schema70->71 migration, whole-history/pay/text/audio hashes, repeat apply, both reviewer queue/audio
+probes, and full database/audio certification passed. This is not a production GO or human listening
+certificate. Private evidence stays outside Git.
+
+The release controller accepts optional `--reopen-plan`: it rehearses that exact plan on its own
+clone, checks file drift, then applies through the locked owner writer during maintenance, before
+candidate certification/exposure. Targeted reviewer holds remain configured until post-deployment
+verification and explicit restoration. Valid zero-item queues are reported as idle, not mistaken
+for a service outage; nonempty queues still require valid sample audio and idempotency proof.

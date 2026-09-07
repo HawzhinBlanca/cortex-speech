@@ -1,5 +1,18 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-07 — Shared owner quality rounds (schema71; rollout verification in progress)
+
+Added exact digest/revision-bound owner reopen rounds, fresh independent opinions for any eligible
+reviewer (including the original), immediate prior-authority withdrawal, no historical pay/text/audio
+changes, stale offline fencing, unique pinned snapshots, and monotonic restore protection. Release
+controller can rehearse/apply the exact round during maintenance before candidate exposure.
+
+Real-library source-read-only rehearsal:1,064 retained Looks Good clips, migration70->71, retry,
+unchanged history/pay/text/audio hashes, both queue/WAV probes and full integrity/audio certification
+passed. Phone-page unit checks44/44. Release policies40/40. Full Rust/browser/final release checks
+are still in progress; this entry is not a reviewer GO or a gold-dataset certificate. See
+`docs/REVIEW_REOPEN_PREPARATION.md`; private inventories and reviewer credentials are not in Git.
+
 ## 2026-09-07 — Atomic exact-plan pool reversals (Codex; not general reopen)
 
 Replaced the unsafe row-by-row operator send-back writer with an explicit retained-decision plan.

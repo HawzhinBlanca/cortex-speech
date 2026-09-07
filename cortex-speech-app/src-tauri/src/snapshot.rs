@@ -3973,7 +3973,7 @@ mod tests {
     #[test]
     fn active_pilot_snapshot_authority_distinguishes_archival_schema_and_invalid_policy_shapes() {
         let archival = seeded_db();
-        crate::migrations::rollback(&archival, 12).unwrap();
+        crate::migrations::rollback(&archival, 13).unwrap();
         assert_eq!(crate::migrations::get_current_version(&archival).unwrap(), 58);
         validate_active_pilot_snapshot_authority(archival.connection(), None, None, &pilot_policy())
             .expect("pre-v59 capture validation is archival only; restore admission rejects it separately");

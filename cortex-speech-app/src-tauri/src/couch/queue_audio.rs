@@ -395,6 +395,12 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
     // Redo pass (`review_redo.json`, owner 2026-09-07): when the file names this reviewer, their
     // queue is ONLY their own canonical "Looks good" clips, served with the text they approved.
     let mut redo_started_at_ms: Option<i64> = None;
+    let reopened = match crate::review_pool::reopen::priorities(db) {
+        Ok(value) => value,
+        Err(error) => {
+            return err_reply(503, &format!("Review is temporarily paused: reopen authority unavailable ({error})"))
+        }
+    };
     let pending_result = match pool_policy.as_ref() {
         Some(pool) => {
             let data_dir = lock_state(state).session_store.as_ref().map(|(data_dir, _db_path)| data_dir.clone());
@@ -403,7 +409,9 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
                 Some(Ok(policy)) => policy,
                 None => None,
             };
-            if let Some(policy) = crate::review_redo::active_for(redo_policy.as_ref(), reviewer) {
+            if let Some(policy) =
+                crate::review_redo::active_for(redo_policy.as_ref(), reviewer).filter(|_| reopened.is_empty())
+            {
                 redo_started_at_ms = Some(policy.started_at_ms);
                 crate::review_redo::pending_segment_ids(db, pool, reviewer, policy, allowed_dialects.as_deref())
                     .map_err(crate::error::AppError::Validation)
@@ -461,6 +469,9 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
     let restricted_and_empty =
         (allowed_dialects.is_some() || focus.is_some() || pilot_slots.is_some()) && pending_total == 0;
     let mut guard = lock_state(state);
+    if let Some(skipped) = guard.skipped.get_mut(reviewer) {
+        skipped.retain(|id| !reopened.contains_key(id));
+    }
     guard.skipped.entry(reviewer.to_string()).or_default().extend(durable_skipped);
     let now = guard.now();
     let mut serving: Vec<String> = Vec::new();
@@ -552,7 +563,8 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
             // the reviewer corrects their OWN approved text, so that text is what they see.
             // A sent-back POOL clip in the redo queue stays blind (raw draft): the other reviewer's
             // canonical text must not leak into a second opinion.
-            let own_canonical_redo = redo_started_at_ms.is_some()
+            let own_canonical_redo = !reopened.contains_key(&s.id)
+                && redo_started_at_ms.is_some()
                 && s.verified
                 && s.reviewed_by.as_deref().is_some_and(|stored| stored.trim().eq_ignore_ascii_case(reviewer.trim()))
                 && matches!(s.human_decision.as_deref(), Some("accept" | "human_accept" | "edit" | "human_edit"));
@@ -568,7 +580,7 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
             serde_json::json!({
                 "id": s.id,
                 "text": served_text,
-                "redo": redo_started_at_ms.is_some(),
+                "redo": redo_started_at_ms.is_some() || reopened.contains_key(&s.id),
                 "durationMs": s.duration_ms,
                 "speakerId": pool_policy
                     .as_ref()

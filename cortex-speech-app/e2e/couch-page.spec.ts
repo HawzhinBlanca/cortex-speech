@@ -163,6 +163,28 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#text')).toHaveCSS('direction', 'rtl');
   });
 
+  test('a shared returned clip keeps typed corrections when Looks Good is clicked', async ({
+    page,
+  }) => {
+    await showAClip(page);
+    await page.evaluate(`queue[0].redo = true; show();`);
+    await page.locator('#lang').click();
+    await expect(page.locator('body')).toContainText('returned for a fresh review');
+    await expect(page.locator('body')).not.toContainText('you marked this clip');
+    await page.locator('#text').fill('ڕاستکراوەی نوێ');
+    // Offline keeps the real button's exact payload inspectable without a synthetic paid review.
+    await page.evaluate(`window.fetch = async () => { throw new TypeError('test offline'); };`);
+    await authorizeCurrentClipForNonPlaybackTest(page);
+    await page.locator('#accept').click();
+    await expect.poll(async () => operationOutboxCount(page)).toBe(1);
+    expect((await readOperationOutbox(page))[0]).toMatchObject({
+      id: 's1',
+      action: 'accept',
+      text: 'ڕاستکراوەی نوێ',
+      rowVersion: '1',
+    });
+  });
+
   test('a typed correction survives a reload', async ({ page }) => {
     await showAClip(page);
     await page.locator('#text').fill('ڕاستکراوەی من');
