@@ -770,6 +770,20 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
                             // field differently would be spottable, and a reviewer who can spot the
                             // test is not being tested.
                             "speakerChange": holds_a_speaker_change(&seg),
+                            // Same field, same computation as work clips (a missing key would mark the
+                            // trap). Spot checks are never salted in pool mode, so this is null in
+                            // practice — but computed, not hardcoded, so the two blocks cannot drift.
+                            "uncertainWords": pool_policy
+                                .as_ref()
+                                .and(seg.alignment_json.as_deref())
+                                .map(|alignment| {
+                                    crate::review_routing::uncertain_words(
+                                        &seg.raw_transcript,
+                                        alignment,
+                                        crate::review_routing::UNCERTAIN_WORDS_LIMIT,
+                                    )
+                                })
+                                .filter(|words| !words.is_empty()),
                             // Same field as work clips for the same indistinguishability reason —
                             // resolved above, never degraded to null.
                             "rowVersion": row_stamp,
