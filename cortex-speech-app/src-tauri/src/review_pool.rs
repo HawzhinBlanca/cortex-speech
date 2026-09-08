@@ -10,6 +10,7 @@ mod coverage;
 mod dedup;
 mod family;
 pub mod reopen;
+pub mod reopen_routing;
 mod send_back;
 
 pub use send_back::{apply_send_back_plan, prepare_send_back_plan, SendBackPlan};
@@ -30,6 +31,7 @@ use family::family_seen_on;
 pub(crate) use family::{require_unseen_pool_family_on, require_unseen_pool_family_or_own_canonical_on};
 
 use crate::db::Database;
+use crate::review_routing::DifficultyOrder;
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1154,7 +1156,7 @@ pub fn pending_segment_ids_with_listen_list(
     allowed_dialects: Option<&[String]>,
     listen_first: &HashSet<String>,
 ) -> Result<Vec<String>, String> {
-    let hints = QueueHints { listen_first, difficulty: crate::review_routing::DifficultyOrder::Unchanged };
+    let hints = QueueHints { listen_first, difficulty: DifficultyOrder::Unchanged, reopen_routing: None };
     pending_segment_ids_with_hints(db, pool, reviewer, allowed_dialects, &hints)
 }
 
@@ -1166,6 +1168,8 @@ pub struct QueueHints<'a> {
     /// Difficulty routing (`review_routing.rs`): hard clips first for the ears the owner named,
     /// easy clips first for everyone else, unchanged without a routing file.
     pub difficulty: crate::review_routing::DifficultyOrder,
+    /// Reopen routing (`reopen_routing.rs`, owner 2026-09-08); `None` = no file = everyone.
+    pub reopen_routing: Option<&'a reopen_routing::ReopenRouting>,
 }
 
 /// `pending_segment_ids` with the owner listen list and the difficulty routing order.
@@ -1191,6 +1195,8 @@ pub fn pending_segment_ids_with_hints(
     let reviewer = reviewer_key(Some(reviewer));
     let family_seen = family_seen_on(db.connection(), &reviewers)
         .map_err(|error| format!("review pool queue cannot be prepared: {error}"))?;
+    let priorities = reopen::priorities(db)?;
+    let reopen_held = hints.reopen_routing.map(|_| reopen_routing::held_reviewers_on(db.connection())).transpose()?;
     let mut statement = db
         .connection()
         .prepare(
@@ -1234,6 +1240,10 @@ pub fn pending_segment_ids_with_hints(
         }
         let (resolution, _) = derive_resolution(&segment_id, coverage, adjudications.get(&segment_id));
         if matches!(resolution, DerivedResolution::Resolved { .. } | DerivedResolution::OwnerConflict) {
+            continue;
+        }
+        // Owner 2026-09-08: a reopened clip is private to the people it re-checks + the final reviewers.
+        if reopen_routing::excludes(hints.reopen_routing, reopen_held.as_ref(), &priorities, &segment_id, &reviewer) {
             continue;
         }
         if !pool.playable_member_ids.contains(&segment_id)
@@ -1308,7 +1318,6 @@ pub fn pending_segment_ids_with_hints(
             segment_id,
         ));
     }
-    let priorities = reopen::priorities(db)?;
     let mut ordered = order_pending_by_voice_priority(pending);
     // Explicit owner remediation precedes ordinary work; stable sorting preserves the existing
     // voice/decision-distance/difficulty ordering within each owner-selected priority tier.
@@ -3359,7 +3368,7 @@ mod tests {
         }
         // "b" keeps the fixture's words-free alignment: unmeasured = medium, never easy.
         let none = HashSet::new();
-        let hints = |difficulty| QueueHints { listen_first: &none, difficulty };
+        let hints = |difficulty| QueueHints { listen_first: &none, difficulty, reopen_routing: None };
         let unchanged = pending_segment_ids(&db, &pool, "Hemn", None).unwrap();
         assert_eq!(
             pending_segment_ids_with_hints(&db, &pool, "Hemn", None, &hints(DifficultyOrder::Unchanged)).unwrap(),
@@ -3385,7 +3394,7 @@ mod tests {
         );
         // And the owner listen list still precedes everything.
         let listed: HashSet<String> = ["b".to_string()].into_iter().collect();
-        let listen = QueueHints { listen_first: &listed, difficulty: DifficultyOrder::HardFirst };
+        let listen = QueueHints { listen_first: &listed, difficulty: DifficultyOrder::HardFirst, reopen_routing: None };
         assert_eq!(pending_segment_ids_with_hints(&db, &pool, "Hemn", None, &listen).unwrap(), vec!["b", "c", "a"]);
     }
 
@@ -3815,6 +3824,88 @@ mod tests {
         let restored_pool = load(&restored).unwrap().unwrap();
         assert_eq!(apply_send_back_plan(&restored, &restored_pool, &plan, 5, true).unwrap(), 2);
         assert_eq!(restored.segment_review_revision("clip").unwrap(), Some(revision + 1));
+    }
+
+    /// Live incident 2026-09-08: 18 of the owner's 25 fresh verdicts on reopened clips came straight
+    /// back to him. `family_roots` maps a live root to itself, and the reopen skip in `family_seen_on`
+    /// therefore dropped the root's OWN fresh exposure whenever the clip had a retired twin. The
+    /// writer's second guard refused duplicates, so the damage was repeats, not duplicate evidence.
+    #[test]
+    fn a_fresh_verdict_on_a_reopened_clip_with_a_retired_twin_is_never_re_served() {
+        let (_dir, db, source_pool) = two_clip_pool(Some("a"));
+        apply_dedup_manifest(&db, &dedup_manifest(&source_pool, "a", Some("a"), 1_000)).unwrap();
+        let pool = load(&db).unwrap().unwrap();
+        let ids = vec!["a".to_string()];
+        let plan = reopen::prepare(&db, &pool, &ids, "Owner disputes historical Looks Good work", 0).unwrap();
+        assert_eq!(reopen::apply(&db, &pool, &plan, 2).unwrap(), 1);
+        assert_eq!(pending_segment_ids(&db, &pool, "Roza", None).unwrap(), ids, "reopened: fresh work for Roza");
+        let (_, revision) = db.get_segment_by_id_with_revision("a").unwrap().unwrap();
+        let fresh = |operation_id: &str, at: i64| {
+            let authority = authority(&db, "Roza", "a");
+            record_decision(
+                &db,
+                &pool,
+                &PoolDecisionInput {
+                    segment_id: "a",
+                    reviewer: "Roza",
+                    action: "edit",
+                    submitted_transcript: Some("دەقی نوێ"),
+                    served_transcript: "دەقی چامپیۆن",
+                    served_revision: revision,
+                    audio_content_hash: Some(&clip_hash("a")),
+                    source_start_ms: Some(0),
+                    source_end_ms: Some(1_000),
+                    duration_ms: 1_000,
+                    requested_action: "edit",
+                    requested_transcript: "دەقی نوێ",
+                    operation_id,
+                    operation_payload_hash: &"b".repeat(64),
+                    created_at_ms: at,
+                    playback_authority_session_id: Some(&authority),
+                },
+            )
+        };
+        fresh("123e4567-e89b-42d3-a456-426614175021", 3).unwrap();
+        assert!(
+            pending_segment_ids(&db, &pool, "Roza", None).unwrap().is_empty(),
+            "a clip the reviewer just judged must never come back to them, twin or no twin"
+        );
+        assert_eq!(
+            pending_segment_ids(&db, &pool, "Alle", None).unwrap(),
+            ids,
+            "the second fresh opinion is still wanted"
+        );
+        let refused = fresh("123e4567-e89b-42d3-a456-426614175022", 4).unwrap_err();
+        assert!(refused.contains("ALREADY_SEEN") || refused.contains("duplicated"), "{refused}");
+    }
+
+    /// Owner direction 2026-09-08: a reopened clip goes back to the people whose work it re-checks
+    /// and to the named final reviewers; nobody else sees it until two fresh opinions disagree.
+    #[test]
+    fn reopen_routing_keeps_a_reopened_clip_private_to_its_reviewers_and_the_final_reviewers() {
+        let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        decide(&db, &pool, "Iftikhar", "دەقی یەکەم", "123e4567-e89b-42d3-a456-426614175011", 1);
+        let ids = vec!["clip".to_string()];
+        let plan = reopen::prepare(&db, &pool, &ids, "Owner disputes historical Looks Good work", 0).unwrap();
+        assert_eq!(reopen::apply(&db, &pool, &plan, 2).unwrap(), 1);
+        let routing = reopen_routing::parse(r#"{ "final_reviewers": ["Hawzhin"] }"#).unwrap();
+        let none = HashSet::new();
+        let hints =
+            QueueHints { listen_first: &none, difficulty: DifficultyOrder::Unchanged, reopen_routing: Some(&routing) };
+        let queue = |name: &str| pending_segment_ids_with_hints(&db, &pool, name, None, &hints).unwrap();
+        assert_eq!(queue("Iftikhar"), ids, "the reviewer whose held opinion is re-checked redoes their own work");
+        assert_eq!(queue("hawzhin"), ids, "the final reviewer hears every reopened clip");
+        assert!(queue("Roza").is_empty(), "nobody else is served disputed work");
+        assert_eq!(
+            pending_segment_ids(&db, &pool, "Roza", None).unwrap(),
+            ids,
+            "without a routing file nothing changes"
+        );
+        // Fresh work never widens the circle: after a disagreement the clip waits for the owner.
+        decide(&db, &pool, "Iftikhar", "دەقی نوێ", "123e4567-e89b-42d3-a456-426614175012", 3);
+        decide(&db, &pool, "Hawzhin", "دەقی جیاواز", "123e4567-e89b-42d3-a456-426614175013", 4);
+        assert!(queue("Roza").is_empty(), "only the named people and the owner ever see disputed work");
+        assert!(queue("Iftikhar").is_empty() && queue("hawzhin").is_empty(), "both have spoken; the clip waits");
     }
 
     #[test]

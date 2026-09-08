@@ -244,6 +244,56 @@ preserving its schedule/log directory. Future rollouts must rebind that task alo
 watchdog/restore-drill handover; an old controller import had caused false schema-version alarms.
 Unknown historical-button and corrected-later groups remain separate. Private inventories, identities,
 exact production paths, backup hashes and handover evidence are recorded in the owner's vault/audit.
+## 2026-09-08 — Incident: reopened clips with retired twins came back to the reviewer who had just judged them
+
+**Report (owner, 22:50 local):** "i reviewed my 25 almost, then the sounds get back, repeated instead of new data."
+
+**Measured (live DB read-only + the serving `pool_admin probe` on a clone, one clip pinned via the listen list at a
+time):** all 25 verdicts saved, 25 distinct clips, zero duplicate evidence. Yet 18 of the 25 were still in the owner's
+queue. Every one of the 18 has a retired duplicate twin; the 7 excluded ones were excluded only because two fresh
+opinions had already resolved them. 579 of the 1,064 reopened clips have twins, so every reviewer working the round
+was exposed. Repeats began with release 7397c1f2 (schema 71, live since 2026-09-07 17:45).
+
+**Root cause (`review_pool/family.rs`, `family_seen_on`, 7397c1f2):** the reopen skip
+`if roots.get(id).is_some_and(|root| reopened.contains(root)) { continue; }` intends to drop exposure inherited from a
+RETIRED twin. But `family_roots` also maps a live root to itself (its own doc comment says otherwise), so for a live
+reopened clip with any twin the clip's OWN fresh coverage was dropped from `seen` — for the queue and for the
+write guard `require_unseen_pool_family_impl`, which shares the function. The writer's second guard
+(`reviewer_sets_on` → "review pool decision is duplicated for this reviewer") still refused a second verdict, so the
+damage was repeats and lost reviewer time, not duplicate evidence or pay.
+
+**Fix:** skip only when `root != id`. Regression test
+`a_fresh_verdict_on_a_reopened_clip_with_a_retired_twin_is_never_re_served` (two-clip pool, twin retired by a dedup
+manifest, clip reopened, fresh verdict → queue empty for that reviewer, second verdict refused) fails on the unfixed
+file and passes with the fix (bite proven by stashing the fix).
+
+## 2026-09-08 — Reopen routing: a reopened clip goes only to its own reviewers and the final reviewers
+
+**Owner direction (2026-09-08, his words):** "i dont want everyone be served rubar's work … send rubar's earlier work to
+herself and iftikhar be sent Iftikhar's earlier work and hawzhin be sent both of their work for final review … let the
+Guest and everyone else get fresh data from the pool … only herself and hawzhin."
+
+**Measured before the change (live DB, read-only, serving release 7397c1f2):** the shared reopen round (1,064 clips,
+priority 0) sorted first for EVERY reviewer. The Guest link's 25 verdicts on 2026-09-08 19:47–19:55 were all reopened
+clips, nine of them the exact clips the disputed reviewer had re-judged at 15:00 — the round was being decided by
+whoever was online, not re-checked by the people whose work it holds.
+
+**Change (`review_pool/reopen_routing.rs`, +`QueueHints.reopen_routing`):** `<data_dir>/review_reopen_routing.json`
+`{"final_reviewers": [names]}`. With the file present a reopened clip is served only to (a) reviewers whose HELD
+opinion the round re-checks — read from the round's own floors (`review_events.id <= review_event_floor`,
+`review_pool_decisions.id <= pool_decision_floor`), never from the file — and (b) the named final reviewers. Nobody else
+sees it; the queue never widens the circle on its own (a disagreement between the two waits for the owner's adjudication
+or a name added to the file). Missing file: unchanged behaviour. Unreadable/invalid file: restriction stays with NO
+final reviewers and an error log — a typo must not publish disputed work. Re-read per queue fetch like the listen list.
+`pool_admin probe` reports `reopenRouting`. Ordinary pool work is untouched: everyone else gets first or second
+opinions on fresh clips exactly as before; Lamo and Sewa keep the Lamo single-voice listen list (data change,
+2026-09-08, 4,965 clips) ahead of everything.
+
+**Evidence:** `cargo test --lib` (reopen_routing unit tests; `reopen_routing_keeps_a_reopened_clip_private_to_its_reviewers_and_the_final_reviewers`;
+listen-list, difficulty, shared-reopen and spot-check queue tests) and `cargo clippy --all-targets --all-features -D
+warnings` exit 0; `rust_quality_gate.py architecture` exit 0 (review_pool.rs 1,987 production lines);
+`test_consensus_review_canon.py` and the five policy gates pinning the touched files exit 0. Built on 7397c1f2 (the
+serving release, Codex's `codex/pool-reopen-safety-20260907`, not yet on `origin/main`).
 
 ## 2026-09-07 — Shared owner quality rounds (schema71; rollout verification in progress)
 

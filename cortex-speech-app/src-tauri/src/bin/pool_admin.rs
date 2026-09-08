@@ -1066,12 +1066,13 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             let dialects = repeated_values(&args, "--dialect")?;
             let pool = review_pool::load(&db)?.ok_or("review pool is not active")?;
             let allowed = (!dialects.is_empty()).then_some(dialects.as_slice());
-            let (listen_first, difficulty) = match db_path.parent() {
+            let (listen_first, difficulty, reopen_routing) = match db_path.parent() {
                 Some(data_dir) => (
                     cortex_speech_app_lib::listen_list::listen_first_for(data_dir, &reviewer, &pool),
                     cortex_speech_app_lib::review_routing::order_for(data_dir, &reviewer),
+                    review_pool::reopen_routing::load(data_dir),
                 ),
-                None => (Default::default(), cortex_speech_app_lib::review_routing::DifficultyOrder::Unchanged),
+                None => (Default::default(), cortex_speech_app_lib::review_routing::DifficultyOrder::Unchanged, None),
             };
             let redo_policy = match db_path.parent() {
                 Some(data_dir) => cortex_speech_app_lib::review_redo::load(data_dir)?,
@@ -1089,7 +1090,11 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                     &pool,
                     &reviewer,
                     allowed,
-                    &review_pool::QueueHints { listen_first: &listen_first, difficulty },
+                    &review_pool::QueueHints {
+                        listen_first: &listen_first,
+                        difficulty,
+                        reopen_routing: reopen_routing.as_ref(),
+                    },
                 )?,
             };
             let segment_id = available.first().ok_or("canonical queue has no audio sample for this reviewer")?;
@@ -1107,6 +1112,11 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                     "availableClips": available.len(),
                     "listenListClips": listen_first.len(),
                     "difficultyOrder": format!("{difficulty:?}"),
+                    "reopenRouting": reopen_routing.as_ref().map(|routing| {
+                        let mut names: Vec<&String> = routing.final_reviewers.iter().collect();
+                        names.sort();
+                        serde_json::json!({ "finalReviewers": names })
+                    }),
                     "redoPass": redo_policy.is_some(),
                     "sharedReopenRounds": shared_rounds,
                     "sampleSegmentId": segment_id,
