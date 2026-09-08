@@ -136,9 +136,10 @@ def mismatched_stage_fixture() -> tuple[
     return temporary, root, changed
 
 
-def test_valid_hash_bound_schema70_active_release_is_selected() -> None:
+def test_valid_hash_bound_schema71_active_release_is_selected() -> None:
     temporary, _appdata, root, manifest, exe = fixture()
     try:
+        assert manifest["expectedDatabaseSchema"] == 71
         assert GATE.validate_active_release_runtime(
             manifest, root, expected_sha=GIT_SHA
         ) == exe.resolve()
@@ -405,7 +406,7 @@ def test_staged_candidate_wrong_root_symlink_schema_sha_and_hash_fail_closed() -
                 manifest_path, expected_sha=GIT_SHA, release_root=root
             )
         except GATE.EvidenceError as error:
-            assert "schema 70" in str(error) or "database schema 70" in str(error)
+            assert "schema 71" in str(error) or "database schema 71" in str(error)
         else:
             raise AssertionError("candidate with the wrong database schema was accepted")
         manifest_path.write_bytes(original_manifest)

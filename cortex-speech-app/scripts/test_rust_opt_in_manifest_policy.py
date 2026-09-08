@@ -105,6 +105,22 @@ def test_owner_runner_and_manifest_agree() -> None:
     assert scale == {SCALE_TEST.split("::")[-1]}
 
 
+def test_browser_regressions_are_explicit_required_windows_steps() -> None:
+    selectors = {
+        entry["selector"] for entry in _manifest()
+        if entry["authority"] == "non-certifying-browser-regression"
+    }
+    assert len(selectors) == 3
+    for name in ("ci.yml", "release.yml"):
+        workflow = (REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+        for selector in selectors:
+            command = (
+                "cargo test --locked --manifest-path src-tauri/Cargo.toml --all-features "
+                f"--test reviewer_serving_path {selector} -- --ignored --exact --nocapture"
+            )
+            assert f"run: {command}" in workflow, f"{name} must run {selector} explicitly"
+
+
 def test_owner_runner_refuses_missing_proof_inputs() -> None:
     with mock.patch.dict(
         os.environ,
@@ -143,6 +159,7 @@ def main() -> None:
     test_manifest_exactly_covers_every_ignore()
     test_every_scope_has_real_authority()
     test_owner_runner_and_manifest_agree()
+    test_browser_regressions_are_explicit_required_windows_steps()
     test_owner_runner_refuses_missing_proof_inputs()
     test_owner_runner_refuses_a_vacuous_ignored_test()
     print(f"Rust opt-in manifest policy passed ({len(_manifest())} classified tests)")
