@@ -590,9 +590,18 @@ def test_clone_preflight_proves_65_to_71_and_same_schema_71() -> None:
             data.mkdir()
             seed_database(data / "cortex-speech.db", source_schema)
 
+            profiles = {name: {} for name in release.PROFILE_STATE}
+            profiles["couch_session.json"] = {"reviewers": {"protected-fixture-key": "Fixture"}}
+            profiles["reviewer_dialects.json"] = {"Fixture": ["sorani"]}
+            profiles["review_reopen_routing.json"] = {"final_reviewers": ["Fixture"]}
+            for name, payload in profiles.items():
+                (data / name).write_text(json.dumps(payload), encoding="utf-8")
+            wrong_queue_count = False
+
             def fake_run_json(command: list[str], *, timeout: int = 300) -> dict[str, object]:
                 verb = command[1]
                 db = Path(command[command.index("--db") + 1])
+                assert db != data / "cortex-speech.db", "preflight must never target the live database"
                 if verb == "migrate":
                     before = release.database_schema(db)
                     if before < 71:
@@ -620,6 +629,13 @@ def test_clone_preflight_proves_65_to_71_and_same_schema_71() -> None:
                         "audio": {"allAvailable": True},
                         "rights": {"allExact": True},
                     }
+                if verb in {"benchmark", "probe"}:
+                    for name in release.PROFILE_STATE:
+                        assert (db.parent / name).read_bytes() == (data / name).read_bytes()
+                    assert command[command.index("--reviewer") + 1] == "Fixture"
+                    assert command[-2:] == ["--dialect", "sorani"]
+                    return {"passes": True, "availableClips": 3 if wrong_queue_count and verb == "benchmark" else 2,
+                            "sampleAudioValidWav": True, "submissionIdempotencyAuthority": True}
                 raise AssertionError(f"unexpected preflight command: {command}")
 
             with mock.patch.object(release, "run_json", side_effect=fake_run_json):
@@ -627,6 +643,16 @@ def test_clone_preflight_proves_65_to_71_and_same_schema_71() -> None:
             assert proof["sourceSchemaVersion"] == source_schema
             assert proof["migration"]["migrated"] is (source_schema != 71)
             assert proof["certification"]["databaseSchemaVersion"] == 71
+            assert proof["reviewerQueues"] == {"Fixture": 2}
+            wrong_queue_count = True
+            with mock.patch.object(release, "run_json", side_effect=fake_run_json):
+                try:
+                    release.preflight_clone(data, manifest)
+                except release.ReleaseError as error:
+                    assert "audio/idempotency probe failed" in str(error)
+                else:
+                    raise AssertionError("routing mismatch escaped clone preflight")
+            assert release.database_schema(data / "cortex-speech.db") == source_schema
 
 
 def test_clone_preflight_refuses_future_schema_before_candidate_execution() -> None:
@@ -1534,6 +1560,40 @@ def test_canonical_queue_proof_refuses_bad_counts_errors_and_nonempty_audio_fail
                     raise AssertionError(f"invalid queue proof accepted: {responses}")
         with mock.patch.object(release, "run_json", side_effect=[good, good]):
             assert release.prove_canonical_queues(Path("owned-data"), manifest) == {"Reviewer": 2}
+
+
+def test_legacy_routed_count_mismatch_is_recovery_only_and_keeps_audio_guards() -> None:
+    manifest = {"poolAdminExe": "owned-admin.exe"}
+    benchmark = {"passes": True, "availableClips": 8}
+    probe = {"passes": True, "availableClips": 7, "sampleAudioValidWav": True,
+             "submissionIdempotencyAuthority": True, "sharedReopenRounds": True,
+             "reopenRouting": {"finalReviewers": ["Owner"]}}
+    with mock.patch.object(release, "session_reviewers", return_value=["Reviewer"]), \
+         mock.patch.object(release, "reviewer_dialects", return_value=[]):
+        with mock.patch.object(release, "run_json", side_effect=[benchmark, probe]):
+            assert release.prove_canonical_queues(
+                Path("owned-data"), manifest, recovering_previous=True,
+            ) == {"Reviewer": 7}
+        cases = [(benchmark, probe, False)]
+        cases += [(benchmark, {**probe, key: value}, True) for key, value in [
+            ("availableClips", 0), ("availableClips", 9), ("availableClips", True),
+            ("availableClips", "7"), ("sampleAudioValidWav", False),
+            ("submissionIdempotencyAuthority", False), ("passes", False),
+            ("sharedReopenRounds", False), ("reopenRouting", None),
+            ("reopenRouting", {"finalReviewers": []}),
+            ("reopenRouting", {"finalReviewers": [None]}),
+        ]]
+        cases += [({**benchmark, "queueAuthority": "routed-reviewer-v1"}, probe, True)]
+        for measured, sampled, recovering in cases:
+            with mock.patch.object(release, "run_json", side_effect=[measured, sampled]):
+                try:
+                    release.prove_canonical_queues(
+                        Path("owned-data"), manifest, recovering_previous=recovering,
+                    )
+                except release.ReleaseError:
+                    pass
+                else:
+                    raise AssertionError(f"invalid routed recovery accepted: {measured}, {sampled}, {recovering}")
 
 
 def test_quality_reopen_requires_exact_membership_and_unchanged_pay_receipt() -> None:

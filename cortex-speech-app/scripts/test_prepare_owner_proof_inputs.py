@@ -1955,21 +1955,25 @@ proof.prepare_bundle(
         identity = f"owner-proof-test-{uuid.uuid4()}"
         scripts = Path(proof.__file__).parent
         child_code = (
-            "import sys,time; from owner_proof_platform import NamedMutex; "
+            "import os,sys,time; from owner_proof_platform import NamedMutex; "
             "mutex=NamedMutex('CortexOwnerProofPrepare',sys.argv[1]); "
-            "print('READY',flush=True); time.sleep(60)"
+            "print('READY '+str(os.getpid()),flush=True); time.sleep(60)"
         )
         environment = dict(os.environ)
         environment["PYTHONPATH"] = os.fspath(scripts)
+        # A Windows venv python.exe is a redirector: killing/waiting that launcher
+        # does not prove its real Python child has released the mutex yet. This
+        # standard-library-only fixture must kill the actual owner, not a proxy.
+        interpreter = getattr(sys, "_base_executable", sys.executable)
         child = subprocess.Popen(
-            [sys.executable, "-c", child_code, identity],
+            [interpreter, "-c", child_code, identity],
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
         try:
-            self.assertEqual(child.stdout.readline().strip(), "READY")
+            self.assertEqual(child.stdout.readline().strip(), f"READY {child.pid}")
             with self.assertRaises(proof.ProofInputError):
                 proof_platform.NamedMutex("CortexOwnerProofPrepare", identity)
             child.kill()

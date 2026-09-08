@@ -132,6 +132,11 @@ PROFILE_STATE = (
     "reviewer_dialects.json",
     "voice_focus.json",
     "review_pilot_policy.json",
+    "couch_session.json",
+    "review_listen_list.json",
+    "review_routing.json",
+    "review_redo.json",
+    "review_reopen_routing.json",
 )
 
 
@@ -915,12 +920,16 @@ def preflight_clone(data_dir: Path, manifest: dict[str, Any], reopen_plan: Path 
             raise ReleaseError("candidate clone has missing or changed pool audio")
         if report.get("rights", {}).get("allExact") is not True:
             raise ReleaseError("candidate clone did not establish exact owner rights")
+        # Rehearse the exact serving queues before maintenance, not merely database
+        # and file integrity. The profile copy above includes all routing inputs.
+        queues = prove_canonical_queues(clone, manifest)
         return {
             "sourceSchemaVersion": source_schema,
             "migration": migration,
             "rights": rights,
             "qualityReopen": reopen,
             "certification": report,
+            "reviewerQueues": queues,
         }
 
 
@@ -1071,7 +1080,9 @@ def reviewer_dialects(data_dir: Path, reviewer: str) -> list[str]:
     return list(dict.fromkeys(str(item).strip().lower() for item in dialects))
 
 
-def prove_canonical_queues(data_dir: Path, manifest: dict[str, Any]) -> dict[str, int]:
+def prove_canonical_queues(
+    data_dir: Path, manifest: dict[str, Any], *, recovering_previous: bool = False,
+) -> dict[str, int]:
     db = data_dir / "cortex-speech.db"
     available: dict[str, int] = {}
     for reviewer in session_reviewers(data_dir):
@@ -1105,15 +1116,34 @@ def prove_canonical_queues(data_dir: Path, manifest: dict[str, Any]) -> dict[str
         for dialect in dialects:
             probe_command.extend(["--dialect", dialect])
         probe = run_json(probe_command, timeout=180)
+        probe_count = probe.get("availableClips")
+        # Older schema-71 binaries benchmarked the unrestricted queue while `probe`
+        # already applied shared-reopen final-reviewer routing. A strict comparison
+        # therefore strands even the last-known-good release in maintenance. During
+        # rollback ONLY, accept a strictly smaller, nonempty canonical routed queue;
+        # retain every audio/idempotency/latency check. New deployments still require
+        # the benchmark and serving-path probe to agree exactly.
+        routing = probe.get("reopenRouting")
+        final_reviewers = routing.get("finalReviewers") if isinstance(routing, dict) else None
+        legacy_routed_recovery = (
+            recovering_previous
+            and "queueAuthority" not in benchmark
+            and probe.get("sharedReopenRounds") is True
+            and isinstance(final_reviewers, list)
+            and bool(final_reviewers)
+            and all(isinstance(name, str) and bool(name.strip()) for name in final_reviewers)
+            and type(probe_count) is int
+            and 0 < probe_count < count
+        )
         if (
-            type(probe.get("availableClips")) is not int
-            or probe["availableClips"] != count
+            type(probe_count) is not int
+            or (probe_count != count and not legacy_routed_recovery)
             or probe.get("passes") is not True
             or probe.get("sampleAudioValidWav") is not True
             or probe.get("submissionIdempotencyAuthority") is not True
         ):
             raise ReleaseError(f"canonical release audio/idempotency probe failed for reviewer {reviewer}")
-        available[reviewer] = count
+        available[reviewer] = probe_count
     return available
 
 
@@ -1493,7 +1523,7 @@ def _recover_under_lock(data_dir: Path, release_root: Path, journal_path: Path) 
             certify_live(data_dir, previous)
             prove_links(data_dir, previous, funnel=False)
             prove_links(data_dir, previous, funnel=True)
-            prove_canonical_queues(data_dir, previous)
+            prove_canonical_queues(data_dir, previous, recovering_previous=True)
             register_release_tasks(previous)
             task_change(WATCHDOG_TASK, True)
             task_change(LEGACY_WATCHDOG_TASK, False, allow_missing=True)
@@ -1539,7 +1569,7 @@ def _recover_under_lock(data_dir: Path, release_root: Path, journal_path: Path) 
     certify_live(data_dir, target)
     prove_links(data_dir, target, funnel=False)
     prove_links(data_dir, target, funnel=True)
-    prove_canonical_queues(data_dir, target)
+    prove_canonical_queues(data_dir, target, recovering_previous=target is previous)
     register_release_tasks(target)
     task_change(WATCHDOG_TASK, True)
     task_change(LEGACY_WATCHDOG_TASK, False, allow_missing=True)

@@ -12,6 +12,65 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const CERTIFICATION_REPORT_SCHEMA: u32 = 3;
+const REVIEWER_QUEUE_AUTHORITY: &str = "routed-reviewer-v1";
+
+struct CanonicalReviewerQueue {
+    ids: Vec<String>,
+    listen_list_clips: usize,
+    difficulty: cortex_speech_app_lib::review_routing::DifficultyOrder,
+    reopen_routing: Option<review_pool::reopen_routing::ReopenRouting>,
+    redo_pass: bool,
+    shared_rounds: bool,
+}
+
+// Benchmark and audio probe must resolve exactly the same reviewer queue. In particular,
+// benchmarking the unrestricted pool can disagree with a correctly routed audio probe and
+// prevent both deployment and rollback while the live service is in maintenance.
+fn canonical_reviewer_queue(
+    db: &Database,
+    db_path: &Path,
+    pool: &review_pool::ReviewPool,
+    reviewer: &str,
+    allowed: Option<&[String]>,
+) -> Result<CanonicalReviewerQueue, String> {
+    let (listen_first, difficulty, reopen_routing) = match db_path.parent() {
+        Some(data_dir) => (
+            cortex_speech_app_lib::listen_list::listen_first_for(data_dir, reviewer, pool),
+            cortex_speech_app_lib::review_routing::order_for(data_dir, reviewer),
+            review_pool::reopen_routing::load(data_dir),
+        ),
+        None => (Default::default(), cortex_speech_app_lib::review_routing::DifficultyOrder::Unchanged, None),
+    };
+    let redo_policy = match db_path.parent() {
+        Some(data_dir) => cortex_speech_app_lib::review_redo::load(data_dir)?,
+        None => None,
+    };
+    let shared_rounds = review_pool::reopen::has_rounds(db)?;
+    let redo_policy =
+        cortex_speech_app_lib::review_redo::active_for(redo_policy.as_ref(), reviewer).filter(|_| !shared_rounds);
+    let ids = match redo_policy {
+        Some(policy) => cortex_speech_app_lib::review_redo::pending_segment_ids(db, pool, reviewer, policy, allowed)?,
+        None => review_pool::pending_segment_ids_with_hints(
+            db,
+            pool,
+            reviewer,
+            allowed,
+            &review_pool::QueueHints {
+                listen_first: &listen_first,
+                difficulty,
+                reopen_routing: reopen_routing.as_ref(),
+            },
+        )?,
+    };
+    Ok(CanonicalReviewerQueue {
+        ids,
+        listen_list_clips: listen_first.len(),
+        difficulty,
+        reopen_routing,
+        redo_pass: redo_policy.is_some(),
+        shared_rounds,
+    })
+}
 
 #[derive(Debug, Clone)]
 struct VoiceSpec {
@@ -1066,38 +1125,8 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             let dialects = repeated_values(&args, "--dialect")?;
             let pool = review_pool::load(&db)?.ok_or("review pool is not active")?;
             let allowed = (!dialects.is_empty()).then_some(dialects.as_slice());
-            let (listen_first, difficulty, reopen_routing) = match db_path.parent() {
-                Some(data_dir) => (
-                    cortex_speech_app_lib::listen_list::listen_first_for(data_dir, &reviewer, &pool),
-                    cortex_speech_app_lib::review_routing::order_for(data_dir, &reviewer),
-                    review_pool::reopen_routing::load(data_dir),
-                ),
-                None => (Default::default(), cortex_speech_app_lib::review_routing::DifficultyOrder::Unchanged, None),
-            };
-            let redo_policy = match db_path.parent() {
-                Some(data_dir) => cortex_speech_app_lib::review_redo::load(data_dir)?,
-                None => None,
-            };
-            let shared_rounds = review_pool::reopen::has_rounds(&db)?;
-            let redo_policy = cortex_speech_app_lib::review_redo::active_for(redo_policy.as_ref(), &reviewer)
-                .filter(|_| !shared_rounds);
-            let available = match redo_policy {
-                Some(policy) => {
-                    cortex_speech_app_lib::review_redo::pending_segment_ids(&db, &pool, &reviewer, policy, allowed)?
-                }
-                None => review_pool::pending_segment_ids_with_hints(
-                    &db,
-                    &pool,
-                    &reviewer,
-                    allowed,
-                    &review_pool::QueueHints {
-                        listen_first: &listen_first,
-                        difficulty,
-                        reopen_routing: reopen_routing.as_ref(),
-                    },
-                )?,
-            };
-            let segment_id = available.first().ok_or("canonical queue has no audio sample for this reviewer")?;
+            let queue = canonical_reviewer_queue(&db, &db_path, &pool, &reviewer, allowed)?;
+            let segment_id = queue.ids.first().ok_or("canonical queue has no audio sample for this reviewer")?;
             let segment = db.get_segment_by_id(segment_id)?.ok_or("canonical queue sample disappeared")?;
             let audio = cortex_speech_app_lib::agentic::segment_audio_as_wav_bytes(&segment)?;
             let valid_wav = audio.len() >= 44 && audio.starts_with(b"RIFF") && audio.get(8..12) == Some(&b"WAVE"[..]);
@@ -1109,16 +1138,17 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                     "readOnly": true,
                     "reviewer": reviewer,
                     "dialects": dialects,
-                    "availableClips": available.len(),
-                    "listenListClips": listen_first.len(),
-                    "difficultyOrder": format!("{difficulty:?}"),
-                    "reopenRouting": reopen_routing.as_ref().map(|routing| {
+                    "availableClips": queue.ids.len(),
+                    "queueAuthority": REVIEWER_QUEUE_AUTHORITY,
+                    "listenListClips": queue.listen_list_clips,
+                    "difficultyOrder": format!("{:?}", queue.difficulty),
+                    "reopenRouting": queue.reopen_routing.as_ref().map(|routing| {
                         let mut names: Vec<&String> = routing.final_reviewers.iter().collect();
                         names.sort();
                         serde_json::json!({ "finalReviewers": names })
                     }),
-                    "redoPass": redo_policy.is_some(),
-                    "sharedReopenRounds": shared_rounds,
+                    "redoPass": queue.redo_pass,
+                    "sharedReopenRounds": queue.shared_rounds,
                     "sampleSegmentId": segment_id,
                     "sampleAudioBytes": audio.len(),
                     "sampleAudioValidWav": valid_wav,
@@ -1146,7 +1176,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             let mut available = 0usize;
             for _ in 0..iterations {
                 let started = std::time::Instant::now();
-                available = review_pool::pending_segment_ids(&db, &pool, &reviewer, allowed)?.len();
+                available = canonical_reviewer_queue(&db, &db_path, &pool, &reviewer, allowed)?.ids.len();
                 samples_ms.push(started.elapsed().as_secs_f64() * 1000.0);
             }
             samples_ms.sort_by(f64::total_cmp);
@@ -1158,6 +1188,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                     "reviewer": reviewer,
                     "dialects": dialects,
                     "iterations": iterations,
+                    "queueAuthority": REVIEWER_QUEUE_AUTHORITY,
                     "availableClips": available,
                     "p95Ms": p95_ms,
                     "maxMs": samples_ms.last(),
@@ -1727,6 +1758,43 @@ mod tests {
     }
 
     // ── Argument helpers ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn canonical_probe_and_benchmark_queue_honors_shared_reopen_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cortex-speech.db");
+        let (db, pool) = pool_fixture(dir.path(), &[("held", true), ("fresh", false)]);
+        pool_decision(&db, &pool, "held", &clip_hash(0), ("ReviewerB", "edit", Some("دەقی دروست")), 1);
+        let plan = review_pool::reopen::prepare(&db, &pool, &["held".into()], "fixture quality recheck", 0).unwrap();
+        review_pool::reopen::apply(&db, &pool, &plan, 100).unwrap();
+        std::fs::write(dir.path().join(review_pool::reopen_routing::FILE_NAME), r#"{"final_reviewers":["Owner"]}"#)
+            .unwrap();
+        let unrestricted = review_pool::pending_segment_ids(&db, &pool, "Unrelated", None).unwrap();
+        assert!(unrestricted.contains(&"held".to_string()), "fixture must reproduce the old benchmark mismatch");
+        for reviewer in ["Unrelated", "ReviewerB", "Owner"] {
+            let queue = canonical_reviewer_queue(&db, &path, &pool, reviewer, None).unwrap();
+            assert!(queue.shared_rounds);
+            assert!(!queue.redo_pass);
+            assert!(queue.reopen_routing.is_some());
+            assert!(queue.ids.contains(&"fresh".to_string()));
+            assert_eq!(queue.ids.contains(&"held".to_string()), reviewer != "Unrelated", "{reviewer}");
+        }
+        // A malformed legacy redo policy must not be silently ignored by either command.
+        std::fs::write(dir.path().join(cortex_speech_app_lib::review_redo::FILE_NAME), "broken json").unwrap();
+        assert!(canonical_reviewer_queue(&db, &path, &pool, "Owner", None).is_err());
+    }
+
+    #[test]
+    fn canonical_probe_and_benchmark_queue_keeps_restricted_empty_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cortex-speech.db");
+        let (db, pool) = pool_fixture(dir.path(), &[("fresh", false)]);
+        let unrestricted = canonical_reviewer_queue(&db, &path, &pool, "Reviewer", None).unwrap();
+        assert_eq!(unrestricted.ids, ["fresh"]);
+        let dialects = vec!["sorani".to_string()];
+        let restricted = canonical_reviewer_queue(&db, &path, &pool, "Reviewer", Some(&dialects)).unwrap();
+        assert!(restricted.ids.is_empty(), "an unmapped fixture must stay unavailable to a restricted reviewer");
+    }
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
