@@ -1,5 +1,229 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-08 late evening — Compact UI finishing and waveform lifecycle
+
+Owner-approved compact layout retained. Unified typography, aligned transport
+controls, quieter count/coin pills and secondary surfaces, clear speed value,
+focus/press/hover feedback with reduced-motion support. Real waveform bars now
+remain distinct at phone widths. Fixed stale waveform decode races and closed
+temporary decoding AudioContexts on both success and error; three regressions
+proved failing before the change and passing after it.
+
+HTML SHA-256: `c0b1c9ae69491ade0028730215ae3309e53bf7b9c6d4141c317400ce3d679fc8`.
+Focused units 79/79; browser suite 66/66 (34.9s). Four English/Sorani dark/light
+screenshots inspected at 390×844; typical header count/coins also checked at 320px.
+Expanded compact accessibility checks 2/2 (4.9s), covering edited/returned state
+in both languages/themes. TypeScript, ESLint/Prettier, storage policy 5/5, frontend
+guard policy 33 pins and i18n structure pass; native copy approval remains separate.
+Evidence: app `test-results/polish-acceptance/` and `design-qa.md`.
+Final real-backend verification 3/3 passed (19.73s; 2m02s rebuild): actual owner
+reopen, lost request/reply plus restart/Undo, and competing tabs. Disposable profiles
+retain expected history/drafts and exactly-once effects. No live data, deployment, schema, payroll
+or scheduler change. Native copy/device and broader release gates remain open.
+
+## 2026-09-08 evening — Owner-directed compact phone UI and refresh safety
+
+The owner amended the selected Option 3 design: one Cortex/clip-count/earned-coin
+header, audio directly below, no numbered mobile section headings, a transcript
+that grows and shrinks with text, and judgments directly below it. Implemented
+without changing server review/pay semantics. Detailed progress/identity move to
+Help; warnings, metadata, text-size, Undo and draft recovery remain reachable.
+
+HTML SHA-256: `231593fe579a621191c903148886d4d263d81a17e9c629c0367f77ba7b091c74`.
+Focused units 76/76; reviewer browser suite 66/66 (33.9s), including native/fallback
+content sizing, four widths/two locales, CSS 200% zoom, 44px targets, keyboard
+clearance, light/dark axe, and native corrupt/404/416/503 media + Retry. TypeScript
+passes. Browser API responses are mocked; this is not the full backend matrix.
+
+New failing-before regressions fixed: blocked optional preference storage aborted
+startup; same-revision repaint hid broken-audio warnings/re-enabled judgments;
+the same repaint overwrote unstored/IME text and reset edit-pause rewind. Handover
+also clears stale coin totals if the new reviewer response omits accounting.
+
+Latest visual evidence is under app `test-results/compact-acceptance/`; the compact
+390×844 short-transcript screenshots fit judgments, Help, Undo and local recovery
+without scrolling. Long transcripts deliberately grow and may require page scroll.
+`cortex-speech-app/design-qa.md` records the source plus explicit owner amendments,
+remaining native Kurdish/physical-device approval, and rejected earlier fixture
+captures. No new source commit, production deployment, live data, payroll, audio,
+schema or scheduler mutation occurred. Broader release approval remains outstanding.
+
+Final verification of this exact HTML: explicit real-browser/backend tests 3/3,
+19.48s after 2m35s rebuild (owner reopen; lost request/reply + restart/Undo; two
+competing tabs). Independent DB assertions preserve expected history and exactly
+one credit/reversal. Targeted ESLint, Prettier, TypeScript, diff whitespace,
+storage policy 5/5, frontend guards 33 pins and i18n policy also pass.
+
+## 2026-09-08 — Real owner-reopen recovery finds and fixes initial queue ordering
+
+New explicit browser/backend test keeps a reviewer tab and its unacknowledged
+pool correction alive while the disposable server is stopped, the actual owner
+`pool_admin plan-reopen` / `apply-reopen --confirm-quality-hold` commands run
+(including a pinned snapshot), and the server resumes. Initial reproduction:
+the stale operation received 409, but its clip stayed hidden because the page had
+published eligibility before finishing the identity-held outbox replay.
+
+The page now finishes that replay after learning its reviewer identity and, only
+if an operation settled, fetches one fresh queue before rendering. Unacknowledged
+work remains hidden; refused reopened work returns with the new revision and
+clean draft. Added unit cases cover both ACK and refusal; an old offline fixture
+now actually fails transport instead of returning a successful empty ACK.
+
+Focused units 73/73 (2.35s), browser suite 55/55 (26.7s), TypeScript, JS lint/format,
+storage 5/5, frontend guards 33 and i18n policies pass. Final real-browser/backend
+suite: 3/3 (18.65s), including fresh-round duplicate replay and pool receipt checks. Windows CI
+and release YAML each explicitly require all three real browser/backend gates;
+configuration parsing passed, remote execution not claimed.
+Final targeted Rust clippy (`--test reviewer_serving_path -- -D warnings`) passes
+in 28.68s; full release lint remains separate.
+
+HTML SHA256: `00517eb20ec59d317a4a5517dcd91b06f17272fb8c3eb18a4323edd3112f72dd`.
+Production, real reviewers, datasets and payment policy unchanged. Remaining:
+broader failure matrix, native phone/Kurdish checks, performance and full candidate
+release/rollback/canary evidence. No full-completion or flawless-system claim.
+
+## 2026-09-08 — Copyable stale drafts and fail-closed shared-phone handover
+
+Guided Review now exposes a read-only, author-scoped local draft recovery panel.
+New drafts carry reviewer/revision metadata; an old revision is archived and read
+back before its original key is removed. It never silently fills a reopened round.
+The reviewer can copy old text with native selection/copy without submitting it.
+Storage remains session-scoped; closing the tab can discard these drafts. Ordinary
+legacy unversioned reloads retain compatibility; returned rounds archive those
+unbound drafts. This is not a claim of retroactive revision proof for legacy text.
+
+A new fault-injection test reproduced old text remaining visible when storage
+cleanup failed during a reviewer switch. Identity adoption now clears the old
+view/playback first, completes storage ownership before publishing identity/queue,
+and fails closed with no decision target on error. Three regressions cover failed
+read/write/removal, direct submission attempts and successful retry. No schema,
+compensation, dataset, production or deployment changes.
+
+Final focused units: 71/71 (2.12s); browser page: 55/55 (25.6s), including real native
+clipboard copying and scoped axe checks on the open recovery panel. TypeScript,
+targeted ESLint/Prettier, storage policy 5/5 and frontend guards 33 pass. I18n:
+47 strings, 30 reviewed-source reuses, 17 existing pending translations. The
+refusal guidance changed and still needs native approval; no allowlist expansion.
+Final real-browser/backend rerun: 2/2, 10.47s after a 2m01s rebuild; includes native
+copy of the losing correction plus independent effect/payment assertions.
+
+HTML SHA256: `3696fa21d0d8dde710b0fe85e876ea31fee965d3d2431093a19109881474af74`.
+Uncommitted base remains `9c5b4c43967639d695624a620be998744cb8d015`. Real owner-reopen
+with queued old work, broader failure matrix, phones/native copy review, performance
+and release/rollback/canary gates remain; this is not full-plan completion.
+
+## 2026-09-08 — Simultaneous reviewer tabs reveal and fix canonical replay race
+
+The real two-tab browser test reproduced a false 428 on a duplicate of a committed
+operation: both copies observed New before the writer lock; the winner consumed
+its playback receipt and the waiting duplicate was rejected. Canonical validation
+now holds the existing commit lock from before mutable row reads and rechecks
+immutable operation truth after acquisition. Exact ACKs restore Undo/accounting;
+conflicting UUID/payloads remain refused. Payment and playback policies unchanged.
+
+Two real pages share cookie/localStorage, each queues a different played correction
+to the same clip, and network barriers force duplicate concurrent replay. Required:
+all winning copies 200, all competing copies 409, two original UUIDs preserved,
+one durable effect/credit, exact winning text, losing draft retained in tab storage
+and refusal visible. This does not prove a complete UI recovery route for that draft.
+
+Fresh evidence: Rust couch suite 184/184 (70.16s); explicit browser/backend tests
+2/2 (10.46s); existing HTTPS serving-path 1/1 (4.10s). JS lint/format, decision
+observability/pay policies, architecture gate (179 modules), YAML parsing and diff
+whitespace pass. Targeted Rust clippy (`--lib --test reviewer_serving_path`, warnings
+denied) also passes. The two formerly ignored browser tests now have explicit required
+steps in Windows CI and release workflows; no remote workflow run is claimed.
+
+Backend source SHA256: `f70c60fc4dedfd645910801b1a524d7846f3dcbffee367917cb489a26dca6185`.
+Base remains `9c5b4c43967639d695624a620be998744cb8d015`; uncommitted; production unchanged.
+Broader matrix/stale-round recovery, native copy, real devices and release gates
+remain open. See `cortex-speech-app/design-qa.md` for commands and limitations.
+
+## 2026-09-08 — Real browser/backend recovery proven; two UI defects fixed
+
+Uncommitted working copy at base `9c5b4c43967639d695624a620be998744cb8d015`.
+Production unchanged. Option 3 mobile height reduced by 167 CSS pixels in both
+English and Sorani without shrinking 44px targets. Normalized same-state captures
+now work; native Kurdish help and final density acceptance still block design QA.
+
+Fixed ACK-after-reload presentation: successful outbox replay now exposes Undo
+and refreshes stale not-sent status for the current author. The new coupled
+Chromium/HTTPS/SQLite gate then found a real terminal-playback defect: paused
+timeupdate cleared the last anchor before pause/ended, discarding the tail of a
+fully played short clip and triggering HTTP 428. The handler captures that final
+continuous interval before clearing; seeking remains excluded. A red/green unit
+test proves 1250ms → 1500ms for a complete 1.5s playback. No server threshold,
+compensation policy or authority check was weakened.
+
+Final HTML SHA256: `88418682392f49192cc4bda636807b2236b5c1742e7c1968397c310f227f1ef6`.
+Final focused unit suite 64/64 (9 files, 2.17s); browser suite 54/54 (26.6s),
+no retries/skips. TypeScript, targeted ESLint, Prettier, cargo fmt and whitespace
+pass. Python policies: storage 5, frontend guards 33, playback readiness 40;
+i18n 45 strings with 17 still awaiting native review.
+
+Existing HTTPS retry/restart test: 1/1 (4.32s). New real-browser test: 1/1 twice
+(7.20s, 6.77s), each using a fresh disposable profile. Genuine native playback,
+request loss before forwarding, response loss after commit, browser-state
+restoration, server process restart, identical operation replay and UI Undo.
+Independent DB reads show zero effects/credits before commit, one effect/credit
+after commit, then exactly one reversal and zero net credit after Undo.
+
+Required explicit command from `cortex-speech-app/src-tauri` (Node dependencies
+and Playwright Chromium required):
+
+```powershell
+cargo test --locked --test reviewer_serving_path real_browser_replays_lost_request_and_response_once_across_restart -- --ignored --exact --nocapture
+```
+
+Ordinary Rust runs intentionally skip this browser-dependent test; do not count
+it as passed unless explicitly run. Not yet automated in CI. Remaining work:
+broader coupled failure matrix, native copy, phones/IME/manual accessibility,
+performance, full candidate release/rollback/canary gates. No release GO.
+Detailed evidence: `cortex-speech-app/design-qa.md`.
+
+## 2026-09-08 — Guided Review browser regression 46/46; release remains gated
+
+Owner approved direct Playwright. Initial reviewer run: 43 passed, 2 failed
+(44.7s), because nonexistent file-based audio in the fixture triggered the new
+missing-audio judgment guard. Guard retained. Test requests are now intercepted
+at a synthetic loopback origin: exact embedded HTML and decodable generated WAV
+are fulfilled; all other requests abort. API mocks remain explicit, with no live
+backend, reviewer credentials or database involved.
+
+Added native media decoding/timeline/Play/Pause coverage and strengthened the
+missing-audio test to assert judgments disabled while Skip stays enabled.
+Focused run: 4/4 (2.4s). Complete reviewer run: **46 passed (15.0s)**, no retries
+or skips. Reproducer from `cortex-speech-app`:
+
+```powershell
+node node_modules/@playwright/test/cli.js test --config playwright.couch.config.ts --workers=2 --reporter=line
+```
+
+Includes Sorani light/dark axe checks and keyboard/outbox/Undo/expiry/autoplay
+regressions. TypeScript, targeted ESLint and diff whitespace pass. HTML SHA256:
+`e2fd0f4061dfa18e90fe712a4b0161d6e9bb91ace77bf32bcb434b0bd38a7679`.
+This is not a full-app test run, backend durability proof, physical-device test
+or complete accessibility certification. Visual/native-copy QA and Rust/release
+gates remain; no commit/deployment or production mutation occurred.
+
+## 2026-09-07 — Guided Review Option 3 local implementation; QA/release not complete
+
+Owner selected the three-step Listen / Check transcript / Submit design. Applied
+inside the existing embedded reviewer page with one visible primary action,
+retained media/editor identity, explicit pending state, recoverable audio errors,
+composition/storage guards and library icons. No backend/schema/pay policy change.
+
+Focused reviewer unit tests: 62/62 across 9 files (18 new). TypeScript, Svelte
+check, ESLint, i18n/storage/frontend-guard policies and diff whitespace pass.
+Synthetic in-app browser exercised editing, mock-acknowledged Save/Undo,
+missing-audio retry and Skip; this is not real-server durability evidence.
+
+`cortex-speech-app/design-qa.md` is blocked on normalized full-view comparison,
+mobile density and critical Kurdish help review. Updated browser tests have not
+run; direct Playwright permission is pending. Real-device/accessibility and
+Rust/release gates remain. Uncommitted working-copy changes only; production,
+reviewers, payment history and scheduled tasks remain unchanged.
+
 ## 2026-09-07 — Schema71 shared reopen deployed and reviewer access restored
 
 Production build `7397c1f21b68b4f7dc32c8b92a03a4e1f2f72558` deployed through the protected controller;
