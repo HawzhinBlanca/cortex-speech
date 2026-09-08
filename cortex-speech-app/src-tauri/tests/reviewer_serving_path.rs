@@ -407,6 +407,293 @@ fn count(db: &Database, sql: &str, params: &[&dyn rusqlite::ToSql]) -> i64 {
     db.connection().query_row(sql, params, |row| row.get(0)).unwrap_or_else(|error| panic!("{sql}: {error}"))
 }
 
+fn run_browser_phase(profile: &Path, base: &str, token: &str, phase: &str) -> Value {
+    run_browser_phase_with_checkpoint(profile, base, token, phase, || {})
+}
+
+fn run_browser_phase_with_checkpoint(
+    profile: &Path,
+    base: &str,
+    token: &str,
+    phase: &str,
+    mut checkpoint: impl FnMut(),
+) -> Value {
+    let report = profile.join(format!("browser-{phase}.json"));
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/reviewer_browser_serving_path.cjs");
+    let child = Command::new("node")
+        .arg(script)
+        .args([phase, base])
+        .arg(profile)
+        .arg(&report)
+        .env("CORTEX_BROWSER_FIXTURE_TOKEN", token)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("start explicitly requested browser gate (Node and Playwright must be installed)");
+    // Also reap the browser if an independent checkpoint assertion panics.
+    let mut owned = ServerChild { child: Some(child), control_path: profile.join("unused-browser-control") };
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        checkpoint();
+        let child = owned.child.as_mut().expect("browser child is owned");
+        if let Some(status) = child.try_wait().expect("poll browser gate") {
+            assert!(status.success(), "browser phase {phase} failed: {status}");
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("browser phase {phase} exceeded its bounded deadline");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    serde_json::from_slice(&fs::read(report).expect("browser phase evidence")).expect("parse browser phase evidence")
+}
+
+fn owner_reopen_cli(db_path: &Path, arguments: &[&str]) -> Value {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pool_admin"));
+    command.args(arguments).arg("--db").arg(db_path).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().expect("launch real owner CLI on disposable database");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if child.try_wait().expect("poll owner CLI").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("owner reopen CLI exceeded its bounded deadline");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let output = child.wait_with_output().expect("read owner CLI result");
+    assert!(output.status.success(), "owner CLI refused fixture: {}", String::from_utf8_lossy(&output.stderr));
+    serde_json::from_slice(&output.stdout).expect("owner CLI JSON evidence")
+}
+
+#[test]
+#[ignore = "explicit browser/backend gate: requires installed Node, Playwright and Chromium"]
+fn real_browser_owner_reopen_fences_queued_work_and_recovers_the_draft() {
+    let temp = tempfile::tempdir().expect("isolated owner-reopen browser profile");
+    let profile = temp.path().join("profile");
+    let db_path = profile.join("cortex-speech.db");
+    seed_profile(&profile, &db_path);
+    let port = free_non_live_port();
+    let base = format!("https://127.0.0.1:{port}");
+    fs::write(profile.join("browser-fixture.json"), json!({ "base": base, "synthetic": true }).to_string()).unwrap();
+    let (initial_server, status) = spawn_server_child(&profile, &db_path, port, 301, "start");
+    let agent = tls_agent(&profile);
+    let cookie = claim(&agent, &base, &reviewer_pairing_token(&status, REVIEWER_ONE));
+    let served = queue(&agent, &base, &cookie);
+    let first = item(&served, FIRST_ID);
+    let revision = first["rowVersion"].as_str().unwrap();
+    let receipt =
+        earn_playback_receipt(&agent, &base, &cookie, FIRST_ID, revision, "60000000-0000-4000-8000-000000000001");
+    let historical_text = "دەقی مێژوویی";
+    let (code, body) = post_decision(
+        &agent,
+        &base,
+        &cookie,
+        &json!({
+            "operationId": FIRST_OPERATION, "id": FIRST_ID, "action": "edit", "text": historical_text,
+            "rowVersion": revision, "playbackReceiptId": receipt,
+        }),
+    );
+    assert_eq!(code, 200, "canonical fixture decision failed: {body}");
+    let mut server = Some(initial_server);
+    let mut applied = false;
+    let result = run_browser_phase_with_checkpoint(
+        &profile,
+        &base,
+        &reviewer_pairing_token(&status, REVIEWER_TWO),
+        "owner-reopen",
+        || {
+            if applied {
+                return;
+            }
+            let Ok(bytes) = fs::read(profile.join("reopen-ready.json")) else {
+                return;
+            };
+            let Ok(operation) = serde_json::from_slice::<Value>(&bytes) else {
+                return;
+            };
+            assert_eq!(operation["id"], FIRST_ID);
+            assert_eq!(operation["reviewer"], REVIEWER_TWO);
+            server.take().expect("first server generation").crash();
+            {
+                let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+                assert_eq!(count(&db, "SELECT COUNT(*) FROM review_compensation_ledger", &[]), 1);
+                assert_eq!(count(&db, "SELECT COUNT(*) FROM review_pool_decisions", &[]), 0);
+            }
+            let plan = owner_reopen_cli(
+                &db_path,
+                &["plan-reopen", "--segment-id", FIRST_ID, "--reason", "Disposable stale-outbox regression"],
+            );
+            let manifest = profile.join("owner-reopen-plan.json");
+            fs::write(&manifest, serde_json::to_vec(&plan).unwrap()).unwrap();
+            let outcome = owner_reopen_cli(
+                &db_path,
+                &["apply-reopen", "--manifest", manifest.to_str().unwrap(), "--confirm-quality-hold"],
+            );
+            assert_eq!(outcome["reopenedOrAlreadyApplied"], 1);
+            assert_eq!(outcome["paymentHistoryChanged"], false);
+            assert!(!outcome["preReopenPinnedSnapshot"].is_null());
+            {
+                let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+                assert_eq!(count(&db, "SELECT COUNT(*) FROM review_compensation_ledger", &[]), 1);
+                assert_eq!(count(&db, "SELECT COUNT(*) FROM review_reopen_rounds", &[]), 1);
+                assert_eq!(
+                    count(
+                        &db,
+                        "SELECT COUNT(*) FROM speech_segments WHERE id=?1 AND annotated_transcript=?2",
+                        &[&FIRST_ID, &historical_text]
+                    ),
+                    1
+                );
+            }
+            let (resumed, _) = spawn_server_child(&profile, &db_path, port, 302, "resume");
+            server = Some(resumed);
+            applied = true;
+            fs::write(profile.join("reopen-applied.json"), serde_json::to_vec(&outcome).unwrap()).unwrap();
+        },
+    );
+    assert!(applied, "owner reopen checkpoint actually ran");
+    server.take().unwrap().stop();
+    let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+    let old = result["operation"]["operationId"].as_str().unwrap();
+    let fresh_text = result["newOperation"]["text"].as_str().unwrap();
+    assert!(db.review_operation(old).unwrap().is_none(), "stale operation never gains a canonical receipt");
+    assert!(review_pool::operation(&db, old).unwrap().is_none(), "stale operation never gains a pool receipt");
+    assert!(review_pool::operation(&db, result["newOperation"]["operationId"].as_str().unwrap()).unwrap().is_some());
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM human_decision_effect_events", &[]), 1);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM review_pool_decisions", &[]), 1);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM review_pool_decisions WHERE reviewer=?1 AND submitted_transcript=?2 AND action='edit'", &[&REVIEWER_TWO, &fresh_text]), 1);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM review_compensation_ledger", &[]), 2);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM review_compensation_ledger WHERE reviewer=?1 AND delta_micro_iqd=7500000",
+            &[&REVIEWER_TWO]
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM speech_segments WHERE id=?1 AND annotated_transcript=?2",
+            &[&FIRST_ID, &historical_text]
+        ),
+        1
+    );
+    assert_eq!(
+        review_pool::resolution_summary(&db).unwrap().resolved_clips,
+        0,
+        "a new round still needs two distinct reviewers"
+    );
+    eprintln!("real-browser owner reopen: actual offline CLI/snapshot; stale queued operation refused; old draft copied; fresh round saved once; history/pay preserved; no false consensus");
+}
+
+/// Explicit because ordinary Rust-only environments do not install a browser. Release verification
+/// of reviewer changes must invoke this gate with --ignored --exact, never count it as an ordinary
+/// Rust pass. The parent independently reads durable effects between each browser phase.
+#[test]
+#[ignore = "explicit browser/backend gate: requires installed Node, Playwright and Chromium"]
+fn real_browser_replays_lost_request_and_response_once_across_restart() {
+    let temp = tempfile::tempdir().expect("isolated browser profile");
+    let profile = temp.path().join("profile");
+    let db_path = profile.join("cortex-speech.db");
+    seed_profile(&profile, &db_path);
+    let port = free_non_live_port();
+    let base = format!("https://127.0.0.1:{port}");
+    fs::write(profile.join("browser-fixture.json"), json!({ "base": base, "synthetic": true }).to_string())
+        .expect("write fixture ownership marker");
+    let (server, status) = spawn_server_child(&profile, &db_path, port, 101, "start");
+    let token = reviewer_pairing_token(&status, REVIEWER_ONE);
+
+    let lost_request = run_browser_phase(&profile, &base, &token, "request-lost");
+    let segment_id = lost_request["operation"]["id"].as_str().expect("actual served fixture clip");
+    let corrected = lost_request["operation"]["text"].as_str().expect("actual browser correction");
+    assert!([FIRST_ID, SKIP_ID, THIRD_ID].contains(&segment_id));
+    {
+        let db = Database::open(db_path.to_string_lossy().as_ref()).expect("independent pre-commit DB read");
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM human_decision_effect_events", &[]), 0);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM review_compensation_ledger", &[]), 0);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM speech_segments WHERE verified=1", &[]), 0);
+    }
+    let lost_response = run_browser_phase(&profile, &base, &token, "response-lost");
+    assert_eq!(lost_request["operation"], lost_response["operation"], "browser restart must retain exact operation");
+    {
+        let db = Database::open(db_path.to_string_lossy().as_ref()).expect("independent post-commit DB read");
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM human_decision_effect_events", &[]), 1);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM review_compensation_ledger", &[]), 1);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM speech_segments WHERE id=?1 AND verified=1 AND human_decision='edit' AND annotated_transcript=?2", &[&segment_id, &corrected]), 1);
+    }
+    server.crash();
+    let (resumed, _) = spawn_server_child(&profile, &db_path, port, 102, "resume");
+    let replay = run_browser_phase(&profile, &base, &token, "replay");
+    assert_eq!(lost_request["operation"], replay["operation"], "lost reply retry must keep the original identity");
+    assert_eq!(replay["acknowledged"]["duplicate"], true);
+    assert_eq!(replay["outbox"], json!([]));
+    assert_eq!(replay["undone"]["id"], segment_id);
+    resumed.stop();
+    let db = Database::open(db_path.to_string_lossy().as_ref()).expect("independent final DB read");
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM human_decision_effect_events", &[]), 1);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM review_compensation_ledger", &[]), 2);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM human_decision_effect_reversals", &[]), 1);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM speech_segments WHERE id=?1 AND verified=0 AND human_decision IS NULL",
+            &[&segment_id]
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COALESCE(SUM(delta_micro_iqd),0) FROM review_compensation_ledger WHERE reviewer=?1 COLLATE NOCASE",
+            &[&REVIEWER_ONE]
+        ),
+        0
+    );
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM review_compensation_ledger WHERE compensation_action='edit' AND delta_micro_iqd=7500000", &[]), 1);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM review_compensation_ledger WHERE compensation_action='undo' AND delta_micro_iqd=-7500000", &[]), 1);
+    eprintln!("real-browser recovery: 0 effects before commit; 1 effect/credit after lost reply; same UUID acknowledged after restart; UI Undo adds exactly one reversal and nets credit to zero");
+}
+
+#[test]
+#[ignore = "explicit browser/backend gate: requires installed Node, Playwright and Chromium"]
+fn real_browser_two_tabs_preserve_competing_edits_and_credit_only_once() {
+    let temp = tempfile::tempdir().expect("isolated concurrent browser profile");
+    let profile = temp.path().join("profile");
+    let db_path = profile.join("cortex-speech.db");
+    seed_profile(&profile, &db_path);
+    let port = free_non_live_port();
+    let base = format!("https://127.0.0.1:{port}");
+    fs::write(profile.join("browser-fixture.json"), json!({ "base": base, "synthetic": true }).to_string())
+        .expect("write fixture ownership marker");
+    let (server, status) = spawn_server_child(&profile, &db_path, port, 201, "start");
+    let result = run_browser_phase(&profile, &base, &reviewer_pairing_token(&status, REVIEWER_ONE), "two-tabs");
+    server.stop();
+    let db = Database::open(db_path.to_string_lossy().as_ref()).expect("independent concurrent result DB read");
+    let winner = &result["winning"];
+    let id = winner["id"].as_str().expect("winning segment");
+    let text = winner["text"].as_str().expect("winning correction");
+    assert_eq!(result["operations"].as_array().expect("two original operations").len(), 2);
+    assert_ne!(winner["operationId"], result["losing"]["operationId"]);
+    assert_ne!(winner["text"], result["losing"]["text"]);
+    let winning_operation = winner["operationId"].as_str().expect("winning UUID");
+    let losing_operation = result["losing"]["operationId"].as_str().expect("losing UUID");
+    assert!(db.review_operation(winning_operation).expect("winning receipt lookup").is_some());
+    assert!(db.review_operation(losing_operation).expect("losing receipt lookup").is_none());
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM human_decision_effect_events", &[]), 1);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM review_compensation_ledger", &[]), 1);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM speech_segments WHERE id=?1 AND verified=1 AND human_decision='edit' AND annotated_transcript=?2", &[&id, &text]), 1);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM review_compensation_ledger WHERE compensation_action='edit' AND delta_micro_iqd=7500000", &[]), 1);
+    eprintln!("real-browser two tabs: two durable distinct edits retained; one canonical effect/credit; losing draft preserved and refusal visible");
+}
+
 #[test]
 fn reviewer_flow_survives_real_https_retries_and_restarts() {
     let temp = tempfile::tempdir().expect("isolated serving profile");

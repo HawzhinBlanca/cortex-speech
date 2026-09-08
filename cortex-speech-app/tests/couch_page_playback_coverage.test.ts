@@ -84,6 +84,30 @@ afterEach(() => {
 });
 
 describe('couch.html unique playback coverage', () => {
+  it('captures the final traversal when paused timeupdate precedes pause and ended', async () => {
+    const page = await runningPage('short-clip', 1500);
+    for (const seconds of [0.25, 0.5, 0.75, 1, 1.25]) page.tick(seconds);
+    Object.defineProperty(page.player, 'paused', { configurable: true, value: true });
+    page.tick(1.5);
+    page.player.dispatchEvent(new page.dom.window.Event('pause'));
+    page.player.dispatchEvent(new page.dom.window.Event('ended'));
+    expect(page.traversalMs()).toBe(1500);
+    page.tick(1.5);
+    expect(page.traversalMs(), 'terminal events must not double-count').toBe(1500);
+  });
+
+  it('does not count a seek or later position changes while paused', async () => {
+    const page = await runningPage();
+    page.tick(0.5);
+    Object.defineProperty(page.player, 'paused', { configurable: true, value: true });
+    page.player.dispatchEvent(new page.dom.window.Event('seeking'));
+    page.tick(1);
+    page.player.dispatchEvent(new page.dom.window.Event('seeked'));
+    page.tick(1.5);
+    page.player.dispatchEvent(new page.dom.window.Event('pause'));
+    expect(page.traversalMs()).toBe(500);
+  });
+
   it('replaying the same half twice remains half coverage', async () => {
     const page = await runningPage();
     for (const seconds of [0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5]) page.tick(seconds);

@@ -45,9 +45,9 @@
   "en": {
     "progress": "Clip {n} of {total}",
     "audioDone": "{t} of audio done",
-    "accept": "Looks good",
+    "accept": "Confirm unchanged & next",
     "bad": "Reject",
-    "save": "Save & next",
+    "save": "Save correction & next",
     "undo": "Undo review",
     "saved": "Saved",
     "markedBad": "Reject",
@@ -69,11 +69,27 @@
     "skippedByYou": "You skipped {n} clip(s) — they are still waiting for someone else.",
     "speakerChange": "more than one speaker",
     "uncertainWords": "unsure words: {words}",
-    "redoPass": "returned for a fresh review — listen again and correct any mistakes",
+    "redoPass": "Returned for fresh review",
     "stillSending": "{n} decision(s) have not been sent yet. Keep this page open until they go through.",
-    "refused": "{n} decision(s) could not be saved: another reviewer got there first, or the link changed. Your typed text is kept — find those clips and review them again.",
+    "refused": "{n} decision(s) were not saved. Open Saved local draft below to copy any text kept in this tab. Keep the tab open until you have your copy.",
     "mustListen": "Not saved: the server could not verify enough renderer-reported playback traversal for this clip. Replay it, then try again.",
-    "editHint": "Listen, then fix the text if needed"
+    "editHint": "Listen, then fix the text if needed",
+    "listenStep": "Listen",
+    "transcriptStep": "Check transcript",
+    "submitStep": "Submit",
+    "play": "Play",
+    "pause": "Pause",
+    "seek": "Seek audio",
+    "replay": "Replay",
+    "speedLabel": "Playback Speed",
+    "loopOn": "Loop On",
+    "loopOff": "Loop Off",
+    "edited": "Edited",
+    "pending": "Not submitted",
+    "saving": "Saving...",
+    "emptyEdit": "Enter a transcript before saving the correction.",
+    "localDraft": "Saved local draft",
+    "localOnly": "Local only"
   },
   "ckb": {
     "progress": "پارچەی {n} لە {total}",
@@ -104,9 +120,25 @@
     "uncertainWords": "وشە نادڵنیاکان: {words}",
     "redoPass": "بۆ پێداچوونەوەی نوێ گەڕێنراوەتەوە — دووبارە گوێ بگرە و هەڵەکان ڕاست بکەرەوە",
     "stillSending": "{n} بڕیار هێشتا نەنێردراون. ئەم پەڕەیە کراوە بهێڵەوە تا دەنێردرێن.",
-    "refused": "{n} بڕیار پاشەکەوت نەکران: پێداچوونەوەرێکی تر پێشتر کردوویەتی، یان بەستەرەکە گۆڕاوە. دەقە نووسراوەکەت پارێزراوە — ئەو پارچانە بدۆزەرەوە و دووبارە پێداچوونەوەیان بۆ بکە.",
+    "refused": "{n} بڕیار پاشەکەوت نەکران. لە خوارەوە ڕەشنووسی ناوخۆیی پاشەکەوتکراو بکەرەوە بۆ کۆپیکردنی ئەو دەقەی لەم تابەدا ماوەتەوە. تا کۆپییەکەت وەرنەگرتووە، تابەکە کراوە بهێڵەوە.",
     "mustListen": "پاشەکەوت نەکرا: ڕاژەکار نەیتوانی گەڕانی پەخشکردنی ڕاپۆرتکراو بۆ ئەم پارچەیە بە ڕادەی پێویست بسەلمێنێت. دووبارە پەخشی بکە و هەوڵ بدەرەوە.",
-    "editHint": "گوێ بگرە، ئەگەر پێویست بوو دەقەکە ڕاست بکەرەوە"
+    "editHint": "گوێ بگرە، ئەگەر پێویست بوو دەقەکە ڕاست بکەرەوە",
+    "listenStep": "گوێ بگرە و بیدۆزەرەوە",
+    "transcriptStep": "دەق",
+    "submitStep": "دڵنیاکردنەوە",
+    "play": "لێدان",
+    "pause": "ڕاگرتن",
+    "seek": "گەڕان لە دەنگدا",
+    "replay": "دووبارە لێدان",
+    "speedLabel": "خێرایی لێدان",
+    "loopOn": "دووبارە لێدان چالاکە",
+    "loopOff": "دووبارە لێدان ناچالاکە",
+    "edited": "دەستکاریکرا",
+    "pending": "چاوەڕوان",
+    "saving": "پاشەکەوتکردن...",
+    "emptyEdit": "پێش پاشەکەوتکردنی ڕاستکردنەوەکە دەق بنووسە.",
+    "localDraft": "ڕەشنووسی ناوخۆیی پاشەکەوتکراو",
+    "localOnly": "تەنیا ناوخۆیی"
   },
   "source": {
     "progress": "review.progress",
@@ -139,8 +171,46 @@
     "stillSending": null,
     "refused": null,
     "mustListen": null,
-    "editHint": "review.editHint"
+    "editHint": "review.editHint",
+    "listenStep": "review.listen",
+    "transcriptStep": "transcript",
+    "submitStep": "confirm",
+    "play": "audio.play",
+    "pause": "audio.pause",
+    "seek": "audio.seek",
+    "replay": "review.replay",
+    "speedLabel": "audio.playbackSpeed",
+    "loopOn": "audio.loopOn",
+    "loopOff": "audio.loopOff",
+    "edited": "inbox.status.edited",
+    "pending": "pending",
+    "saving": "saving",
+    "emptyEdit": "inbox.disabled.emptyEdit",
+    "localDraft": "review.localDraft",
+    "localOnly": "inbox.localOnly"
   }
+}
+</script>
+<!-- Icons copied verbatim from @lucide/svelte 1.34.0 iconNode data (play, pause,
+     rewind, repeat, skip-forward, ban, coins). No network dependency or handwritten icon paths.
+     ISC License. Copyright (c) 2026 Lucide Icons and Contributors.
+     Permission to use, copy, modify, and/or distribute this software for any purpose with or
+     without fee is hereby granted, provided that the above copyright notice and this permission
+     notice appear in all copies. THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+     WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+     AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR
+     CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+     WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+     CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. -->
+<script id="couch-icons" type="application/json">
+{
+  "play": [["path", {"d":"M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z"}]],
+  "pause": [["rect", {"x":"14","y":"3","width":"5","height":"18","rx":"1"}],["rect", {"x":"5","y":"3","width":"5","height":"18","rx":"1"}]],
+  "rewind": [["path", {"d":"M12 6a2 2 0 0 0-3.414-1.414l-6 6a2 2 0 0 0 0 2.828l6 6A2 2 0 0 0 12 18z"}],["path", {"d":"M22 6a2 2 0 0 0-3.414-1.414l-6 6a2 2 0 0 0 0 2.828l6 6A2 2 0 0 0 22 18z"}]],
+  "repeat": [["path", {"d":"m17 2 4 4-4 4"}],["path", {"d":"M3 11v-1a4 4 0 0 1 4-4h14"}],["path", {"d":"m7 22-4-4 4-4"}],["path", {"d":"M21 13v1a4 4 0 0 1-4 4H3"}]],
+  "skip-forward": [["path", {"d":"M21 4v16"}],["path", {"d":"M6.029 4.285A2 2 0 0 0 3 6v12a2 2 0 0 0 3.029 1.715l9.997-5.998a2 2 0 0 0 .003-3.432z"}]],
+  "ban": [["circle", {"cx":"12","cy":"12","r":"10"}],["path", {"d":"M4.929 4.929 19.07 19.071"}]],
+  "coins": [["path", {"d":"M13.744 17.736a6 6 0 1 1-7.48-7.48"}],["path", {"d":"M15 6h1v4"}],["path", {"d":"m6.134 14.768.866-.5 2 3.464"}],["circle", {"cx":"16","cy":"8","r":"6"}]]
 }
 </script>
 <style>
@@ -274,33 +344,196 @@
   .toast.sticky { background: var(--panel); border-color: var(--bad); color: var(--bad); cursor: pointer; }
   /* Respect a reviewer who has asked their phone to reduce motion. */
   @media (prefers-reduced-motion: reduce) { .toast { transition: none; } }
+  /* Guided Review: keep the existing controller and media element, change the hierarchy.
+     These are numbered sections, not a wizard: no new listening/quality authority is implied. */
+  body { max-width: 820px; margin-inline: auto; gap: 8px; }
+  header { flex-wrap: wrap; align-items: center; gap: 8px; }
+  h1 { font-size: 18px; flex: 1; }
+  #who { font-size: 14px; font-weight: 400; }
+  #progress { display: block; font-size: 12px; line-height: 1.5; font-weight: 400; }
+  .chip { min-height: 44px; min-width: 44px; font-size: 13px; border-radius: 10px; }
+  #card { background: transparent; border: 0; border-radius: 0; padding: 0; gap: 0; flex: none; }
+  .review-step { border-top: 1px solid var(--line); padding-block: 8px; }
+  .review-step:last-child { padding-bottom: 0; }
+  .step-heading { display: flex; gap: 12px; align-items: center; margin-bottom: 6px; }
+  .step-heading h2 { font-size: 16px; line-height: 1.5; }
+  .step-heading .chip { margin-inline-start: auto; }
+  .step-number { background: #4cc7ef; color: #071426; border-radius: 50%; width: 26px; height: 26px;
+                 display: grid; place-items: center; flex: 0 0 26px; font-size: 14px; font-weight: 700; }
+  .step-hint { color: var(--dim); font-size: 13px; line-height: 1.6; margin: 0 0 6px; margin-inline-start: 38px; }
+  #returnBanner { align-self: flex-start; max-width: 100%; padding: 4px 8px; color: var(--warn); border: 1px solid var(--warn);
+                  border-radius: 7px; font-size: 12px; line-height: 1.6; margin-bottom: 8px; }
+  .audio-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 8px; }
+  .player-main { display: grid; grid-template-columns: 56px minmax(0, 1fr); gap: 12px; align-items: center; direction: ltr; }
+  #play { width: 56px; min-height: 56px; border-radius: 50%; background: #4cc7ef; color: #071426;
+          border-color: #4cc7ef; padding: 6px; font-size: 13px; }
+  .control-icon { width: 18px; height: 18px; flex: 0 0 18px; vertical-align: middle; margin-inline-end: 6px; }
+  #play .control-icon { width: 25px; height: 25px; margin: 0; fill: currentColor; }
+  /* The real waveform and native range share a 44px hit area. The range owns keyboard/touch
+     seeking; canvas remains a signal visualization, not a competing control. Keep a visible
+     wrapper focus ring because the range itself is transparent over the waveform. */
+  .wave-seek { position: relative; height: 44px; border-radius: 4px; }
+  .wave-seek:focus-within { outline: 3px solid var(--brand); outline-offset: 3px; }
+  #wave { height: 44px; border: 0; background: transparent; border-radius: 0; }
+  #seek { position: absolute; inset: 0; margin: 0; width: 100%; height: 44px; opacity: 0; cursor: pointer; }
+  #playTime { font-size: 13px; font-variant-numeric: tabular-nums; color: var(--dim); }
+  .transport { border-top: 1px solid var(--line); padding-top: 8px; margin-top: 8px; align-items: stretch; }
+  .transport button { min-height: 44px; font-size: 12px; line-height: 1.4; white-space: normal; }
+  #player { display: none; }
+  textarea { min-height: 112px; resize: vertical; background: var(--panel); }
+  /* Text size shares the heading + hint height instead of adding a 44px row. It stays visible,
+     keyboard reachable and a full touch target; long/zoomed translations grow the grid normally. */
+  .transcript-heading { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; }
+  .transcript-heading .step-heading, .transcript-heading .step-hint { grid-column: 1; }
+  .transcript-heading #textsize { grid-column: 2; grid-row: 1 / 3; align-self: start; }
+  .transcript-status { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0 12px; }
+  #draftState { min-height: 22px; margin-top: 4px; color: var(--dim); font-size: 13px; line-height: 1.6; }
+  #draftState[data-edited="true"] { color: var(--warn); }
+  .meta { font-size: 12px; line-height: 1.6; margin-block: 4px; overflow-wrap: anywhere; min-width: 0; }
+  .meta .redo { display: none; }
+  details { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; margin-top: 6px; }
+  summary { min-height: 44px; padding: 12px; cursor: pointer; font-size: 14px; }
+  details p { padding: 0 12px 12px; color: var(--dim); font-size: 13px; line-height: 1.7; }
+  #draftRecoveryList { display: block; width: calc(100% - 24px); min-height: 44px;
+    margin: 0 12px 12px; padding: 8px; color: var(--ink); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 8px; }
+  #draftRecoveryText { display: block; width: calc(100% - 24px); margin: 0 12px 12px; }
+  #actions { flex-direction: column; }
+  #actions button, .secondary-actions button { min-height: 48px; white-space: normal; line-height: 1.5; padding: 10px; }
+  #save, #accept { background: #4cc7ef; border-color: #4cc7ef; color: #071426; font-size: 16px; }
+  .secondary-actions { display: flex; gap: 8px; margin-top: 8px; }
+  #skip, #bad { flex: 1; width: auto; margin: 0; background: var(--panel); border-color: var(--line); }
+  #skip { color: var(--brand); font-weight: 600; }
+  #after { justify-content: space-between; align-items: center; background: var(--panel);
+           border: 1px solid var(--line); padding: 4px 12px; border-radius: 10px; }
+  #undo { color: var(--brand); background: transparent; border: 0; min-height: 44px; white-space: normal; }
+  #afterLabel { color: var(--dim); font-size: 13px; }
+  #warn { text-align: start; margin-top: 10px; line-height: 1.7; }
+  #retryAudio { min-height: 44px; width: 100%; margin-top: 8px; white-space: normal; }
+  #submitHint { min-height: 22px; }
+  button, summary, input { touch-action: manipulation; }
+  button:focus-visible, summary:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+    outline: 3px solid var(--brand); outline-offset: 3px;
+  }
+  .toast { max-width: calc(100vw - 24px); border-radius: 12px; line-height: 1.6; text-align: center; pointer-events: none; }
+  .toast.show { pointer-events: auto; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #030c1b; --panel: #0b1628; --brand: #56cef6; } }
+  @media (min-width: 768px) {
+    body { padding-top: 24px; }
+    .review-step { padding-block: 22px; }
+    textarea { min-height: 180px; }
+  }
+  /* Owner's compact-phone revision, 2026-09-08: one status bar, audio, growing text,
+     decisions. Full progress, identity and help remain available without occupying every clip. */
+  header { justify-content: flex-start; }
+  header h1 { flex: 0 0 auto; font-size: 16px; }
+  #compactProgress { font-size: 13px; color: var(--dim); font-variant-numeric: tabular-nums; }
+  #accounting { display: flex; align-items: center; gap: 2px; font-size: 13px; color: var(--warn);
+    min-width: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+  #accounting .control-icon { margin: 0; }
+  #lang { margin-inline-start: auto; }
+  #who { display: block; padding: 10px 12px 0; overflow-wrap: anywhere; }
+  #progress { padding: 6px 12px; overflow-wrap: anywhere; }
+  .review-tools { display: flex; align-items: flex-start; gap: 8px; margin-top: 8px; }
+  .review-tools details { min-width: 0; flex: 1; margin: 0; }
+  .review-tools #textsize { flex: 0 0 44px; }
+  #text { field-sizing: content; min-height: 72px; resize: none; overflow-y: hidden; }
+  @media (max-width: 767px) {
+    body { gap: 6px; }
+    .review-step { border: 0; padding-block: 4px; }
+    .step-heading, .transcript-heading, #listenHint { display: none; }
+    /* Preserve the label for assistive technology; normal instructions live in Help. */
+    #submitHint { position: absolute; width: 1px; height: 1px; min-height: 0; padding: 0;
+      margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+    #submitHint[data-attention="true"] { position: static; width: auto; height: auto; margin: 0 0 6px;
+      overflow: visible; clip-path: none; white-space: normal; color: var(--warn); }
+    #returnBanner { margin-bottom: 2px; }
+    #text { min-height: 64px; padding: 10px 12px; }
+    .transcript-status { gap: 0 8px; }
+    #draftState { margin-top: 2px; }
+    .meta { margin-block: 2px; }
+    .secondary-actions { margin-top: 6px; }
+  }
+  /* Finishing pass: one type system, stable controls, quiet separation rather than more chrome. */
+  button, input, select { font-family: inherit; }
+  button { cursor: pointer; transition: background-color .14s ease, border-color .14s ease; }
+  button:disabled { cursor: not-allowed; }
+  header { column-gap: 8px; }
+  header h1 { letter-spacing: -.02em; font-weight: 700; }
+  #compactProgress, #accounting { padding: 4px 7px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--panel); line-height: 1.5; }
+  #compactProgress:empty { display: none; }
+  #accounting { gap: 4px; }
+  .transport button { display: flex; align-items: center; justify-content: center; gap: 5px;
+    min-height: 52px; padding: 7px 5px; font-size: 12px; font-weight: 500; border-radius: 9px; }
+  .transport .control-icon { margin: 0; }
+  #speed { flex-direction: column; gap: 0; }
+  .speed-value { font-size: 15px; line-height: 1.4; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .speed-caption { font-size: 10px; line-height: 1.4; font-weight: 400; }
+  .secondary-actions button { font-weight: 550; }
+  #text { transition: border-color .14s ease; }
+  #text:focus { border-color: var(--brand); }
+  #after { background: transparent; }
+  #undo { font-weight: 550; }
+  #draftRecovery { background: transparent; }
+  @media (hover: hover) and (pointer: fine) {
+    button:not(:disabled):hover { border-color: var(--brand); }
+    #save:not(:disabled):hover, #accept:not(:disabled):hover, #play:hover { background: #7ddafa; }
+    summary:hover { color: var(--brand); }
+  }
+  button:not(:disabled):active { border-color: var(--brand); background: var(--line); }
+  #save:not(:disabled):active, #accept:not(:disabled):active, #play:active { background: #38bdf8; }
+  @media (prefers-reduced-motion: reduce) { button, #text { transition: none; } }
 </style>
 </head>
 <body>
 <header>
-  <h1>Cortex<span id="who"></span></h1>
+  <h1>Cortex</h1>
   <!-- LIVE REGIONS (R3.4). Every one of these changes without the reviewer doing anything at the
        moment it changes, which is precisely the case a screen reader cannot discover by itself: the
        progress counter after a decision, a warning about a clip, the drained-queue verdict. `polite`
        rather than `assertive` because none of them should interrupt a word being spoken. -->
-  <div id="progress" aria-live="polite"></div>
-  <button id="textsize" class="chip" type="button" title="A±">A±</button>
+  <span id="compactProgress" dir="ltr" role="status"></span>
+  <div id="accounting" dir="ltr" aria-live="polite" hidden></div>
   <button id="lang" class="chip" type="button"></button>
 </header>
-<div id="accounting" aria-live="polite" hidden></div>
 <div id="card" hidden>
+  <div id="returnBanner" hidden></div>
+  <section class="review-step" aria-labelledby="listenTitle">
+  <div class="step-heading"><span class="step-number" aria-hidden="true">1</span><h2 id="listenTitle"></h2></div>
+  <p class="step-hint" id="listenHint"></p>
+  <div class="audio-panel">
   <audio id="player" controls preload="auto"></audio>
-  <canvas id="wave" aria-hidden="true"></canvas>
+  <div class="player-main">
+    <button id="play" type="button"></button>
+    <div><div class="wave-seek"><canvas id="wave" aria-hidden="true"></canvas>
+      <input id="seek" type="range" min="0" max="1" step="0.05" value="0" />
+      </div>
+      <div id="playTime" dir="ltr">0:00 / 0:00</div>
+    </div>
+  </div>
   <div class="transport">
     <button id="again" type="button" title="↺ 2s">↺ 2s</button>
     <button id="loop" type="button" aria-pressed="false">⟳</button>
     <button id="speed" type="button">1×</button>
   </div>
-  <textarea id="text" lang="ckb" dir="rtl" spellcheck="false"></textarea>
-  <div class="meta" id="meta"></div>
+  </div>
   <div id="warn" aria-live="polite" hidden></div>
+  <button id="retryAudio" type="button" hidden></button>
+  </section>
+  <section class="review-step" aria-labelledby="transcriptTitle">
+  <div class="transcript-heading">
+  <div class="step-heading"><span class="step-number" aria-hidden="true">2</span><h2 id="transcriptTitle"></h2></div>
+  <p class="step-hint" id="transcriptHint"></p>
+  </div>
+  <textarea id="text" rows="1" lang="ckb" dir="rtl" spellcheck="false"></textarea>
+  <div class="transcript-status"><div id="draftState" role="status" aria-live="polite"></div>
+  <div class="meta" id="meta"></div></div>
+  </section>
+  <section class="review-step" aria-labelledby="submitTitle">
+  <div class="step-heading"><span class="step-number" aria-hidden="true">3</span><h2 id="submitTitle"></h2></div>
+  <p class="step-hint" id="submitHint" aria-live="polite"></p>
   <div class="row" id="actions">
-    <button id="bad"></button>
     <button id="accept"></button>
     <button id="save"></button>
   </div>
@@ -311,17 +544,27 @@
        reject, which permanently excludes a clip that may be perfectly fine. Skipping writes nothing —
        it hands the clip to somebody who can judge it. Below the decision row, not in it: a fourth
        button among three would make the honest exit as prominent as the work. -->
-  <button id="skip" type="button"></button>
+  <div class="secondary-actions"><button id="skip" type="button"></button><button id="bad" type="button"></button></div>
+  <div class="review-tools"><details><summary id="helpTitle"></summary>
+    <span id="who"></span><div id="progress" aria-live="polite"></div><p id="helpText"></p>
+  </details><button id="textsize" class="chip" type="button" title="A±">A±</button></div>
+  </section>
 </div>
 <div id="done" aria-live="polite" hidden></div>
 <!-- Undo lives OUTSIDE the card on purpose. Inside it, the button vanished with the card the moment
      the queue drained — so the one decision a reviewer is most likely to want back, the last one they
      made, was the one they could never reach. Shown whenever there is something to undo. -->
 <div class="row" id="after" hidden>
-  <button id="undo">↩</button>
+  <span id="afterLabel"></span><button id="undo"></button>
 </div>
 <div id="err" role="alert" hidden></div>
 <div class="row" id="errActions" hidden><button id="retry" type="button"></button></div>
+<details id="draftRecovery" hidden>
+  <summary id="draftRecoveryTitle"></summary>
+  <p id="draftRecoveryHint"></p>
+  <select id="draftRecoveryList"></select>
+  <textarea id="draftRecoveryText" dir="rtl" readonly></textarea>
+</details>
 <div class="toast" id="toast" aria-live="polite"></div>
 <script>
   // The token arrives in the URL FRAGMENT (#t=...), which the browser never sends to any server —
@@ -370,19 +613,51 @@
   }
   const $ = (id) => document.getElementById(id);
   let queue = [], i = 0, busy = false;
+  let composing = false;
+  let draftStorageFailed = false;
+  let audioUnavailable = false;
+  let lastReviewMessage = 'saved';
   // True only while the audio was paused BY the reviewer focusing the transcript (R2.3), so the 2s
   // rewind on resume never steals position from a pause they chose themselves.
   let pausedByEdit = false;
 
   // ── i18n ────────────────────────────────────────────────────────────────────
   const STRINGS = JSON.parse($('i18n').textContent);
+  const CONTROL_ICONS = JSON.parse($('couch-icons').textContent);
+  // Display preferences are optional. A privacy setting / full storage must not abort script
+  // initialization or disable the controls. This fallback is ONLY for these four preferences:
+  // decisions, identities and drafts retain their strict durable-write/readback safeguards.
+  function readPreference(name) {
+    try { return localStorage.getItem('cortex.couch.' + name); } catch { return null; }
+  }
+  function writePreference(name, value) {
+    try { localStorage.setItem('cortex.couch.' + name, value); } catch { /* session-only preference */ }
+  }
+  function labelControl(id, label, icon, iconOnly) {
+    const control = $(id);
+    const identity = JSON.stringify([label, icon, !!iconOnly]);
+    if (control.dataset.labelIdentity === identity) return;
+    control.dataset.labelIdentity = identity;
+    control.setAttribute('aria-label', label);
+    control.replaceChildren();
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    for (const [key, value] of Object.entries({viewBox:'0 0 24 24', fill:'none', stroke:'currentColor',
+      'stroke-width':'2', 'stroke-linecap':'round', 'stroke-linejoin':'round', 'aria-hidden':'true', focusable:'false', class:'control-icon'})) svg.setAttribute(key, value);
+    for (const [tag, attributes] of CONTROL_ICONS[icon]) {
+      const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
+      for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, value);
+      svg.appendChild(node);
+    }
+    control.appendChild(svg);
+    if (!iconOnly) control.appendChild(document.createTextNode(label));
+  }
   // Kurdish-first, matching the desktop app. An explicit ?lang= wins (so a link can pin a language),
   // then the reviewer's own saved choice, then ckb — NOT navigator.language, because the browser
   // language of a shared phone says nothing about which language this corpus is in.
   let locale = new URLSearchParams(location.search).get('lang')
-    || localStorage.getItem('cortex.couch.lang')
+    || readPreference('lang')
     || 'ckb';
-  if (!STRINGS[locale]) locale = 'ckb';
+  if (!['en', 'ckb'].includes(locale)) locale = 'ckb';
   // Fall back to English for a key missing from ckb, exactly like the desktop dictionary does, so a
   // gap shows the other language rather than a raw key.
   const t = (key, params) => {
@@ -391,22 +666,41 @@
     return s;
   };
   function applyLocale() {
-    localStorage.setItem('cortex.couch.lang', locale);
+    writePreference('lang', locale);
     document.documentElement.lang = locale;
     document.documentElement.dir = locale === 'ckb' ? 'rtl' : 'ltr';
     $('lang').textContent = locale === 'ckb' ? 'English' : 'کوردی';
-    $('bad').textContent = '✗ ' + t('bad');
-    $('accept').textContent = '✓ ' + t('accept');
+    labelControl('bad', t('bad'), 'ban');
+    $('accept').textContent = t('accept');
     $('save').textContent = t('save');
-    $('skip').textContent = '⏭ ' + t('skip');
-    $('retry').textContent = '↻ ' + t('retry');
+    labelControl('skip', t('skip'), 'skip-forward');
+    $('retry').textContent = t('retry');
     $('undo').title = t('undo');
+    $('undo').textContent = t('undo');
+    $('afterLabel').textContent = t(lastReviewMessage);
+    $('listenTitle').textContent = t('listenStep');
+    $('transcriptTitle').textContent = t('transcriptStep');
+    $('submitTitle').textContent = t('submitStep');
+    $('listenHint').textContent = locale === 'en' ? 'Play the audio. Listen carefully.' : t('editHint');
+    $('transcriptHint').textContent = locale === 'en' ? 'Correct every word you hear.' : t('editHint');
+    $('helpTitle').textContent = locale === 'en' ? 'Need help with this clip?' : t('editHint');
+    $('helpText').textContent = locale === 'en'
+      ? 'If you cannot judge the clip, use Skip. It records no transcript verdict. Reject only when you can judge the clip.'
+      : t('editHint');
+    labelControl('again', t('replay') + ' 2s', 'rewind');
+    $('again').title = t('replay') + ' 2s';
+    $('retryAudio').textContent = t('retry') + ' · ' + t('play');
+    $('seek').setAttribute('aria-label', t('seek'));
+    $('textsize').setAttribute('aria-label', locale === 'en' ? 'Transcript text size' : t('transcriptStep') + ' A±');
     // The transcript box had NO accessible name at all — a screen-reader user reached an unlabelled
     // edit field and had to guess what it was for. Reuses the desktop's own review hint.
     $('text').setAttribute('aria-label', t('editHint'));
     renderProgress();
     renderEmptyState();
     if (queue[i]) renderClipMeta(queue[i]);
+    renderGuidedState();
+    renderTransportLabels();
+    renderDraftRecovery();
   }
   $('lang').onclick = () => { locale = locale === 'ckb' ? 'en' : 'ckb'; applyLocale(); };
 
@@ -414,13 +708,37 @@
   // Sorani at a fixed 18px is small for some readers and there was no way to change it. Cycles rather
   // than using two buttons: header space is scarce on a phone, and this is set once and forgotten.
   const SIZES = [16, 18, 21, 24, 28];
-  let tsize = Number(localStorage.getItem('cortex.couch.tsize')) || 18;
+  let tsize = Number(readPreference('tsize')) || 18;
   function applyTextSize() {
     if (!SIZES.includes(tsize)) tsize = 18;
     document.documentElement.style.setProperty('--tsize', tsize + 'px');
-    localStorage.setItem('cortex.couch.tsize', String(tsize));
+    writePreference('tsize', String(tsize));
+    resizeTranscript();
   }
   $('textsize').onclick = () => { tsize = SIZES[(SIZES.indexOf(tsize) + 1) % SIZES.length]; applyTextSize(); };
+
+  // Native content sizing follows line wrapping, font size and IME without rewriting the value.
+  // Older engines use measured scrollHeight. Never animate height: it moves the caret/Save target
+  // while typing. The fallback also handles viewport/keyboard width changes, not just input.
+  function resizeTranscript() {
+    const text = $('text');
+    if (!text || $('card').hidden) return;
+    if (typeof CSS !== 'undefined' && CSS.supports('field-sizing', 'content')) return;
+    const scrollX = window.scrollX, scrollY = window.scrollY;
+    text.style.height = 'auto';
+    const style = getComputedStyle(text);
+    const borders = parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth);
+    text.style.height = Math.ceil(text.scrollHeight + borders) + 'px';
+    if (window.scrollX !== scrollX || window.scrollY !== scrollY) window.scrollTo(scrollX, scrollY);
+  }
+  if (typeof ResizeObserver !== 'undefined') {
+    let transcriptWidth = 0;
+    new ResizeObserver((entries) => {
+      const width = entries[0].contentRect.width;
+      if (width !== transcriptWidth) { transcriptWidth = width; resizeTranscript(); }
+    }).observe($('text'));
+  }
+  window.addEventListener('resize', resizeTranscript);
 
   // ── rendering ───────────────────────────────────────────────────────────────
   let heldByOthers = 0;
@@ -567,6 +885,9 @@
     const audio = reviewedMs != null && reviewedMs > 0 ? ` · ${t('audioDone', { t: fmtDuration(reviewedMs) })}` : '';
     const corrected = correctedMs != null && correctedMs > 0 ? ` · ✍ ${fmtDuration(correctedMs)}` : '';
     $('progress').textContent = (doneThisSession ? `${pos} · ✓${doneThisSession}` : pos) + audio + corrected;
+    $('compactProgress').textContent = queue.length ? `${Math.min(i + 1, total)} / ${total}` : '';
+    $('compactProgress').setAttribute('aria-label', $('progress').textContent);
+    $('compactProgress').title = $('progress').textContent;
     const accounting = $('accounting');
     // Owner instruction 2026-08-28: a single quiet coin count, nothing else. The lifetime EARNED
     // total is the one figure that only ever grows, so it reads like a score rather than a
@@ -574,11 +895,13 @@
     // the compensation ledger — they are simply not this screen's job. When the ledger is
     // unavailable the badge hides instead of showing an error the reviewer cannot act on.
     if (earnedMicroIqd != null) {
-      accounting.textContent = `\u{1FA99} ${fmtCoins(earnedMicroIqd)}`;
+      labelControl('accounting', fmtCoins(earnedMicroIqd), 'coins');
+      accounting.setAttribute('aria-label', 'IQD ' + fmtCoins(earnedMicroIqd));
       accounting.classList.remove('pending');
       accounting.hidden = false;
     } else {
       accounting.textContent = '';
+      delete accounting.dataset.labelIdentity;
       accounting.classList.remove('pending');
       accounting.hidden = true;
     }
@@ -650,10 +973,126 @@
   // tab clears it from a shared phone. Only decisions that have not reached the server enter the
   // durable outbox below; successful or merely abandoned transcript text must not persist forever.
   const draftKey = (id) => 'cortex.couch.draft.' + id;
+  const draftMetaKey = (id) => 'cortex.couch.draft-meta.' + id;
+  const DRAFT_RECOVERY_PREFIX = 'cortex.couch.draft-recovery.';
+  function draftForSegment(seg) {
+    const text = sessionStorage.getItem(draftKey(seg.id));
+    if (text === null) return null;
+    let meta;
+    try { meta = JSON.parse(sessionStorage.getItem(draftMetaKey(seg.id))); } catch { meta = null; }
+    if (meta && meta.text === text && meta.reviewer === me
+        && String(meta.rowVersion) === String(seg.rowVersion)) return text;
+    if (meta?.reviewer && meta.reviewer !== me) return null;
+    // Previous shells had no revision metadata. Keep ordinary legacy reload compatibility,
+    // but never silently introduce an unbound prior answer into a fresh shared review round.
+    if (!meta && !seg.redo && sessionStorage.getItem(draftMetaKey(seg.id)) === null) return text;
+    const key = DRAFT_RECOVERY_PREFIX + newOperationId();
+    const record = JSON.stringify({ id: seg.id, reviewer: me, rowVersion: meta?.rowVersion ?? null, text });
+    // Archive/read back before clearing either original. Quota/denial must preserve the old text.
+    sessionStorage.setItem(key, record);
+    if (sessionStorage.getItem(key) !== record) throw new Error('draft recovery readback failed');
+    sessionStorage.removeItem(draftKey(seg.id));
+    sessionStorage.removeItem(draftMetaKey(seg.id));
+    return null;
+  }
+  function rememberDraft(seg, text) {
+    draftForSegment(seg); // fence/archive a previous revision before replacing its text
+    sessionStorage.setItem(draftKey(seg.id), text);
+    sessionStorage.setItem(draftMetaKey(seg.id), JSON.stringify({ reviewer: me, rowVersion: seg.rowVersion, text }));
+  }
+  function renderDraftRecovery() {
+    const panel = $('draftRecovery');
+    if (!panel) return;
+    const list = $('draftRecoveryList');
+    const selected = list.value;
+    const entries = [];
+    // sessionStorage follows the tab, not the cookie. Require the server-confirmed owner before
+    // exposing any text; load() clears all draft namespaces when the tab changes hands.
+    try {
+      if (me && sessionStorage.getItem('cortex.couch.who') === me) {
+        for (let n = 0; n < sessionStorage.length; n++) {
+          const key = sessionStorage.key(n);
+          if (key?.startsWith('cortex.couch.draft.')) {
+            const id = key.slice('cortex.couch.draft.'.length);
+            let meta;
+            try { meta = JSON.parse(sessionStorage.getItem(draftMetaKey(id))); } catch { meta = null; }
+            if (meta?.reviewer && meta.reviewer !== me) continue;
+            entries.push({ key, id, text: sessionStorage.getItem(key) });
+          } else if (key?.startsWith(DRAFT_RECOVERY_PREFIX)) {
+            let record;
+            try { record = JSON.parse(sessionStorage.getItem(key)); } catch { continue; }
+            if (record?.reviewer === me && typeof record.text === 'string' && typeof record.id === 'string') {
+              entries.push({ key, id: record.id, text: record.text, revision: record.rowVersion });
+            }
+          }
+        }
+      }
+    } catch { entries.length = 0; }
+    entries.sort((a, b) => a.key.localeCompare(b.key));
+    list.replaceChildren();
+    for (const entry of entries) {
+      const option = document.createElement('option');
+      option.value = entry.key;
+      option.textContent = entry.id + (entry.revision != null ? ' · ' + entry.revision : '');
+      list.append(option);
+    }
+    if (entries.some((entry) => entry.key === selected)) list.value = selected;
+    panel.hidden = entries.length === 0;
+    if (panel.hidden) panel.open = false;
+    $('draftRecoveryTitle').textContent = t('localDraft') + ' · ' + entries.length;
+    $('draftRecoveryHint').textContent = t('localOnly') + ' · ' + t('pending');
+    list.setAttribute('aria-label', t('localDraft'));
+    $('draftRecoveryText').setAttribute('aria-label', t('localDraft'));
+    $('draftRecoveryText').value = entries.find((entry) => entry.key === list.value)?.text ?? '';
+    list.onchange = () => {
+      // Re-evaluate identity and storage; never cache another author's text across a queue refresh.
+      renderDraftRecovery();
+    };
+  }
+  $('draftRecoveryText').addEventListener('focus', () => $('draftRecoveryText').select());
+  $('draftRecovery').addEventListener('toggle', () => { if ($('draftRecovery').open) renderDraftRecovery(); });
   $('text').addEventListener('input', () => {
     const seg = queue[i];
-    if (seg) sessionStorage.setItem(draftKey(seg.id), $('text').value);
+    try {
+      if (seg) rememberDraft(seg, $('text').value);
+      draftStorageFailed = false;
+    } catch { draftStorageFailed = true; }
+    renderGuidedState();
+    renderDraftRecovery();
+    resizeTranscript();
   });
+  $('text').addEventListener('compositionstart', () => { composing = true; renderGuidedState(); });
+  $('text').addEventListener('compositionend', () => { composing = false; renderGuidedState(); });
+  // Presentation only. The server still determines semantic action and compensation. This is
+  // NFC + lowercase + Rust char::is_whitespace, NOT JavaScript \s (which also strips U+FEFF).
+  function presentationTextKey(text) {
+    return String(text).normalize('NFC').toLowerCase()
+      .replace(/[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/gu, ' ')
+      .replace(/^ | $/g, '');
+  }
+  function renderGuidedState() {
+    if (typeof document === 'undefined' || !$('draftState')) return;
+    const seg = queue[i];
+    const edited = !!seg && presentationTextKey($('text').value) !== presentationTextKey(seg.text);
+    const empty = presentationTextKey($('text').value) === '';
+    $('accept').hidden = edited;
+    $('save').hidden = !edited;
+    $('accept').disabled = busy || composing || audioUnavailable || empty;
+    $('save').disabled = busy || composing || audioUnavailable || empty;
+    $('bad').disabled = busy || composing || audioUnavailable;
+    $('skip').disabled = busy || composing;
+    $('undo').disabled = busy || composing;
+    $('draftState').dataset.edited = String(edited);
+    const draftMessage = draftStorageFailed ? t('saveFailed', { err: '—' })
+      : (edited ? t('edited') + ' · ' : '') + t('pending');
+    if ($('draftState').textContent !== draftMessage) $('draftState').textContent = draftMessage;
+    const readyHint = locale === 'en'
+      ? (edited ? 'Save your correction and continue to the next clip.' : 'Confirm only when the transcript matches the audio.')
+      : t('editHint');
+    const hint = busy ? t('saving') : audioUnavailable ? t('audioMissing') : empty ? t('emptyEdit') : readyHint;
+    $('submitHint').dataset.attention = String(!busy && empty);
+    if ($('submitHint').textContent !== hint) $('submitHint').textContent = hint;
+  }
 
   // ── unsent decisions, so a dropped request is not a lost decision ───────────
   // Kept in localStorage rather than memory: the most likely way to lose a submit is the reviewer
@@ -994,6 +1433,7 @@
     clearErr('refused'); // a no-op if #err is currently carrying a more urgent message
   }
   function renderRefused() {
+    renderDraftRecovery();
     const n = refusedMine().length;
     // A count of zero must also TAKE DOWN a banner a previous reviewer's entries put up.
     if (!n) { if (errKind === 'refused') clearErr('refused'); return; }
@@ -1112,11 +1552,22 @@
         // same reviewer, later typing is not part of this acknowledged immutable submission.
         if (submissionReviewer === me && sessionStorage.getItem(draftKey(item.id)) === item.text) {
           sessionStorage.removeItem(draftKey(item.id));
+          sessionStorage.removeItem(draftMetaKey(item.id));
         }
         clearRefused(item.id, submissionReviewer); // it landed after all
+        // Recovery is a real acknowledgement too. Previously a reload could drain the outbox
+        // but leave Undo hidden and the page still saying "not sent". Only update the current
+        // author's presentation; a late ACK must never give a new reviewer someone else's Undo.
+        if (submissionReviewer && submissionReviewer === me) {
+          doneThisSession += 1;
+          lastReviewMessage = 'saved';
+          $('afterLabel').textContent = t(lastReviewMessage);
+          renderProgress();
+        }
       }
     }
     renderRefused();
+    if (exhausted && !$('done').hidden) renderEmptyState();
   }
   addEventListener('online', () => void flushOutbox());
 
@@ -1151,12 +1602,18 @@
     $('warn').dataset.audioIssue = 'true';
     $('warn').textContent = t(key);
     $('warn').hidden = false;
+    audioUnavailable = key === 'audioMissing';
+    $('retryAudio').hidden = false;
+    renderGuidedState();
   }
   function clearPlaybackWarning() {
     if ($('warn').dataset.audioIssue !== 'true') return;
     delete $('warn').dataset.audioIssue;
     $('warn').textContent = '';
     $('warn').hidden = true;
+    audioUnavailable = false;
+    $('retryAudio').hidden = true;
+    renderGuidedState();
   }
   function requestPlayback() {
     const started = $('player').play();
@@ -1179,7 +1636,7 @@
     // not depend on a final DOM input event having fired (IME composition and programmatic assistive
     // input can leave the textarea newer than sessionStorage for a brief window).
     if (playbackIdentity(queue[i]) === identity) {
-      sessionStorage.setItem(draftKey(seg.id), $('text').value);
+      rememberDraft(seg, $('text').value);
     }
     invalidatePlaybackPreparation();
     resetPlaybackTraversalCoverage(identity);
@@ -1264,6 +1721,8 @@
   // undo or a skip must not start audio on its own — those are navigation, not a rhythm. A skip in
   // particular is somebody saying "I cannot judge this": a burst of sound is the last thing they want.
   function renderClipMeta(seg) {
+    $('returnBanner').hidden = seg.redo !== true;
+    $('returnBanner').textContent = seg.redo === true ? t('redoPass') : '';
     $('meta').textContent = (seg.durationMs / 1000).toFixed(1) + 's' + (seg.speakerId ? ' · ' + seg.speakerId : '');
     // Library text is rendered as nodes, never markup. Language changes update these hints without
     // restarting playback or replacing the reviewer's draft. Absence never certifies a clean voice.
@@ -1289,14 +1748,22 @@
   }
   function show(autoplay) {
     const seg = queue[i];
+    const sameRevision = !!seg && playbackTraversalIdentity === playbackIdentity(seg);
     // Drained the batch: go ask for the next one before claiming anything is finished. `exhausted`
     // breaks the recursion — load() calls show() again, and a fetch that returned nothing sets it, so
     // the empty state renders on the second pass instead of refetching forever.
     if (!seg && !exhausted && !refilling) { void refill(); return; }
     $('card').hidden = !seg; $('done').hidden = !!seg;
-    $('warn').hidden = true;
+    if (!sameRevision) {
+      clearWave();
+      $('warn').hidden = true;
+      delete $('warn').dataset.audioIssue;
+      audioUnavailable = false;
+      $('retryAudio').hidden = true;
+    }
     renderProgress();
     if (!seg) {
+      renderDraftRecovery();
       // Hiding the card does not stop the <audio> element inside it. The last clip kept playing behind
       // the empty state — forever, if loop was on — with every transport control now unreachable.
       $('player').pause();
@@ -1322,10 +1789,23 @@
     void preparePlayback(seg, autoplay);
     $('player').playbackRate = speed;
     $('player').loop = looping;
-    pausedByEdit = false; // a new clip owes the reviewer no rewind
+    if (!sameRevision) pausedByEdit = false; // only a new clip owes no rewind
     // A saved draft is a correction the reviewer already typed; it must win over the server's copy.
-    $('text').value = sessionStorage.getItem(draftKey(seg.id)) ?? seg.text;
+    try {
+      if (!sameRevision || (!composing && !draftStorageFailed)) {
+        const nextText = draftForSegment(seg) ?? seg.text;
+        if ($('text').value !== nextText) $('text').value = nextText;
+      }
+    } catch {
+      // Keep unarchivable text in storage for read-only recovery, never bind it to a new round.
+      $('text').value = seg.text;
+      draftStorageFailed = true;
+    }
+    renderDraftRecovery();
     renderClipMeta(seg);
+    renderGuidedState();
+    renderTransportLabels();
+    resizeTranscript();
     prefetchNext();
     // ONE TAP PER CLIP (R2.2). Deciding a clip is the reviewer saying "next", so the next clip should
     // simply start — otherwise every clip costs two taps, a decision and then a reach for the player's
@@ -1367,6 +1847,40 @@
     if (!loadInFlight) loadInFlight = doLoad().finally(() => { loadInFlight = null; });
     return loadInFlight;
   }
+  function clearReviewerView() {
+    // Storage can fail during a shared-phone handover. Remove the old text and decision targets
+    // BEFORE adopting the new cookie identity; a hidden recovery panel alone is insufficient.
+    me = ''; queue = []; i = 0; exhausted = true; doneThisSession = 0;
+    $('text').value = ''; $('card').hidden = true; $('after').hidden = true;
+    $('who').textContent = ''; $('progress').textContent = ''; $('compactProgress').textContent = '';
+    $('compactProgress').removeAttribute('aria-label'); $('compactProgress').removeAttribute('title');
+    applyAccounting({accountingAvailable:false});
+    $('accounting').hidden = true; $('accounting').textContent = '';
+    $('accounting').removeAttribute('aria-label'); delete $('accounting').dataset.labelIdentity;
+    $('player').pause(); $('player').removeAttribute('src');
+    clearWave();
+    invalidatePlaybackPreparation(); resetPlaybackTraversalCoverage(null);
+    renderDraftRecovery(); renderGuidedState();
+  }
+  function adoptReviewerIdentity(reviewer) {
+    if (me !== reviewer) clearReviewerView();
+    try {
+      const prevWho = sessionStorage.getItem('cortex.couch.who');
+      if (prevWho !== null && prevWho !== reviewer) {
+        clearReviewerView();
+        for (let k = sessionStorage.length - 1; k >= 0; k--) {
+          const key = sessionStorage.key(k);
+          if (key && (key.startsWith('cortex.couch.draft.') || key.startsWith('cortex.couch.draft-meta.')
+              || key.startsWith(DRAFT_RECOVERY_PREFIX))) sessionStorage.removeItem(key);
+        }
+      }
+      // Publishing a reviewer and their queue is contingent on completing this ownership fence.
+      sessionStorage.setItem('cortex.couch.who', reviewer);
+    } catch (error) { clearReviewerView(); throw error; }
+    me = reviewer;
+    $('who').textContent = ' · ' + reviewer;
+    renderDraftRecovery();
+  }
   async function doLoad() {
     // Tapping Retry must visibly do something. Without this the button swallowed the tap while the
     // request was in flight and the failure message stayed put, so a reviewer on bad signal had no
@@ -1378,9 +1892,27 @@
       // very first /api/queue races the Set-Cookie and 401s a perfectly good link.
       await ensureClaimed();
       await flushOutbox();
-      const res = await api('/api/queue');
+      let res = await api('/api/queue');
       if (res.playbackContractVersion !== 4) {
         throw new Error('Couch playback policy 4 is required');
+      }
+      if (typeof res.reviewer !== 'string' || !res.reviewer) throw new Error('Reviewer identity is required');
+      adoptReviewerIdentity(res.reviewer);
+      // On a fresh page the first flush intentionally held author-stamped work: no server identity
+      // was known. Finish that replay before publishing this batch. A settled operation changes
+      // server eligibility (ACK or stale-round refusal), so fetch one fresh batch instead of keeping
+      // a now-refused clip hidden until another reload, or redisplaying a just-committed decision.
+      const heldOnArrival = readOutbox().filter((s) => s.reviewer === me).map((s) => s.operationId);
+      if (heldOnArrival.length) {
+        await flushOutbox();
+        const remaining = new Set(readOutbox().map((s) => s.operationId));
+        if (heldOnArrival.some((id) => !remaining.has(id))) {
+          res = await api('/api/queue');
+          if (res.playbackContractVersion !== 4 || typeof res.reviewer !== 'string' || !res.reviewer) {
+            throw new Error('Confirmed reviewer queue is required');
+          }
+          adoptReviewerIdentity(res.reviewer);
+        }
       }
       retryable = false;
       clearErr('load');
@@ -1418,23 +1950,6 @@
       // drains one batch, sees the finished screen, and later reloads is not stuck with a stale verdict.
       exhausted = queue.length === 0;
       renderEmptyState();
-      // Show WHO the server is recording these decisions as. Every save is stored under this name, so
-      // the reviewer must be able to see it — silent attribution is attribution nobody can correct.
-      me = res.reviewer;
-      $('who').textContent = ' · ' + res.reviewer;
-      // A tab that CHANGES HANDS must not hand the next person the previous reviewer's typed
-      // drafts (2026-08-20 hunt): sessionStorage survives navigating from one link to another in
-      // the same tab, and a saved draft overrides the served text — reviewer B would be shown, and
-      // could save, reviewer A's half-typed correction as their own. Identity change = the drafts
-      // are gone.
-      const prevWho = sessionStorage.getItem('cortex.couch.who');
-      if (prevWho !== null && prevWho !== me) {
-        doneThisSession = 0;
-        for (let k = sessionStorage.length - 1; k >= 0; k--) {
-          const key = sessionStorage.key(k);
-          if (key && key.startsWith('cortex.couch.draft.')) sessionStorage.removeItem(key);
-        }
-      }
       // RE-SCOPE THE SHARED BANNER, on identity ARRIVAL and not only on identity CHANGE. `refused` is
       // localStorage and therefore shared by everyone who opens a link on this phone; `refusedMine()`
       // keeps each person to their own entries, but it cannot while `me` is still empty — and the
@@ -1447,7 +1962,6 @@
       // stop, still reachable through the first load. Unconditional here, and idempotent: with no
       // entries of your own it takes a stale banner DOWN, which is the same fix pointing the other way.
       renderRefused();
-      sessionStorage.setItem('cortex.couch.who', me);
       // Now that the server has named this reviewer, send the stamped work the pre-identity flush
       // above rightly held back (it must never guess whose cookie it is flushing under). Fire and
       // forget: the queue is already rendered, and the 30s retry timer backstops a failure here.
@@ -1545,7 +2059,15 @@
     const el = $('player');
     if (!el) return;
     el.addEventListener('timeupdate', () => {
-      if (el.paused) { resetPlaybackTraversalBaseline(); return; }
+      if (el.paused) {
+        // Browsers can emit the terminal timeupdate with paused=true BEFORE pause/ended.
+        // Preserve the final continuous interval before fencing the next play. Otherwise short
+        // clips lose their last tick and can fail the server's 85% gate after complete playback.
+        // A seek is not traversal; seeking/load/error handlers also clear the anchor.
+        if (!el.seeking && lastPos !== null) observePlaybackTraversal(el);
+        resetPlaybackTraversalBaseline();
+        return;
+      }
       observePlaybackTraversal(el);
     });
     // A new media load is a new grant/attempt boundary. A previous artifact's intervals never cross it.
@@ -1619,7 +2141,7 @@
   }
 
   async function decide(action) {
-    if (busy || !queue[i]) return;
+    if (busy || composing || !queue[i] || (audioUnavailable && action !== 'skip')) return;
     // Capture the click, not whatever a queue refresh displays after finalization or the POST.
     const submittedSegment = { ...queue[i] };
     const submittedReviewer = me;
@@ -1633,6 +2155,7 @@
     const isSkip = action === 'skip';
     busy = true;
     const btns = ['save','accept','bad','skip','undo'].map($); btns.forEach(b => b.disabled = true);
+    renderGuidedState();
     // rowVersion: the row fingerprint this clip was SERVED with — the server refuses the decision
     // if the draft changed in between, so what gets recorded is always judged-as-seen.
     // A non-skip verdict carries only the immutable receipt returned after policy-4 finalization.
@@ -1643,6 +2166,7 @@
       if (!submissionStillCurrent()) {
         busy = false;
         btns.forEach(b => b.disabled = false);
+        renderGuidedState();
         return; // no outbox record or POST may bind an old receipt to a new reviewer/revision
       }
       submission = { operationId: newOperationId(), id: submittedSegment.id, action, text: submittedText, reviewer: submittedReviewer, rowVersion: submittedSegment.rowVersion,
@@ -1661,6 +2185,7 @@
       }
       busy = false;
       btns.forEach(b => b.disabled = false);
+      renderGuidedState();
       return;
     }
     try {
@@ -1678,10 +2203,12 @@
       if (!isSkip) {
         if (sessionStorage.getItem(draftKey(submission.id)) === submission.text) {
           sessionStorage.removeItem(draftKey(submission.id));
+          sessionStorage.removeItem(draftMetaKey(submission.id));
         }
         clearRefused(submission.id, submission.reviewer); // retract only this author's refusal
         decidedHere.add(decidedHereKey(submission.id, submission.reviewer)); // suppress only this author's stale replay
         toast(action === 'bad' ? t('markedBad') : t('saved'));
+        lastReviewMessage = 'saved'; $('afterLabel').textContent = t(lastReviewMessage);
         doneThisSession += 1;
       }
       // A DECISION is the "next" gesture and starts the next clip (R2.2). A skip is not: the reviewer
@@ -1758,23 +2285,69 @@
         if (e.status === 409) { i += 1; show(); }
       }
     }
-    finally { busy = false; btns.forEach(b => b.disabled = false); }
+    finally { busy = false; btns.forEach(b => b.disabled = false); renderGuidedState(); }
   }
 
   // ── transport: the controls a transcriber actually uses ────────────────────
   const SPEEDS = [0.75, 1, 1.25, 1.5];
-  let speed = Number(localStorage.getItem('cortex.couch.speed')) || 1;
-  let looping = localStorage.getItem('cortex.couch.loop') === '1';
+  let speed = Number(readPreference('speed')) || 1;
+  if (!SPEEDS.includes(speed)) speed = 1;
+  let looping = readPreference('loop') === '1';
+  function renderTransportLabels() {
+    if (typeof document === 'undefined' || !$('play')) return;
+    const player = $('player');
+    labelControl('play', t(player.paused ? 'play' : 'pause'), player.paused ? 'play' : 'pause', true);
+    labelControl('loop', t(looping ? 'loopOn' : 'loopOff'), 'repeat');
+    const speedIdentity = speed + '|' + locale;
+    if ($('speed').dataset.speedIdentity !== speedIdentity) {
+      $('speed').dataset.speedIdentity = speedIdentity;
+      const value = document.createElement('span');
+      value.className = 'speed-value'; value.dir = 'ltr'; value.textContent = speed + '×';
+      const caption = document.createElement('span');
+      caption.className = 'speed-caption'; caption.textContent = t('speedLabel');
+      $('speed').replaceChildren(value, caption);
+      $('speed').setAttribute('aria-label', speed + '× · ' + t('speedLabel'));
+    }
+    const duration = Number.isFinite(player.duration) ? player.duration : Number(queue[i]?.durationMs || 0) / 1000;
+    const position = Number.isFinite(player.currentTime) ? player.currentTime : 0;
+    const clock = (value) => Math.floor(value / 60) + ':' + String(Math.floor(value % 60)).padStart(2, '0');
+    $('playTime').textContent = clock(position) + ' / ' + clock(duration);
+    $('seek').max = String(duration || 1);
+    $('seek').value = String(position);
+    $('seek').disabled = duration <= 0;
+    $('seek').setAttribute('aria-valuetext', clock(position) + ' / ' + clock(duration));
+  }
   function applyTransport() {
     $('player').playbackRate = speed;
     $('player').loop = looping;
-    $('speed').textContent = speed + '×';
+    renderTransportLabels();
     $('loop').setAttribute('aria-pressed', String(looping));
-    localStorage.setItem('cortex.couch.speed', String(speed));
-    localStorage.setItem('cortex.couch.loop', looping ? '1' : '0');
+    writePreference('speed', String(speed));
+    writePreference('loop', looping ? '1' : '0');
   }
   $('speed').onclick = () => { speed = SPEEDS[(SPEEDS.indexOf(speed) + 1) % SPEEDS.length]; applyTransport(); };
   $('loop').onclick  = () => { looping = !looping; applyTransport(); };
+  $('play').onclick = () => {
+    if ($('player').paused) void requestPlayback();
+    else $('player').pause();
+  };
+  $('seek').addEventListener('input', () => {
+    if (!Number.isFinite($('player').duration)) return;
+    resetPlaybackTraversalBaseline();
+    $('player').currentTime = Math.min($('player').duration, Math.max(0, Number($('seek').value)));
+    renderTransportLabels();
+  });
+  for (const event of ['play', 'pause', 'timeupdate', 'loadedmetadata', 'emptied', 'ended']) {
+    $('player').addEventListener(event, renderTransportLabels);
+  }
+  $('retryAudio').onclick = async () => {
+    const seg = queue[i];
+    if (!seg || busy) return;
+    $('retryAudio').disabled = true;
+    try { await rearmPlayback(seg); }
+    catch { showPlaybackWarning('audioMissing'); }
+    finally { $('retryAudio').disabled = false; }
+  };
   // Replaying the last couple of seconds is the single most repeated action in transcription,
   // and dragging a phone-sized scrubber to do it is where the time goes.
   $('again').onclick = () => {
@@ -1840,7 +2413,7 @@
       // top 400px visible. The overshoot is the honest number, so use it.
       if (nudge && covered > 0 && document.activeElement === $('text')) {
         requestAnimationFrame(() => {
-          const overshoot = $('actions').getBoundingClientRect().bottom - (vv.offsetTop + vv.height);
+          const overshoot = $('skip').parentElement.getBoundingClientRect().bottom - (vv.offsetTop + vv.height);
           if (overshoot > 0) window.scrollBy(0, overshoot);
         });
       }
@@ -1851,12 +2424,21 @@
   }
 
   // ── waveform ───────────────────────────────────────────────────────────────
-  // Peaks are computed ONCE per clip and cached with it; redraw is then pure canvas work, so seeking
+  // Peaks are computed for the current clip load; redraw is then pure canvas work, so seeking
   // and the playback cursor stay smooth on a phone. Decoding is best-effort: a codec the browser
   // cannot decode leaves the strip blank and changes nothing else — the reviewer still has the audio
   // element, the transport row and every button.
   const WAVE_BUCKETS = 160;
   let peaks = null;
+  let waveGeneration = 0;
+  let waveAbort = null;
+  function clearWave() {
+    waveGeneration++;
+    if (waveAbort) waveAbort.abort();
+    waveAbort = null;
+    peaks = null;
+    void drawWave();
+  }
   async function drawWave() {
     const c = $('wave');
     const dpr = window.devicePixelRatio || 1;
@@ -1864,6 +2446,7 @@
     const h = Math.max(1, Math.round(c.clientHeight * dpr));
     if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
     const ctx = c.getContext('2d');
+    if (!ctx) return;
     ctx.clearRect(0, 0, w, h);
     if (!peaks || !peaks.length) return;
     const style = getComputedStyle(document.documentElement);
@@ -1871,21 +2454,35 @@
     const ahead = style.getPropertyValue('--line').trim() || '#334155';
     const dur = $('player').duration;
     const frac = dur && isFinite(dur) ? $('player').currentTime / dur : 0;
-    const bw = w / peaks.length;
-    for (let i = 0; i < peaks.length; i++) {
-      const bh = Math.max(2 * dpr, peaks[i] * h * 0.92);
-      ctx.fillStyle = i / peaks.length <= frac ? played : ahead;
-      ctx.fillRect(i * bw, (h - bh) / 2, Math.max(1, bw - dpr), bh);
+    // Keep distinct bars at phone widths. Each column is the maximum of its real source
+    // buckets, not invented decoration; DPR-aligned edges avoid a blurred single-pixel comb.
+    const columns = Math.max(1, Math.min(peaks.length, Math.floor(c.clientWidth / 3)));
+    const bw = w / columns;
+    for (let i = 0; i < columns; i++) {
+      const start = Math.floor(i * peaks.length / columns);
+      const end = Math.max(start + 1, Math.floor((i + 1) * peaks.length / columns));
+      const peak = Math.max(...peaks.slice(start, end));
+      const bh = Math.max(2 * dpr, peak * h * 0.82);
+      ctx.fillStyle = i / columns <= frac ? played : ahead;
+      ctx.fillRect(Math.round(i * bw), Math.round((h - bh) / 2), Math.max(1, Math.round(bw - dpr)), Math.round(bh));
     }
   }
   async function loadWave(url) {
-    peaks = null;
-    void drawWave();
+    clearWave();
+    const generation = waveGeneration;
+    const controller = new AbortController();
+    waveAbort = controller;
+    let decoder = null;
     try {
-      const buf = await (await fetch(url)).arrayBuffer();
+      const response = await fetch(url, {signal:controller.signal});
+      if (!response.ok || generation !== waveGeneration) return;
+      const buf = await response.arrayBuffer();
+      if (generation !== waveGeneration) return;
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       if (!AudioCtx) return;
-      const audio = await new AudioCtx().decodeAudioData(buf);
+      decoder = new AudioCtx();
+      const audio = await decoder.decodeAudioData(buf);
+      if (generation !== waveGeneration) return;
       const data = audio.getChannelData(0);
       const per = Math.max(1, Math.floor(data.length / WAVE_BUCKETS));
       const out = [];
@@ -1899,7 +2496,15 @@
       const top = Math.max(...out, 0.01);
       peaks = out.map((v) => v / top); // normalise: a quiet clip must still be readable
       void drawWave();
-    } catch { /* undecodable audio simply leaves the strip blank */ }
+    } catch { /* undecodable/cancelled visualization never changes playback or review authority */ }
+    finally {
+      if (waveAbort === controller) waveAbort = null;
+      // A decoder per clip without close() eventually exhausts browser audio resources.
+      // decodeAudioData cannot itself be aborted; stale completions are fenced above.
+      if (decoder && typeof decoder.close === 'function') {
+        try { await decoder.close(); } catch { /* context may already be closed by the browser */ }
+      }
+    }
   }
   $('player').addEventListener('timeupdate', () => void drawWave());
   $('player').addEventListener('loadedmetadata', () => void drawWave());
@@ -2006,7 +2611,7 @@
   $('accept').onclick = () => decide('accept');
   $('bad').onclick    = () => decide('bad');
   $('undo').onclick   = async () => {
-    if (busy) return; busy = true;
+    if (busy || composing) return; busy = true; renderGuidedState();
     try {
       const poolUndoTarget = preparePoolUndoTarget();
       const undone = await api('/api/undo', {
@@ -2015,12 +2620,13 @@
       });
       clearPoolUndoTarget(poolUndoTarget);
       toast(t('undone'));
+      lastReviewMessage = 'undone'; $('afterLabel').textContent = t(lastReviewMessage);
       await load();
       const pos = queue.findIndex((s) => s.id === undone.id);
       if (pos >= 0) i = pos;
       show();
     } catch { toast(t('undoFailed'), true); } // sticky, and no English server text appended (R3.3)
-    finally { busy = false; }
+    finally { busy = false; renderGuidedState(); }
   };
   // ── swipe: accept / reject without reaching for a button ───────────────────
   // Bound to the CARD, not the page, and ignored when the gesture starts on the textarea — a reviewer
@@ -2040,7 +2646,7 @@
     $('card').style.transform = '';
   }
   $('card').addEventListener('touchstart', (e) => {
-    if (e.target.closest('textarea, audio, button')) { touch = null; return; }
+    if (e.target.closest('textarea, audio, button, input, canvas, summary, details')) { touch = null; return; }
     touch = { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
   }, { passive: true });
   // DIRECT MANIPULATION (R3.5). The gesture was undiscoverable and, worse, gave no warning: a reviewer

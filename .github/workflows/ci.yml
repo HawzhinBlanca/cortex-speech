@@ -157,6 +157,17 @@ jobs:
       - name: Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 
+      # Browser-dependent tests are ignored by Rust-only runs. Chromium is installed above;
+      # invoke each required real-page/HTTPS/SQLite gate explicitly, with separate failure status.
+      - name: Reviewer lost-request and lost-response recovery (real backend)
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --all-features --test reviewer_serving_path real_browser_replays_lost_request_and_response_once_across_restart -- --ignored --exact --nocapture
+
+      - name: Reviewer two-tab contention (real backend)
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --all-features --test reviewer_serving_path real_browser_two_tabs_preserve_competing_edits_and_credit_only_once -- --ignored --exact --nocapture
+
+      - name: Reviewer owner-reopen recovery (real backend and owner CLI)
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --all-features --test reviewer_serving_path real_browser_owner_reopen_fences_queued_work_and_recovers_the_draft -- --ignored --exact --nocapture
+
       # This is a UI smoke test against a MOCKED Tauri backend (e2e/helpers/tauri-mock.ts): it
       # exercises Svelte wiring against canned IPC data and does NOT run the real Rust pipeline
       # (no decode / VAD / OmniASR / SQLite / export). The real-app end-to-end gate is

@@ -84,6 +84,46 @@ afterEach(() => {
 });
 
 describe('couch.html — delayed decisions across a shared-phone identity change', () => {
+  it.each(['getItem', 'removeItem', 'setItem'])(
+    'fails closed without exposing an old correction when identity %s fails',
+    async (method) => {
+      const dom = await bootPage();
+      typeDraft(dom, 'private correction from Sara');
+      dom.window.eval(`
+      window.nextReviewer = 'Hemn';
+      window.originalStorageMethod = Storage.prototype[${JSON.stringify(method)}];
+      Storage.prototype[${JSON.stringify(method)}] = function(key, ...args) {
+        if (key.startsWith('cortex.couch.draft') || key === 'cortex.couch.who') throw new Error('storage denied');
+        return window.originalStorageMethod.call(this, key, ...args);
+      };
+    `);
+      await dom.window.eval('load()');
+      expect(dom.window.document.getElementById('text')!.value).toBe('');
+      expect(dom.window.document.getElementById('draftRecoveryText')!.value).toBe('');
+      expect(dom.window.document.getElementById('card')!.hidden).toBe(true);
+      expect(dom.window.document.getElementById('player')!.getAttribute('src')).toBeNull();
+      expect(dom.window.eval('queue')).toEqual([]);
+      expect(dom.window.eval('me')).toBe('');
+      dom.window.eval(
+        `Storage.prototype[${JSON.stringify(method)}] = window.originalStorageMethod;`,
+      );
+      expect(dom.window.sessionStorage.getItem('cortex.couch.draft.shared')).toBe(
+        method === 'setItem' ? null : 'private correction from Sara',
+      );
+      dom.window.eval(
+        'window.previousApi = api; window.posted = []; api = async (path) => { window.posted.push(path); return {}; };',
+      );
+      await dom.window.eval('decide("skip")');
+      await dom.window.eval('decide("edit")');
+      expect(dom.window.posted).toEqual([]);
+      dom.window.eval('api = window.previousApi');
+      await dom.window.eval('load()');
+      expect(dom.window.eval('me')).toBe('Hemn');
+      expect(dom.window.document.getElementById('text')!.value).toBe('server draft');
+      expect(dom.window.sessionStorage.getItem('cortex.couch.draft.shared')).toBeNull();
+    },
+  );
+
   it('a new reviewer obtains a fresh playback grant even for the same clip revision', async () => {
     const dom = await bootPage();
     dom.window.eval(`
