@@ -3826,6 +3826,59 @@ mod tests {
         assert_eq!(restored.segment_review_revision("clip").unwrap(), Some(revision + 1));
     }
 
+    /// Live incident 2026-09-08: 18 of the owner's 25 fresh verdicts on reopened clips came straight
+    /// back to him. `family_roots` maps a live root to itself, and the reopen skip in `family_seen_on`
+    /// therefore dropped the root's OWN fresh exposure whenever the clip had a retired twin. The
+    /// writer's second guard refused duplicates, so the damage was repeats, not duplicate evidence.
+    #[test]
+    fn a_fresh_verdict_on_a_reopened_clip_with_a_retired_twin_is_never_re_served() {
+        let (_dir, db, source_pool) = two_clip_pool(Some("a"));
+        apply_dedup_manifest(&db, &dedup_manifest(&source_pool, "a", Some("a"), 1_000)).unwrap();
+        let pool = load(&db).unwrap().unwrap();
+        let ids = vec!["a".to_string()];
+        let plan = reopen::prepare(&db, &pool, &ids, "Owner disputes historical Looks Good work", 0).unwrap();
+        assert_eq!(reopen::apply(&db, &pool, &plan, 2).unwrap(), 1);
+        assert_eq!(pending_segment_ids(&db, &pool, "Roza", None).unwrap(), ids, "reopened: fresh work for Roza");
+        let (_, revision) = db.get_segment_by_id_with_revision("a").unwrap().unwrap();
+        let fresh = |operation_id: &str, at: i64| {
+            let authority = authority(&db, "Roza", "a");
+            record_decision(
+                &db,
+                &pool,
+                &PoolDecisionInput {
+                    segment_id: "a",
+                    reviewer: "Roza",
+                    action: "edit",
+                    submitted_transcript: Some("دەقی نوێ"),
+                    served_transcript: "دەقی چامپیۆن",
+                    served_revision: revision,
+                    audio_content_hash: Some(&clip_hash("a")),
+                    source_start_ms: Some(0),
+                    source_end_ms: Some(1_000),
+                    duration_ms: 1_000,
+                    requested_action: "edit",
+                    requested_transcript: "دەقی نوێ",
+                    operation_id,
+                    operation_payload_hash: &"b".repeat(64),
+                    created_at_ms: at,
+                    playback_authority_session_id: Some(&authority),
+                },
+            )
+        };
+        fresh("123e4567-e89b-42d3-a456-426614175021", 3).unwrap();
+        assert!(
+            pending_segment_ids(&db, &pool, "Roza", None).unwrap().is_empty(),
+            "a clip the reviewer just judged must never come back to them, twin or no twin"
+        );
+        assert_eq!(
+            pending_segment_ids(&db, &pool, "Alle", None).unwrap(),
+            ids,
+            "the second fresh opinion is still wanted"
+        );
+        let refused = fresh("123e4567-e89b-42d3-a456-426614175022", 4).unwrap_err();
+        assert!(refused.contains("ALREADY_SEEN") || refused.contains("duplicated"), "{refused}");
+    }
+
     /// Owner direction 2026-09-08: a reopened clip goes back to the people whose work it re-checks
     /// and to the named final reviewers; nobody else sees it until two fresh opinions disagree.
     #[test]

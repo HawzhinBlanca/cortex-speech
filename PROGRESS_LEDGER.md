@@ -1,5 +1,28 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-08 — Incident: reopened clips with retired twins came back to the reviewer who had just judged them
+
+**Report (owner, 22:50 local):** "i reviewed my 25 almost, then the sounds get back, repeated instead of new data."
+
+**Measured (live DB read-only + the serving `pool_admin probe` on a clone, one clip pinned via the listen list at a
+time):** all 25 verdicts saved, 25 distinct clips, zero duplicate evidence. Yet 18 of the 25 were still in the owner's
+queue. Every one of the 18 has a retired duplicate twin; the 7 excluded ones were excluded only because two fresh
+opinions had already resolved them. 579 of the 1,064 reopened clips have twins, so every reviewer working the round
+was exposed. Repeats began with release 7397c1f2 (schema 71, live since 2026-09-07 17:45).
+
+**Root cause (`review_pool/family.rs`, `family_seen_on`, 7397c1f2):** the reopen skip
+`if roots.get(id).is_some_and(|root| reopened.contains(root)) { continue; }` intends to drop exposure inherited from a
+RETIRED twin. But `family_roots` also maps a live root to itself (its own doc comment says otherwise), so for a live
+reopened clip with any twin the clip's OWN fresh coverage was dropped from `seen` — for the queue and for the
+write guard `require_unseen_pool_family_impl`, which shares the function. The writer's second guard
+(`reviewer_sets_on` → "review pool decision is duplicated for this reviewer") still refused a second verdict, so the
+damage was repeats and lost reviewer time, not duplicate evidence or pay.
+
+**Fix:** skip only when `root != id`. Regression test
+`a_fresh_verdict_on_a_reopened_clip_with_a_retired_twin_is_never_re_served` (two-clip pool, twin retired by a dedup
+manifest, clip reopened, fresh verdict → queue empty for that reviewer, second verdict refused) fails on the unfixed
+file and passes with the fix (bite proven by stashing the fix).
+
 ## 2026-09-08 — Reopen routing: a reopened clip goes only to its own reviewers and the final reviewers
 
 **Owner direction (2026-09-08, his words):** "i dont want everyone be served rubar's work … send rubar's earlier work to

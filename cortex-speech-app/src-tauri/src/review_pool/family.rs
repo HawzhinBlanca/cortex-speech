@@ -26,7 +26,10 @@ pub(super) fn family_seen_on(
     for (id, coverage) in reviewers {
         // Reopening the retained family root authorizes fresh listening even after exposure to a
         // retired twin. The twin itself remains excluded and never contributes a transferred vote.
-        if roots.get(id).is_some_and(|root| reopened.contains(root)) {
+        // Only a RETIRED twin's exposure is dropped: `family_roots` also maps a live root to itself,
+        // and dropping the root's own coverage re-served every reopened clip with twins to the
+        // reviewer who had just judged it (live incident 2026-09-08, 18 of 25 verdicts came back).
+        if roots.get(id).is_some_and(|root| root != id && reopened.contains(root)) {
             continue;
         }
         seen.entry(roots.get(id).unwrap_or(id).clone()).or_default().extend(coverage.seen.iter().cloned());
