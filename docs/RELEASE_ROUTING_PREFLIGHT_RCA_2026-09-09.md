@@ -53,3 +53,10 @@ passing runs; these are not field acceptance or a full dataset-quality certifica
 The subsequent deployment must still build the exact merged revision, pass clone
 preflight, preserve a certified snapshot, prove the live serving page and existing
 reviewer links, and receive separate physical-phone acceptance.
+
+The full local policy sweep also exposed an independent Windows test-fixture race:
+killing a virtual-environment launcher did not establish that the actual Python
+process owning the synthetic mutex had exited. The fixture now launches the base
+interpreter directly and asserts its reported PID matches the process handle it
+kills and waits on. Twenty consecutive crash/reacquire checks passed. Production
+mutex semantics, timeouts and exclusion rules are unchanged.
