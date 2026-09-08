@@ -1536,6 +1536,40 @@ def test_canonical_queue_proof_refuses_bad_counts_errors_and_nonempty_audio_fail
             assert release.prove_canonical_queues(Path("owned-data"), manifest) == {"Reviewer": 2}
 
 
+def test_legacy_routed_count_mismatch_is_recovery_only_and_keeps_audio_guards() -> None:
+    manifest = {"poolAdminExe": "owned-admin.exe"}
+    benchmark = {"passes": True, "availableClips": 8}
+    probe = {"passes": True, "availableClips": 7, "sampleAudioValidWav": True,
+             "submissionIdempotencyAuthority": True, "sharedReopenRounds": True,
+             "reopenRouting": {"finalReviewers": ["Owner"]}}
+    with mock.patch.object(release, "session_reviewers", return_value=["Reviewer"]), \
+         mock.patch.object(release, "reviewer_dialects", return_value=[]):
+        with mock.patch.object(release, "run_json", side_effect=[benchmark, probe]):
+            assert release.prove_canonical_queues(
+                Path("owned-data"), manifest, recovering_previous=True,
+            ) == {"Reviewer": 7}
+        cases = [(benchmark, probe, False)]
+        cases += [(benchmark, {**probe, key: value}, True) for key, value in [
+            ("availableClips", 0), ("availableClips", 9), ("availableClips", True),
+            ("availableClips", "7"), ("sampleAudioValidWav", False),
+            ("submissionIdempotencyAuthority", False), ("passes", False),
+            ("sharedReopenRounds", False), ("reopenRouting", None),
+            ("reopenRouting", {"finalReviewers": []}),
+            ("reopenRouting", {"finalReviewers": [None]}),
+        ]]
+        cases += [({**benchmark, "queueAuthority": "routed-reviewer-v1"}, probe, True)]
+        for measured, sampled, recovering in cases:
+            with mock.patch.object(release, "run_json", side_effect=[measured, sampled]):
+                try:
+                    release.prove_canonical_queues(
+                        Path("owned-data"), manifest, recovering_previous=recovering,
+                    )
+                except release.ReleaseError:
+                    pass
+                else:
+                    raise AssertionError(f"invalid routed recovery accepted: {measured}, {sampled}, {recovering}")
+
+
 def test_quality_reopen_requires_exact_membership_and_unchanged_pay_receipt() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
