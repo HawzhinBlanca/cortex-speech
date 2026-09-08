@@ -420,19 +420,24 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
                 // roster, so naming a clip takes effect on this reviewer's next queue fetch without a
                 // restart. Difficulty routing (`review_routing.json`, owner item 1 2026-09-07): same
                 // hot-reload, same fail-open; hard clips first for the named ears, easy first for the rest.
-                let (listen_first, difficulty) = match data_dir {
+                let (listen_first, difficulty, reopen_routing) = match data_dir {
                     Some(dir) => (
                         crate::listen_list::listen_first_for(&dir, reviewer, pool),
                         crate::review_routing::order_for(&dir, reviewer),
+                        crate::review_pool::reopen_routing::load(&dir),
                     ),
-                    None => (Default::default(), crate::review_routing::DifficultyOrder::Unchanged),
+                    None => (Default::default(), crate::review_routing::DifficultyOrder::Unchanged, None),
                 };
                 crate::review_pool::pending_segment_ids_with_hints(
                     db,
                     pool,
                     reviewer,
                     allowed_dialects.as_deref(),
-                    &crate::review_pool::QueueHints { listen_first: &listen_first, difficulty },
+                    &crate::review_pool::QueueHints {
+                        listen_first: &listen_first,
+                        difficulty,
+                        reopen_routing: reopen_routing.as_ref(),
+                    },
                 )
                 .map_err(crate::error::AppError::Validation)
             }

@@ -1,5 +1,33 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-08 — Reopen routing: a reopened clip goes only to its own reviewers and the final reviewers
+
+**Owner direction (2026-09-08, his words):** "i dont want everyone be served rubar's work … send rubar's earlier work to
+herself and iftikhar be sent Iftikhar's earlier work and hawzhin be sent both of their work for final review … let the
+Guest and everyone else get fresh data from the pool … only herself and hawzhin."
+
+**Measured before the change (live DB, read-only, serving release 7397c1f2):** the shared reopen round (1,064 clips,
+priority 0) sorted first for EVERY reviewer. The Guest link's 25 verdicts on 2026-09-08 19:47–19:55 were all reopened
+clips, nine of them the exact clips the disputed reviewer had re-judged at 15:00 — the round was being decided by
+whoever was online, not re-checked by the people whose work it holds.
+
+**Change (`review_pool/reopen_routing.rs`, +`QueueHints.reopen_routing`):** `<data_dir>/review_reopen_routing.json`
+`{"final_reviewers": [names]}`. With the file present a reopened clip is served only to (a) reviewers whose HELD
+opinion the round re-checks — read from the round's own floors (`review_events.id <= review_event_floor`,
+`review_pool_decisions.id <= pool_decision_floor`), never from the file — and (b) the named final reviewers. Nobody else
+sees it; the queue never widens the circle on its own (a disagreement between the two waits for the owner's adjudication
+or a name added to the file). Missing file: unchanged behaviour. Unreadable/invalid file: restriction stays with NO
+final reviewers and an error log — a typo must not publish disputed work. Re-read per queue fetch like the listen list.
+`pool_admin probe` reports `reopenRouting`. Ordinary pool work is untouched: everyone else gets first or second
+opinions on fresh clips exactly as before; Lamo and Sewa keep the Lamo single-voice listen list (data change,
+2026-09-08, 4,965 clips) ahead of everything.
+
+**Evidence:** `cargo test --lib` (reopen_routing unit tests; `reopen_routing_keeps_a_reopened_clip_private_to_its_reviewers_and_the_final_reviewers`;
+listen-list, difficulty, shared-reopen and spot-check queue tests) and `cargo clippy --all-targets --all-features -D
+warnings` exit 0; `rust_quality_gate.py architecture` exit 0 (review_pool.rs 1,987 production lines);
+`test_consensus_review_canon.py` and the five policy gates pinning the touched files exit 0. Built on 7397c1f2 (the
+serving release, Codex's `codex/pool-reopen-safety-20260907`, not yet on `origin/main`).
+
 ## 2026-09-07 — Shared owner quality rounds (schema71; rollout verification in progress)
 
 Added exact digest/revision-bound owner reopen rounds, fresh independent opinions for any eligible
