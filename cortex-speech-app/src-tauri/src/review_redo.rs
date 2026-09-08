@@ -18,7 +18,7 @@
 //!    we can have those flexibility"). The consensus canon itself is untouched: a clip is still
 //!    decided by any two DIFFERENT reviewers, and a reversed decision never counts.
 //!
-//! A clip the reviewer re-judged since `started_at_ms` (any action, skip included) leaves the queue.
+//! A clip the reviewer re-judged since `started_at_ms` leaves the queue. A skip is not a judgment.
 //!
 //! `<data_dir>/review_redo.json`:
 //!
@@ -192,8 +192,8 @@ pub fn is_own_canonical_verdict(
 /// content-independent spread:
 ///   * their own canonical verdicts (kinds in `actions`) in the live pool, not re-judged since
 ///     `started_at_ms`;
-///   * live pool clips where the owner sent back (reversed) one of their pool decisions and they
-///     hold no effective decision since, provided the clip still lacks two opinions.
+///   * live pool clips reversed during this redo round which the ordinary pool authority still
+///     allows them to judge. Two disagreeing opinions need a third; two agreeing opinions do not.
 ///
 /// Playable and within their dialects, like every queue.
 pub fn pending_segment_ids(
@@ -203,8 +203,12 @@ pub fn pending_segment_ids(
     policy: &RedoPolicy,
     allowed_dialects: Option<&[String]>,
 ) -> Result<Vec<String>, String> {
+    // Reuse the writer-aligned queue authority, including family, resolution, legacy judgments,
+    // playable audio and dialect checks. Counting rows alone confuses disagreement with resolution.
+    let eligible_pool: std::collections::HashSet<String> =
+        crate::review_pool::pending_segment_ids(db, pool, reviewer, allowed_dialects)?.into_iter().collect();
     let sql = format!(
-        "SELECT segment.id, segment.audio_path, member.raw_transcript, member.duration_ms, segment.alignment_json
+        "SELECT segment.id, segment.audio_path, member.raw_transcript, member.duration_ms, segment.alignment_json, 1
            FROM review_pool_members member
            JOIN speech_segments segment ON segment.id=member.segment_id
           WHERE member.pool_id=?1
@@ -217,9 +221,9 @@ pub fn pending_segment_ids(
                              WHERE decision.segment_id=segment.id AND lower(trim(decision.reviewer))=?2)
             AND NOT EXISTS (SELECT 1 FROM review_events event
                              WHERE event.segment_id=segment.id AND lower(trim(event.reviewer))=?2
-                               AND event.timestamp_ms>=?3)
+                               AND event.timestamp_ms>=?3 AND event.action IN ('accept','edit','reject'))
          UNION
-         SELECT segment.id, segment.audio_path, member.raw_transcript, member.duration_ms, segment.alignment_json
+         SELECT segment.id, segment.audio_path, member.raw_transcript, member.duration_ms, segment.alignment_json, 0
            FROM review_pool_reversals reversal
            JOIN review_pool_decisions decision ON decision.id=reversal.decision_id
            JOIN review_pool_members member
@@ -227,14 +231,12 @@ pub fn pending_segment_ids(
            JOIN speech_segments segment ON segment.id=member.segment_id
           WHERE member.pool_id=?1
             AND lower(trim(decision.reviewer))=?2
+            AND reversal.created_at_ms>=?3
             AND decision.action IN ({pool_actions})
             AND NOT EXISTS (SELECT 1 FROM review_pool_duplicate_exclusions x
                              WHERE x.pool_id=member.pool_id AND x.segment_id=member.segment_id)
             AND NOT EXISTS (SELECT 1 FROM effective_review_pool_decisions_v62 effective
-                             WHERE effective.segment_id=segment.id AND lower(trim(effective.reviewer))=?2)
-            AND (SELECT COUNT(*) FROM effective_review_pool_decisions_v62 others
-                  WHERE others.segment_id=segment.id)
-                + (CASE WHEN segment.verified=1 AND segment.human_decision IS NOT NULL THEN 1 ELSE 0 END) < 2",
+                             WHERE effective.segment_id=segment.id AND lower(trim(effective.reviewer))=?2)",
         decisions = canonical_decisions_sql(&policy.actions),
         pool_actions = pool_actions_sql(&policy.actions)
     );
@@ -248,13 +250,17 @@ pub fn pending_segment_ids(
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, Option<String>>(4)?,
+                row.get::<_, bool>(5)?,
             ))
         })
         .map_err(|error| format!("redo queue cannot be read: {error}"))?;
     let mut candidates: Vec<(u8, [u8; 32], String)> = Vec::new();
     for row in rows {
-        let (segment_id, audio_path, raw_transcript, duration_ms, alignment_json) =
+        let (segment_id, audio_path, raw_transcript, duration_ms, alignment_json, own_canonical) =
             row.map_err(|error| format!("redo queue row is unreadable: {error}"))?;
+        if !own_canonical && !eligible_pool.contains(&segment_id) {
+            continue;
+        }
         if !pool.is_playable(&segment_id) || !crate::dialect::reviewer_may_judge(allowed_dialects, &audio_path) {
             continue;
         }

@@ -741,8 +741,19 @@ def test_nightly_real_audio_fails_on_real_regressions_but_skips_missing_fixtures
     assert_contains(nightly, "cargo test --test soak -- --nocapture", "nightly-real-audio.yml")
 
 
+def test_ci_installs_the_repository_pinned_rust_toolchain() -> None:
+    channel = tomllib.loads((REPO_ROOT.parent / "rust-toolchain.toml").read_text(encoding="utf-8"))["toolchain"]["channel"]
+    for name in ("ci.yml", "release.yml"):
+        steps = re.split(r"(?m)^      - ", workflow_steps_text(name))
+        installs = [step for step in steps if step.startswith("uses: dtolnay/rust-toolchain@")]
+        assert installs, f"{name} must install Rust explicitly"
+        for step in installs:
+            assert f"toolchain: {channel}" in step, f"{name} installs floating stable instead of the repository pin"
+
+
 def main() -> None:
     test_workflow_yaml_is_ascii()
+    test_ci_installs_the_repository_pinned_rust_toolchain()
     test_workflow_permissions_are_explicit()
     test_workflow_jobs_have_timeouts()
     test_cargo_deny_install_is_pinned()

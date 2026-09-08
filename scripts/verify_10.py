@@ -209,7 +209,7 @@ def _validated_private_release_manifest(
     *,
     expected_sha: str | None = None,
 ) -> tuple[dict[str, object], Path, dict[str, object]]:
-    """Validate one exact schema-70 release and derive its immutable candidate identity."""
+    """Validate the current exact release contract and derive its immutable candidate identity."""
 
     release = _private_production_release_module()
     if not isinstance(manifest, dict):
@@ -221,9 +221,9 @@ def _validated_private_release_manifest(
         raise ValueError(f"private-production release manifest is invalid: {error}") from error
 
     if not _is_exact_integer(manifest.get("schema"), 2) or not _is_exact_integer(
-        manifest.get("expectedDatabaseSchema"), 70
+        manifest.get("expectedDatabaseSchema"), release.EXPECTED_SCHEMA
     ):
-        raise ValueError("private-production release is not the exact schema-2/schema-70 contract")
+        raise ValueError(f"private-production release is not the exact schema-2/schema-{release.EXPECTED_SCHEMA} contract")
     source_sha = manifest.get("appGitSha")
     if not isinstance(source_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", source_sha):
         raise ValueError("private-production release source SHA is not canonical")
@@ -285,7 +285,7 @@ def _validated_private_release_manifest(
         "releaseId": release_id,
         "manifestRelativePath": f"{release_id}/{release.RELEASE_MANIFEST_FILE}",
         "sourceGitSha": source_sha,
-        "expectedDatabaseSchema": 70,
+        "expectedDatabaseSchema": release.EXPECTED_SCHEMA,
         "schemaContractId": manifest.get("schemaContractId"),
         "artifacts": {
             "applicationExecutable": {
@@ -331,7 +331,7 @@ def validate_active_release_runtime(
     *,
     expected_sha: str | None = None,
 ) -> Path:
-    """Return the exact schema-70 active app binary, or fail closed on any release drift."""
+    """Return the exact current-contract app binary, or fail closed on any release drift."""
 
     validated, executable, _candidate = _validated_private_release_manifest(
         manifest,
@@ -1984,6 +1984,7 @@ def _document_digest(document: dict[str, object]) -> str:
 
 
 def _validate_staged_candidate_authority(value: object) -> dict[str, object]:
+    release = _private_production_release_module()
     expected_fields = {
         "schema",
         "type",
@@ -2018,9 +2019,9 @@ def _validate_staged_candidate_authority(value: object) -> dict[str, object]:
         or not isinstance(manifest_bytes, int)
         or isinstance(manifest_bytes, bool)
         or manifest_bytes <= 0
-        or not _is_exact_integer(value.get("expectedDatabaseSchema"), 70)
+        or not _is_exact_integer(value.get("expectedDatabaseSchema"), release.EXPECTED_SCHEMA)
         or value.get("schemaContractId")
-        != "cortex-private-production-schema-65-to-70-v1"
+        != release.SCHEMA_CONTRACT_ID
         or value.get("manifestRelativePath")
         != f"{release_id}/release-manifest.json"
     ):
@@ -11472,7 +11473,7 @@ def _validate_release_artifacts(
             "releasePhase": RELEASE_PHASE_PREDEPLOYMENT,
             "stagedReleaseId": staged_candidate["releaseId"],
             "stagedReleaseManifestSha256": staged_candidate["manifestSha256"],
-            "expectedDatabaseSchema": 70,
+            "expectedDatabaseSchema": staged_candidate["expectedDatabaseSchema"],
             "schemaContractId": staged_candidate["schemaContractId"],
             "schemaContractSha256": staged_candidate["artifacts"]["schemaContract"][
                 "sha256"

@@ -260,6 +260,39 @@ pub(super) fn operation_result_after_write_failure(
     }
 }
 
+/// Recheck immutable operation truth both before mutable validation and after waiting for the
+/// canonical commit lock. A concurrent copy can commit (and consume its playback receipt) while
+/// this request waits. That is an ACK, not a new verdict requiring fresh playback authority.
+fn canonical_operation_replay_reply(
+    db: &Database,
+    parsed: &DecisionBody,
+    reviewer: &str,
+    state: &Mutex<CouchState>,
+    operation_id: &str,
+) -> Option<Reply> {
+    match review_operation_state(db, operation_id, &parsed.id, &parsed.action, &parsed.text, reviewer) {
+        Ok(ReviewOperationState::New) => None,
+        Ok(ReviewOperationState::ExactReplay) => {
+            let effect = match db.human_decision_effect_for_operation(operation_id) {
+                Ok(effect) => effect,
+                Err(error) => return Some(err_reply(500, &format!("decision effect lookup failed: {error}"))),
+            };
+            let effect_event_id = effect.as_ref().map(|value| value.0);
+            if let Some((effect_event_id, segment_id)) = effect.as_ref() {
+                remember_phone_undo(state, reviewer, operation_id, segment_id, *effect_event_id);
+            }
+            Some(json_reply_with_accounting(
+                200,
+                serde_json::json!({ "ok": true, "duplicate": true, "effectEventId": effect_event_id }),
+                db,
+                reviewer,
+            ))
+        }
+        Ok(ReviewOperationState::Reused) => Some(err_reply(409, "operation UUID is already bound to another decision")),
+        Err(error) => Some(err_reply(500, &format!("operation receipt lookup failed: {error}"))),
+    }
+}
+
 #[cfg(test)]
 pub(super) fn api_independent_decision(
     db: &Database,
@@ -521,6 +554,13 @@ pub(super) fn api_pool_decision(
                     reviewer,
                 ) =>
         {
+            match crate::review_pool::reopen::decision_is_current(db, &receipt.segment_id, receipt.decision_id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return err_reply(409, "this receipt belongs to an earlier review round — refresh and listen again")
+                }
+                Err(error) => return err_reply(503, &format!("reopen authority unavailable: {error}")),
+            }
             remember_pool_undo(state, reviewer, operation_id, &receipt.segment_id, receipt.decision_id);
             forget_work_audio_assignment(state, &parsed.id, reviewer);
             return json_reply_with_accounting(
@@ -821,6 +861,15 @@ pub(super) fn api_decision_authenticated(
             Ok(receipt) => receipt.flatten().is_some(),
             Err(error) => return err_reply(500, &format!("operation receipt lookup failed: {error}")),
         };
+        let reopened = match crate::review_pool::reopen::revision(db, &parsed.id) {
+            Ok(value) => value.is_some(),
+            Err(error) => return err_reply(503, &format!("reopen authority unavailable: {error}")),
+        };
+        if reopened {
+            // Never overwrite the held canonical record, even for its original author or an old
+            // canonical UUID replay. The shared pool writer enforces current revision/playback.
+            return api_pool_decision(db, &parsed, reviewer, session_binding_sha256, state, pool);
+        }
         if (pool_replay || already_canonical) && !canonical_replay {
             // Redo pass (owner 2026-09-07, `review_redo.rs`): a reviewer re-judging their OWN
             // canonical "Looks good" stays on the canonical path below — it is their one opinion,
@@ -878,37 +927,23 @@ pub(super) fn api_decision_authenticated(
             return err_reply(400, "operationId must be a lowercase hyphenated UUID");
         }
         let payload_hash = decision_operation_payload_hash(&parsed.id, &parsed.action, &parsed.text, reviewer);
-        match review_operation_state(db, operation_id, &parsed.id, &parsed.action, &parsed.text, reviewer) {
-            Ok(ReviewOperationState::ExactReplay) => {
-                let effect = match db.human_decision_effect_for_operation(operation_id) {
-                    Ok(effect) => effect,
-                    Err(error) => return err_reply(500, &format!("decision effect lookup failed: {error}")),
-                };
-                let effect_event_id = effect.as_ref().map(|value| value.0);
-                if let Some((effect_event_id, segment_id)) = effect.as_ref() {
-                    remember_phone_undo(state, reviewer, operation_id, segment_id, *effect_event_id);
-                }
-                return json_reply_with_accounting(
-                    200,
-                    serde_json::json!({
-                        "ok": true,
-                        "duplicate": true,
-                        "effectEventId": effect_event_id,
-                    }),
-                    db,
-                    reviewer,
-                );
-            }
-            Ok(ReviewOperationState::Reused) => {
-                return err_reply(409, "operation UUID is already bound to another decision");
-            }
-            Ok(ReviewOperationState::New) => {}
-            Err(error) => return err_reply(500, &format!("operation receipt lookup failed: {error}")),
+        if let Some(reply) = canonical_operation_replay_reply(db, &parsed, reviewer, state, operation_id) {
+            return reply;
         }
         Some(payload_hash)
     } else {
         None
     };
+    // Serialize canonical validation with its writer, not merely the final receipt consumption.
+    // A duplicate can arrive before the first copy commits, then wait here; reread durable truth
+    // before consulting the row revision, pilot cap or consumed playback receipt. Pool decisions
+    // have already branched above and retain their own transactional arbitration.
+    let _canonical_commit_guard = lock_pilot_decision_commit();
+    if let Some(operation_id) = parsed.operation_id.as_deref() {
+        if let Some(reply) = canonical_operation_replay_reply(db, &parsed, reviewer, state, operation_id) {
+            return reply;
+        }
+    }
     let (prev, request_revision) = match db.get_segment_by_id_with_revision(&parsed.id) {
         Ok(Some(row)) => row,
         Ok(None) => return err_reply(404, "no such segment"),
@@ -1231,15 +1266,14 @@ pub(super) fn api_decision_authenticated(
         return err_reply(400, "operationId payload could not be validated — reload this page before deciding");
     };
 
-    // Serialize the last pre-receipt check with the database commit. The database repeats the cap
+    // The canonical guard above serializes these pre-receipt checks with the commit. The database repeats the cap
     // check under BEGIN IMMEDIATE (the cross-connection authority); this outer lock ensures a losing
     // in-process request leaves no playback-receipt side effect before that transaction refuses it.
     // A regular-work skip is zero-pay and not a verdict, but it DOES consume a pilot corpus safety
     // slot: otherwise repeated skips could refill queues forever. A hidden-check skip belongs to the
     // separately bounded two-key QC budget and is recorded as a failed QC result below, not corpus work.
     let mut pilot_decision_limit: Option<ReviewDecisionLimit> = None;
-    let _pilot_commit_guard = if expected_key.is_none() {
-        let guard = lock_pilot_decision_commit();
+    if expected_key.is_none() {
         let current = match active_pilot_policy(reviewer, state) {
             Ok(policy) => policy,
             Err(error) => return err_reply(503, &error),
@@ -1274,10 +1308,7 @@ pub(super) fn api_decision_authenticated(
                 Err(error) => return err_reply(503, &error),
             };
         }
-        Some(guard)
-    } else {
-        None
-    };
+    }
 
     // PLAYBACK AUTHORITY. A new verdict never mints evidence from request counters. The page must first
     // finalize a server-issued, cookie-session-bound attempt carrying a normalized interval union. This

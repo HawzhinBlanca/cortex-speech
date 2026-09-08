@@ -9,6 +9,11 @@ mod authority;
 mod coverage;
 mod dedup;
 mod family;
+pub mod reopen;
+pub mod reopen_routing;
+mod send_back;
+
+pub use send_back::{apply_send_back_plan, prepare_send_back_plan, SendBackPlan};
 
 pub use coverage::{coverage_by_voice, VoiceCoverage};
 
@@ -26,6 +31,7 @@ use family::family_seen_on;
 pub(crate) use family::{require_unseen_pool_family_on, require_unseen_pool_family_or_own_canonical_on};
 
 use crate::db::Database;
+use crate::review_routing::DifficultyOrder;
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -777,6 +783,7 @@ fn reviewer_sets_for_ids_on(
     segment_ids_json: Option<&str>,
 ) -> Result<HashMap<String, SegmentReviewers>, String> {
     let mut result: HashMap<String, SegmentReviewers> = HashMap::new();
+    let reopen_filter = reopen::canonical_clause(conn, "segment")?;
     let canonical_filter =
         if segment_ids_json.is_some() { "AND member.segment_id IN (SELECT value FROM json_each(?1))" } else { "" };
     let independent_filter =
@@ -796,7 +803,7 @@ fn reviewer_sets_for_ids_on(
                JOIN speech_segments segment ON segment.id=member.segment_id
               WHERE segment.verified=1
                 AND segment.human_decision IN ('accept','edit','reject','human_accept','human_edit','human_reject')
-                {canonical_filter}",
+                {canonical_filter} {reopen_filter}",
         ))
         .map_err(|error| format!("canonical review coverage cannot be read: {error}"))?;
     let rows = canonical
@@ -887,11 +894,16 @@ fn owner_adjudications_for_ids_on(
     if schema_version < REVIEW_POOL_SCHEMA_VERSION {
         return Ok(HashMap::new());
     }
-    let filter = if segment_ids_json.is_some() { "WHERE segment_id IN (SELECT value FROM json_each(?1))" } else { "" };
+    let filter = if segment_ids_json.is_some() { "AND segment_id IN (SELECT value FROM json_each(?1))" } else { "" };
+    let round_filter = if reopen::supported_on(conn)? {
+        "AND id>COALESCE((SELECT adjudication_floor FROM current_review_reopen_members_v71 round WHERE round.segment_id=review_pool_owner_adjudications.segment_id),0)"
+    } else {
+        ""
+    };
     let mut statement = conn
         .prepare(&format!(
             "SELECT segment_id, final_action, final_transcript, evidence_sha256
-               FROM review_pool_owner_adjudications {filter} ORDER BY id DESC",
+               FROM review_pool_owner_adjudications WHERE 1=1 {filter} {round_filter} ORDER BY id DESC",
         ))
         .map_err(|error| format!("owner adjudications cannot be read: {error}"))?;
     let rows = statement
@@ -965,6 +977,8 @@ fn derive_resolution(
 }
 
 fn require_live_member_identity(db: &Database, pool: &ReviewPool) -> Result<(), String> {
+    reopen::validate_on(db.connection())?;
+    let canonical_independence = reopen::canonical_clause(db.connection(), "segment")?;
     let drifted: Option<String> = db
         .connection()
         .query_row(
@@ -996,7 +1010,8 @@ fn require_live_member_identity(db: &Database, pool: &ReviewPool) -> Result<(), 
     let invalid_history: bool = db
         .connection()
         .query_row(
-            "SELECT EXISTS(
+            &format!(
+                "SELECT EXISTS(
                  SELECT 1 FROM review_pool_decisions decision
                  JOIN review_pool_members member
                    ON member.pool_id=decision.pool_id AND member.segment_id=decision.segment_id
@@ -1028,8 +1043,8 @@ fn require_live_member_identity(db: &Database, pool: &ReviewPool) -> Result<(), 
                 WHERE decision.pool_id=?1 AND decision.action<>'skip' AND (
                       segment.verified<>1
                    OR segment.human_decision NOT IN ('accept','edit','reject')
-                   OR lower(trim(COALESCE(segment.reviewed_by, '@desktop-owner')))
-                      = lower(trim(decision.reviewer))
+                   OR (lower(trim(COALESCE(segment.reviewed_by, '@desktop-owner')))
+                      = lower(trim(decision.reviewer)) {canonical_independence})
                    OR EXISTS (
                         SELECT 1 FROM effective_independent_review_decisions_v61 legacy
                          WHERE legacy.segment_id=decision.segment_id
@@ -1041,7 +1056,8 @@ fn require_live_member_identity(db: &Database, pool: &ReviewPool) -> Result<(), 
                 WHERE decision.pool_id=?1
                 GROUP BY decision.segment_id, lower(trim(decision.reviewer))
                HAVING COUNT(*)<>1
-             )",
+             )"
+            ),
             [&pool.pool_id],
             |row| row.get(0),
         )
@@ -1140,7 +1156,7 @@ pub fn pending_segment_ids_with_listen_list(
     allowed_dialects: Option<&[String]>,
     listen_first: &HashSet<String>,
 ) -> Result<Vec<String>, String> {
-    let hints = QueueHints { listen_first, difficulty: crate::review_routing::DifficultyOrder::Unchanged };
+    let hints = QueueHints { listen_first, difficulty: DifficultyOrder::Unchanged, reopen_routing: None };
     pending_segment_ids_with_hints(db, pool, reviewer, allowed_dialects, &hints)
 }
 
@@ -1152,6 +1168,8 @@ pub struct QueueHints<'a> {
     /// Difficulty routing (`review_routing.rs`): hard clips first for the ears the owner named,
     /// easy clips first for everyone else, unchanged without a routing file.
     pub difficulty: crate::review_routing::DifficultyOrder,
+    /// Reopen routing (`reopen_routing.rs`, owner 2026-09-08); `None` = no file = everyone.
+    pub reopen_routing: Option<&'a reopen_routing::ReopenRouting>,
 }
 
 /// `pending_segment_ids` with the owner listen list and the difficulty routing order.
@@ -1177,6 +1195,8 @@ pub fn pending_segment_ids_with_hints(
     let reviewer = reviewer_key(Some(reviewer));
     let family_seen = family_seen_on(db.connection(), &reviewers)
         .map_err(|error| format!("review pool queue cannot be prepared: {error}"))?;
+    let priorities = reopen::priorities(db)?;
+    let reopen_held = hints.reopen_routing.map(|_| reopen_routing::held_reviewers_on(db.connection())).transpose()?;
     let mut statement = db
         .connection()
         .prepare(
@@ -1220,6 +1240,10 @@ pub fn pending_segment_ids_with_hints(
         }
         let (resolution, _) = derive_resolution(&segment_id, coverage, adjudications.get(&segment_id));
         if matches!(resolution, DerivedResolution::Resolved { .. } | DerivedResolution::OwnerConflict) {
+            continue;
+        }
+        // Owner 2026-09-08: a reopened clip is private to the people it re-checks + the final reviewers.
+        if reopen_routing::excludes(hints.reopen_routing, reopen_held.as_ref(), &priorities, &segment_id, &reviewer) {
             continue;
         }
         if !pool.playable_member_ids.contains(&segment_id)
@@ -1294,7 +1318,11 @@ pub fn pending_segment_ids_with_hints(
             segment_id,
         ));
     }
-    Ok(order_pending_by_voice_priority(pending))
+    let mut ordered = order_pending_by_voice_priority(pending);
+    // Explicit owner remediation precedes ordinary work; stable sorting preserves the existing
+    // voice/decision-distance/difficulty ordering within each owner-selected priority tier.
+    ordered.sort_by_key(|id| priorities.get(id).copied().unwrap_or(3));
+    Ok(ordered)
 }
 
 /// One queue-eligible pool row as read from the database.
@@ -3121,6 +3149,30 @@ mod tests {
     }
 
     #[test]
+    fn shared_reopen_invalidates_warm_learning_and_inflight_export_authority() {
+        let (dir, db, pool) = one_clip_pool_fixture("دەقی یەکەم", true, true);
+        decide(&db, &pool, "Alle", "دەقی دووەم", "52000000-0000-4000-8000-000000000001", 1);
+        decide(&db, &pool, "Iftikhar", "دەقی دووەم", "52000000-0000-4000-8000-000000000002", 2);
+        assert_eq!(crate::jury::get_few_shot_examples(&db, "query-other", 3).unwrap().len(), 1);
+        let output = dir.path().join("pack");
+        crate::eval::export_finetune_pack(&db, &output, None).unwrap();
+        let previous = std::fs::read(output.join("finetune_manifest.jsonl")).unwrap();
+        let plan = reopen::prepare(&db, &pool, &["clip".into()], "Disputed quality during export", 0).unwrap();
+        let error = crate::eval::export_finetune_pack_with_review_test_hook(&db, &output, || {
+            reopen::apply(&db, &pool, &plan, 3).map_err(crate::error::AppError::Validation)?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("consensus authority"), "{error}");
+        assert_eq!(std::fs::read(output.join("finetune_manifest.jsonl")).unwrap(), previous);
+        assert!(crate::jury::get_few_shot_examples(&db, "query-other", 3).unwrap().is_empty());
+        let held_export =
+            crate::export::exclude_unexportable_segments(&db, vec![db.get_segment_by_id("clip").unwrap().unwrap()])
+                .unwrap_err();
+        assert!(held_export.to_string().contains("nothing is exportable"), "{held_export}");
+    }
+
+    #[test]
     fn pool_spreads_equal_priority_work_instead_of_replaying_import_order() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(":memory:").unwrap();
@@ -3316,7 +3368,7 @@ mod tests {
         }
         // "b" keeps the fixture's words-free alignment: unmeasured = medium, never easy.
         let none = HashSet::new();
-        let hints = |difficulty| QueueHints { listen_first: &none, difficulty };
+        let hints = |difficulty| QueueHints { listen_first: &none, difficulty, reopen_routing: None };
         let unchanged = pending_segment_ids(&db, &pool, "Hemn", None).unwrap();
         assert_eq!(
             pending_segment_ids_with_hints(&db, &pool, "Hemn", None, &hints(DifficultyOrder::Unchanged)).unwrap(),
@@ -3342,7 +3394,7 @@ mod tests {
         );
         // And the owner listen list still precedes everything.
         let listed: HashSet<String> = ["b".to_string()].into_iter().collect();
-        let listen = QueueHints { listen_first: &listed, difficulty: DifficultyOrder::HardFirst };
+        let listen = QueueHints { listen_first: &listed, difficulty: DifficultyOrder::HardFirst, reopen_routing: None };
         assert_eq!(pending_segment_ids_with_hints(&db, &pool, "Hemn", None, &listen).unwrap(), vec!["b", "c", "a"]);
     }
 
@@ -3675,6 +3727,353 @@ mod tests {
         assert_eq!(row.final_transcript.as_deref(), Some("دەقی یەکەم"));
         assert_eq!(row.agreeing_reviewers, vec!["Rubar", "Sewa"]);
         assert!(pending_segment_ids(&db, &pool, "Roza", None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn redo_reversal_reuses_consensus_authority_and_is_scoped_to_its_round() {
+        let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        decide(&db, &pool, "Alle", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174071", 1);
+        let third = decide(&db, &pool, "Sewa", "دەقی سێیەم", "123e4567-e89b-42d3-a456-426614174072", 2);
+        let policy = crate::review_redo::RedoPolicy {
+            started_at_ms: 3,
+            reviewers: vec!["Sewa".into()],
+            actions: vec!["edit".into()],
+        };
+        assert!(crate::review_redo::pending_segment_ids(&db, &pool, "Sewa", &policy, None).unwrap().is_empty());
+        reverse_decision(&db, &pool, third, "Sewa", "123e4567-e89b-42d3-a456-426614174073", 4).unwrap();
+        assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "needsThirdReview");
+        assert_eq!(
+            crate::review_redo::pending_segment_ids(&db, &pool, "Sewa", &policy, None).unwrap(),
+            vec!["clip"],
+            "two disagreeing opinions must not strand the returned third opinion"
+        );
+        let later = crate::review_redo::RedoPolicy { started_at_ms: 5, ..policy.clone() };
+        assert!(
+            crate::review_redo::pending_segment_ids(&db, &pool, "Sewa", &later, None).unwrap().is_empty(),
+            "an earlier undo must not silently join a new redo round"
+        );
+        decide(&db, &pool, "Roza", "دەقی یەکەم", "123e4567-e89b-42d3-a456-426614174074", 5);
+        assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "resolved");
+        assert!(
+            crate::review_redo::pending_segment_ids(&db, &pool, "Sewa", &policy, None).unwrap().is_empty(),
+            "new agreement must close the queue just as it closes the writer"
+        );
+    }
+
+    #[test]
+    fn redo_skip_is_not_a_completed_canonical_correction() {
+        let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        let policy = crate::review_redo::RedoPolicy {
+            started_at_ms: 1,
+            reviewers: vec!["Rubar".into()],
+            actions: vec!["accept".into(), "edit".into()],
+        };
+        assert_eq!(crate::review_redo::pending_segment_ids(&db, &pool, "Rubar", &policy, None).unwrap(), vec!["clip"]);
+        db.record_review_event("clip", "Rubar", "skip", "couch", 2).unwrap();
+        assert_eq!(
+            crate::review_redo::pending_segment_ids(&db, &pool, "Rubar", &policy, None).unwrap(),
+            vec!["clip"],
+            "a skip may defer a clip, but it cannot certify that redo work is finished"
+        );
+    }
+
+    #[test]
+    fn send_back_plan_is_atomic_revision_fenced_and_exactly_replayable() {
+        let (dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        let a = decide(&db, &pool, "Alle", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174081", 1);
+        let b = decide(&db, &pool, "Sewa", "دەقی سێیەم", "123e4567-e89b-42d3-a456-426614174082", 2);
+        let plan = prepare_send_back_plan(&db, &pool, &[b, a]).unwrap();
+        let revision = db.segment_review_revision("clip").unwrap().unwrap();
+        let ledger_rows = || {
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM review_compensation_ledger", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        let before = ledger_rows();
+        assert!(apply_send_back_plan(&db, &pool, &plan, 3, false).unwrap_err().contains("acknowledgment"));
+        db.connection()
+            .execute_batch(&format!(
+                "CREATE TEMP TRIGGER fail_batch BEFORE INSERT ON main.review_pool_reversals WHEN NEW.decision_id={b}
+             BEGIN SELECT RAISE(ABORT, 'injected second-item failure'); END;"
+            ))
+            .unwrap();
+        assert!(apply_send_back_plan(&db, &pool, &plan, 3, true).unwrap_err().contains("injected"));
+        assert_eq!(ledger_rows(), before, "no earlier item's pay adjustment may survive failure");
+        let reversals: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM review_pool_reversals", [], |r| r.get(0)).unwrap();
+        assert_eq!(reversals, 0);
+        assert_eq!(db.segment_review_revision("clip").unwrap(), Some(revision));
+        db.connection().execute_batch("DROP TRIGGER fail_batch").unwrap();
+        assert_eq!(apply_send_back_plan(&db, &pool, &plan, 3, true).unwrap(), 2);
+        assert_eq!(db.segment_review_revision("clip").unwrap(), Some(revision + 1), "one bump per clip");
+        assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "pending");
+        let after = ledger_rows();
+        assert_eq!(apply_send_back_plan(&db, &pool, &plan, 4, true).unwrap(), 2);
+        assert_eq!(ledger_rows(), after, "lost-response retry must not double-adjust pay");
+        assert_eq!(db.segment_review_revision("clip").unwrap(), Some(revision + 1));
+        let path = dir.path().join("send-back-restart.db");
+        {
+            let mut target = rusqlite::Connection::open(&path).unwrap();
+            rusqlite::backup::Backup::new(db.connection(), &mut target)
+                .unwrap()
+                .run_to_completion(128, std::time::Duration::from_millis(1), None)
+                .unwrap();
+        }
+        let restored = Database::open(path.to_str().unwrap()).unwrap();
+        restored.initialize().unwrap();
+        let restored_pool = load(&restored).unwrap().unwrap();
+        assert_eq!(apply_send_back_plan(&restored, &restored_pool, &plan, 5, true).unwrap(), 2);
+        assert_eq!(restored.segment_review_revision("clip").unwrap(), Some(revision + 1));
+    }
+
+    /// Live incident 2026-09-08: 18 of the owner's 25 fresh verdicts on reopened clips came straight
+    /// back to him. `family_roots` maps a live root to itself, and the reopen skip in `family_seen_on`
+    /// therefore dropped the root's OWN fresh exposure whenever the clip had a retired twin. The
+    /// writer's second guard refused duplicates, so the damage was repeats, not duplicate evidence.
+    #[test]
+    fn a_fresh_verdict_on_a_reopened_clip_with_a_retired_twin_is_never_re_served() {
+        let (_dir, db, source_pool) = two_clip_pool(Some("a"));
+        apply_dedup_manifest(&db, &dedup_manifest(&source_pool, "a", Some("a"), 1_000)).unwrap();
+        let pool = load(&db).unwrap().unwrap();
+        let ids = vec!["a".to_string()];
+        let plan = reopen::prepare(&db, &pool, &ids, "Owner disputes historical Looks Good work", 0).unwrap();
+        assert_eq!(reopen::apply(&db, &pool, &plan, 2).unwrap(), 1);
+        assert_eq!(pending_segment_ids(&db, &pool, "Roza", None).unwrap(), ids, "reopened: fresh work for Roza");
+        let (_, revision) = db.get_segment_by_id_with_revision("a").unwrap().unwrap();
+        let fresh = |operation_id: &str, at: i64| {
+            let authority = authority(&db, "Roza", "a");
+            record_decision(
+                &db,
+                &pool,
+                &PoolDecisionInput {
+                    segment_id: "a",
+                    reviewer: "Roza",
+                    action: "edit",
+                    submitted_transcript: Some("دەقی نوێ"),
+                    served_transcript: "دەقی چامپیۆن",
+                    served_revision: revision,
+                    audio_content_hash: Some(&clip_hash("a")),
+                    source_start_ms: Some(0),
+                    source_end_ms: Some(1_000),
+                    duration_ms: 1_000,
+                    requested_action: "edit",
+                    requested_transcript: "دەقی نوێ",
+                    operation_id,
+                    operation_payload_hash: &"b".repeat(64),
+                    created_at_ms: at,
+                    playback_authority_session_id: Some(&authority),
+                },
+            )
+        };
+        fresh("123e4567-e89b-42d3-a456-426614175021", 3).unwrap();
+        assert!(
+            pending_segment_ids(&db, &pool, "Roza", None).unwrap().is_empty(),
+            "a clip the reviewer just judged must never come back to them, twin or no twin"
+        );
+        assert_eq!(
+            pending_segment_ids(&db, &pool, "Alle", None).unwrap(),
+            ids,
+            "the second fresh opinion is still wanted"
+        );
+        let refused = fresh("123e4567-e89b-42d3-a456-426614175022", 4).unwrap_err();
+        assert!(refused.contains("ALREADY_SEEN") || refused.contains("duplicated"), "{refused}");
+    }
+
+    /// Owner direction 2026-09-08: a reopened clip goes back to the people whose work it re-checks
+    /// and to the named final reviewers; nobody else sees it until two fresh opinions disagree.
+    #[test]
+    fn reopen_routing_keeps_a_reopened_clip_private_to_its_reviewers_and_the_final_reviewers() {
+        let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        decide(&db, &pool, "Iftikhar", "دەقی یەکەم", "123e4567-e89b-42d3-a456-426614175011", 1);
+        let ids = vec!["clip".to_string()];
+        let plan = reopen::prepare(&db, &pool, &ids, "Owner disputes historical Looks Good work", 0).unwrap();
+        assert_eq!(reopen::apply(&db, &pool, &plan, 2).unwrap(), 1);
+        let routing = reopen_routing::parse(r#"{ "final_reviewers": ["Hawzhin"] }"#).unwrap();
+        let none = HashSet::new();
+        let hints =
+            QueueHints { listen_first: &none, difficulty: DifficultyOrder::Unchanged, reopen_routing: Some(&routing) };
+        let queue = |name: &str| pending_segment_ids_with_hints(&db, &pool, name, None, &hints).unwrap();
+        assert_eq!(queue("Iftikhar"), ids, "the reviewer whose held opinion is re-checked redoes their own work");
+        assert_eq!(queue("hawzhin"), ids, "the final reviewer hears every reopened clip");
+        assert!(queue("Roza").is_empty(), "nobody else is served disputed work");
+        assert_eq!(
+            pending_segment_ids(&db, &pool, "Roza", None).unwrap(),
+            ids,
+            "without a routing file nothing changes"
+        );
+        // Fresh work never widens the circle: after a disagreement the clip waits for the owner.
+        decide(&db, &pool, "Iftikhar", "دەقی نوێ", "123e4567-e89b-42d3-a456-426614175012", 3);
+        decide(&db, &pool, "Hawzhin", "دەقی جیاواز", "123e4567-e89b-42d3-a456-426614175013", 4);
+        assert!(queue("Roza").is_empty(), "only the named people and the owner ever see disputed work");
+        assert!(queue("Iftikhar").is_empty() && queue("hawzhin").is_empty(), "both have spoken; the clip waits");
+    }
+
+    #[test]
+    fn shared_reopen_holds_old_authority_preserves_pay_and_supports_original_reviewers_across_rounds() {
+        let (dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        decide(&db, &pool, "Iftikhar", "دەقی یەکەم", "123e4567-e89b-42d3-a456-426614175001", 1);
+        assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "resolved");
+        let ids = vec!["clip".to_string()];
+        assert_eq!(learning_resolutions(&db, &pool, &ids).unwrap()[0].status, "resolved");
+        let history: String=db.connection().query_row("SELECT json_array(verified,human_decision,reviewed_by,verdict_transcript,annotated_transcript) FROM speech_segments WHERE id='clip'",[],|r|r.get(0)).unwrap();
+        let ledger = || {
+            db.connection().query_row("SELECT json_group_array(json_array(id,delta_micro_iqd,delta_corrected_ms)) FROM review_compensation_ledger",[],|r|r.get::<_,String>(0)).unwrap()
+        };
+        let paid = ledger();
+        let pre_round_path = dir.path().join("before-owner-round.db");
+        db.backup(&pre_round_path).unwrap();
+        let pre_round = Database::open(pre_round_path.to_str().unwrap()).unwrap();
+        let plan = reopen::prepare(&db, &pool, &ids, "Owner disputes historical Looks Good work", 0).unwrap();
+        assert_eq!(reopen::apply(&db, &pool, &plan, 2).unwrap(), 1);
+        let stale_restore =
+            crate::restore_service::require_durable_review_history_superset(&db, &pre_round).unwrap_err();
+        assert!(stale_restore.contains("review_reopen_rounds"), "{stale_restore}");
+        crate::restore_service::require_durable_review_history_superset(&pre_round, &db)
+            .expect("forward restore preserves every older authority while adding the owner's hold");
+        assert_eq!(paid, ledger(), "quality withdrawal must not reverse or mint pay");
+        assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "pending");
+        assert_eq!(learning_resolutions(&db, &pool, &ids).unwrap()[0].status, "pending");
+        assert!(consensus_resolved_segment_ids(&db).unwrap().is_empty());
+        for name in ["Rubar", "Iftikhar", "Roza"] {
+            assert_eq!(
+                pending_segment_ids(&db, &pool, name, None).unwrap(),
+                ids,
+                "original and new reviewers can pick up"
+            );
+        }
+        let unchanged:String=db.connection().query_row("SELECT json_array(verified,human_decision,reviewed_by,verdict_transcript,annotated_transcript) FROM speech_segments WHERE id='clip'",[],|r|r.get(0)).unwrap();
+        assert_eq!(history, unchanged);
+        assert!(db
+            .connection()
+            .execute("UPDATE speech_segments SET verdict_transcript='overwrite held history' WHERE id='clip'", [])
+            .is_err());
+        decide(&db, &pool, "Rubar", "دەقی نوێ", "123e4567-e89b-42d3-a456-426614175002", 3);
+        assert_eq!(
+            segment_resolutions(&db, None).unwrap()[0].status,
+            "pending",
+            "old Iftikhar agreement cannot be reused"
+        );
+        assert!(pending_segment_ids(&db, &pool, "rubar", None).unwrap().is_empty());
+        decide(&db, &pool, "Iftikhar", "دەقی نوێ", "123e4567-e89b-42d3-a456-426614175003", 4);
+        assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "resolved");
+        let paid_after = ledger();
+        let second = reopen::prepare(&db, &pool, &ids, "Owner requests another independent pass", 0).unwrap();
+        reopen::apply(&db, &pool, &second, 5).unwrap();
+        assert_eq!(paid_after, ledger());
+        assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "pending");
+        assert_eq!(reopen::apply(&db, &pool, &plan, 6).unwrap(), 1, "old receipt replay must not reopen again");
+        let rounds: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM review_reopen_rounds", [], |r| r.get(0)).unwrap();
+        assert_eq!(rounds, 2);
+        let path = dir.path().join("shared-reopen-restore.db");
+        {
+            let mut target = rusqlite::Connection::open(&path).unwrap();
+            rusqlite::backup::Backup::new(db.connection(), &mut target)
+                .unwrap()
+                .run_to_completion(128, std::time::Duration::from_millis(1), None)
+                .unwrap();
+        }
+        let restored = Database::open(path.to_str().unwrap()).unwrap();
+        restored.initialize().unwrap();
+        let restored_pool = load(&restored).unwrap().unwrap();
+        assert_eq!(reopen::apply(&restored, &restored_pool, &second, 7).unwrap(), 1);
+        decide(&restored, &restored_pool, "Rubar", "دەقی کۆتایی", "123e4567-e89b-42d3-a456-426614175004", 8);
+        decide(&restored, &restored_pool, "Roza", "دەقی جیاواز", "123e4567-e89b-42d3-a456-426614175005", 9);
+        assert_eq!(segment_resolutions(&restored, None).unwrap()[0].status, "needsThirdReview");
+        decide(&restored, &restored_pool, "Iftikhar", "دەقی کۆتایی", "123e4567-e89b-42d3-a456-426614175006", 10);
+        assert_eq!(segment_resolutions(&restored, None).unwrap()[0].status, "resolved");
+        assert!(
+            crate::migrations::rollback(&restored, 1).is_err(),
+            "populated round cannot roll back into trusted history"
+        );
+    }
+
+    #[test]
+    fn shared_reopen_refuses_stale_preview_and_rolls_back_revision_failure() {
+        let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        let ids = vec!["clip".to_string()];
+        let stale = reopen::prepare(&db, &pool, &ids, "Owner dispute", 0).unwrap();
+        decide(&db, &pool, "Iftikhar", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614175007", 1);
+        assert!(reopen::apply(&db, &pool, &stale, 2).unwrap_err().contains("stale"));
+        let plan = reopen::prepare(&db, &pool, &ids, "Owner dispute", 0).unwrap();
+        db.connection()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_round_revision BEFORE UPDATE OF review_revision ON main.speech_segments
+            BEGIN SELECT RAISE(ABORT,'injected round revision failure'); END;",
+            )
+            .unwrap();
+        assert!(reopen::apply(&db, &pool, &plan, 3).unwrap_err().contains("injected"));
+        assert_eq!(
+            db.connection().query_row("SELECT COUNT(*) FROM review_reopen_rounds", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0
+        );
+        assert_eq!(
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM review_reopen_members", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "needsThirdReview");
+        db.connection().execute_batch("DROP TRIGGER fail_round_revision").unwrap();
+        reopen::apply(&db, &pool, &plan, 4).unwrap();
+        assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "pending");
+    }
+
+    #[test]
+    fn send_back_plan_respects_read_only_snapshot_and_pay_failure_rollback() {
+        let (dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        let a = decide(&db, &pool, "Alle", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174085", 1);
+        let path = dir.path().join("send-back-preview.db");
+        {
+            let mut target = rusqlite::Connection::open(&path).unwrap();
+            rusqlite::backup::Backup::new(db.connection(), &mut target)
+                .unwrap()
+                .run_to_completion(128, std::time::Duration::from_millis(1), None)
+                .unwrap();
+        }
+        let reader = Database::open_read_only(path.to_str().unwrap()).unwrap();
+        let read_pool = load(&reader).unwrap().unwrap();
+        let plan = prepare_send_back_plan(&reader, &read_pool, &[a]).unwrap();
+        assert!(!reader.connection().is_autocommit(), "caller-owned snapshot must remain open");
+        assert_eq!(plan, prepare_send_back_plan(&db, &pool, &[a]).unwrap());
+        assert!(reader.connection().execute("DELETE FROM review_pool_decisions", []).is_err());
+        let revision = db.segment_review_revision("clip").unwrap();
+        db.connection()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_pay BEFORE INSERT ON main.review_compensation_ledger
+            BEGIN SELECT RAISE(ABORT, 'injected pay failure'); END;",
+            )
+            .unwrap();
+        assert!(apply_send_back_plan(&db, &pool, &plan, 2, true).unwrap_err().contains("injected pay"));
+        assert_eq!(
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM review_pool_reversals", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.segment_review_revision("clip").unwrap(), revision);
+        assert_eq!(prepare_send_back_plan(&db, &pool, &[a]).unwrap(), plan);
+    }
+
+    #[test]
+    fn send_back_plan_refuses_tampering_stale_evidence_and_duplicate_targets_without_writes() {
+        let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        let a = decide(&db, &pool, "Alle", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174083", 1);
+        assert!(prepare_send_back_plan(&db, &pool, &[a, a]).is_err());
+        let plan = prepare_send_back_plan(&db, &pool, &[a]).unwrap();
+        let mut tampered = plan.clone();
+        tampered.items[0].reviewer = "Other".into();
+        assert!(apply_send_back_plan(&db, &pool, &tampered, 2, true).unwrap_err().contains("digest"));
+        decide(&db, &pool, "Sewa", "دەقی سێیەم", "123e4567-e89b-42d3-a456-426614174084", 2);
+        assert!(apply_send_back_plan(&db, &pool, &plan, 3, true).unwrap_err().contains("stale"));
+        let count: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM review_pool_reversals", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        let revised = prepare_send_back_plan(&db, &pool, &[a]).unwrap();
+        db.connection()
+            .execute("UPDATE speech_segments SET review_revision=review_revision+1 WHERE id='clip'", [])
+            .unwrap();
+        assert!(apply_send_back_plan(&db, &pool, &revised, 4, true).unwrap_err().contains("stale"));
     }
 
     #[test]

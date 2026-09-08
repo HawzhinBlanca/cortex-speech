@@ -44,6 +44,9 @@
     {"source":"cortex-speech-app/src-tauri/tests/real_audio.rs","selector":"transcribe_file_with_finetuned","scope":"model-evidence","authority":"model-evidence"},
     {"source":"cortex-speech-app/src-tauri/tests/refinery_lift.rs","selector":"refinery_lift_diag_score_cer_distribution","scope":"model-evidence","authority":"model-evidence"},
     {"source":"cortex-speech-app/src-tauri/tests/refinery_lift.rs","selector":"refinery_lift_injected_error_benchmark","scope":"model-evidence","authority":"model-evidence"},
-    {"source":"cortex-speech-app/src-tauri/tests/reviewer_serving_path.rs","selector":"reviewer_serving_path_child","scope":"diagnostic-tool","authority":"non-certifying-test-harness-child"}
+    {"source":"cortex-speech-app/src-tauri/tests/reviewer_serving_path.rs","selector":"reviewer_serving_path_child","scope":"diagnostic-tool","authority":"non-certifying-test-harness-child"},
+    {"source":"cortex-speech-app/src-tauri/tests/reviewer_serving_path.rs","selector":"real_browser_owner_reopen_fences_queued_work_and_recovers_the_draft","scope":"diagnostic-tool","authority":"non-certifying-browser-regression"},
+    {"source":"cortex-speech-app/src-tauri/tests/reviewer_serving_path.rs","selector":"real_browser_replays_lost_request_and_response_once_across_restart","scope":"diagnostic-tool","authority":"non-certifying-browser-regression"},
+    {"source":"cortex-speech-app/src-tauri/tests/reviewer_serving_path.rs","selector":"real_browser_two_tabs_preserve_competing_edits_and_credit_only_once","scope":"diagnostic-tool","authority":"non-certifying-browser-regression"}
   ]
 }

@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { AxeBuilder } from '@axe-core/playwright';
-import { pathToFileURL } from 'node:url';
+import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 // The phone review page (src-tauri/assets/couch.html) is served straight out of the Rust binary via
@@ -8,14 +8,42 @@ import { resolve } from 'node:path';
 // axe.spec.ts covers the desktop App root and Settings only. It is also the surface handed to people
 // who are not the owner, which makes it the one most in need of an accessibility floor, not the least.
 //
-// Loaded from the file system rather than a live server: this asserts the page's own markup,
-// theming and i18n, which need no backend. The server-side contract (auth, leases, attribution,
-// spot checks) is covered by the Rust suite against a real HTTP server in src-tauri/src/couch.rs.
-const PAGE = pathToFileURL(resolve(process.cwd(), 'src-tauri/assets/couch.html')).href;
+// The exact embedded source is fulfilled through an intercepted loopback origin. Every request is
+// fulfilled or aborted: no server is started and no production endpoint can be reached. Unlike the
+// former file:// fixture, native media gets a decodable synthetic WAV instead of a nonexistent file
+// that asynchronously triggers the real missing-audio guard during unrelated queue tests.
+// API mocks below remain explicit; this suite is NOT proof of server persistence or playback policy.
+const PAGE = 'http://127.0.0.1:18741/review';
+const REVIEW_HTML = readFileSync(resolve(process.cwd(), 'src-tauri/assets/couch.html'), 'utf8');
+
+function syntheticAudio(): Buffer {
+  const rate = 16000;
+  const samples = rate;
+  const wav = Buffer.alloc(44 + samples * 2);
+  wav.write('RIFF', 0);
+  wav.writeUInt32LE(wav.length - 8, 4);
+  wav.write('WAVEfmt ', 8);
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20);
+  wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(rate, 24);
+  wav.writeUInt32LE(rate * 2, 28);
+  wav.writeUInt16LE(2, 32);
+  wav.writeUInt16LE(16, 34);
+  wav.write('data', 36);
+  wav.writeUInt32LE(samples * 2, 40);
+  for (let n = 0; n < samples; n++) {
+    wav.writeInt16LE(Math.round(2000 * Math.sin((2 * Math.PI * 440 * n) / rate)), 44 + n * 2);
+  }
+  return wav;
+}
+const SYNTHETIC_WAV = syntheticAudio();
 
 const WCAG_AA = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'];
 
 const OUTBOX_OPERATION_PREFIX = 'cortex.couch.outbox.operation.';
+// The guided layout exposes exactly one primary judgment action for the current text.
+const PRIMARY_ACTION = '#actions button:not([hidden])';
 
 type CouchOutboxSubmission = {
   operationId: string;
@@ -135,6 +163,46 @@ async function authorizeCurrentClipForNonPlaybackTest(page: import('@playwright/
 
 test.describe('Couch Review phone page', () => {
   test.beforeEach(async ({ page }) => {
+    await page.route('**/*', async (route) => {
+      const url = new URL(route.request().url());
+      if (url.origin !== new URL(PAGE).origin) return route.abort('blockedbyclient');
+      if (url.pathname === '/review') {
+        return route.fulfill({ status: 200, contentType: 'text/html', body: REVIEW_HTML });
+      }
+      if (url.pathname.startsWith('/api/audio/')) {
+        const range = route.request().headers().range;
+        const match = range?.match(/^bytes=(\d+)-(\d*)$/);
+        const headers = { 'accept-ranges': 'bytes' };
+        if (match) {
+          const start = Number(match[1]);
+          const end = Math.min(
+            Number(match[2] || SYNTHETIC_WAV.length - 1),
+            SYNTHETIC_WAV.length - 1,
+          );
+          if (start > end)
+            return route.fulfill({
+              status: 416,
+              headers: { 'content-range': `bytes */${SYNTHETIC_WAV.length}` },
+            });
+          return route.fulfill({
+            status: 206,
+            contentType: 'audio/wav',
+            headers: {
+              ...headers,
+              'content-range': `bytes ${start}-${end}/${SYNTHETIC_WAV.length}`,
+            },
+            body: SYNTHETIC_WAV.subarray(start, end + 1),
+          });
+        }
+        return route.fulfill({
+          status: 200,
+          contentType: 'audio/wav',
+          headers,
+          body: SYNTHETIC_WAV,
+        });
+      }
+      return route.abort('blockedbyclient');
+    });
     // A fresh origin per test: the page persists locale/size/loop in localStorage, and a leaked
     // choice from a previous test would silently change what the next one asserts.
     await page.goto(PAGE);
@@ -153,14 +221,106 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#bad')).toContainText('ڕەتکردنەوە');
   });
 
+  test('blocked display-preference storage never prevents startup or changing preferences', async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      const originalGet = Storage.prototype.getItem;
+      const originalSet = Storage.prototype.setItem;
+      const preferences = /^cortex\.couch\.(lang|tsize|speed|loop)$/;
+      Storage.prototype.getItem = function (key) {
+        if (preferences.test(key)) throw new DOMException('Storage blocked', 'SecurityError');
+        return originalGet.call(this, key);
+      };
+      Storage.prototype.setItem = function (key, value) {
+        if (preferences.test(key)) throw new DOMException('Storage blocked', 'SecurityError');
+        return originalSet.call(this, key, value);
+      };
+    });
+    const errors: string[] = [];
+    page.on('pageerror', (error) => errors.push(error.message));
+    await page.reload();
+    await showAClip(page);
+    await page.locator('#lang').click();
+    await expect(page.locator('html')).toHaveAttribute('lang', 'en');
+    await page.locator('#textsize').click();
+    await expect(page.locator('#text')).toHaveCSS('font-size', '21px');
+    await page.locator('#speed').click();
+    await expect(page.locator('#speed')).toContainText('1.25');
+    await page.locator('#loop').click();
+    await expect(page.locator('#loop')).toHaveAttribute('aria-pressed', 'true');
+    expect(errors).toEqual([]);
+  });
+
   test('the language toggle flips the UI but never the transcript direction', async ({ page }) => {
     await showAClip(page);
     await page.locator('#lang').click();
     await expect(page.locator('html')).toHaveAttribute('dir', 'ltr');
-    await expect(page.locator('#save')).toHaveText('Save & next');
+    await expect(page.locator('#save')).toHaveText('Save correction & next');
     // The corpus is Sorani whatever language the chrome is in. An LTR transcript box would put the
     // caret on the wrong side of every correction the reviewer types.
     await expect(page.locator('#text')).toHaveCSS('direction', 'rtl');
+  });
+
+  test('custom transport decodes and advances real synthetic audio without a media stub', async ({
+    page,
+  }) => {
+    await showAClip(page);
+    await authorizeCurrentClipForNonPlaybackTest(page);
+    await page.evaluate('preparePlayback(queue[i], false)');
+    await expect
+      .poll(() => page.locator('#player').evaluate((node: HTMLAudioElement) => node.readyState))
+      .toBeGreaterThanOrEqual(2);
+    expect(await page.locator('#player').evaluate((node: HTMLAudioElement) => node.duration)).toBe(
+      1,
+    );
+    await page.locator('#loop').click();
+    await page.locator('#play').click();
+    await expect
+      .poll(() => page.locator('#player').evaluate((node: HTMLAudioElement) => node.currentTime))
+      .toBeGreaterThan(0);
+    await expect(page.locator('#play')).toHaveAttribute('aria-label', 'ڕاگرتن');
+    await page.locator('#play').click();
+    expect(await page.locator('#player').evaluate((node: HTMLAudioElement) => node.paused)).toBe(
+      true,
+    );
+    expect(
+      await page.locator('#player').evaluate((node: HTMLAudioElement) => node.error),
+    ).toBeNull();
+    await expect(page.locator('#play')).toHaveAttribute('aria-label', 'لێدان');
+    await expect(page.locator('#warn')).toBeHidden();
+    await page.locator('#seek').focus();
+    await expect(page.locator('.wave-seek')).toHaveCSS('outline-style', 'solid');
+    await expect(page.locator('.wave-seek')).toHaveCSS('outline-width', '3px');
+    await page.locator('#seek').press('Home');
+    await page.locator('#seek').press('ArrowRight');
+    await expect
+      .poll(() => page.locator('#player').evaluate((node: HTMLAudioElement) => node.currentTime))
+      .toBeCloseTo(0.05, 2);
+  });
+
+  test('a shared returned clip exposes one correction action and keeps its exact text', async ({
+    page,
+  }) => {
+    await showAClip(page);
+    await page.evaluate(`queue[0].redo = true; show();`);
+    await page.locator('#lang').click();
+    await expect(page.locator('#returnBanner')).toHaveText('Returned for fresh review');
+    await expect(page.locator('body')).not.toContainText('you marked this clip');
+    await page.locator('#text').fill('ڕاستکراوەی نوێ');
+    await expect(page.locator('#accept')).toBeHidden();
+    await expect(page.locator('#save')).toBeVisible();
+    // Offline keeps the real button's exact payload inspectable without a synthetic paid review.
+    await page.evaluate(`window.fetch = async () => { throw new TypeError('test offline'); };`);
+    await authorizeCurrentClipForNonPlaybackTest(page);
+    await page.locator(PRIMARY_ACTION).click();
+    await expect.poll(async () => operationOutboxCount(page)).toBe(1);
+    expect((await readOperationOutbox(page))[0]).toMatchObject({
+      id: 's1',
+      action: 'edit',
+      text: 'ڕاستکراوەی نوێ',
+      rowVersion: '1',
+    });
   });
 
   test('a typed correction survives a reload', async ({ page }) => {
@@ -171,13 +331,116 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#text')).toHaveValue('ڕاستکراوەی من');
   });
 
+  test('old-round text is recoverable by native copy without changing the fresh transcript', async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await showAClip(page);
+    await page.evaluate("me = 'Fixture reviewer'; sessionStorage.setItem('cortex.couch.who', me)");
+    await page.locator('#text').fill('ڕاستکردنەوەی کۆن');
+    await page.evaluate(
+      "queue[0].rowVersion = '9'; queue[0].redo = true; queue[0].text = 'دەقی نوێ'; show()",
+    );
+    await expect(page.locator('#text')).toHaveValue('دەقی نوێ');
+    await expect(page.locator('#draftRecovery')).toBeVisible();
+    await page.locator('#draftRecoveryTitle').click();
+    await expect(page.locator('#draftRecoveryText')).toHaveValue('ڕاستکردنەوەی کۆن');
+    await expect(page.locator('#draftRecoveryText')).toHaveAttribute('readonly', '');
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+    await page.locator('#draftRecoveryText').focus();
+    await page.keyboard.press('ControlOrMeta+c');
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('ڕاستکردنەوەی کۆن');
+    await expect(page.locator('#text')).toHaveValue('دەقی نوێ');
+    expect(await operationOutboxCount(page)).toBe(0);
+    await page
+      .locator('#draftRecovery')
+      .screenshot({ path: testInfo.outputPath('draft-recovery.png') });
+    const accessibility = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(accessibility.violations).toEqual([]);
+    expect(
+      await page.locator('body').evaluate((body) => body.scrollWidth <= window.innerWidth),
+    ).toBe(true);
+  });
+
+  for (const locale of ['en', 'ckb'] as const) {
+    for (const width of [320, 390, 768, 1440]) {
+      test(`guided review keeps controls reachable at ${width}px in ${locale}`, async ({
+        page,
+      }, testInfo) => {
+        await page.setViewportSize({ width, height: 844 });
+        await page.emulateMedia({ colorScheme: 'dark', reducedMotion: 'reduce' });
+        await showAClip(page);
+        // Synthetic presentation state, not a claim that this test committed a paid review.
+        await page.evaluate(`
+          queue[0].redo = true;
+          queue[0].durationMs = 1000;
+          doneThisSession = 1;
+          document.getElementById('errActions').hidden = true;
+          show();
+        `);
+        if (locale === 'en') await page.locator('#lang').click();
+        await page.locator('#text').fill('ئەمە دەقێکی نوێیە بۆ پێداچوونەوە');
+        await page.locator('#text').blur();
+        await authorizeCurrentClipForNonPlaybackTest(page);
+        await page.evaluate('preparePlayback(queue[i], false)');
+        await page.locator('#play').click();
+        await expect
+          .poll(() => page.locator('#player').evaluate((node: HTMLAudioElement) => node.ended))
+          .toBe(true);
+        await expect(page.locator('#warn')).toBeHidden();
+        await expect(page.locator('#errActions')).toBeHidden();
+        const geometry = await page.evaluate(() => {
+          const controls = Array.from(document.querySelectorAll('button, summary, #seek'))
+            .filter((node) => node.getClientRects().length > 0)
+            .map((node) => {
+              const box = node.getBoundingClientRect();
+              return { id: node.id, width: box.width, height: box.height };
+            });
+          return {
+            viewport: {
+              width: window.innerWidth,
+              height: window.innerHeight,
+              density: window.devicePixelRatio,
+            },
+            clientWidth: document.documentElement.clientWidth,
+            scrollWidth: document.documentElement.scrollWidth,
+            contentHeight: document.documentElement.scrollHeight,
+            controls,
+          };
+        });
+        expect(geometry.scrollWidth).toBeLessThanOrEqual(geometry.clientWidth);
+        for (const control of geometry.controls) {
+          expect(control.width, `${control.id} touch width`).toBeGreaterThanOrEqual(44);
+          expect(control.height, `${control.id} touch height`).toBeGreaterThanOrEqual(44);
+        }
+        await expect(page.locator(PRIMARY_ACTION)).toHaveCount(1);
+        await expect(page.locator('#undo')).toBeVisible();
+        await testInfo.attach('geometry', {
+          body: JSON.stringify(geometry),
+          contentType: 'application/json',
+        });
+        await page.screenshot({
+          path: testInfo.outputPath(`guided-${locale}-${width}.png`),
+          fullPage: true,
+        });
+        // Scrolling to each control is allowed; none may be clipped by a fixed container.
+        for (const selector of [PRIMARY_ACTION, '#skip', '#bad', '#undo']) {
+          await page.locator(selector).scrollIntoViewIfNeeded();
+          await expect(page.locator(selector)).toBeInViewport();
+        }
+      });
+    }
+  }
+
   test('the empty state is actually empty — `hidden` is not defeated by a display rule', async ({
     page,
   }) => {
     // Regression: #card sets display:flex, which beats the hidden attribute's display:none default,
     // so the empty review card rendered next to the "all reviewed" message.
     // `exhausted = true` states what this test is actually about: the TRUE empty state. Without it,
-    // show() now (correctly) tries a refill, whose fetch fails on file:// — and the failure path takes
+    // show() now (correctly) tries a refill, whose unmocked fetch is aborted — the failure path takes
     // down the "Loading clips…" placeholder, which is the dead-end fix, not a regression. This test's
     // subject is the CSS rule, so it must reach the empty state directly instead of relying on a
     // placeholder that used to sit there forever.
@@ -200,14 +463,157 @@ test.describe('Couch Review phone page', () => {
     expect(await size()).toBe(bigger);
   });
 
+  for (const sizing of ['native', 'fallback']) {
+    test(`compact transcript grows and shrinks with text, font and width (${sizing})`, async ({
+      page,
+    }) => {
+      await page.setViewportSize({ width: 390, height: 844 });
+      if (sizing === 'fallback') {
+        await page.evaluate(() => {
+          const original = CSS.supports.bind(CSS);
+          CSS.supports = ((...args: string[]) =>
+            args[0] === 'field-sizing'
+              ? false
+              : Reflect.apply(original, CSS, args)) as typeof CSS.supports;
+        });
+        await page.addStyleTag({ content: '#text { field-sizing: fixed; }' });
+      }
+      await showAClip(page);
+      await page.locator('#text').fill('دەقی کورت');
+      const shortHeight = await page.locator('#text').evaluate((text) => text.clientHeight);
+      expect(shortHeight).toBeLessThan(90);
+      const longText = 'ئەمە دەقێکی درێژە بۆ پێداچوونەوە و ڕاستکردنەوە. '.repeat(12);
+      await page.locator('#text').fill(longText);
+      const longHeight = await page.locator('#text').evaluate((text) => text.clientHeight);
+      expect(longHeight).toBeGreaterThan(shortHeight * 3);
+      await expect
+        .poll(() => page.locator('#text').evaluate((text) => text.scrollHeight - text.clientHeight))
+        .toBeLessThanOrEqual(1);
+      await page.locator('#textsize').click();
+      await expect
+        .poll(() => page.locator('#text').evaluate((text) => text.clientHeight))
+        .toBeGreaterThan(longHeight);
+      await page.setViewportSize({ width: 320, height: 844 });
+      await expect
+        .poll(() => page.locator('#text').evaluate((text) => text.scrollHeight - text.clientHeight))
+        .toBeLessThanOrEqual(1);
+      await expect(page.locator('#text')).toHaveValue(longText);
+      await page.locator('#text').fill('دەقی کورت');
+      await expect
+        .poll(() => page.locator('#text').evaluate((text) => text.clientHeight))
+        .toBeLessThan(90);
+      await page.locator(PRIMARY_ACTION).scrollIntoViewIfNeeded();
+      await expect(page.locator(PRIMARY_ACTION)).toBeInViewport();
+    });
+  }
+
+  for (const locale of ['en', 'ckb']) {
+    test(`compact phone puts count and server coins on one line with decisions below text (${locale})`, async ({
+      page,
+    }, testInfo) => {
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.emulateMedia({ colorScheme: 'dark', reducedMotion: 'reduce' });
+      // A settled synthetic queue, not a card painted over a still-failing startup request.
+      await page.route('**/api/queue', (route) =>
+        route.fulfill({
+          json: {
+            playbackContractVersion: 4,
+            reviewer: 'Demo',
+            pendingTotal: 407,
+            items: [
+              {
+                id: 's1',
+                text: 'دەقی نموونە',
+                durationMs: 1000,
+                speakerId: 'spk_01',
+                rowVersion: '1',
+                redo: true,
+              },
+              { id: 's2', text: 'دەقی دووەم', durationMs: 1000, rowVersion: '2' },
+            ],
+            accountingAvailable: true,
+            reviewedMs: 600000,
+            correctedMs: 1000,
+            earnedMicroIqd: '1250000000',
+            settledMicroIqd: '0',
+            outstandingMicroIqd: '1250000000',
+            legacyEventsPendingReconciliation: 0,
+          },
+        }),
+      );
+      await page.reload();
+      await expect(page.locator('#text')).toHaveValue('دەقی نموونە');
+      await page.evaluate(`
+        locale = ${JSON.stringify(locale)};
+        doneThisSession = 1;
+        applyLocale(); renderProgress();
+      `);
+      await page.locator('#text').fill('ئەمە دەقێکی نوێیە بۆ پێداچوونەوە');
+      await page.locator('#text').blur();
+      await authorizeCurrentClipForNonPlaybackTest(page);
+      await page.evaluate('rearmPlayback(queue[i])');
+      await page.locator('#play').click();
+      await expect
+        .poll(() => page.locator('#player').evaluate((p: HTMLAudioElement) => p.ended))
+        .toBe(true);
+      await expect(page.locator('#warn')).toBeHidden();
+      await expect(page.locator('#errActions')).toBeHidden();
+      await expect(page.locator('#compactProgress')).toHaveText('1 / 407');
+      await expect(page.locator('#accounting')).toHaveText('1,250');
+      await expect(page.locator('#listenTitle')).toBeHidden();
+      await expect(page.locator('#transcriptTitle')).toBeHidden();
+      const boxes = await page.evaluate(() => {
+        const box = (id: string) => document.getElementById(id)!.getBoundingClientRect().toJSON();
+        return {
+          header: document.querySelector('header')!.getBoundingClientRect().toJSON(),
+          progress: box('compactProgress'),
+          coins: box('accounting'),
+          text: box('text'),
+          actions: box('actions'),
+          skip: box('skip'),
+          height: document.documentElement.scrollHeight,
+        };
+      });
+      expect(boxes.progress.top).toBeGreaterThanOrEqual(boxes.header.top);
+      expect(boxes.coins.bottom).toBeLessThanOrEqual(boxes.header.bottom);
+      expect(Math.abs(boxes.progress.top - boxes.coins.top)).toBeLessThan(10);
+      expect(boxes.actions.top - boxes.text.bottom).toBeLessThan(65);
+      expect(boxes.skip.bottom).toBeLessThan(650);
+      await page.screenshot({
+        path: testInfo.outputPath(`compact-${locale}-390.png`),
+        fullPage: true,
+      });
+      expect((await new AxeBuilder({ page }).withTags(WCAG_AA).analyze()).violations).toEqual([]);
+      await page.emulateMedia({ colorScheme: 'light', reducedMotion: 'reduce' });
+      await page.screenshot({
+        path: testInfo.outputPath(`compact-${locale}-390-light.png`),
+        fullPage: true,
+      });
+      expect((await new AxeBuilder({ page }).withTags(WCAG_AA).analyze()).violations).toEqual([]);
+      await page.setViewportSize({ width: 320, height: 700 });
+      const narrowHeader = await page.evaluate(() => {
+        const header = document.querySelector('header')!.getBoundingClientRect();
+        return ['compactProgress', 'accounting'].map((id) => {
+          const box = document.getElementById(id)!.getBoundingClientRect();
+          return { top: box.top - header.top, bottom: box.bottom - header.top };
+        });
+      });
+      expect(Math.abs(narrowHeader[0].top - narrowHeader[1].top)).toBeLessThan(10);
+      expect(narrowHeader.every((box) => box.bottom < 60)).toBe(true);
+      await page.locator('#helpTitle').click();
+      await expect(page.locator('#progress')).toContainText('407');
+      await page.evaluate('applyAccounting({accountingAvailable:false}); renderProgress()');
+      await expect(page.locator('#accounting')).toBeHidden();
+    });
+  }
+
   test('a dropped submit goes to the outbox and is replayed on the next load', async ({ page }) => {
     // THE DATA-LOSS PATH, and it had no test. A phone at the edge of Wi-Fi loses requests; the outbox
     // is what turns "your correction is gone" into "it lands when you reconnect". If this silently
     // broke, a reviewer would keep working and their decisions would evaporate one by one — the exact
     // failure that is invisible until the corpus is short and nobody knows why.
     //
-    // fetch is stubbed rather than routed: page.route cannot intercept a file:// page, and the point
-    // here is the PAGE's behaviour when the network fails, not the server's.
+    // fetch is stubbed so this test controls the exact failure and acknowledgement, not the server.
     await page.addInitScript(() => {
       (window as unknown as { __net: { fail: boolean; calls: string[] } }).__net = {
         fail: false,
@@ -248,7 +654,7 @@ test.describe('Couch Review phone page', () => {
     // The network drops, then the reviewer saves.
     await page.evaluate(`window.__net.fail = true`);
     await authorizeCurrentClipForNonPlaybackTest(page);
-    await page.locator('#accept').click();
+    await page.locator(PRIMARY_ACTION).click();
 
     // Their decision is HELD, not lost — and they are moved on rather than stranded on a dead clip.
     const queued = await readOperationOutbox(page);
@@ -269,6 +675,10 @@ test.describe('Couch Review phone page', () => {
     await expect.poll(async () => operationOutboxCount(page), { timeout: 5000 }).toBe(0);
     const calls = (await page.evaluate(`window.__net.calls`)) as string[];
     expect(calls.some((c) => c.includes('/api/decision') && c.includes('s1'))).toBe(true);
+    // A server-acknowledged recovery must expose the same Undo affordance as an online save.
+    await expect(page.locator('#undo')).toBeVisible();
+    await expect(page.locator('#afterLabel')).toHaveText('پاشەکەوتکرا');
+    await expect(page.locator('#done')).not.toContainText('نەنێردراون');
   });
 
   test('outbox readback uses the same undefined-property semantics as JSON storage and wire', async ({
@@ -310,7 +720,7 @@ test.describe('Couch Review phone page', () => {
     await page.goto(PAGE);
     await showAClip(page);
     await authorizeCurrentClipForNonPlaybackTest(page);
-    await page.locator('#accept').click();
+    await page.locator(PRIMARY_ACTION).click();
     await expect.poll(async () => operationOutboxCount(page)).toBe(0);
   });
 
@@ -379,13 +789,13 @@ test.describe('Couch Review phone page', () => {
 
     // Draining batch 1 must go BACK to the server, not declare victory.
     await authorizeCurrentClipForNonPlaybackTest(page);
-    await page.locator('#accept').click();
+    await page.locator(PRIMARY_ACTION).click();
     await expect(page.locator('#text')).toHaveValue('دووەم', { timeout: 5000 });
     await expect(page.locator('#done')).toBeHidden();
 
     // Only a fetch that genuinely comes back empty may draw the finished state.
     await authorizeCurrentClipForNonPlaybackTest(page);
-    await page.locator('#accept').click();
+    await page.locator(PRIMARY_ACTION).click();
     await expect(page.locator('#done')).toBeVisible({ timeout: 5000 });
     await expect(page.locator('#done')).toContainText('هەموو پارچەکان');
     expect(await page.evaluate(`window.__q.fetches`)).toBe(3);
@@ -600,7 +1010,7 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#progress')).toHaveText('پارچەی 1 لە 1 (1s)');
 
     await authorizeCurrentClipForNonPlaybackTest(page);
-    await page.locator('#accept').click();
+    await page.locator(PRIMARY_ACTION).click();
     await expect(page.locator('#done')).toBeVisible({ timeout: 5000 });
 
     // UNDO must still be reachable. It used to live inside #card, so it vanished exactly when the
@@ -661,7 +1071,7 @@ test.describe('Couch Review phone page', () => {
     await page.goto(PAGE);
     await expect(page.locator('#text')).toHaveValue('کۆتا پارچە', { timeout: 5000 });
     await authorizeCurrentClipForNonPlaybackTest(page);
-    await page.locator('#accept').click();
+    await page.locator(PRIMARY_ACTION).click();
 
     await expect(page.locator('#done')).toBeVisible({ timeout: 5000 });
     await expect(page.locator('#done')).not.toContainText('هەموو پارچەکان');
@@ -732,6 +1142,9 @@ test.describe('Couch Review phone page', () => {
     `);
     await expect(page.locator('#warn')).toBeVisible();
     await expect(page.locator('#skip')).toBeVisible();
+    await expect(page.locator(PRIMARY_ACTION)).toBeDisabled();
+    await expect(page.locator('#bad')).toBeDisabled();
+    await expect(page.locator('#skip')).toBeEnabled();
 
     await page.locator('#skip').click();
     // Moved on to the next clip...
@@ -747,6 +1160,89 @@ test.describe('Couch Review phone page', () => {
     expect(aboutBroken).toHaveLength(1);
     expect(JSON.parse(aboutBroken[0]).action).toBe('skip');
   });
+
+  for (const failure of ['corrupt', '404', '416', '503']) {
+    test(`native audio ${failure} preserves the draft and recovers through Retry`, async ({
+      page,
+    }) => {
+      let broken = true;
+      await page.route('**/api/audio/**', (route) => {
+        if (!broken) return route.fallback();
+        return route.fulfill({
+          status: failure === 'corrupt' ? 200 : Number(failure),
+          contentType: failure === 'corrupt' ? 'audio/wav' : 'text/plain',
+          body: 'not a decodable audio file',
+        });
+      });
+      await showAClip(page);
+      await authorizeCurrentClipForNonPlaybackTest(page);
+      await page.evaluate('preparePlayback(queue[i], false)');
+      await page.locator('#text').fill('ڕاستکردنەوەی پارێزراو');
+      await expect(page.locator('#warn')).toBeVisible();
+      await expect(page.locator(PRIMARY_ACTION)).toBeDisabled();
+      await expect(page.locator('#bad')).toBeDisabled();
+      await expect(page.locator('#skip')).toBeEnabled();
+      // Repainting the same revision cannot turn a broken player into a judgeable clip.
+      await page.evaluate('show()');
+      await expect(page.locator(PRIMARY_ACTION)).toBeDisabled();
+      await expect(page.locator('#retryAudio')).toBeVisible();
+      expect(await operationOutboxCount(page)).toBe(0);
+      broken = false;
+      await page.locator('#retryAudio').click();
+      await page.locator('#play').click();
+      await expect
+        .poll(() => page.locator('#player').evaluate((p: HTMLAudioElement) => p.ended))
+        .toBe(true);
+      await expect(page.locator('#warn')).toBeHidden();
+      await expect(page.locator('#text')).toHaveValue('ڕاستکردنەوەی پارێزراو');
+      await expect(page.locator(PRIMARY_ACTION)).toBeEnabled();
+      expect(await operationOutboxCount(page)).toBe(0);
+    });
+  }
+
+  for (const locale of ['en', 'ckb']) {
+    test(`long labels and 200% CSS zoom reflow without clipped controls in ${locale}`, async ({
+      page,
+    }, testInfo) => {
+      // CSS layout zoom in Chromium, not physical-phone / OS text scaling certification.
+      await page.setViewportSize({ width: 640, height: 1000 });
+      await showAClip(page);
+      await page.evaluate(`
+        locale = ${JSON.stringify(locale)};
+        me = 'Reviewer_' + 'long_name_'.repeat(15);
+        queue[0].speakerId = 'speaker_' + 'identifier'.repeat(20);
+        queue[0].speakerChange = true;
+        queue[0].uncertainWords = ['وشەیەکی نادڵنیا'];
+        applyLocale(); show();
+        document.documentElement.style.zoom = '2';
+        tsize = 28; applyTextSize();
+      `);
+      await expect
+        .poll(() =>
+          page.evaluate(
+            () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+          ),
+        )
+        .toBeLessThanOrEqual(1);
+      for (const selector of [
+        '#lang',
+        '#textsize',
+        '#helpTitle',
+        PRIMARY_ACTION,
+        '#skip',
+        '#bad',
+      ]) {
+        await page.locator(selector).scrollIntoViewIfNeeded();
+        await expect(page.locator(selector)).toBeInViewport();
+        const box = await page.locator(selector).boundingBox();
+        expect(box!.x).toBeGreaterThanOrEqual(0);
+        expect(box!.x + box!.width).toBeLessThanOrEqual(641);
+      }
+      await page.locator('#helpTitle').click();
+      await expect(page.locator('#helpText')).toBeVisible();
+      await page.screenshot({ path: testInfo.outputPath(`zoom-${locale}.png`), fullPage: true });
+    });
+  }
 
   test('a slow first load says so instead of showing a blank page', async ({ page }) => {
     // Both panels start hidden, so until /api/queue resolved the reviewer saw nothing at all — and on
@@ -845,7 +1341,7 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#text')).toHaveValue('یەکەم', { timeout: 5000 });
 
     await authorizeCurrentClipForNonPlaybackTest(page);
-    await page.locator('#accept').click();
+    await page.locator(PRIMARY_ACTION).click();
     // HELD in the outbox, and the reviewer is moved on rather than stranded re-submitting.
     await expect.poll(async () => operationOutboxCount(page)).toBe(1);
     await expect(page.locator('#text')).toHaveValue('دووەم');
@@ -930,7 +1426,7 @@ test.describe('Couch Review phone page', () => {
     // The reviewer goes back and re-reviews that same clip, and this time it lands.
     await page.evaluate(`window.__refuse = false`);
     await authorizeCurrentClipForNonPlaybackTest(page);
-    await page.locator('#accept').click();
+    await page.locator(PRIMARY_ACTION).click();
 
     await expect
       .poll(async () => page.evaluate(`localStorage.getItem('cortex.couch.refused')`))
@@ -1026,7 +1522,7 @@ test.describe('Couch Review phone page', () => {
       document.getElementById('err').textContent = STRINGS[locale].linkExpired;
     `);
     await authorizeCurrentClipForNonPlaybackTest(page);
-    await page.locator('#accept').click();
+    await page.locator(PRIMARY_ACTION).click();
 
     // The refusal is retracted from storage, but the link notice stays up.
     await expect
@@ -1089,7 +1585,7 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#text')).toHaveValue('پارچە', { timeout: 5000 });
 
     await authorizeCurrentClipForNonPlaybackTest(page);
-    await page.locator('#accept').click();
+    await page.locator(PRIMARY_ACTION).click();
     await expect.poll(async () => operationOutboxCount(page)).toBe(1);
 
     // The throttle clears. NOTHING else happens: no reload, no online event, no batch drain.
@@ -1198,7 +1694,7 @@ test.describe('Couch Review phone page', () => {
     // Offline: the decision is held.
     await page.evaluate(`localStorage.setItem('__netmode', 'offline')`);
     await authorizeCurrentClipForNonPlaybackTest(page);
-    await page.locator('#accept').click();
+    await page.locator(PRIMARY_ACTION).click();
     await expect.poll(async () => operationOutboxCount(page)).toBe(1);
 
     // Back online, but the owner restarted the server meanwhile — the token is dead.
@@ -1233,7 +1729,7 @@ test.describe('Couch Review phone page', () => {
     await page.goto(PAGE);
     await showAClip(page);
     await authorizeCurrentClipForNonPlaybackTest(page);
-    await page.locator('#accept').click();
+    await page.locator(PRIMARY_ACTION).click();
 
     // The verdict is held for the next working link...
     await expect.poll(async () => operationOutboxCount(page)).toBe(1);
@@ -1499,7 +1995,7 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#progress')).not.toContainText('لە 2');
     // And the position advances within it rather than restarting at every batch boundary.
     await authorizeCurrentClipForNonPlaybackTest(page);
-    await page.locator('#accept').click();
+    await page.locator(PRIMARY_ACTION).click();
     await expect(page.locator('#progress')).toContainText('2');
     await expect(page.locator('#progress')).toContainText('407');
   });
@@ -1627,8 +2123,8 @@ test.describe('Couch Review phone page', () => {
     await page.addInitScript(() => {
       const w = window as unknown as { __plays: string[] };
       w.__plays = [];
-      // jsdom-less Chromium will not decode a nonexistent src, so record the INTENT rather than
-      // relying on real playback: the assertion is about whether the page asks to play, and when.
+      // Record playback INTENT: this assertion is about whether the page asks to play, and when.
+      // A separate test exercises native decoding/playback of the routed synthetic WAV.
       const proto = window.HTMLMediaElement.prototype;
       proto.play = function play() {
         w.__plays.push(this.getAttribute('src') || '');
@@ -1711,7 +2207,7 @@ test.describe('Couch Review phone page', () => {
     // Opening the page must NOT start audio on its own — arriving is not a request to play.
     expect(await page.evaluate(`window.__plays`)).toEqual([]);
 
-    await page.locator('#accept').click();
+    await page.locator(PRIMARY_ACTION).click();
     await expect(page.locator('#text')).toHaveValue('دووەم', { timeout: 5000 });
     await expect.poll(async () => page.evaluate(`window.__plays.length`)).toBe(1);
     // ...and it played the clip that is now on screen, not the one just decided.
@@ -1855,6 +2351,7 @@ test.describe('Couch Review phone page', () => {
   });
 
   test('the keyboard can never cover the save buttons or the toast', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
     // THE WORST FLOW-BREAKER ON THE PAGE, verified: on iOS the on-screen keyboard does not resize the
     // layout viewport, so a reviewer who tapped the transcript to fix a word had Save/Accept/Reject —
     // and the "Saved" toast — sitting underneath it. They typed the correction and could not see the
@@ -1865,7 +2362,9 @@ test.describe('Couch Review phone page', () => {
     // Nothing covered yet: no phantom padding from ordinary browser chrome.
     expect(['', '0px']).toContain(await kb());
 
-    const roomBefore = await page.evaluate(`document.documentElement.scrollHeight`);
+    const paddingBefore = await page.evaluate(
+      `parseFloat(getComputedStyle(document.body).paddingBottom)`,
+    );
     // Simulate the keyboard by shrinking the visual viewport, exactly as iOS reports it — the layout
     // viewport does NOT change there, which is the whole reason this listener has to exist.
     await page.locator('#text').focus();
@@ -1878,19 +2377,24 @@ test.describe('Couch Review phone page', () => {
 
     // Half one: the page can now scroll far enough for the row to clear the keyboard. Without this
     // there is no room at all — the buttons sit behind it with nowhere to go.
-    expect(await page.evaluate(`document.documentElement.scrollHeight`)).toBe(roomBefore + 320);
+    // Compact clips can already have spare space inside min-height:100dvh, so total document
+    // height need not grow by the whole keyboard height. Check the actual clearance padding;
+    // the following bounds assertions still require every decision to be above the keyboard.
+    expect(await page.evaluate(`parseFloat(getComputedStyle(document.body).paddingBottom)`)).toBe(
+      paddingBefore + 320,
+    );
 
     // Half two: it is actually scrolled there, so the reviewer does not have to discover that they
     // could scroll. Every decision button must be inside what they can see.
     const visibleBottom = await page.evaluate(`window.innerHeight - 320`);
-    for (const id of ['save', 'accept', 'bad']) {
+    for (const selector of [PRIMARY_ACTION, '#bad', '#skip']) {
       await expect
         .poll(
           async () => {
-            const box = await page.locator(`#${id}`).boundingBox();
+            const box = await page.locator(selector).boundingBox();
             return box ? box.y + box.height : Number.POSITIVE_INFINITY;
           },
-          { message: `#${id} must clear the keyboard`, timeout: 5000 },
+          { message: `${selector} must clear the keyboard`, timeout: 5000 },
         )
         .toBeLessThanOrEqual(visibleBottom);
     }

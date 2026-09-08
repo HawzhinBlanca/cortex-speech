@@ -28,6 +28,11 @@
       "version": 70,
       "description": "Add superseding lag-tolerant review-pool dedup manifests that may retire reviewed twins",
       "sourceBlockSha256": "d0b40840d123c5d68ecdcf386f0593175bb6744aacb698be2ef74f7f16682c67"
+    },
+    {
+      "version": 71,
+      "description": "Immutable owner reopen rounds and immediate prior-authority withdrawal",
+      "sourceBlockSha256": "4668e782545b52023f7067e95db179f290065539ad5be03d3b57d7964623692b"
     }
   ]
 }

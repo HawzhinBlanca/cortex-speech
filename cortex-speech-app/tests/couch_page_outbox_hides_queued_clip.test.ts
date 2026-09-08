@@ -33,6 +33,9 @@ async function pageWithQueue(items: Array<{ id: string }>, seedOutboxFor: string
     beforeParse(win: any) {
       win.fetch = async (input: string) => {
         const url = String(input);
+        // This fixture models an UNACKNOWLEDGED operation, not a successful empty ACK.
+        // Initial-load replay now finishes before rendering eligibility; keep the transport lost.
+        if (seedOutboxFor && url.endsWith('/api/decision')) throw new Error('fixture offline');
         if (url.endsWith('/api/queue')) {
           return jsonResponse({
             playbackContractVersion: 4,
@@ -78,6 +81,7 @@ describe('couch page outbox', () => {
   it('keeps a clip with a queued, unacknowledged decision out of the batch', async () => {
     const dom = await pageWithQueue(items, 's1');
     expect(dom.window.eval('queue.map((s) => s.id)')).toEqual(['s2']);
+    expect(dom.window.eval('readOutbox().map((s) => s.operationId)')).toEqual([OP_QUEUED]);
   });
 
   it('serves every clip when nothing is queued', async () => {

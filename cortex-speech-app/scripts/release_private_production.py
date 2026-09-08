@@ -90,15 +90,17 @@ SCHEMA_CONTRACT_FIELDS = {
     "appendOnlyContract",
     "appendOnlyContractSha256",
 }
-SCHEMA_CONTRACT_ID = "cortex-private-production-schema-65-to-70-v1"
-SCHEMA_CONTRACT_TARGET = 70
-# Migration sources this controller has proven on a live-sized clone: the schema-65 legacy boundary
-# (v1 pointer) and the schema-69 line that served until the dedup-supersession release.
-SCHEMA_CONTRACT_SOURCES = [65, 69]
+SCHEMA_CONTRACT_ID = "cortex-private-production-schema-65-to-71-v1"
+SCHEMA_CONTRACT_TARGET = 71
+# These are the only permitted source schemas; each candidate must still prove its own clone preflight.
+SCHEMA_CONTRACT_SOURCES = [65, 69, 70]
 # Contracts a COMPATIBLE PREVIOUS release (schema-2 pointer) may still carry: id -> (target, sources).
 # A 69 pointer is the last-known-good during a 69->70 handover and is validated against its own
 # contract, never against the current one.
-PREVIOUS_SCHEMA_CONTRACTS = {"cortex-private-production-schema-65-to-69-v1": (69, [65])}
+PREVIOUS_SCHEMA_CONTRACTS = {
+    "cortex-private-production-schema-65-to-69-v1": (69, [65]),
+    "cortex-private-production-schema-65-to-70-v1": (70, [65, 69]),
+}
 PRODUCTION_SCHEMA_BOUNDARY = 65
 HISTORICAL_PREFIX_START = "pub static MIGRATIONS: &[Migration] = &["
 FIRST_POST_PRODUCTION_MIGRATION = "    Migration {\n        version: 66,"
@@ -851,7 +853,25 @@ def database_content_sha256(db_path: Path) -> str:
     return digest.hexdigest()
 
 
-def preflight_clone(data_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+def apply_quality_reopen(db: Path, manifest: dict[str, Any], plan_path: Path) -> dict[str, Any]:
+    """Use the locked, atomic owner writer; never recompute a reviewer-wide selection here."""
+    plan = load_json(validate_artifact(plan_path, "exact quality reopen plan"))
+    items = plan.get("items")
+    if not isinstance(items, list) or not 1 <= len(items) <= 10000:
+        raise ReleaseError("quality reopen plan has no bounded exact membership")
+    report = run_json([str(manifest["poolAdminExe"]), "apply-reopen", "--db", str(db),
+                       "--manifest", str(plan_path), "--confirm-quality-hold"], timeout=600)
+    if (report.get("roundId") != plan.get("roundId")
+            or report.get("planSha256") != plan.get("planSha256")
+            or type(report.get("reopenedOrAlreadyApplied")) is not int
+            or report["reopenedOrAlreadyApplied"] != len(items)
+            or report.get("paymentHistoryChanged") is not False
+            or report.get("requiresFreshDistinctReviewers") is not True):
+        raise ReleaseError("quality reopen writer did not prove the exact unchanged-pay round")
+    return report
+
+
+def preflight_clone(data_dir: Path, manifest: dict[str, Any], reopen_plan: Path | None = None) -> dict[str, Any]:
     db_path = data_dir / "cortex-speech.db"
     with tempfile.TemporaryDirectory(prefix="cortex-release-preflight-") as raw:
         clone = Path(raw)
@@ -883,6 +903,7 @@ def preflight_clone(data_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
             timeout=600,
         )
         rights = run_json([admin, "stamp-rights", "--db", str(clone / "cortex-speech.db")], timeout=300)
+        reopen = apply_quality_reopen(clone / "cortex-speech.db", manifest, reopen_plan) if reopen_plan else None
         report = run_json([admin, "certify", "--db", str(clone / "cortex-speech.db"), "--full-integrity"], timeout=600)
         if report.get("appGitSha") != manifest["appGitSha"]:
             raise ReleaseError("candidate pool_admin is not built from the declared release commit")
@@ -898,6 +919,7 @@ def preflight_clone(data_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
             "sourceSchemaVersion": source_schema,
             "migration": migration,
             "rights": rights,
+            "qualityReopen": reopen,
             "certification": report,
         }
 
@@ -1054,19 +1076,6 @@ def prove_canonical_queues(data_dir: Path, manifest: dict[str, Any]) -> dict[str
     available: dict[str, int] = {}
     for reviewer in session_reviewers(data_dir):
         dialects = reviewer_dialects(data_dir, reviewer)
-        probe_command = [str(manifest["poolAdminExe"]), "probe", "--db", str(db), "--reviewer", reviewer]
-        for dialect in dialects:
-            probe_command.extend(["--dialect", dialect])
-        probe = run_json(probe_command, timeout=180)
-        count = probe.get("availableClips")
-        if type(count) is not int or count <= 0:
-            raise ReleaseError(f"canonical release queue is empty for reviewer {reviewer}")
-        if (
-            probe.get("passes") is not True
-            or probe.get("sampleAudioValidWav") is not True
-            or probe.get("submissionIdempotencyAuthority") is not True
-        ):
-            raise ReleaseError(f"canonical release audio/idempotency probe failed for reviewer {reviewer}")
         benchmark_command = [
             str(manifest["poolAdminExe"]),
             "benchmark",
@@ -1082,6 +1091,28 @@ def prove_canonical_queues(data_dir: Path, manifest: dict[str, Any]) -> dict[str
         benchmark = run_json(benchmark_command, timeout=180)
         if benchmark.get("passes") is not True:
             raise ReleaseError(f"canonical release queue latency failed for reviewer {reviewer}")
+        count = benchmark.get("availableClips")
+        if type(count) is not int or count < 0:
+            raise ReleaseError(f"canonical release queue count is invalid for reviewer {reviewer}")
+        # A completed or intentionally restricted queue is a valid idle state, not an outage.
+        # The full-library certification still verifies all audio. Do not invent a sample or call
+        # an empty queue reviewer-ready; retain its exact zero in the handover result. This also
+        # lets recovery bring the app back while an owner's targeted reviewer hold remains active.
+        if count == 0:
+            available[reviewer] = 0
+            continue
+        probe_command = [str(manifest["poolAdminExe"]), "probe", "--db", str(db), "--reviewer", reviewer]
+        for dialect in dialects:
+            probe_command.extend(["--dialect", dialect])
+        probe = run_json(probe_command, timeout=180)
+        if (
+            type(probe.get("availableClips")) is not int
+            or probe["availableClips"] != count
+            or probe.get("passes") is not True
+            or probe.get("sampleAudioValidWav") is not True
+            or probe.get("submissionIdempotencyAuthority") is not True
+        ):
+            raise ReleaseError(f"canonical release audio/idempotency probe failed for reviewer {reviewer}")
         available[reviewer] = count
     return available
 
@@ -1554,7 +1585,13 @@ def deploy(args: argparse.Namespace) -> int:
         )
     manifest = stage_release(args.candidate_dir, args.source_root, release_root, args.git_sha, args.dedup_manifest)
     print(f"STAGED_RELEASE={manifest['releaseId']}")
-    preflight = preflight_clone(data_dir, manifest)
+    reopen_plan = getattr(args, "reopen_plan", None)
+    if reopen_plan is not None:
+        reopen_plan = validate_artifact(reopen_plan, "exact quality reopen plan").resolve(strict=True)
+    reopen_plan_sha = sha256_file(reopen_plan) if reopen_plan else None
+    preflight = preflight_clone(data_dir, manifest, reopen_plan)
+    if reopen_plan is not None and sha256_file(reopen_plan) != reopen_plan_sha:
+        raise ReleaseError("quality reopen plan changed during clone rehearsal")
     if preflight["sourceSchemaVersion"] != source_schema:
         raise ReleaseError("clone preflight source schema differs from the live database boundary")
     audio = preflight["certification"]["audio"]
@@ -1634,6 +1671,11 @@ def deploy(args: argparse.Namespace) -> int:
             timeout=600,
         )
         run_json([admin, "stamp-rights", "--db", str(db)], timeout=600)
+        if reopen_plan is not None:
+            if sha256_file(reopen_plan) != reopen_plan_sha:
+                raise ReleaseError("quality reopen plan changed after clone rehearsal")
+            reopened = apply_quality_reopen(db, manifest, reopen_plan)
+            print(f"QUALITY_REOPEN=PASS round={reopened['roundId']} clips={reopened['reopenedOrAlreadyApplied']} payChanged=false")
         certification = certify_live(data_dir, manifest)
         queues = prove_canonical_queues(data_dir, manifest)
         if max_pool_decision_id(db) != baseline:
@@ -1708,6 +1750,8 @@ def parser() -> argparse.ArgumentParser:
         target.add_argument("--data-dir", type=Path, default=default_data)
         target.add_argument("--release-root", type=Path, default=default_releases)
         target.add_argument("--dedup-manifest", type=Path, required=True)
+        target.add_argument("--reopen-plan", type=Path,
+                            help="exact owner quality-hold plan, clone-proven then applied before exposure")
     deploy_parser.add_argument("--fallback-app", type=Path)
     deploy_parser.add_argument("--fallback-watchdog", type=Path)
     recover_parser = commands.add_parser("recover", help="resume the fail-closed recovery journal")

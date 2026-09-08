@@ -5790,6 +5790,294 @@ pub static MIGRATIONS: &[Migration] = &[
              DROP TABLE review_pool_dedup_supersessions;",
         ),
     },
+    Migration {
+        version: 71,
+        description: "Immutable owner reopen rounds and immediate prior-authority withdrawal",
+        up_sql: "-- Owner-directed re-review epochs. Quality withdrawal never deletes history or reverses pay.
+CREATE TABLE review_reopen_rounds (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ round_id TEXT NOT NULL UNIQUE CHECK(length(round_id)=36 AND round_id=lower(trim(round_id))),
+ pool_id TEXT NOT NULL REFERENCES review_pool_registry(pool_id),
+ plan_sha256 TEXT NOT NULL UNIQUE CHECK(length(plan_sha256)=64 AND plan_sha256 NOT GLOB '*[^0-9a-f]*'),
+ plan_json TEXT NOT NULL CHECK(json_valid(plan_json)),
+ reason TEXT NOT NULL CHECK(length(trim(reason)) BETWEEN 1 AND 2000),
+ member_count INTEGER NOT NULL CHECK(member_count BETWEEN 1 AND 10000),
+ created_at_ms INTEGER NOT NULL CHECK(created_at_ms>0)
+) STRICT;
+CREATE TABLE review_reopen_members (
+ round_seq INTEGER NOT NULL REFERENCES review_reopen_rounds(id),
+ segment_id TEXT NOT NULL REFERENCES speech_segments(id) ON DELETE RESTRICT,
+ pool_decision_floor INTEGER NOT NULL CHECK(pool_decision_floor>=0),
+ adjudication_floor INTEGER NOT NULL CHECK(adjudication_floor>=0),
+ review_event_floor INTEGER NOT NULL CHECK(review_event_floor>=0),
+ expected_revision INTEGER NOT NULL CHECK(expected_revision>=0),
+ target_revision INTEGER NOT NULL CHECK(target_revision=expected_revision+1),
+ evidence_sha256 TEXT NOT NULL CHECK(length(evidence_sha256)=64 AND evidence_sha256 NOT GLOB '*[^0-9a-f]*'),
+ priority INTEGER NOT NULL CHECK(priority BETWEEN 0 AND 2),
+ PRIMARY KEY(round_seq,segment_id)
+) STRICT;
+CREATE INDEX idx_review_reopen_member_latest ON review_reopen_members(segment_id,round_seq DESC);
+CREATE VIEW current_review_reopen_members_v71 AS
+ SELECT member.* FROM review_reopen_members member
+ WHERE NOT EXISTS (SELECT 1 FROM review_reopen_members newer
+                   WHERE newer.segment_id=member.segment_id AND newer.round_seq>member.round_seq);
+CREATE TRIGGER review_reopen_rounds_immutable_update BEFORE UPDATE ON review_reopen_rounds
+ BEGIN SELECT RAISE(ABORT,'reopen rounds are immutable'); END;
+CREATE TRIGGER review_reopen_rounds_immutable_delete BEFORE DELETE ON review_reopen_rounds
+ BEGIN SELECT RAISE(ABORT,'reopen rounds are immutable'); END;
+CREATE TRIGGER review_reopen_members_immutable_update BEFORE UPDATE ON review_reopen_members
+ BEGIN SELECT RAISE(ABORT,'reopen membership is immutable'); END;
+CREATE TRIGGER review_reopen_members_immutable_delete BEFORE DELETE ON review_reopen_members
+ BEGIN SELECT RAISE(ABORT,'reopen membership is immutable'); END;
+CREATE TRIGGER review_reopen_member_validate BEFORE INSERT ON review_reopen_members
+ WHEN NOT EXISTS (
+   SELECT 1 FROM review_reopen_rounds round
+   JOIN review_pool_members member ON member.pool_id=round.pool_id AND member.segment_id=NEW.segment_id
+   JOIN speech_segments segment ON segment.id=member.segment_id
+   WHERE round.id=NEW.round_seq AND segment.review_revision=NEW.expected_revision
+     AND segment.verified=1 AND segment.human_decision IN ('accept','edit','reject')
+     AND NOT EXISTS (SELECT 1 FROM review_pool_duplicate_exclusions excluded WHERE excluded.segment_id=member.segment_id)
+     AND NOT EXISTS (SELECT 1 FROM review_pool_voice_certificates cert WHERE cert.pool_id=member.pool_id AND cert.voice_name=member.voice_name)
+ )
+ OR NEW.pool_decision_floor<>(SELECT COALESCE(MAX(id),0) FROM review_pool_decisions WHERE segment_id=NEW.segment_id)
+ OR NEW.adjudication_floor<>(SELECT COALESCE(MAX(id),0) FROM review_pool_owner_adjudications WHERE segment_id=NEW.segment_id)
+ OR NEW.review_event_floor<>(SELECT COALESCE(MAX(id),0) FROM review_events WHERE segment_id=NEW.segment_id)
+ OR (SELECT COUNT(*) FROM review_reopen_members WHERE round_seq=NEW.round_seq)>=(SELECT member_count FROM review_reopen_rounds WHERE id=NEW.round_seq)
+ BEGIN SELECT RAISE(ABORT,'reopen member is stale, retired, certified, or invalid'); END;
+DROP VIEW effective_review_pool_decisions_v62;
+CREATE VIEW effective_review_pool_decisions_v62 AS
+ SELECT decision.* FROM review_pool_decisions decision
+ WHERE NOT EXISTS (SELECT 1 FROM review_pool_reversals reversal WHERE reversal.decision_id=decision.id)
+ AND decision.id>COALESCE((SELECT pool_decision_floor FROM current_review_reopen_members_v71 round WHERE round.segment_id=decision.segment_id),0);
+DROP VIEW effective_independent_review_decisions_v61;
+CREATE VIEW effective_independent_review_decisions_v61 AS
+ SELECT decision.* FROM independent_review_decisions decision
+ WHERE NOT EXISTS (SELECT 1 FROM independent_review_reversals reversal WHERE reversal.decision_id=decision.id)
+ AND NOT EXISTS (SELECT 1 FROM current_review_reopen_members_v71 round WHERE round.segment_id=decision.segment_id);
+DROP TRIGGER review_pool_decision_validate_insert;
+CREATE TRIGGER review_pool_decision_validate_insert
+                 BEFORE INSERT ON review_pool_decisions
+                 WHEN
+                      (NEW.action IN ('accept','edit')
+                       AND (NEW.submitted_transcript IS NULL OR trim(NEW.submitted_transcript) = ''))
+                   OR (NEW.action IN ('reject','skip') AND NEW.submitted_transcript IS NOT NULL)
+                   OR (NEW.action <> 'skip' AND (
+                          NEW.audio_content_hash IS NULL
+                          OR length(NEW.audio_content_hash) <> 64
+                          OR NEW.audio_content_hash GLOB '*[^0-9a-f]*'
+                          OR typeof(NEW.source_start_ms) <> 'integer'
+                          OR typeof(NEW.source_end_ms) <> 'integer'
+                          OR NEW.source_start_ms < 0
+                          OR NEW.source_end_ms <= NEW.source_start_ms
+                       ))
+                   OR NOT EXISTS (
+                          SELECT 1 FROM review_pool_members member
+                           JOIN speech_segments segment ON segment.id=member.segment_id
+                           WHERE member.pool_id = NEW.pool_id
+                             AND member.segment_id = NEW.segment_id
+                             AND segment.verified = 1
+                             AND segment.human_decision IN ('accept','edit','reject')
+                             AND segment.raw_transcript = member.raw_transcript
+                             AND COALESCE(segment.model_version_id, '') = member.model_version_id
+                             AND segment.audio_content_hash = member.audio_content_hash
+                             AND json_extract(segment.alignment_json, '$.source_start_ms') = member.source_start_ms
+                             AND json_extract(segment.alignment_json, '$.source_end_ms') = member.source_end_ms
+                             AND segment.duration_ms = member.duration_ms
+                             AND NEW.served_transcript = trim(member.raw_transcript)
+                             AND NEW.duration_ms = member.duration_ms
+                             AND (
+                                  NEW.action = 'skip'
+                                  OR (
+                                     NEW.audio_content_hash = member.audio_content_hash
+                                     AND NEW.source_start_ms = member.source_start_ms
+                                     AND NEW.source_end_ms = member.source_end_ms
+                                  )
+                             )
+                      )
+                   OR EXISTS (
+                          SELECT 1 FROM speech_segments segment
+                           WHERE segment.id = NEW.segment_id
+                             AND lower(trim(COALESCE(segment.reviewed_by, '@desktop-owner')))
+                                 = lower(trim(NEW.reviewer))
+                             AND NOT EXISTS (SELECT 1 FROM current_review_reopen_members_v71 round WHERE round.segment_id=NEW.segment_id)
+                      )
+                   OR EXISTS (
+                          SELECT 1 FROM effective_review_pool_decisions_v62 prior
+                           WHERE prior.pool_id = NEW.pool_id
+                             AND prior.segment_id = NEW.segment_id
+                             AND prior.reviewer = NEW.reviewer COLLATE NOCASE
+                             AND NOT EXISTS (
+                                  SELECT 1 FROM review_pool_reversals reversal
+                                   WHERE reversal.decision_id = prior.id
+                             )
+                      )
+                   OR EXISTS (
+                          SELECT 1 FROM effective_independent_review_decisions_v61 prior
+                           WHERE prior.segment_id = NEW.segment_id
+                             AND prior.reviewer = NEW.reviewer COLLATE NOCASE
+                      )
+                   OR EXISTS (SELECT 1 FROM review_events event WHERE event.operation_id = NEW.operation_id)
+                   OR EXISTS (SELECT 1 FROM independent_review_decisions decision
+                               WHERE decision.operation_id = NEW.operation_id)
+                 BEGIN SELECT RAISE(ABORT, 'review pool decision is invalid, duplicated, or not independent'); END;
+DROP TRIGGER review_pool_v63_decision_terminal_guard;
+CREATE TRIGGER review_pool_v63_decision_terminal_guard
+                 BEFORE INSERT ON review_pool_decisions
+                 WHEN EXISTS (
+                        SELECT 1 FROM review_pool_voice_certificates certificate
+                        JOIN review_pool_members member
+                          ON member.pool_id=certificate.pool_id AND member.voice_name=certificate.voice_name
+                       WHERE member.pool_id=NEW.pool_id AND member.segment_id=NEW.segment_id
+                      )
+                   OR (NEW.action <> 'skip' AND 3 <= (
+                        SELECT COUNT(*) FROM (
+                            SELECT lower(trim(COALESCE(segment.reviewed_by, '@desktop-owner'))) AS reviewer
+                              FROM speech_segments segment
+                             WHERE segment.id=NEW.segment_id AND segment.verified=1
+                               AND segment.human_decision IN ('accept','edit','reject')
+                               AND NOT EXISTS (SELECT 1 FROM current_review_reopen_members_v71 round WHERE round.segment_id=segment.id)
+                            UNION
+                            SELECT lower(trim(decision.reviewer))
+                              FROM effective_independent_review_decisions_v61 decision
+                             WHERE decision.segment_id=NEW.segment_id AND decision.action<>'skip'
+                            UNION
+                            SELECT lower(trim(decision.reviewer))
+                              FROM effective_review_pool_decisions_v62 decision
+                             WHERE decision.segment_id=NEW.segment_id AND decision.action<>'skip'
+                        )
+                   ))
+                 BEGIN SELECT RAISE(ABORT, 'review pool clip is terminal or already has three effective judgements'); END;
+CREATE TRIGGER review_reopen_legacy_write_guard BEFORE INSERT ON independent_review_decisions
+ WHEN EXISTS (SELECT 1 FROM current_review_reopen_members_v71 round WHERE round.segment_id=NEW.segment_id)
+ BEGIN SELECT RAISE(ABORT,'reopened clips require current pool-round decisions'); END;
+CREATE TRIGGER review_reopen_canonical_write_guard
+ BEFORE UPDATE OF human_decision,verdict,verdict_transcript,annotated_transcript,verified,reviewed_by ON speech_segments
+ WHEN EXISTS (SELECT 1 FROM current_review_reopen_members_v71 round WHERE round.segment_id=OLD.id)
+ AND (NEW.human_decision IS NOT OLD.human_decision OR NEW.verdict IS NOT OLD.verdict
+   OR NEW.verdict_transcript IS NOT OLD.verdict_transcript OR NEW.annotated_transcript IS NOT OLD.annotated_transcript
+   OR NEW.verified IS NOT OLD.verified OR NEW.reviewed_by IS NOT OLD.reviewed_by)
+ BEGIN SELECT RAISE(ABORT,'reopened canonical history is held; submit a current pool-round decision'); END;",
+        down_sql: Some("-- A populated epoch cannot be silently rolled back into trusted legacy approvals.
+CREATE TEMP TABLE review_reopen_rollback_guard (must_be_zero INTEGER CHECK(must_be_zero=0));
+INSERT INTO review_reopen_rollback_guard SELECT 1 WHERE EXISTS(SELECT 1 FROM review_reopen_rounds);
+DROP TABLE review_reopen_rollback_guard;
+DROP TRIGGER review_reopen_canonical_write_guard;
+DROP TRIGGER review_reopen_legacy_write_guard;
+DROP TRIGGER review_pool_decision_validate_insert;
+CREATE TRIGGER review_pool_decision_validate_insert
+                 BEFORE INSERT ON review_pool_decisions
+                 WHEN
+                      (NEW.action IN ('accept','edit')
+                       AND (NEW.submitted_transcript IS NULL OR trim(NEW.submitted_transcript) = ''))
+                   OR (NEW.action IN ('reject','skip') AND NEW.submitted_transcript IS NOT NULL)
+                   OR (NEW.action <> 'skip' AND (
+                          NEW.audio_content_hash IS NULL
+                          OR length(NEW.audio_content_hash) <> 64
+                          OR NEW.audio_content_hash GLOB '*[^0-9a-f]*'
+                          OR typeof(NEW.source_start_ms) <> 'integer'
+                          OR typeof(NEW.source_end_ms) <> 'integer'
+                          OR NEW.source_start_ms < 0
+                          OR NEW.source_end_ms <= NEW.source_start_ms
+                       ))
+                   OR NOT EXISTS (
+                          SELECT 1 FROM review_pool_members member
+                           JOIN speech_segments segment ON segment.id=member.segment_id
+                           WHERE member.pool_id = NEW.pool_id
+                             AND member.segment_id = NEW.segment_id
+                             AND segment.verified = 1
+                             AND segment.human_decision IN ('accept','edit','reject')
+                             AND segment.raw_transcript = member.raw_transcript
+                             AND COALESCE(segment.model_version_id, '') = member.model_version_id
+                             AND segment.audio_content_hash = member.audio_content_hash
+                             AND json_extract(segment.alignment_json, '$.source_start_ms') = member.source_start_ms
+                             AND json_extract(segment.alignment_json, '$.source_end_ms') = member.source_end_ms
+                             AND segment.duration_ms = member.duration_ms
+                             AND NEW.served_transcript = trim(member.raw_transcript)
+                             AND NEW.duration_ms = member.duration_ms
+                             AND (
+                                  NEW.action = 'skip'
+                                  OR (
+                                     NEW.audio_content_hash = member.audio_content_hash
+                                     AND NEW.source_start_ms = member.source_start_ms
+                                     AND NEW.source_end_ms = member.source_end_ms
+                                  )
+                             )
+                      )
+                   OR EXISTS (
+                          SELECT 1 FROM speech_segments segment
+                           WHERE segment.id = NEW.segment_id
+                             AND lower(trim(COALESCE(segment.reviewed_by, '@desktop-owner')))
+                                 = lower(trim(NEW.reviewer))
+                      )
+                   OR EXISTS (
+                          SELECT 1 FROM review_pool_decisions prior
+                           WHERE prior.pool_id = NEW.pool_id
+                             AND prior.segment_id = NEW.segment_id
+                             AND prior.reviewer = NEW.reviewer COLLATE NOCASE
+                             AND NOT EXISTS (
+                                  SELECT 1 FROM review_pool_reversals reversal
+                                   WHERE reversal.decision_id = prior.id
+                             )
+                      )
+                   OR EXISTS (
+                          SELECT 1 FROM effective_independent_review_decisions_v61 prior
+                           WHERE prior.segment_id = NEW.segment_id
+                             AND prior.reviewer = NEW.reviewer COLLATE NOCASE
+                      )
+                   OR EXISTS (SELECT 1 FROM review_events event WHERE event.operation_id = NEW.operation_id)
+                   OR EXISTS (SELECT 1 FROM independent_review_decisions decision
+                               WHERE decision.operation_id = NEW.operation_id)
+                 BEGIN SELECT RAISE(ABORT, 'review pool decision is invalid, duplicated, or not independent'); END;
+DROP TRIGGER review_pool_v63_decision_terminal_guard;
+CREATE TRIGGER review_pool_v63_decision_terminal_guard
+                 BEFORE INSERT ON review_pool_decisions
+                 WHEN EXISTS (
+                        SELECT 1 FROM review_pool_voice_certificates certificate
+                        JOIN review_pool_members member
+                          ON member.pool_id=certificate.pool_id AND member.voice_name=certificate.voice_name
+                       WHERE member.pool_id=NEW.pool_id AND member.segment_id=NEW.segment_id
+                      )
+                   OR (NEW.action <> 'skip' AND 3 <= (
+                        SELECT COUNT(*) FROM (
+                            SELECT lower(trim(COALESCE(segment.reviewed_by, '@desktop-owner'))) AS reviewer
+                              FROM speech_segments segment
+                             WHERE segment.id=NEW.segment_id AND segment.verified=1
+                               AND segment.human_decision IN ('accept','edit','reject')
+                            UNION
+                            SELECT lower(trim(decision.reviewer))
+                              FROM effective_independent_review_decisions_v61 decision
+                             WHERE decision.segment_id=NEW.segment_id AND decision.action<>'skip'
+                            UNION
+                            SELECT lower(trim(decision.reviewer))
+                              FROM effective_review_pool_decisions_v62 decision
+                             WHERE decision.segment_id=NEW.segment_id AND decision.action<>'skip'
+                        )
+                   ))
+                 BEGIN SELECT RAISE(ABORT, 'review pool clip is terminal or already has three effective judgements'); END;
+DROP VIEW effective_review_pool_decisions_v62;
+CREATE VIEW effective_review_pool_decisions_v62 AS
+                 SELECT decision.* FROM review_pool_decisions decision
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM review_pool_reversals reversal
+                         WHERE reversal.decision_id = decision.id
+                  );
+DROP VIEW effective_independent_review_decisions_v61;
+CREATE VIEW effective_independent_review_decisions_v61 AS
+                 SELECT decision.*
+                   FROM independent_review_decisions decision
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM independent_review_reversals reversal
+                         WHERE reversal.decision_id = decision.id
+                  );
+DROP TRIGGER review_reopen_member_validate;
+DROP TRIGGER review_reopen_members_immutable_delete;
+DROP TRIGGER review_reopen_members_immutable_update;
+DROP TRIGGER review_reopen_rounds_immutable_delete;
+DROP TRIGGER review_reopen_rounds_immutable_update;
+DROP VIEW current_review_reopen_members_v71;
+DROP TABLE review_reopen_members;
+DROP TABLE review_reopen_rounds;"),
+    },
 ];
 
 #[cfg(test)]
@@ -5802,8 +6090,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 13).unwrap(),
-            vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58],
+            rollback(&db, 14).unwrap(),
+            vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58],
             "fixture must stop immediately before v58"
         );
         assert_eq!(get_current_version(&db).unwrap(), 57);
@@ -5814,8 +6102,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 11).unwrap(),
-            vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 12).unwrap(),
+            vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "fixture must expose the populated-v59 boundary"
         );
         assert_eq!(get_current_version(&db).unwrap(), 59);
@@ -5826,8 +6114,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 10).unwrap(),
-            vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61],
+            rollback(&db, 11).unwrap(),
+            vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61],
             "fixture must expose the v60 boundary"
         );
         assert_eq!(get_current_version(&db).unwrap(), 60);
@@ -6109,8 +6397,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 11).unwrap(),
-            vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 12).unwrap(),
+            vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "fixture must expose the v59 layer directly"
         );
         assert_eq!(get_current_version(&db).unwrap(), 59);
@@ -6201,10 +6489,10 @@ mod tests {
 
         let empty = Database::open(":memory:").unwrap();
         empty.initialize().unwrap();
-        assert_eq!(rollback(&empty, 11).unwrap(), vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(rollback(&empty, 12).unwrap(), vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60]);
         assert_eq!(rollback(&empty, 1).unwrap(), vec![59]);
         assert_eq!(get_current_version(&empty).unwrap(), 58);
-        assert_eq!(run_migrations(&empty).unwrap(), vec![59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70]);
+        assert_eq!(run_migrations(&empty).unwrap(), vec![59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]);
     }
 
     #[test]
@@ -6258,10 +6546,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]);
         assert_eq!(
-            rollback(&db, 10).unwrap(),
-            vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61],
+            rollback(&db, 11).unwrap(),
+            vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61],
             "this test isolates the v60 migration"
         );
         assert_eq!(get_current_version(&db).unwrap(), 60);
@@ -6564,7 +6852,7 @@ mod tests {
                  VALUES ('delete-memory-proof', 'w', 'r', 'slot', 'phon', 'delete-memory');",
             )
             .unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]);
 
         assert_eq!(
             db.connection().execute("DELETE FROM speech_segments WHERE id='delete-clean'", []).unwrap(),
@@ -8355,8 +8643,8 @@ mod tests {
         let with_reversal = database_at_v59();
         let (_, baseline_entry) =
             insert_review_original(&with_reversal, "baseline-reversal", "baseline-work", "Sara", "legacy");
-        assert_eq!(run_migrations(&with_reversal).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70]);
-        assert_eq!(rollback(&with_reversal, 10).unwrap(), vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61]);
+        assert_eq!(run_migrations(&with_reversal).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]);
+        assert_eq!(rollback(&with_reversal, 11).unwrap(), vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61]);
         reverse_review_entry(&with_reversal, &baseline_entry, "post-v60-baseline-undo").unwrap();
         let reversal_error = rollback(&with_reversal, 1)
             .expect_err("the ledger cutoff must distinguish a reversal appended after migration")
@@ -8386,8 +8674,8 @@ mod tests {
                          1, 'human correction', 'edit', '2026-08-20 00:00:00', 'Sara', 1);",
             )
             .unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70]);
-        assert_eq!(rollback(&db, 10).unwrap(), vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]);
+        assert_eq!(rollback(&db, 11).unwrap(), vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61]);
 
         let (machine_snapshots, human_overlap, exact): (i64, i64, i64) = db
             .connection()
@@ -8450,8 +8738,8 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(run_migrations(&drifted).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70]);
-        assert_eq!(rollback(&drifted, 10).unwrap(), vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61]);
+        assert_eq!(run_migrations(&drifted).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]);
+        assert_eq!(rollback(&drifted, 11).unwrap(), vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61]);
         drifted
             .connection()
             .execute("UPDATE speech_segments SET rationale='forged rationale' WHERE id='legacy-machine-drift'", [])
@@ -8677,6 +8965,8 @@ mod tests {
             "segment_hypotheses_v68_revision_insert",
             "segment_hypotheses_v68_revision_delete",
             "segment_hypotheses_v68_revision_update",
+            "review_reopen_member_validate",
+            "review_reopen_canonical_write_guard",
         ]
         .iter()
         .map(|name| {
@@ -8696,7 +8986,9 @@ mod tests {
                  DROP TRIGGER speech_segments_v64_excluded_review_guard;
                  DROP TRIGGER segment_hypotheses_v68_revision_insert;
                  DROP TRIGGER segment_hypotheses_v68_revision_delete;
-                 DROP TRIGGER segment_hypotheses_v68_revision_update;",
+                 DROP TRIGGER segment_hypotheses_v68_revision_update;
+                 DROP TRIGGER review_reopen_member_validate;
+                 DROP TRIGGER review_reopen_canonical_write_guard;",
             )
             .expect("synthetic historical replay can temporarily remove the future trigger");
         {
@@ -9086,7 +9378,7 @@ mod tests {
     fn v63_partial_migration_failure_is_atomic_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 8).unwrap(), vec![70, 69, 68, 67, 66, 65, 64, 63]);
+        assert_eq!(rollback(&db, 9).unwrap(), vec![71, 70, 69, 68, 67, 66, 65, 64, 63]);
         assert_eq!(get_current_version(&db).unwrap(), 62);
         db.connection().execute("CREATE TABLE review_pool_owner_adjudications(collision INTEGER)", []).unwrap();
         let error = run_migrations(&db).expect_err("a v63 object collision must fail the entire migration");
@@ -9105,15 +9397,15 @@ mod tests {
             .unwrap();
         assert_eq!(leaked_objects, 0, "failed v63 leaked later tables or triggers");
         db.connection().execute("DROP TABLE review_pool_owner_adjudications", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![63, 64, 65, 66, 67, 68, 69, 70]);
-        assert_eq!(get_current_version(&db).unwrap(), 70);
+        assert_eq!(run_migrations(&db).unwrap(), vec![63, 64, 65, 66, 67, 68, 69, 70, 71]);
+        assert_eq!(get_current_version(&db).unwrap(), 71);
     }
 
     #[test]
     fn v64_partial_migration_failure_is_atomic_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 7).unwrap(), vec![70, 69, 68, 67, 66, 65, 64]);
+        assert_eq!(rollback(&db, 8).unwrap(), vec![71, 70, 69, 68, 67, 66, 65, 64]);
         assert_eq!(get_current_version(&db).unwrap(), 63);
         db.connection().execute("CREATE TABLE review_pool_dedup_manifests(collision INTEGER)", []).unwrap();
         let error = run_migrations(&db).expect_err("a v64 object collision must fail the entire migration");
@@ -9132,15 +9424,15 @@ mod tests {
             .unwrap();
         assert_eq!(leaked_objects, 0, "failed v64 leaked later tables or triggers");
         db.connection().execute("DROP TABLE review_pool_dedup_manifests", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![64, 65, 66, 67, 68, 69, 70]);
-        assert_eq!(get_current_version(&db).unwrap(), 70);
+        assert_eq!(run_migrations(&db).unwrap(), vec![64, 65, 66, 67, 68, 69, 70, 71]);
+        assert_eq!(get_current_version(&db).unwrap(), 71);
     }
 
     #[test]
     fn v65_partial_migration_failure_is_atomic_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 6).unwrap(), vec![70, 69, 68, 67, 66, 65]);
+        assert_eq!(rollback(&db, 7).unwrap(), vec![71, 70, 69, 68, 67, 66, 65]);
         assert_eq!(get_current_version(&db).unwrap(), 64);
         let v64_trigger_sql: String = db
             .connection()
@@ -9157,8 +9449,8 @@ mod tests {
         assert!(error.to_string().contains("no such trigger"), "unexpected v65 failure: {error}");
         assert_eq!(get_current_version(&db).unwrap(), 64, "failed v65 must not record its migration row");
         db.connection().execute_batch(&v64_trigger_sql).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![65, 66, 67, 68, 69, 70]);
-        assert_eq!(get_current_version(&db).unwrap(), 70);
+        assert_eq!(run_migrations(&db).unwrap(), vec![65, 66, 67, 68, 69, 70, 71]);
+        assert_eq!(get_current_version(&db).unwrap(), 71);
         let v65_trigger_sql: String = db
             .connection()
             .query_row(
@@ -9175,7 +9467,7 @@ mod tests {
     fn v66_review_draft_migration_is_additive_atomic_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 5).unwrap(), vec![70, 69, 68, 67, 66]);
+        assert_eq!(rollback(&db, 6).unwrap(), vec![71, 70, 69, 68, 67, 66]);
         assert_eq!(get_current_version(&db).unwrap(), 65);
         db.connection().execute("CREATE TABLE review_drafts(collision INTEGER)", []).unwrap();
         let error = run_migrations(&db).expect_err("a v66 object collision must fail the entire migration");
@@ -9189,8 +9481,8 @@ mod tests {
             .unwrap();
         assert_eq!(leaked_index, 0, "failed v66 leaked its later index");
         db.connection().execute("DROP TABLE review_drafts", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![66, 67, 68, 69, 70]);
-        assert_eq!(get_current_version(&db).unwrap(), 70);
+        assert_eq!(run_migrations(&db).unwrap(), vec![66, 67, 68, 69, 70, 71]);
+        assert_eq!(get_current_version(&db).unwrap(), 71);
         let strict_sql: String = db
             .connection()
             .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'review_drafts'", [], |row| {
@@ -9204,7 +9496,7 @@ mod tests {
     fn v67_desktop_playback_authority_migration_is_atomic_strict_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 4).unwrap(), vec![70, 69, 68, 67]);
+        assert_eq!(rollback(&db, 5).unwrap(), vec![71, 70, 69, 68, 67]);
         assert_eq!(get_current_version(&db).unwrap(), 66);
 
         db.connection().execute("CREATE TABLE desktop_playback_sessions_v4(collision INTEGER)", []).unwrap();
@@ -9236,8 +9528,8 @@ mod tests {
         assert_eq!(receipt_columns, 0, "failed v67 leaked additive receipt columns");
 
         db.connection().execute("DROP TABLE desktop_playback_sessions_v4", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![67, 68, 69, 70]);
-        assert_eq!(get_current_version(&db).unwrap(), 70);
+        assert_eq!(run_migrations(&db).unwrap(), vec![67, 68, 69, 70, 71]);
+        assert_eq!(get_current_version(&db).unwrap(), 71);
         let paid_identity_trigger: String = db
             .connection()
             .query_row(
@@ -9275,7 +9567,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(rollback(&db, 4).unwrap(), vec![70, 69, 68, 67]);
+        assert_eq!(rollback(&db, 5).unwrap(), vec![71, 70, 69, 68, 67]);
         assert_eq!(
             db.connection()
                 .query_row(
@@ -9294,15 +9586,15 @@ mod tests {
             66,
             "a never-finalized playback attempt is ephemeral and must not make schema 67 irreversible",
         );
-        assert_eq!(run_migrations(&db).unwrap(), vec![67, 68, 69, 70]);
-        assert_eq!(get_current_version(&db).unwrap(), 70);
+        assert_eq!(run_migrations(&db).unwrap(), vec![67, 68, 69, 70, 71]);
+        assert_eq!(get_current_version(&db).unwrap(), 71);
     }
 
     #[test]
     fn v68_batch_item_authority_is_strict_exact_append_only_and_rollback_guarded() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 2).unwrap(), vec![70, 69], "this test isolates the v68 migration");
+        assert_eq!(rollback(&db, 3).unwrap(), vec![71, 70, 69], "this test isolates the v68 migration");
         assert_eq!(get_current_version(&db).unwrap(), 68);
         let conn = db.connection();
 
@@ -9508,11 +9800,11 @@ mod tests {
 
         let empty = Database::open(":memory:").unwrap();
         empty.initialize().unwrap();
-        assert_eq!(rollback(&empty, 2).unwrap(), vec![70, 69], "this test isolates the v68 migration");
+        assert_eq!(rollback(&empty, 3).unwrap(), vec![71, 70, 69], "this test isolates the v68 migration");
         assert_eq!(rollback(&empty, 1).unwrap(), vec![68]);
         assert_eq!(get_current_version(&empty).unwrap(), 67);
-        assert_eq!(run_migrations(&empty).unwrap(), vec![68, 69, 70]);
-        assert_eq!(get_current_version(&empty).unwrap(), 70);
+        assert_eq!(run_migrations(&empty).unwrap(), vec![68, 69, 70, 71]);
+        assert_eq!(get_current_version(&empty).unwrap(), 71);
     }
 
     #[test]
@@ -9521,7 +9813,7 @@ mod tests {
 
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(get_current_version(&db).unwrap(), 70);
+        assert_eq!(get_current_version(&db).unwrap(), 71);
         let conn = db.connection();
 
         for table in ["desktop_review_legacy_actions_v1", "desktop_review_action_events_v1"] {
@@ -9623,7 +9915,7 @@ mod tests {
             )
             .is_err());
 
-        let rollback_error = rollback(&db, 2).unwrap_err().to_string();
+        let rollback_error = rollback(&db, 3).unwrap_err().to_string();
         assert!(
             rollback_error.contains("CHECK constraint failed"),
             "unexpected v69 rollback refusal: {rollback_error}"
@@ -9632,9 +9924,9 @@ mod tests {
 
         let empty = Database::open(":memory:").unwrap();
         empty.initialize().unwrap();
-        assert_eq!(rollback(&empty, 2).unwrap(), vec![70, 69]);
+        assert_eq!(rollback(&empty, 3).unwrap(), vec![71, 70, 69]);
         assert_eq!(get_current_version(&empty).unwrap(), 68);
-        assert_eq!(run_migrations(&empty).unwrap(), vec![69, 70]);
+        assert_eq!(run_migrations(&empty).unwrap(), vec![69, 70, 71]);
     }
 
     #[test]
@@ -9767,7 +10059,7 @@ mod tests {
 
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 2).unwrap(), vec![70, 69]);
+        assert_eq!(rollback(&db, 3).unwrap(), vec![71, 70, 69]);
         let legacy_decision =
             insert_effect_event_with_action(&db, None, "legacy-v69-decision", None, "desktop", "accept", 1);
         let legacy_flag = insert_flag_effect_event(&db, "legacy-v69-flag", 0, None, None, false);
@@ -9778,7 +10070,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![69, 70]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![69, 70, 71]);
         assert_eq!(
             db.connection()
                 .query_row("SELECT COUNT(*) FROM desktop_review_legacy_actions_v1", [], |row| row.get::<_, i64>(0))
@@ -10019,8 +10311,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 11).unwrap(),
-            vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 12).unwrap(),
+            vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 v20 surface"
         );
         let conn = db.connection();
@@ -10083,8 +10375,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 11).unwrap(),
-            vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 12).unwrap(),
+            vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 v32 surface"
         );
         let conn = db.connection();
@@ -10114,8 +10406,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 11).unwrap(),
-            vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 12).unwrap(),
+            vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 FK behavior"
         );
         let conn = db.connection();
@@ -10147,8 +10439,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 11).unwrap(),
-            vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 12).unwrap(),
+            vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 v21 surface"
         );
         let conn = db.connection();
@@ -10188,8 +10480,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 11).unwrap(),
-            vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 12).unwrap(),
+            vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 FK behavior"
         );
         let conn = db.connection();
@@ -10401,8 +10693,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 11).unwrap(),
-            vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 12).unwrap(),
+            vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates v46's historical surface"
         );
         assert!(get_current_version(&db).unwrap() >= 46, "v46 must have applied");
@@ -10459,8 +10751,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 14).unwrap(),
-            vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58, 57],
+            rollback(&db, 15).unwrap(),
+            vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58, 57],
             "fixture must return to the v56 schema"
         );
 
@@ -10482,7 +10774,7 @@ mod tests {
             .unwrap();
         let legacy_event_id = db.connection().last_insert_rowid();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]);
         let cutoff: i64 = db
             .connection()
             .query_row(
@@ -10506,8 +10798,8 @@ mod tests {
         assert_eq!(before.legacy_events_pending_reconciliation, 1);
 
         assert_eq!(
-            rollback(&db, 11).unwrap(),
-            vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 12).unwrap(),
+            vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "the remainder of this test isolates v57 accounting"
         );
         let (priced_event_id, _) = insert_review_original(&db, "pay-cutoff", "prospective-paid-work", "Sara", "couch");
@@ -10522,8 +10814,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 11).unwrap(),
-            vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 12).unwrap(),
+            vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates v57's immutable ledger"
         );
         db.insert_segment(&crate::db::SpeechSegment {
@@ -10653,8 +10945,8 @@ mod tests {
             let db = Database::open(":memory:").unwrap();
             db.initialize().unwrap();
             assert_eq!(
-                rollback(&db, 13).unwrap(),
-                vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58],
+                rollback(&db, 14).unwrap(),
+                vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58],
                 "fixture must target v57 rollback semantics"
             );
             db.insert_segment(&crate::db::SpeechSegment {
@@ -10785,7 +11077,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]);
         assert_eq!(foreign_key_violation_count(db.connection()), 0);
         let archive_counts: (i64, i64) = db
             .connection()
@@ -11032,7 +11324,7 @@ mod tests {
         // Once an operator separately resolves the unknown class, the same pending migration can
         // safely run and preserve the known orphan. No manual schema surgery or retry flag is needed.
         db.connection().execute("DELETE FROM playback_receipts WHERE segment_id = 'v58-unrelated-orphan'", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]);
         assert_eq!(foreign_key_violation_count(db.connection()), 0);
         let archived: i64 = db
             .connection()
@@ -11062,11 +11354,11 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]);
 
         assert_eq!(
-            rollback(&db, 12).unwrap(),
-            vec![70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59],
+            rollback(&db, 13).unwrap(),
+            vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59],
             "the empty v63/v62/v61/v60/v59 layers must be removed before probing v58"
         );
 
@@ -11138,7 +11430,7 @@ mod tests {
 
         // Re-applying v58 after a safe rollback sees valid parents, archives nothing, and leaves both
         // restored children in place. This pins the full up/down/up round trip.
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]);
         let reapply_counts: (i64, i64, i64, i64) = db
             .connection()
             .query_row(

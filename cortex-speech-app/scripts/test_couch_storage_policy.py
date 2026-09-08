@@ -31,7 +31,7 @@ def test_outbox_never_flushes_stamped_work_under_an_unknown_identity() -> None:
     assert "if (item.reviewer && me && item.reviewer !== me) continue;" not in source, (
         "`me &&` disables the author guard exactly when the identity is unknown"
     )
-    idx_me = source.find("me = res.reviewer;")
+    idx_me = source.find("adoptReviewerIdentity(res.reviewer);")
     assert idx_me != -1, "load() must record who the server says this link belongs to"
     # Bound this by load()'s success path, not by a character count. The window used to be
     # `idx_me + 1800`, which is a proxy for "in the same block" that decays every time anything is
@@ -51,9 +51,17 @@ def test_a_tab_that_changes_hands_clears_the_previous_reviewers_drafts() -> None
     half-typed correction as their own (2026-08-20 hunt). An identity change must clear the drafts."""
     source = (Path(__file__).parents[1] / "src-tauri" / "assets" / "couch.html").read_text(encoding="utf-8")
     assert "sessionStorage.getItem('cortex.couch.who')" in source, "load() must remember whose tab this is"
-    idx = source.find("prevWho !== null && prevWho !== me")
-    assert idx != -1, "an identity CHANGE (not first load) must trigger the draft sweep"
-    assert "startsWith('cortex.couch.draft.')" in source[idx : idx + 600], "the sweep removes every per-clip draft"
+    start = source.find("function adoptReviewerIdentity(reviewer)")
+    end = source.find("async function doLoad()", start)
+    assert start != -1 and end > start, "the ownership fence must be isolated before queue publication"
+    fence = source[start:end]
+    assert "prevWho !== null && prevWho !== reviewer" in fence, "an identity CHANGE must trigger the draft sweep"
+    for namespace in ("startsWith('cortex.couch.draft.')", "startsWith('cortex.couch.draft-meta.')", "startsWith(DRAFT_RECOVERY_PREFIX)"):
+        assert namespace in fence, f"the sweep must include {namespace}"
+    assert "sessionStorage.removeItem(key)" in fence
+    assert "catch (error) { clearReviewerView(); throw error; }" in fence, "failed ownership cleanup must clear the old view and abort adoption"
+    assert fence.index("sessionStorage.setItem('cortex.couch.who', reviewer)") < fence.index("me = reviewer;"), "publish identity only after the storage fence succeeds"
+    assert source.index("adoptReviewerIdentity(res.reviewer);") < source.index("queue = res.items.filter"), "publish the new queue only after adopting its author"
 
 
 def test_the_attribution_fence_holds_work_instead_of_deleting_it() -> None:
