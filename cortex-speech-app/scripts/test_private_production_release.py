@@ -590,9 +590,18 @@ def test_clone_preflight_proves_65_to_71_and_same_schema_71() -> None:
             data.mkdir()
             seed_database(data / "cortex-speech.db", source_schema)
 
+            profiles = {name: {} for name in release.PROFILE_STATE}
+            profiles["couch_session.json"] = {"reviewers": {"protected-fixture-key": "Fixture"}}
+            profiles["reviewer_dialects.json"] = {"Fixture": ["sorani"]}
+            profiles["review_reopen_routing.json"] = {"final_reviewers": ["Fixture"]}
+            for name, payload in profiles.items():
+                (data / name).write_text(json.dumps(payload), encoding="utf-8")
+            wrong_queue_count = False
+
             def fake_run_json(command: list[str], *, timeout: int = 300) -> dict[str, object]:
                 verb = command[1]
                 db = Path(command[command.index("--db") + 1])
+                assert db != data / "cortex-speech.db", "preflight must never target the live database"
                 if verb == "migrate":
                     before = release.database_schema(db)
                     if before < 71:
@@ -620,6 +629,13 @@ def test_clone_preflight_proves_65_to_71_and_same_schema_71() -> None:
                         "audio": {"allAvailable": True},
                         "rights": {"allExact": True},
                     }
+                if verb in {"benchmark", "probe"}:
+                    for name in release.PROFILE_STATE:
+                        assert (db.parent / name).read_bytes() == (data / name).read_bytes()
+                    assert command[command.index("--reviewer") + 1] == "Fixture"
+                    assert command[-2:] == ["--dialect", "sorani"]
+                    return {"passes": True, "availableClips": 3 if wrong_queue_count and verb == "benchmark" else 2,
+                            "sampleAudioValidWav": True, "submissionIdempotencyAuthority": True}
                 raise AssertionError(f"unexpected preflight command: {command}")
 
             with mock.patch.object(release, "run_json", side_effect=fake_run_json):
@@ -627,6 +643,16 @@ def test_clone_preflight_proves_65_to_71_and_same_schema_71() -> None:
             assert proof["sourceSchemaVersion"] == source_schema
             assert proof["migration"]["migrated"] is (source_schema != 71)
             assert proof["certification"]["databaseSchemaVersion"] == 71
+            assert proof["reviewerQueues"] == {"Fixture": 2}
+            wrong_queue_count = True
+            with mock.patch.object(release, "run_json", side_effect=fake_run_json):
+                try:
+                    release.preflight_clone(data, manifest)
+                except release.ReleaseError as error:
+                    assert "audio/idempotency probe failed" in str(error)
+                else:
+                    raise AssertionError("routing mismatch escaped clone preflight")
+            assert release.database_schema(data / "cortex-speech.db") == source_schema
 
 
 def test_clone_preflight_refuses_future_schema_before_candidate_execution() -> None:

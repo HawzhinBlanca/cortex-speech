@@ -132,6 +132,11 @@ PROFILE_STATE = (
     "reviewer_dialects.json",
     "voice_focus.json",
     "review_pilot_policy.json",
+    "couch_session.json",
+    "review_listen_list.json",
+    "review_routing.json",
+    "review_redo.json",
+    "review_reopen_routing.json",
 )
 
 
@@ -915,12 +920,16 @@ def preflight_clone(data_dir: Path, manifest: dict[str, Any], reopen_plan: Path 
             raise ReleaseError("candidate clone has missing or changed pool audio")
         if report.get("rights", {}).get("allExact") is not True:
             raise ReleaseError("candidate clone did not establish exact owner rights")
+        # Rehearse the exact serving queues before maintenance, not merely database
+        # and file integrity. The profile copy above includes all routing inputs.
+        queues = prove_canonical_queues(clone, manifest)
         return {
             "sourceSchemaVersion": source_schema,
             "migration": migration,
             "rights": rights,
             "qualityReopen": reopen,
             "certification": report,
+            "reviewerQueues": queues,
         }
 
 
