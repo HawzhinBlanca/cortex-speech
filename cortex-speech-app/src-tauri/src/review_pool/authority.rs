@@ -157,8 +157,24 @@ fn validate_voice_certificate_evidence(
         .map_err(|error| format!("voice certificate JSON is invalid: {error}"))?;
     let dedup = dedup_status(db)?;
     let expected_u64 = |value: usize| u64::try_from(value).ok();
-    let certificate_matches_authority = certificate_value.get("schemaVersion").and_then(serde_json::Value::as_u64)
-        == Some(2)
+    // v2 is historical evidence, not retroactively a clean-TTS certificate. v3 explicitly
+    // seals ASR + UNQUALIFIED masters and cannot mint a positive gold status/count.
+    let schema = certificate_value.get("schemaVersion").and_then(serde_json::Value::as_u64);
+    let tts_shape_valid = match schema {
+        Some(2) => true,
+        Some(3) => {
+            certificate_value.get("ttsQualificationStatus").and_then(serde_json::Value::as_str) == Some("pending")
+                && certificate_value.get("ttsRetainedSegments").and_then(serde_json::Value::as_u64) == Some(0)
+                && certificate_value.get("ttsExcludedSegments").and_then(serde_json::Value::as_u64)
+                    == expected_u64(input.retained_segments)
+                && certificate_value
+                    .get("ttsCandidateSegments")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|count| count <= input.retained_segments as u64)
+        }
+        _ => false,
+    };
+    let certificate_matches_authority = tts_shape_valid
         && certificate_value.get("poolId").and_then(serde_json::Value::as_str) == Some(pool.pool_id.as_str())
         && certificate_value.get("poolFocusSha256").and_then(serde_json::Value::as_str)
             == Some(pool.focus_sha256.as_str())

@@ -1,29 +1,14 @@
 #!/usr/bin/env python3
-"""Measure every clip in a prepared TTS folder, so a "keep only the gold" cull is decided by numbers.
+"""Non-destructive TTS triage, NEVER a gold certificate.
 
-Auditioning tens of thousands of clips by ear is not a plan — it is slow, it drifts as the ear tires,
-and the clips that hurt a TTS model most (a truncated onset, a clipped rail, a noise floor 6 dB under
-the voice) are the ones a quick listen forgives. This measures all of them and ranks the damage.
+100ms frame metrics follow audio_quality.rs for mono PCM16. The field named snr_db
+is an amplitude-range proxy, not a calibrated speech/noise or overlap detector.
+Similarity metadata is advisory and cannot prove target voice or clean boundaries.
+Output verdicts are hold or pending_qualification, never keep/gold. Every WAV gets
+a row, including unreadable input. Missing/ambiguous evidence stays visible.
 
-Mirrors `audio_quality.rs` EXACTLY — same 100 ms frames, same lowest/highest-10% noise and signal
-floors, same 32760 clipping rail, same "fewer than 3 frames means SNR is UNMEASURABLE, not zero".
-A separate estimator would produce a second opinion that disagrees with the app's own gates on the
-same file, and then neither number could be trusted. Thresholds come from `quality.rs`.
-
-What it reports per clip, worst first:
-  * snr_db          — voice against its own noise floor. The app calls < 5 dB poor.
-  * clipping_ratio  — samples at the 16-bit rail. The app calls > 0.1 poor; for TTS, ANY is suspect.
-  * rms_db          — level. A set normalized to a loudness target should be tight; outliers are
-                      clips whose speech is mostly silence, or that are pinned to the ceiling.
-  * lead/tail_sil   — leading and trailing silence. Long tails teach a TTS model to trail off.
-  * dc_offset       — a DC bias no listener hears and every vocoder does.
-  * similarity      — the speaker-verification score already in metadata.csv, joined by filename.
-
-It writes a CSV of every clip and a plain list of the ones that fail, and it MOVES NOTHING. Deciding
-what leaves the dataset is the owner's call; this exists to make that call an informed one.
-
-Run:  python scripts/audit_tts_clip_quality.py <folder> [--out report.csv] [--min-snr 5]
-                                               [--max-clipping 0.0] [--min-similarity 0.65]
+Exit 0 means the audit completed, NOT that clips qualify for training; exit 2
+means input/metadata could not be fully measured. No originals are moved/deleted.
 """
 
 from __future__ import annotations
@@ -31,14 +16,14 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import hashlib
 import statistics
 import sys
 import wave
 from array import array
 from pathlib import Path
 
-# Mirrors quality.rs. Kept as the defaults so a clip this audit passes is a clip the app's own gates
-# also pass — a stricter number here would reject work the pipeline would happily have used.
+# Existing thresholds are triage only; no recalibration or gold admission is implied.
 POOR_AUDIO_SNR_DB = 5.0
 POOR_AUDIO_CLIPPING_RATIO = 0.1
 FRAME_MS = 100
@@ -48,18 +33,25 @@ CLIP_RAIL = 32760
 def measure(path: Path) -> dict | None:
     """Per-clip metrics, or None if the file cannot be read as PCM WAV."""
     try:
+        before = path.stat()
         with wave.open(str(path), "rb") as w:
-            if w.getsampwidth() != 2:
+            if w.getsampwidth() != 2 or w.getnchannels() != 1 or w.getcomptype() != "NONE":
                 return None
             sr, channels = w.getframerate(), w.getnchannels()
-            raw = w.readframes(w.getnframes())
-    except Exception:
+            frames = w.getnframes()
+            raw = w.readframes(frames)
+            if len(raw) != frames * channels * 2:
+                return None
+        after = path.stat()
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            return None
+    except (OSError, ValueError, EOFError, wave.Error):
         return None
 
     pcm = array("h")
-    pcm.frombytes(raw[: len(raw) // 2 * 2])
-    if channels > 1:  # mix to mono the cheap way; these sets are mono in practice
-        pcm = array("h", [int(sum(pcm[i : i + channels]) / channels) for i in range(0, len(pcm) - channels, channels)])
+    pcm.frombytes(raw)
+    if sys.byteorder != "little":
+        pcm.byteswap()
     n = len(pcm)
     if n == 0:
         return None
@@ -118,32 +110,74 @@ def measure(path: Path) -> dict | None:
         "file": path.name,
         "duration_s": round(n / sr, 3),
         "sample_rate": sr,
-        "snr_db": None if snr_db is None else round(snr_db, 2),
-        "clipping_ratio": round(clipped / n, 6),
+        "snr_db": snr_db,
+        "clipped_samples": clipped,
+        "clipping_ratio": clipped / n,
+        "constant_signal": min(pcm) == max(pcm),
+        "pcm_sha256": hashlib.sha256(raw).hexdigest(),
         "rms_db": round(rms_db, 2),
         "lead_silence_s": round(lead, 2),
         "tail_silence_s": round(tail, 2),
-        "dc_offset": round(dc_offset, 5),
+        "dc_offset": dc_offset,
     }
 
 
 def load_similarity(folder: Path) -> dict[str, float]:
-    """Speaker-verification scores the dataset already computed, joined by filename."""
+    """Advisory scores only. Duplicate names (even identical rows) fail closed."""
     meta = folder.parent / "metadata.csv"
     if not meta.is_file():
         return {}
     out: dict[str, float] = {}
-    try:
-        with meta.open(encoding="utf-8") as f:
-            for row in csv.DictReader(f, delimiter="|"):
-                name = Path((row.get("audio_path") or "").replace("\\", "/")).name
-                try:
-                    out[name] = float(row.get("similarity_score") or row.get("speaker_similarity"))
-                except (TypeError, ValueError):
-                    continue
-    except OSError:
-        return {}
+    seen: set[str] = set()
+    with meta.open(encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f, delimiter="|")
+        if not reader.fieldnames or "audio_path" not in reader.fieldnames:
+            raise ValueError("metadata_missing_audio_path_column")
+        for row in reader:
+            relative = Path((row.get("audio_path") or "").replace("\\", "/"))
+            resolved = (meta.parent / relative).resolve()
+            if relative.is_absolute() or resolved.parent != folder.resolve():
+                raise ValueError("metadata_audio_path_outside_requested_folder")
+            name = relative.name.casefold()
+            if name in seen:
+                raise ValueError(f"duplicate_metadata_audio_path:{relative.name}")
+            seen.add(name)
+            if not resolved.is_file():
+                raise ValueError(f"metadata_audio_missing:{relative.name}")
+            try:
+                score = float(row.get("similarity_score") or row.get("speaker_similarity"))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(score) and -1 <= score <= 1:
+                out[name] = score
     return out
+
+
+def classify(m: dict, args: argparse.Namespace, metadata_error: str | None = None) -> tuple[str, list[str]]:
+    reasons = []
+    if m.get("audio_error"):
+        reasons.append(m["audio_error"])
+    else:
+        if m["constant_signal"]:
+            reasons.append("constant_or_silent_audio")
+        if m["snr_db"] is None:
+            reasons.append("snr_unmeasurable")
+        elif m["snr_db"] < args.min_snr:
+            reasons.append("low_dynamic_range_proxy")
+        if m["clipping_ratio"] > args.max_clipping:
+            reasons.append("clipping_candidate")
+        if m["tail_silence_s"] > args.max_tail_silence:
+            reasons.append("long_tail_candidate")
+        if abs(m["dc_offset"]) > 0.01:
+            reasons.append("dc_offset_candidate")
+    if metadata_error:
+        reasons.append(metadata_error)
+    if m.get("similarity") is None:
+        reasons.append("speaker_similarity_missing_or_invalid")
+    elif m["similarity"] < args.min_similarity:
+        reasons.append("speaker_similarity_candidate")
+    # A numerically clean clip still lacks explicit overlap/identity/text qualification.
+    return ("hold" if reasons else "pending_qualification"), reasons
 
 
 def main() -> int:
@@ -155,12 +189,21 @@ def main() -> int:
     ap.add_argument("--min-similarity", type=float, default=0.65)
     ap.add_argument("--max-tail-silence", type=float, default=1.0)
     args = ap.parse_args()
+    if not all(math.isfinite(v) for v in (args.min_snr, args.max_clipping, args.min_similarity, args.max_tail_silence)):
+        ap.error("thresholds must be finite")
+    if not 0 <= args.max_clipping <= 1 or not -1 <= args.min_similarity <= 1 or args.max_tail_silence < 0:
+        ap.error("invalid threshold range")
 
     files = sorted(p for p in args.folder.glob("*.wav"))
     if not files:
         print(f"no .wav files in {args.folder}")
         return 1
-    similarity = load_similarity(args.folder)
+    metadata_error = None
+    try:
+        similarity = load_similarity(args.folder)
+    except (OSError, ValueError, csv.Error) as error:
+        similarity = {}
+        metadata_error = f"metadata_integrity_error:{error}"
     print(f"measuring {len(files)} clip(s) in {args.folder}", flush=True)
 
     rows, unreadable = [], []
@@ -168,47 +211,42 @@ def main() -> int:
         m = measure(f)
         if m is None:
             unreadable.append(f.name)
-            continue
-        m["similarity"] = similarity.get(f.name)
+            m = {"file": f.name, "audio_error": "unreadable_unsupported_or_changed_audio"}
+        m["similarity"] = similarity.get(f.name.casefold())
         rows.append(m)
         if i % 2000 == 0:
             print(f"  {i}/{len(files)}", flush=True)
 
     reasons: dict[str, list[str]] = {}
     for m in rows:
-        why = []
-        if m["snr_db"] is not None and m["snr_db"] < args.min_snr:
-            why.append(f"snr {m['snr_db']}dB")
-        if m["clipping_ratio"] > args.max_clipping:
-            why.append(f"clipping {m['clipping_ratio']}")
-        if m["similarity"] is not None and m["similarity"] < args.min_similarity:
-            why.append(f"similarity {m['similarity']}")
-        if m["tail_silence_s"] > args.max_tail_silence:
-            why.append(f"tail silence {m['tail_silence_s']}s")
-        if abs(m["dc_offset"]) > 0.01:
-            why.append(f"dc offset {m['dc_offset']}")
+        m["verdict"], why = classify(m, args, metadata_error)
+        m["reasons"] = "; ".join(why)
+        m["tts_gold_certified"] = False
         if why:
             reasons[m["file"]] = why
 
-    with args.out.open("w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()) + ["verdict"])
-        w.writeheader()
-        for m in sorted(rows, key=lambda r: (r["snr_db"] is None, r["snr_db"] if r["snr_db"] is not None else 999)):
-            w.writerow({**m, "verdict": "; ".join(reasons.get(m["file"], [])) or "keep"})
     flagged = args.out.with_name(args.out.stem + "_flagged.txt")
-    flagged.write_text("\n".join(sorted(reasons)), encoding="utf-8")
+    if args.out.exists() or flagged.exists():
+        print("Refusing to replace existing audit evidence", file=sys.stderr)
+        return 2
+    with args.out.open("x", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=sorted({key for row in rows for key in row}))
+        w.writeheader()
+        w.writerows(rows)
+    with flagged.open("x", encoding="utf-8") as target:
+        target.write("\n".join(sorted(reasons)))
 
-    snrs = [m["snr_db"] for m in rows if m["snr_db"] is not None]
+    snrs = [m["snr_db"] for m in rows if m.get("snr_db") is not None]
     print()
-    print(f"measured        : {len(rows)}   unreadable: {len(unreadable)}")
+    print(f"measured        : {len(rows)-len(unreadable)}   unreadable: {len(unreadable)}")
     if snrs:
         snrs.sort()
         print(f"SNR dB          : min {snrs[0]:.1f} | p10 {snrs[len(snrs)//10]:.1f} | median "
               f"{statistics.median(snrs):.1f} | max {snrs[-1]:.1f}")
-    rmss = sorted(m["rms_db"] for m in rows)
-    print(f"RMS dBFS        : p10 {rmss[len(rmss)//10]:.1f} | median {statistics.median(rmss):.1f} "
-          f"| p90 {rmss[len(rmss)*9//10]:.1f}")
-    print(f"any clipping    : {sum(1 for m in rows if m['clipping_ratio'] > 0)}")
+    rmss = sorted(m["rms_db"] for m in rows if "rms_db" in m)
+    if rmss:
+        print(f"RMS dBFS        : median {statistics.median(rmss):.1f}")
+    print(f"any clipping    : {sum(1 for m in rows if m.get('clipped_samples', 0) > 0)}")
     print(f"FLAGGED         : {len(reasons)}  ({len(reasons)/len(rows)*100:.1f}%)")
     tally: dict[str, int] = {}
     for why in reasons.values():
@@ -217,7 +255,8 @@ def main() -> int:
         print(f"   {k:12s} {v}")
     print(f"\nfull report : {args.out}")
     print(f"flagged list: {flagged}   (nothing was moved or deleted)")
-    return 0
+    print("TTS GOLD CERTIFIED: 0. No warning is not proof of clean speech, correct voice, or complete text.")
+    return 2 if unreadable or metadata_error else 0
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const POOL_EXPORT_SCHEMA_VERSION: u32 = 2;
+const POOL_EXPORT_SCHEMA_VERSION: u32 = 3;
 const TTS_SAMPLE_RATE: u32 = 24_000;
 const ASR_SAMPLE_RATE: u32 = 16_000;
 
@@ -55,10 +55,13 @@ pub struct PoolDatasetResult {
     pub voice_name: String,
     pub retained_segments: usize,
     pub rejected_segments: usize,
-    /// Retained clips that also entered the TTS set (measured single-voice score at or above the bar).
+    /// Gold TTS clips. A speaker-change score alone never qualifies a clip.
     pub tts_retained_segments: usize,
-    /// Retained clips kept for ASR but excluded from TTS by name (unmeasured or speaker-change candidate).
+    /// ASR-retained clips excluded from gold TTS, including pending quality qualification.
     pub tts_excluded_segments: usize,
+    /// Screen-passing masters in the explicitly unqualified candidate directory, not tts/.
+    pub tts_candidate_segments: usize,
+    pub tts_qualification_status: String,
     pub total_duration_ms: i64,
     pub manifest_sha256: String,
     pub sha256sums_sha256: String,
@@ -81,11 +84,8 @@ struct PoolExportRow {
     speaker_change_score: Option<f64>,
 }
 
-/// TTS admission (owner direction 2026-09-05: a clean single-voice set per speaker). A clip enters the
-/// TTS set only with a MEASURED speaker-change score at or above the calibrated threshold (0/15
-/// misclassified on the owner's blind listening pass). An unmeasured clip is not clean, it is unknown,
-/// and unknown is excluded by name. Simultaneous overlap is invisible to this score; reviewers mark it
-/// BAD, and a BAD consensus never reaches this function.
+/// Legacy name retained for the calibrated queue preference: this is ONLY a turn-change screen.
+/// Simultaneous overlap and a stable wrong speaker can pass. It is NOT gold TTS admission.
 pub(crate) fn tts_admission(speaker_change_score: Option<f64>) -> Result<(), &'static str> {
     match speaker_change_score {
         None => Err("tts_speaker_change_unmeasured"),
@@ -98,6 +98,14 @@ pub(crate) fn tts_admission(speaker_change_score: Option<f64>) -> Result<(), &'s
 /// yields 0.5899999737739563, which would make the artifact and the rule disagree by a hair).
 fn tts_speaker_change_threshold() -> f64 {
     (f64::from(crate::diarization::SPEAKER_CHANGE_THRESHOLD) * 10_000.0).round() / 10_000.0
+}
+
+/// Current evidence does not contain an authenticated, audio/text-bound TTS quality approval.
+/// A new qualification authority is required before any schema can claim gold. Neither legacy v2
+/// certificates nor v3 candidate packaging is that authority. Do not infer it from scalar scores,
+/// a JSON status supplied by a caller, or successful transcript consensus.
+pub fn gold_tts_qualification_supported() -> bool {
+    false
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -478,13 +486,16 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
 
         fs::create_dir_all(staging.join("asr/audio_16k"))?;
         fs::create_dir_all(staging.join("tts/audio_24k"))?;
+        fs::create_dir_all(staging.join("tts_candidates/audio_24k"))?;
         let mut asr_meta = BufWriter::new(File::create(staging.join("asr/metadata.jsonl"))?);
-        let mut tts_meta = BufWriter::new(File::create(staging.join("tts/metadata.jsonl"))?);
+        File::create(staging.join("tts/metadata.jsonl"))?;
+        let mut tts_meta = BufWriter::new(File::create(staging.join("tts_candidates/metadata.jsonl"))?);
         let mut rights_meta = BufWriter::new(File::create(staging.join("rights.jsonl"))?);
         let mut exclusions = BufWriter::new(File::create(staging.join("exclusions.jsonl"))?);
         let mut files = vec![
             "asr/metadata.jsonl".to_string(),
             "tts/metadata.jsonl".to_string(),
+            "tts_candidates/metadata.jsonl".to_string(),
             "rights.jsonl".to_string(),
             "exclusions.jsonl".to_string(),
         ];
@@ -557,7 +568,7 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
                     AppError::Validation(format!("{}: deterministic export ordinal is missing", row.segment_id))
                 })?;
                 let file_name = format!("{ordinal:06}.wav");
-                let tts_relative = format!("tts/audio_24k/{file_name}");
+                let tts_relative = format!("tts_candidates/audio_24k/{file_name}");
                 let source_bytes_preserved = start == 0 && end == master.len();
                 let tts_admitted = tts_admission(row.speaker_change_score);
                 let tts_sha = if tts_admitted.is_ok() {
@@ -628,6 +639,22 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
                                 "sourceMasterSha256": source_sha,
                                 "sourceStartMs": row.source_start_ms,
                                 "sourceEndMs": row.source_end_ms,
+                                "qualificationStatus": "pending",
+                                "goldTtsEligible": false,
+                                "verbatimTextSha256": sha256_bytes(text.as_bytes()),
+                                "resolutionEvidenceSha256": row.resolution.evidence_sha256,
+                                "requiredChecks": ["target_speaker", "no_secondary_speech", "audio_quality", "verbatim_and_boundaries"],
+                            }),
+                        )?;
+                        write_jsonl(
+                            &mut exclusions,
+                            &serde_json::json!({
+                                "id": row.segment_id,
+                                "reason": "tts_quality_qualification_missing",
+                                "scope": "tts",
+                                "asrRetained": true,
+                                "ttsAudioCopied": false,
+                                "unqualifiedCandidateAudioCopied": true,
                             }),
                         )?;
                         hash_field(&mut audio_digest, tts_sha.as_bytes());
@@ -702,15 +729,20 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
             "audioSha256": audio_sha256,
             "retainedSegments": retained_rows.len(),
             "rejectedSegments": rejected_rows.len(),
-            "ttsRetainedSegments": tts_retained,
-            "ttsExcludedSegments": tts_excluded,
+            "ttsRetainedSegments": 0,
+            "ttsExcludedSegments": tts_retained + tts_excluded,
+            "ttsCandidateSegments": tts_retained,
+            "ttsQualificationStatus": "pending",
             "totalDurationMs": total_duration_ms,
             "transcriptAuthority": "two matching independent reviewers, matching pair among three, or owner adjudication",
             "asr": {"directory": "asr", "sampleRate": ASR_SAMPLE_RATE, "audio": "mono PCM16 WAV"},
             "tts": {"directory": "tts", "sampleRate": TTS_SAMPLE_RATE,
-                    "audio": "byte-preserved masters or exact-sample bounded PCM16 extraction",
-                    "admission": "measured speaker-change score at or above the threshold; unmeasured or candidate clips are excluded by name",
+                    "audio": "empty: no gold TTS quality authority yet",
+                    "admission": "explicit audio/text-bound quality qualification required; speaker-change scores and transcript consensus are insufficient",
                     "speakerChangeThreshold": tts_speaker_change_threshold()},
+            "ttsCandidates": {"directory": "tts_candidates", "goldTtsEligible": false,
+                    "audio": "unqualified byte-preserved masters or exact-sample PCM16 extraction",
+                    "admission": "turn-change screen only; requires separate human TTS qualification"},
             "exclusions": {"file": "exclusions.jsonl", "rejectedAudioCopied": false, "ttsAudioCopied": false},
         });
         let manifest_bytes =
@@ -765,8 +797,10 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
                 "exportSha256sumsSha256": sha256sums_sha256,
                 "retainedSegments": retained_rows.len(),
                 "rejectedSegments": rejected_rows.len(),
-                "ttsRetainedSegments": tts_retained,
-                "ttsExcludedSegments": tts_excluded,
+                "ttsRetainedSegments": 0,
+                "ttsExcludedSegments": tts_retained + tts_excluded,
+                "ttsCandidateSegments": tts_retained,
+                "ttsQualificationStatus": "pending",
                 "totalDurationMs": total_duration_ms,
                 "appGitSha": app_git_sha,
                 "createdAtMs": created_at_ms,
@@ -898,8 +932,10 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
             voice_name: voice_name.to_string(),
             retained_segments: retained_rows.len(),
             rejected_segments: rejected_rows.len(),
-            tts_retained_segments: tts_retained,
-            tts_excluded_segments: tts_excluded,
+            tts_retained_segments: 0,
+            tts_excluded_segments: tts_retained + tts_excluded,
+            tts_candidate_segments: tts_retained,
+            tts_qualification_status: "pending".to_string(),
             total_duration_ms,
             manifest_sha256,
             sha256sums_sha256,
@@ -1201,13 +1237,10 @@ mod tests {
         std::fs::read_to_string(path).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect()
     }
 
-    /// Owner direction 2026-09-05: the TTS set for a voice must be clean single-speaker audio. Decided
-    /// words are not enough — a clip enters TTS only with a measured speaker-change score at or above the
-    /// calibrated threshold; an unmeasured clip is unknown and is excluded BY NAME. ASR keeps every
-    /// retained clip either way, because a correct transcript of a two-voice clip still teaches recognition.
+    /// The existing screen still ranks queue work; its passing result is not a gold decision.
     #[test]
     fn tts_admission_requires_a_measured_speaker_change_score_at_or_above_the_threshold() {
-        assert!(tts_admission(Some(0.59)).is_ok(), "the threshold itself is admitted");
+        assert!(tts_admission(Some(0.59)).is_ok(), "the threshold itself passes the turn screen only");
         assert!(tts_admission(Some(0.93)).is_ok());
         assert_eq!(tts_admission(Some(0.5899)), Err("tts_speaker_change_candidate"));
         assert_eq!(tts_admission(Some(f64::NAN)), Err("tts_speaker_change_candidate"));
@@ -1278,7 +1311,9 @@ mod tests {
         let certificate: serde_json::Value =
             serde_json::from_slice(&fs::read(first_output.join("certificate.json")).unwrap()).unwrap();
         for value in [&manifest, &certificate] {
-            assert_eq!(value["schemaVersion"], 2);
+            assert_eq!(value["schemaVersion"], 3);
+            assert_eq!(value["ttsQualificationStatus"], "pending");
+            assert_eq!(value["ttsCandidateSegments"], 2);
             assert_eq!(value["sourcePoolSegmentCount"], 4);
             assert_eq!(value["canonicalReviewSegmentCount"], 3);
             assert_eq!(value["excludedDuplicateSegmentCount"], 1);
@@ -1290,11 +1325,21 @@ mod tests {
 
         assert_eq!(
             (manifest["ttsRetainedSegments"].as_u64(), manifest["ttsExcludedSegments"].as_u64()),
-            (Some(2), Some(0))
+            (Some(0), Some(2))
         );
-        assert_eq!((first.tts_retained_segments, first.tts_excluded_segments), (2, 0));
-        let tts = read_jsonl(&first_output.join("tts/metadata.jsonl"));
+        assert_eq!((first.tts_retained_segments, first.tts_excluded_segments), (0, 2));
+        assert_eq!(first.tts_candidate_segments, 2);
+        assert!(!gold_tts_qualification_supported());
+        assert!(read_jsonl(&first_output.join("tts/metadata.jsonl")).is_empty());
+        assert_eq!(fs::read_dir(first_output.join("tts/audio_24k")).unwrap().count(), 0);
+        let tts = read_jsonl(&first_output.join("tts_candidates/metadata.jsonl"));
         assert_eq!(tts.len(), 2);
+        for row in &tts {
+            assert_eq!(row["goldTtsEligible"], false);
+            assert_eq!(row["qualificationStatus"], "pending");
+            assert_eq!(row["verbatimTextSha256"], sha256_bytes(row["verbatimText"].as_str().unwrap().as_bytes()));
+            assert_eq!(row["resolutionEvidenceSha256"].as_str().unwrap().len(), 64);
+        }
         let bounded = tts.iter().find(|row| row["id"] == "bounded").unwrap();
         let full = tts.iter().find(|row| row["id"] == "full").unwrap();
         assert_eq!(bounded["sourceBytesPreserved"], false);
@@ -1302,19 +1347,22 @@ mod tests {
         assert_eq!(bounded["sourceEndMs"], 1_500);
         assert_eq!(full["sourceBytesPreserved"], true);
         assert_eq!(
-            sha256_file(&first_output.join("tts/audio_24k/000002.wav")).unwrap(),
+            sha256_file(&first_output.join("tts_candidates/audio_24k/000002.wav")).unwrap(),
             sha256_file(&directory.path().join("full-master.wav")).unwrap()
         );
         let asr_reader = hound::WavReader::open(first_output.join("asr/audio_16k/000001.wav")).unwrap();
         assert_eq!(asr_reader.spec().sample_rate, ASR_SAMPLE_RATE);
         assert_eq!(asr_reader.spec().channels, 1);
         assert_eq!(asr_reader.duration(), 16_000);
-        assert_eq!(read_jsonl(&first_output.join("exclusions.jsonl"))[0]["id"], "rejected");
+        let exclusions = read_jsonl(&first_output.join("exclusions.jsonl"));
+        assert_eq!(exclusions.len(), 3);
+        assert_eq!(exclusions.iter().filter(|r| r["reason"] == "tts_quality_qualification_missing").count(), 2);
+        assert!(exclusions.iter().any(|r| r["id"] == "rejected"));
         assert!(
             !read_jsonl(&first_output.join("rights.jsonl")).iter().any(|row| row["id"] == "duplicate"),
             "proven non-canonical duplicates must be absent from every export surface"
         );
-        assert_eq!(fs::read_dir(first_output.join("tts/audio_24k")).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(first_output.join("tts_candidates/audio_24k")).unwrap().count(), 2);
 
         let second_output = directory.path().join("export-two");
         let second = export_voice(
@@ -1492,6 +1540,54 @@ mod tests {
             error.contains("complete v64 pool authority") || error.contains("digest"),
             "unexpected certificate refusal: {error}"
         );
+    }
+
+    #[test]
+    fn candidate_certificate_cannot_be_rehashed_into_gold_or_change_qualification_counts() {
+        let (directory, db) = fixture();
+        export_voice(
+            &db,
+            &PoolDatasetOptions {
+                output_dir: directory.path().join("candidate").to_string_lossy().to_string(),
+                voice_name: "Lamo".into(),
+            },
+        )
+        .unwrap();
+        let original = review_pool::voice_certificate(&db, "Lamo").unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&original.certificate_json).unwrap();
+        db.connection().execute("DROP TRIGGER review_pool_voice_certificates_immutable_update", []).unwrap();
+        for (key, bad) in [
+            ("ttsQualificationStatus", serde_json::json!("qualified")),
+            ("ttsRetainedSegments", serde_json::json!(1)),
+            ("ttsExcludedSegments", serde_json::json!(1)),
+            ("ttsCandidateSegments", serde_json::json!(3)),
+            ("ttsCandidateSegments", serde_json::Value::Null),
+            ("schemaVersion", serde_json::json!(999)),
+        ] {
+            let mut tampered = value.clone();
+            tampered[key] = bad;
+            let json = serde_json::to_string(&tampered).unwrap();
+            db.connection()
+                .execute(
+                    "UPDATE review_pool_voice_certificates SET certificate_json=?1, certificate_sha256=?2",
+                    rusqlite::params![json, sha256_bytes(json.as_bytes())],
+                )
+                .unwrap();
+            let error = review_pool::voice_certificate(&db, "Lamo").unwrap_err();
+            assert!(error.contains("complete v64 pool authority"), "{key}: {error}");
+        }
+        // Historical schema-2 evidence remains readable, but cannot enable gold readiness.
+        let mut legacy = value;
+        legacy["schemaVersion"] = serde_json::json!(2);
+        let json = serde_json::to_string(&legacy).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE review_pool_voice_certificates SET certificate_json=?1, certificate_sha256=?2",
+                rusqlite::params![json, sha256_bytes(json.as_bytes())],
+            )
+            .unwrap();
+        assert!(review_pool::voice_certificate(&db, "Lamo").unwrap().is_some());
+        assert!(!gold_tts_qualification_supported());
     }
 
     /// One-voice, one-clip pool with rights stamped but NO dedup manifest and NO second opinion,
