@@ -357,6 +357,30 @@ of disputed canonical approval from resolution/export/learning, shared eligible-
 stale submission/playback fences, explicit compensation handling and clone/restore/rollout proof.
 Timestamp scoping alone cannot distinguish ordinary undo from owner send-back within a round.
 
+## 2026-09-07 — Incident: deploy of 1b0ff03e failed on the queue proof I had emptied (recovered 16:58)
+
+**What happened.** The owner ran the handover for release `1b0ff03e2ede-…` at 16:52. It stopped the live app,
+snapshotted (`snapshots/pinned/preprivate_v70_to_v70_1788789153`), then FAILED in `prove_canonical_queues`: the
+gate probes every Couch-session reviewer and refuses when `availableClips` is 0, and two reviewers had been paused
+that afternoon via `reviewer_dialects.json` → `["badini"]` (a dialect no pool source maps to). The inline recovery
+relaunched the previous release `a808d48e` at 16:53:49 and died on the same probe, leaving
+`private-production-maintenance.json` (review writes 503), the handover journal (phase `snapshotted`) and the
+watchdog task DISABLED; `logs/release-recovery-failure.json` recorded the probe error at 16:54:32 and the recovery
+arm would have kept failing every five minutes. Review was unavailable from 16:51:40 to 16:58.
+
+**Cause.** Mine: pausing reviewers by emptying their queue violates the release gate's invariant that every session
+reviewer has work. The gate was right; the pause mechanism was wrong.
+
+**Recovery.** Roster lines restored (backup `reviewer_roster_backups/pre_unpause_recovery_*`), probes for both
+reviewers green (9,798 / 10,545 clips), `schtasks /Run /TN CortexReleaseRecovery`; at 16:58 the journal, maintenance
+marker and failure file were gone, the watchdog task was `Ready`, `https://127.0.0.1:8737` answered 200 on release
+`a808d48e`. No database restore was needed (the migration was 70→70; decision history unchanged: baseline pool
+decision id 582). The deploy of `1b0ff03e` is to be re-run by the owner with the roster intact; the redo file then
+becomes the pause mechanism (a reviewer in redo has a non-empty queue: their own clips).
+
+**Rule recorded.** Never pause a reviewer by emptying their queue while they remain in the session; run the gate's
+queue proof for every session reviewer before declaring a release staged.
+
 ## 2026-09-07 — Send-back: the owner's rule change for a reviewer's POOL "Looks good" decisions
 
 **Owner instruction (verbatim).** "i want to make rubar's work all second pass, starting with what she chose
