@@ -1283,6 +1283,35 @@ def snapshot_before_handover(data_dir: Path, manifest: dict[str, Any]) -> tuple[
     return snapshot, manifest_sha
 
 
+def training_quarantine_history(db: Path) -> dict[str, set[tuple[Any, ...]]]:
+    """Read complete immutable history, including cleared holds, from one consistent snapshot."""
+    connection = sqlite3.connect(db.resolve(strict=True).as_uri() + "?mode=ro", uri=True, timeout=30)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        result = {}
+        for table in ("training_quarantine_holds", "training_quarantine_clearances"):
+            exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+            if exists is None:
+                if version >= 72:
+                    raise ReleaseError(f"schema-{version} database lost {table}; automatic restore is unsafe")
+                result[table] = set()
+            else:
+                result[table] = set(connection.execute(f'SELECT * FROM "{table}"').fetchall())
+        return result
+    finally:
+        connection.close()
+
+
+def assert_training_quarantine_restore_floor(live: Path, restored: Path) -> None:
+    floor = training_quarantine_history(live)
+    candidate = training_quarantine_history(restored)
+    for table, rows in floor.items():
+        if not rows.issubset(candidate[table]):
+            raise ReleaseError(f"automatic restore would erase or change {table}; preserve current database")
+
+
 def restore_database(
     snapshot: Path,
     data_dir: Path,
@@ -1310,6 +1339,7 @@ def _restore_database_locked(
     if database_schema(source) != expected_schema:
         raise ReleaseError("rollback snapshot schema does not match the pre-handover database")
     live = data_dir / "cortex-speech.db"
+    assert_training_quarantine_restore_floor(live, source)
     temporary = data_dir / f".cortex-speech.rollback.{os.getpid()}.{time.time_ns()}.db"
     try:
         sqlite_backup(source, temporary)
@@ -1355,6 +1385,7 @@ def _restore_database_locked(
             checkpoint.close()
         if database_content_sha256(live) != live_digest:
             raise ReleaseError("live database changed while rollback was preparing its replacement")
+        assert_training_quarantine_restore_floor(live, temporary)
 
         for suffix in ("-wal", "-shm"):
             sidecar = Path(str(live) + suffix)
@@ -1538,6 +1569,10 @@ def _recover_under_lock(data_dir: Path, release_root: Path, journal_path: Path) 
             # validate_release_journal normally catches this. Keep the recovery decision locally
             # fail-closed even if a future journal reader relaxes shape validation.
             raise ReleaseError("post-migration database authority is missing; rollback safety is unknowable")
+        # Holds can be written before certification and without a new paid opinion. Even an exact
+        # certified digest cannot authorize returning to a schema that cannot represent those holds.
+        # Preserve cleared history too; reactivating old code would otherwise bypass training safety.
+        database_changed = database_changed or any(training_quarantine_history(db).values())
     mode = rollback_policy(
         source_schema,
         current_schema,

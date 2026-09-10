@@ -22,6 +22,10 @@ Owner-final transcripts remain final; quality restrictions still apply before tr
   pinned migration flow first. Old binaries must refuse schema 72.
 - Restore admission preserves every exact hold and clearance. Schema downgrade refuses to discard
   even cleared history. A raw external replacement of the whole data directory is not an approved restore.
+- Automatic deployment recovery follows the same floor: any recorded hold prevents rollback to an
+  older schema, even before certification or when no reviewer decision or post-certification write
+  exists. Recovery keeps the current database and retries a quarantine-aware candidate; a failed
+  candidate launch leaves maintenance active instead of silently enabling old training/export code.
 
 ## Offline operator workflow
 

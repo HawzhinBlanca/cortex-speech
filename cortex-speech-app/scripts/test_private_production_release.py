@@ -115,6 +115,12 @@ def seed_database(path: Path, version: int, marker: str = "test") -> None:
         "CREATE TABLE review_pool_decisions(id INTEGER PRIMARY KEY);"
         "CREATE TABLE marker(value TEXT);"
     )
+    if version >= 72:
+        # Minimal row shapes test the release controller's field-independent exact-history floor.
+        connection.executescript(
+            "CREATE TABLE training_quarantine_holds(batch_id TEXT,segment_id TEXT,evidence TEXT);"
+            "CREATE TABLE training_quarantine_clearances(batch_id TEXT,segment_id TEXT,evidence TEXT);"
+        )
     connection.executemany(
         "INSERT INTO schema_migrations(version, description) VALUES(?, ?)",
         [(item, f"migration-{item}") for item in range(1, version + 1)],
@@ -825,6 +831,48 @@ def test_restore_preserves_failed_database_and_verifies_snapshot() -> None:
         connection.close()
 
 
+def test_rollback_refuses_to_erase_holds_or_clearances_and_missing_authority() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        data, snapshot = base / "data", base / "snapshot"
+        data.mkdir()
+        snapshot.mkdir()
+        live = data / "cortex-speech.db"
+        seed_database(live, 72, "current")
+        seed_database(snapshot / "cortex-speech.db", 71, "before-holds")
+        sealed = seal_snapshot(snapshot)
+        with closing(sqlite3.connect(live)) as conn, conn:
+            conn.execute("INSERT INTO training_quarantine_holds VALUES('batch','clip','held-evidence')")
+            conn.execute("INSERT INTO training_quarantine_clearances VALUES('batch','clip','manual-evidence')")
+        before = release.database_content_sha256(live)
+        try:
+            release.restore_database(snapshot, data, 71, sealed)
+        except release.ReleaseError as error:
+            assert "training_quarantine_holds" in str(error)
+        else:
+            raise AssertionError("rollback erased cleared quarantine history")
+        assert release.database_content_sha256(live) == before
+        same_schema = base / "same-schema.db"
+        release.sqlite_backup(live, same_schema)
+        release.assert_training_quarantine_restore_floor(live, same_schema)
+        with closing(sqlite3.connect(same_schema)) as conn, conn:
+            conn.execute("UPDATE training_quarantine_clearances SET evidence='different'")
+        try:
+            release.assert_training_quarantine_restore_floor(live, same_schema)
+        except release.ReleaseError as error:
+            assert "training_quarantine_clearances" in str(error)
+        else:
+            raise AssertionError("restore changed manual-clearance evidence")
+        with closing(sqlite3.connect(same_schema)) as conn:
+            conn.execute("DROP TABLE training_quarantine_holds")
+        try:
+            release.training_quarantine_history(same_schema)
+        except release.ReleaseError as error:
+            assert "lost training_quarantine_holds" in str(error)
+        else:
+            raise AssertionError("missing quarantine authority was treated as an empty history")
+
+
 def test_handover_refuses_a_freshly_bound_but_stale_snapshot_generation() -> None:
     with tempfile.TemporaryDirectory() as raw:
         base = Path(raw)
@@ -1180,6 +1228,58 @@ def test_post_migration_database_write_refuses_rollback_to_schema65_snapshot() -
         connection.close()
         pointer = json.loads((data / release.POINTER_FILE).read_text(encoding="utf-8"))
         assert pointer["releaseId"] == candidate["releaseId"]
+
+
+def test_recovery_preserves_quarantine_even_without_new_decisions_or_digest_drift() -> None:
+    for phase in ("snapshotted", "candidate-certified", "exposed"):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            source, releases, data, snapshot = (base / name for name in ("source", "releases", "data", "snapshot"))
+            seed_source(source)
+            seed_candidate(base / "candidate", git_sha="3" * 40)
+            seed_candidate(base / "previous", git_sha="4" * 40)
+            candidate = release.stage_release(base / "candidate", source, releases, "3" * 40)
+            previous = as_legacy_v65(release.stage_release(base / "previous", source, releases, "4" * 40))
+            data.mkdir()
+            snapshot.mkdir()
+            live = data / "cortex-speech.db"
+            seed_database(live, 72)
+            seed_database(snapshot / "cortex-speech.db", 65)
+            seal_snapshot(snapshot)
+            with closing(sqlite3.connect(live)) as conn, conn:
+                conn.execute("INSERT INTO training_quarantine_holds VALUES('batch','clip','hold')")
+                conn.execute("INSERT INTO training_quarantine_clearances VALUES('batch','clip','clearance')")
+            digest = release.database_content_sha256(live)
+            release.atomic_json(data / release.JOURNAL_FILE, release_journal(
+                candidate, previous, source_schema=65, phase=phase, snapshot=snapshot,
+                target_digest=None if phase == "snapshotted" else digest,
+            ))
+            with (
+                mock.patch.object(release, "task_change"), mock.patch.object(release, "stop_app"),
+                mock.patch.object(release, "restore_database") as restore,
+                mock.patch.object(release, "launch_app") as launch,
+                mock.patch.object(release, "wait_for_server"), mock.patch.object(release, "certify_live"),
+                mock.patch.object(release, "prove_links"), mock.patch.object(release, "prove_canonical_queues"),
+                mock.patch.object(release, "register_release_tasks"), mock.patch.object(release, "unregister_task"),
+            ):
+                launch.side_effect = release.ReleaseError("simulated candidate launch failure")
+                try:
+                    release.recover(data, releases)
+                except release.ReleaseError as error:
+                    assert "simulated candidate launch failure" in str(error)
+                else:
+                    raise AssertionError("failed launch was reported as recovered")
+                assert (data / release.MAINTENANCE_FILE).is_file()
+                assert (data / release.JOURNAL_FILE).is_file()
+                assert release.database_content_sha256(live) == digest
+                restore.assert_not_called()
+                launch.reset_mock()
+                launch.side_effect = None
+                assert release.recover(data, releases)
+            restore.assert_not_called()
+            launch.assert_called_once_with(Path(candidate["appExe"]))
+            assert release.database_content_sha256(live) == digest
+            assert json.loads((data / release.POINTER_FILE).read_text(encoding="utf-8"))["releaseId"] == candidate["releaseId"]
 
 
 def test_recovery_refuses_future_schema_before_process_or_task_mutation() -> None:
