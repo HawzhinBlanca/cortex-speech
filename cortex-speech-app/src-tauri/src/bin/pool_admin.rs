@@ -157,7 +157,9 @@ fn first_overlapping_window(spans: &mut [(i64, i64, String)]) -> Option<(String,
 }
 
 fn usage() -> &'static str {
+    concat!(
     "Usage:\n  pool_admin migrate --db <cortex-speech.db>\n  pool_admin inventory --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...]\n  pool_admin activate --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...] [--pool-id <uuid>]\n  pool_admin apply-dedup --db <cortex-speech.db> --manifest <review-pool-dedup.json>\n  pool_admin status --db <cortex-speech.db>\n  pool_admin certify --db <cortex-speech.db> [--full-integrity] [--require-review-ready | --require-final-ready]\n  pool_admin probe --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...]\n  pool_admin benchmark --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...] [--iterations <1..100>]\n  pool_admin benchmark-commit --db <read-only-source.db> --iterations <1..500> --confirm-disposable\n    Synthetic commits use an internally owned temporary clone, never the supplied source.\n  pool_admin stamp-rights --db <cortex-speech.db>\n  pool_admin adjudicate --db <cortex-speech.db> --segment <id> (--retain-text <text> | --reject) --operation-id <uuid>\n  pool_admin send-back --db <cortex-speech.db> --reviewer <Name> [--action accept|edit ...]\n    Read-only semantic-action inventory; not exact clicked-button selection. --apply is disabled.\n  pool_admin plan-send-back --db <cortex-speech.db> --decision-id <id> [--decision-id ...]\n    Outputs an exact retained-pool plan for owner inspection; does not change the database.\n  pool_admin apply-send-back --db <cortex-speech.db> --manifest <plan.json> --acknowledge-pay-adjustments\n    Offline atomic pool reversal only; NOT canonical trust withdrawal or general re-review activation.\n  pool_admin plan-reopen --db <library.db> (--segment-list <ids.json> | --segment-id <id> ...) --reason <text> [--priority 0..2]\n    Read-only exact preview; retained canonical clips only. Save and inspect stdout privately.\n  pool_admin apply-reopen --db <offline-library.db> --manifest <plan.json> --confirm-quality-hold\n    Atomic trust withdrawal and shared fresh-review round; preserves prior transcripts and pay.\n  pool_admin export --db <cortex-speech.db> --voice-name <Name> --output <directory>"
+    , "\n    Optional --approved-subset exports resolved clips without certifying the complete voice.")
 }
 
 const DETACHED_READ_COMMANDS: &[&str] = &["certify"];
@@ -1414,10 +1416,12 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         "export" => {
             let voice_name = value_after(&args, "--voice-name")?;
             let output_dir = value_after(&args, "--output")?;
-            let result = cortex_speech_app_lib::review_pool_export::export_voice(
-                &db,
-                &cortex_speech_app_lib::review_pool_export::PoolDatasetOptions { output_dir, voice_name },
-            )?;
+            let options = cortex_speech_app_lib::review_pool_export::PoolDatasetOptions { output_dir, voice_name };
+            let result = if args.iter().any(|arg| arg == "--approved-subset") {
+                cortex_speech_app_lib::review_pool_export::export_approved_subset(&db, &options)?
+            } else {
+                cortex_speech_app_lib::review_pool_export::export_voice(&db, &options)?
+            };
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         _ => return Err(usage().into()),

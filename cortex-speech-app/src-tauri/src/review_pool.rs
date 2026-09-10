@@ -28,6 +28,7 @@ pub use dedup::{apply_dedup_manifest, dedup_status, PoolDedupStatus};
 #[cfg(test)]
 pub(crate) use dedup::{canonical_json_bytes, normalized_text_sha256};
 use dedup::{load_dedup_binding, RegistryDedupRow};
+pub(crate) use dedup::{DEDUP_ALGORITHM_V1, DEDUP_ALGORITHM_V2};
 use family::family_seen_on;
 pub(crate) use family::{require_unseen_pool_family_on, require_unseen_pool_family_or_own_canonical_on};
 
@@ -1249,9 +1250,7 @@ pub fn pending_segment_ids_with_hints(
         // verdict can still be written (the schema refuses a fourth judgement; beyond that only
         // `pool_admin adjudicate` settles it) — audit 2026-09-10 finding 6.
         let judged = coverage.map_or(0, |coverage| coverage.judged.len());
-        if matches!(resolution, DerivedResolution::Resolved { .. })
-            || (matches!(resolution, DerivedResolution::OwnerConflict) && !(trust::is_owner(&reviewer) && judged < 3))
-        {
+        if !trust::permits_fresh_opinion(&resolution, coverage, &reviewer) {
             continue;
         }
         // Owner 2026-09-08: a reopened clip is private to the people it re-checks + the final reviewers.
@@ -1646,7 +1645,7 @@ pub fn record_decision(db: &Database, pool: &ReviewPool, input: &PoolDecisionInp
             DerivedResolution::Resolved { .. } => {
                 return Err("review pool clip is already resolved".to_string());
             }
-            DerivedResolution::OwnerConflict if !trust::is_owner(&reviewer) => {
+            DerivedResolution::OwnerConflict if !trust::permits_fresh_opinion(&resolution, current, &reviewer) => {
                 return Err("review pool clip requires owner adjudication".to_string());
             }
             DerivedResolution::OwnerConflict | DerivedResolution::Pending | DerivedResolution::NeedsThird => {}
@@ -2734,6 +2733,30 @@ mod tests {
             .query_row("SELECT human_fix FROM agent_examples WHERE id='first-example'", [], |row| row.get(0))
             .unwrap();
         assert_eq!(old, "دەقی یەکەم");
+    }
+
+    #[test]
+    fn a_single_owner_or_trusted_first_review_reaches_real_export_and_learning() {
+        for policy in [r#"{"owner":"Rubar","trusted":[]}"#, r#"{"owner":"Hawzhin","trusted":["Rubar"]}"#] {
+            let (directory, db, _pool) = one_clip_pool_fixture("دەقی یەکەم", false, true);
+            trust::with_policy(trust::parse(policy).unwrap(), || {
+                let resolution = segment_resolutions(&db, None).unwrap().remove(0);
+                assert_eq!(resolution.reviewer_count, 1);
+                assert_eq!(resolution.status, "resolved");
+                let kept = crate::export::exclude_unexportable_segments(&db, db.get_segments(None).unwrap()).unwrap();
+                assert_eq!(kept.len(), 1);
+                assert_eq!(kept[0].export_review.as_ref().unwrap().transcript(), "دەقی یەکەم");
+                let path = directory.path().join("approved.json");
+                crate::export::export_dataset(&db, &path, &crate::settings::ExportFormat::Json).unwrap();
+                let exported: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                assert!(exported.to_string().contains("دەقی یەکەم"));
+                let pairs = crate::jury::learning::build_dpo_dataset(&db).unwrap();
+                assert_eq!(pairs.pair_count, 1);
+                let pair: serde_json::Value = serde_json::from_str(&pairs.jsonl).unwrap();
+                assert_eq!(pair["chosen"], "دەقی یەکەم");
+                assert_eq!(crate::jury::learning::export_lm_corpus(&db).unwrap(), vec!["دەقی یەکەم"]);
+            });
+        }
     }
 
     #[test]
@@ -3956,6 +3979,20 @@ mod tests {
             assert_eq!((row.status.as_str(), row.final_transcript.as_deref()), ("resolved", Some("دەقی خاوەن")));
             assert!(trust::is_decided(&db, "clip").unwrap());
             assert!(pending_segment_ids(&db, &pool, "Hawzhin", None).unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn bulk_reopen_protects_owner_finality_at_preview_and_apply() {
+        let (_dir, db, pool) = one_clip_pool("دەقی خاوەن");
+        let ids = vec!["clip".to_string()];
+        let preview = reopen::prepare(&db, &pool, &ids, "Recheck disputed work", 0).unwrap();
+        let policy = trust::parse(r#"{"owner":"Rubar","trusted":[]}"#).unwrap();
+        trust::with_policy(policy, || {
+            assert!(reopen::prepare(&db, &pool, &ids, "Recheck disputed work", 0).unwrap_err().contains("owner-final"));
+            assert!(reopen::apply(&db, &pool, &preview, 2).unwrap_err().contains("owner-final"));
+            assert!(!reopen::has_rounds(&db).unwrap());
+            assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "resolved");
         });
     }
 

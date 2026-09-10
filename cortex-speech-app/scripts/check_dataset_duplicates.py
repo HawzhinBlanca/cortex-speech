@@ -98,7 +98,7 @@ def _data_dir() -> Path:
     return Path.home() / ".local" / "share" / "cortex-speech"
 
 
-def duplicate_groups(rows: list[tuple[str, str, str, str, int]]) -> list[list[tuple[str, str]]]:
+def duplicate_groups(rows: list[tuple[str, str, str, str, int]], *, include_short: bool = False) -> list[list[tuple[str, str]]]:
     """Groups of (segment_id, source_file) holding the same content across DIFFERENT files.
 
     `rows` = (id, audio_path, alignment_json, raw_transcript, verified).
@@ -114,7 +114,9 @@ def duplicate_groups(rows: list[tuple[str, str, str, str, int]]) -> list[list[tu
     durations: dict[str, int] = {}
     for seg_id, path, alignment_json, raw, _verified in rows:
         text = " ".join((raw or "").split())
-        if len(text) < MIN_TEXT_CHARS:
+        # Historical manifest generation retains its versioned 25-character contract. The live
+        # audit also nominates short phrases: text nominates; waveform proof alone retires audio.
+        if not text or (not include_short and len(text) < MIN_TEXT_CHARS):
             continue
         try:
             meta = json.loads(alignment_json or "{}")
@@ -776,7 +778,7 @@ def main() -> int:
     finally:
         con.close()
 
-    candidates = duplicate_groups(rows)
+    candidates = duplicate_groups(rows, include_short=True)
     # RULE C: the audio decides. Text-matched groups whose clips are demonstrably DIFFERENT audio are
     # a narrator repeating a sentence, not a duplicated import.
     groups, unconfirmed, repeats, probable = confirm_groups_with_audio(candidates, rows, include_probable=True)
@@ -833,7 +835,7 @@ def main() -> int:
             flush=True,
         )
     else:
-        print("DATASET DUPLICATES: OK (no cross-file duplicate content)", flush=True)
+        print("DATASET DUPLICATES: OK (no unresolved cross-file duplicates among text-nominated audio candidates, including short phrases; not an exhaustive all-audio proof)", flush=True)
     return 0
 
 

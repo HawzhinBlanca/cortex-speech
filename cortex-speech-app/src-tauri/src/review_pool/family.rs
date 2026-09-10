@@ -30,6 +30,11 @@ pub(super) fn family_seen_on(
         // and dropping the root's own coverage re-served every reopened clip with twins to the
         // reviewer who had just judged it (live incident 2026-09-08, 18 of 25 verdicts came back).
         if roots.get(id).is_some_and(|root| root != id && reopened.contains(root)) {
+            // A disputed ordinary opinion may be rechecked, but reopening a different cut must
+            // not erase the owner's exposure. Do not transfer text across unequal boundaries.
+            seen.entry(roots[id].clone())
+                .or_default()
+                .extend(coverage.seen.iter().filter(|reviewer| super::trust::is_owner(reviewer)).cloned());
             continue;
         }
         seen.entry(roots.get(id).unwrap_or(id).clone()).or_default().extend(coverage.seen.iter().cloned());
@@ -166,4 +171,30 @@ fn require_unseen_pool_family_impl(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod owner_exposure_tests {
+    use super::*;
+
+    #[test]
+    fn reopening_a_root_preserves_its_retired_twins_owner_exposure_only() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations(version INTEGER); INSERT INTO schema_migrations VALUES(71);
+            CREATE TABLE review_pool_registry(pool_id TEXT); INSERT INTO review_pool_registry VALUES('pool');
+            CREATE TABLE review_pool_duplicate_exclusions(pool_id TEXT,segment_id TEXT,canonical_segment_id TEXT);
+            INSERT INTO review_pool_duplicate_exclusions VALUES('pool','twin','root');
+            CREATE TABLE current_review_reopen_members_v71(segment_id TEXT);
+            INSERT INTO current_review_reopen_members_v71 VALUES('root');",
+        )
+        .unwrap();
+        let mut coverage = SegmentReviewers::default();
+        coverage.seen.extend(["hawzhin".to_string(), "rubar".to_string()]);
+        let reviewers = HashMap::from([("twin".to_string(), coverage)]);
+        let policy = super::super::trust::parse(r#"{"owner":"Hawzhin","trusted":[]}"#).unwrap();
+        super::super::trust::with_policy(policy, || {
+            assert_eq!(family_seen_on(&conn, &reviewers).unwrap()["root"], HashSet::from(["hawzhin".to_string()]));
+        });
+    }
 }

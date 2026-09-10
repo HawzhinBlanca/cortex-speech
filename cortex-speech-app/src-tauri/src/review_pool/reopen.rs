@@ -133,7 +133,12 @@ fn items_on(conn: &rusqlite::Connection, pool: &ReviewPool, ids: &[String]) -> R
                     (SELECT COALESCE(MAX(id),0) FROM review_events WHERE segment_id=?1),
                     COALESCE((SELECT round_seq FROM current_review_reopen_members_v71 WHERE segment_id=?1),0)",
             [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(|e| e.to_string())?;
-        let (_, evidence) = derive_resolution(id, reviewers.get(id), owners.get(id));
+        let (resolution, evidence) = derive_resolution(id, reviewers.get(id), owners.get(id));
+        if let DerivedResolution::Resolved { owner, ref agreeing_reviewers, .. } = resolution {
+            if owner || agreeing_reviewers.iter().any(|name| trust::is_owner(&reviewer_key(Some(name)))) {
+                return Err(format!("{id}: owner-final review is protected from bulk reopening; no review history was invalidated"));
+            }
+        }
         Ok(ReopenItem { segment_id: id.clone(), revision, pool_decision_floor: floor,
             adjudication_floor: owner_floor, review_event_floor: event_floor, prior_round_seq: prior_round,
             evidence_sha256: sha(&(canonical,evidence,owners.get(id).map(|rows| rows.iter()

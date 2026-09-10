@@ -591,6 +591,8 @@ def test_clone_preflight_proves_65_to_71_and_same_schema_71() -> None:
             seed_database(data / "cortex-speech.db", source_schema)
 
             profiles = {name: {} for name in release.PROFILE_STATE}
+            # Independent of the implementation list: deleting trust from PROFILE_STATE must fail.
+            profiles["review_trust.json"] = {"owner": "Hawzhin", "trusted": ["Lamo", "Sewa"]}
             profiles["couch_session.json"] = {"reviewers": {"protected-fixture-key": "Fixture"}}
             profiles["reviewer_dialects.json"] = {"Fixture": ["sorani"]}
             profiles["review_reopen_routing.json"] = {"final_reviewers": ["Fixture"]}
@@ -630,6 +632,7 @@ def test_clone_preflight_proves_65_to_71_and_same_schema_71() -> None:
                         "rights": {"allExact": True},
                     }
                 if verb in {"benchmark", "probe"}:
+                    assert (db.parent / "review_trust.json").read_bytes() == (data / "review_trust.json").read_bytes()
                     for name in release.PROFILE_STATE:
                         assert (db.parent / name).read_bytes() == (data / name).read_bytes()
                     assert command[command.index("--reviewer") + 1] == "Fixture"

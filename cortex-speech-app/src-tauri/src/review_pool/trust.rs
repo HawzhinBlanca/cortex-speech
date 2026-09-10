@@ -153,6 +153,36 @@ pub fn is_decided(db: &Database, segment_id: &str) -> Result<bool, String> {
     Ok(matches!(resolution, DerivedResolution::Resolved { .. }))
 }
 
+/// Fresh review eligibility for a previously served pool assignment. Media/renewal must also
+/// reject an already-seen opinion or a conflict this person cannot settle, not just final clips.
+pub fn may_review(db: &Database, segment_id: &str, reviewer: &str) -> Result<bool, String> {
+    let ids = serde_json::to_string(&[segment_id]).map_err(|error| error.to_string())?;
+    let reviewers = reviewer_sets_for_ids_on(db.connection(), Some(&ids))?;
+    let adjudications = owner_adjudications_for_ids_on(db.connection(), Some(&ids))?;
+    let current = reviewers.get(segment_id);
+    let reviewer = reviewer_key(Some(reviewer));
+    let (resolution, _) = derive_resolution(segment_id, current, adjudications.get(segment_id));
+    Ok(permits_fresh_opinion(&resolution, current, &reviewer)
+        && !super::reviewer_already_saw(db, segment_id, &reviewer)?)
+}
+
+pub(super) fn permits_fresh_opinion(
+    resolution: &DerivedResolution,
+    current: Option<&SegmentReviewers>,
+    reviewer: &str,
+) -> bool {
+    if current.is_some_and(|coverage| coverage.seen.contains(reviewer)) {
+        return false;
+    }
+    match resolution {
+        DerivedResolution::Resolved { .. } => false,
+        DerivedResolution::OwnerConflict => {
+            is_owner(reviewer) && current.map_or(0, |coverage| coverage.judged.len()) < 3
+        }
+        DerivedResolution::Pending | DerivedResolution::NeedsThird => true,
+    }
+}
+
 /// For `pool_admin probe` / status output.
 pub fn describe() -> serde_json::Value {
     let policy = current();

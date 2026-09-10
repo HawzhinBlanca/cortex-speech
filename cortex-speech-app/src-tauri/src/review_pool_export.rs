@@ -50,6 +50,9 @@ pub struct PoolDatasetOptions {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PoolDatasetResult {
+    /// False for an approved subset: no complete-voice certificate was recorded.
+    pub complete_voice: bool,
+    pub pending_segments: usize,
     pub output_dir: String,
     pub pool_id: String,
     pub voice_name: String,
@@ -377,6 +380,16 @@ fn remove_staging(path: &Path) {
 /// Export and certify one independently completed voice. The caller must hold the Cortex instance
 /// lock; `pool_admin export` enforces that requirement so review evidence cannot change mid-export.
 pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<PoolDatasetResult> {
+    export_voice_scope(db, options, false)
+}
+
+/// Publish only resolved members, with all existing audio/rights gates. This NEVER certifies the
+/// entire voice or locks out later review. The artifact explicitly records its incomplete scope.
+pub fn export_approved_subset(db: &Database, options: &PoolDatasetOptions) -> AppResult<PoolDatasetResult> {
+    export_voice_scope(db, options, true)
+}
+
+fn export_voice_scope(db: &Database, options: &PoolDatasetOptions, subset: bool) -> AppResult<PoolDatasetResult> {
     let pool = review_pool::load(db)
         .map_err(AppError::Validation)?
         .ok_or_else(|| AppError::Validation("review pool is not active".to_string()))?;
@@ -394,7 +407,7 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
         AppError::Validation("review-pool export requires a bound duplicate-detection algorithm".to_string())
     })?;
     if !dedup.applied
-        || dedup_algorithm_id != "cortex-cross-file-waveform-correlation-v1"
+        || !matches!(dedup_algorithm_id, review_pool::DEDUP_ALGORITHM_V1 | review_pool::DEDUP_ALGORITHM_V2)
         || dedup.unconfirmed_risk_count != 0
         || dedup.source_segment_count != pool.focus_segment_count
         || dedup.canonical_segment_count != pool.review_segment_count
@@ -432,9 +445,21 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
     fs::create_dir(&staging)?;
 
     let result = (|| -> AppResult<PoolDatasetResult> {
-        let rows = load_rows(db, &pool.pool_id, voice_name)?;
-        if rows.iter().any(|row| !matches!(row.resolution.status.as_str(), "resolved" | "ownerResolved")) {
+        let all_rows = load_rows(db, &pool.pool_id, voice_name)?;
+        let pending_segments = all_rows
+            .iter()
+            .filter(|row| !matches!(row.resolution.status.as_str(), "resolved" | "ownerResolved"))
+            .count();
+        if !subset && pending_segments > 0 {
             return Err(AppError::Validation(format!("voice {voice_name} is not fully resolved")));
+        }
+        let rows: Vec<_> = all_rows
+            .iter()
+            .filter(|row| !subset || matches!(row.resolution.status.as_str(), "resolved" | "ownerResolved"))
+            .cloned()
+            .collect();
+        if rows.is_empty() {
+            return Err(AppError::Validation(format!("voice {voice_name} has no resolved clips to export")));
         }
         for row in &rows {
             if row.model_version_id != pool.champion_model_version_id {
@@ -681,7 +706,7 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
         drop(exclusions);
         let audio_sha256: String = audio_digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
 
-        let manifest = serde_json::json!({
+        let mut manifest = serde_json::json!({
             "schemaVersion": POOL_EXPORT_SCHEMA_VERSION,
             "poolId": pool.pool_id,
             "poolFocusSha256": pool.focus_sha256,
@@ -713,6 +738,11 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
                     "speakerChangeThreshold": tts_speaker_change_threshold()},
             "exclusions": {"file": "exclusions.jsonl", "rejectedAudioCopied": false, "ttsAudioCopied": false},
         });
+        if subset {
+            manifest["scope"] = serde_json::json!("approved-subset");
+            manifest["completeVoice"] = serde_json::json!(false);
+            manifest["pendingSegments"] = serde_json::json!(pending_segments);
+        }
         let manifest_bytes =
             serde_json::to_vec_pretty(&manifest).map_err(|error| AppError::Other(error.to_string()))?;
         fs::write(staging.join("manifest.json"), &manifest_bytes)?;
@@ -725,7 +755,7 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
         // before publication. The instance lock prevents writers; this second read detects accidental
         // out-of-band changes and implementation drift.
         let current_rows = load_rows(db, &pool.pool_id, voice_name)?;
-        if current_rows != rows {
+        if current_rows != all_rows {
             return Err(AppError::Validation(
                 "voice authority, rights, or pool membership changed during export".into(),
             ));
@@ -740,9 +770,10 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
             }
         }
 
-        let existing = review_pool::voice_certificate(db, voice_name).map_err(AppError::Validation)?;
+        let existing =
+            if subset { None } else { review_pool::voice_certificate(db, voice_name).map_err(AppError::Validation)? };
         let certificate_value = |app_git_sha: &str, created_at_ms: i64| {
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "schemaVersion": POOL_EXPORT_SCHEMA_VERSION,
                 "poolId": pool.pool_id,
                 "poolFocusSha256": pool.focus_sha256,
@@ -770,7 +801,13 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
                 "totalDurationMs": total_duration_ms,
                 "appGitSha": app_git_sha,
                 "createdAtMs": created_at_ms,
-            })
+            });
+            if subset {
+                value["scope"] = serde_json::json!("approved-subset");
+                value["completeVoice"] = serde_json::json!(false);
+                value["pendingSegments"] = serde_json::json!(pending_segments);
+            }
+            value
         };
         let (certificate_json, certificate_sha256, created_at_ms) = if let Some(certificate) = &existing {
             let same = certificate.pool_id == pool.pool_id
@@ -867,7 +904,7 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
             }
         }
 
-        if existing.is_none() {
+        if !subset && existing.is_none() {
             review_pool::record_voice_certificate(
                 db,
                 &review_pool::VoiceCertificateInput {
@@ -893,6 +930,8 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
             })?;
         }
         Ok(PoolDatasetResult {
+            complete_voice: !subset,
+            pending_segments,
             output_dir: output.to_string_lossy().to_string(),
             pool_id: pool.pool_id,
             voice_name: voice_name.to_string(),
@@ -918,6 +957,28 @@ mod tests {
 
     const TEST_CHAMPION: &str = "omniasr-7b-pool-export-test";
     const RAW: &str = "دەقی چامپیۆن";
+
+    #[test]
+    fn approved_subset_exports_final_rows_without_certifying_unfinished_voice() {
+        let (directory, db) = fixture();
+        let pool = review_pool::load(&db).unwrap().unwrap();
+        let plan = review_pool::reopen::prepare(&db, &pool, &["bounded".into()], "Recheck disputed work", 0).unwrap();
+        review_pool::reopen::apply(&db, &pool, &plan, 99).unwrap();
+        let options = PoolDatasetOptions {
+            output_dir: directory.path().join("subset").to_string_lossy().into_owned(),
+            voice_name: "Lamo".into(),
+        };
+        assert!(export_voice(&db, &options).unwrap_err().to_string().contains("not fully resolved"));
+        let exported = export_approved_subset(&db, &options).unwrap();
+        assert!(!exported.complete_voice);
+        assert_eq!(exported.pending_segments, 1);
+        assert!(review_pool::voice_certificate(&db, "Lamo").unwrap().is_none());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(Path::new(&options.output_dir).join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["scope"], "approved-subset");
+        assert_eq!(manifest["completeVoice"], false);
+        assert_eq!(export_approved_subset(&db, &options).unwrap(), exported, "an exact retry must be idempotent");
+    }
 
     fn rollback_fixture_to(db: &Database, target_version: i64) {
         let expected = crate::migrations::MIGRATIONS

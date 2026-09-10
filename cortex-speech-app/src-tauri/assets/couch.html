@@ -43,6 +43,7 @@
 <script id="i18n" type="application/json">
 {
   "en": {
+    "assignmentChanged": "This clip's assignment has changed. Refresh the queue before continuing.",
     "progress": "Clip {n} of {total}",
     "audioDone": "{t} of audio done",
     "accept": "Confirm unchanged & next",
@@ -92,6 +93,7 @@
     "localOnly": "Local only"
   },
   "ckb": {
+    "assignmentChanged": "کلیپە دیاریکراوەکەت گۆڕاوە. پێش بەردەوامبوون لیستەکە نوێ بکەرەوە.",
     "progress": "پارچەی {n} لە {total}",
     "audioDone": "{t} دەنگ تەواو بووە",
     "accept": "دروستە",
@@ -141,6 +143,7 @@
     "localOnly": "تەنیا ناوخۆیی"
   },
   "source": {
+    "assignmentChanged": null,
     "progress": "review.progress",
     "audioDone": null,
     "accept": "review.acceptAsIs",
@@ -615,7 +618,10 @@
   let queue = [], i = 0, busy = false;
   let composing = false;
   let draftStorageFailed = false;
+  const volatileDrafts = new Map();
+  const volatileDraftKey = (reviewer, seg) => JSON.stringify([reviewer, seg.id, String(seg.rowVersion)]);
   let audioUnavailable = false;
+  let assignmentRevoked = false;
   let lastReviewMessage = 'saved';
   // True only while the audio was paused BY the reviewer focusing the transcript (R2.3), so the 2s
   // rewind on resume never steals position from a pause they chose themselves.
@@ -779,20 +785,18 @@
     // throws with NO status, which every caller already treats as "never arrived" — retryable.
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), 15000);
-    let r;
     try {
-      r = await fetch(path, { ...opts, signal: ctl.signal });
+      const r = await fetch(path, { ...opts, signal: ctl.signal });
+      if (!r.ok) {
+        const err = new Error(await r.text());
+        err.status = r.status;
+        throw err;
+      }
+      // Await consumption inside the timeout: headers are not a complete response.
+      return r.headers.get('content-type')?.includes('json') ? await r.json() : r;
     } finally {
       clearTimeout(timer);
     }
-    if (!r.ok) {
-      // Carry the status so callers can tell "the server refused" (a real answer, do not retry) from
-      // "the request never arrived" (fetch throws a TypeError with no status, and IS worth retrying).
-      const err = new Error(await r.text());
-      err.status = r.status;
-      throw err;
-    }
-    return r.headers.get('content-type')?.includes('json') ? r.json() : r;
   }
   // How many clips this reviewer has finished in this sitting. A session with no visible total is a
   // session with no sense of an ending, and the count is the cheapest form of pacing there is.
@@ -906,7 +910,9 @@
       accounting.hidden = true;
     }
     // Something to take back = the button is reachable, whether or not a card is on screen.
-    $('after').hidden = doneThisSession === 0;
+    let durableUndo = false;
+    try { durableUndo = readPoolUndoTarget() !== null; } catch { /* never trust a damaged receipt */ }
+    $('after').hidden = doneThisSession === 0 && !durableUndo;
   }
   function renderEmptyState() {
     // Unsent work outranks both other messages. Decisions sitting in the outbox have NOT reached the
@@ -996,9 +1002,14 @@
     return null;
   }
   function rememberDraft(seg, text) {
+    // Keep a revision/author-bound fallback before storage can throw. Never let a refresh or
+    // server refusal destroy the only copy; this remains private to the current page.
+    const key = volatileDraftKey(me, seg);
+    volatileDrafts.set(key, text);
     draftForSegment(seg); // fence/archive a previous revision before replacing its text
     sessionStorage.setItem(draftKey(seg.id), text);
     sessionStorage.setItem(draftMetaKey(seg.id), JSON.stringify({ reviewer: me, rowVersion: seg.rowVersion, text }));
+    volatileDrafts.delete(key);
   }
   function renderDraftRecovery() {
     const panel = $('draftRecovery');
@@ -1028,6 +1039,12 @@
         }
       }
     } catch { entries.length = 0; }
+    if (me) {
+      for (const [key, text] of volatileDrafts) {
+        const [reviewer, id, revision] = JSON.parse(key);
+        if (reviewer === me) entries.push({ key: 'volatile:' + key, id, revision, text });
+      }
+    }
     entries.sort((a, b) => a.key.localeCompare(b.key));
     list.replaceChildren();
     for (const entry of entries) {
@@ -1080,8 +1097,8 @@
     $('accept').disabled = busy || composing || audioUnavailable || empty;
     $('save').disabled = busy || composing || audioUnavailable || empty;
     $('bad').disabled = busy || composing || audioUnavailable;
-    $('skip').disabled = busy || composing;
-    $('undo').disabled = busy || composing;
+    $('skip').disabled = busy || composing || draftStorageFailed;
+    $('undo').disabled = busy || composing || draftStorageFailed;
     $('draftState').dataset.edited = String(edited);
     const draftMessage = draftStorageFailed ? t('saveFailed', { err: '—' })
       : (edited ? t('edited') + ' · ' : '') + t('pending');
@@ -1793,8 +1810,10 @@
     // A saved draft is a correction the reviewer already typed; it must win over the server's copy.
     try {
       if (!sameRevision || (!composing && !draftStorageFailed)) {
-        const nextText = draftForSegment(seg) ?? seg.text;
+        const fallback = volatileDrafts.get(volatileDraftKey(me, seg));
+        const nextText = fallback ?? draftForSegment(seg) ?? seg.text;
         if ($('text').value !== nextText) $('text').value = nextText;
+        draftStorageFailed = fallback !== undefined;
       }
     } catch {
       // Keep unarchivable text in storage for read-only recovery, never bind it to a new round.
@@ -1916,6 +1935,13 @@
       }
       retryable = false;
       clearErr('load');
+      if (assignmentRevoked) {
+        // Only an authoritative queue response may rearm a revoked assignment. A repaint of
+        // the old card is not renewal, even when it has the same clip and row revision.
+        assignmentRevoked = false;
+        resetPlaybackTraversalCoverage(null);
+        clearErr('assignment');
+      }
       // If the clip on screen survives into the fresh batch, STAY on it (2026-08-20 hunt): the 60s
       // background retry lands mid-playback, and snapping to clip 0 re-assigns the src, which zeroes
       // the renderer-reported traversal union and makes the reviewer replay the clip.
@@ -2142,6 +2168,10 @@
 
   async function decide(action) {
     if (busy || composing || !queue[i] || (audioUnavailable && action !== 'skip')) return;
+    if (action === 'skip' && draftStorageFailed) {
+      toast(t('saveFailed', { err: '—' }), true);
+      return; // retain the only copy on screen until saving/recovery succeeds
+    }
     // Capture the click, not whatever a queue refresh displays after finalization or the POST.
     const submittedSegment = { ...queue[i] };
     const submittedReviewer = me;
@@ -2201,6 +2231,7 @@
       // Both judged-audio progress and weighted earnings come back WITH the committed decision.
       applyAccounting(saved);
       if (!isSkip) {
+        volatileDrafts.delete(volatileDraftKey(submission.reviewer, { id: submission.id, rowVersion: submission.rowVersion }));
         if (sessionStorage.getItem(draftKey(submission.id)) === submission.text) {
           sessionStorage.removeItem(draftKey(submission.id));
           sessionStorage.removeItem(draftMetaKey(submission.id));
@@ -2558,13 +2589,25 @@
   // instead of at save time when it is already unsaveable.
   async function renewLease() {
     const seg = queue[i];
+    const reviewer = me;
     if (!seg || document.hidden) return;
     try {
       await api('/api/renew', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: seg.id }),
       });
     } catch (e) {
-      if (e.status === 409) { $('warn').textContent = t('heldByOthers', { n: 1 }); $('warn').hidden = false; }
+      if ((e.status === 409 || e.status === 503) && me === reviewer && playbackIdentity(queue[i]) === playbackIdentity(seg)) {
+        // Cached media is no longer work. Stop it now, retaining text/recovery instead of allowing
+        // another wasted listen followed by an inevitable refusal at save time.
+        $('player').pause();
+        $('player').removeAttribute('src');
+        invalidatePlaybackPreparation();
+        clearWave();
+        audioUnavailable = true;
+        assignmentRevoked = true;
+        showErr('assignment', e.status === 409 ? t('assignmentChanged') : t('loadFailed', { err: e.status }), true);
+        renderGuidedState();
+      }
     }
   }
   setInterval(() => void renewLease(), 4 * 60 * 1000);
@@ -2590,6 +2633,9 @@
   // it because the event bubbles, which is a needless dependency for the one event that must not be
   // missed here.
   document.addEventListener('visibilitychange', () => { if (!document.hidden) void renewLease(); });
+  window.addEventListener('beforeunload', (event) => {
+    if (volatileDrafts.size) { event.preventDefault(); event.returnValue = ''; }
+  });
 
   // ── keep the screen awake while reviewing (phase 6) ─────────────────────────
   // Listen-and-type means long stretches with no touch, and a phone dims and locks mid-clip — which
@@ -2611,7 +2657,7 @@
   $('accept').onclick = () => decide('accept');
   $('bad').onclick    = () => decide('bad');
   $('undo').onclick   = async () => {
-    if (busy || composing) return; busy = true; renderGuidedState();
+    if (busy || composing || draftStorageFailed) return; busy = true; renderGuidedState();
     try {
       const poolUndoTarget = preparePoolUndoTarget();
       const undone = await api('/api/undo', {
