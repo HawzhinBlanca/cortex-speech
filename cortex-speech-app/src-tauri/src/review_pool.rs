@@ -12,6 +12,7 @@ mod family;
 pub mod reopen;
 pub mod reopen_routing;
 mod send_back;
+pub mod trust;
 
 pub use send_back::{apply_send_back_plan, prepare_send_back_plan, SendBackPlan};
 
@@ -952,6 +953,11 @@ fn derive_resolution(
             },
             digest,
         );
+    }
+    // Owner canon 2026-09-10 (`trust.rs`): the owner's verdict decides alone; a trusted reviewer's
+    // verdict decides alone unless the owner judged. Everyone else needs two different reviewers.
+    if let Some(resolution) = trust::resolve(judgements) {
+        return (resolution, digest);
     }
     let mut outcomes: HashMap<ReviewOutcome, Vec<String>> = HashMap::new();
     for evidence in judgements.values() {
@@ -3824,6 +3830,101 @@ mod tests {
         let restored_pool = load(&restored).unwrap().unwrap();
         assert_eq!(apply_send_back_plan(&restored, &restored_pool, &plan, 5, true).unwrap(), 2);
         assert_eq!(restored.segment_review_revision("clip").unwrap(), Some(revision + 1));
+    }
+
+    fn judged(rows: &[(&str, &str, Option<&str>)]) -> SegmentReviewers {
+        let mut all = HashMap::new();
+        for (n, (reviewer, action, text)) in rows.iter().enumerate() {
+            insert_judgement(
+                &mut all,
+                "clip".into(),
+                reviewer.to_string(),
+                format!("pool:{n}"),
+                action.to_string(),
+                text.map(str::to_string),
+            )
+            .unwrap();
+        }
+        all.remove("clip").unwrap()
+    }
+
+    /// Owner canon 2026-09-10: "when Hawzhin previews, directly goes to approve export, even lamo and
+    /// sewa need just one round … the other reviewers need second pass from reviewers".
+    #[test]
+    fn a_trusted_verdict_decides_alone_the_owner_decides_over_everyone_and_others_still_need_two() {
+        let policy = trust::parse(r#"{ "owner": "Hawzhin", "trusted": ["Lamo", "Sewa"] }"#).unwrap();
+        let resolved_text = |resolution: &DerivedResolution| match resolution {
+            DerivedResolution::Resolved { outcome: ReviewOutcome::Retain(text), agreeing_reviewers, owner: false } => {
+                Some((text.clone(), agreeing_reviewers.clone()))
+            }
+            _ => None,
+        };
+        trust::with_policy(policy, || {
+            // One trusted verdict decides.
+            let (r, _) = derive_resolution("clip", Some(&judged(&[("Lamo", "edit", Some("دەقی لامۆ"))])), None);
+            assert_eq!(resolved_text(&r), Some(("دەقی لامۆ".to_string(), vec!["Lamo".to_string()])));
+            // The owner decides over a trusted reviewer AND over two agreeing others.
+            let (r, _) = derive_resolution(
+                "clip",
+                Some(&judged(&[
+                    ("Rubar", "accept", Some("دەقی ماشین")),
+                    ("Guest", "accept", Some("دەقی ماشین")),
+                    ("Lamo", "edit", Some("دەقی لامۆ")),
+                    ("Hawzhin", "edit", Some("دەقی خاوەن")),
+                ])),
+                None,
+            );
+            assert_eq!(resolved_text(&r), Some(("دەقی خاوەن".to_string(), vec!["Hawzhin".to_string()])));
+            // Trusted reviewers disagreeing wait for the owner: served to nobody, exported by nobody.
+            let (r, _) = derive_resolution(
+                "clip",
+                Some(&judged(&[("Lamo", "edit", Some("دەقی لامۆ")), ("Sewa", "edit", Some("دەقی سێوا"))])),
+                None,
+            );
+            assert!(matches!(r, DerivedResolution::OwnerConflict), "{r:?}");
+            // Trusted reviewers agreeing decide together.
+            let (r, _) =
+                derive_resolution("clip", Some(&judged(&[("Sewa", "reject", None), ("Lamo", "reject", None)])), None);
+            assert!(
+                matches!(&r, DerivedResolution::Resolved { outcome: ReviewOutcome::Reject, agreeing_reviewers, .. } if agreeing_reviewers == &["Lamo", "Sewa"]),
+                "{r:?}"
+            );
+            // Everyone else: one opinion is still not a decision, two agreeing still are.
+            let (r, _) = derive_resolution("clip", Some(&judged(&[("Rubar", "accept", Some("دەقی ماشین"))])), None);
+            assert!(matches!(r, DerivedResolution::Pending));
+            let (r, _) = derive_resolution(
+                "clip",
+                Some(&judged(&[("Rubar", "accept", Some("دەقی ماشین")), ("Guest", "accept", Some("دەقی ماشین"))])),
+                None,
+            );
+            assert!(matches!(r, DerivedResolution::Resolved { owner: false, .. }));
+        });
+        // Without a policy the owner's lone verdict is one opinion, exactly as before this canon.
+        trust::with_policy(trust::TrustPolicy::default(), || {
+            let (r, _) = derive_resolution("clip", Some(&judged(&[("Hawzhin", "edit", Some("دەقی خاوەن"))])), None);
+            assert!(matches!(r, DerivedResolution::Pending));
+        });
+    }
+
+    /// A clip the owner judged is decided: the queue stops offering it to anyone else.
+    #[test]
+    fn a_clip_the_owner_judged_leaves_every_other_queue() {
+        let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        let policy = trust::parse(r#"{ "owner": "Hawzhin", "trusted": ["Lamo"] }"#).unwrap();
+        trust::with_policy(policy, || {
+            assert_eq!(pending_segment_ids(&db, &pool, "Roza", None).unwrap(), vec!["clip"]);
+            decide(&db, &pool, "Hawzhin", "دەقی خاوەن", "123e4567-e89b-42d3-a456-426614175031", 1);
+            assert!(
+                pending_segment_ids(&db, &pool, "Roza", None).unwrap().is_empty(),
+                "decided by the owner: nobody else is served it"
+            );
+            assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "resolved");
+            assert_eq!(
+                consensus_resolved_segment_ids(&db).unwrap(),
+                ["clip".to_string()].into_iter().collect::<HashSet<String>>(),
+                "exportable on the owner's verdict alone"
+            );
+        });
     }
 
     /// Live incident 2026-09-08: 18 of the owner's 25 fresh verdicts on reopened clips came straight
