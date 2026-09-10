@@ -960,6 +960,9 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if !db_path.is_file() {
         return Err(format!("database does not exist: {}", db_path.display()).into());
     }
+    if let Some(data_dir) = db_path.parent() {
+        review_pool::trust::install(review_pool::trust::load(data_dir));
+    }
     let _instance_lock = if database_access == DatabaseAccess::LockedWrite {
         let data_dir =
             db_path.parent().ok_or_else(|| format!("database has no parent data directory: {}", db_path.display()))?;
@@ -1142,6 +1145,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                     "queueAuthority": REVIEWER_QUEUE_AUTHORITY,
                     "listenListClips": queue.listen_list_clips,
                     "difficultyOrder": format!("{:?}", queue.difficulty),
+                    "reviewTrust": review_pool::trust::describe(),
                     "reopenRouting": queue.reopen_routing.as_ref().map(|routing| {
                         let mut names: Vec<&String> = routing.final_reviewers.iter().collect();
                         names.sort();

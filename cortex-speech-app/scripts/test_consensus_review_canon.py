@@ -47,8 +47,18 @@ def require(path: Path, needle: str, why: str) -> None:
 def test_two_different_reviewers_decide_a_sentence() -> None:
     require(
         POOL,
+        "if let Some(resolution) = trust::resolve(judgements) {",
+        "owner canon 2026-09-10: the owner's verdict, or a trusted reviewer's, decides before the two-reviewer rule",
+    )
+    require(
+        APP / "src-tauri" / "src" / "review_pool" / "trust.rs",
+        "return Some(DerivedResolution::OwnerConflict);",
+        "trusted reviewers who disagree wait for the owner; nobody else is served the clip",
+    )
+    require(
+        POOL,
         "(names.len() >= 2).then_some((outcome, names))",
-        "an outcome resolves only when two or more DISTINCT reviewers agree on it",
+        "for everyone else an outcome resolves only when two or more DISTINCT reviewers agree on it",
     )
     require(
         POOL,
@@ -182,6 +192,11 @@ def test_the_canon_is_written_down() -> None:
         CANON,
         "enforced PER CLIP",
         "independence is per clip, never per person - the rule that lets throughput scale",
+    )
+    require(
+        CANON,
+        "A verdict by the owner decides the clip on its own",
+        "the trusted-reviewer canon of 2026-09-10 is recorded in the owner's words",
     )
 
 

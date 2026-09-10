@@ -1256,6 +1256,8 @@ pub fn run() {
         eprintln!("Failed to create app data directory at {data_dir:?}: {e}");
         fatal_app_error(format!("Failed to create app data directory at {:?}: {e}", data_dir));
     }
+    // Trusted-reviewer canon (owner 2026-09-10): read once per process, before any resolution is derived.
+    review_pool::trust::install(review_pool::trust::load(&data_dir));
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));

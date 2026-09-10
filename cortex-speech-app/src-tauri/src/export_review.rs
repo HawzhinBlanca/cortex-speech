@@ -84,7 +84,9 @@ impl ExportReviewAuthority {
             || text.trim().is_empty()
             || crate::quality::is_placeholder_transcript(text)
             || resolution.evidence_sha256.len() != 64
-            || resolution.reviewer_count < 2
+            // Owner canon 2026-09-10: a resolution the owner or a trusted reviewer carries needs no
+            // second name; everyone else still needs two.
+            || (resolution.reviewer_count < 2 && !crate::review_pool::trust::authorizes(&resolution.agreeing_reviewers))
             || !resolution.evidence_sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             return Err(AppError::Validation(format!(
@@ -215,4 +217,49 @@ fn verify_authorities<'a>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod trust_authority_tests {
+    use super::*;
+    use crate::review_pool::trust;
+
+    fn resolution(names: &[&str], count: usize) -> crate::review_pool::SegmentResolution {
+        crate::review_pool::SegmentResolution {
+            segment_id: "clip".into(),
+            voice_name: "Lamo".into(),
+            status: "resolved".into(),
+            final_action: Some("retain".into()),
+            final_transcript: Some("دەقی خاوەن".into()),
+            evidence_sha256: "a".repeat(64),
+            reviewer_count: count,
+            agreeing_reviewers: names.iter().map(|n| n.to_string()).collect(),
+        }
+    }
+
+    /// Audit 2026-09-10 finding 1: the queue decided a clip on the owner's word while this validator
+    /// still demanded two names, so every export and learning capture that met such a clip aborted.
+    #[test]
+    fn an_owner_or_trusted_resolution_is_export_authority_on_its_own() {
+        let policy = trust::parse(r#"{ "owner": "Hawzhin", "trusted": ["Lamo", "Sewa"] }"#).unwrap();
+        trust::with_policy(policy, || {
+            assert!(ExportReviewAuthority::retained(&resolution(&["Hawzhin"], 1)).is_ok());
+            assert!(ExportReviewAuthority::retained(&resolution(&["Sewa"], 1)).is_ok());
+            assert!(
+                ExportReviewAuthority::retained(&resolution(&["Hawzhin"], 3)).is_ok(),
+                "others' opinions on the clip change nothing"
+            );
+            assert!(
+                ExportReviewAuthority::retained(&resolution(&["Rubar"], 1)).is_err(),
+                "an untrusted single name is still refused"
+            );
+            assert!(ExportReviewAuthority::retained(&resolution(&["Rubar", "Guest"], 2)).is_ok());
+        });
+        trust::with_policy(trust::TrustPolicy::default(), || {
+            assert!(
+                ExportReviewAuthority::retained(&resolution(&["Hawzhin"], 1)).is_err(),
+                "no policy: two names as before"
+            );
+        });
+    }
 }

@@ -98,6 +98,17 @@ if a checkable pin drifts from what is written here.
   clip again, blind. Consensus is still any two DIFFERENT reviewers; a reversed decision never counts;
   nothing is deleted or rewritten. Enforced: `review_redo.rs`, `review_pool/family.rs`
   (`require_unseen_pool_family_or_own_canonical_on` for the canonical writer only), couch redo tests.
+- **Trusted reviewers (owner rule change 2026-09-10, in the owner's words: "anything done by me, should
+  be final even one review, should be eligible for export, even lamo and sewa are trusted well … when
+  Hawzhin previews, directly goes to approve export, even lamo and sewa need just one round, if hawzhin
+  and lamo and sewa accept for first round they go to directly export, if they do for second round of
+  course for export, the other reviewers need second pass from reviewers").** The owner names himself and
+  trusted reviewers in `<data_dir>/review_trust.json`. A verdict by the owner decides the clip on its own,
+  whatever anyone else said. A verdict by a trusted reviewer decides the clip on its own unless the owner
+  judged it; trusted reviewers who disagree with each other wait for the owner. Every other reviewer
+  still needs any two DIFFERENT reviewers agreeing. Decided clips are exportable and leave every other
+  queue. Pay is unchanged. Missing or broken file = nobody trusted. Enforced: `review_pool/trust.rs`
+  (`trust::resolve` runs before the two-reviewer rule in `derive_resolution`), read once per process.
 
 ## Calibrated numbers (measured, not chosen — recalibrate only with a new measurement)
 - `SPEAKER_CHANGE_THRESHOLD = 0.59` — within-clip half-vs-half; owner's blind 15-clip pass, 15/15.

@@ -137,6 +137,7 @@ PROFILE_STATE = (
     "review_routing.json",
     "review_redo.json",
     "review_reopen_routing.json",
+    "review_trust.json",
 )
 
 
