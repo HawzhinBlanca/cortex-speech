@@ -1859,12 +1859,27 @@ impl Database {
             && !segment.is_gold)
     }
 
-    pub(super) fn load_correction_memories_on(conn: &Connection) -> AppResult<Vec<crate::corrections::MemoryEntry>> {
-        let mut stmt = conn.prepare(
+    pub(super) fn load_correction_memories_on(
+        conn: &Connection,
+        training_only: bool,
+    ) -> AppResult<Vec<crate::corrections::MemoryEntry>> {
+        // Recording a person's feedback is not permission to USE it. Preserve historical feedback
+        // accounting (including old-schema migration fixtures); inference must use the held filter.
+        let filter = if training_only {
+            "WHERE NOT EXISTS (SELECT 1 FROM active_training_quarantined_segments held WHERE held.segment_id=memory.source_segment)
+                AND NOT EXISTS (
+                    SELECT 1 FROM correction_memory_contributions contribution
+                    JOIN human_decision_effect_events effect ON effect.id=contribution.effect_event_id
+                    JOIN active_training_quarantined_segments held ON held.segment_id=effect.segment_id
+                    WHERE contribution.memory_id=memory.id
+                )"
+        } else {
+            ""
+        };
+        let mut stmt = conn.prepare(&format!(
             "SELECT wrong_token, human_token, slot_key, phonetic_key, confidence, hit_count
-               FROM effective_correction_memory_v60
-              ORDER BY id",
-        )?;
+               FROM effective_correction_memory_v60 memory {filter} ORDER BY id"
+        ))?;
         let rows = stmt.query_map([], |row| {
             Ok(crate::corrections::MemoryEntry {
                 wrong_token: row.get(0)?,

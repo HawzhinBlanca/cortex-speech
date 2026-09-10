@@ -466,7 +466,7 @@ impl Database {
             type MemoryOutcomeUpdate = (String, String, String, crate::corrections::MemoryOutcome);
             let confidence_updates: Vec<MemoryOutcomeUpdate> = if !prior.is_gold {
                 if let Some(reference) = confidence_reference.as_deref() {
-                    let memories = Self::load_correction_memories_on(&tx)?;
+                    let memories = Self::load_correction_memories_on(&tx, false)?;
                     crate::corrections::classify_memory_outcomes(
                         &finalized_text,
                         reference,
@@ -804,9 +804,9 @@ impl Database {
     }
 
     /// Load all LOOP-0 correction memories for the firing rule. `apply_memories` applies the
-    /// confidence / hit-count / phonetic gates itself, so every stored row is returned here.
+    /// confidence / hit-count / phonetic gates itself; training-quarantined evidence is excluded here.
     pub fn load_correction_memories(&self) -> AppResult<Vec<crate::corrections::MemoryEntry>> {
-        Self::load_correction_memories_on(&self.conn)
+        Self::load_correction_memories_on(&self.conn, true)
     }
 
     /// Return escalated segments ordered riskiest-first (lowest agreement_score).

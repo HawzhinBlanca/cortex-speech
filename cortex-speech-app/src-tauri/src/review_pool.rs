@@ -2769,6 +2769,26 @@ mod tests {
     }
 
     #[test]
+    fn training_quarantine_overrides_final_owner_for_export_and_learning_without_reopening() {
+        let (_directory, db, _pool) = one_clip_pool_fixture("دەقی یەکەم", false, true);
+        trust::with_policy(trust::parse(r#"{"owner":"Rubar","trusted":[]}"#).unwrap(), || {
+            assert_eq!(crate::jury::learning::build_dpo_dataset(&db).unwrap().pair_count, 1);
+            assert_eq!(crate::jury::get_few_shot_examples(&db, "other", 3).unwrap().len(), 1);
+            let before = segment_resolutions(&db, None).unwrap();
+            let plan =
+                crate::training_quarantine::prepare(&db, &["clip".into()], "Uncertain audio", &"b".repeat(64)).unwrap();
+            crate::training_quarantine::apply(&db, &plan).unwrap();
+            assert!(crate::export::exclude_unexportable_segments(&db, db.get_segments(None).unwrap())
+                .unwrap()
+                .is_empty());
+            assert_eq!(crate::jury::learning::build_dpo_dataset(&db).unwrap().pair_count, 0);
+            assert!(crate::jury::learning::export_lm_corpus(&db).unwrap().is_empty());
+            assert!(crate::jury::get_few_shot_examples(&db, "other", 3).unwrap().is_empty());
+            assert_eq!(segment_resolutions(&db, None).unwrap(), before);
+        });
+    }
+
+    #[test]
     fn pool_learning_dpo_and_lm_exclude_unresolved_first_opinions() {
         let (_dir, db, _pool) = one_clip_pool_fixture("دەقی یەکەم", false, true);
         assert_eq!(crate::jury::learning::build_dpo_dataset(&db).unwrap().pair_count, 0);
@@ -4153,7 +4173,7 @@ mod tests {
         decide(&restored, &restored_pool, "Iftikhar", "دەقی کۆتایی", "123e4567-e89b-42d3-a456-426614175006", 10);
         assert_eq!(segment_resolutions(&restored, None).unwrap()[0].status, "resolved");
         assert!(
-            crate::migrations::rollback(&restored, 1).is_err(),
+            crate::migrations::rollback(&restored, 2).is_err(),
             "populated round cannot roll back into trusted history"
         );
     }

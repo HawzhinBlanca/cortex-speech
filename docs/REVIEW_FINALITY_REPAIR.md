@@ -62,7 +62,10 @@ decides whether a recording may be retired.
 The private snapshot rehearsal found eight exported TTS-eligible clips in inconclusive acoustic
 groups. Existing signal/speaker gates are not exhaustive duplicate clearance. That rehearsal
 artifact is explicitly `DO_NOT_TRAIN`; operator assessment and an explicit export-quarantine
-policy remain necessary before treating those clips as training-ready.
+policy remain necessary before treating those clips as training-ready. The successor
+[training-only quarantine](TRAINING_QUARANTINE.md) implements that explicit hold without changing
+review or compensation history. Deployment must apply the assessed, exact-ID plan; code presence
+alone does not quarantine a live library. Manual acoustic clearance remains separate.
 
 Inconclusive groups remain unresolved. Do not raise the baseline, blindly remove clips, infer a
 second independent vote from one person's repeated work, or copy an old transcript onto a longer

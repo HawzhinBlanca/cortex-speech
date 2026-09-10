@@ -53,6 +53,7 @@ pub struct PoolDatasetResult {
     /// False for an approved subset: no complete-voice certificate was recorded.
     pub complete_voice: bool,
     pub pending_segments: usize,
+    pub quarantined_segments: usize,
     pub output_dir: String,
     pub pool_id: String,
     pub voice_name: String,
@@ -445,7 +446,12 @@ fn export_voice_scope(db: &Database, options: &PoolDatasetOptions, subset: bool)
     fs::create_dir(&staging)?;
 
     let result = (|| -> AppResult<PoolDatasetResult> {
+        let quarantine = crate::training_quarantine::TrainingBoundary::capture(db)?;
         let all_rows = load_rows(db, &pool.pool_id, voice_name)?;
+        let quarantined_segments = all_rows.iter().filter(|row| quarantine.blocked.contains(&row.segment_id)).count();
+        if !subset && quarantined_segments > 0 {
+            return Err(AppError::Validation(format!("voice {voice_name} has {quarantined_segments} training-quarantined clips; full certification is blocked")));
+        }
         let pending_segments = all_rows
             .iter()
             .filter(|row| !matches!(row.resolution.status.as_str(), "resolved" | "ownerResolved"))
@@ -455,6 +461,7 @@ fn export_voice_scope(db: &Database, options: &PoolDatasetOptions, subset: bool)
         }
         let rows: Vec<_> = all_rows
             .iter()
+            .filter(|row| !quarantine.blocked.contains(&row.segment_id))
             .filter(|row| !subset || matches!(row.resolution.status.as_str(), "resolved" | "ownerResolved"))
             .cloned()
             .collect();
@@ -717,6 +724,9 @@ fn export_voice_scope(db: &Database, options: &PoolDatasetOptions, subset: bool)
             "dedupManifestSha256": dedup_manifest_sha256,
             "dedupAlgorithmId": dedup_algorithm_id,
             "dedupUnconfirmedRiskCount": dedup.unconfirmed_risk_count,
+            "trainingQuarantineSha256": quarantine.sha256,
+            "quarantinedSegments": quarantined_segments,
+            "quarantinedSegmentIds": all_rows.iter().filter(|row| quarantine.blocked.contains(&row.segment_id)).map(|row| &row.segment_id).collect::<Vec<_>>(),
             "voiceName": voice_name,
             "championModelVersionId": pool.champion_model_version_id,
             "championDeploymentSha256": pool.champion_deployment_sha256,
@@ -754,6 +764,7 @@ fn export_voice_scope(db: &Database, options: &PoolDatasetOptions, subset: bool)
         // Re-prove mutable rights, database bindings, review authority, and source bytes immediately
         // before publication. The instance lock prevents writers; this second read detects accidental
         // out-of-band changes and implementation drift.
+        quarantine.verify(db)?;
         let current_rows = load_rows(db, &pool.pool_id, voice_name)?;
         if current_rows != all_rows {
             return Err(AppError::Validation(
@@ -784,6 +795,8 @@ fn export_voice_scope(db: &Database, options: &PoolDatasetOptions, subset: bool)
                 "dedupManifestSha256": dedup_manifest_sha256,
                 "dedupAlgorithmId": dedup_algorithm_id,
                 "dedupUnconfirmedRiskCount": dedup.unconfirmed_risk_count,
+                "trainingQuarantineSha256": quarantine.sha256,
+                "quarantinedSegments": quarantined_segments,
                 "voiceName": voice_name,
                 "championModelVersionId": pool.champion_model_version_id,
                 "championDeploymentSha256": pool.champion_deployment_sha256,
@@ -931,6 +944,7 @@ fn export_voice_scope(db: &Database, options: &PoolDatasetOptions, subset: bool)
         }
         Ok(PoolDatasetResult {
             complete_voice: !subset,
+            quarantined_segments,
             pending_segments,
             output_dir: output.to_string_lossy().to_string(),
             pool_id: pool.pool_id,
@@ -957,6 +971,29 @@ mod tests {
 
     const TEST_CHAMPION: &str = "omniasr-7b-pool-export-test";
     const RAW: &str = "دەقی چامپیۆن";
+
+    #[test]
+    fn training_quarantine_excludes_subset_audio_and_refuses_full_certificate() {
+        let (directory, db) = fixture();
+        let plan =
+            crate::training_quarantine::prepare(&db, &["bounded".into()], "Acoustic uncertainty", &"b".repeat(64))
+                .unwrap();
+        crate::training_quarantine::apply(&db, &plan).unwrap();
+        let options = PoolDatasetOptions {
+            output_dir: directory.path().join("quarantine-subset").to_string_lossy().into_owned(),
+            voice_name: "Lamo".into(),
+        };
+        assert!(export_voice(&db, &options).unwrap_err().to_string().contains("training-quarantined"));
+        let result = export_approved_subset(&db, &options).unwrap();
+        assert_eq!(result.quarantined_segments, 1);
+        assert_eq!(result.retained_segments, 1);
+        assert!(!result.complete_voice);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(Path::new(&options.output_dir).join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["quarantinedSegmentIds"], serde_json::json!(["bounded"]));
+        assert!(review_pool::voice_certificate(&db, "Lamo").unwrap().is_none());
+        assert_eq!(export_approved_subset(&db, &options).unwrap(), result);
+    }
 
     #[test]
     fn approved_subset_exports_final_rows_without_certifying_unfinished_voice() {

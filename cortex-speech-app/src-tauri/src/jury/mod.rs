@@ -563,6 +563,7 @@ pub fn get_few_shot_examples(db: &Database, segment_id: &str, k: usize) -> AppRe
         return Ok(Vec::new());
     }
     let initial_stamp = crate::review_pool::learning_data_stamp(db).map_err(crate::error::AppError::Validation)?;
+    let quarantine = crate::training_quarantine::TrainingBoundary::capture(db)?;
     let review_pool = crate::review_pool::learning_pool(db).map_err(crate::error::AppError::Validation)?;
     // The current segment's canonical text (prefer normalized), if present.
     let segment_text: Option<String> = db
@@ -664,6 +665,9 @@ pub fn get_few_shot_examples(db: &Database, segment_id: &str, k: usize) -> AppRe
             std::collections::HashMap::new()
         };
         for (mut example, effect_event_id, retained_human_text, rationale) in candidates {
+            if quarantine.blocked.contains(&example.segment_id) {
+                continue;
+            }
             if crate::quality::technical_unusable_reason_from_rationale(rationale.as_deref()).is_some() {
                 continue;
             }
@@ -716,6 +720,7 @@ pub fn get_few_shot_examples(db: &Database, segment_id: &str, k: usize) -> AppRe
     }
 
     examples.truncate(k);
+    quarantine.verify(db)?;
     if crate::review_pool::learning_data_stamp(db).map_err(crate::error::AppError::Validation)? != initial_stamp {
         return Err(crate::error::AppError::Validation("learning authority changed during retrieval; retry".into()));
     }

@@ -304,7 +304,11 @@ pub fn export_finalized_voice_dataset(
     }
     fs::create_dir(&staging)?;
     let result = (|| -> AppResult<ProductionDatasetResult> {
+        let quarantine = crate::training_quarantine::TrainingBoundary::capture(db)?;
         let rows = load_final_rows(db, &policy.campaign_id)?;
+        if rows.iter().any(|row| quarantine.blocked.contains(&row.segment_id)) {
+            return Err(AppError::Validation("finalized campaign contains training-quarantined audio".into()));
+        }
         if rows.len() != policy.focus_segment_count {
             return Err(AppError::Validation(format!(
                 "adjudicated focus changed before export: {}/{} rows",
@@ -500,6 +504,7 @@ pub fn export_finalized_voice_dataset(
         // replaced while export is running.
         let current_policy =
             crate::review_campaign::require_finalized_production_export(db, "ASR/TTS production export commit")?;
+        quarantine.verify(db)?;
         if current_policy != policy {
             return Err(AppError::Validation("campaign authority changed during production export".to_string()));
         }
@@ -529,6 +534,7 @@ pub fn export_finalized_voice_dataset(
             "schemaVersion": EXPORT_SCHEMA_VERSION,
             "campaignId": policy.campaign_id,
             "focusSha256": policy.focus_sha256,
+            "trainingQuarantineSha256": quarantine.sha256,
             "voiceName": voice_name,
             "createdAtMs": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0),
             "appGitSha": crate::GIT_SHA,

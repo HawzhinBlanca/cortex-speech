@@ -4007,7 +4007,10 @@ mod tests {
         // the production writer. The validator must accept that complete chain before any sabotage.
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 12).unwrap(), vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(
+            crate::migrations::rollback(&db, 13).unwrap(),
+            vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60]
+        );
         paid_segment(&db, "legacy-decision-baseline");
         assert_eq!(
             db.connection()
@@ -4032,7 +4035,7 @@ mod tests {
         );
         assert_eq!(
             crate::migrations::run_migrations(&db).unwrap(),
-            vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]
+            vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72]
         );
         validate_review_effect_semantics(&db).expect("the exact migrated terminal state must remain restorable");
 
@@ -4202,8 +4205,8 @@ mod tests {
             let db = Database::open(":memory:").unwrap();
             db.initialize().unwrap();
             assert_eq!(
-                crate::migrations::rollback(&db, 12).unwrap(),
-                vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60]
+                crate::migrations::rollback(&db, 13).unwrap(),
+                vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60]
             );
             paid_segment(&db, id);
             assert_eq!(
@@ -4227,7 +4230,7 @@ mod tests {
             );
             assert_eq!(
                 crate::migrations::run_migrations(&db).unwrap(),
-                vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]
+                vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72]
             );
             validate_review_effect_semantics(&db).expect("the exact migrated reviewed state must validate");
             db
@@ -4293,7 +4296,10 @@ mod tests {
     fn every_legacy_terminal_field_must_match_its_immutable_snapshot() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 12).unwrap(), vec![71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(
+            crate::migrations::rollback(&db, 13).unwrap(),
+            vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60]
+        );
         paid_segment(&db, "legacy-terminal-fields");
         assert_eq!(
             db.connection()
@@ -4318,7 +4324,7 @@ mod tests {
         );
         assert_eq!(
             crate::migrations::run_migrations(&db).unwrap(),
-            vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]
+            vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72]
         );
         validate_review_effect_semantics(&db).expect("the exact migrated legacy terminal state must validate first");
 

@@ -15,6 +15,7 @@ type PoolRegistryBoundary = (String, i64, String, String, String, Option<String>
 pub(crate) struct ExportReviewBoundary {
     schema_version: i64,
     registry: Option<PoolRegistryBoundary>,
+    training: crate::training_quarantine::TrainingBoundary,
 }
 
 impl ExportReviewBoundary {
@@ -41,7 +42,7 @@ impl ExportReviewBoundary {
                 )
                 .optional()?
         };
-        Ok(Self { schema_version, registry })
+        Ok(Self { schema_version, registry, training: crate::training_quarantine::TrainingBoundary::capture(db)? })
     }
 
     pub(crate) fn verify(&self, db: &Database) -> AppResult<()> {
@@ -153,7 +154,8 @@ impl LearningReviewScope {
     }
 
     pub(crate) fn includes(&self, segment_id: &str) -> bool {
-        self.retained.as_ref().map_or(true, |rows| rows.contains_key(segment_id))
+        !self.boundary.training.blocked.contains(segment_id)
+            && self.retained.as_ref().map_or(true, |rows| rows.contains_key(segment_id))
     }
 
     pub(crate) fn authority(&self, segment_id: &str) -> Option<&ExportReviewAuthority> {

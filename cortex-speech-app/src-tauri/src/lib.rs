@@ -48,6 +48,7 @@ pub mod export_review;
 pub mod listen_list;
 pub mod review_redo;
 pub mod review_routing;
+pub mod training_quarantine;
 pub mod voice_focus;
 // REMOVED (iteration 231): `features` — an 80-bin mel-filterbank extractor, 473 lines, and the sole
 // user of the `rustfft` dependency. Its production consumer was the fbank diarization fallback, deleted

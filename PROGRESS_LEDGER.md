@@ -15616,6 +15616,23 @@ input, and has a raw-probability real-Sorani regression test that cannot pass th
 Targeted evidence: VAD tests 13/13, restart/skip Rust contract 1/1, restart browser harness 5/5,
 playback-readiness policy 38 pins, frontend guard policy 33 pins, format and clippy clean.
 
+## 2026-09-10 — Training-only acoustic holds independent of reviewer finality
+
+Schema 72 appends exact-identity training quarantine and manual-clearance authority. Uncertain
+recordings and overlapping same-PCM aliases are excluded from dataset, ASR/TTS, DPO/LM, few-shot
+and correction-memory use without undoing reviews, routing, transcripts or compensation. Full-voice
+certification refuses held members; an explicit approved subset records its exclusions. Atomic
+application revalidates source identity; certified snapshots precede locked operator writes. Restore
+and downgrade safeguards preserve even cleared hold history. A manual clearance needs separately
+identified assessment evidence; software does not certify human listening or dataset perfection.
+
+The protected release controller rehearses an exact hash-pinned plan before maintenance, then applies
+it before exposure and independently verifies every non-hold table is unchanged. Historical migration
+blocks 1–71 are unchanged. Local verification: full Rust library 2,735 passed / 8 ignored, all-target
+all-feature Clippy clean, 148 locked Python scripts passed, then updated release-controller suite 43/43;
+frontend production build and bundle budget passed. These are implementation results, not live rollout
+or exhaustive acoustic clearance. See `docs/TRAINING_QUARANTINE.md` for operator boundaries.
+
 ## 2026-09-03 — Durable batch guard and both batch bodies testable through a mock app; a normalization batch proven end to end
 
 Follow-up to the ingest harness: `DurableBatchWorkerGuard` and its owner enum are generic over

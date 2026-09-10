@@ -858,6 +858,10 @@ struct SnapshotRowCounts {
     review_pool_duplicate_exclusions: Option<u64>,
     #[serde(default)]
     review_pool_dedup_supersessions: Option<u64>,
+    #[serde(default)]
+    training_quarantine_holds: Option<u64>,
+    #[serde(default)]
+    training_quarantine_clearances: Option<u64>,
 }
 
 fn safe_manifest_name(name: &str) -> Result<(), String> {
@@ -1199,6 +1203,8 @@ fn inspect_schema2_database_evidence(path: &Path) -> Result<SnapshotDatabaseEvid
             review_pool_dedup_manifests: count_from(64, "review_pool_dedup_manifests")?,
             review_pool_duplicate_exclusions: count_from(64, "review_pool_duplicate_exclusions")?,
             review_pool_dedup_supersessions: count_from(70, "review_pool_dedup_supersessions")?,
+            training_quarantine_holds: count_from(72, "training_quarantine_holds")?,
+            training_quarantine_clearances: count_from(72, "training_quarantine_clearances")?,
         },
     })
 }
@@ -3973,7 +3979,7 @@ mod tests {
     #[test]
     fn active_pilot_snapshot_authority_distinguishes_archival_schema_and_invalid_policy_shapes() {
         let archival = seeded_db();
-        crate::migrations::rollback(&archival, 13).unwrap();
+        crate::migrations::rollback(&archival, 14).unwrap();
         assert_eq!(crate::migrations::get_current_version(&archival).unwrap(), 58);
         validate_active_pilot_snapshot_authority(archival.connection(), None, None, &pilot_policy())
             .expect("pre-v59 capture validation is archival only; restore admission rejects it separately");

@@ -2225,6 +2225,25 @@ mod tests {
         assert!(output.join("manifest.json").is_file());
         assert!(output.join("SHA256SUMS").is_file());
         assert!(output.join("_COMPLETE.json").is_file());
+        let hold = crate::training_quarantine::prepare(
+            &db,
+            std::slice::from_ref(&segment.id),
+            "Uncertain audio",
+            &"b".repeat(64),
+        )
+        .unwrap();
+        crate::training_quarantine::apply(&db, &hold).unwrap();
+        let held_output = temp.path().join("held-production-export");
+        let error = crate::production_dataset::export_finalized_voice_dataset(
+            &db,
+            &crate::production_dataset::ProductionDatasetOptions {
+                output_dir: held_output.to_string_lossy().into_owned(),
+                voice_name: "Lamo".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("training-quarantined"), "{error}");
+        assert!(!held_output.exists());
     }
 
     /// Record one effective Alle decision through the production writer, mirroring the couch
