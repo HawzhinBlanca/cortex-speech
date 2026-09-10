@@ -1203,7 +1203,15 @@ pub(super) fn authorize_audio(
                     // Membership in the immutable active pool is the authority; blindness is
                     // untouched — the queue serves the raw champion draft and audio bytes never
                     // carry the first reviewer's answer.
-                    Some(pool) => pool.contains(id),
+                    // A clip somebody decided while this batch sat idle plays for nothing: the save
+                    // would be refused as already resolved (audit 2026-09-10 finding 4).
+                    Some(pool) => {
+                        pool.contains(id)
+                            && !crate::review_pool::trust::is_decided(db, id).map_err(|error| {
+                                tracing::error!("Couch Review decision lookup failed: {error}");
+                                err_reply(503, "review authority is temporarily unavailable")
+                            })?
+                    }
                     None => !seg.verified,
                 },
             };

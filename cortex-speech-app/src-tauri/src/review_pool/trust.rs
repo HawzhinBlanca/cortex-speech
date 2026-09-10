@@ -129,6 +129,30 @@ pub(super) fn resolve(judgements: &HashMap<String, JudgementEvidence>) -> Option
     })
 }
 
+/// Export authority: a resolution carried by the owner or a trusted reviewer needs no second name.
+pub fn authorizes(agreeing_reviewers: &[String]) -> bool {
+    let policy = current();
+    agreeing_reviewers
+        .iter()
+        .map(|name| reviewer_key(Some(name)))
+        .any(|key| policy.owner.as_deref() == Some(key.as_str()) || policy.trusted.contains(&key))
+}
+
+/// Is this `reviewer_key` the owner named by the policy?
+pub fn is_owner(key: &str) -> bool {
+    current().owner.as_deref() == Some(key)
+}
+
+/// Is this clip decided right now? Media serving asks before playing a clip a stale batch still
+/// holds (audit 2026-09-10 finding 4): a verdict on it would be refused, so the listen is wasted.
+pub fn is_decided(db: &Database, segment_id: &str) -> Result<bool, String> {
+    let ids = serde_json::to_string(&[segment_id]).map_err(|error| error.to_string())?;
+    let reviewers = reviewer_sets_for_ids_on(db.connection(), Some(&ids))?;
+    let adjudications = owner_adjudications_for_ids_on(db.connection(), Some(&ids))?;
+    let (resolution, _) = derive_resolution(segment_id, reviewers.get(segment_id), adjudications.get(segment_id));
+    Ok(matches!(resolution, DerivedResolution::Resolved { .. }))
+}
+
 /// For `pool_admin probe` / status output.
 pub fn describe() -> serde_json::Value {
     let policy = current();
@@ -163,6 +187,20 @@ mod tests {
         let policy = load(dir.path());
         assert_eq!(policy.owner.as_deref(), Some("hawzhin"));
         assert!(policy.trusted.contains("lamo") && policy.trusted.contains("sewa"));
+    }
+
+    #[test]
+    fn authority_and_ownership_follow_the_policy() {
+        let policy = parse(r#"{ "owner": "Hawzhin", "trusted": ["Lamo"] }"#).unwrap();
+        with_policy(policy, || {
+            assert!(authorizes(&["Hawzhin".to_string()]));
+            assert!(authorizes(&["lamo".to_string()]));
+            assert!(!authorizes(&["Rubar".to_string()]));
+            assert!(is_owner("hawzhin") && !is_owner("lamo"));
+        });
+        with_policy(TrustPolicy::default(), || {
+            assert!(!authorizes(&["Hawzhin".to_string()]) && !is_owner("hawzhin"));
+        });
     }
 
     #[test]

@@ -244,6 +244,31 @@ preserving its schedule/log directory. Future rollouts must rebind that task alo
 watchdog/restore-drill handover; an old controller import had caused false schema-version alarms.
 Unknown historical-button and corrected-later groups remain separate. Private inventories, identities,
 exact production paths, backup hashes and handover evidence are recorded in the owner's vault/audit.
+## 2026-09-10 — Audit response: owner-decided clips were refused by the export validator (fixed), conflicts reach the owner, stale media refused
+
+**Trigger:** a second agent's finality audit (vault: "Cortex review finality deep audit 2026-09-10") after the trusted-reviewer
+canon went live at 13:55. Verified here against the code before acting.
+
+**Finding 1 (confirmed, P1, mine):** `ExportReviewAuthority::retained` still demanded `reviewer_count >= 2`, and both the
+export root and `LearningReviewScope::capture` propagate its error with `?`, so any export or learning capture meeting an
+owner-decided clip ABORTED — 237 decided clips were affected on the live DB at audit time. Fix: a resolution carried by
+the owner or a trusted reviewer (`trust::authorizes`) is export authority on its own; untrusted single names stay refused.
+No export ran between 13:55 and this fix; nothing shipped wrong, nothing was silently dropped — the calls would have failed.
+**Finding 6 (confirmed):** `OwnerConflict` was excluded from every queue including the owner's, and the decision writer
+refused the owner's verdict on it, so trusted disagreements and the disputed reopen clips could only be settled by
+`pool_admin adjudicate`. Fix: conflicts are served to the policy owner's own link and the owner's ordinary verdict settles them.
+**Finding 4 (confirmed):** a stale phone batch could renew and play a clip another reviewer had since decided; the save then
+failed "already resolved". Fix: media eligibility now asks `review_pool::is_decided` — a decided clip refuses playback, so the
+page's existing media-error path names the reason instead of the reviewer wasting a listen and a correction.
+**Finding 8 (confirmed):** clone preflight omitted `review_trust.json`; added to PROFILE_STATE.
+**Findings 2, 3, 5, 7 (design, not changed here):** the reopen round holds the owner's pre-round opinions too (he has since
+re-judged all but 2); a reopened root may be re-served to someone who judged its retired twin; the voice export is
+all-or-nothing (the TTS test export is per clip); 95 acoustic groups remain inconclusive. Recorded for owner decisions.
+
+**Evidence:** `an_owner_or_trusted_resolution_is_export_authority_on_its_own`,
+`a_trusted_conflict_is_served_to_the_owner_who_settles_it_by_verdict`, `authority_and_ownership_follow_the_policy`;
+review_pool/couch/export modules + clippy + gates exit 0 (see PR #118).
+
 ## 2026-09-10 — Trusted-reviewer canon: the owner's verdict decides alone; Lamo and Sewa need one round
 
 **Owner rule change (2026-09-10, his words):** "anything done by me, should be final even one review, should be eligible for

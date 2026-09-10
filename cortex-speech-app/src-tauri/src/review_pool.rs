@@ -1245,7 +1245,13 @@ pub fn pending_segment_ids_with_hints(
             continue;
         }
         let (resolution, _) = derive_resolution(&segment_id, coverage, adjudications.get(&segment_id));
-        if matches!(resolution, DerivedResolution::Resolved { .. } | DerivedResolution::OwnerConflict) {
+        // Decided: served to nobody. Conflict: waits for the owner and is served to his link while a
+        // verdict can still be written (the schema refuses a fourth judgement; beyond that only
+        // `pool_admin adjudicate` settles it) — audit 2026-09-10 finding 6.
+        let judged = coverage.map_or(0, |coverage| coverage.judged.len());
+        if matches!(resolution, DerivedResolution::Resolved { .. })
+            || (matches!(resolution, DerivedResolution::OwnerConflict) && !(trust::is_owner(&reviewer) && judged < 3))
+        {
             continue;
         }
         // Owner 2026-09-08: a reopened clip is private to the people it re-checks + the final reviewers.
@@ -1270,7 +1276,6 @@ pub fn pending_segment_ids_with_hints(
         // 1 judgement -> needs one more to agree.        2 -> a disagreeing pair awaiting a third.
         // 0 -> untouched, still valuable but furthest from a decision. 3+ -> owner conflict, which
         // no ordinary reviewer can settle, so it sinks to the bottom rather than blocking the queue.
-        let judged = coverage.map_or(0, |coverage| coverage.judged.len());
         let distance_to_decision: usize = match judged {
             1 => 0,
             2 => 1,
@@ -1641,10 +1646,10 @@ pub fn record_decision(db: &Database, pool: &ReviewPool, input: &PoolDecisionInp
             DerivedResolution::Resolved { .. } => {
                 return Err("review pool clip is already resolved".to_string());
             }
-            DerivedResolution::OwnerConflict => {
+            DerivedResolution::OwnerConflict if !trust::is_owner(&reviewer) => {
                 return Err("review pool clip requires owner adjudication".to_string());
             }
-            DerivedResolution::Pending | DerivedResolution::NeedsThird => {}
+            DerivedResolution::OwnerConflict | DerivedResolution::Pending | DerivedResolution::NeedsThird => {}
         }
         let changed = tx
             .execute(
@@ -3924,6 +3929,33 @@ mod tests {
                 ["clip".to_string()].into_iter().collect::<HashSet<String>>(),
                 "exportable on the owner's verdict alone"
             );
+        });
+    }
+
+    /// Audit 2026-09-10 findings 4 and 6: a conflict between trusted reviewers reaches the owner's own
+    /// link and the owner settles it with an ordinary verdict; a decided clip reports decided.
+    #[test]
+    fn a_trusted_conflict_is_served_to_the_owner_who_settles_it_by_verdict() {
+        // The fixture's canonical verdict is Rubar's; Lamo's pool edit disagrees with it. Both were
+        // recorded before any policy (the only way two trusted people can disagree: once the rule is
+        // on, the first trusted verdict ends the clip).
+        let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        decide(&db, &pool, "Lamo", "دەقی لامۆ", "123e4567-e89b-42d3-a456-426614175041", 1);
+        assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "needsThirdReview");
+        let policy = trust::parse(r#"{ "owner": "Hawzhin", "trusted": ["Rubar", "Lamo"] }"#).unwrap();
+        trust::with_policy(policy, || {
+            assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "ownerConflict");
+            assert!(
+                pending_segment_ids(&db, &pool, "Roza", None).unwrap().is_empty(),
+                "nobody else is served a conflict"
+            );
+            assert_eq!(pending_segment_ids(&db, &pool, "Hawzhin", None).unwrap(), vec!["clip"], "the owner is");
+            assert!(!trust::is_decided(&db, "clip").unwrap());
+            decide(&db, &pool, "Hawzhin", "دەقی خاوەن", "123e4567-e89b-42d3-a456-426614175043", 3);
+            let row = &segment_resolutions(&db, None).unwrap()[0];
+            assert_eq!((row.status.as_str(), row.final_transcript.as_deref()), ("resolved", Some("دەقی خاوەن")));
+            assert!(trust::is_decided(&db, "clip").unwrap());
+            assert!(pending_segment_ids(&db, &pool, "Hawzhin", None).unwrap().is_empty());
         });
     }
 
