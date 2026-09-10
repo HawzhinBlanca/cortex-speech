@@ -110,6 +110,12 @@ def test_a_repeated_short_phrase_in_different_recordings_is_not_flagged() -> Non
     assert duplicate_groups(rows) == []
 
 
+def test_live_audit_nominates_short_phrases_without_changing_manifest_contract() -> None:
+    rows = [("a", r"D:\x\one.wav", ALIGN, "بەڵێ", 0), ("b", r"D:\x\two.wav", ALIGN, "بەڵێ", 0)]
+    assert duplicate_groups(rows) == [], "historical manifest nomination stays versioned"
+    assert duplicate_groups(rows, include_short=True) == [[("a", "one.wav"), ("b", "two.wav")]], "the live audit must send short candidates to audio confirmation"
+
+
 def test_the_mp4_lesson_exact_text_is_a_duplicate_at_ANY_offset() -> None:
     # The first version required offset agreement and the owner then heard the same sentence AGAIN:
     # A1-0032_PODCAST-001.mp4 is a third encode whose clock is shifted by a constant 137.8 s. An

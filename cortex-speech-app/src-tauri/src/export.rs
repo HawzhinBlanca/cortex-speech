@@ -439,6 +439,7 @@ fn exclude_unexportable_segments_with_holdout_policy(
     // human ever having heard the clip. The curated 43.8 h would have been the minority of its own
     // dataset. `None` = no pool registered (the pre-pool corpus), which leaves scope exactly as it
     // was before this guard existed.
+    let quarantine = crate::training_quarantine::TrainingBoundary::capture(db)?;
     let pool_scope = crate::review_pool::exportable_segment_ids(db).map_err(AppError::Validation)?;
     // OWNER CANON 2026-08-29: "a sentence is decided by any two DIFFERENT reviewers". Membership
     // says a clip is IN the corpus; it does not say anyone decided it. Without this second scope an
@@ -463,6 +464,10 @@ fn exclude_unexportable_segments_with_holdout_policy(
     for mut seg in segments {
         // Never trust a projection supplied by a caller or retained from an earlier export.
         seg.export_review = None;
+        if quarantine.blocked.contains(&seg.id) {
+            tracing::info!(segment_id = %seg.id, "export: training quarantine excludes unresolved audio risk");
+            continue;
+        }
         if pool_scope.as_ref().is_some_and(|scope| !scope.contains(&seg.id)) {
             tracing::info!(segment_id = %seg.id, "export: dropping segment outside the active review pool");
             continue;

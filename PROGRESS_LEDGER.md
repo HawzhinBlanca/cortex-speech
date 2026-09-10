@@ -1,5 +1,89 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-10 — Review finality repair, isolated implementation
+
+Current focus: `codex/review-finality-hardening-20260910`, based on deployed
+`062e42ab8c0e5b1df655aeb7fe1dc21914a49761`. Claude is paused. This entry records
+source implementation, **not production rollout or a 10/10 certificate**.
+
+Owner-final outcomes are protected from bulk reopen at preview and transaction
+time. Reopening a retained duplicate-family root preserves the owner's exposure
+on retired twins without transferring text. Fresh queue/media eligibility agrees;
+explicit legacy redo uses its own bounded pending scope and completion cutoff.
+Renewal rechecks current authorization and revokes stale delivery. The phone stops
+revoked cached audio, preserves corrections, and recovers only after a fresh queue.
+
+Durable last-action pool Undo is visible after reload for the same reviewer. A failed
+draft write retains an author/revision-bound in-memory recovery copy; Skip/Undo
+cannot discard it. API deadlines now include response-body consumption. Explicit
+`export --approved-subset` accepts recognized v1/v2 duplicate bindings, keeps all
+rights/audio/TTS gates, marks incomplete scope, and creates no complete-voice DB
+certificate. Short phrases enter live duplicate nomination without rewriting the
+immutable historical nomination contract. See `docs/REVIEW_FINALITY_REPAIR.md`.
+
+Evidence checkpoint: private bundle `review-finality-20260910`; its absolute
+location is retained only in the owner's vault, not this publishable repository.
+
+- `npm test`: 135 files, 1,082 tests passed.
+- `npm run test:reviewer-reliability`: eight passed; the last two failed before
+  fixing same-clip refresh recovery and 503 cached-playback behavior.
+- `npx playwright test --config playwright.couch.config.ts`: 66 passed (36.9s)
+  on the latest page, including light/dark WCAG checks.
+- `npm run typecheck`: zero errors/warnings; `npm run lint`: passed.
+- `npm run build`: passed, including bundle budget.
+- `cargo test -j2 --lib review_pool -- --test-threads=2`: 124 passed before the
+  final shared media refinement; broader library run remains pending below.
+- Operator binary tests: 41 passed; actual HTTPS retry/restart/Undo serving test:
+  one passed, four explicitly opt-in/helper tests ignored by that invocation.
+- Focused duplicate policy: 23 tests passed; private release policy: 41 passed.
+  Full locked Python suite is running at this checkpoint.
+- `npm audit --omit=dev --json`: zero advisories. Compatible js-yaml lock update
+  removes the high development advisory; three moderate Vitest tool advisories
+  remain, with a major-version runner upgrade outside this repair.
+
+The earlier Couch run exposed a real legacy-redo playback regression (184 pass,
+one fail); the repaired test passes within the broader run. Concurrent Windows
+verification builds encountered executing-binary/resource locks; these failed
+attempts are retained, and blocked checks must be repeated sequentially. No
+production process was stopped to resolve a test-environment lock.
+
+Private acoustic recheck on the immutable audit snapshot: 488 nominated groups,
+zero confirmed complete-PCM duplicates, 98 inconclusive groups covering 200 active
+IDs, 390 cleared groups. Candidate-limited, **not exhaustive clearance**. No
+automatic retirement, transcript transfer, historical payment adjustment, or
+review-round activation. A private clone export is being tested; its outputs are
+explicitly `DO_NOT_TRAIN`.
+
+Final verification: full Rust library suite 2,727 passed / eight opt-in tests
+ignored (575.63s). After the final page recovery changes, the focused Couch suite
+passed 185/185 (89.51s), pool suite 124/124 (71.81s), and all three explicit real
+browser/backend recovery scenarios passed (19.95s). Strict all-target/all-feature
+Clippy passes without warning allowances. Complete Playwright suite: 143 passed
+(1.7m). Complete locked Python rerun: **148 policy scripts passed**. The first
+policy sweep caught this entry's private filesystem path; it was removed from
+publishable documentation, not exempted from the gate. The test module ordering
+reported by Clippy was corrected rather than suppressed.
+
+The real snapshot's v2-bound Lamo subset exported 541 retained ASR clips, excluded
+46 rejects, and admitted 518 through the existing TTS gates while excluding 23.
+It marks `completeVoice: false` and 6,765 pending clips. An independent read-only
+row-hash comparison of all 76 user tables found **no changes**, quick-check OK,
+zero FK violations. All three named reviewer queue/audio/idempotency probes pass
+on the private clone. Comparing identical-clone owner probes: baseline 10,618
+available clips; candidate 10,616, excluding the two prior owner-exposure twins.
+
+**Not training clearance:** eight exported TTS/ASR clips intersect the 200 IDs in
+inconclusive acoustic groups. The entire private artifact remains `DO_NOT_TRAIN`.
+Owner direction is requested before adding explicit export quarantine; originals,
+review records, and pay must be preserved. These measurements are from the audit
+snapshot, not a claim about a continuously changing live database.
+
+Still required: release preflight/rollout, native Sorani copy approval, and human
+assessment/export-quarantine policy for uncertain audio. Selective named-reviewer
+trust withdrawal, explicit owner-final withdrawal, full history UI, canonical
+Undo discoverability after reload, and phone adjudication of three-opinion
+conflicts are not implemented by this patch. Production remains on the base SHA.
+
 ## 2026-09-08 late evening — Compact UI finishing and waveform lifecycle
 
 Owner-approved compact layout retained. Unified typography, aligned transport
@@ -15531,6 +15615,23 @@ implementation now resets recurrent state/context per independent buffer, suppli
 input, and has a raw-probability real-Sorani regression test that cannot pass through the fallback.
 Targeted evidence: VAD tests 13/13, restart/skip Rust contract 1/1, restart browser harness 5/5,
 playback-readiness policy 38 pins, frontend guard policy 33 pins, format and clippy clean.
+
+## 2026-09-10 — Training-only acoustic holds independent of reviewer finality
+
+Schema 72 appends exact-identity training quarantine and manual-clearance authority. Uncertain
+recordings and overlapping same-PCM aliases are excluded from dataset, ASR/TTS, DPO/LM, few-shot
+and correction-memory use without undoing reviews, routing, transcripts or compensation. Full-voice
+certification refuses held members; an explicit approved subset records its exclusions. Atomic
+application revalidates source identity; certified snapshots precede locked operator writes. Restore
+and downgrade safeguards preserve even cleared hold history. A manual clearance needs separately
+identified assessment evidence; software does not certify human listening or dataset perfection.
+
+The protected release controller rehearses an exact hash-pinned plan before maintenance, then applies
+it before exposure and independently verifies every non-hold table is unchanged. Historical migration
+blocks 1–71 are unchanged. Local verification: full Rust library 2,735 passed / 8 ignored, all-target
+all-feature Clippy clean, 148 locked Python scripts passed, then updated release-controller suite 43/43;
+frontend production build and bundle budget passed. These are implementation results, not live rollout
+or exhaustive acoustic clearance. See `docs/TRAINING_QUARANTINE.md` for operator boundaries.
 
 ## 2026-09-03 — Durable batch guard and both batch bodies testable through a mock app; a normalization batch proven end to end
 

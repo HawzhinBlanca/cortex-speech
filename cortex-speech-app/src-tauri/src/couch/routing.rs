@@ -664,7 +664,7 @@ pub(super) fn handle_request(
             reply
         }
         (tiny_http::Method::Post, "/api/renew") => match read_body(request) {
-            Ok(body) => with_live_reviewer(&token, reviewer, state, || api_renew(&body, reviewer, state)),
+            Ok(body) => with_live_reviewer(&token, reviewer, state, || api_renew_current(db, &body, reviewer, state)),
             Err(e) => err_reply(400, &e),
         },
         (tiny_http::Method::Post, "/api/undo") => match read_body(request) {

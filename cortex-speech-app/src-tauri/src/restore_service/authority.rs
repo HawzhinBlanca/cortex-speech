@@ -1,6 +1,8 @@
 //! Monotonic review, payment, and consent authority for restore admission.
 
-const DURABLE_REVIEW_RESTORE_TABLES: [&str; 37] = [
+const DURABLE_REVIEW_RESTORE_TABLES: [&str; 39] = [
+    "training_quarantine_holds",
+    "training_quarantine_clearances",
     "review_pilot_hidden_keys",
     "review_events",
     "spot_checks",
@@ -429,6 +431,8 @@ pub(crate) fn has_durable_review_activity(db: &crate::db::Database) -> Result<bo
     // comparison below. Once any actual audit/payment/grant row exists, a bare DB-only swap is no
     // longer an adequate recovery protocol because it cannot bind the companion policy/config files.
     for table in [
+        "training_quarantine_holds",
+        "training_quarantine_clearances",
         "review_pilot_hidden_keys",
         "review_events",
         "spot_checks",

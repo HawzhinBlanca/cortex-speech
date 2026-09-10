@@ -90,14 +90,15 @@ SCHEMA_CONTRACT_FIELDS = {
     "appendOnlyContract",
     "appendOnlyContractSha256",
 }
-SCHEMA_CONTRACT_ID = "cortex-private-production-schema-65-to-71-v1"
-SCHEMA_CONTRACT_TARGET = 71
+SCHEMA_CONTRACT_ID = "cortex-private-production-schema-65-to-72-v1"
+SCHEMA_CONTRACT_TARGET = 72
 # These are the only permitted source schemas; each candidate must still prove its own clone preflight.
-SCHEMA_CONTRACT_SOURCES = [65, 69, 70]
+SCHEMA_CONTRACT_SOURCES = [65, 69, 70, 71]
 # Contracts a COMPATIBLE PREVIOUS release (schema-2 pointer) may still carry: id -> (target, sources).
 # A 69 pointer is the last-known-good during a 69->70 handover and is validated against its own
 # contract, never against the current one.
 PREVIOUS_SCHEMA_CONTRACTS = {
+    "cortex-private-production-schema-65-to-71-v1": (71, [65, 69, 70]),
     "cortex-private-production-schema-65-to-69-v1": (69, [65]),
     "cortex-private-production-schema-65-to-70-v1": (70, [65, 69]),
 }
@@ -877,7 +878,54 @@ def apply_quality_reopen(db: Path, manifest: dict[str, Any], plan_path: Path) ->
     return report
 
 
-def preflight_clone(data_dir: Path, manifest: dict[str, Any], reopen_plan: Path | None = None) -> dict[str, Any]:
+def quarantine_preservation_sha256(db: Path) -> str:
+    """Every non-hold table is invariant across a training-only hold, including clearances and pay."""
+    digest = hashlib.sha256()
+    connection = sqlite3.connect(db.resolve(strict=True).as_uri() + "?mode=ro", uri=True, timeout=30)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        names = connection.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
+        for name, schema in names:
+            digest.update(json.dumps([name, schema], separators=(",", ":")).encode())
+            if name == "training_quarantine_holds":
+                continue
+            quoted = '"' + name.replace('"', '""') + '"'
+            rows = [hashlib.sha256(json.dumps(row, ensure_ascii=False, separators=(",", ":"),
+                    default=lambda value: {"blob": value.hex()}).encode()).digest()
+                    for row in connection.execute("SELECT * FROM " + quoted)]
+            digest.update(len(rows).to_bytes(8, "big"))
+            for row_digest in sorted(rows):
+                digest.update(row_digest)
+    finally:
+        connection.close()
+    return digest.hexdigest()
+
+
+def apply_training_quarantine(db: Path, manifest: dict[str, Any], plan_path: Path) -> dict[str, Any]:
+    plan = load_json(validate_artifact(plan_path, "exact training quarantine plan"))
+    members = plan.get("members")
+    if not isinstance(members, list) or not 1 <= len(members) <= 100000:
+        raise ReleaseError("training quarantine plan has no bounded exact membership")
+    # Match Rust's declared struct order, independent of whitespace/order in the input JSON.
+    canonical = {key: plan[key] for key in ("schemaVersion", "batchId", "reason", "evidenceSha256")}
+    canonical["members"] = [{key: row[key] for key in
+                              ("segmentId", "audioContentHash", "sourceStartMs", "sourceEndMs")} for row in members]
+    expected_sha = hashlib.sha256(json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+    before = quarantine_preservation_sha256(db)
+    report = run_json([str(manifest["poolAdminExe"]), "apply-quarantine", "--db", str(db),
+                       "--manifest", str(plan_path), "--confirm-training-only"], timeout=600)
+    if (report.get("batchId") != plan.get("batchId") or report.get("planSha256") != expected_sha
+            or type(report.get("members")) is not int or report["members"] != len(members)
+            or type(report.get("applied")) is not bool or report.get("reviewAndPayChanged") is not False):
+        raise ReleaseError("training quarantine writer did not prove the exact unchanged-review/pay batch")
+    if quarantine_preservation_sha256(db) != before:
+        raise ReleaseError("training quarantine changed data outside its hold table; keep maintenance active")
+    return report
+
+
+def preflight_clone(data_dir: Path, manifest: dict[str, Any], reopen_plan: Path | None = None,
+                    quarantine_plan: Path | None = None) -> dict[str, Any]:
     db_path = data_dir / "cortex-speech.db"
     with tempfile.TemporaryDirectory(prefix="cortex-release-preflight-") as raw:
         clone = Path(raw)
@@ -910,6 +958,7 @@ def preflight_clone(data_dir: Path, manifest: dict[str, Any], reopen_plan: Path 
         )
         rights = run_json([admin, "stamp-rights", "--db", str(clone / "cortex-speech.db")], timeout=300)
         reopen = apply_quality_reopen(clone / "cortex-speech.db", manifest, reopen_plan) if reopen_plan else None
+        quarantine = apply_training_quarantine(clone / "cortex-speech.db", manifest, quarantine_plan) if quarantine_plan else None
         report = run_json([admin, "certify", "--db", str(clone / "cortex-speech.db"), "--full-integrity"], timeout=600)
         if report.get("appGitSha") != manifest["appGitSha"]:
             raise ReleaseError("candidate pool_admin is not built from the declared release commit")
@@ -929,6 +978,7 @@ def preflight_clone(data_dir: Path, manifest: dict[str, Any], reopen_plan: Path 
             "migration": migration,
             "rights": rights,
             "qualityReopen": reopen,
+            "trainingQuarantine": quarantine,
             "certification": report,
             "reviewerQueues": queues,
         }
@@ -1233,6 +1283,35 @@ def snapshot_before_handover(data_dir: Path, manifest: dict[str, Any]) -> tuple[
     return snapshot, manifest_sha
 
 
+def training_quarantine_history(db: Path) -> dict[str, set[tuple[Any, ...]]]:
+    """Read complete immutable history, including cleared holds, from one consistent snapshot."""
+    connection = sqlite3.connect(db.resolve(strict=True).as_uri() + "?mode=ro", uri=True, timeout=30)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        result = {}
+        for table in ("training_quarantine_holds", "training_quarantine_clearances"):
+            exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+            if exists is None:
+                if version >= 72:
+                    raise ReleaseError(f"schema-{version} database lost {table}; automatic restore is unsafe")
+                result[table] = set()
+            else:
+                result[table] = set(connection.execute(f'SELECT * FROM "{table}"').fetchall())
+        return result
+    finally:
+        connection.close()
+
+
+def assert_training_quarantine_restore_floor(live: Path, restored: Path) -> None:
+    floor = training_quarantine_history(live)
+    candidate = training_quarantine_history(restored)
+    for table, rows in floor.items():
+        if not rows.issubset(candidate[table]):
+            raise ReleaseError(f"automatic restore would erase or change {table}; preserve current database")
+
+
 def restore_database(
     snapshot: Path,
     data_dir: Path,
@@ -1260,6 +1339,7 @@ def _restore_database_locked(
     if database_schema(source) != expected_schema:
         raise ReleaseError("rollback snapshot schema does not match the pre-handover database")
     live = data_dir / "cortex-speech.db"
+    assert_training_quarantine_restore_floor(live, source)
     temporary = data_dir / f".cortex-speech.rollback.{os.getpid()}.{time.time_ns()}.db"
     try:
         sqlite_backup(source, temporary)
@@ -1305,6 +1385,7 @@ def _restore_database_locked(
             checkpoint.close()
         if database_content_sha256(live) != live_digest:
             raise ReleaseError("live database changed while rollback was preparing its replacement")
+        assert_training_quarantine_restore_floor(live, temporary)
 
         for suffix in ("-wal", "-shm"):
             sidecar = Path(str(live) + suffix)
@@ -1488,6 +1569,10 @@ def _recover_under_lock(data_dir: Path, release_root: Path, journal_path: Path) 
             # validate_release_journal normally catches this. Keep the recovery decision locally
             # fail-closed even if a future journal reader relaxes shape validation.
             raise ReleaseError("post-migration database authority is missing; rollback safety is unknowable")
+        # Holds can be written before certification and without a new paid opinion. Even an exact
+        # certified digest cannot authorize returning to a schema that cannot represent those holds.
+        # Preserve cleared history too; reactivating old code would otherwise bypass training safety.
+        database_changed = database_changed or any(training_quarantine_history(db).values())
     mode = rollback_policy(
         source_schema,
         current_schema,
@@ -1620,7 +1705,13 @@ def deploy(args: argparse.Namespace) -> int:
     if reopen_plan is not None:
         reopen_plan = validate_artifact(reopen_plan, "exact quality reopen plan").resolve(strict=True)
     reopen_plan_sha = sha256_file(reopen_plan) if reopen_plan else None
-    preflight = preflight_clone(data_dir, manifest, reopen_plan)
+    quarantine_plan = getattr(args, "quarantine_plan", None)
+    if quarantine_plan is not None:
+        quarantine_plan = validate_artifact(quarantine_plan, "exact training quarantine plan").resolve(strict=True)
+    quarantine_plan_sha = sha256_file(quarantine_plan) if quarantine_plan else None
+    preflight = preflight_clone(data_dir, manifest, reopen_plan, quarantine_plan)
+    if quarantine_plan is not None and sha256_file(quarantine_plan) != quarantine_plan_sha:
+        raise ReleaseError("training quarantine plan changed during clone rehearsal")
     if reopen_plan is not None and sha256_file(reopen_plan) != reopen_plan_sha:
         raise ReleaseError("quality reopen plan changed during clone rehearsal")
     if preflight["sourceSchemaVersion"] != source_schema:
@@ -1707,6 +1798,11 @@ def deploy(args: argparse.Namespace) -> int:
                 raise ReleaseError("quality reopen plan changed after clone rehearsal")
             reopened = apply_quality_reopen(db, manifest, reopen_plan)
             print(f"QUALITY_REOPEN=PASS round={reopened['roundId']} clips={reopened['reopenedOrAlreadyApplied']} payChanged=false")
+        if quarantine_plan is not None:
+            if sha256_file(quarantine_plan) != quarantine_plan_sha:
+                raise ReleaseError("training quarantine plan changed after clone rehearsal")
+            held = apply_training_quarantine(db, manifest, quarantine_plan)
+            print(f"TRAINING_QUARANTINE=PASS batch={held['batchId']} clips={held['members']} reviewAndPayChanged=false")
         certification = certify_live(data_dir, manifest)
         queues = prove_canonical_queues(data_dir, manifest)
         if max_pool_decision_id(db) != baseline:
@@ -1783,6 +1879,8 @@ def parser() -> argparse.ArgumentParser:
         target.add_argument("--dedup-manifest", type=Path, required=True)
         target.add_argument("--reopen-plan", type=Path,
                             help="exact owner quality-hold plan, clone-proven then applied before exposure")
+        target.add_argument("--quarantine-plan", type=Path,
+                            help="exact training-only hold plan, clone-proven then applied before exposure")
     deploy_parser.add_argument("--fallback-app", type=Path)
     deploy_parser.add_argument("--fallback-watchdog", type=Path)
     recover_parser = commands.add_parser("recover", help="resume the fail-closed recovery journal")

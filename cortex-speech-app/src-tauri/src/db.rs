@@ -1552,6 +1552,7 @@ impl Database {
         // ordering once at startup; interactive Undo availability can then read only the journal
         // tail under the append-only triggers instead of rescanning the complete history.
         self.validate_desktop_review_action_journal()?;
+        crate::training_quarantine::validate_history(self)?;
         Ok(())
     }
 

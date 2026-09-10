@@ -33,6 +33,11 @@
       "version": 71,
       "description": "Immutable owner reopen rounds and immediate prior-authority withdrawal",
       "sourceBlockSha256": "4668e782545b52023f7067e95db179f290065539ad5be03d3b57d7964623692b"
+    },
+    {
+      "version": 72,
+      "description": "Append-only training quarantine independent of review and compensation",
+      "sourceBlockSha256": "54b6e02cf3d04b4e9a66c282f3783eb955ebca4682995baff73496f7761bc0bd"
     }
   ]
 }

@@ -157,14 +157,39 @@ fn first_overlapping_window(spans: &mut [(i64, i64, String)]) -> Option<(String,
 }
 
 fn usage() -> &'static str {
+    concat!(
     "Usage:\n  pool_admin migrate --db <cortex-speech.db>\n  pool_admin inventory --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...]\n  pool_admin activate --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...] [--pool-id <uuid>]\n  pool_admin apply-dedup --db <cortex-speech.db> --manifest <review-pool-dedup.json>\n  pool_admin status --db <cortex-speech.db>\n  pool_admin certify --db <cortex-speech.db> [--full-integrity] [--require-review-ready | --require-final-ready]\n  pool_admin probe --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...]\n  pool_admin benchmark --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...] [--iterations <1..100>]\n  pool_admin benchmark-commit --db <read-only-source.db> --iterations <1..500> --confirm-disposable\n    Synthetic commits use an internally owned temporary clone, never the supplied source.\n  pool_admin stamp-rights --db <cortex-speech.db>\n  pool_admin adjudicate --db <cortex-speech.db> --segment <id> (--retain-text <text> | --reject) --operation-id <uuid>\n  pool_admin send-back --db <cortex-speech.db> --reviewer <Name> [--action accept|edit ...]\n    Read-only semantic-action inventory; not exact clicked-button selection. --apply is disabled.\n  pool_admin plan-send-back --db <cortex-speech.db> --decision-id <id> [--decision-id ...]\n    Outputs an exact retained-pool plan for owner inspection; does not change the database.\n  pool_admin apply-send-back --db <cortex-speech.db> --manifest <plan.json> --acknowledge-pay-adjustments\n    Offline atomic pool reversal only; NOT canonical trust withdrawal or general re-review activation.\n  pool_admin plan-reopen --db <library.db> (--segment-list <ids.json> | --segment-id <id> ...) --reason <text> [--priority 0..2]\n    Read-only exact preview; retained canonical clips only. Save and inspect stdout privately.\n  pool_admin apply-reopen --db <offline-library.db> --manifest <plan.json> --confirm-quality-hold\n    Atomic trust withdrawal and shared fresh-review round; preserves prior transcripts and pay.\n  pool_admin export --db <cortex-speech.db> --voice-name <Name> --output <directory>"
+    , "\n    Optional --approved-subset exports resolved clips without certifying the complete voice.",
+    "\n  pool_admin plan-quarantine --db <library.db> --segment-list <ids.json> --reason <text> --evidence-sha256 <sha>",
+    "\n  pool_admin apply-quarantine --db <offline-library.db> --manifest <plan.json> --confirm-training-only",
+    "\n  pool_admin quarantine-status --db <library.db>",
+    "\n  pool_admin clear-quarantine --db <offline-library.db> --batch-id <uuid> --segment-id <id> --reason <assessment> --evidence-sha256 <sha> --confirm-training-only --confirm-manual-clearance")
 }
 
 const DETACHED_READ_COMMANDS: &[&str] = &["certify"];
-const DIRECT_READ_COMMANDS: &[&str] =
-    &["inventory", "status", "probe", "benchmark", "send-back", "plan-send-back", "plan-reopen"];
-const WRITE_COMMANDS: &[&str] =
-    &["migrate", "activate", "apply-dedup", "stamp-rights", "adjudicate", "apply-send-back", "apply-reopen", "export"];
+const DIRECT_READ_COMMANDS: &[&str] = &[
+    "inventory",
+    "status",
+    "probe",
+    "benchmark",
+    "send-back",
+    "plan-send-back",
+    "plan-reopen",
+    "plan-quarantine",
+    "quarantine-status",
+];
+const WRITE_COMMANDS: &[&str] = &[
+    "migrate",
+    "activate",
+    "apply-dedup",
+    "stamp-rights",
+    "adjudicate",
+    "apply-send-back",
+    "apply-reopen",
+    "export",
+    "apply-quarantine",
+    "clear-quarantine",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DatabaseAccess {
@@ -859,7 +884,9 @@ fn certification_outcome(
     }
     let every_voice_certified =
         voice_outcomes.values().all(|row| row.get("certificate").is_some_and(|value| !value.is_null()));
-    let final_dataset_ready = review_ready && all_resolved && rights.all_exact && every_voice_certified;
+    let quarantined = cortex_speech_app_lib::training_quarantine::blocked_segment_ids(db)?;
+    let final_dataset_ready =
+        review_ready && all_resolved && rights.all_exact && every_voice_certified && quarantined.is_empty();
     let last_decision_at_ms: Option<i64> = db.connection().query_row(
         "SELECT MAX(created_at_ms) FROM (
              SELECT decision.created_at_ms
@@ -924,6 +951,8 @@ fn certification_outcome(
             "rightsComplete": rights.all_exact,
             "everyVoiceCertified": every_voice_certified,
             "finalDatasetReady": final_dataset_ready,
+            "trainingQuarantineClear": quarantined.is_empty(),
+            "trainingQuarantinedSegments": quarantined.len(),
         },
     });
     Ok(CertificationOutcome { report, review_ready, final_dataset_ready })
@@ -934,8 +963,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     run(args)
 }
 
+fn read_bounded_json<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, Box<dyn std::error::Error>> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, 8_000_001), &mut bytes)?;
+    if bytes.len() > 8_000_000 {
+        return Err("quarantine input exceeds 8 MB".into());
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let command = args.first().map(String::as_str).ok_or_else(|| usage().to_string())?;
+    if command == "clear-quarantine" && !args.iter().any(|arg| arg == "--confirm-manual-clearance") {
+        return Err(
+            "clear-quarantine requires --confirm-manual-clearance and the SHA-256 of a genuine manual assessment"
+                .into(),
+        );
+    }
+    if matches!(command, "apply-quarantine" | "clear-quarantine")
+        && !args.iter().any(|arg| arg == "--confirm-training-only")
+    {
+        return Err(
+            "quarantine writes require --confirm-training-only; review and payment authority will not change".into()
+        );
+    }
     if command == "apply-reopen" && !args.iter().any(|arg| arg == "--confirm-quality-hold") {
         return Err("apply-reopen requires --confirm-quality-hold: this withdraws all prior approvals for the exact clips, preserves history/pay, and requires fresh review".into());
     }
@@ -1030,6 +1082,63 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match command {
+        "quarantine-status" => {
+            let ids = cortex_speech_app_lib::training_quarantine::blocked_segment_ids(&db)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({"blockedSegments": ids.len(), "segmentIds": ids}))?
+            );
+        }
+        "plan-quarantine" => {
+            let ids: Vec<String> = read_bounded_json(&value_after(&args, "--segment-list")?)?;
+            let plan = cortex_speech_app_lib::training_quarantine::prepare(
+                &db,
+                &ids,
+                &value_after(&args, "--reason")?,
+                &value_after(&args, "--evidence-sha256")?,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
+        "apply-quarantine" => {
+            let plan: cortex_speech_app_lib::training_quarantine::QuarantinePlan =
+                read_bounded_json(&value_after(&args, "--manifest")?)?;
+            let sha = plan.sha256()?;
+            // A unique pin is certified before even an idempotent retry; existing pins are preserved.
+            let pin = cortex_speech_app_lib::snapshot::take_pinned_snapshot(
+                &db,
+                db_path.parent().ok_or("database parent missing")?,
+                &format!("pre_training_hold_{}", uuid::Uuid::new_v4()),
+                1,
+            )?;
+            let changed = cortex_speech_app_lib::training_quarantine::apply(&db, &plan)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"applied":changed, "batchId":plan.batch_id, "planSha256":sha, "members":plan.members.len(), "snapshot":pin, "reviewAndPayChanged":false})
+                )?
+            );
+        }
+        "clear-quarantine" => {
+            let pin = cortex_speech_app_lib::snapshot::take_pinned_snapshot(
+                &db,
+                db_path.parent().ok_or("database parent missing")?,
+                &format!("pre_training_clearance_{}", uuid::Uuid::new_v4()),
+                1,
+            )?;
+            let changed = cortex_speech_app_lib::training_quarantine::clear(
+                &db,
+                &value_after(&args, "--batch-id")?,
+                &value_after(&args, "--segment-id")?,
+                &value_after(&args, "--reason")?,
+                &value_after(&args, "--evidence-sha256")?,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"cleared":changed, "snapshot":pin, "reviewAndPayChanged":false})
+                )?
+            );
+        }
         "status" => {
             let pool = review_pool::load(&db)?;
             let output = match pool {
@@ -1414,10 +1523,12 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         "export" => {
             let voice_name = value_after(&args, "--voice-name")?;
             let output_dir = value_after(&args, "--output")?;
-            let result = cortex_speech_app_lib::review_pool_export::export_voice(
-                &db,
-                &cortex_speech_app_lib::review_pool_export::PoolDatasetOptions { output_dir, voice_name },
-            )?;
+            let options = cortex_speech_app_lib::review_pool_export::PoolDatasetOptions { output_dir, voice_name };
+            let result = if args.iter().any(|arg| arg == "--approved-subset") {
+                cortex_speech_app_lib::review_pool_export::export_approved_subset(&db, &options)?
+            } else {
+                cortex_speech_app_lib::review_pool_export::export_voice(&db, &options)?
+            };
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         _ => return Err(usage().into()),

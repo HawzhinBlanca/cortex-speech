@@ -125,7 +125,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let memories: Vec<SourcedMemory> = conn
         .prepare(
             "SELECT wrong_token, human_token, slot_key, phonetic_key, confidence, hit_count, source_segment
-             FROM effective_correction_memory_v60",
+             FROM effective_correction_memory_v60 memory
+             WHERE NOT EXISTS (SELECT 1 FROM active_training_quarantined_segments held WHERE held.segment_id=memory.source_segment)
+               AND NOT EXISTS (
+                 SELECT 1 FROM correction_memory_contributions contribution
+                 JOIN human_decision_effect_events effect ON effect.id=contribution.effect_event_id
+                 JOIN active_training_quarantined_segments held ON held.segment_id=effect.segment_id
+                 WHERE contribution.memory_id=memory.id
+               )",
         )?
         .query_map([], |r| {
             Ok(SourcedMemory {

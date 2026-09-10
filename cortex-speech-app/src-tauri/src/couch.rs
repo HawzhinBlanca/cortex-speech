@@ -8165,6 +8165,29 @@ mod tests {
     }
 
     #[test]
+    fn renewal_rechecks_completion_and_revokes_stale_delivery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        let wav = tmp.path().join("renew-finality.wav");
+        write_test_wav(&wav, 1_600);
+        let mut segment = seg("renew-finality", "دەقی کار");
+        segment.audio_path = wav.to_string_lossy().into_owned();
+        db.insert_segment(&segment).unwrap();
+        let state = Mutex::new(CouchState {
+            session_store: Some((tmp.path().to_path_buf(), db_path)),
+            served_work: HashSet::from([("renew-finality".into(), "Sara".into())]),
+            ..CouchState::default()
+        });
+        let body = br#"{"id":"renew-finality"}"#;
+        assert_eq!(api_renew_current(&db, body, "Sara", &state).0, 200);
+        db.update_verified_for_test("renew-finality", true).unwrap();
+        assert_eq!(api_renew_current(&db, body, "Sara", &state).0, 409);
+        assert!(!lock_state(&state).served_work.contains(&("renew-finality".into(), "Sara".into())));
+        assert!(!lock_state(&state).leases.contains_key("renew-finality"));
+        assert_eq!(api_renew_current(&db, body, "Sara", &state).0, 409);
+    }
+
+    #[test]
     fn audio_rechecks_hot_focus_and_completion_before_honouring_an_etag() {
         let tmp = tempfile::tempdir().unwrap();
         let (db, db_path) = test_db(tmp.path());

@@ -297,6 +297,10 @@ fn tail() {}
 
 
 class ArchitecturePolicyTests(unittest.TestCase):
+    def test_repository_architecture_and_exact_migration_exception_are_current(self) -> None:
+        verdict = gate.evaluate_architecture()
+        self.assertTrue(verdict.passed, "\n".join(verdict.failures))
+
     def make_app(self, directory: str, modules: dict[str, str]) -> Path:
         app = Path(directory)
         root = app / "src-tauri" / "src"

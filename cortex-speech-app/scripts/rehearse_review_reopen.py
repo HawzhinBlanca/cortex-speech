@@ -83,8 +83,8 @@ def rehearse(source: Path, executable: Path, output: Path, reviewers: list[str])
     clone = output / "cortex-speech.db"
     version = copy_snapshot(source, clone)
     migration = run_admin(executable, output, "migration", "migrate", "--db", str(clone))
-    if migration["afterSchemaVersion"] != 71:
-        raise RuntimeError("candidate did not migrate its owned clone to schema 71")
+    if migration["afterSchemaVersion"] != 72:
+        raise RuntimeError("candidate did not migrate its owned clone to schema 72")
     preview = inventory.prepare(clone, reviewers)
     write_json(output / "inventory.json", preview)
     ids = sorted({row["segment_id"] for row in preview["rows"]
@@ -128,7 +128,7 @@ def rehearse(source: Path, executable: Path, output: Path, reviewers: list[str])
     if certification["database"]["healthy"] is not True or certification["audio"]["allAvailable"] is not True:
         raise RuntimeError("clone database or audio certification failed")
     result = {"passed": True, "sourceAccess": "SQLite read-only consistent snapshot", "sourceSchema": version,
-              "cloneSchema": 71, "selectedClips": len(ids), "inventorySha256": preview["inventory_sha256"],
+              "cloneSchema": migration["afterSchemaVersion"], "selectedClips": len(ids), "inventorySha256": preview["inventory_sha256"],
               "planSha256": plan["planSha256"], "historyAndPayUnchanged": True, "exactRetryPassed": True,
               "reviewerProbes": probes, "poolAdminSha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
               "observedAt": datetime.now(timezone.utc).isoformat(), "certifiesProduction": False,

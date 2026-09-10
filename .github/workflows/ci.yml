@@ -97,6 +97,10 @@ jobs:
         with:
           python-version: '3.12'
 
+      # A stale migration-catalog identity should fail before heavyweight setup or test suites.
+      - name: Fail-closed Rust production-module architecture
+        run: python scripts/rust_quality_gate.py architecture
+
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: 1.95.0
@@ -132,6 +136,9 @@ jobs:
       - name: Frontend tests
         run: npm test
 
+      - name: Reviewer recovery regressions
+        run: npm run test:reviewer-reliability
+
       # tauri::generate_context! (compiled by clippy / cargo test below) requires build.frontendDist
       # ("../dist") to exist. This job never runs `tauri build` (which would trigger the
       # beforeBuildCommand), so build the frontend explicitly here -- mirrors the Linux/macOS smoke jobs.
@@ -142,9 +149,6 @@ jobs:
         run: |
           npm run setup:python-policies
           npm run test:python-policies
-
-      - name: Fail-closed Rust production-module architecture
-        run: python scripts/rust_quality_gate.py architecture
 
       - name: Lint
         run: npm run lint

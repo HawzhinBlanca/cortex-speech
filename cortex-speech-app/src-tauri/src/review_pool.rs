@@ -28,6 +28,7 @@ pub use dedup::{apply_dedup_manifest, dedup_status, PoolDedupStatus};
 #[cfg(test)]
 pub(crate) use dedup::{canonical_json_bytes, normalized_text_sha256};
 use dedup::{load_dedup_binding, RegistryDedupRow};
+pub(crate) use dedup::{DEDUP_ALGORITHM_V1, DEDUP_ALGORITHM_V2};
 use family::family_seen_on;
 pub(crate) use family::{require_unseen_pool_family_on, require_unseen_pool_family_or_own_canonical_on};
 
@@ -1249,9 +1250,7 @@ pub fn pending_segment_ids_with_hints(
         // verdict can still be written (the schema refuses a fourth judgement; beyond that only
         // `pool_admin adjudicate` settles it) — audit 2026-09-10 finding 6.
         let judged = coverage.map_or(0, |coverage| coverage.judged.len());
-        if matches!(resolution, DerivedResolution::Resolved { .. })
-            || (matches!(resolution, DerivedResolution::OwnerConflict) && !(trust::is_owner(&reviewer) && judged < 3))
-        {
+        if !trust::permits_fresh_opinion(&resolution, coverage, &reviewer) {
             continue;
         }
         // Owner 2026-09-08: a reopened clip is private to the people it re-checks + the final reviewers.
@@ -1646,7 +1645,7 @@ pub fn record_decision(db: &Database, pool: &ReviewPool, input: &PoolDecisionInp
             DerivedResolution::Resolved { .. } => {
                 return Err("review pool clip is already resolved".to_string());
             }
-            DerivedResolution::OwnerConflict if !trust::is_owner(&reviewer) => {
+            DerivedResolution::OwnerConflict if !trust::permits_fresh_opinion(&resolution, current, &reviewer) => {
                 return Err("review pool clip requires owner adjudication".to_string());
             }
             DerivedResolution::OwnerConflict | DerivedResolution::Pending | DerivedResolution::NeedsThird => {}
@@ -2737,12 +2736,56 @@ mod tests {
     }
 
     #[test]
+    fn a_single_owner_or_trusted_first_review_reaches_real_export_and_learning() {
+        for policy in [r#"{"owner":"Rubar","trusted":[]}"#, r#"{"owner":"Hawzhin","trusted":["Rubar"]}"#] {
+            let (directory, db, _pool) = one_clip_pool_fixture("دەقی یەکەم", false, true);
+            trust::with_policy(trust::parse(policy).unwrap(), || {
+                let resolution = segment_resolutions(&db, None).unwrap().remove(0);
+                assert_eq!(resolution.reviewer_count, 1);
+                assert_eq!(resolution.status, "resolved");
+                let kept = crate::export::exclude_unexportable_segments(&db, db.get_segments(None).unwrap()).unwrap();
+                assert_eq!(kept.len(), 1);
+                assert_eq!(kept[0].export_review.as_ref().unwrap().transcript(), "دەقی یەکەم");
+                let path = directory.path().join("approved.json");
+                crate::export::export_dataset(&db, &path, &crate::settings::ExportFormat::Json).unwrap();
+                let exported: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                assert!(exported.to_string().contains("دەقی یەکەم"));
+                let pairs = crate::jury::learning::build_dpo_dataset(&db).unwrap();
+                assert_eq!(pairs.pair_count, 1);
+                let pair: serde_json::Value = serde_json::from_str(&pairs.jsonl).unwrap();
+                assert_eq!(pair["chosen"], "دەقی یەکەم");
+                assert_eq!(crate::jury::learning::export_lm_corpus(&db).unwrap(), vec!["دەقی یەکەم"]);
+            });
+        }
+    }
+
+    #[test]
     fn pool_learning_lm_uses_the_final_matching_pair() {
         let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
         decide(&db, &pool, "Alle", "دەقی دووەم", "60000000-0000-4000-8000-000000000211", 2_000);
         decide(&db, &pool, "Sewa", "دەقی دووەم", "60000000-0000-4000-8000-000000000212", 3_000);
         assert_eq!(crate::jury::learning::export_lm_corpus(&db).unwrap(), vec!["دەقی دووەم"]);
         assert_eq!(crate::quality::effective_transcript(&db.get_segment_by_id("clip").unwrap().unwrap()), "دەقی یەکەم");
+    }
+
+    #[test]
+    fn training_quarantine_overrides_final_owner_for_export_and_learning_without_reopening() {
+        let (_directory, db, _pool) = one_clip_pool_fixture("دەقی یەکەم", false, true);
+        trust::with_policy(trust::parse(r#"{"owner":"Rubar","trusted":[]}"#).unwrap(), || {
+            assert_eq!(crate::jury::learning::build_dpo_dataset(&db).unwrap().pair_count, 1);
+            assert_eq!(crate::jury::get_few_shot_examples(&db, "other", 3).unwrap().len(), 1);
+            let before = segment_resolutions(&db, None).unwrap();
+            let plan =
+                crate::training_quarantine::prepare(&db, &["clip".into()], "Uncertain audio", &"b".repeat(64)).unwrap();
+            crate::training_quarantine::apply(&db, &plan).unwrap();
+            assert!(crate::export::exclude_unexportable_segments(&db, db.get_segments(None).unwrap())
+                .unwrap()
+                .is_empty());
+            assert_eq!(crate::jury::learning::build_dpo_dataset(&db).unwrap().pair_count, 0);
+            assert!(crate::jury::learning::export_lm_corpus(&db).unwrap().is_empty());
+            assert!(crate::jury::get_few_shot_examples(&db, "other", 3).unwrap().is_empty());
+            assert_eq!(segment_resolutions(&db, None).unwrap(), before);
+        });
     }
 
     #[test]
@@ -3959,6 +4002,20 @@ mod tests {
         });
     }
 
+    #[test]
+    fn bulk_reopen_protects_owner_finality_at_preview_and_apply() {
+        let (_dir, db, pool) = one_clip_pool("دەقی خاوەن");
+        let ids = vec!["clip".to_string()];
+        let preview = reopen::prepare(&db, &pool, &ids, "Recheck disputed work", 0).unwrap();
+        let policy = trust::parse(r#"{"owner":"Rubar","trusted":[]}"#).unwrap();
+        trust::with_policy(policy, || {
+            assert!(reopen::prepare(&db, &pool, &ids, "Recheck disputed work", 0).unwrap_err().contains("owner-final"));
+            assert!(reopen::apply(&db, &pool, &preview, 2).unwrap_err().contains("owner-final"));
+            assert!(!reopen::has_rounds(&db).unwrap());
+            assert_eq!(segment_resolutions(&db, None).unwrap()[0].status, "resolved");
+        });
+    }
+
     /// Live incident 2026-09-08: 18 of the owner's 25 fresh verdicts on reopened clips came straight
     /// back to him. `family_roots` maps a live root to itself, and the reopen skip in `family_seen_on`
     /// therefore dropped the root's OWN fresh exposure whenever the clip had a retired twin. The
@@ -4116,7 +4173,7 @@ mod tests {
         decide(&restored, &restored_pool, "Iftikhar", "دەقی کۆتایی", "123e4567-e89b-42d3-a456-426614175006", 10);
         assert_eq!(segment_resolutions(&restored, None).unwrap()[0].status, "resolved");
         assert!(
-            crate::migrations::rollback(&restored, 1).is_err(),
+            crate::migrations::rollback(&restored, 2).is_err(),
             "populated round cannot roll back into trusted history"
         );
     }

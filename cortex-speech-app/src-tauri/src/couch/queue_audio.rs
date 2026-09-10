@@ -1206,11 +1206,36 @@ pub(super) fn authorize_audio(
                     // A clip somebody decided while this batch sat idle plays for nothing: the save
                     // would be refused as already resolved (audit 2026-09-10 finding 4).
                     Some(pool) => {
-                        pool.contains(id)
-                            && !crate::review_pool::trust::is_decided(db, id).map_err(|error| {
-                                tracing::error!("Couch Review decision lookup failed: {error}");
-                                err_reply(503, "review authority is temporarily unavailable")
-                            })?
+                        let eligible = (|| -> Result<bool, String> {
+                            if !pool.contains(id) {
+                                return Ok(false);
+                            }
+                            let data_dir =
+                                lock_state(state).session_store.as_ref().map(|(data_dir, _)| data_dir.clone());
+                            let redo = data_dir.as_deref().map(crate::review_redo::load).transpose()?.flatten();
+                            let shared_rounds = crate::review_pool::reopen::has_rounds(db)?;
+                            // Explicit legacy redo is not a fresh independent opinion. Match the
+                            // queue's bounded redo scope, including its completion cutoff, instead
+                            // of either blocking all redo audio or exempting every old verdict.
+                            if let Some(policy) =
+                                crate::review_redo::active_for(redo.as_ref(), reviewer).filter(|_| !shared_rounds)
+                            {
+                                return Ok(crate::review_redo::pending_segment_ids(
+                                    db,
+                                    pool,
+                                    reviewer,
+                                    policy,
+                                    allowed_dialects.as_deref(),
+                                )?
+                                .iter()
+                                .any(|pending| pending == id));
+                            }
+                            crate::review_pool::trust::may_review(db, id, reviewer)
+                        })();
+                        eligible.map_err(|error| {
+                            tracing::error!("Couch Review decision lookup failed: {error}");
+                            err_reply(503, "review authority is temporarily unavailable")
+                        })?
                     }
                     None => !seg.verified,
                 },
@@ -1745,6 +1770,29 @@ pub(super) struct RenewBody {
 /// Reclaiming an unheld clip is allowed only when `/api/queue` actually delivered it to this
 /// reviewer: if the lease lapsed but nobody else took it, the page that still has it open should keep
 /// it. A bearer presenting an arbitrary known id must not be able to mint that delivery proof.
+pub(super) fn api_renew_current(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchState>) -> Reply {
+    // First prove delivery/lease ownership, including legitimate expired-lease reclamation.
+    // Then revalidate live media authority before reporting that the reviewer can keep working.
+    let reply = api_renew(body, reviewer, state);
+    if reply.0 != 200 {
+        return reply;
+    }
+    let parsed: RenewBody = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(error) => return err_reply(400, &format!("bad json: {error}")),
+    };
+    match authorize_audio(db, &parsed.id, reviewer, state) {
+        Ok(_) => reply,
+        Err(mut failure) => {
+            forget_work_audio_assignment(state, &parsed.id, reviewer);
+            if failure.0 == 403 {
+                failure.0 = 409;
+            }
+            failure
+        }
+    }
+}
+
 pub(super) fn api_renew(body: &[u8], reviewer: &str, state: &Mutex<CouchState>) -> Reply {
     let parsed: RenewBody = match serde_json::from_slice(body) {
         Ok(p) => p,

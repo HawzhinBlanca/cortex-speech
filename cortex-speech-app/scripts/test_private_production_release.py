@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -114,6 +115,12 @@ def seed_database(path: Path, version: int, marker: str = "test") -> None:
         "CREATE TABLE review_pool_decisions(id INTEGER PRIMARY KEY);"
         "CREATE TABLE marker(value TEXT);"
     )
+    if version >= 72:
+        # Minimal row shapes test the release controller's field-independent exact-history floor.
+        connection.executescript(
+            "CREATE TABLE training_quarantine_holds(batch_id TEXT,segment_id TEXT,evidence TEXT);"
+            "CREATE TABLE training_quarantine_clearances(batch_id TEXT,segment_id TEXT,evidence TEXT);"
+        )
     connection.executemany(
         "INSERT INTO schema_migrations(version, description) VALUES(?, ?)",
         [(item, f"migration-{item}") for item in range(1, version + 1)],
@@ -211,7 +218,7 @@ def test_stage_is_atomic_versioned_and_hash_bound() -> None:
             f"{manifest['dedupManifestSha256'][:12]}"
         )
         assert manifest["schema"] == 2
-        assert manifest["expectedDatabaseSchema"] == 71
+        assert manifest["expectedDatabaseSchema"] == 72
         assert manifest["schemaContractId"] == release.SCHEMA_CONTRACT_ID
         assert manifest["schemaContractSha256"] == release.sha256_file(Path(manifest["schemaContract"]))
         assert manifest["appSha256"] == release.sha256_file(candidate / "cortex-speech-app.exe")
@@ -228,7 +235,7 @@ def test_stage_is_atomic_versioned_and_hash_bound() -> None:
 
 
 def test_stage_accepts_a_superseding_dedup_manifest_and_refuses_a_malformed_one() -> None:
-    """Schema 71 releases ship a schema-2 (superseding) dedup manifest; its identity is bound like v1."""
+    """Schema 72 releases ship a schema-2 (superseding) dedup manifest; its identity is bound like v1."""
     with tempfile.TemporaryDirectory() as raw:
         base = Path(raw)
         source, candidate, releases = base / "source", base / "candidate", base / "releases"
@@ -424,27 +431,27 @@ def test_candidate_inside_live_release_root_is_refused() -> None:
 
 
 def test_schema_rollback_policy_never_destroys_post_migration_work() -> None:
-    assert release.rollback_policy(65, 71, 2, 2, 65) == "restore-pre-migration"
+    assert release.rollback_policy(65, 72, 2, 2, 65) == "restore-pre-migration"
     assert release.rollback_policy(65, 65, 2, 2, 65) == "resume-pre-migration"
     assert release.rollback_policy(65, 65, 2, 3, 65) == "resume-pre-migration"
-    assert release.rollback_policy(65, 71, 2, 3, 65) == "preserve-current"
-    assert release.rollback_policy(65, 71, 2, 2, 65, database_changed=True) == "preserve-current"
-    assert release.rollback_policy(71, 71, 20, 20, 71) == "binary-only"
-    assert release.rollback_policy(71, 71, 20, 21, 71) == "binary-only"
-    assert release.rollback_policy(71, 71, 20, 20, 65) == "blocked"
-    assert release.rollback_policy(65, 72, 2, 2, 65) == "blocked"
-    assert release.rollback_policy(64, 71, 2, 2, 64) == "blocked"
+    assert release.rollback_policy(65, 72, 2, 3, 65) == "preserve-current"
+    assert release.rollback_policy(65, 72, 2, 2, 65, database_changed=True) == "preserve-current"
+    assert release.rollback_policy(72, 72, 20, 20, 72) == "binary-only"
+    assert release.rollback_policy(72, 72, 20, 21, 72) == "binary-only"
+    assert release.rollback_policy(72, 72, 20, 20, 65) == "blocked"
+    assert release.rollback_policy(65, 73, 2, 2, 65) == "blocked"
+    assert release.rollback_policy(64, 72, 2, 2, 64) == "blocked"
     # The schema-69 line (the release that served until the dedup-supersession release) is a proven
-    # migration source: an interrupted 69->71 handover resumes or restores exactly like 65->71 did.
+    # migration source: an interrupted 69->72 handover resumes or restores exactly like 65->72 did.
     assert release.rollback_policy(69, 69, 7, 7, 69) == "resume-pre-migration"
-    assert release.rollback_policy(69, 71, 7, 7, 69) == "restore-pre-migration"
-    assert release.rollback_policy(69, 71, 7, 8, 69) == "preserve-current"
-    assert release.rollback_policy(69, 71, 7, 7, 69, database_changed=True) == "preserve-current"
-    assert release.rollback_policy(68, 71, 2, 2, 68) == "blocked"
+    assert release.rollback_policy(69, 72, 7, 7, 69) == "restore-pre-migration"
+    assert release.rollback_policy(69, 72, 7, 8, 69) == "preserve-current"
+    assert release.rollback_policy(69, 72, 7, 7, 69, database_changed=True) == "preserve-current"
+    assert release.rollback_policy(68, 72, 2, 2, 68) == "blocked"
     assert release.rollback_policy(70, 70, 7, 7, 70) == "resume-pre-migration"
-    assert release.rollback_policy(70, 71, 7, 7, 70) == "restore-pre-migration"
-    assert release.rollback_policy(70, 71, 7, 8, 70) == "preserve-current"
-    assert release.rollback_policy(70, 71, 7, 7, 70, database_changed=True) == "preserve-current"
+    assert release.rollback_policy(70, 72, 7, 7, 70) == "restore-pre-migration"
+    assert release.rollback_policy(70, 72, 7, 8, 70) == "preserve-current"
+    assert release.rollback_policy(70, 72, 7, 7, 70, database_changed=True) == "preserve-current"
 
 
 def test_only_exact_legacy_schema65_pointer_is_a_compatible_previous_boundary() -> None:
@@ -461,7 +468,7 @@ def test_only_exact_legacy_schema65_pointer_is_a_compatible_previous_boundary() 
         except release.ReleaseError as error:
             assert "fields" in str(error)
         else:
-            raise AssertionError("a legacy schema-65 release must never be accepted as a schema-71 candidate")
+            raise AssertionError("a legacy schema-65 release must never be accepted as a schema-72 candidate")
         for unsupported in (63, 64):
             changed = dict(legacy, expectedDatabaseSchema=unsupported)
             try:
@@ -479,7 +486,7 @@ def as_previous_schema(manifest: dict[str, object], release_dir: Path, schema: i
     """
     migrations = release_dir / "src-tauri" / "src" / "migrations" / "mod.rs"
     text = migrations.read_text(encoding="utf-8").replace("\r\n", "\n")
-    assert schema in (69, 70)
+    assert schema in (69, 70, 71)
     cut = text.index(f"    Migration {{\n        version: {schema + 1},")
     end = text.index("\n];", cut)
     text = text[:cut].rstrip("\n") + text[end:]
@@ -488,7 +495,7 @@ def as_previous_schema(manifest: dict[str, object], release_dir: Path, schema: i
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
     contract["contractId"] = f"cortex-private-production-schema-65-to-{schema}-v1"
     contract["targetSchema"] = schema
-    contract["supportedMigrationSources"] = [65] if schema == 69 else [65, 69]
+    contract["supportedMigrationSources"] = {69: [65], 70: [65, 69], 71: [65, 69, 70]}[schema]
     contract["migrationSourceSha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
     contract_path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8", newline="\n")
     previous = dict(manifest)
@@ -512,7 +519,7 @@ def test_schema69_previous_pointer_is_compatible_but_never_a_candidate() -> None
         assert accepted["expectedDatabaseSchema"] == 69
         for label, manifest in (
             ("candidate", previous),
-            ("wrong contract", dict(previous, schemaContractId="cortex-private-production-schema-65-to-71-v1")),
+            ("wrong contract", dict(previous, schemaContractId="cortex-private-production-schema-65-to-72-v1")),
         ):
             try:
                 release.validate_manifest(
@@ -528,12 +535,12 @@ def test_schema69_previous_pointer_is_compatible_but_never_a_candidate() -> None
                 dict(previous, expectedDatabaseSchema=68), expected_root=releases, allow_compatible_previous=True
             )
         except release.ReleaseError as error:
-            assert "database schema 71" in str(error)
+            assert "database schema 72" in str(error)
         else:
             raise AssertionError("schema 68 is not a proven migration source")
 
 
-def test_schema70_previous_release_is_recovery_only_not_a_schema71_candidate() -> None:
+def test_schema70_previous_release_is_recovery_only_not_a_schema72_candidate() -> None:
     with tempfile.TemporaryDirectory() as raw:
         base = Path(raw)
         source, candidate, releases = base / "source", base / "candidate", base / "releases"
@@ -546,17 +553,36 @@ def test_schema70_previous_release_is_recovery_only_not_a_schema71_candidate() -
         try:
             release.validate_manifest(previous, expected_root=releases)
         except release.ReleaseError as error:
-            assert "database schema 71" in str(error)
+            assert "database schema 72" in str(error)
         else:
             raise AssertionError("an older release was accepted as the current candidate")
 
 
-def test_checked_in_schema_contract_is_the_exact_65_to_71_authority() -> None:
+def test_schema71_previous_release_remains_recovery_only() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        source, candidate, releases = base / "source", base / "candidate", base / "releases"
+        seed_source(source)
+        seed_candidate(candidate, git_sha="d" * 40)
+        staged = release.stage_release(candidate, source, releases, "d" * 40)
+        previous = as_previous_schema(staged, Path(str(staged["directory"])), 71)
+        accepted = release.validate_manifest(previous, expected_root=releases, allow_compatible_previous=True)
+        assert accepted["expectedDatabaseSchema"] == 71
+        try:
+            release.validate_manifest(previous, expected_root=releases)
+        except release.ReleaseError as error:
+            assert "database schema 72" in str(error)
+        else:
+            raise AssertionError("schema-71 binary was accepted for quarantine-aware serving")
+        assert release.rollback_policy(71, 72, 2, 2, 71, database_changed=True) == "preserve-current"
+
+
+def test_checked_in_schema_contract_is_the_exact_65_to_72_authority() -> None:
     path, contract, digest = release.validate_schema_contract(APP / "scripts" / release.SCHEMA_CONTRACT_FILE)
     assert path.name == release.SCHEMA_CONTRACT_FILE
-    assert contract["contractId"] == "cortex-private-production-schema-65-to-71-v1"
-    assert contract["supportedMigrationSources"] == [65, 69, 70]
-    assert contract["targetSchema"] == 71
+    assert contract["contractId"] == "cortex-private-production-schema-65-to-72-v1"
+    assert contract["supportedMigrationSources"] == [65, 69, 70, 71]
+    assert contract["targetSchema"] == 72
     assert contract["sameSchemaRecovery"] is True
     assert digest == release.sha256_file(path)
 
@@ -564,18 +590,18 @@ def test_checked_in_schema_contract_is_the_exact_65_to_71_authority() -> None:
         source = Path(raw) / "source"
         seed_source(source)
         changed = json.loads((source / release.SCHEMA_CONTRACT_RELATIVE_PATH).read_text(encoding="utf-8"))
-        changed["targetSchema"] = 72
+        changed["targetSchema"] = 73
         (source / release.SCHEMA_CONTRACT_RELATIVE_PATH).write_text(json.dumps(changed), encoding="utf-8")
         try:
             release.validate_schema_contract(source / release.SCHEMA_CONTRACT_RELATIVE_PATH)
         except release.ReleaseError as error:
-            assert "exactly 71" in str(error)
+            assert "exactly 72" in str(error)
         else:
             raise AssertionError("a rewritten target schema unexpectedly retained release authority")
 
 
-def test_clone_preflight_proves_65_to_71_and_same_schema_71() -> None:
-    for source_schema in (65, 69, 70, 71):
+def test_clone_preflight_proves_65_to_72_and_same_schema_72() -> None:
+    for source_schema in (65, 69, 70, 71, 72):
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw)
             source, candidate_dir, releases, data = (
@@ -591,6 +617,8 @@ def test_clone_preflight_proves_65_to_71_and_same_schema_71() -> None:
             seed_database(data / "cortex-speech.db", source_schema)
 
             profiles = {name: {} for name in release.PROFILE_STATE}
+            # Independent of the implementation list: deleting trust from PROFILE_STATE must fail.
+            profiles["review_trust.json"] = {"owner": "Hawzhin", "trusted": ["Lamo", "Sewa"]}
             profiles["couch_session.json"] = {"reviewers": {"protected-fixture-key": "Fixture"}}
             profiles["reviewer_dialects.json"] = {"Fixture": ["sorani"]}
             profiles["review_reopen_routing.json"] = {"final_reviewers": ["Fixture"]}
@@ -604,16 +632,16 @@ def test_clone_preflight_proves_65_to_71_and_same_schema_71() -> None:
                 assert db != data / "cortex-speech.db", "preflight must never target the live database"
                 if verb == "migrate":
                     before = release.database_schema(db)
-                    if before < 71:
+                    if before < 72:
                         connection = sqlite3.connect(db)
                         connection.executemany(
                             "INSERT INTO schema_migrations(version, description) VALUES(?, ?)",
-                            [(item, f"migration-{item}") for item in range(before + 1, 72)],
+                            [(item, f"migration-{item}") for item in range(before + 1, 73)],
                         )
                         connection.commit()
                         connection.close()
                     return {
-                        "migrated": before != 71,
+                        "migrated": before != 72,
                         "beforeSchemaVersion": before,
                         "afterSchemaVersion": release.database_schema(db),
                         "appGitSha": manifest["appGitSha"],
@@ -621,15 +649,16 @@ def test_clone_preflight_proves_65_to_71_and_same_schema_71() -> None:
                 if verb in {"apply-dedup", "stamp-rights"}:
                     return {}
                 if verb == "certify":
-                    assert release.database_schema(db) == 71
+                    assert release.database_schema(db) == 72
                     return {
                         "appGitSha": manifest["appGitSha"],
-                        "databaseSchemaVersion": 71,
+                        "databaseSchemaVersion": 72,
                         "database": {"healthy": True},
                         "audio": {"allAvailable": True},
                         "rights": {"allExact": True},
                     }
                 if verb in {"benchmark", "probe"}:
+                    assert (db.parent / "review_trust.json").read_bytes() == (data / "review_trust.json").read_bytes()
                     for name in release.PROFILE_STATE:
                         assert (db.parent / name).read_bytes() == (data / name).read_bytes()
                     assert command[command.index("--reviewer") + 1] == "Fixture"
@@ -641,8 +670,8 @@ def test_clone_preflight_proves_65_to_71_and_same_schema_71() -> None:
             with mock.patch.object(release, "run_json", side_effect=fake_run_json):
                 proof = release.preflight_clone(data, manifest)
             assert proof["sourceSchemaVersion"] == source_schema
-            assert proof["migration"]["migrated"] is (source_schema != 71)
-            assert proof["certification"]["databaseSchemaVersion"] == 71
+            assert proof["migration"]["migrated"] is (source_schema != 72)
+            assert proof["certification"]["databaseSchemaVersion"] == 72
             assert proof["reviewerQueues"] == {"Fixture": 2}
             wrong_queue_count = True
             with mock.patch.object(release, "run_json", side_effect=fake_run_json):
@@ -668,12 +697,12 @@ def test_clone_preflight_refuses_future_schema_before_candidate_execution() -> N
         seed_candidate(candidate_dir, git_sha="9" * 40)
         manifest = release.stage_release(candidate_dir, source, releases, "9" * 40)
         data.mkdir()
-        seed_database(data / "cortex-speech.db", 72)
+        seed_database(data / "cortex-speech.db", 73)
         with mock.patch.object(release, "run_json") as runner:
             try:
                 release.preflight_clone(data, manifest)
             except release.ReleaseError as error:
-                assert "not schema 72" in str(error)
+                assert "not schema 73" in str(error)
             else:
                 raise AssertionError("future schema unexpectedly entered candidate migration")
         runner.assert_not_called()
@@ -686,7 +715,7 @@ def test_database_schema_refuses_a_forged_max_version_with_gaps() -> None:
         connection.executescript(
             "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, description TEXT);"
             "INSERT INTO schema_migrations VALUES(1, 'one');"
-            "INSERT INTO schema_migrations VALUES(71, 'forged max');"
+            "INSERT INTO schema_migrations VALUES(72, 'forged max');"
         )
         connection.commit()
         connection.close()
@@ -701,7 +730,7 @@ def test_database_schema_refuses_a_forged_max_version_with_gaps() -> None:
 def test_database_content_authority_includes_committed_wal_frames() -> None:
     with tempfile.TemporaryDirectory() as raw:
         db = Path(raw) / "wal.db"
-        seed_database(db, 71, "before")
+        seed_database(db, 72, "before")
         writer = sqlite3.connect(db)
         try:
             assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
@@ -789,17 +818,59 @@ def test_restore_preserves_failed_database_and_verifies_snapshot() -> None:
         data.mkdir()
         snapshot.mkdir()
         for path, version, marker in (
-            (data / "cortex-speech.db", 71, "failed-v70"),
+            (data / "cortex-speech.db", 72, "failed-v70"),
             (snapshot / "cortex-speech.db", 65, "known-good-v65"),
         ):
             seed_database(path, version, marker)
         manifest_sha = seal_snapshot(snapshot)
         preserved = release.restore_database(snapshot, data, 65, manifest_sha)
         assert release.database_schema(data / "cortex-speech.db") == 65
-        assert release.database_schema(preserved) == 71
+        assert release.database_schema(preserved) == 72
         connection = sqlite3.connect(data / "cortex-speech.db")
         assert connection.execute("SELECT value FROM marker").fetchone()[0] == "known-good-v65"
         connection.close()
+
+
+def test_rollback_refuses_to_erase_holds_or_clearances_and_missing_authority() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        data, snapshot = base / "data", base / "snapshot"
+        data.mkdir()
+        snapshot.mkdir()
+        live = data / "cortex-speech.db"
+        seed_database(live, 72, "current")
+        seed_database(snapshot / "cortex-speech.db", 71, "before-holds")
+        sealed = seal_snapshot(snapshot)
+        with closing(sqlite3.connect(live)) as conn, conn:
+            conn.execute("INSERT INTO training_quarantine_holds VALUES('batch','clip','held-evidence')")
+            conn.execute("INSERT INTO training_quarantine_clearances VALUES('batch','clip','manual-evidence')")
+        before = release.database_content_sha256(live)
+        try:
+            release.restore_database(snapshot, data, 71, sealed)
+        except release.ReleaseError as error:
+            assert "training_quarantine_holds" in str(error)
+        else:
+            raise AssertionError("rollback erased cleared quarantine history")
+        assert release.database_content_sha256(live) == before
+        same_schema = base / "same-schema.db"
+        release.sqlite_backup(live, same_schema)
+        release.assert_training_quarantine_restore_floor(live, same_schema)
+        with closing(sqlite3.connect(same_schema)) as conn, conn:
+            conn.execute("UPDATE training_quarantine_clearances SET evidence='different'")
+        try:
+            release.assert_training_quarantine_restore_floor(live, same_schema)
+        except release.ReleaseError as error:
+            assert "training_quarantine_clearances" in str(error)
+        else:
+            raise AssertionError("restore changed manual-clearance evidence")
+        with closing(sqlite3.connect(same_schema)) as conn:
+            conn.execute("DROP TABLE training_quarantine_holds")
+        try:
+            release.training_quarantine_history(same_schema)
+        except release.ReleaseError as error:
+            assert "lost training_quarantine_holds" in str(error)
+        else:
+            raise AssertionError("missing quarantine authority was treated as an empty history")
 
 
 def test_handover_refuses_a_freshly_bound_but_stale_snapshot_generation() -> None:
@@ -837,7 +908,7 @@ def test_restore_requires_the_exact_sealed_snapshot_bound_into_the_journal() -> 
         data.mkdir()
         expected_snapshot.mkdir()
         other_snapshot.mkdir()
-        seed_database(data / "cortex-speech.db", 71, "live-must-survive")
+        seed_database(data / "cortex-speech.db", 72, "live-must-survive")
         seed_database(expected_snapshot / "cortex-speech.db", 65, "journal-authority")
         seed_database(other_snapshot / "cortex-speech.db", 65, "older-but-self-consistent")
         expected_manifest_sha = seal_snapshot(expected_snapshot)
@@ -877,7 +948,7 @@ def test_restore_refuses_a_real_concurrent_windows_instance_lock_holder() -> Non
         data, snapshot = base / "data", base / "snapshot"
         data.mkdir()
         snapshot.mkdir()
-        seed_database(data / "cortex-speech.db", 71, "live-under-lock")
+        seed_database(data / "cortex-speech.db", 72, "live-under-lock")
         seed_database(snapshot / "cortex-speech.db", 65, "rollback")
         manifest_sha = seal_snapshot(snapshot)
         ready = base / "holder.ready"
@@ -939,7 +1010,7 @@ def test_restore_refuses_a_real_concurrent_windows_instance_lock_holder() -> Non
             connection.close()
 
 
-def test_interrupted_65_to_71_handover_restores_schema65_and_reactivates_legacy_release() -> None:
+def test_interrupted_65_to_72_handover_restores_schema65_and_reactivates_legacy_release() -> None:
     with tempfile.TemporaryDirectory() as raw:
         base = Path(raw)
         source, releases, data, snapshot = (
@@ -957,7 +1028,7 @@ def test_interrupted_65_to_71_handover_restores_schema65_and_reactivates_legacy_
         data.mkdir()
         snapshot.mkdir()
         for path, version, marker in (
-            (data / "cortex-speech.db", 71, "failed-v70"),
+            (data / "cortex-speech.db", 72, "failed-v70"),
             (snapshot / "cortex-speech.db", 65, "known-good-v65"),
         ):
             seed_database(path, version, marker)
@@ -1049,7 +1120,7 @@ def test_pre_migration_recovery_preserves_a_decision_committed_during_stop_admis
         ]
 
 
-def test_same_schema_71_recovery_uses_previous_binary_without_database_rollback() -> None:
+def test_same_schema_72_recovery_uses_previous_binary_without_database_rollback() -> None:
     with tempfile.TemporaryDirectory() as raw:
         base = Path(raw)
         source, releases, data = base / "source", base / "releases", base / "data"
@@ -1060,14 +1131,14 @@ def test_same_schema_71_recovery_uses_previous_binary_without_database_rollback(
         candidate = release.stage_release(candidate_dir, source, releases, "1" * 40)
         previous = release.stage_release(previous_dir, source, releases, "2" * 40)
         data.mkdir()
-        seed_database(data / "cortex-speech.db", 71, "same-schema")
+        seed_database(data / "cortex-speech.db", 72, "same-schema")
         digest = release.database_content_sha256(data / "cortex-speech.db")
         release.atomic_json(
             data / release.JOURNAL_FILE,
             release_journal(
                 candidate,
                 previous,
-                source_schema=71,
+                source_schema=72,
                 phase="candidate-active",
                 snapshot=None,
                 target_digest=digest,
@@ -1088,7 +1159,7 @@ def test_same_schema_71_recovery_uses_previous_binary_without_database_rollback(
         ):
             assert release.recover(data, releases)
         restore.assert_not_called()
-        assert release.database_schema(data / "cortex-speech.db") == 71
+        assert release.database_schema(data / "cortex-speech.db") == 72
         assert json.loads((data / release.POINTER_FILE).read_text(encoding="utf-8"))["releaseId"] == previous[
             "releaseId"
         ]
@@ -1112,7 +1183,7 @@ def test_post_migration_database_write_refuses_rollback_to_schema65_snapshot() -
         previous = as_legacy_v65(release.stage_release(previous_dir, source, releases, "4" * 40))
         data.mkdir()
         snapshot.mkdir()
-        seed_database(data / "cortex-speech.db", 71, "certified-before-exposure")
+        seed_database(data / "cortex-speech.db", 72, "certified-before-exposure")
         seed_database(snapshot / "cortex-speech.db", 65, "pre-migration")
         seal_snapshot(snapshot)
         certified_digest = release.database_content_sha256(data / "cortex-speech.db")
@@ -1148,7 +1219,7 @@ def test_post_migration_database_write_refuses_rollback_to_schema65_snapshot() -
         ):
             assert release.recover(data, releases)
         restore.assert_not_called()
-        assert release.database_schema(data / "cortex-speech.db") == 71
+        assert release.database_schema(data / "cortex-speech.db") == 72
         connection = sqlite3.connect(data / "cortex-speech.db")
         retained = connection.execute(
             "SELECT COUNT(*) FROM marker WHERE value='owner-write-after-migration'"
@@ -1157,6 +1228,58 @@ def test_post_migration_database_write_refuses_rollback_to_schema65_snapshot() -
         connection.close()
         pointer = json.loads((data / release.POINTER_FILE).read_text(encoding="utf-8"))
         assert pointer["releaseId"] == candidate["releaseId"]
+
+
+def test_recovery_preserves_quarantine_even_without_new_decisions_or_digest_drift() -> None:
+    for phase in ("snapshotted", "candidate-certified", "exposed"):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            source, releases, data, snapshot = (base / name for name in ("source", "releases", "data", "snapshot"))
+            seed_source(source)
+            seed_candidate(base / "candidate", git_sha="3" * 40)
+            seed_candidate(base / "previous", git_sha="4" * 40)
+            candidate = release.stage_release(base / "candidate", source, releases, "3" * 40)
+            previous = as_legacy_v65(release.stage_release(base / "previous", source, releases, "4" * 40))
+            data.mkdir()
+            snapshot.mkdir()
+            live = data / "cortex-speech.db"
+            seed_database(live, 72)
+            seed_database(snapshot / "cortex-speech.db", 65)
+            seal_snapshot(snapshot)
+            with closing(sqlite3.connect(live)) as conn, conn:
+                conn.execute("INSERT INTO training_quarantine_holds VALUES('batch','clip','hold')")
+                conn.execute("INSERT INTO training_quarantine_clearances VALUES('batch','clip','clearance')")
+            digest = release.database_content_sha256(live)
+            release.atomic_json(data / release.JOURNAL_FILE, release_journal(
+                candidate, previous, source_schema=65, phase=phase, snapshot=snapshot,
+                target_digest=None if phase == "snapshotted" else digest,
+            ))
+            with (
+                mock.patch.object(release, "task_change"), mock.patch.object(release, "stop_app"),
+                mock.patch.object(release, "restore_database") as restore,
+                mock.patch.object(release, "launch_app") as launch,
+                mock.patch.object(release, "wait_for_server"), mock.patch.object(release, "certify_live"),
+                mock.patch.object(release, "prove_links"), mock.patch.object(release, "prove_canonical_queues"),
+                mock.patch.object(release, "register_release_tasks"), mock.patch.object(release, "unregister_task"),
+            ):
+                launch.side_effect = release.ReleaseError("simulated candidate launch failure")
+                try:
+                    release.recover(data, releases)
+                except release.ReleaseError as error:
+                    assert "simulated candidate launch failure" in str(error)
+                else:
+                    raise AssertionError("failed launch was reported as recovered")
+                assert (data / release.MAINTENANCE_FILE).is_file()
+                assert (data / release.JOURNAL_FILE).is_file()
+                assert release.database_content_sha256(live) == digest
+                restore.assert_not_called()
+                launch.reset_mock()
+                launch.side_effect = None
+                assert release.recover(data, releases)
+            restore.assert_not_called()
+            launch.assert_called_once_with(Path(candidate["appExe"]))
+            assert release.database_content_sha256(live) == digest
+            assert json.loads((data / release.POINTER_FILE).read_text(encoding="utf-8"))["releaseId"] == candidate["releaseId"]
 
 
 def test_recovery_refuses_future_schema_before_process_or_task_mutation() -> None:
@@ -1170,13 +1293,13 @@ def test_recovery_refuses_future_schema_before_process_or_task_mutation() -> Non
         candidate = release.stage_release(candidate_dir, source, releases, "5" * 40)
         previous = release.stage_release(previous_dir, source, releases, "6" * 40)
         data.mkdir()
-        seed_database(data / "cortex-speech.db", 72, "future")
+        seed_database(data / "cortex-speech.db", 73, "future")
         release.atomic_json(
             data / release.JOURNAL_FILE,
             release_journal(
                 candidate,
                 previous,
-                source_schema=71,
+                source_schema=72,
                 phase="prepared",
                 snapshot=None,
                 target_digest=None,
@@ -1189,7 +1312,7 @@ def test_recovery_refuses_future_schema_before_process_or_task_mutation() -> Non
             try:
                 release.recover(data, releases)
             except release.ReleaseError as error:
-                assert "future database schema 72" in str(error)
+                assert "future database schema 73" in str(error)
             else:
                 raise AssertionError("future-schema recovery unexpectedly continued")
         task_change.assert_not_called()
@@ -1209,8 +1332,8 @@ def test_watchdog_and_server_pin_the_release_boundary() -> None:
     assert "$actualSha = Get-Sha256Hex $check[0]" in watchdog
     assert "(Get-FileHash" not in watchdog
     assert release.SCHEMA_CONTRACT_FILE in watchdog
-    assert "cortex-private-production-schema-65-to-71-v1" in watchdog
-    assert "release pointer does not require private-production database schema 71" in watchdog
+    assert "cortex-private-production-schema-65-to-72-v1" in watchdog
+    assert "release pointer does not require private-production database schema 72" in watchdog
     assert "$dedup.manifestSchema -notin @(1, 2)" in watchdog, "the watchdog must accept a superseding (schema-2) dedup manifest"
     assert "-or $sources[1] -isnot [int] -or $sources[1] -ne 69 `" in watchdog
     assert "legacy release pointer is not the exact schema-65 handover boundary" in watchdog
@@ -1495,7 +1618,7 @@ def test_watchdog_refuses_contract_drift_and_schema_mismatch_before_process_cont
         pointer = {
             "schema": 2,
             "releaseId": "test",
-            "expectedDatabaseSchema": 71,
+            "expectedDatabaseSchema": 72,
             "appGitSha": "a" * 40,
             "createdAtUtc": release.utc_now(),
             "directory": str(immutable),
@@ -1522,7 +1645,7 @@ def test_watchdog_refuses_contract_drift_and_schema_mismatch_before_process_cont
             immutable / "scripts" / release.SCHEMA_CONTRACT_FILE
         )
         (data / release.POINTER_FILE).write_text(json.dumps(pointer), encoding="utf-8")
-        (data / "cortex-speech.db").write_bytes(b"not-a-schema-71-database")
+        (data / "cortex-speech.db").write_bytes(b"not-a-schema-72-database")
         result = run_watchdog_with_pointer(data)
         assert result.returncode != 0
         assert "WATCHDOG-ACTION: blocked (active release database schema mismatch)" in result.stdout
@@ -1626,6 +1749,44 @@ def test_quality_reopen_requires_exact_membership_and_unchanged_pay_receipt() ->
             else:
                 raise AssertionError("empty quality reopen accepted")
             run.assert_not_called()
+
+
+def test_training_quarantine_requires_exact_receipt_and_preserves_other_tables() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        database = root / "clone.db"
+        with closing(sqlite3.connect(database)) as conn, conn:
+            conn.executescript("CREATE TABLE marker(value TEXT); INSERT INTO marker VALUES('paid-history'); CREATE TABLE training_quarantine_holds(id TEXT);")
+        plan = root / "plan.json"
+        payload = {"schemaVersion": 1, "batchId": "10000000-0000-4000-8000-000000000001", "reason": "دەنگ",
+                   "evidenceSha256": "a" * 64, "members": [{"segmentId": "clip", "audioContentHash": "b" * 64,
+                                                          "sourceStartMs": 0, "sourceEndMs": 1000}]}
+        plan.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        digest = hashlib.sha256(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+        good = {"batchId": payload["batchId"], "planSha256": digest, "members": 1, "applied": True, "reviewAndPayChanged": False}
+        with mock.patch.object(release, "run_json", return_value=good) as run:
+            assert release.apply_training_quarantine(database, {"poolAdminExe": "admin"}, plan) == good
+            assert run.call_args.args[0][-1] == "--confirm-training-only"
+        for key, value in [("batchId", "other"), ("planSha256", "0" * 64), ("members", True),
+                           ("members", 2), ("applied", 1), ("reviewAndPayChanged", True)]:
+            with mock.patch.object(release, "run_json", return_value={**good, key: value}):
+                try:
+                    release.apply_training_quarantine(database, {"poolAdminExe": "admin"}, plan)
+                except release.ReleaseError:
+                    pass
+                else:
+                    raise AssertionError(f"incorrect quarantine receipt accepted: {key}")
+        def mutate(_command, **_kwargs):
+            with closing(sqlite3.connect(database)) as conn, conn:
+                conn.execute("UPDATE marker SET value='corrupted-pay'")
+            return good
+        with mock.patch.object(release, "run_json", side_effect=mutate):
+            try:
+                release.apply_training_quarantine(database, {"poolAdminExe": "admin"}, plan)
+            except release.ReleaseError as error:
+                assert "outside its hold table" in str(error)
+            else:
+                raise AssertionError("training-only quarantine rewrote protected history")
 
 
 def main() -> int:
