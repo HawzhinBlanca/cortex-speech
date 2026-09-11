@@ -790,6 +790,8 @@ fn reviewer_sets_for_ids_on(
         if segment_ids_json.is_some() { "AND member.segment_id IN (SELECT value FROM json_each(?1))" } else { "" };
     let independent_filter =
         if segment_ids_json.is_some() { "WHERE decision.segment_id IN (SELECT value FROM json_each(?1))" } else { "" };
+    // `+` keeps SQLite off the verified index when a few ids drive the query (14 ms → 0.02 ms).
+    let verified = if segment_ids_json.is_some() { "+segment.verified=1" } else { "segment.verified=1" };
     let mut canonical = conn
         .prepare(&format!(
             "SELECT member.segment_id,
@@ -803,7 +805,7 @@ fn reviewer_sets_for_ids_on(
                     segment.review_revision
                FROM review_pool_members member
                JOIN speech_segments segment ON segment.id=member.segment_id
-              WHERE segment.verified=1
+              WHERE {verified}
                 AND segment.human_decision IN ('accept','edit','reject','human_accept','human_edit','human_reject')
                 {canonical_filter} {reopen_filter}",
         ))
@@ -1605,8 +1607,8 @@ pub fn operation(db: &Database, operation_id: &str) -> Result<Option<PoolOperati
 }
 
 pub fn reviewer_already_saw(db: &Database, segment_id: &str, reviewer: &str) -> Result<bool, String> {
-    let seen = family_seen_on(db.connection(), &reviewer_sets(db)?)?;
-    Ok(seen.get(segment_id).is_some_and(|members| members.contains(&reviewer_key(Some(reviewer)))))
+    let (_, seen) = family::family_coverage_on(db.connection(), segment_id)?;
+    Ok(seen.contains(&reviewer_key(Some(reviewer))))
 }
 
 /// Append an independent decision without touching the canonical corpus row.
@@ -5643,6 +5645,25 @@ mod tests {
         );
         assert_eq!(exportable_segment_ids(&db).unwrap().unwrap(), ["a".to_string()].into_iter().collect());
         assert!(registry_matches(&db, &reopened).unwrap(), "request-boundary proof follows the latest authority");
+
+        // The per-request check reads one family, not the pool: the chain b→a, c→a resolves to a.
+        let (coverage, seen) = family::family_coverage_on(db.connection(), "a").unwrap();
+        assert_eq!(coverage.keys().collect::<Vec<_>>(), vec!["c"], "only the retired twin carries evidence yet");
+        assert_eq!(seen, HashSet::from(["rubar".to_string()]));
+
+        // Owner 2026-09-11: reopening the root hands it back to the person it re-checks, never to
+        // whoever already judged the twin — that exposure now survives a reopen for everyone.
+        db.connection()
+            .execute("UPDATE speech_segments SET verified=1, human_decision='edit', verdict='human_edit', verdict_transcript='دەقی هێمن', annotated_transcript='دەقی هێمن', reviewed_by='Hemn', review_revision=review_revision+1 WHERE id='a'", [])
+            .unwrap();
+        let plan = reopen::prepare(&db, &reopened, &["a".to_string()], "Owner disputes the first opinion", 0).unwrap();
+        assert_eq!(reopen::apply(&db, &reopened, &plan, 2_000).unwrap(), 1);
+        assert!(reviewer_already_saw(&db, "a", "Rubar").unwrap(), "twin exposure outlives the reopen");
+        assert!(pending_segment_ids(&db, &reopened, "Rubar", None).unwrap().is_empty());
+        assert_eq!(pending_segment_ids(&db, &reopened, "Hemn", None).unwrap(), vec!["a".to_string()]);
+        let mut again = alle_edit_on_a(revision + 1, &audio_hash, OPS[2], None);
+        again.reviewer = "Rubar";
+        assert!(record_decision(&db, &reopened, &again).unwrap_err().contains("E_REVIEW_FAMILY_ALREADY_SEEN"));
 
         // A third generation chains on the second, never on the base.
         let stale = family_manifest(

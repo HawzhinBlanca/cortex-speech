@@ -12,8 +12,10 @@ transfer transcripts between audio cuts, or activate a new review round.
   cached phone playback and leaves typed text available for recovery.
 - Bulk reopen previews and commits refuse owner-final clips. This is deliberately conservative:
   disputed ordinary work must not silently invalidate the owner's final authority.
-- Reopening a retained duplicate-family root does not discard the owner's exposure on a retired
-  twin. It does not transfer the twin's transcript: extended cuts can contain different words.
+- Reopening a retained duplicate-family root does not discard anyone's exposure on a retired twin
+  (owner 2026-09-11: extended from the owner alone to every reviewer - the same recording is never
+  served twice to one person). It does not transfer the twin's transcript: extended cuts can
+  contain different words. The per-request media/renew/decision check reads only the clip's family.
 - Owner conflicts with room for an ordinary owner opinion reach the owner under the prior fix.
   Three-opinion conflicts still require the existing explicit administrative adjudication path;
   this repair does not bypass the immutable three-opinion constraint or fabricate a paid fourth vote.

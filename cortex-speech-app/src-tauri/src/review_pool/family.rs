@@ -4,42 +4,59 @@
 //! receipts stay with their original decisions; callers enforce this guard inside their write
 //! transaction before any decision, payment or playback-consumption effect.
 
-use super::{reviewer_key, reviewer_sets_on, SegmentReviewers};
+use super::{reviewer_key, reviewer_sets_for_ids_on, SegmentReviewers};
 use std::collections::{HashMap, HashSet};
 
-/// Merge only exposure, NEVER transcript opinions, across the active acoustic family. Historical
-/// judgments/credits remain bound to the original clip. Effective views make undo reversible.
+/// Pool-wide exposure by live root, for the queue (once per fetch). Merges only exposure, NEVER
+/// transcript opinions, across the active acoustic family; historical judgements and credits remain
+/// bound to the original clip. Owner 2026-09-11: a retired twin's exposure counts for everyone,
+/// reopened root or not (until then a reopen dropped every twin exposure but the owner's).
 pub(super) fn family_seen_on(
     conn: &rusqlite::Connection,
     reviewers: &HashMap<String, SegmentReviewers>,
 ) -> Result<HashMap<String, HashSet<String>>, String> {
     let roots = family_roots(conn)?;
-    let reopened: HashSet<String> = if super::reopen::supported_on(conn)? {
-        let mut statement =
-            conn.prepare("SELECT segment_id FROM current_review_reopen_members_v71").map_err(|e| e.to_string())?;
-        let rows = statement.query_map([], |r| r.get(0)).map_err(|e| e.to_string())?;
-        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
-    } else {
-        HashSet::new()
-    };
     let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
     for (id, coverage) in reviewers {
-        // Reopening the retained family root authorizes fresh listening even after exposure to a
-        // retired twin. The twin itself remains excluded and never contributes a transferred vote.
-        // Only a RETIRED twin's exposure is dropped: `family_roots` also maps a live root to itself,
-        // and dropping the root's own coverage re-served every reopened clip with twins to the
-        // reviewer who had just judged it (live incident 2026-09-08, 18 of 25 verdicts came back).
-        if roots.get(id).is_some_and(|root| root != id && reopened.contains(root)) {
-            // A disputed ordinary opinion may be rechecked, but reopening a different cut must
-            // not erase the owner's exposure. Do not transfer text across unequal boundaries.
-            seen.entry(roots[id].clone())
-                .or_default()
-                .extend(coverage.seen.iter().filter(|reviewer| super::trust::is_owner(reviewer)).cloned());
-            continue;
-        }
         seen.entry(roots.get(id).unwrap_or(id).clone()).or_default().extend(coverage.seen.iter().cloned());
     }
     Ok(seen)
+}
+
+/// Coverage of one family only — `segment_id` and every retired member that resolves to it — and
+/// the reviewers it exposed: the same rule as `family_seen_on`, read for the per-request checks
+/// (media, renew, the decision writer). Loading the whole pool's coverage there cost ~35 ms of SQL
+/// per audio start and per phone heartbeat (2026-09-11, 20k members, 9k exclusions); one family is
+/// under 1 ms and does not grow with the pool.
+pub(super) fn family_coverage_on(
+    conn: &rusqlite::Connection,
+    segment_id: &str,
+) -> Result<(HashMap<String, SegmentReviewers>, HashSet<String>), String> {
+    // Both CROSS JOINs pin the order family → registry → exclusion: only then does SQLite search the
+    // (pool_id, canonical_segment_id) index (0.03 ms) instead of building an automatic index over
+    // every exclusion per call (12 ms, measured 2026-09-11). UNION ends a cycle instead of looping.
+    let mut statement = conn
+        .prepare(
+            "WITH RECURSIVE family(id) AS (
+                SELECT ?1
+                UNION
+                SELECT exclusion.segment_id
+                  FROM family
+                  CROSS JOIN review_pool_registry registry
+                  CROSS JOIN review_pool_duplicate_exclusions exclusion
+                    ON exclusion.pool_id=registry.pool_id AND exclusion.canonical_segment_id=family.id)
+             SELECT id FROM family",
+        )
+        .map_err(|error| format!("duplicate family identity cannot be read: {error}"))?;
+    let ids: Vec<String> = statement
+        .query_map([segment_id], |row| row.get(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|error| error.to_string())?;
+    let ids_json = serde_json::to_string(&ids).map_err(|error| error.to_string())?;
+    let reviewers = reviewer_sets_for_ids_on(conn, Some(&ids_json))?;
+    let seen = reviewers.values().flat_map(|coverage| coverage.seen.iter().cloned()).collect();
+    Ok((reviewers, seen))
 }
 
 /// Retired member → the live canonical clip its family resolves to (chains followed). A live
@@ -158,10 +175,9 @@ fn require_unseen_pool_family_impl(
     if excluded {
         return Err("E_REVIEW_FAMILY_RETIRED: this duplicate clip is no longer reviewable".into());
     }
-    let reviewers = reviewer_sets_on(conn)?;
-    let seen = family_seen_on(conn, &reviewers)?;
+    let (reviewers, seen) = family_coverage_on(conn, segment_id)?;
     let key = reviewer_key(Some(reviewer));
-    if seen.get(segment_id).is_some_and(|members| members.contains(&key)) {
+    if seen.contains(&key) {
         if allow_own_canonical_update && only_own_canonical_verdict(conn, &reviewers, segment_id, &key)? {
             return Ok(());
         }
@@ -171,30 +187,4 @@ fn require_unseen_pool_family_impl(
         );
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod owner_exposure_tests {
-    use super::*;
-
-    #[test]
-    fn reopening_a_root_preserves_its_retired_twins_owner_exposure_only() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE schema_migrations(version INTEGER); INSERT INTO schema_migrations VALUES(71);
-            CREATE TABLE review_pool_registry(pool_id TEXT); INSERT INTO review_pool_registry VALUES('pool');
-            CREATE TABLE review_pool_duplicate_exclusions(pool_id TEXT,segment_id TEXT,canonical_segment_id TEXT);
-            INSERT INTO review_pool_duplicate_exclusions VALUES('pool','twin','root');
-            CREATE TABLE current_review_reopen_members_v71(segment_id TEXT);
-            INSERT INTO current_review_reopen_members_v71 VALUES('root');",
-        )
-        .unwrap();
-        let mut coverage = SegmentReviewers::default();
-        coverage.seen.extend(["hawzhin".to_string(), "rubar".to_string()]);
-        let reviewers = HashMap::from([("twin".to_string(), coverage)]);
-        let policy = super::super::trust::parse(r#"{"owner":"Hawzhin","trusted":[]}"#).unwrap();
-        super::super::trust::with_policy(policy, || {
-            assert_eq!(family_seen_on(&conn, &reviewers).unwrap()["root"], HashSet::from(["hawzhin".to_string()]));
-        });
-    }
 }

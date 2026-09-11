@@ -1,5 +1,30 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-11 — Per-request exposure check reads one family; a retired twin's exposure now counts for everyone
+
+**Trigger:** owner, after the review of PR #119: "fix the media check yourself and extend exposure protection to everyone".
+
+**Cost (measured on a clone of the live DB, 20,323 members / 9,079 exclusions / 1,064 reopened):** since #119 every
+audio start and every phone heartbeat (`api_renew_current`) ran `trust::may_review` → `reviewer_already_saw`, which
+loaded the WHOLE pool's coverage (`reviewer_sets` + `family_roots`): ~35 ms of SQL per request — far less than the
+~1 s I estimated in the review (that figure came from the queue's note about the Start-time identity proof, not
+this path). The decision writer's `require_unseen_pool_family_*` guard did the same inside its transaction. Now
+`family::family_coverage_on` reads only the clip's family (recursive CTE; both `CROSS JOIN`s are load-bearing —
+without them SQLite builds an automatic index over every exclusion per call, 12 ms; with them the
+`(pool_id, canonical_segment_id)` index answers in 0.03 ms) and `reviewer_sets_for_ids_on` uses `+segment.verified=1`
+so a handful of ids drives the canonical query (14 ms → 0.02 ms). Per request: ~35 ms → under 1 ms, and no longer
+growing with the pool. The queue keeps the pool-wide `family_seen_on` (once per fetch); both reads share one rule.
+
+**Rule change (owner 2026-09-11):** exposure to a retired duplicate twin is exposure to the live root for EVERY reviewer,
+reopened root or not. Until now a reopen dropped every twin exposure except the owner's (#119), so a reviewer who had
+already judged the same recording could be paid to listen again. `reviewer_already_saw`, the queue and the decision
+writer all agree through the one shared read.
+
+**Evidence:** `a_superseding_manifest_retires_a_reviewed_twin_and_restates_the_applied_family` extended — after the
+root is reopened the twin's reviewer is still not served and her decision is refused `E_REVIEW_FAMILY_ALREADY_SEEN`,
+while the held reviewer is asked again; `family_coverage_on` proves the b→a, c→a chain resolves to one family.
+Rollout recorded below when deployed.
+
 ## 2026-09-10 — Review finality repair, isolated implementation
 
 Current focus: `codex/review-finality-hardening-20260910`, based on deployed
