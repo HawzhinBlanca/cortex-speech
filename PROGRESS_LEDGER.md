@@ -1,5 +1,39 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-11 — Incident: deploy of #120 stalled at `certify --full-integrity`; rollback blocked; live in maintenance 05:36–05:48
+
+**What happened.** Deploy of d10ae639 (PR #120, merged as 37d5aab4, byte-identical tree) at 05:35. Phases prepared →
+maintenance → snapshotted passed; `certify_live(candidate)` failed "review-readiness certification failed", and the
+inline recovery's `certify_live(previous 807c21d9)` failed the same way ("AUTOMATIC RECOVERY BLOCKED"). Live sat in
+maintenance (HTTPS 503, review writes blocked, pointer still 807c21d9, app 807c21d9 running) for ~12 minutes at night;
+no reviewer request was refused in the Couch log during the window.
+
+**Root cause (Codex PR #119, schema 72).** `snapshot.rs` counts `training_quarantine_holds` / `training_quarantine_clearances`
+in `SnapshotRowCounts` at schema ≥ 72, but the Python pre-handover snapshot writer `scripts/create_recovery_snapshot.py`
+(and the daily `restore_drill.py`, which requires an EXACT row-count key set) were not updated. The pinned offsite
+snapshot `preprivate_v72_to_v72_1789094143` written by the deploy therefore carried `training_quarantine_holds: None`
+while the verifier recomputed `Some(200)`; `latest_snapshot` marked it unverified → `offsite.fresh=false` →
+`reviewReady=false` for BOTH releases. Codex's own deploy of 807c21d9 passed because its snapshot was taken at schema 71
+(no tables on either side). Every deploy after the first hold would have failed the same way.
+
+**Recovery.** The 807c21d9 app the recovery had launched kept its 9-minute snapshot cadence; its Rust-written regular
+offsite snapshot `snapshot_1789094813` (05:46:53) verified and was newer than the pinned one, so at 05:47
+`release_private_production.py recover` completed: mode binary-only, pointer 807c21d9, certify + links + queues proven,
+watchdog re-registered 05:48:47 ("pool certification OK" 05:50:09), maintenance marker and journal removed, recovery arm
+unregistered. HTTPS 200. No database restore, no reviewer data touched.
+
+**Fix (this commit).** `create_recovery_snapshot.py` and `restore_drill.py` gain `TRAINING_QUARANTINE_*` tables at schema 72,
+mirroring `SnapshotRowCounts`; tests `test_schema72_snapshot_counts_training_quarantine_and_preserves_schema71_shape`
+and `test_schema72_drill_expects_training_quarantine_counts_and_keeps_schema71_shape`. Proof on the staging clone: the
+fixed writer's manifest carries `training_quarantine_holds: 200` and `pool_admin certify` reports the snapshot
+`verified: true` (the live deploy already proved the old writer fails). The #120 exposure change is NOT live yet: it is
+re-staged and deployed from the commit that carries this fix, recorded below.
+
+**Lesson.** A row-count evidence struct has three copies (snapshot.rs, create_recovery_snapshot.py, restore_drill.py);
+adding a table to one breaks the next deploy AND its rollback. The stage/clone rehearsal never exercises the pinned
+snapshot writer against the verifier — added to the pre-deploy checklist here: run the fixed writer on the clone data
+dir and `certify` it before any handover that follows a schema change.
+
 ## 2026-09-11 — Per-request exposure check reads one family; a retired twin's exposure now counts for everyone
 
 **Trigger:** owner, after the review of PR #119: "fix the media check yourself and extend exposure protection to everyone".

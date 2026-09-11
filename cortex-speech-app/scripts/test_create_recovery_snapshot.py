@@ -890,6 +890,16 @@ def test_schema64_evidence_includes_duplicate_authority_only_at_v64() -> None:
     assert snapshot.evidence_tables_for_schema(65) == at_64
 
 
+def test_schema72_snapshot_counts_training_quarantine_and_preserves_schema71_shape() -> None:
+    # Live incident 2026-09-11: the Rust verifier counted these two tables at v72 while this writer
+    # did not, so the pinned pre-handover snapshot never verified and the deploy and its rollback
+    # both stalled at `certify --full-integrity` (maintenance 503 for the reviewers).
+    tables = ("training_quarantine_holds", "training_quarantine_clearances")
+    assert snapshot.evidence_tables_for_schema(71) == snapshot.evidence_tables_for_schema(70)
+    assert snapshot.evidence_tables_for_schema(72) == snapshot.evidence_tables_for_schema(71) + tables
+    assert snapshot.evidence_tables_for_schema(73) == snapshot.evidence_tables_for_schema(72)
+
+
 def test_schema70_snapshot_binds_supersessions_and_preserves_schema69_shape() -> None:
     table = "review_pool_dedup_supersessions"
     assert snapshot.evidence_tables_for_schema(69) == snapshot.evidence_tables_for_schema(64)

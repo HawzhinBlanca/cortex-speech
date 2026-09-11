@@ -100,6 +100,11 @@ POOL_DEDUP_COUNT_TABLES = (
 )
 POOL_DEDUP_SUPERSESSION_SCHEMA_VERSION = 70
 POOL_DEDUP_SUPERSESSION_COUNT_TABLES = ("review_pool_dedup_supersessions",)
+# Schema 72 (PR #119) counted these in the Rust verifier (snapshot.rs) but not here, so every
+# pinned pre-handover snapshot written after the first hold failed `certify --full-integrity`
+# and blocked the 2026-09-11 deploy AND its rollback. Keep this list identical to SnapshotRowCounts.
+TRAINING_QUARANTINE_SCHEMA_VERSION = 72
+TRAINING_QUARANTINE_COUNT_TABLES = ("training_quarantine_holds", "training_quarantine_clearances")
 MANIFEST_FIELDS = {
     "schema",
     "createdAtEpochSecs",
@@ -130,7 +135,7 @@ from policy_python import sha256_file
 
 
 def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
-    """Keep old evidence shapes exact while binding every review authority through v70."""
+    """Keep old evidence shapes exact while binding every review authority through v72."""
 
     tables = BASE_COUNT_TABLES
     if schema_version >= HIDDEN_KEY_SCHEMA_VERSION:
@@ -145,6 +150,8 @@ def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
         tables += POOL_DEDUP_COUNT_TABLES
     if schema_version >= POOL_DEDUP_SUPERSESSION_SCHEMA_VERSION:
         tables += POOL_DEDUP_SUPERSESSION_COUNT_TABLES
+    if schema_version >= TRAINING_QUARANTINE_SCHEMA_VERSION:
+        tables += TRAINING_QUARANTINE_COUNT_TABLES
     return tables
 
 
