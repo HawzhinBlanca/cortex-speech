@@ -27,7 +27,7 @@ mirroring `SnapshotRowCounts`; tests `test_schema72_snapshot_counts_training_qua
 and `test_schema72_drill_expects_training_quarantine_counts_and_keeps_schema71_shape`. Proof on the staging clone: the
 fixed writer's manifest carries `training_quarantine_holds: 200` and `pool_admin certify` reports the snapshot
 `verified: true` (the live deploy already proved the old writer fails). The #120 exposure change is NOT live yet: it is
-re-staged and deployed from the commit that carries this fix, recorded below.
+re-staged and deployed from the commit that carries this fix: see the rollout line under the #120 entry.
 
 **Lesson.** A row-count evidence struct has three copies (snapshot.rs, create_recovery_snapshot.py, restore_drill.py);
 adding a table to one breaks the next deploy AND its rollback. The stage/clone rehearsal never exercises the pinned
@@ -57,7 +57,13 @@ writer all agree through the one shared read.
 **Evidence:** `a_superseding_manifest_retires_a_reviewed_twin_and_restates_the_applied_family` extended — after the
 root is reopened the twin's reviewer is still not served and her decision is refused `E_REVIEW_FAMILY_ALREADY_SEEN`,
 while the held reviewer is asked again; `family_coverage_on` proves the b→a, c→a chain resolves to one family.
-Rollout recorded below when deployed.
+**Rollout 2026-09-11 06:58 (private production):** release e2f3ec1c4617-a8966fda67a6-0ab64397f664-22a120a1dfda-2c260072055f,
+commit e2f3ec1c (PR #121 = #120 + the snapshot-writer fix; main 99b79641 has the identical tree). Stage + clone rehearsal +
+the new staged-writer-vs-staged-certify check passed; deploy READY at 06:58:37 with all ten reviewer links proven and
+reviewReady=True; pointer/exe SHA-256 match, HTTPS 200, no markers, watchdog re-registered 06:58:37 and "pool
+certification OK" 07:00:01. First attempt (d10ae639, 05:35) stalled on the snapshot-writer defect recorded in the
+incident entry above; live ran 807c21d9 in between. Media/renew latency under the new check: to be read from the
+Couch log once reviewers work today (no request served yet at rollout).
 
 ## 2026-09-10 — Review finality repair, isolated implementation
 
