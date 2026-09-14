@@ -22,8 +22,8 @@ files (nothing written live): Lamo 609 clips / 78.8 min (TTS subset 586 / 76.4 m
   **Rollout 2026-09-14:** PR #123 merged as 597820c5 (tree identical to the deployed 388a70f3). Reviewers idle since 11:11;
   deploy READY 12:30:29 (release 388a70f362e9-004a5daf51e3-…, all ten links proven, reviewReady=True, HTTPS 200, no markers,
   watchdog re-registered 12:30:29). Clearance run 12:31: 18-second offline window (watchdog task disabled, app stopped and
-  relaunched by the release script helpers under the handover lock),  cleared 200 with ONE
-  pinned snapshot , reviewAndPayChanged=false, quarantine-status 0 blocked,
+  relaunched by the release script helpers under the handover lock), `clear-quarantine --all-remaining` cleared 200 with ONE
+  pinned snapshot `pre_training_clearance_5b8a5134-…_1789378292`, reviewAndPayChanged=false, quarantine-status 0 blocked,
   certify review-ready OK. Recount on a fresh clone: Lamo 617 clips / 79.9 min (TTS 594), Kawa 14 / 1.9 min, Halwest 3 /
   0.6 min — 634 clips, ~1 h 22 min ready; resolution summary unchanged (resolved 699, needs-third 61).
 - 61 rejected clips: already resolved as reject, never served, never exported. Pool membership is immutable by design
