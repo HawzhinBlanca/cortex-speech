@@ -1,5 +1,33 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-14 — Export readiness: 1 h 21 min ready; the 200-clip hold gets a batch clearance; 60 disputes routed to the owner
+
+**Owner asks (verbatim):** "how many hours now ready for export ?" then "lets solve the  200 clips, remove 61 bad audio clips, if
+the 59 clips has 2 reviews, lets accept them , also anything hawzhin reviewed, or sewa and lamo reviewed would be legitable for
+export. then lets see how mnay we have".
+
+**Measured** by running the real `pool_admin export --approved-subset` per voice on a clone of the live DB with the live policy
+files (nothing written live): Lamo 609 clips / 78.8 min (TTS subset 586 / 76.4 min), Kawa 14 / 1.9 min, Halwest 3 / 0.6 min —
+626 clips, ~1 h 21 min. Held back: 200 quarantined (batch 08bfff84), 61 rejected, 59 needs-third, ~10,500 unreviewed.
+
+**Actions.**
+- 200-clip hold: reason "inconclusive candidates, not confirmed duplicates"; 184 have no opinion yet, 12 are resolved. Codex's
+  `clear-quarantine` clears ONE clip per call and pins a full 256 MB snapshot each time (200 calls = ~50 GB on C:, 145 GB
+  free). Added `training_quarantine::clear_batch` + `pool_admin clear-quarantine --all-remaining`: one assessment, one pin,
+  the same append-only clearance row per member, sequential and re-runnable; test
+  `a_batch_clearance_clears_every_member_once_and_leaves_other_batches_held`. The assessment document (owner instruction +
+  hold facts) is `Desktop\cortex-speech-exports\quarantine-clearance-08bfff84-20260914.md`, SHA-256
+  ca82a6225bced054a5b45a826b4ca0676b7b92cf561643f69b3ce1d3b2ac7d29. Simulated on the clone (clearance rows inserted, export
+  re-run): +8 Lamo clips, +1.1 min today; the rest count as they resolve. Applied live after the deploy, recorded below.
+- 61 rejected clips: already resolved as reject, never served, never exported. Pool membership is immutable by design
+  (schema v62), so they are not "removed"; they simply do not count.
+- 59/60 disputed clips: all have exactly two DIFFERENT texts from Rubar/Iftikhar/Guest/Roza/Sabat (none has three). Two
+  different texts cannot both be accepted (consensus canon); the owner's single verdict decides each, so all 60 (7.6 min,
+  55 Lamo, 5 Kawa) are now first on the owner's link via `review_listen_list.json` (backup
+  `reviewer_roster_backups/review_listen_list.before-60-disputes-20260914-1125.json`).
+- "Anything Hawzhin, Sewa or Lamo reviewed is exportable": already the rule since 2026-09-10 (trusted-reviewer canon, export
+  validator fixed the same day); verified again here — every clip with such an opinion is resolved unless it is a skip.
+
 ## 2026-09-11 — Incident: deploy of #120 stalled at `certify --full-integrity`; rollback blocked; live in maintenance 05:36–05:48
 
 **What happened.** Deploy of d10ae639 (PR #120, merged as 37d5aab4, byte-identical tree) at 05:35. Phases prepared →

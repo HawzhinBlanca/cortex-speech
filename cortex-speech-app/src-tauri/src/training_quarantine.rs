@@ -141,6 +141,33 @@ pub fn clear(db: &Database, batch_id: &str, segment_id: &str, reason: &str, evid
     db.with_full_sync(|| clear_inner(db, batch_id, segment_id, reason, evidence))
 }
 
+/// One manual assessment covering every still-held member of a batch (owner 2026-09-14: the 200-clip
+/// hold 08bfff84 was for inconclusive duplicate candidates, none confirmed; the owner directed that
+/// they follow the normal review rules). Same append-only clearance rows as `clear`, one per member,
+/// so the per-clip audit trail is unchanged; the caller pins ONE snapshot instead of one per clip.
+/// Sequential and re-runnable: a member that fails (changed audio identity) stops the run with the
+/// earlier clearances kept, and the next run skips what is already cleared with this evidence.
+pub fn clear_batch(db: &Database, batch_id: &str, reason: &str, evidence: &str) -> AppResult<usize> {
+    db.with_full_sync(|| {
+        validate_reason(reason, evidence)?;
+        let members: Vec<String> = db
+            .connection()
+            .prepare("SELECT segment_id FROM training_quarantine_holds WHERE batch_id=?1 ORDER BY segment_id")?
+            .query_map(params![batch_id], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        if members.is_empty() {
+            return Err(AppError::Validation("no training-quarantine batch with that id".into()));
+        }
+        let mut cleared = 0;
+        for segment_id in &members {
+            if clear_inner(db, batch_id, segment_id, reason, evidence)? {
+                cleared += 1;
+            }
+        }
+        Ok(cleared)
+    })
+}
+
 fn clear_inner(db: &Database, batch_id: &str, segment_id: &str, reason: &str, evidence: &str) -> AppResult<bool> {
     validate_reason(reason, evidence)?;
     validate_history(db)?;
@@ -314,6 +341,43 @@ mod tests {
         assert!(!apply(&db, &first).unwrap());
         assert!(blocked_segment_ids(&db).unwrap().is_empty());
         assert!(crate::migrations::rollback(&db, 1).is_err(), "even cleared history survives rollback");
+    }
+
+    #[test]
+    fn a_batch_clearance_clears_every_member_once_and_leaves_other_batches_held() {
+        let db = fixture();
+        let first =
+            prepare(&db, &["original".into(), "adjacent".into()], "Uncertain candidates", &"b".repeat(64)).unwrap();
+        let second = plan(&db);
+        apply(&db, &first).unwrap();
+        apply(&db, &second).unwrap();
+        assert!(clear_batch(&db, "no-such-batch", "Owner assessment", &"c".repeat(64)).is_err());
+        assert_eq!(clear_batch(&db, &first.batch_id, "Owner assessment", &"c".repeat(64)).unwrap(), 2);
+        assert_eq!(
+            clear_batch(&db, &first.batch_id, "Owner assessment", &"c".repeat(64)).unwrap(),
+            0,
+            "re-run is a no-op"
+        );
+        assert!(
+            clear_batch(&db, &first.batch_id, "Other assessment", &"c".repeat(64)).is_err(),
+            "different evidence refused"
+        );
+        assert_eq!(
+            blocked_segment_ids(&db).unwrap(),
+            BTreeSet::from(["original".into(), "alias".into()]),
+            "the second batch still holds"
+        );
+        assert_eq!(
+            db.connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM training_quarantine_clearances WHERE batch_id=?1",
+                    params![first.batch_id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2,
+            "one append-only clearance row per member"
+        );
     }
 
     #[test]
