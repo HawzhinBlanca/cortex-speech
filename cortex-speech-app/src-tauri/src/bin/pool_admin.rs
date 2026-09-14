@@ -163,7 +163,7 @@ fn usage() -> &'static str {
     "\n  pool_admin plan-quarantine --db <library.db> --segment-list <ids.json> --reason <text> --evidence-sha256 <sha>",
     "\n  pool_admin apply-quarantine --db <offline-library.db> --manifest <plan.json> --confirm-training-only",
     "\n  pool_admin quarantine-status --db <library.db>",
-    "\n  pool_admin clear-quarantine --db <offline-library.db> --batch-id <uuid> --segment-id <id> --reason <assessment> --evidence-sha256 <sha> --confirm-training-only --confirm-manual-clearance")
+    "\n  pool_admin clear-quarantine --db <offline-library.db> --batch-id <uuid> (--segment-id <id> | --all-remaining) --reason <assessment> --evidence-sha256 <sha> --confirm-training-only --confirm-manual-clearance")
 }
 
 const DETACHED_READ_COMMANDS: &[&str] = &["certify"];
@@ -1125,13 +1125,24 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 &format!("pre_training_clearance_{}", uuid::Uuid::new_v4()),
                 1,
             )?;
-            let changed = cortex_speech_app_lib::training_quarantine::clear(
-                &db,
-                &value_after(&args, "--batch-id")?,
-                &value_after(&args, "--segment-id")?,
-                &value_after(&args, "--reason")?,
-                &value_after(&args, "--evidence-sha256")?,
-            )?;
+            // One assessment for the whole batch pins one snapshot; per clip it would pin one per call
+            // (2026-09-14: 200 clips x 256 MB).
+            let changed = if args.iter().any(|arg| arg == "--all-remaining") {
+                cortex_speech_app_lib::training_quarantine::clear_batch(
+                    &db,
+                    &value_after(&args, "--batch-id")?,
+                    &value_after(&args, "--reason")?,
+                    &value_after(&args, "--evidence-sha256")?,
+                )?
+            } else {
+                usize::from(cortex_speech_app_lib::training_quarantine::clear(
+                    &db,
+                    &value_after(&args, "--batch-id")?,
+                    &value_after(&args, "--segment-id")?,
+                    &value_after(&args, "--reason")?,
+                    &value_after(&args, "--evidence-sha256")?,
+                )?)
+            };
             println!(
                 "{}",
                 serde_json::to_string_pretty(
