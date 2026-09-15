@@ -17,5 +17,5 @@
   "historicalPrefixThroughSchema": 65,
   "historicalPrefixSha256": "92745eae14ae11016995a2010ff035453faf8d42d8d9edda52997feed73b3fd2",
   "appendOnlyContract": "scripts/append_only_migration_contract.v1.json",
-  "appendOnlyContractSha256": "b021d0f8cdb6434f6f306a7de68dd548ff04a6e0d69f21d415cf05d1c381c3f0"
+  "appendOnlyContractSha256": "bb83565d0b8e6093ee60030c8e8b3c2add45aada31986cecc98eacd16fd9b77c"
 }
