@@ -98,6 +98,7 @@ SCHEMA_CONTRACT_SOURCES = [65, 69, 70, 71, 72]
 # A 69 pointer is the last-known-good during a 69->70 handover and is validated against its own
 # contract, never against the current one.
 PREVIOUS_SCHEMA_CONTRACTS = {
+    "cortex-private-production-schema-65-to-72-v1": (72, [65, 69, 70, 71]),
     "cortex-private-production-schema-65-to-71-v1": (71, [65, 69, 70]),
     "cortex-private-production-schema-65-to-69-v1": (69, [65]),
     "cortex-private-production-schema-65-to-70-v1": (70, [65, 69]),
