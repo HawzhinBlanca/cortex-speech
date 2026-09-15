@@ -38,7 +38,20 @@ second batch with nothing new refuses → legacy record with different text → 
 clip → a third batch refuses → recorded batches refuse rollback), `export_batches::tests` (fail-closed below 73, skip rule,
 record validation), migrations/restore/snapshot/quarantine suites; Python: append-only contract 66-73, release controller
 46/46 incl. the new batch restore-floor test, snapshot 28/28, drill 23/23, verify10 runtime, rust_quality_gate architecture.
-Rollout and the live backfill are recorded below when done.
+**Rollout 2026-09-15 20:27 (private production):** PR #126 merged as 10f86c43 (tree identical to the deployed 38e0e557;
+the branch also carried the cargo-deny fix rustls 0.23.45 / der 0.8.2 for RUSTSEC-2026-0285 published that day, and the
+proven-previous-contract entry for 65-to-72 that staging demanded). Stage + clone rehearsal: migration 72→73 PASS on the
+clone, watchdog dry-run pin 73, staged-writer-vs-staged-certify verified, and the full backfill + next-batch dry run
+rehearsed on the clone first. Deploy READY 20:27:23 (release 38e0e5579209-c4d6f6308ab7-…, all ten links proven,
+reviewReady=True, HTTPS 200, no markers, pointer/exe SHA-256 match, watchdog registered 20:27:23, pool certification OK
+20:33:50). Reviewers idle since 12:56. CI: the first run failed on a pre-existing timing test
+(`a_runaway_page_is_throttled_per_reviewer`, untouched code), the rerun on cargo deny (new advisory); green after the
+dependency update.
+**Live backfill 20:28 (24 s offline window, handover lock, watchdog disabled/enabled):** `record-export-batch` recorded
+`tts-test-lamo-20260908` (167 legacy, text-bound), `approved-v1-20260915-Lamo` (451 exported + 166 skipped), `-Kawa` (14),
+`-Halwest` (3). `export-batches`: 635 clips delivered, **65 deliveredButWithdrawn** — 64 "no longer resolved" (the
+Lamo-only clips after his trust removal, audit P1-1) and 1 "now rejected". Next-batch dry run on a fresh clone with the
+live binary: Lamo would ship 64 clips, all re-exports of the stale-text TTS-test clips (528 s); Kawa/Halwest nothing new.
 
 **Not done here (owner decisions):** time-bounded trust (Rubar/Iftikhar "last two weeks") — the policy remains permanent per
 name; the 64 Lamo-only clips of approved-v1 stay delivered until the owner says whether Lamo's past verdicts keep authority
