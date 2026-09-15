@@ -43,6 +43,7 @@ pub mod error;
 pub mod eval;
 pub mod export;
 pub mod export_audio;
+pub mod export_batches;
 pub mod export_bundle;
 pub mod export_review;
 pub mod listen_list;

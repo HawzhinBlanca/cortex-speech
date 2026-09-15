@@ -90,14 +90,15 @@ SCHEMA_CONTRACT_FIELDS = {
     "appendOnlyContract",
     "appendOnlyContractSha256",
 }
-SCHEMA_CONTRACT_ID = "cortex-private-production-schema-65-to-72-v1"
-SCHEMA_CONTRACT_TARGET = 72
+SCHEMA_CONTRACT_ID = "cortex-private-production-schema-65-to-73-v1"
+SCHEMA_CONTRACT_TARGET = 73
 # These are the only permitted source schemas; each candidate must still prove its own clone preflight.
-SCHEMA_CONTRACT_SOURCES = [65, 69, 70, 71]
+SCHEMA_CONTRACT_SOURCES = [65, 69, 70, 71, 72]
 # Contracts a COMPATIBLE PREVIOUS release (schema-2 pointer) may still carry: id -> (target, sources).
 # A 69 pointer is the last-known-good during a 69->70 handover and is validated against its own
 # contract, never against the current one.
 PREVIOUS_SCHEMA_CONTRACTS = {
+    "cortex-private-production-schema-65-to-72-v1": (72, [65, 69, 70, 71]),
     "cortex-private-production-schema-65-to-71-v1": (71, [65, 69, 70]),
     "cortex-private-production-schema-65-to-69-v1": (69, [65]),
     "cortex-private-production-schema-65-to-70-v1": (70, [65, 69]),
@@ -1310,6 +1311,36 @@ def assert_training_quarantine_restore_floor(live: Path, restored: Path) -> None
     for table, rows in floor.items():
         if not rows.issubset(candidate[table]):
             raise ReleaseError(f"automatic restore would erase or change {table}; preserve current database")
+    assert_export_batch_restore_floor(live, restored)
+
+
+def export_batch_history(db: Path) -> dict[str, set[tuple[Any, ...]]]:
+    """Schema 73: every export batch and member row; a restore that drops one would re-deliver clips."""
+    connection = sqlite3.connect(db.resolve(strict=True).as_uri() + "?mode=ro", uri=True, timeout=30)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        result = {}
+        for table in ("review_pool_export_batches", "review_pool_export_batch_members"):
+            exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+            if exists is None:
+                if version >= 73:
+                    raise ReleaseError(f"schema-{version} database lost {table}; automatic restore is unsafe")
+                result[table] = set()
+            else:
+                result[table] = set(connection.execute(f'SELECT * FROM "{table}"').fetchall())
+        return result
+    finally:
+        connection.close()
+
+
+def assert_export_batch_restore_floor(live: Path, restored: Path) -> None:
+    floor = export_batch_history(live)
+    candidate = export_batch_history(restored)
+    for table, rows in floor.items():
+        if not rows.issubset(candidate[table]):
+            raise ReleaseError(f"automatic restore would erase or change {table}; preserve current database")
 
 
 def restore_database(
@@ -1572,7 +1603,11 @@ def _recover_under_lock(data_dir: Path, release_root: Path, journal_path: Path) 
         # Holds can be written before certification and without a new paid opinion. Even an exact
         # certified digest cannot authorize returning to a schema that cannot represent those holds.
         # Preserve cleared history too; reactivating old code would otherwise bypass training safety.
-        database_changed = database_changed or any(training_quarantine_history(db).values())
+        database_changed = (
+            database_changed
+            or any(training_quarantine_history(db).values())
+            or any(export_batch_history(db).values())
+        )
     mode = rollback_policy(
         source_schema,
         current_schema,

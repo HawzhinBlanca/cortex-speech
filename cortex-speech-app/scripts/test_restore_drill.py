@@ -740,6 +740,8 @@ def test_schema72_drill_expects_training_quarantine_counts_and_keeps_schema71_sh
     tables = ("training_quarantine_holds", "training_quarantine_clearances")
     assert drill_module.evidence_tables_for_schema(71) == drill_module.evidence_tables_for_schema(70)
     assert drill_module.evidence_tables_for_schema(72) == drill_module.evidence_tables_for_schema(71) + tables
+    batches = ("review_pool_export_batches", "review_pool_export_batch_members")
+    assert drill_module.evidence_tables_for_schema(73) == drill_module.evidence_tables_for_schema(72) + batches
 
 
 if __name__ == "__main__":

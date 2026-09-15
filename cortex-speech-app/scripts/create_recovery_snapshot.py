@@ -105,6 +105,8 @@ POOL_DEDUP_SUPERSESSION_COUNT_TABLES = ("review_pool_dedup_supersessions",)
 # and blocked the 2026-09-11 deploy AND its rollback. Keep this list identical to SnapshotRowCounts.
 TRAINING_QUARANTINE_SCHEMA_VERSION = 72
 TRAINING_QUARANTINE_COUNT_TABLES = ("training_quarantine_holds", "training_quarantine_clearances")
+EXPORT_BATCH_SCHEMA_VERSION = 73
+EXPORT_BATCH_COUNT_TABLES = ("review_pool_export_batches", "review_pool_export_batch_members")
 MANIFEST_FIELDS = {
     "schema",
     "createdAtEpochSecs",
@@ -135,7 +137,7 @@ from policy_python import sha256_file
 
 
 def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
-    """Keep old evidence shapes exact while binding every review authority through v72."""
+    """Keep old evidence shapes exact while binding every review authority through v73."""
 
     tables = BASE_COUNT_TABLES
     if schema_version >= HIDDEN_KEY_SCHEMA_VERSION:
@@ -152,6 +154,8 @@ def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
         tables += POOL_DEDUP_SUPERSESSION_COUNT_TABLES
     if schema_version >= TRAINING_QUARANTINE_SCHEMA_VERSION:
         tables += TRAINING_QUARANTINE_COUNT_TABLES
+    if schema_version >= EXPORT_BATCH_SCHEMA_VERSION:
+        tables += EXPORT_BATCH_COUNT_TABLES
     return tables
 
 

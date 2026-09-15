@@ -318,7 +318,10 @@ mod tests {
             );
         }
         validate_history(&db).unwrap();
-        assert!(crate::migrations::rollback(&db, 1).is_err());
+        assert!(
+            crate::migrations::rollback(&db, 2).is_err(),
+            "the empty v73 layer rolls back; the populated v72 layer refuses"
+        );
         assert!(db.connection().execute("DELETE FROM training_quarantine_holds", []).is_err());
         assert!(db.connection().execute("UPDATE training_quarantine_holds SET reason='changed'", []).is_err());
     }
@@ -340,7 +343,7 @@ mod tests {
         assert!(held.verify(&db).is_err());
         assert!(!apply(&db, &first).unwrap());
         assert!(blocked_segment_ids(&db).unwrap().is_empty());
-        assert!(crate::migrations::rollback(&db, 1).is_err(), "even cleared history survives rollback");
+        assert!(crate::migrations::rollback(&db, 2).is_err(), "even cleared history survives rollback");
     }
 
     #[test]
@@ -452,7 +455,7 @@ mod tests {
         assert!(crate::restore_service::has_durable_review_activity(&floor).unwrap());
         floor.connection().execute_batch("DROP TRIGGER training_quarantine_holds_no_update; UPDATE training_quarantine_holds SET reason='tampered';").unwrap();
         assert!(validate_history(&floor).is_err());
-        crate::migrations::rollback(&target, 1).unwrap();
+        crate::migrations::rollback(&target, 2).unwrap();
         assert!(blocked_segment_ids(&target).is_err());
     }
 }

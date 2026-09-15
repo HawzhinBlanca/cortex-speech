@@ -163,6 +163,9 @@ fn usage() -> &'static str {
     "\n  pool_admin plan-quarantine --db <library.db> --segment-list <ids.json> --reason <text> --evidence-sha256 <sha>",
     "\n  pool_admin apply-quarantine --db <offline-library.db> --manifest <plan.json> --confirm-training-only",
     "\n  pool_admin quarantine-status --db <library.db>",
+    "\n  pool_admin export-batches --db <library.db>",
+    "\n  pool_admin record-export-batch --db <offline-library.db> --batch-id <id> --voice-name <voice> --output-dir <dir> --manifest-sha256 <sha> [--certificate-sha256 <sha>] --total-duration-ms <n> --created-at-ms <n> --trust-policy-json <json> --members-json <file> --confirm-legacy-record",
+    "\n  pool_admin export --approved-subset --voice-name <voice> --output <dir> [--batch <id>] --db <library.db>  (--batch skips clips earlier batches delivered and records this one)",
     "\n  pool_admin clear-quarantine --db <offline-library.db> --batch-id <uuid> (--segment-id <id> | --all-remaining) --reason <assessment> --evidence-sha256 <sha> --confirm-training-only --confirm-manual-clearance")
 }
 
@@ -177,6 +180,7 @@ const DIRECT_READ_COMMANDS: &[&str] = &[
     "plan-reopen",
     "plan-quarantine",
     "quarantine-status",
+    "export-batches",
 ];
 const WRITE_COMMANDS: &[&str] = &[
     "migrate",
@@ -189,6 +193,7 @@ const WRITE_COMMANDS: &[&str] = &[
     "export",
     "apply-quarantine",
     "clear-quarantine",
+    "record-export-batch",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1082,6 +1087,50 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match command {
+        "export-batches" => {
+            println!("{}", serde_json::to_string_pretty(&cortex_speech_app_lib::export_batches::describe(&db)?)?);
+        }
+        "record-export-batch" => {
+            // Backfill of artifacts made before schema 73 (2026-09-08 TTS test, 2026-09-15 approved-v1).
+            if !args.iter().any(|arg| arg == "--confirm-legacy-record") {
+                return Err("record-export-batch requires --confirm-legacy-record: it records an artifact this tool did not produce".into());
+            }
+            let members_path = value_after(&args, "--members-json")?;
+            let members: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&members_path)?)?;
+            let members = members
+                .iter()
+                .map(|m| {
+                    Ok(cortex_speech_app_lib::export_batches::ExportBatchMember {
+                        segment_id: m["id"].as_str().ok_or("members-json entries need an id")?.to_string(),
+                        resolution_evidence_sha256: m["resolutionEvidenceSha256"].as_str().map(str::to_string),
+                        transcript_sha256: m["transcriptSha256"].as_str().map(str::to_string),
+                        disposition: cortex_speech_app_lib::export_batches::Disposition::parse(
+                            m["disposition"].as_str().unwrap_or("exported"),
+                        )
+                        .ok_or("members-json disposition must be exported | skipped-previously-exported | re-exported-changed-authority")?,
+                    })
+                })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+            let record = cortex_speech_app_lib::export_batches::ExportBatchRecord {
+                batch_id: value_after(&args, "--batch-id")?,
+                voice_name: value_after(&args, "--voice-name")?,
+                legacy: true,
+                export_manifest_sha256: value_after(&args, "--manifest-sha256")?,
+                certificate_sha256: optional_value_after(&args, "--certificate-sha256")?,
+                output_dir: value_after(&args, "--output-dir")?,
+                total_duration_ms: value_after(&args, "--total-duration-ms")?.parse()?,
+                created_at_ms: value_after(&args, "--created-at-ms")?.parse()?,
+                trust_policy: serde_json::from_str(&value_after(&args, "--trust-policy-json")?)?,
+                members,
+            };
+            let recorded = cortex_speech_app_lib::export_batches::record(&db, &record)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"recorded": recorded, "batchId": record.batch_id, "members": record.members.len()})
+                )?
+            );
+        }
         "quarantine-status" => {
             let ids = cortex_speech_app_lib::training_quarantine::blocked_segment_ids(&db)?;
             println!(
@@ -1534,7 +1583,18 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         "export" => {
             let voice_name = value_after(&args, "--voice-name")?;
             let output_dir = value_after(&args, "--output")?;
-            let options = cortex_speech_app_lib::review_pool_export::PoolDatasetOptions { output_dir, voice_name };
+            let batch_id = optional_value_after(&args, "--batch")?;
+            if batch_id.is_some()
+                && !db_path
+                    .parent()
+                    .is_some_and(|dir| dir.join(cortex_speech_app_lib::review_pool::trust::FILE_NAME).is_file())
+            {
+                // Audit 2026-09-15 P2-3: without the policy file beside the DB the tool silently trusts
+                // nobody and a batch would be recorded under the wrong authority.
+                return Err("export --batch requires review_trust.json beside the database: the policy that decides the batch must be the live one".into());
+            }
+            let options =
+                cortex_speech_app_lib::review_pool_export::PoolDatasetOptions { output_dir, voice_name, batch_id };
             let result = if args.iter().any(|arg| arg == "--approved-subset") {
                 cortex_speech_app_lib::review_pool_export::export_approved_subset(&db, &options)?
             } else {
