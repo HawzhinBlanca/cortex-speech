@@ -1,5 +1,28 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-15 — Export batch approved-v1-20260915 (468 new clips / 60.4 min); Lamo retires; Sewa sole trusted reviewer
+
+**Owner (verbatim):** "lets export those who have two reviews by anyonre, also those have 1 review by Me, hawhizxn , also lamo and
+sewa, make sure we dont export earlier exports, and make sure we record this batch so we dont export again in future" and
+"lamo no longer reviews, will later change to another eviewer".
+
+**Export.** Real `pool_admin export --approved-subset` per voice (release 388a70f3) on a read-only clone of the live DB (13:36:58
++03:00); rules = consensus + trusted-reviewer canon, unchanged. Approved 634 clips / 82.4 min (Lamo 617, Kawa 14, Halwest 3).
+New, never exported: 468 clips / 60.4 min (Lamo 451, 428 TTS-grade; Kawa 14; Halwest 3) in
+`Desktop\cortex-speech-exports\approved-v1-20260915\batch-new-clips\`; 166 skipped as already delivered by the 2026-09-08 TTS
+test (one of its 167 is no longer approved). Recorded in `BATCH_MANIFEST.json` + `export_ledger.jsonl` (append-only; two
+earlier same-batch records are marked superseded — first read only the ledger, second counted its predecessor — the last is
+authoritative). Future batches skip every id in the ledger.
+
+**"Rubar and Iftikhar trusted for the last two weeks" — not applied.** Trust is permanent per name; cannot be time-bounded.
+Their single-verdict clips in the window: Rubar 64 (7.9 min), Iftikhar 61 (8.6 min) = 125; recommended against permanent trust
+(owner's second pass agreed with Iftikhar on 2/29). The 125 are first on Sewa's listen list instead (one trusted listen each).
+
+**Lamo retires.** `review_trust.json` trusted = ["Sewa"]; Lamo's listen-list entry emptied; app restarted 13:47:32 (13 s window
+under the handover lock, watchdog disabled/enabled) because the policy is read once per process; `pool_admin probe` confirms
+`trusted: [sewa]`; HTTPS 200, no markers. Backups: `reviewer_roster_backups/*before-lamo-retires-20260915-1347*`. A new
+reviewer on that link gets a new roster name and no trust by default.
+
 ## 2026-09-14 — Export readiness: 1 h 21 min ready; the 200-clip hold gets a batch clearance; 60 disputes routed to the owner
 
 **Owner asks (verbatim):** "how many hours now ready for export ?" then "lets solve the  200 clips, remove 61 bad audio clips, if
