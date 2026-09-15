@@ -1,20 +1,21 @@
 {
   "schema": 1,
-  "contractId": "cortex-private-production-schema-65-to-72-v1",
-  "targetSchema": 72,
+  "contractId": "cortex-private-production-schema-65-to-73-v1",
+  "targetSchema": 73,
   "supportedMigrationSources": [
     65,
     69,
     70,
-    71
+    71,
+    72
   ],
   "sameSchemaRecovery": true,
   "normalization": "utf8-lf",
   "algorithm": "sha256",
   "migrationSource": "src-tauri/src/migrations/mod.rs",
-  "migrationSourceSha256": "bc805a0dd05f4dccaf1fc772b2d21d70f36ad1df8ca155de8316f2b5bbba68d4",
+  "migrationSourceSha256": "8060c6e2005632e11f66609cead715bcc6a6c1d22b31a26318bb99c81bd5133c",
   "historicalPrefixThroughSchema": 65,
   "historicalPrefixSha256": "92745eae14ae11016995a2010ff035453faf8d42d8d9edda52997feed73b3fd2",
   "appendOnlyContract": "scripts/append_only_migration_contract.v1.json",
-  "appendOnlyContractSha256": "024d8470bb1f1971dc16b7f2c45461cbd0f8def280bfdee2d310440223bdcb74"
+  "appendOnlyContractSha256": "b021d0f8cdb6434f6f306a7de68dd548ff04a6e0d69f21d415cf05d1c381c3f0"
 }

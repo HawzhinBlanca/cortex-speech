@@ -83,8 +83,8 @@ def rehearse(source: Path, executable: Path, output: Path, reviewers: list[str])
     clone = output / "cortex-speech.db"
     version = copy_snapshot(source, clone)
     migration = run_admin(executable, output, "migration", "migrate", "--db", str(clone))
-    if migration["afterSchemaVersion"] != 72:
-        raise RuntimeError("candidate did not migrate its owned clone to schema 72")
+    if migration["afterSchemaVersion"] != 73:
+        raise RuntimeError("candidate did not migrate its owned clone to schema 73")
     preview = inventory.prepare(clone, reviewers)
     write_json(output / "inventory.json", preview)
     ids = sorted({row["segment_id"] for row in preview["rows"]

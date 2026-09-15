@@ -1,5 +1,49 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-15 — Schema 73: export batches recorded inside the database; export-pipeline audit fixes
+
+**Owner (verbatim):** "yes add the batch record inside the database too, and harden the pipeline hunt bugs and gaps for this
+final ship readiness".
+
+**Audit first** (read-only subagent over origin/main e96b50a9, re-deriving every pool resolution on a DB clone; it reproduced
+the 2026-09-15 batch exactly — 634 ids, all texts byte-equal). Confirmed defects, all closed here:
+- P1-1 An artifact never named the trust policy that decided it. Six minutes after the approved-v1 export I removed Lamo
+  from the trusted list, so under the policy now live 64 of the 634 delivered clips are no longer resolved (42 needs-third,
+  22 pending) — every one carried by Lamo's single verdict — and nothing recorded which rule they were exported under.
+- P1-2 My batch script skipped "already exported" clips by id. The 2026-09-08 TTS test used its own text rule; 64 of the 166
+  skipped clips were delivered then with a DIFFERENT text than the canon yields, so the corrected text shipped nowhere.
+- P2-3 `pool_admin` loads the trust policy from the DB's directory and silently trusts nobody when the file is absent (a
+  clone dir without it yields 63 retained clips instead of 634, exit 0).
+- P2-4 A single trusted verdict looked identical to two-name consensus in the artifact. P2-5 three JSON-ledger records for
+  one batch. P3-6/7/8 pre-existing output dir message, silent staging-dir cleanup failure, held clips absent from
+  exclusions.jsonl.
+
+**Schema 73** (`review_pool_export_batches`, `review_pool_export_batch_members`; append-only triggers; rollback refused while a
+batch exists): a batch binds pool, voice, manifest + certificate digests, counts, the trust policy (JSON + SHA-256), app git
+sha; each member binds pool audio identity, resolution evidence digest, exact exported-text digest and a disposition
+`exported` | `skipped-previously-exported` | `re-exported-changed-authority`. `export --approved-subset --batch <id>` skips a
+clip only when an earlier batch delivered the SAME authority (evidence, or text for a legacy record); otherwise it ships it
+again marked `reExportedChangedAuthority` (closes P1-2). It refuses to run without `review_trust.json` beside the DB (P2-3),
+writes `trustPolicy` and per-clip `resolutionAuthority` (`owner` | `trusted` | `consensus` | `single`) into manifest,
+certificate and metadata (P1-1, P2-4), lists held clips in exclusions.jsonl (P3-8), warns on staging cleanup failure (P3-7).
+A retry of the same batch id is idempotent; a different artifact under a known id is refused (P2-5). `pool_admin
+export-batches` reports every batch and `deliveredButWithdrawn` (delivered earlier, now unresolved/rejected/held/re-decided).
+`record-export-batch --confirm-legacy-record` backfills the two pre-73 artifacts. Release controller: batch history is a
+restore floor like quarantine history and blocks binary-only rollback to a schema that cannot hold it. Row-count evidence
+in all three copies (snapshot.rs, create_recovery_snapshot.py, restore_drill.py); restore floors +2 tables; watchdog pin 73;
+contract `cortex-private-production-schema-65-to-73-v1` (sources 65/69/70/71/72). Docs: `docs/EXPORT_BATCHES.md`.
+
+**Evidence:** Rust `a_batch_export_records_its_clips_and_a_later_batch_skips_them` (batch 1 → same-id retry idempotent → a
+second batch with nothing new refuses → legacy record with different text → batch 2 re-delivers it marked and skips batch 1's
+clip → a third batch refuses → recorded batches refuse rollback), `export_batches::tests` (fail-closed below 73, skip rule,
+record validation), migrations/restore/snapshot/quarantine suites; Python: append-only contract 66-73, release controller
+46/46 incl. the new batch restore-floor test, snapshot 28/28, drill 23/23, verify10 runtime, rust_quality_gate architecture.
+Rollout and the live backfill are recorded below when done.
+
+**Not done here (owner decisions):** time-bounded trust (Rubar/Iftikhar "last two weeks") — the policy remains permanent per
+name; the 64 Lamo-only clips of approved-v1 stay delivered until the owner says whether Lamo's past verdicts keep authority
+(restoring him to the trusted list would make them resolved again; he no longer reviews, so it is harmless).
+
 ## 2026-09-14 — Export readiness: 1 h 21 min ready; the 200-clip hold gets a batch clearance; 60 disputes routed to the owner
 
 **Owner asks (verbatim):** "how many hours now ready for export ?" then "lets solve the  200 clips, remove 61 bad audio clips, if
