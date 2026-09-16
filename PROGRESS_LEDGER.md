@@ -1,5 +1,135 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-09-16 — Reviewer reports of downtime, slowness and dead audio: two causes found, one not established
+
+**Owner (verbatim):** "reviewers report down app, slowness, and sometimes doesnt play well, find out whats the
+issues remain", then "fix the probe first, then lets do the rest".
+
+Nothing was broken at the moment of investigation: release 38e0e557 was up, pool certification green every five
+minutes, and the day's 106 decisions each answered in 150-220 ms. Downtime and the dead alarm are explained and
+fixed below; the slowness and playback complaints are NOT explained by anything measured, and section 3 says so.
+
+**1. Downtime is Windows Update restarting the machine.** Event 1074 shows restarts on 09-16 15:11 and 15:14,
+09-13 11:39, 09-10 03:29+03:32, 09-03 04:00+04:03 and 09-02 00:05. The app logs an orderly exit because Windows
+closes it, and `CortexPrivateProductionWatchdog` relaunches 3-8 minutes later; on 09-16 the couch was listening
+again 6 min 47 s after the exit. Active hours are 09:00-03:00, so AUTOMATIC restarts only fall between 03:00 and
+09:00, and the session signs back in by itself — the watchdog, which runs only when logged on, resumed four
+minutes after the unattended 09-10 03:32 restart with nobody present. The 09-16 15:11 restart was user-initiated
+from the update prompt. Measured cost: about seven minutes per restart, recovered automatically. Watchdog
+heartbeat gaps over 11 minutes since 09-02 total 183 minutes, dominated by one 104-minute gap overnight 09-05/06.
+No change made: narrowing active hours or enabling autologon is an owner decision and a system setting.
+
+**2. The one alarm that would have said so had been red for six days.** `CortexReviewHealthProbe` was registered
+by hand against a single release directory and no deploy ever re-pointed it, so after the schema 71 → 72 → 73
+bumps it kept running that old release's reviewer gates, which assert the OLD expected schema. It failed every
+five minutes with "REVIEWER QUEUES: FAIL — release manifest must require database schema 71 — the server serves
+NOTHING to any reviewer", which was false: **1,659 alerts between 2026-09-10 20:09Z and 2026-09-16** while
+reviewers were served normally, with `CortexAlarmForwarder` exiting 1 throughout. Every real outage in that
+window was indistinguishable from the noise, which is why reviewer trouble reached the owner by word of mouth.
+Repointed live at 19:13 (old definition backed up under `cortex-speech-app/logs/task-backups/`): exit 0, all four
+gates green — 10 links authenticate, 10 queues have work, continuity OK, vault unchanged — desktop
+`REVIEW-PIPELINE-ALERT.txt` cleared, forwarder back to exit 0, and confirmed again unattended on its own
+30-minute schedule at 19:18. PR #128 makes it durable: the probe gains `-Register`, `register_release_tasks`
+calls it on every deploy and recovery, and re-registration inherits the interpreter and log directory the live
+task already carries while swapping only the `-File` path (the release tree ships no `.policy-python`, so those
+paths must not be invented; a machine with no usable interpreter is told so rather than having a probe that
+cannot start registered over one that runs). Two pins in `test_reviewer_link_ops_policy.py`.
+
+**3. Slowness and dead audio: measured, and my first reading was wrong.** All 20,253 sources sit on D:, a
+Seagate ST2000VX008 (5900-rpm SATA HDD); C: and F: are NVMe. `pcm_cache_key` opens and BLAKE3-hashes the
+entire source before the decoded-PCM cache can be consulted, and reading one 157 MB episode cold took 1075 ms
+(4.42 s for the slowest of four concurrent readers) on one of only ten accept threads. I wrote that up as the
+cause — from the sources with the MOST clips. Querying what was actually SERVED corrected it: over the last
+fourteen days the queue served 1,856 small per-clip WAVs at 24 kHz, median 0.37 MB, none over 2.6 MB, about
+60 ms a read. **The audio path is therefore not established as the cause of the current reports.** The
+expensive case is real but still ahead of the reviewers: 33 large sources carry 11,242 of the 29,472
+unverified clips, 11,186 of them canonical 16 kHz, median clip window 8.6 s of a 65-87 minute episode.
+And it is far worse than the disk figures implied. Measured against REAL episodes and REAL clip windows,
+a cold full decode of one KBHP episode takes **10.5 s and 11.6 s** — symphonia's packet loop, the f32
+conversion and the 157 MB allocations dominate, not the 1.08 s read — against **23-89 ms** for the
+windowed read. Ten and a half seconds on one of ten accept threads is a clip that never plays.
+
+PR #129 addresses that backlog and makes the next report measurable. Serving a clip reads only its own window
+(~275 KB instead of 120-160 MB) when the source is a canonical 16 kHz mono WAV with real offsets, declining
+24 kHz, stereo, MP3/FLAC/MOV masters, whole-file segments and clobbered metadata to the unchanged path.
+Byte-identity is the safety argument, because those bytes reach the phone, the cloud listener and
+`review_pool/dedup.rs`'s identity hash: the window repeats the same i16 -> f32 (/32768) -> i16 (*32767) round
+trip and calls the slicer's own `ms_to_samples`, with two tests asserting equality against the real full
+decode, one of them on the served WAV bytes; a temporary harness also compared six REAL clips (first,
+middle and last window of two KBHP episodes) against the real full decode and zero samples differed. `pcm_cache_key` also memoizes its hash against `(len, mtime)`
+once the mtime has settled two seconds (Windows clock ticks are ~15.6 ms, so a same-length rewrite inside one
+tick would otherwise serve stale PCM) — worth about 11% of serves, since 123 playbacks touched 109 distinct
+sources. `AUDIO_CACHE_BYTES` goes 32 MB -> 128 MB: 32 MB held exactly ONE reviewer's 25-clip batch while ten
+reviewers evicted each other. And `/api/audio` now logs status, elapsed_ms and bytes, the shape
+`/api/decision` has had since 2026-09-02 — audio was the one hot path where a four-second serve looked
+identical to a forty-millisecond one, which is precisely why this investigation could measure the disk and
+the caches but never the route. The connection read timeouts during the work window (124 and 90 on 09-16,
+roughly two per decision, against a ~12/hour baseline that is the watchdog's own TLS-aborting probe) remain
+unattributed; the new line is what will attribute them next time.
+
+`/api/queue` gained the same line. I suspected it next — `check_reviewer_queues_live.py` takes 17.9 s for ten
+reviewers, and the page refetches a batch every 25 clips, on every reload and on its one-a-minute retry — and
+`pool_admin benchmark` against the live database refuted that too: derivation is **251-470 ms** per reviewer
+over five iterations each (Rubar 256 ms p95, Hawzhin 277, Sewa 468) against a 750 ms target. Those 17.9 s are
+ten process startups, not the query. The line ships anyway, so "the queue is fine" stays proven rather than
+remembered.
+
+**Net: nothing measurable on this machine explains the slowness complaint.** Decisions 150-220 ms, queue
+derivation 251-470 ms, a clip of the material actually being served ~60 ms, and the 10.5 s cliff sits only on
+episodes nobody has been served in a fortnight. What is left is the network. Reviewers reach the app through
+**Tailscale Funnel**, so every byte travels to a Tailscale ingress and back; `tailscale netcheck` puts the
+nearest relay in **Frankfurt at 71.2 ms** from this machine. Measured from here that detour costs about 27 ms
+(funnel median 30.7 ms against loopback 3.3 ms for the same 162 KB page, max 338.8 ms), but a reviewer's phone
+on mobile data adds its own leg to Frankfurt, which cannot be measured from this machine. The DOWNTIME is real
+and separately explained (section 1), and a reviewer whose session dies mid-batch during a restart would
+reasonably call that the app being slow or the audio not playing. After the deploy the new timings settle it:
+server-side tens of milliseconds alongside a reviewer still waiting means the wait is the network.
+
+**Same bug class elsewhere, reported not fixed.** Auditing every Cortex scheduled task: all three
+release-bound ones now point at the active release. The two that are not release-bound run from the repo
+checkout at `Desktop\cortex-speech`, which is parked on `codex/kurdish-expert-review`, 25 commits behind
+main. `CortexAlarmForwarder`'s script there differs from main by 652 lines — main adds
+`Newest-SnapshotAgeMinutes`, `Add-Finding` and finding de-duplication, so snapshot age and recovery failures
+are watched by main's version but not by the one actually running. `CortexChampionSupervisor` is
+byte-identical today but bound the same way. The same staleness bit the diagnosis: running
+`check_reviewer_queues_live.py` from that checkout asserts schema 69 and prints the identical false "serves
+NOTHING to any reviewer" line. Either register the forwarder from the release (the pattern #128 establishes)
+or bring that checkout current — it carries staged owner work, so it was left untouched.
+
+Ruled out and left alone: zero missing source files; lease handling (4-minute heartbeat, whole-batch renew,
+`visibilitychange` re-renew, 409 surfaced immediately); draft persistence and the offline outbox; snapshot
+retention (the 20 directories on disk are the designed 10 rolling + 7 daily + 4 weekly tiers); completed
+playbacks average 0.99 coverage. Not done on purpose: moving 2 TB of audio to NVMe (owner's call), raising the
+10-entry PCM cache (nothing measured says it thrashes), and changing the watchdog's own probe so it stops logging
+a connection WARN per cycle — harmless, self-inflicted noise in a script with a kill-loop history.
+
+**Rollout 2026-09-16 22:06 (private production).** PR #129 merged as 4fbe0456, PR #128 as bd160b93 (rebased
+after two runner stalls; see below). Built at bd160b93 in the cortex-perf worktree, both exes carrying
+`CORTEX_BUILD_SHA:bd160b93...`, frontend dist reused (no frontend change since 9a381971). Stage:
+`PREFLIGHT_CLONE=PASS schema=73 audioClips=11244/11244 rightsExact=true`, watchdog dry-run correctly refused
+the not-yet-active release, clone rehearsal showed every probed reviewer a full queue, and the staged
+snapshot writer verified against the staged certifier (`"verified": true`, the check added after the
+2026-09-11 incident). Deploy `READY` 22:06, release bd160b93e07a-9218c813085f-400f8c60b44d-..., pointer git
+sha bd160b93, **exe SHA-256 matches the manifest**, schema 73, HTTPS 200, no markers, watchdog running,
+couch up for 10 reviewers.
+
+**The probe fix proved itself in the same deploy:** `register_release_tasks` re-registered
+`CortexReviewHealthProbe` at the NEW release automatically, and the probe then ran green from there
+(exit 0, `ok=true`, no desktop alert). That is the whole point of #128, demonstrated in production rather
+than argued.
+
+The `/api/audio` and `/api/queue` timing lines are live but silent so far: an unauthenticated request is
+refused at 401 before route dispatch, so only real reviewer traffic produces them. The first reviewer
+session after this deploy is what turns "the server is fast, the wait is elsewhere" from an inference into a
+measurement.
+
+**CI detour.** The Windows Release Gate failed #128 twice on `tauri_integration_import_export_validate`,
+killed at its 120 s budget with empty output — the stall the test's own panic text calls "not a pipeline
+verdict", on a branch containing only a PowerShell script, a Python function and a policy test. #129 passed
+the same test on the same runner image between the two failures. #128 passed on a rebase. PR #130 gives that
+stall the retry the file already performs for a sibling flake, keeping the fail-fast behaviour for a genuine
+non-zero exit.
+
 ## 2026-09-15 — Schema 73: export batches recorded inside the database; export-pipeline audit fixes
 
 **Owner (verbatim):** "yes add the batch record inside the database too, and harden the pipeline hunt bugs and gaps for this
