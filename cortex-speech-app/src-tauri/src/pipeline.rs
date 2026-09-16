@@ -1786,6 +1786,10 @@ impl ProcessingPipeline {
     /// Clear the audio PCM cache.
     pub fn clear_audio_cache(&self) {
         audio::clear_pcm_cache();
+        // Also the file-identity memo, so "clear the cache" means the next decode really does re-read
+        // and re-hash the file rather than trusting a `(len, mtime)` stamp taken before whatever
+        // prompted the clear.
+        audio::clear_pcm_key_memo();
     }
 
     /// Re-run acoustic diarization on existing segments (grouped by source audio file).

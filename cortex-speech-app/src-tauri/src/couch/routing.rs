@@ -613,7 +613,13 @@ pub(super) fn handle_request(
         // Content-Length, so the same reply is the correct answer to both.
         (audio_method @ (tiny_http::Method::Get | tiny_http::Method::Head), p) if p.starts_with("/api/audio/") => {
             let is_head = audio_method == tiny_http::Method::Head;
-            with_live_reviewer(&token, reviewer, state, || {
+            // Per-clip observability, no identity: status, wall time and body size only. The
+            // 2026-09-16 investigation of "the app is slow / the clip doesn't play" could measure
+            // the HDD and the cache but NOT the route itself — audio was the one hot path with no
+            // log line at all, so a serve that took four seconds looked exactly like one that took
+            // forty milliseconds. Same reasoning, and same shape, as the decision line below.
+            let started = std::time::Instant::now();
+            let reply = with_live_reviewer(&token, reviewer, state, || {
                 let playback_attempt = match playback_attempt_query(&url) {
                     Ok(value) => value,
                     Err(reply) => return reply,
@@ -629,7 +635,17 @@ pub(super) fn handle_request(
                     range.as_deref(),
                     if_none_match.as_deref(),
                 )
-            })
+            });
+            tracing::info!(
+                target: "cortex_speech_app_lib::couch::audio",
+                status = reply.0,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                bytes = reply.2.len(),
+                head = is_head,
+                ranged = range.is_some(),
+                "audio request answered"
+            );
+            reply
         }
         (tiny_http::Method::Post, "/api/playback/start") => match read_body(request) {
             Ok(body) => with_live_reviewer(&token, reviewer, state, || {

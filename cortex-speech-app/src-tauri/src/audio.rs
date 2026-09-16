@@ -77,7 +77,68 @@ pub fn decode_passes_on_this_thread() -> usize {
 static PCM_CACHE: LazyLock<Mutex<LruCache<String, (u32, Vec<i16>)>>> =
     LazyLock::new(|| Mutex::new(LruCache::new(pcm_cache_capacity())));
 
+/// Content keys already computed, addressed by the cheap file identity `(len, mtime)`.
+///
+/// MEASURED COST THIS AVOIDS (2026-09-16, the owner's box): `pcm_cache_key` reads and BLAKE3-hashes
+/// the WHOLE source before the decoded-PCM cache can be consulted, and the library lives on D:, a
+/// 5900-rpm SATA disk. One 157 MB episode read cold took 1075 ms; with four readers on different
+/// episodes the slowest took 4.42 s. Every `/api/audio` miss paid that, and a reviewer opens a clip
+/// they have not played before constantly — so a phone waited seconds for the first byte of a
+/// ten-second clip, which is what reviewers reported as "slow" and "sometimes doesn't play".
+///
+/// Identity is STILL the file's content hash: this only skips recomputing it while length and mtime
+/// are both unchanged, the same staleness trade rsync and ccache make. A file edited in place moves
+/// its mtime, so `decode_to_pcm_cache_is_bound_to_audio_content_not_path` keeps holding. Entries are
+/// cheap (a path and 64 hex chars), so this holds far more sources than the PCM cache itself and a
+/// reviewer moving between episodes never re-reads one.
+#[allow(clippy::type_complexity)]
+static PCM_KEY_MEMO: LazyLock<Mutex<LruCache<std::path::PathBuf, (u64, std::time::SystemTime, String)>>> =
+    LazyLock::new(|| Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap_or(NonZeroUsize::MIN))));
+
+fn lock_pcm_key_memo() -> MutexGuard<'static, LruCache<std::path::PathBuf, (u64, std::time::SystemTime, String)>> {
+    PCM_KEY_MEMO.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("Recovering poisoned PCM key memo");
+        poisoned.into_inner()
+    })
+}
+
+/// Clear the memo of file-identity to content-hash. Paired with [`clear_pcm_cache`] in tests.
+pub fn clear_pcm_key_memo() {
+    lock_pcm_key_memo().clear();
+}
+
+/// How long a file must have been untouched before its `(len, mtime)` may stand in for its content.
+///
+/// Windows advances the system clock in ~15.6 ms ticks, so two writes close together can land on the
+/// SAME mtime — and a same-length rewrite inside one tick would otherwise be served stale decoded
+/// PCM. Anything still settling is hashed for real. Production sources are months old and always take
+/// the shortcut; a file being written right now never does, which is also what keeps
+/// `decode_to_pcm_cache_is_bound_to_audio_content_not_path` honest rather than merely passing.
+const STAMP_SETTLE: Duration = Duration::from_secs(2);
+
+/// Pure so the rule is testable without waiting on a real clock.
+fn stamp_is_settled(modified: std::time::SystemTime, now: std::time::SystemTime) -> bool {
+    now.duration_since(modified).is_ok_and(|age| age >= STAMP_SETTLE)
+}
+
 fn pcm_cache_key(path: &Path) -> AppResult<String> {
+    // A file whose metadata cannot be read is hashed unconditionally: never let an unreadable stamp
+    // turn into a WRONG key. `None` simply means "no shortcut available this time".
+    let stamp = std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok().map(|at| (meta.len(), at)))
+        .filter(|(_, modified)| stamp_is_settled(*modified, std::time::SystemTime::now()));
+    if let Some((len, modified)) = stamp {
+        let mut memo = lock_pcm_key_memo();
+        if let Some((known_len, known_modified, key)) = memo.get(path) {
+            if *known_len == len && *known_modified == modified {
+                return Ok(key.clone());
+            }
+        }
+    }
+    // The hash runs OUTSIDE the memo lock: it is the seconds-long part, and holding the lock through
+    // it would serialise every reviewer's audio behind one file — the same reason `cached_audio`
+    // decodes outside its own lock.
     let mut file = std::fs::File::open(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0_u8; 128 * 1024];
@@ -88,7 +149,11 @@ fn pcm_cache_key(path: &Path) -> AppResult<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hasher.finalize().to_hex().to_string())
+    let key = hasher.finalize().to_hex().to_string();
+    if let Some((len, modified)) = stamp {
+        lock_pcm_key_memo().put(path.to_path_buf(), (len, modified, key.clone()));
+    }
+    Ok(key)
 }
 
 fn pcm_cache_capacity() -> NonZeroUsize {
@@ -2179,6 +2244,53 @@ mod tests {
 
         assert_ne!(first_pcm, second_pcm, "same-path changed audio must not reuse stale decoded PCM");
         clear_pcm_cache();
+    }
+
+    #[test]
+    fn stamp_is_settled_only_after_the_window() {
+        let now = std::time::SystemTime::now();
+        let fresh = now - Duration::from_millis(15); // one Windows clock tick
+        let settled = now - Duration::from_secs(3);
+        assert!(!stamp_is_settled(fresh, now), "a file written a tick ago must still be hashed");
+        assert!(stamp_is_settled(settled, now), "a settled file may use its (len, mtime) stamp");
+        // A stamp in the FUTURE (clock moved back, copied file) yields Err from duration_since and
+        // must read as "not settled" rather than panicking or silently trusting it.
+        assert!(!stamp_is_settled(now + Duration::from_secs(60), now), "a future mtime must not be trusted");
+    }
+
+    #[test]
+    fn pcm_cache_key_uses_a_settled_stamp_and_notices_a_new_one() {
+        use tempfile::TempDir;
+
+        // Backdate the mtime with std's own FileTimes so the settle window is satisfied without the
+        // test sleeping for it.
+        fn backdate(path: &Path, seconds: u64) -> std::time::SystemTime {
+            let when = std::time::SystemTime::now() - Duration::from_secs(seconds);
+            let handle = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            handle.set_times(std::fs::FileTimes::new().set_modified(when)).unwrap();
+            when
+        }
+
+        clear_pcm_key_memo();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("settled.wav");
+
+        write_constant_wav(&path, 1000);
+        let stamp = backdate(&path, 60);
+        let first = pcm_cache_key(&path).unwrap();
+
+        // Same length, DIFFERENT bytes, and the stamp put back exactly as it was: the memo must be
+        // what answers, which is the whole point — the 157 MB re-read never happens.
+        write_constant_wav(&path, 2000);
+        let handle = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        handle.set_times(std::fs::FileTimes::new().set_modified(stamp)).unwrap();
+        drop(handle);
+        assert_eq!(pcm_cache_key(&path).unwrap(), first, "an unchanged (len, mtime) stamp must reuse the key");
+
+        // Move the stamp and the real content hash must come back.
+        backdate(&path, 30);
+        assert_ne!(pcm_cache_key(&path).unwrap(), first, "a changed stamp must re-hash the file");
+        clear_pcm_key_memo();
     }
 
     #[test]

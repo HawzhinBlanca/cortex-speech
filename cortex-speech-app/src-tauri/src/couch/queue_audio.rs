@@ -981,8 +981,15 @@ pub(super) fn audio_fingerprint(seg: &crate::db::SpeechSegment) -> u64 {
 /// replaying a clip, or a second reviewer meeting the same spot check, still arrives here.
 pub(super) static AUDIO_CACHE: Mutex<Vec<(u64, Arc<Vec<u8>>)>> = Mutex::new(Vec::new());
 
-/// ~32 MB, i.e. roughly 80 clips at the measured 300-500 KB each: a whole batch plus its spot checks.
-pub(super) const AUDIO_CACHE_BYTES: usize = 32 * 1024 * 1024;
+/// ~128 MB, i.e. roughly 320 clips at the measured 300-500 KB each.
+///
+/// Was 32 MB — one reviewer's batch plus spot checks — which is exactly one reviewer's worth. Ten
+/// reviewers each hold a QUEUE_BATCH of 25, so ~250 clips are live at once and every reviewer past
+/// the first was evicting the others. A miss is not cheap: it re-reads the whole 120-160 MB source
+/// off the library disk (measured 2026-09-16: 1075 ms cold for a 157 MB episode, 4.42 s with four
+/// readers at once) on one of only ten accept threads. 128 MB holds every live batch with room to
+/// spare and costs nothing on a box that idles with 192 GB free.
+pub(super) const AUDIO_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
 /// Cached clip bytes, materialising on a miss. The decode happens OUTSIDE the cache lock: it takes
 /// seconds on a long source, and holding the lock through it would serialise every reviewer's audio
