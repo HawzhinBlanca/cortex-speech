@@ -45,11 +45,32 @@ fn tauri_integration_import_export_validate() {
         if !output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let verdict = if elapsed >= EXE_BUDGET - Duration::from_secs(2) {
+            // A kill at the budget is the stall this file has named since PR #77, and the retry loop
+            // already exists — it just did not cover this arm. Measured 2026-09-16: the gate stalled
+            // here TWICE in a row on PR #128, a branch whose only changes were a PowerShell script, a
+            // Python function and a policy test, none of which CI runs against this binary — while a
+            // far larger PR passed the same test on the same runner image between the two failures.
+            // Ninety minutes of gate time per rerun, for a verdict the code itself calls "not a
+            // pipeline verdict".
+            //
+            // This retries ONLY the stall. A genuine pipeline break exits non-zero within seconds, so
+            // `stalled` is false and it still fails immediately on the first attempt — the property
+            // that makes retrying safe enough to do at all.
+            let stalled = elapsed >= EXE_BUDGET - Duration::from_secs(2);
+            if stalled && attempt < 3 {
+                eprintln!(
+                    "integration attempt {attempt}/3: the exe was KILLED at the {}s budget after {:.1}s \
+                     (runner stall, not a pipeline verdict) — retrying",
+                    EXE_BUDGET.as_secs(),
+                    elapsed.as_secs_f64()
+                );
+                continue;
+            }
+            let verdict = if stalled {
                 format!(
-                    "the exe was KILLED at the {}s budget after {:.1}s: a startup or runtime stall on this \
-                     machine, not a pipeline verdict (a real pipeline failure prints CORTEX_INTEGRATION_FAIL \
-                     and exits within seconds)",
+                    "the exe was KILLED at the {}s budget after {:.1}s on every one of 3 attempts: a startup \
+                     or runtime stall on this machine, not a pipeline verdict (a real pipeline failure prints \
+                     CORTEX_INTEGRATION_FAIL and exits within seconds)",
                     EXE_BUDGET.as_secs(),
                     elapsed.as_secs_f64()
                 )
