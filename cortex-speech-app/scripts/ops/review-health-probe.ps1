@@ -16,6 +16,7 @@
 # Recovery clears the desktop flag on the next green run and says so in the log.
 
 param(
+    [switch]$Register,
     [string]$PythonPath = '',
     [string]$LogDirectory = '',
     [string]$AlertPath = '',
@@ -38,6 +39,56 @@ if ($AlertPath) { $alertFile = $AlertPath }
 $logFile = Join-Path $logDir 'review-health.log'
 $heartbeat = Join-Path $logDir 'review-health.json'
 $timeoutSec = $GateTimeoutSeconds
+$taskName = 'CortexReviewHealthProbe'
+
+if ($Register) {
+    # WHY THIS EXISTS: this task was registered BY HAND once, against one release directory, and no
+    # deploy ever re-pointed it. After the schema 71 -> 72 -> 73 bumps it kept running that old
+    # release's gates, which assert the OLD schema, so it raised a false CRITICAL every five minutes
+    # for six days (1,659 alerts, 2026-09-10 20:09Z to 2026-09-16) while reviewers were being served
+    # normally — and the one alarm that would have shown a REAL outage was already red. The probe
+    # must follow the ACTIVE release exactly like the watchdog does, so `register_release_tasks`
+    # now calls this on every deploy and recovery.
+    #
+    # The interpreter and the log directory live OUTSIDE the release tree (a release carries no
+    # .policy-python venv), so a re-registration must not invent them: keep whatever the live task
+    # already proved good and swap only the -File path. Explicit parameters still win, and a
+    # first-ever registration falls back to this tree's own venv.
+    $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($existing) {
+        $live = [string]$existing.Actions[0].Arguments
+        if (-not $PythonPath) {
+            $inherited = [regex]::Match($live, '(?<=-PythonPath ")[^"]+').Value
+            if ($inherited) { $python = $inherited }
+        }
+        if (-not $LogDirectory) {
+            $inherited = [regex]::Match($live, '(?<=-LogDirectory ")[^"]+').Value
+            if ($inherited) { $logDir = $inherited }
+        }
+    }
+    if (-not (Test-Path -LiteralPath $python)) {
+        # Registering a probe that cannot start is WORSE than leaving the old one alone: the old one
+        # at least still runs. Change nothing, say why, and do not fail the deploy that called us.
+        Write-Output "$taskName NOT re-registered: no interpreter at $python (pass -PythonPath)."
+        exit 0
+    }
+    $template = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -PythonPath "{1}" -LogDirectory "{2}"'
+    $argument = $template -f $PSCommandPath, $python, $logDir
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument
+    # Starts within a minute of the deploy rather than at the next half-hour: a release that broke
+    # the serving chain should be caught by the first probe after it, not up to 30 minutes later.
+    $trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) `
+        -RepetitionInterval (New-TimeSpan -Minutes 30)
+    # Battery flags are ON by default and would disable the probe whenever Windows believes it is on
+    # battery — which includes this desktop behind a UPS. Same reasoning as the watchdog.
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+        -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 30) `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+        -Settings $settings -Force | Out-Null
+    Write-Output "$taskName registered: every 30 minutes, running $PSCommandPath"
+    exit 0
+}
 
 function Write-HealthLog([string]$line) {
     $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
