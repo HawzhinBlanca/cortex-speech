@@ -23,6 +23,7 @@ SCRIPTS = pathlib.Path(__file__).resolve().parent
 CONTINUITY = SCRIPTS / "check_reviewer_link_continuity.py"
 VAULT = SCRIPTS / "reviewer_link_vault.py"
 PROBE = SCRIPTS / "ops" / "review-health-probe.ps1"
+RELEASE = SCRIPTS / "release_private_production.py"
 
 CHECKS: list[tuple[pathlib.Path, str, str]] = [
     # continuity: identity is compared by full digest and released immediately — never the token.
@@ -39,6 +40,17 @@ CHECKS: list[tuple[pathlib.Path, str, str]] = [
     (PROBE, "check_reviewer_queues_live.py", "probe must prove every reviewer has servable work"),
     (PROBE, "check_reviewer_link_continuity.py", "probe must catch a reminted token within one cycle"),
     (PROBE, "reviewer_link_vault.py", "probe must snapshot the credentials it watches"),
+    # The probe must FOLLOW the active release. Registered by hand against one release and never
+    # moved, it ran that release's gates after the schema bumps, asserted the old schema, and raised
+    # a false CRITICAL every five minutes for six days (1,659 alerts) while reviewers were served
+    # normally — so the only alarm that could show a real outage was already red.
+    (PROBE, "if ($Register)", "probe must be able to re-register itself against the release it ships in"),
+    (
+        RELEASE,
+        "review-health-probe.ps1",
+        "every deploy and recovery must re-register the health probe, or it keeps running a stale "
+        "release's gates and alarms on the schema it expected",
+    ),
 ]
 
 # Absence pins: a matching line is the regression.

@@ -1480,6 +1480,13 @@ def register_release_tasks(manifest: dict[str, Any]) -> None:
         WATCHDOG_TASK,
     )
     powershell_file(root / "scripts" / "ops" / "cortex-daily-restore-drill.ps1", "-Register")
+    # The reviewer health probe runs the ACTIVE release's own reviewer gates, so it has to follow the
+    # release exactly like the watchdog. It used to be registered by hand against one release and
+    # never moved: after the schema bumps it ran the old release's gates, which assert the old
+    # schema, and raised a false CRITICAL every five minutes for six days while reviewers were being
+    # served normally (2026-09-16 diagnosis). It re-registers itself preserving the interpreter and
+    # log directory the live task already carries, and declines loudly rather than failing a deploy.
+    powershell_file(root / "scripts" / "ops" / "review-health-probe.ps1", "-Register")
 
 
 def validate_release_journal(
