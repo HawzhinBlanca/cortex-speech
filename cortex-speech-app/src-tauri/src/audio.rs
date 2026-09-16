@@ -275,6 +275,55 @@ pub fn check_audio_file<P: AsRef<Path>>(path: P) -> AppResult<AudioInfo> {
 
 /// Decode any audio file to 16kHz mono 16-bit PCM using symphonia.
 /// Results are cached in a small LRU to avoid re-decoding the same file.
+/// The exact round trip `decode_to_pcm` performs on a 16-bit PCM sample: symphonia hands the decoder
+/// f32 in [-1, 1) as `sample / 32768`, and `interleaved_f32_to_pcm_i16` multiplies by 32767. Written
+/// out here so a windowed read can reproduce the full decode's samples EXACTLY rather than
+/// approximately — `a_windowed_read_is_identical_to_the_full_decode` is what proves it still does,
+/// and would fail loudly if a symphonia bump ever changed the conversion.
+fn i16_through_f32(sample: i16) -> i16 {
+    ((sample as f32 / 32768.0).clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+}
+
+/// Read ONLY `[start_sample, end_sample)` out of a canonical 16 kHz mono 16-bit PCM WAV.
+///
+/// WHY: the review library is 20,253 sources of 120-160 MB each (85 minutes per episode) on D:, a
+/// 5900-rpm HDD, and a clip is ten seconds of one of them. `decode_to_pcm` reads and decodes the WHOLE
+/// episode and `slice_pcm_by_alignment` then throws away 99.8% of it. Measured 2026-09-16: 1075 ms to
+/// read one 157 MB episode cold, 4.42 s for the slowest of four concurrent readers — on one of only
+/// ten accept threads. Caching cannot rescue this: over the last two days' 123 real playbacks the
+/// reviewers' queue served 109 DISTINCT sources, so nearly every clip is a first touch.
+///
+/// Returns `None` for anything that is not exactly this format, so the caller falls back to the full
+/// decode and every other source (MP3 masters, stereo, other rates) behaves precisely as before.
+pub fn read_canonical_wav_window(path: &Path, start_sample: usize, end_sample: usize) -> Option<Vec<i16>> {
+    let reader = hound::WavReader::open(path).ok()?;
+    let spec = reader.spec();
+    if spec.channels != 1
+        || spec.sample_rate != TARGET_SAMPLE_RATE
+        || spec.bits_per_sample != 16
+        || spec.sample_format != hound::SampleFormat::Int
+    {
+        return None;
+    }
+    // Clamp exactly as `slice_pcm_by_alignment` clamps against the decoded length: for this format the
+    // decode preserves the sample count one-for-one (asserted by
+    // `decode_to_pcm_preserves_i16_sample_values_within_1_lsb`), so the two bounds are the same bound.
+    let end_sample = end_sample.min(reader.len() as usize);
+    if end_sample <= start_sample {
+        return None;
+    }
+    let wanted = end_sample - start_sample;
+    let mut reader = reader;
+    reader.seek(u32::try_from(start_sample).ok()?).ok()?;
+    let mut window = Vec::with_capacity(wanted);
+    for sample in reader.samples::<i16>().take(wanted) {
+        window.push(i16_through_f32(sample.ok()?));
+    }
+    // A short read means the file ended early or is malformed. Fall back rather than serve a clip that
+    // is quietly shorter than the one the reviewer is being asked to judge.
+    (window.len() == wanted).then_some(window)
+}
+
 pub fn decode_to_pcm<P: AsRef<Path>>(path: P) -> AppResult<(u32, Vec<i16>)> {
     // A caller with no way to stop waiting also has no way to abort: a flag that is never set.
     decode_to_pcm_abortable(path, &AtomicBool::new(false))
@@ -2244,6 +2293,84 @@ mod tests {
 
         assert_ne!(first_pcm, second_pcm, "same-path changed audio must not reuse stale decoded PCM");
         clear_pcm_cache();
+    }
+
+    #[test]
+    fn a_windowed_read_is_identical_to_the_full_decode() {
+        use hound::{WavSpec, WavWriter};
+        use tempfile::TempDir;
+
+        // THE load-bearing proof for the windowed read: the clip a reviewer hears, and its bytes, must
+        // not change because the server stopped reading 157 MB to serve ten seconds. Equality is
+        // asserted against the real full-decode path, so a symphonia bump that altered the i16 -> f32
+        // conversion reds this test instead of silently shifting every served clip by an LSB.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("canonical.wav");
+        let spec =
+            WavSpec { channels: 1, sample_rate: 16000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        // Spans both signs, the extremes, and a sweep — the values where a scaling error would show.
+        let input: Vec<i16> = (0..4096)
+            .map(|i| ((i as f64 * std::f64::consts::TAU / 97.0).sin() * 32767.0) as i16)
+            .chain([0i16, 1, -1, 32767, -32768, 16384, -16384, 255, -255])
+            .collect();
+        {
+            let mut writer = WavWriter::create(&path, spec).unwrap();
+            for &s in &input {
+                writer.write_sample(s).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+
+        let (rate, whole) = decode_to_pcm(&path).unwrap();
+        assert_eq!(rate, TARGET_SAMPLE_RATE);
+        for (start, end) in [(0usize, input.len()), (0, 1), (1000, 1064), (input.len() - 9, input.len())] {
+            let window = read_canonical_wav_window(&path, start, end).expect("canonical wav must take the fast path");
+            assert_eq!(window, whole[start..end], "windowed read must equal the full decode over [{start}, {end})");
+        }
+
+        // Past the end clamps like the slicer does; an empty or inverted range declines.
+        assert_eq!(
+            read_canonical_wav_window(&path, input.len() - 4, input.len() + 500),
+            Some(whole[input.len() - 4..].to_vec()),
+            "an over-long end must clamp to the file, not fail"
+        );
+        assert!(read_canonical_wav_window(&path, 10, 10).is_none(), "an empty range must decline");
+        assert!(read_canonical_wav_window(&path, 20, 5).is_none(), "an inverted range must decline");
+    }
+
+    #[test]
+    fn a_non_canonical_source_declines_the_windowed_read() {
+        use hound::{WavSpec, WavWriter};
+        use tempfile::TempDir;
+
+        // Anything that is not 16 kHz mono 16-bit PCM must fall back to the full decode, because the
+        // fast path reproduces NO downmix and NO resample. Stereo is the case that would corrupt a clip
+        // silently (interleaved samples read as mono), so it is the one pinned here.
+        let dir = TempDir::new().unwrap();
+        let stereo = dir.path().join("stereo.wav");
+        let spec =
+            WavSpec { channels: 2, sample_rate: 16000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        {
+            let mut writer = WavWriter::create(&stereo, spec).unwrap();
+            for i in 0..512 {
+                writer.write_sample(i as i16).unwrap();
+                writer.write_sample(-(i as i16)).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        assert!(read_canonical_wav_window(&stereo, 0, 100).is_none(), "stereo must fall back to the full decode");
+
+        let wrong_rate = dir.path().join("rate.wav");
+        let spec =
+            WavSpec { channels: 1, sample_rate: 48000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        {
+            let mut writer = WavWriter::create(&wrong_rate, spec).unwrap();
+            for i in 0..512 {
+                writer.write_sample(i as i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        assert!(read_canonical_wav_window(&wrong_rate, 0, 100).is_none(), "a non-target rate must fall back");
     }
 
     #[test]
