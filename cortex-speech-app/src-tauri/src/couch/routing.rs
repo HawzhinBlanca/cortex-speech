@@ -605,7 +605,23 @@ pub(super) fn handle_request(
 
     let reply = match (method, path.as_str()) {
         (tiny_http::Method::Get, "/api/queue") => {
-            with_live_reviewer(&token, reviewer, state, || api_queue(db, reviewer, state))
+            // The other unmeasured reviewer-facing route, and the better suspect for "the app is slow":
+            // deriving one canonical queue is real work (dedup families, exclusions, the recursive
+            // coverage CTE), and the page asks for a fresh batch every 25 clips, on every reload, and on
+            // every one-a-minute retry. Measured 2026-09-16 out of process against the live database,
+            // `check_reviewer_queues_live.py` took 17.9 s to derive all ten reviewers' queues. Whether
+            // the in-app path costs anything like that per reviewer was unknowable, because nothing
+            // logged it. Status and wall time only, no identity.
+            let started = std::time::Instant::now();
+            let reply = with_live_reviewer(&token, reviewer, state, || api_queue(db, reviewer, state));
+            tracing::info!(
+                target: "cortex_speech_app_lib::couch::queue",
+                status = reply.0,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                bytes = reply.2.len(),
+                "queue request answered"
+            );
+            reply
         }
         // HEAD alongside GET: some mobile media stacks probe with it before opening a stream, and every
         // non-GET/POST method used to fall through to 404 — a probe answered "no such thing" while the

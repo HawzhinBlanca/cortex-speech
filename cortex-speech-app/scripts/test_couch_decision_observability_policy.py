@@ -45,6 +45,21 @@ def test_audio_dispatch_logs_status_and_latency_without_identity() -> None:
     assert "reviewer" not in line and "segment" not in line, "the audio log line must carry no identity"
 
 
+def test_queue_dispatch_logs_status_and_latency_without_identity() -> None:
+    """MEASURED 2026-09-16: deriving all ten reviewers' canonical queues out of process took 17.9 s, and
+    the page asks for a fresh batch every 25 clips, on every reload and on its one-a-minute retry. Whether
+    the in-app route costs anything like that was unknowable because nothing logged it."""
+    text = ROUTING.read_text(encoding="utf-8")
+    start = text.index('(tiny_http::Method::Get, "/api/queue")')
+    block = text[start : start + 1600]
+    assert 'target: "cortex_speech_app_lib::couch::queue"' in block, "the queue log target is gone"
+    assert "status = reply.0" in block and "elapsed_ms = started.elapsed()" in block, (
+        "status and latency must both be logged for the queue"
+    )
+    line = block.split("tracing::info!")[1].split(");")[0]
+    assert "reviewer" not in line and "segment" not in line, "the queue log line must carry no identity"
+
+
 def test_page_keeps_queued_clips_out_of_the_batch() -> None:
     text = PAGE.read_text(encoding="utf-8")
     assert "queue = res.items.filter((s) => !queuedIds.has(s.id));" in text, (
@@ -56,6 +71,7 @@ def test_page_keeps_queued_clips_out_of_the_batch() -> None:
 def main() -> None:
     test_decision_dispatch_logs_status_and_latency_without_identity()
     test_audio_dispatch_logs_status_and_latency_without_identity()
+    test_queue_dispatch_logs_status_and_latency_without_identity()
     test_page_keeps_queued_clips_out_of_the_batch()
     print("couch decision observability policy passed")
 
