@@ -138,6 +138,22 @@ pub fn authorizes(agreeing_reviewers: &[String]) -> bool {
         .any(|key| policy.owner.as_deref() == Some(key.as_str()) || policy.trusted.contains(&key))
 }
 
+/// The authority class a resolution rests on, for export metadata (audit 2026-09-15 P2-4: a single
+/// trusted verdict looked identical to two-name consensus in the artifact).
+pub fn authority_class(agreeing_reviewers: &[String]) -> &'static str {
+    let policy = current();
+    let keys: Vec<String> = agreeing_reviewers.iter().map(|name| reviewer_key(Some(name))).collect();
+    if keys.iter().any(|key| policy.owner.as_deref() == Some(key.as_str())) {
+        "owner"
+    } else if keys.len() == 1 && policy.trusted.contains(&keys[0]) {
+        "trusted"
+    } else if keys.len() >= 2 {
+        "consensus"
+    } else {
+        "single"
+    }
+}
+
 /// Is this `reviewer_key` the owner named by the policy?
 pub fn is_owner(key: &str) -> bool {
     current().owner.as_deref() == Some(key)

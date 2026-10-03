@@ -6140,6 +6140,54 @@ DROP TABLE review_reopen_rounds;"),
         DROP TABLE training_quarantine_clearances;
         DROP TABLE training_quarantine_holds;"),
     },
+    Migration {
+        version: 73,
+        description: "Append-only review-pool export batches so later exports skip delivered clips",
+        up_sql: "CREATE TABLE review_pool_export_batches (
+            batch_id TEXT NOT NULL PRIMARY KEY CHECK(length(batch_id) BETWEEN 8 AND 120 AND batch_id NOT GLOB '*[^0-9A-Za-z._-]*'),
+            pool_id TEXT NOT NULL REFERENCES review_pool_registry(pool_id),
+            voice_name TEXT NOT NULL CHECK(voice_name = trim(voice_name) AND length(voice_name) BETWEEN 1 AND 80),
+            kind TEXT NOT NULL CHECK(kind IN ('approved-subset','legacy')),
+            export_manifest_sha256 TEXT NOT NULL CHECK(length(export_manifest_sha256)=64 AND export_manifest_sha256 NOT GLOB '*[^0-9a-f]*'),
+            certificate_sha256 TEXT CHECK(certificate_sha256 IS NULL OR (length(certificate_sha256)=64 AND certificate_sha256 NOT GLOB '*[^0-9a-f]*')),
+            output_dir TEXT NOT NULL CHECK(length(output_dir) BETWEEN 1 AND 4096),
+            exported_segments INTEGER NOT NULL CHECK(exported_segments>=0),
+            skipped_segments INTEGER NOT NULL CHECK(skipped_segments>=0),
+            total_duration_ms INTEGER NOT NULL CHECK(total_duration_ms>=0),
+            trust_policy_sha256 TEXT NOT NULL CHECK(length(trust_policy_sha256)=64 AND trust_policy_sha256 NOT GLOB '*[^0-9a-f]*'),
+            trust_policy_json TEXT NOT NULL CHECK(length(trust_policy_json) BETWEEN 2 AND 4000),
+            app_git_sha TEXT NOT NULL CHECK(length(app_git_sha) BETWEEN 7 AND 64),
+            created_at_ms INTEGER NOT NULL CHECK(created_at_ms>0)
+        ) STRICT;
+        CREATE TABLE review_pool_export_batch_members (
+            batch_id TEXT NOT NULL REFERENCES review_pool_export_batches(batch_id),
+            segment_id TEXT NOT NULL REFERENCES speech_segments(id),
+            audio_content_hash TEXT NOT NULL CHECK(length(audio_content_hash)=64 AND audio_content_hash NOT GLOB '*[^0-9a-f]*'),
+            resolution_evidence_sha256 TEXT CHECK(resolution_evidence_sha256 IS NULL OR (length(resolution_evidence_sha256)=64 AND resolution_evidence_sha256 NOT GLOB '*[^0-9a-f]*')),
+            transcript_sha256 TEXT CHECK(transcript_sha256 IS NULL OR (length(transcript_sha256)=64 AND transcript_sha256 NOT GLOB '*[^0-9a-f]*')),
+            disposition TEXT NOT NULL CHECK(disposition IN ('exported','skipped-previously-exported','re-exported-changed-authority')),
+            PRIMARY KEY(batch_id,segment_id)
+        ) STRICT;
+        CREATE INDEX review_pool_export_batch_members_segment ON review_pool_export_batch_members(segment_id,disposition);
+        CREATE TRIGGER review_pool_export_batches_no_update BEFORE UPDATE ON review_pool_export_batches
+        BEGIN SELECT RAISE(ABORT,'export batch history is append-only'); END;
+        CREATE TRIGGER review_pool_export_batches_no_delete BEFORE DELETE ON review_pool_export_batches
+        BEGIN SELECT RAISE(ABORT,'export batch history is append-only'); END;
+        CREATE TRIGGER review_pool_export_batch_members_no_update BEFORE UPDATE ON review_pool_export_batch_members
+        BEGIN SELECT RAISE(ABORT,'export batch history is append-only'); END;
+        CREATE TRIGGER review_pool_export_batch_members_no_delete BEFORE DELETE ON review_pool_export_batch_members
+        BEGIN SELECT RAISE(ABORT,'export batch history is append-only'); END;",
+        down_sql: Some("CREATE TEMP TABLE review_pool_export_batches_rollback_guard(n INTEGER CHECK(n=0));
+        INSERT INTO review_pool_export_batches_rollback_guard SELECT COUNT(*) FROM review_pool_export_batches;
+        DROP TABLE review_pool_export_batches_rollback_guard;
+        DROP TRIGGER review_pool_export_batch_members_no_delete;
+        DROP TRIGGER review_pool_export_batch_members_no_update;
+        DROP TRIGGER review_pool_export_batches_no_delete;
+        DROP TRIGGER review_pool_export_batches_no_update;
+        DROP INDEX review_pool_export_batch_members_segment;
+        DROP TABLE review_pool_export_batch_members;
+        DROP TABLE review_pool_export_batches;"),
+    },
 ];
 
 #[cfg(test)]
@@ -6152,8 +6200,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 15).unwrap(),
-            vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58],
+            rollback(&db, 16).unwrap(),
+            vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58],
             "fixture must stop immediately before v58"
         );
         assert_eq!(get_current_version(&db).unwrap(), 57);
@@ -6164,8 +6212,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 13).unwrap(),
-            vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 14).unwrap(),
+            vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "fixture must expose the populated-v59 boundary"
         );
         assert_eq!(get_current_version(&db).unwrap(), 59);
@@ -6176,8 +6224,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 12).unwrap(),
-            vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61],
+            rollback(&db, 13).unwrap(),
+            vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61],
             "fixture must expose the v60 boundary"
         );
         assert_eq!(get_current_version(&db).unwrap(), 60);
@@ -6459,8 +6507,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 13).unwrap(),
-            vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 14).unwrap(),
+            vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "fixture must expose the v59 layer directly"
         );
         assert_eq!(get_current_version(&db).unwrap(), 59);
@@ -6551,10 +6599,10 @@ mod tests {
 
         let empty = Database::open(":memory:").unwrap();
         empty.initialize().unwrap();
-        assert_eq!(rollback(&empty, 13).unwrap(), vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(rollback(&empty, 14).unwrap(), vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60]);
         assert_eq!(rollback(&empty, 1).unwrap(), vec![59]);
         assert_eq!(get_current_version(&empty).unwrap(), 58);
-        assert_eq!(run_migrations(&empty).unwrap(), vec![59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72]);
+        assert_eq!(run_migrations(&empty).unwrap(), vec![59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73]);
     }
 
     #[test]
@@ -6608,10 +6656,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73]);
         assert_eq!(
-            rollback(&db, 12).unwrap(),
-            vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61],
+            rollback(&db, 13).unwrap(),
+            vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61],
             "this test isolates the v60 migration"
         );
         assert_eq!(get_current_version(&db).unwrap(), 60);
@@ -6872,7 +6920,7 @@ mod tests {
             .to_string();
         assert!(immutable_error.contains("immutable"), "unexpected snapshot guard: {immutable_error}");
 
-        let rollback_error = rollback(&db, 2)
+        let rollback_error = rollback(&db, 3)
             .expect_err("downgrade must not erase the only evidence that this human-owned row is unbound")
             .to_string();
         assert!(rollback_error.contains("CHECK constraint failed"), "unexpected rollback guard: {rollback_error}");
@@ -6914,7 +6962,7 @@ mod tests {
                  VALUES ('delete-memory-proof', 'w', 'r', 'slot', 'phon', 'delete-memory');",
             )
             .unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73]);
 
         assert_eq!(
             db.connection().execute("DELETE FROM speech_segments WHERE id='delete-clean'", []).unwrap(),
@@ -7657,7 +7705,7 @@ mod tests {
         );
         assert_eq!(db.connection().execute("DELETE FROM playback_receipts WHERE id=?1", [policy2_id]).unwrap(), 1);
 
-        let rollback_error = rollback(&db, 2).expect_err("policy-3 evidence cannot be downgraded away").to_string();
+        let rollback_error = rollback(&db, 3).expect_err("policy-3 evidence cannot be downgraded away").to_string();
         assert!(
             rollback_error.contains("CHECK constraint failed"),
             "unexpected policy-3 rollback guard: {rollback_error}"
@@ -8675,7 +8723,7 @@ mod tests {
         let with_effect = database_at_v60();
         insert_effect_event(&with_effect, None, "rollback-effect", None, "desktop", 1);
         let effect_error =
-            rollback(&with_effect, 2).expect_err("a recorded v60 effect cannot be erased by downgrade").to_string();
+            rollback(&with_effect, 3).expect_err("a recorded v60 effect cannot be erased by downgrade").to_string();
         assert!(effect_error.contains("CHECK constraint failed"), "unexpected effect guard: {effect_error}");
         assert_eq!(get_current_version(&with_effect).unwrap(), 60);
 
@@ -8705,8 +8753,11 @@ mod tests {
         let with_reversal = database_at_v59();
         let (_, baseline_entry) =
             insert_review_original(&with_reversal, "baseline-reversal", "baseline-work", "Sara", "legacy");
-        assert_eq!(run_migrations(&with_reversal).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72]);
-        assert_eq!(rollback(&with_reversal, 12).unwrap(), vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61]);
+        assert_eq!(
+            run_migrations(&with_reversal).unwrap(),
+            vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73]
+        );
+        assert_eq!(rollback(&with_reversal, 13).unwrap(), vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61]);
         reverse_review_entry(&with_reversal, &baseline_entry, "post-v60-baseline-undo").unwrap();
         let reversal_error = rollback(&with_reversal, 1)
             .expect_err("the ledger cutoff must distinguish a reversal appended after migration")
@@ -8736,8 +8787,8 @@ mod tests {
                          1, 'human correction', 'edit', '2026-08-20 00:00:00', 'Sara', 1);",
             )
             .unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72]);
-        assert_eq!(rollback(&db, 12).unwrap(), vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73]);
+        assert_eq!(rollback(&db, 13).unwrap(), vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61]);
 
         let (machine_snapshots, human_overlap, exact): (i64, i64, i64) = db
             .connection()
@@ -8800,8 +8851,8 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(run_migrations(&drifted).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72]);
-        assert_eq!(rollback(&drifted, 12).unwrap(), vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61]);
+        assert_eq!(run_migrations(&drifted).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73]);
+        assert_eq!(rollback(&drifted, 13).unwrap(), vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61]);
         drifted
             .connection()
             .execute("UPDATE speech_segments SET rationale='forged rationale' WHERE id='legacy-machine-drift'", [])
@@ -8885,7 +8936,7 @@ mod tests {
         db.initialize().unwrap();
         // Remove only the empty v72 layer for this synthetic out-of-order parent-table replay.
         // The actual guarded migration is reapplied after the historical recreate below.
-        assert_eq!(rollback(&db, 1).unwrap(), vec![72]);
+        assert_eq!(rollback(&db, 2).unwrap(), vec![73, 72]);
         assert!(get_current_version(&db).unwrap() >= 40, "v40 must have applied");
 
         // Real rows through the real write path, plus a CASCADE child — the thing a naive DROP wipes.
@@ -9173,7 +9224,7 @@ mod tests {
         // (5) FTS still finds a segment by transcript (triggers recreated + index rebuilt).
         let hits = db.search_segments("کوردی").unwrap();
         assert!(!hits.is_empty(), "FTS search must still work after the recreate");
-        assert_eq!(run_migrations(&db).unwrap(), vec![72]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![72, 73]);
 
         // (6) The DB is consistent and FK-clean, and normal writes resume (triggers alive).
         assert_eq!(db.integrity_check().unwrap().trim(), "ok");
@@ -9444,7 +9495,7 @@ mod tests {
     fn v63_partial_migration_failure_is_atomic_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 10).unwrap(), vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63]);
+        assert_eq!(rollback(&db, 11).unwrap(), vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63]);
         assert_eq!(get_current_version(&db).unwrap(), 62);
         db.connection().execute("CREATE TABLE review_pool_owner_adjudications(collision INTEGER)", []).unwrap();
         let error = run_migrations(&db).expect_err("a v63 object collision must fail the entire migration");
@@ -9463,15 +9514,15 @@ mod tests {
             .unwrap();
         assert_eq!(leaked_objects, 0, "failed v63 leaked later tables or triggers");
         db.connection().execute("DROP TABLE review_pool_owner_adjudications", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![63, 64, 65, 66, 67, 68, 69, 70, 71, 72]);
-        assert_eq!(get_current_version(&db).unwrap(), 72);
+        assert_eq!(run_migrations(&db).unwrap(), vec![63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73]);
+        assert_eq!(get_current_version(&db).unwrap(), 73);
     }
 
     #[test]
     fn v64_partial_migration_failure_is_atomic_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 9).unwrap(), vec![72, 71, 70, 69, 68, 67, 66, 65, 64]);
+        assert_eq!(rollback(&db, 10).unwrap(), vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64]);
         assert_eq!(get_current_version(&db).unwrap(), 63);
         db.connection().execute("CREATE TABLE review_pool_dedup_manifests(collision INTEGER)", []).unwrap();
         let error = run_migrations(&db).expect_err("a v64 object collision must fail the entire migration");
@@ -9490,15 +9541,15 @@ mod tests {
             .unwrap();
         assert_eq!(leaked_objects, 0, "failed v64 leaked later tables or triggers");
         db.connection().execute("DROP TABLE review_pool_dedup_manifests", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![64, 65, 66, 67, 68, 69, 70, 71, 72]);
-        assert_eq!(get_current_version(&db).unwrap(), 72);
+        assert_eq!(run_migrations(&db).unwrap(), vec![64, 65, 66, 67, 68, 69, 70, 71, 72, 73]);
+        assert_eq!(get_current_version(&db).unwrap(), 73);
     }
 
     #[test]
     fn v65_partial_migration_failure_is_atomic_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 8).unwrap(), vec![72, 71, 70, 69, 68, 67, 66, 65]);
+        assert_eq!(rollback(&db, 9).unwrap(), vec![73, 72, 71, 70, 69, 68, 67, 66, 65]);
         assert_eq!(get_current_version(&db).unwrap(), 64);
         let v64_trigger_sql: String = db
             .connection()
@@ -9515,8 +9566,8 @@ mod tests {
         assert!(error.to_string().contains("no such trigger"), "unexpected v65 failure: {error}");
         assert_eq!(get_current_version(&db).unwrap(), 64, "failed v65 must not record its migration row");
         db.connection().execute_batch(&v64_trigger_sql).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![65, 66, 67, 68, 69, 70, 71, 72]);
-        assert_eq!(get_current_version(&db).unwrap(), 72);
+        assert_eq!(run_migrations(&db).unwrap(), vec![65, 66, 67, 68, 69, 70, 71, 72, 73]);
+        assert_eq!(get_current_version(&db).unwrap(), 73);
         let v65_trigger_sql: String = db
             .connection()
             .query_row(
@@ -9533,7 +9584,7 @@ mod tests {
     fn v66_review_draft_migration_is_additive_atomic_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 7).unwrap(), vec![72, 71, 70, 69, 68, 67, 66]);
+        assert_eq!(rollback(&db, 8).unwrap(), vec![73, 72, 71, 70, 69, 68, 67, 66]);
         assert_eq!(get_current_version(&db).unwrap(), 65);
         db.connection().execute("CREATE TABLE review_drafts(collision INTEGER)", []).unwrap();
         let error = run_migrations(&db).expect_err("a v66 object collision must fail the entire migration");
@@ -9547,8 +9598,8 @@ mod tests {
             .unwrap();
         assert_eq!(leaked_index, 0, "failed v66 leaked its later index");
         db.connection().execute("DROP TABLE review_drafts", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![66, 67, 68, 69, 70, 71, 72]);
-        assert_eq!(get_current_version(&db).unwrap(), 72);
+        assert_eq!(run_migrations(&db).unwrap(), vec![66, 67, 68, 69, 70, 71, 72, 73]);
+        assert_eq!(get_current_version(&db).unwrap(), 73);
         let strict_sql: String = db
             .connection()
             .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'review_drafts'", [], |row| {
@@ -9562,7 +9613,7 @@ mod tests {
     fn v67_desktop_playback_authority_migration_is_atomic_strict_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 6).unwrap(), vec![72, 71, 70, 69, 68, 67]);
+        assert_eq!(rollback(&db, 7).unwrap(), vec![73, 72, 71, 70, 69, 68, 67]);
         assert_eq!(get_current_version(&db).unwrap(), 66);
 
         db.connection().execute("CREATE TABLE desktop_playback_sessions_v4(collision INTEGER)", []).unwrap();
@@ -9594,8 +9645,8 @@ mod tests {
         assert_eq!(receipt_columns, 0, "failed v67 leaked additive receipt columns");
 
         db.connection().execute("DROP TABLE desktop_playback_sessions_v4", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![67, 68, 69, 70, 71, 72]);
-        assert_eq!(get_current_version(&db).unwrap(), 72);
+        assert_eq!(run_migrations(&db).unwrap(), vec![67, 68, 69, 70, 71, 72, 73]);
+        assert_eq!(get_current_version(&db).unwrap(), 73);
         let paid_identity_trigger: String = db
             .connection()
             .query_row(
@@ -9633,7 +9684,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(rollback(&db, 6).unwrap(), vec![72, 71, 70, 69, 68, 67]);
+        assert_eq!(rollback(&db, 7).unwrap(), vec![73, 72, 71, 70, 69, 68, 67]);
         assert_eq!(
             db.connection()
                 .query_row(
@@ -9652,15 +9703,15 @@ mod tests {
             66,
             "a never-finalized playback attempt is ephemeral and must not make schema 67 irreversible",
         );
-        assert_eq!(run_migrations(&db).unwrap(), vec![67, 68, 69, 70, 71, 72]);
-        assert_eq!(get_current_version(&db).unwrap(), 72);
+        assert_eq!(run_migrations(&db).unwrap(), vec![67, 68, 69, 70, 71, 72, 73]);
+        assert_eq!(get_current_version(&db).unwrap(), 73);
     }
 
     #[test]
     fn v68_batch_item_authority_is_strict_exact_append_only_and_rollback_guarded() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 4).unwrap(), vec![72, 71, 70, 69], "this test isolates the v68 migration");
+        assert_eq!(rollback(&db, 5).unwrap(), vec![73, 72, 71, 70, 69], "this test isolates the v68 migration");
         assert_eq!(get_current_version(&db).unwrap(), 68);
         let conn = db.connection();
 
@@ -9866,11 +9917,11 @@ mod tests {
 
         let empty = Database::open(":memory:").unwrap();
         empty.initialize().unwrap();
-        assert_eq!(rollback(&empty, 4).unwrap(), vec![72, 71, 70, 69], "this test isolates the v68 migration");
+        assert_eq!(rollback(&empty, 5).unwrap(), vec![73, 72, 71, 70, 69], "this test isolates the v68 migration");
         assert_eq!(rollback(&empty, 1).unwrap(), vec![68]);
         assert_eq!(get_current_version(&empty).unwrap(), 67);
-        assert_eq!(run_migrations(&empty).unwrap(), vec![68, 69, 70, 71, 72]);
-        assert_eq!(get_current_version(&empty).unwrap(), 72);
+        assert_eq!(run_migrations(&empty).unwrap(), vec![68, 69, 70, 71, 72, 73]);
+        assert_eq!(get_current_version(&empty).unwrap(), 73);
     }
 
     #[test]
@@ -9879,7 +9930,7 @@ mod tests {
 
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(get_current_version(&db).unwrap(), 72);
+        assert_eq!(get_current_version(&db).unwrap(), 73);
         let conn = db.connection();
 
         for table in ["desktop_review_legacy_actions_v1", "desktop_review_action_events_v1"] {
@@ -9981,7 +10032,7 @@ mod tests {
             )
             .is_err());
 
-        let rollback_error = rollback(&db, 4).unwrap_err().to_string();
+        let rollback_error = rollback(&db, 5).unwrap_err().to_string();
         assert!(
             rollback_error.contains("CHECK constraint failed"),
             "unexpected v69 rollback refusal: {rollback_error}"
@@ -9990,9 +10041,9 @@ mod tests {
 
         let empty = Database::open(":memory:").unwrap();
         empty.initialize().unwrap();
-        assert_eq!(rollback(&empty, 4).unwrap(), vec![72, 71, 70, 69]);
+        assert_eq!(rollback(&empty, 5).unwrap(), vec![73, 72, 71, 70, 69]);
         assert_eq!(get_current_version(&empty).unwrap(), 68);
-        assert_eq!(run_migrations(&empty).unwrap(), vec![69, 70, 71, 72]);
+        assert_eq!(run_migrations(&empty).unwrap(), vec![69, 70, 71, 72, 73]);
     }
 
     #[test]
@@ -10125,7 +10176,7 @@ mod tests {
 
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 4).unwrap(), vec![72, 71, 70, 69]);
+        assert_eq!(rollback(&db, 5).unwrap(), vec![73, 72, 71, 70, 69]);
         let legacy_decision =
             insert_effect_event_with_action(&db, None, "legacy-v69-decision", None, "desktop", "accept", 1);
         let legacy_flag = insert_flag_effect_event(&db, "legacy-v69-flag", 0, None, None, false);
@@ -10136,7 +10187,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![69, 70, 71, 72]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![69, 70, 71, 72, 73]);
         assert_eq!(
             db.connection()
                 .query_row("SELECT COUNT(*) FROM desktop_review_legacy_actions_v1", [], |row| row.get::<_, i64>(0))
@@ -10377,8 +10428,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 13).unwrap(),
-            vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 14).unwrap(),
+            vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 v20 surface"
         );
         let conn = db.connection();
@@ -10441,8 +10492,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 13).unwrap(),
-            vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 14).unwrap(),
+            vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 v32 surface"
         );
         let conn = db.connection();
@@ -10472,8 +10523,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 13).unwrap(),
-            vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 14).unwrap(),
+            vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 FK behavior"
         );
         let conn = db.connection();
@@ -10505,8 +10556,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 13).unwrap(),
-            vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 14).unwrap(),
+            vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 v21 surface"
         );
         let conn = db.connection();
@@ -10546,8 +10597,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 13).unwrap(),
-            vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 14).unwrap(),
+            vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 FK behavior"
         );
         let conn = db.connection();
@@ -10759,8 +10810,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 13).unwrap(),
-            vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 14).unwrap(),
+            vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates v46's historical surface"
         );
         assert!(get_current_version(&db).unwrap() >= 46, "v46 must have applied");
@@ -10817,8 +10868,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 16).unwrap(),
-            vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58, 57],
+            rollback(&db, 17).unwrap(),
+            vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58, 57],
             "fixture must return to the v56 schema"
         );
 
@@ -10840,7 +10891,10 @@ mod tests {
             .unwrap();
         let legacy_event_id = db.connection().last_insert_rowid();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72]);
+        assert_eq!(
+            run_migrations(&db).unwrap(),
+            vec![57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73]
+        );
         let cutoff: i64 = db
             .connection()
             .query_row(
@@ -10864,8 +10918,8 @@ mod tests {
         assert_eq!(before.legacy_events_pending_reconciliation, 1);
 
         assert_eq!(
-            rollback(&db, 13).unwrap(),
-            vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 14).unwrap(),
+            vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "the remainder of this test isolates v57 accounting"
         );
         let (priced_event_id, _) = insert_review_original(&db, "pay-cutoff", "prospective-paid-work", "Sara", "couch");
@@ -10880,8 +10934,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 13).unwrap(),
-            vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 14).unwrap(),
+            vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates v57's immutable ledger"
         );
         db.insert_segment(&crate::db::SpeechSegment {
@@ -11011,8 +11065,8 @@ mod tests {
             let db = Database::open(":memory:").unwrap();
             db.initialize().unwrap();
             assert_eq!(
-                rollback(&db, 15).unwrap(),
-                vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58],
+                rollback(&db, 16).unwrap(),
+                vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59, 58],
                 "fixture must target v57 rollback semantics"
             );
             db.insert_segment(&crate::db::SpeechSegment {
@@ -11143,7 +11197,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73]);
         assert_eq!(foreign_key_violation_count(db.connection()), 0);
         let archive_counts: (i64, i64) = db
             .connection()
@@ -11390,7 +11444,7 @@ mod tests {
         // Once an operator separately resolves the unknown class, the same pending migration can
         // safely run and preserve the known orphan. No manual schema surgery or retry flag is needed.
         db.connection().execute("DELETE FROM playback_receipts WHERE segment_id = 'v58-unrelated-orphan'", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73]);
         assert_eq!(foreign_key_violation_count(db.connection()), 0);
         let archived: i64 = db
             .connection()
@@ -11420,11 +11474,11 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73]);
 
         assert_eq!(
-            rollback(&db, 14).unwrap(),
-            vec![72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59],
+            rollback(&db, 15).unwrap(),
+            vec![73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60, 59],
             "the empty v63/v62/v61/v60/v59 layers must be removed before probing v58"
         );
 
@@ -11496,7 +11550,7 @@ mod tests {
 
         // Re-applying v58 after a safe rollback sees valid parents, archives nothing, and leaves both
         // restored children in place. This pins the full up/down/up round trip.
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73]);
         let reapply_counts: (i64, i64, i64, i64) = db
             .connection()
             .query_row(
@@ -11561,7 +11615,7 @@ mod tests {
         assert_eq!(get_current_version(&db).unwrap(), 6, "test must target v6");
         assert!(has_column("clipping_ratio") && has_column("rms_db"), "fixture columns must exist up front");
 
-        let result = rollback(&db, 2);
+        let result = rollback(&db, 3);
 
         assert!(result.is_err(), "the poisoned third down statement must fail the rollback, got {result:?}");
         // The whole down_sql must roll back as one unit: the first two DROP COLUMNs must NOT have stuck.

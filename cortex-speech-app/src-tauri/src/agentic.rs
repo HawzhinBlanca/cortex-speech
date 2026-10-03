@@ -536,6 +536,18 @@ fn write_reference_text_file(
 /// source file decodes it once.
 pub fn segment_audio_as_wav_bytes(segment: &SpeechSegment) -> AppResult<Vec<u8>> {
     let path = Path::new(&segment.audio_path);
+    // FAST PATH: read only the clip's own samples out of a canonical 16 kHz mono WAV.
+    //
+    // The slow path below reads and decodes an entire 85-minute, 157 MB episode to hand back ten
+    // seconds of it. Measured 2026-09-16 on the library's 5900-rpm disk: 1075 ms cold for one episode,
+    // 4.42 s for the slowest of four concurrent readers, on one of only ten accept threads — and the
+    // queue serves 109 distinct sources per 123 playbacks, so caching never gets a second chance.
+    // `read_canonical_wav_window` reproduces the full decode's samples exactly (proved by
+    // `a_windowed_read_is_identical_to_the_full_decode`) and declines anything that is not that exact
+    // format, so MP3 masters and every other source still take the path below unchanged.
+    if let Some(bytes) = clip_window_fast_path(path, segment.alignment_json.as_deref()) {
+        return pcm_i16_to_wav_bytes(&bytes, audio::TARGET_SAMPLE_RATE);
+    }
     let duration_ms = audio::get_duration_ms(path)?;
     if duration_ms == 0 {
         return Err(AppError::Validation("Empty audio file".into()));
@@ -548,6 +560,24 @@ pub fn segment_audio_as_wav_bytes(segment: &SpeechSegment) -> AppResult<Vec<u8>>
     }
     let (chunk_pcm, _) = chunking::slice_pcm_by_alignment(&pcm, sample_rate, segment.alignment_json.as_deref())?;
     pcm_i16_to_wav_bytes(&chunk_pcm, audio::TARGET_SAMPLE_RATE)
+}
+
+/// The clip's samples, read directly, or `None` to take the full-decode path.
+///
+/// Declines every case the slow path handles differently rather than reimplementing its judgement: a
+/// whole-file segment (no alignment metadata), clobbered metadata without source offsets (which the
+/// slicer must REFUSE, loudly, rather than silently serve the whole recording), an out-of-range offset,
+/// and any source that is not a canonical 16 kHz mono WAV. The range arithmetic is the slicer's own
+/// `ms_to_samples`, so the two cannot drift apart on rounding.
+fn clip_window_fast_path(path: &Path, alignment_json: Option<&str>) -> Option<Vec<i16>> {
+    let meta = crate::chunking::SegmentSourceMeta::from_alignment_json(alignment_json?)?;
+    let (start_ms, end_ms) = (meta.source_start_ms.max(0), meta.source_end_ms.max(0));
+    if start_ms > u32::MAX as i64 || end_ms > u32::MAX as i64 {
+        return None;
+    }
+    let start = crate::chunking::ms_to_samples(start_ms as u32, audio::TARGET_SAMPLE_RATE);
+    let end = crate::chunking::ms_to_samples(end_ms as u32, audio::TARGET_SAMPLE_RATE);
+    audio::read_canonical_wav_window(path, start, end)
 }
 
 pub fn segment_audio_as_wav_base64(segment: &SpeechSegment) -> AppResult<String> {
@@ -894,6 +924,49 @@ mod tests {
             "sliced 1 s segment WAV should be ~32 KB (NOT the ~64 KB whole 2 s file), got {}",
             bytes.len()
         );
+    }
+
+    #[test]
+    fn the_windowed_clip_matches_the_full_decode_byte_for_byte() {
+        // What a reviewer hears must not change because the server stopped reading the whole episode.
+        // This asserts the served bytes against the exact pipeline the fast path skips — decode the
+        // whole file, slice by alignment, encode — so a drift of even one sample fails here rather than
+        // in a reviewer's ear.
+        let tmp = TempDir::new().expect("tempdir");
+        let wav = tmp.path().join("episode.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav, spec).expect("create wav");
+        // Varied, not constant: a window off by one sample is invisible against a flat tone.
+        for i in 0..48_000 {
+            let s = ((i as f64 * std::f64::consts::TAU / 313.0).sin() * 32_000.0) as i16;
+            writer.write_sample(s).expect("write sample");
+        }
+        writer.finalize().expect("finalize wav");
+
+        let meta =
+            chunking::SegmentSourceMeta { source_start_ms: 700, source_end_ms: 2350, chunk_index: 2, chunk_count: 5 };
+        let segment = SpeechSegment {
+            id: "seg".to_string(),
+            audio_path: wav.to_string_lossy().to_string(),
+            alignment_json: Some(meta.to_alignment_json()),
+            ..SpeechSegment::default()
+        };
+
+        let served = segment_audio_as_wav_bytes(&segment).expect("serve clip");
+
+        let (rate, pcm) = audio::decode_to_pcm(&wav).expect("full decode");
+        let (rate, pcm) = audio::ensure_pcm_16khz(rate, pcm).expect("rate");
+        let (chunk, _) = chunking::slice_pcm_by_alignment(&pcm, rate, segment.alignment_json.as_deref())
+            .expect("slice by alignment");
+        let expected = pcm_i16_to_wav_bytes(&chunk, audio::TARGET_SAMPLE_RATE).expect("encode");
+
+        assert_eq!(served.len(), expected.len(), "the served clip must be the same length as the full-decode slice");
+        assert_eq!(served, expected, "the windowed read must serve byte-identical audio to the full decode");
     }
 
     fn hyp(model: &str, text: &str, confidence: f64) -> SegmentHypothesis {

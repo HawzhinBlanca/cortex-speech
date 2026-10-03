@@ -22,6 +22,192 @@ Their single-verdict clips in the window: Rubar 64 (7.9 min), Iftikhar 61 (8.6 m
 under the handover lock, watchdog disabled/enabled) because the policy is read once per process; `pool_admin probe` confirms
 `trusted: [sewa]`; HTTPS 200, no markers. Backups: `reviewer_roster_backups/*before-lamo-retires-20260915-1347*`. A new
 reviewer on that link gets a new roster name and no trust by default.
+## 2026-09-16 — Reviewer reports of downtime, slowness and dead audio: two causes found, one not established
+
+**Owner (verbatim):** "reviewers report down app, slowness, and sometimes doesnt play well, find out whats the
+issues remain", then "fix the probe first, then lets do the rest".
+
+Nothing was broken at the moment of investigation: release 38e0e557 was up, pool certification green every five
+minutes, and the day's 106 decisions each answered in 150-220 ms. Downtime and the dead alarm are explained and
+fixed below; the slowness and playback complaints are NOT explained by anything measured, and section 3 says so.
+
+**1. Downtime is Windows Update restarting the machine.** Event 1074 shows restarts on 09-16 15:11 and 15:14,
+09-13 11:39, 09-10 03:29+03:32, 09-03 04:00+04:03 and 09-02 00:05. The app logs an orderly exit because Windows
+closes it, and `CortexPrivateProductionWatchdog` relaunches 3-8 minutes later; on 09-16 the couch was listening
+again 6 min 47 s after the exit. Active hours are 09:00-03:00, so AUTOMATIC restarts only fall between 03:00 and
+09:00, and the session signs back in by itself — the watchdog, which runs only when logged on, resumed four
+minutes after the unattended 09-10 03:32 restart with nobody present. The 09-16 15:11 restart was user-initiated
+from the update prompt. Measured cost: about seven minutes per restart, recovered automatically. Watchdog
+heartbeat gaps over 11 minutes since 09-02 total 183 minutes, dominated by one 104-minute gap overnight 09-05/06.
+No change made: narrowing active hours or enabling autologon is an owner decision and a system setting.
+
+**2. The one alarm that would have said so had been red for six days.** `CortexReviewHealthProbe` was registered
+by hand against a single release directory and no deploy ever re-pointed it, so after the schema 71 → 72 → 73
+bumps it kept running that old release's reviewer gates, which assert the OLD expected schema. It failed every
+five minutes with "REVIEWER QUEUES: FAIL — release manifest must require database schema 71 — the server serves
+NOTHING to any reviewer", which was false: **1,659 alerts between 2026-09-10 20:09Z and 2026-09-16** while
+reviewers were served normally, with `CortexAlarmForwarder` exiting 1 throughout. Every real outage in that
+window was indistinguishable from the noise, which is why reviewer trouble reached the owner by word of mouth.
+Repointed live at 19:13 (old definition backed up under `cortex-speech-app/logs/task-backups/`): exit 0, all four
+gates green — 10 links authenticate, 10 queues have work, continuity OK, vault unchanged — desktop
+`REVIEW-PIPELINE-ALERT.txt` cleared, forwarder back to exit 0, and confirmed again unattended on its own
+30-minute schedule at 19:18. PR #128 makes it durable: the probe gains `-Register`, `register_release_tasks`
+calls it on every deploy and recovery, and re-registration inherits the interpreter and log directory the live
+task already carries while swapping only the `-File` path (the release tree ships no `.policy-python`, so those
+paths must not be invented; a machine with no usable interpreter is told so rather than having a probe that
+cannot start registered over one that runs). Two pins in `test_reviewer_link_ops_policy.py`.
+
+**3. Slowness and dead audio: measured, and my first reading was wrong.** All 20,253 sources sit on D:, a
+Seagate ST2000VX008 (5900-rpm SATA HDD); C: and F: are NVMe. `pcm_cache_key` opens and BLAKE3-hashes the
+entire source before the decoded-PCM cache can be consulted, and reading one 157 MB episode cold took 1075 ms
+(4.42 s for the slowest of four concurrent readers) on one of only ten accept threads. I wrote that up as the
+cause — from the sources with the MOST clips. Querying what was actually SERVED corrected it: over the last
+fourteen days the queue served 1,856 small per-clip WAVs at 24 kHz, median 0.37 MB, none over 2.6 MB, about
+60 ms a read. **The audio path is therefore not established as the cause of the current reports.** The
+expensive case is real but still ahead of the reviewers: 33 large sources carry 11,242 of the 29,472
+unverified clips, 11,186 of them canonical 16 kHz, median clip window 8.6 s of a 65-87 minute episode.
+And it is far worse than the disk figures implied. Measured against REAL episodes and REAL clip windows,
+a cold full decode of one KBHP episode takes **10.5 s and 11.6 s** — symphonia's packet loop, the f32
+conversion and the 157 MB allocations dominate, not the 1.08 s read — against **23-89 ms** for the
+windowed read. Ten and a half seconds on one of ten accept threads is a clip that never plays.
+
+PR #129 addresses that backlog and makes the next report measurable. Serving a clip reads only its own window
+(~275 KB instead of 120-160 MB) when the source is a canonical 16 kHz mono WAV with real offsets, declining
+24 kHz, stereo, MP3/FLAC/MOV masters, whole-file segments and clobbered metadata to the unchanged path.
+Byte-identity is the safety argument, because those bytes reach the phone, the cloud listener and
+`review_pool/dedup.rs`'s identity hash: the window repeats the same i16 -> f32 (/32768) -> i16 (*32767) round
+trip and calls the slicer's own `ms_to_samples`, with two tests asserting equality against the real full
+decode, one of them on the served WAV bytes; a temporary harness also compared six REAL clips (first,
+middle and last window of two KBHP episodes) against the real full decode and zero samples differed. `pcm_cache_key` also memoizes its hash against `(len, mtime)`
+once the mtime has settled two seconds (Windows clock ticks are ~15.6 ms, so a same-length rewrite inside one
+tick would otherwise serve stale PCM) — worth about 11% of serves, since 123 playbacks touched 109 distinct
+sources. `AUDIO_CACHE_BYTES` goes 32 MB -> 128 MB: 32 MB held exactly ONE reviewer's 25-clip batch while ten
+reviewers evicted each other. And `/api/audio` now logs status, elapsed_ms and bytes, the shape
+`/api/decision` has had since 2026-09-02 — audio was the one hot path where a four-second serve looked
+identical to a forty-millisecond one, which is precisely why this investigation could measure the disk and
+the caches but never the route. The connection read timeouts during the work window (124 and 90 on 09-16,
+roughly two per decision, against a ~12/hour baseline that is the watchdog's own TLS-aborting probe) remain
+unattributed; the new line is what will attribute them next time.
+
+`/api/queue` gained the same line. I suspected it next — `check_reviewer_queues_live.py` takes 17.9 s for ten
+reviewers, and the page refetches a batch every 25 clips, on every reload and on its one-a-minute retry — and
+`pool_admin benchmark` against the live database refuted that too: derivation is **251-470 ms** per reviewer
+over five iterations each (Rubar 256 ms p95, Hawzhin 277, Sewa 468) against a 750 ms target. Those 17.9 s are
+ten process startups, not the query. The line ships anyway, so "the queue is fine" stays proven rather than
+remembered.
+
+**Net: nothing measurable on this machine explains the slowness complaint.** Decisions 150-220 ms, queue
+derivation 251-470 ms, a clip of the material actually being served ~60 ms, and the 10.5 s cliff sits only on
+episodes nobody has been served in a fortnight. What is left is the network. Reviewers reach the app through
+**Tailscale Funnel**, so every byte travels to a Tailscale ingress and back; `tailscale netcheck` puts the
+nearest relay in **Frankfurt at 71.2 ms** from this machine. Measured from here that detour costs about 27 ms
+(funnel median 30.7 ms against loopback 3.3 ms for the same 162 KB page, max 338.8 ms), but a reviewer's phone
+on mobile data adds its own leg to Frankfurt, which cannot be measured from this machine. The DOWNTIME is real
+and separately explained (section 1), and a reviewer whose session dies mid-batch during a restart would
+reasonably call that the app being slow or the audio not playing. After the deploy the new timings settle it:
+server-side tens of milliseconds alongside a reviewer still waiting means the wait is the network.
+
+**Same bug class elsewhere, reported not fixed.** Auditing every Cortex scheduled task: all three
+release-bound ones now point at the active release. The two that are not release-bound run from the repo
+checkout at `Desktop\cortex-speech`, which is parked on `codex/kurdish-expert-review`, 25 commits behind
+main. `CortexAlarmForwarder`'s script there differs from main by 652 lines — main adds
+`Newest-SnapshotAgeMinutes`, `Add-Finding` and finding de-duplication, so snapshot age and recovery failures
+are watched by main's version but not by the one actually running. `CortexChampionSupervisor` is
+byte-identical today but bound the same way. The same staleness bit the diagnosis: running
+`check_reviewer_queues_live.py` from that checkout asserts schema 69 and prints the identical false "serves
+NOTHING to any reviewer" line. Either register the forwarder from the release (the pattern #128 establishes)
+or bring that checkout current — it carries staged owner work, so it was left untouched.
+
+Ruled out and left alone: zero missing source files; lease handling (4-minute heartbeat, whole-batch renew,
+`visibilitychange` re-renew, 409 surfaced immediately); draft persistence and the offline outbox; snapshot
+retention (the 20 directories on disk are the designed 10 rolling + 7 daily + 4 weekly tiers); completed
+playbacks average 0.99 coverage. Not done on purpose: moving 2 TB of audio to NVMe (owner's call), raising the
+10-entry PCM cache (nothing measured says it thrashes), and changing the watchdog's own probe so it stops logging
+a connection WARN per cycle — harmless, self-inflicted noise in a script with a kill-loop history.
+
+**Rollout 2026-09-16 22:06 (private production).** PR #129 merged as 4fbe0456, PR #128 as bd160b93 (rebased
+after two runner stalls; see below). Built at bd160b93 in the cortex-perf worktree, both exes carrying
+`CORTEX_BUILD_SHA:bd160b93...`, frontend dist reused (no frontend change since 9a381971). Stage:
+`PREFLIGHT_CLONE=PASS schema=73 audioClips=11244/11244 rightsExact=true`, watchdog dry-run correctly refused
+the not-yet-active release, clone rehearsal showed every probed reviewer a full queue, and the staged
+snapshot writer verified against the staged certifier (`"verified": true`, the check added after the
+2026-09-11 incident). Deploy `READY` 22:06, release bd160b93e07a-9218c813085f-400f8c60b44d-..., pointer git
+sha bd160b93, **exe SHA-256 matches the manifest**, schema 73, HTTPS 200, no markers, watchdog running,
+couch up for 10 reviewers.
+
+**The probe fix proved itself in the same deploy:** `register_release_tasks` re-registered
+`CortexReviewHealthProbe` at the NEW release automatically, and the probe then ran green from there
+(exit 0, `ok=true`, no desktop alert). That is the whole point of #128, demonstrated in production rather
+than argued.
+
+The `/api/audio` and `/api/queue` timing lines are live but silent so far: an unauthenticated request is
+refused at 401 before route dispatch, so only real reviewer traffic produces them. The first reviewer
+session after this deploy is what turns "the server is fast, the wait is elsewhere" from an inference into a
+measurement.
+
+**CI detour.** The Windows Release Gate failed #128 twice on `tauri_integration_import_export_validate`,
+killed at its 120 s budget with empty output — the stall the test's own panic text calls "not a pipeline
+verdict", on a branch containing only a PowerShell script, a Python function and a policy test. #129 passed
+the same test on the same runner image between the two failures. #128 passed on a rebase. PR #130 gives that
+stall the retry the file already performs for a sibling flake, keeping the fail-fast behaviour for a genuine
+non-zero exit.
+
+## 2026-09-15 — Schema 73: export batches recorded inside the database; export-pipeline audit fixes
+
+**Owner (verbatim):** "yes add the batch record inside the database too, and harden the pipeline hunt bugs and gaps for this
+final ship readiness".
+
+**Audit first** (read-only subagent over origin/main e96b50a9, re-deriving every pool resolution on a DB clone; it reproduced
+the 2026-09-15 batch exactly — 634 ids, all texts byte-equal). Confirmed defects, all closed here:
+- P1-1 An artifact never named the trust policy that decided it. Six minutes after the approved-v1 export I removed Lamo
+  from the trusted list, so under the policy now live 64 of the 634 delivered clips are no longer resolved (42 needs-third,
+  22 pending) — every one carried by Lamo's single verdict — and nothing recorded which rule they were exported under.
+- P1-2 My batch script skipped "already exported" clips by id. The 2026-09-08 TTS test used its own text rule; 64 of the 166
+  skipped clips were delivered then with a DIFFERENT text than the canon yields, so the corrected text shipped nowhere.
+- P2-3 `pool_admin` loads the trust policy from the DB's directory and silently trusts nobody when the file is absent (a
+  clone dir without it yields 63 retained clips instead of 634, exit 0).
+- P2-4 A single trusted verdict looked identical to two-name consensus in the artifact. P2-5 three JSON-ledger records for
+  one batch. P3-6/7/8 pre-existing output dir message, silent staging-dir cleanup failure, held clips absent from
+  exclusions.jsonl.
+
+**Schema 73** (`review_pool_export_batches`, `review_pool_export_batch_members`; append-only triggers; rollback refused while a
+batch exists): a batch binds pool, voice, manifest + certificate digests, counts, the trust policy (JSON + SHA-256), app git
+sha; each member binds pool audio identity, resolution evidence digest, exact exported-text digest and a disposition
+`exported` | `skipped-previously-exported` | `re-exported-changed-authority`. `export --approved-subset --batch <id>` skips a
+clip only when an earlier batch delivered the SAME authority (evidence, or text for a legacy record); otherwise it ships it
+again marked `reExportedChangedAuthority` (closes P1-2). It refuses to run without `review_trust.json` beside the DB (P2-3),
+writes `trustPolicy` and per-clip `resolutionAuthority` (`owner` | `trusted` | `consensus` | `single`) into manifest,
+certificate and metadata (P1-1, P2-4), lists held clips in exclusions.jsonl (P3-8), warns on staging cleanup failure (P3-7).
+A retry of the same batch id is idempotent; a different artifact under a known id is refused (P2-5). `pool_admin
+export-batches` reports every batch and `deliveredButWithdrawn` (delivered earlier, now unresolved/rejected/held/re-decided).
+`record-export-batch --confirm-legacy-record` backfills the two pre-73 artifacts. Release controller: batch history is a
+restore floor like quarantine history and blocks binary-only rollback to a schema that cannot hold it. Row-count evidence
+in all three copies (snapshot.rs, create_recovery_snapshot.py, restore_drill.py); restore floors +2 tables; watchdog pin 73;
+contract `cortex-private-production-schema-65-to-73-v1` (sources 65/69/70/71/72). Docs: `docs/EXPORT_BATCHES.md`.
+
+**Evidence:** Rust `a_batch_export_records_its_clips_and_a_later_batch_skips_them` (batch 1 → same-id retry idempotent → a
+second batch with nothing new refuses → legacy record with different text → batch 2 re-delivers it marked and skips batch 1's
+clip → a third batch refuses → recorded batches refuse rollback), `export_batches::tests` (fail-closed below 73, skip rule,
+record validation), migrations/restore/snapshot/quarantine suites; Python: append-only contract 66-73, release controller
+46/46 incl. the new batch restore-floor test, snapshot 28/28, drill 23/23, verify10 runtime, rust_quality_gate architecture.
+**Rollout 2026-09-15 20:27 (private production):** PR #126 merged as 10f86c43 (tree identical to the deployed 38e0e557;
+the branch also carried the cargo-deny fix rustls 0.23.45 / der 0.8.2 for RUSTSEC-2026-0285 published that day, and the
+proven-previous-contract entry for 65-to-72 that staging demanded). Stage + clone rehearsal: migration 72→73 PASS on the
+clone, watchdog dry-run pin 73, staged-writer-vs-staged-certify verified, and the full backfill + next-batch dry run
+rehearsed on the clone first. Deploy READY 20:27:23 (release 38e0e5579209-c4d6f6308ab7-…, all ten links proven,
+reviewReady=True, HTTPS 200, no markers, pointer/exe SHA-256 match, watchdog registered 20:27:23, pool certification OK
+20:33:50). Reviewers idle since 12:56. CI: the first run failed on a pre-existing timing test
+(`a_runaway_page_is_throttled_per_reviewer`, untouched code), the rerun on cargo deny (new advisory); green after the
+dependency update.
+**Live backfill 20:28 (24 s offline window, handover lock, watchdog disabled/enabled):** `record-export-batch` recorded
+`tts-test-lamo-20260908` (167 legacy, text-bound), `approved-v1-20260915-Lamo` (451 exported + 166 skipped), `-Kawa` (14),
+`-Halwest` (3). `export-batches`: 635 clips delivered, **65 deliveredButWithdrawn** — 64 "no longer resolved" (the
+Lamo-only clips after his trust removal, audit P1-1) and 1 "now rejected". Next-batch dry run on a fresh clone with the
+live binary: Lamo would ship 64 clips, all re-exports of the stale-text TTS-test clips (528 s); Kawa/Halwest nothing new.
+
+**Not done here (owner decisions):** time-bounded trust (Rubar/Iftikhar "last two weeks") — the policy remains permanent per
+name; the 64 Lamo-only clips of approved-v1 stay delivered until the owner says whether Lamo's past verdicts keep authority
+(restoring him to the trusted list would make them resolved again; he no longer reviews, so it is harmless).
 
 ## 2026-09-14 — Export readiness: 1 h 21 min ready; the 200-clip hold gets a batch clearance; 60 disputes routed to the owner
 

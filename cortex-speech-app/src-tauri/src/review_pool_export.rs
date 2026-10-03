@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -45,6 +45,9 @@ fn take_publication_crash() -> bool {
 pub struct PoolDatasetOptions {
     pub output_dir: String,
     pub voice_name: String,
+    /// Approved-subset only: skip every clip an earlier batch delivered and record this artifact as a
+    /// batch (schema 73). `None` keeps the plain export.
+    pub batch_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,6 +66,11 @@ pub struct PoolDatasetResult {
     pub tts_retained_segments: usize,
     /// Retained clips kept for ASR but excluded from TTS by name (unmeasured or speaker-change candidate).
     pub tts_excluded_segments: usize,
+    /// Retained clips left out of this artifact because an earlier batch delivered this exact authority.
+    pub previously_exported_segments: usize,
+    /// Retained clips delivered again because their authority (evidence or text) changed since.
+    pub re_exported_segments: usize,
+    pub batch_id: Option<String>,
     pub total_duration_ms: i64,
     pub manifest_sha256: String,
     pub sha256sums_sha256: String,
@@ -374,7 +382,9 @@ fn write_sha256sums(root: &Path, relative_files: &[String]) -> AppResult<String>
 
 fn remove_staging(path: &Path) {
     if path.is_dir() {
-        let _ = fs::remove_dir_all(path);
+        if let Err(error) = fs::remove_dir_all(path) {
+            tracing::warn!("export staging directory could not be removed ({}): {error}", path.display());
+        }
     }
 }
 
@@ -424,6 +434,9 @@ fn export_voice_scope(db: &Database, options: &PoolDatasetOptions, subset: bool)
     if voice_name.is_empty() || voice_name.chars().any(char::is_control) {
         return Err(AppError::Validation("voice name must be a non-blank printable label".to_string()));
     }
+    if options.batch_id.is_some() && !subset {
+        return Err(AppError::Validation("export batches apply to the approved subset only".to_string()));
+    }
     let output_value =
         crate::validation::input::validate_output_path(&options.output_dir).map_err(AppError::Validation)?;
     let output = PathBuf::from(output_value);
@@ -467,6 +480,59 @@ fn export_voice_scope(db: &Database, options: &PoolDatasetOptions, subset: bool)
             .collect();
         if rows.is_empty() {
             return Err(AppError::Validation(format!("voice {voice_name} has no resolved clips to export")));
+        }
+        // Owner 2026-09-15: a batch never re-delivers a clip an earlier batch shipped with the SAME
+        // authority; a clip re-decided since (or delivered by a legacy artifact with different text)
+        // ships again and is marked so (audit 2026-09-15 P1-2).
+        // A retry of the SAME batch id must reproduce the same artifact, so its own earlier record
+        // is not "an earlier batch".
+        let delivered: HashMap<String, Vec<crate::export_batches::Delivered>> = match options.batch_id.as_deref() {
+            Some(batch_id) => crate::export_batches::delivered(db, &pool.pool_id)?
+                .into_iter()
+                .filter_map(|(id, history)| {
+                    let history: Vec<_> = history.into_iter().filter(|d| d.batch_id != batch_id).collect();
+                    (!history.is_empty()).then_some((id, history))
+                })
+                .collect(),
+            None => HashMap::new(),
+        };
+        let transcript_sha = |row: &PoolExportRow| {
+            crate::export_batches::sha256_hex(
+                row.resolution.final_transcript.as_deref().unwrap_or_default().trim().as_bytes(),
+            )
+        };
+        let mut skipped_rows: Vec<PoolExportRow> = Vec::new();
+        let mut re_exported: BTreeSet<String> = BTreeSet::new();
+        let rows: Vec<PoolExportRow> = rows
+            .into_iter()
+            .filter(|row| {
+                if row.resolution.final_action.as_deref() != Some("retain") {
+                    return true;
+                }
+                match delivered.get(&row.segment_id) {
+                    None => true,
+                    Some(history) => {
+                        if crate::export_batches::already_delivered(
+                            history,
+                            &row.resolution.evidence_sha256,
+                            &transcript_sha(row),
+                        ) {
+                            skipped_rows.push(row.clone());
+                            false
+                        } else {
+                            re_exported.insert(row.segment_id.clone());
+                            true
+                        }
+                    }
+                }
+            })
+            .collect();
+        if options.batch_id.is_some()
+            && !rows.iter().any(|row| row.resolution.final_action.as_deref() == Some("retain"))
+        {
+            return Err(AppError::Validation(format!(
+                "voice {voice_name}: every approved clip was already delivered by an earlier batch"
+            )));
         }
         for row in &rows {
             if row.model_version_id != pool.champion_model_version_id {
@@ -635,6 +701,8 @@ fn export_voice_scope(db: &Database, options: &PoolDatasetOptions, subset: bool)
                         "modelVersionId": row.model_version_id,
                         "championRawTranscript": row.raw_transcript,
                         "resolutionStatus": row.resolution.status,
+                        "resolutionAuthority": crate::review_pool::trust::authority_class(&row.resolution.agreeing_reviewers),
+                        "reExportedChangedAuthority": re_exported.contains(&row.segment_id),
                         "resolutionEvidenceSha256": row.resolution.evidence_sha256,
                         "audioSha256": asr_sha,
                         "sourceMasterSha256": source_sha,
@@ -656,6 +724,7 @@ fn export_voice_scope(db: &Database, options: &PoolDatasetOptions, subset: bool)
                                 "sampleRate": TTS_SAMPLE_RATE,
                                 "sourceBytesPreserved": source_bytes_preserved,
                                 "speakerChangeScore": row.speaker_change_score,
+                                "resolutionAuthority": crate::review_pool::trust::authority_class(&row.resolution.agreeing_reviewers),
                                 "audioSha256": tts_sha,
                                 "sourceMasterSha256": source_sha,
                                 "sourceStartMs": row.source_start_ms,
@@ -703,6 +772,32 @@ fn export_voice_scope(db: &Database, options: &PoolDatasetOptions, subset: bool)
                 }),
             )?;
         }
+        for row in &skipped_rows {
+            write_jsonl(
+                &mut exclusions,
+                &serde_json::json!({
+                    "id": row.segment_id,
+                    "reason": "previously_exported_by_earlier_batch",
+                    "resolutionStatus": row.resolution.status,
+                    "resolutionEvidenceSha256": row.resolution.evidence_sha256,
+                    "audioCopied": false,
+                }),
+            )?;
+        }
+        // Audit 2026-09-15 P3-8: held clips were named only in the manifest; a consumer reading
+        // exclusions.jsonl alone never saw them.
+        for row in all_rows.iter().filter(|row| quarantine.blocked.contains(&row.segment_id)) {
+            write_jsonl(
+                &mut exclusions,
+                &serde_json::json!({
+                    "id": row.segment_id,
+                    "reason": "training_quarantine_hold",
+                    "resolutionStatus": row.resolution.status,
+                    "resolutionEvidenceSha256": row.resolution.evidence_sha256,
+                    "audioCopied": false,
+                }),
+            )?;
+        }
         asr_meta.flush()?;
         tts_meta.flush()?;
         rights_meta.flush()?;
@@ -739,8 +834,12 @@ fn export_voice_scope(db: &Database, options: &PoolDatasetOptions, subset: bool)
             "rejectedSegments": rejected_rows.len(),
             "ttsRetainedSegments": tts_retained,
             "ttsExcludedSegments": tts_excluded,
+            "previouslyExportedSegments": skipped_rows.len(),
+            "reExportedChangedAuthoritySegments": re_exported.len(),
+            "batchId": options.batch_id,
+            "trustPolicy": crate::review_pool::trust::describe(),
             "totalDurationMs": total_duration_ms,
-            "transcriptAuthority": "two matching independent reviewers, matching pair among three, or owner adjudication",
+            "transcriptAuthority": "owner verdict alone; a trusted reviewer's verdict alone (trustPolicy); otherwise two matching independent reviewers, a matching pair among three, or owner adjudication — per clip in asr/tts metadata resolutionAuthority",
             "asr": {"directory": "asr", "sampleRate": ASR_SAMPLE_RATE, "audio": "mono PCM16 WAV"},
             "tts": {"directory": "tts", "sampleRate": TTS_SAMPLE_RATE,
                     "audio": "byte-preserved masters or exact-sample bounded PCM16 extraction",
@@ -811,6 +910,10 @@ fn export_voice_scope(db: &Database, options: &PoolDatasetOptions, subset: bool)
                 "rejectedSegments": rejected_rows.len(),
                 "ttsRetainedSegments": tts_retained,
                 "ttsExcludedSegments": tts_excluded,
+                "previouslyExportedSegments": skipped_rows.len(),
+                "reExportedChangedAuthoritySegments": re_exported.len(),
+                "batchId": options.batch_id,
+                "trustPolicy": crate::review_pool::trust::describe(),
                 "totalDurationMs": total_duration_ms,
                 "appGitSha": app_git_sha,
                 "createdAtMs": created_at_ms,
@@ -942,6 +1045,47 @@ fn export_voice_scope(db: &Database, options: &PoolDatasetOptions, subset: bool)
                 ))
             })?;
         }
+        if let Some(batch_id) = options.batch_id.as_deref() {
+            let members = retained_rows
+                .iter()
+                .map(|row| crate::export_batches::ExportBatchMember {
+                    segment_id: row.segment_id.clone(),
+                    resolution_evidence_sha256: Some(row.resolution.evidence_sha256.clone()),
+                    transcript_sha256: Some(transcript_sha(row)),
+                    disposition: if re_exported.contains(&row.segment_id) {
+                        crate::export_batches::Disposition::ReExportedChangedAuthority
+                    } else {
+                        crate::export_batches::Disposition::Exported
+                    },
+                })
+                .chain(skipped_rows.iter().map(|row| crate::export_batches::ExportBatchMember {
+                    segment_id: row.segment_id.clone(),
+                    resolution_evidence_sha256: Some(row.resolution.evidence_sha256.clone()),
+                    transcript_sha256: Some(transcript_sha(row)),
+                    disposition: crate::export_batches::Disposition::SkippedPreviouslyExported,
+                }))
+                .collect();
+            crate::export_batches::record(
+                db,
+                &crate::export_batches::ExportBatchRecord {
+                    batch_id: batch_id.to_string(),
+                    voice_name: voice_name.to_string(),
+                    legacy: false,
+                    export_manifest_sha256: manifest_sha256.clone(),
+                    certificate_sha256: Some(certificate_sha256.clone()),
+                    output_dir: output.to_string_lossy().to_string(),
+                    total_duration_ms,
+                    created_at_ms,
+                    trust_policy: crate::review_pool::trust::describe(),
+                    members,
+                },
+            )
+            .map_err(|error| {
+                AppError::Validation(format!(
+                    "export is atomically published but the batch record failed; rerun the same command to recover: {error}"
+                ))
+            })?;
+        }
         Ok(PoolDatasetResult {
             complete_voice: !subset,
             quarantined_segments,
@@ -953,6 +1097,9 @@ fn export_voice_scope(db: &Database, options: &PoolDatasetOptions, subset: bool)
             rejected_segments: rejected_rows.len(),
             tts_retained_segments: tts_retained,
             tts_excluded_segments: tts_excluded,
+            previously_exported_segments: skipped_rows.len(),
+            re_exported_segments: re_exported.len(),
+            batch_id: options.batch_id.clone(),
             total_duration_ms,
             manifest_sha256,
             sha256sums_sha256,
@@ -982,6 +1129,7 @@ mod tests {
         let options = PoolDatasetOptions {
             output_dir: directory.path().join("quarantine-subset").to_string_lossy().into_owned(),
             voice_name: "Lamo".into(),
+            batch_id: None,
         };
         assert!(export_voice(&db, &options).unwrap_err().to_string().contains("training-quarantined"));
         let result = export_approved_subset(&db, &options).unwrap();
@@ -1004,6 +1152,7 @@ mod tests {
         let options = PoolDatasetOptions {
             output_dir: directory.path().join("subset").to_string_lossy().into_owned(),
             voice_name: "Lamo".into(),
+            batch_id: None,
         };
         assert!(export_voice(&db, &options).unwrap_err().to_string().contains("not fully resolved"));
         let exported = export_approved_subset(&db, &options).unwrap();
@@ -1015,6 +1164,111 @@ mod tests {
         assert_eq!(manifest["scope"], "approved-subset");
         assert_eq!(manifest["completeVoice"], false);
         assert_eq!(export_approved_subset(&db, &options).unwrap(), exported, "an exact retry must be idempotent");
+    }
+
+    /// Owner 2026-09-15: a batch records what it delivered inside the database and a later batch never
+    /// re-delivers those clips; the same batch id re-run is idempotent; history refuses rollback.
+    #[test]
+    fn a_batch_export_records_its_clips_and_a_later_batch_skips_them() {
+        let (directory, db) = fixture();
+        let hold = crate::training_quarantine::prepare(&db, &["bounded".into()], "Held for batch one", &"b".repeat(64))
+            .unwrap();
+        crate::training_quarantine::apply(&db, &hold).unwrap();
+        let first = PoolDatasetOptions {
+            output_dir: directory.path().join("batch-1").to_string_lossy().into_owned(),
+            voice_name: "Lamo".into(),
+            batch_id: Some("approved-v1-test".into()),
+        };
+        assert!(export_voice(&db, &first).unwrap_err().to_string().contains("approved subset only"));
+        let one = export_approved_subset(&db, &first).unwrap();
+        assert_eq!((one.retained_segments, one.previously_exported_segments, one.quarantined_segments), (1, 0, 1));
+        assert_eq!(export_approved_subset(&db, &first).unwrap(), one, "an exact retry is idempotent");
+        let pool_id = review_pool::load(&db).unwrap().unwrap().pool_id;
+        assert_eq!(crate::export_batches::delivered(&db, &pool_id).unwrap().keys().collect::<Vec<_>>(), vec!["full"]);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(Path::new(&first.output_dir).join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(
+            (manifest["batchId"].as_str(), manifest["previouslyExportedSegments"].as_u64()),
+            (Some("approved-v1-test"), Some(0))
+        );
+
+        // Nothing new: the second batch refuses instead of shipping an empty artifact.
+        let second = PoolDatasetOptions {
+            output_dir: directory.path().join("batch-2").to_string_lossy().into_owned(),
+            voice_name: "Lamo".into(),
+            batch_id: Some("approved-v2-test".into()),
+        };
+        assert!(export_approved_subset(&db, &second).unwrap_err().to_string().contains("already delivered"));
+        assert!(!Path::new(&second.output_dir).exists(), "a refused batch publishes nothing");
+
+        // A legacy artifact (2026-09-08 style, no evidence digest) delivered "bounded" with a DIFFERENT
+        // text; the hold is cleared; the second batch ships "bounded" again marked as re-exported and
+        // lists the first batch's clip as skipped.
+        crate::export_batches::record(
+            &db,
+            &crate::export_batches::ExportBatchRecord {
+                batch_id: "legacy-tts-test".into(),
+                voice_name: "Lamo".into(),
+                legacy: true,
+                export_manifest_sha256: "d".repeat(64),
+                certificate_sha256: None,
+                output_dir: "C:/exports/legacy".into(),
+                total_duration_ms: 1_000,
+                created_at_ms: 5,
+                trust_policy: serde_json::json!({ "owner": "Hawzhin", "trusted": ["Lamo"] }),
+                members: vec![crate::export_batches::ExportBatchMember {
+                    segment_id: "bounded".into(),
+                    resolution_evidence_sha256: None,
+                    transcript_sha256: Some("9".repeat(64)),
+                    disposition: crate::export_batches::Disposition::Exported,
+                }],
+            },
+        )
+        .unwrap();
+        crate::training_quarantine::clear(&db, &hold.batch_id, "bounded", "Cleared for batch two", &"c".repeat(64))
+            .unwrap();
+        let two = export_approved_subset(&db, &second).unwrap();
+        assert_eq!((two.retained_segments, two.re_exported_segments, two.previously_exported_segments), (1, 1, 1));
+        let exclusions = read_jsonl(&Path::new(&second.output_dir).join("exclusions.jsonl"));
+        assert!(exclusions
+            .iter()
+            .any(|row| row["id"] == "full" && row["reason"] == "previously_exported_by_earlier_batch"));
+        let asr = read_jsonl(&Path::new(&second.output_dir).join("asr/metadata.jsonl"));
+        assert_eq!(asr.iter().map(|row| row["id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["bounded"]);
+        assert_eq!(
+            (asr[0]["reExportedChangedAuthority"].as_bool(), asr[0]["resolutionAuthority"].as_str()),
+            (Some(true), Some("consensus"))
+        );
+        assert_eq!(crate::export_batches::delivered(&db, &pool_id).unwrap().len(), 2);
+        let described = crate::export_batches::describe(&db).unwrap();
+        assert_eq!(described["batches"].as_array().unwrap().len(), 3);
+        assert_eq!(described["batches"][2]["skippedSegments"], 1);
+        assert_eq!(described["deliveredButWithdrawn"].as_array().unwrap().len(), 0);
+        let manifest2: serde_json::Value =
+            serde_json::from_slice(&fs::read(Path::new(&second.output_dir).join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest2["reExportedChangedAuthoritySegments"], 1);
+        assert!(manifest2["trustPolicy"].is_object());
+        // Once the corrected text is delivered, a further batch has nothing left.
+        let third = PoolDatasetOptions {
+            output_dir: directory.path().join("batch-3").to_string_lossy().into_owned(),
+            voice_name: "Lamo".into(),
+            batch_id: Some("approved-v3-test".into()),
+        };
+        assert!(export_approved_subset(&db, &third).unwrap_err().to_string().contains("already delivered"));
+
+        // A plain export (no batch) still ships everything and records nothing.
+        let plain = PoolDatasetOptions {
+            output_dir: directory.path().join("plain").to_string_lossy().into_owned(),
+            voice_name: "Lamo".into(),
+            batch_id: None,
+        };
+        assert_eq!(export_approved_subset(&db, &plain).unwrap().retained_segments, 2);
+        assert_eq!(
+            crate::export_batches::describe(&db).unwrap()["batches"].as_array().unwrap().len(),
+            3,
+            "a plain export records nothing"
+        );
+        assert!(crate::migrations::rollback(&db, 1).is_err(), "recorded batches refuse rollback");
     }
 
     fn rollback_fixture_to(db: &Database, target_version: i64) {
@@ -1317,7 +1571,11 @@ mod tests {
         let output = directory.path().join("export-tts");
         let result = export_voice(
             &db,
-            &PoolDatasetOptions { output_dir: output.to_string_lossy().to_string(), voice_name: "Lamo".into() },
+            &PoolDatasetOptions {
+                output_dir: output.to_string_lossy().to_string(),
+                voice_name: "Lamo".into(),
+                batch_id: None,
+            },
         )
         .unwrap();
         assert_eq!(
@@ -1360,6 +1618,7 @@ mod tests {
             &PoolDatasetOptions {
                 output_dir: first_output.to_string_lossy().to_string(),
                 voice_name: "Lamo".to_string(),
+                batch_id: None,
             },
         )
         .unwrap();
@@ -1420,6 +1679,7 @@ mod tests {
             &PoolDatasetOptions {
                 output_dir: second_output.to_string_lossy().to_string(),
                 voice_name: "Lamo".to_string(),
+                batch_id: None,
             },
         )
         .unwrap();
@@ -1432,6 +1692,7 @@ mod tests {
             &PoolDatasetOptions {
                 output_dir: first_output.to_string_lossy().to_string(),
                 voice_name: "Lamo".to_string(),
+                batch_id: None,
             },
         )
         .unwrap();
@@ -1447,6 +1708,7 @@ mod tests {
             &PoolDatasetOptions {
                 output_dir: directory.path().join("rights-refused").to_string_lossy().to_string(),
                 voice_name: "Lamo".to_string(),
+                batch_id: None,
             },
         )
         .unwrap_err()
@@ -1472,6 +1734,7 @@ mod tests {
             &PoolDatasetOptions {
                 output_dir: directory.path().join("audio-refused").to_string_lossy().to_string(),
                 voice_name: "Lamo".to_string(),
+                batch_id: None,
             },
         )
         .unwrap_err()
@@ -1487,7 +1750,11 @@ mod tests {
 
         let error = export_voice(
             &db,
-            &PoolDatasetOptions { output_dir: output.to_string_lossy().to_string(), voice_name: "Lamo".to_string() },
+            &PoolDatasetOptions {
+                output_dir: output.to_string_lossy().to_string(),
+                voice_name: "Lamo".to_string(),
+                batch_id: None,
+            },
         )
         .unwrap_err()
         .to_string();
@@ -1504,7 +1771,11 @@ mod tests {
 
         let error = export_voice(
             &db,
-            &PoolDatasetOptions { output_dir: output.to_string_lossy().to_string(), voice_name: "Lamo".to_string() },
+            &PoolDatasetOptions {
+                output_dir: output.to_string_lossy().to_string(),
+                voice_name: "Lamo".to_string(),
+                batch_id: None,
+            },
         )
         .unwrap_err()
         .to_string();
@@ -1518,7 +1789,11 @@ mod tests {
 
         let retried = export_voice(
             &db,
-            &PoolDatasetOptions { output_dir: output.to_string_lossy().to_string(), voice_name: "Lamo".to_string() },
+            &PoolDatasetOptions {
+                output_dir: output.to_string_lossy().to_string(),
+                voice_name: "Lamo".to_string(),
+                batch_id: None,
+            },
         )
         .unwrap();
         assert_eq!(
@@ -1542,14 +1817,22 @@ mod tests {
         arm_publication_crash();
         export_voice(
             &db,
-            &PoolDatasetOptions { output_dir: output.to_string_lossy().to_string(), voice_name: "Lamo".to_string() },
+            &PoolDatasetOptions {
+                output_dir: output.to_string_lossy().to_string(),
+                voice_name: "Lamo".to_string(),
+                batch_id: None,
+            },
         )
         .unwrap_err();
         fs::write(output.join("unexpected.txt"), b"not part of the certified export").unwrap();
 
         let error = export_voice(
             &db,
-            &PoolDatasetOptions { output_dir: output.to_string_lossy().to_string(), voice_name: "Lamo".to_string() },
+            &PoolDatasetOptions {
+                output_dir: output.to_string_lossy().to_string(),
+                voice_name: "Lamo".to_string(),
+                batch_id: None,
+            },
         )
         .unwrap_err()
         .to_string();
@@ -1568,6 +1851,7 @@ mod tests {
             &PoolDatasetOptions {
                 output_dir: directory.path().join("certified").to_string_lossy().to_string(),
                 voice_name: "Lamo".to_string(),
+                batch_id: None,
             },
         )
         .unwrap();
@@ -1707,7 +1991,11 @@ mod tests {
     fn export_error(db: &Database, output: &Path, voice_name: &str) -> String {
         export_voice(
             db,
-            &PoolDatasetOptions { output_dir: output.to_string_lossy().to_string(), voice_name: voice_name.into() },
+            &PoolDatasetOptions {
+                output_dir: output.to_string_lossy().to_string(),
+                voice_name: voice_name.into(),
+                batch_id: None,
+            },
         )
         .unwrap_err()
         .to_string()
@@ -1753,7 +2041,11 @@ mod tests {
         let output = directory.path().join("lite-export");
         let result = export_voice(
             &db,
-            &PoolDatasetOptions { output_dir: output.to_string_lossy().to_string(), voice_name: "Lamo".to_string() },
+            &PoolDatasetOptions {
+                output_dir: output.to_string_lossy().to_string(),
+                voice_name: "Lamo".to_string(),
+                batch_id: None,
+            },
         )
         .unwrap();
         assert_eq!(result.retained_segments, 1);

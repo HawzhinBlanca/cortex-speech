@@ -38,6 +38,11 @@
       "version": 72,
       "description": "Append-only training quarantine independent of review and compensation",
       "sourceBlockSha256": "54b6e02cf3d04b4e9a66c282f3783eb955ebca4682995baff73496f7761bc0bd"
+    },
+    {
+      "version": 73,
+      "description": "Append-only review-pool export batches so later exports skip delivered clips",
+      "sourceBlockSha256": "af8c7480236c3627677ddf2f47a1e02c1c5e8719f554fc5c854e892047dddbae"
     }
   ]
 }

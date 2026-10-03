@@ -4175,7 +4175,7 @@ mod tests {
         decide(&restored, &restored_pool, "Iftikhar", "دەقی کۆتایی", "123e4567-e89b-42d3-a456-426614175006", 10);
         assert_eq!(segment_resolutions(&restored, None).unwrap()[0].status, "resolved");
         assert!(
-            crate::migrations::rollback(&restored, 2).is_err(),
+            crate::migrations::rollback(&restored, 3).is_err(),
             "populated round cannot roll back into trusted history"
         );
     }

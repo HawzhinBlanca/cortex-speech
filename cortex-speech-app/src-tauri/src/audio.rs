@@ -77,7 +77,68 @@ pub fn decode_passes_on_this_thread() -> usize {
 static PCM_CACHE: LazyLock<Mutex<LruCache<String, (u32, Vec<i16>)>>> =
     LazyLock::new(|| Mutex::new(LruCache::new(pcm_cache_capacity())));
 
+/// Content keys already computed, addressed by the cheap file identity `(len, mtime)`.
+///
+/// MEASURED COST THIS AVOIDS (2026-09-16, the owner's box): `pcm_cache_key` reads and BLAKE3-hashes
+/// the WHOLE source before the decoded-PCM cache can be consulted, and the library lives on D:, a
+/// 5900-rpm SATA disk. One 157 MB episode read cold took 1075 ms; with four readers on different
+/// episodes the slowest took 4.42 s. Every `/api/audio` miss paid that, and a reviewer opens a clip
+/// they have not played before constantly — so a phone waited seconds for the first byte of a
+/// ten-second clip, which is what reviewers reported as "slow" and "sometimes doesn't play".
+///
+/// Identity is STILL the file's content hash: this only skips recomputing it while length and mtime
+/// are both unchanged, the same staleness trade rsync and ccache make. A file edited in place moves
+/// its mtime, so `decode_to_pcm_cache_is_bound_to_audio_content_not_path` keeps holding. Entries are
+/// cheap (a path and 64 hex chars), so this holds far more sources than the PCM cache itself and a
+/// reviewer moving between episodes never re-reads one.
+#[allow(clippy::type_complexity)]
+static PCM_KEY_MEMO: LazyLock<Mutex<LruCache<std::path::PathBuf, (u64, std::time::SystemTime, String)>>> =
+    LazyLock::new(|| Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap_or(NonZeroUsize::MIN))));
+
+fn lock_pcm_key_memo() -> MutexGuard<'static, LruCache<std::path::PathBuf, (u64, std::time::SystemTime, String)>> {
+    PCM_KEY_MEMO.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("Recovering poisoned PCM key memo");
+        poisoned.into_inner()
+    })
+}
+
+/// Clear the memo of file-identity to content-hash. Paired with [`clear_pcm_cache`] in tests.
+pub fn clear_pcm_key_memo() {
+    lock_pcm_key_memo().clear();
+}
+
+/// How long a file must have been untouched before its `(len, mtime)` may stand in for its content.
+///
+/// Windows advances the system clock in ~15.6 ms ticks, so two writes close together can land on the
+/// SAME mtime — and a same-length rewrite inside one tick would otherwise be served stale decoded
+/// PCM. Anything still settling is hashed for real. Production sources are months old and always take
+/// the shortcut; a file being written right now never does, which is also what keeps
+/// `decode_to_pcm_cache_is_bound_to_audio_content_not_path` honest rather than merely passing.
+const STAMP_SETTLE: Duration = Duration::from_secs(2);
+
+/// Pure so the rule is testable without waiting on a real clock.
+fn stamp_is_settled(modified: std::time::SystemTime, now: std::time::SystemTime) -> bool {
+    now.duration_since(modified).is_ok_and(|age| age >= STAMP_SETTLE)
+}
+
 fn pcm_cache_key(path: &Path) -> AppResult<String> {
+    // A file whose metadata cannot be read is hashed unconditionally: never let an unreadable stamp
+    // turn into a WRONG key. `None` simply means "no shortcut available this time".
+    let stamp = std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok().map(|at| (meta.len(), at)))
+        .filter(|(_, modified)| stamp_is_settled(*modified, std::time::SystemTime::now()));
+    if let Some((len, modified)) = stamp {
+        let mut memo = lock_pcm_key_memo();
+        if let Some((known_len, known_modified, key)) = memo.get(path) {
+            if *known_len == len && *known_modified == modified {
+                return Ok(key.clone());
+            }
+        }
+    }
+    // The hash runs OUTSIDE the memo lock: it is the seconds-long part, and holding the lock through
+    // it would serialise every reviewer's audio behind one file — the same reason `cached_audio`
+    // decodes outside its own lock.
     let mut file = std::fs::File::open(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0_u8; 128 * 1024];
@@ -88,7 +149,11 @@ fn pcm_cache_key(path: &Path) -> AppResult<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hasher.finalize().to_hex().to_string())
+    let key = hasher.finalize().to_hex().to_string();
+    if let Some((len, modified)) = stamp {
+        lock_pcm_key_memo().put(path.to_path_buf(), (len, modified, key.clone()));
+    }
+    Ok(key)
 }
 
 fn pcm_cache_capacity() -> NonZeroUsize {
@@ -210,6 +275,55 @@ pub fn check_audio_file<P: AsRef<Path>>(path: P) -> AppResult<AudioInfo> {
 
 /// Decode any audio file to 16kHz mono 16-bit PCM using symphonia.
 /// Results are cached in a small LRU to avoid re-decoding the same file.
+/// The exact round trip `decode_to_pcm` performs on a 16-bit PCM sample: symphonia hands the decoder
+/// f32 in [-1, 1) as `sample / 32768`, and `interleaved_f32_to_pcm_i16` multiplies by 32767. Written
+/// out here so a windowed read can reproduce the full decode's samples EXACTLY rather than
+/// approximately — `a_windowed_read_is_identical_to_the_full_decode` is what proves it still does,
+/// and would fail loudly if a symphonia bump ever changed the conversion.
+fn i16_through_f32(sample: i16) -> i16 {
+    ((sample as f32 / 32768.0).clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+}
+
+/// Read ONLY `[start_sample, end_sample)` out of a canonical 16 kHz mono 16-bit PCM WAV.
+///
+/// WHY: the review library is 20,253 sources of 120-160 MB each (85 minutes per episode) on D:, a
+/// 5900-rpm HDD, and a clip is ten seconds of one of them. `decode_to_pcm` reads and decodes the WHOLE
+/// episode and `slice_pcm_by_alignment` then throws away 99.8% of it. Measured 2026-09-16: 1075 ms to
+/// read one 157 MB episode cold, 4.42 s for the slowest of four concurrent readers — on one of only
+/// ten accept threads. Caching cannot rescue this: over the last two days' 123 real playbacks the
+/// reviewers' queue served 109 DISTINCT sources, so nearly every clip is a first touch.
+///
+/// Returns `None` for anything that is not exactly this format, so the caller falls back to the full
+/// decode and every other source (MP3 masters, stereo, other rates) behaves precisely as before.
+pub fn read_canonical_wav_window(path: &Path, start_sample: usize, end_sample: usize) -> Option<Vec<i16>> {
+    let reader = hound::WavReader::open(path).ok()?;
+    let spec = reader.spec();
+    if spec.channels != 1
+        || spec.sample_rate != TARGET_SAMPLE_RATE
+        || spec.bits_per_sample != 16
+        || spec.sample_format != hound::SampleFormat::Int
+    {
+        return None;
+    }
+    // Clamp exactly as `slice_pcm_by_alignment` clamps against the decoded length: for this format the
+    // decode preserves the sample count one-for-one (asserted by
+    // `decode_to_pcm_preserves_i16_sample_values_within_1_lsb`), so the two bounds are the same bound.
+    let end_sample = end_sample.min(reader.len() as usize);
+    if end_sample <= start_sample {
+        return None;
+    }
+    let wanted = end_sample - start_sample;
+    let mut reader = reader;
+    reader.seek(u32::try_from(start_sample).ok()?).ok()?;
+    let mut window = Vec::with_capacity(wanted);
+    for sample in reader.samples::<i16>().take(wanted) {
+        window.push(i16_through_f32(sample.ok()?));
+    }
+    // A short read means the file ended early or is malformed. Fall back rather than serve a clip that
+    // is quietly shorter than the one the reviewer is being asked to judge.
+    (window.len() == wanted).then_some(window)
+}
+
 pub fn decode_to_pcm<P: AsRef<Path>>(path: P) -> AppResult<(u32, Vec<i16>)> {
     // A caller with no way to stop waiting also has no way to abort: a flag that is never set.
     decode_to_pcm_abortable(path, &AtomicBool::new(false))
@@ -2179,6 +2293,131 @@ mod tests {
 
         assert_ne!(first_pcm, second_pcm, "same-path changed audio must not reuse stale decoded PCM");
         clear_pcm_cache();
+    }
+
+    #[test]
+    fn a_windowed_read_is_identical_to_the_full_decode() {
+        use hound::{WavSpec, WavWriter};
+        use tempfile::TempDir;
+
+        // THE load-bearing proof for the windowed read: the clip a reviewer hears, and its bytes, must
+        // not change because the server stopped reading 157 MB to serve ten seconds. Equality is
+        // asserted against the real full-decode path, so a symphonia bump that altered the i16 -> f32
+        // conversion reds this test instead of silently shifting every served clip by an LSB.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("canonical.wav");
+        let spec =
+            WavSpec { channels: 1, sample_rate: 16000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        // Spans both signs, the extremes, and a sweep — the values where a scaling error would show.
+        let input: Vec<i16> = (0..4096)
+            .map(|i| ((i as f64 * std::f64::consts::TAU / 97.0).sin() * 32767.0) as i16)
+            .chain([0i16, 1, -1, 32767, -32768, 16384, -16384, 255, -255])
+            .collect();
+        {
+            let mut writer = WavWriter::create(&path, spec).unwrap();
+            for &s in &input {
+                writer.write_sample(s).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+
+        let (rate, whole) = decode_to_pcm(&path).unwrap();
+        assert_eq!(rate, TARGET_SAMPLE_RATE);
+        for (start, end) in [(0usize, input.len()), (0, 1), (1000, 1064), (input.len() - 9, input.len())] {
+            let window = read_canonical_wav_window(&path, start, end).expect("canonical wav must take the fast path");
+            assert_eq!(window, whole[start..end], "windowed read must equal the full decode over [{start}, {end})");
+        }
+
+        // Past the end clamps like the slicer does; an empty or inverted range declines.
+        assert_eq!(
+            read_canonical_wav_window(&path, input.len() - 4, input.len() + 500),
+            Some(whole[input.len() - 4..].to_vec()),
+            "an over-long end must clamp to the file, not fail"
+        );
+        assert!(read_canonical_wav_window(&path, 10, 10).is_none(), "an empty range must decline");
+        assert!(read_canonical_wav_window(&path, 20, 5).is_none(), "an inverted range must decline");
+    }
+
+    #[test]
+    fn a_non_canonical_source_declines_the_windowed_read() {
+        use hound::{WavSpec, WavWriter};
+        use tempfile::TempDir;
+
+        // Anything that is not 16 kHz mono 16-bit PCM must fall back to the full decode, because the
+        // fast path reproduces NO downmix and NO resample. Stereo is the case that would corrupt a clip
+        // silently (interleaved samples read as mono), so it is the one pinned here.
+        let dir = TempDir::new().unwrap();
+        let stereo = dir.path().join("stereo.wav");
+        let spec =
+            WavSpec { channels: 2, sample_rate: 16000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        {
+            let mut writer = WavWriter::create(&stereo, spec).unwrap();
+            for i in 0..512 {
+                writer.write_sample(i as i16).unwrap();
+                writer.write_sample(-(i as i16)).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        assert!(read_canonical_wav_window(&stereo, 0, 100).is_none(), "stereo must fall back to the full decode");
+
+        let wrong_rate = dir.path().join("rate.wav");
+        let spec =
+            WavSpec { channels: 1, sample_rate: 48000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        {
+            let mut writer = WavWriter::create(&wrong_rate, spec).unwrap();
+            for i in 0..512 {
+                writer.write_sample(i as i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        assert!(read_canonical_wav_window(&wrong_rate, 0, 100).is_none(), "a non-target rate must fall back");
+    }
+
+    #[test]
+    fn stamp_is_settled_only_after_the_window() {
+        let now = std::time::SystemTime::now();
+        let fresh = now - Duration::from_millis(15); // one Windows clock tick
+        let settled = now - Duration::from_secs(3);
+        assert!(!stamp_is_settled(fresh, now), "a file written a tick ago must still be hashed");
+        assert!(stamp_is_settled(settled, now), "a settled file may use its (len, mtime) stamp");
+        // A stamp in the FUTURE (clock moved back, copied file) yields Err from duration_since and
+        // must read as "not settled" rather than panicking or silently trusting it.
+        assert!(!stamp_is_settled(now + Duration::from_secs(60), now), "a future mtime must not be trusted");
+    }
+
+    #[test]
+    fn pcm_cache_key_uses_a_settled_stamp_and_notices_a_new_one() {
+        use tempfile::TempDir;
+
+        // Backdate the mtime with std's own FileTimes so the settle window is satisfied without the
+        // test sleeping for it.
+        fn backdate(path: &Path, seconds: u64) -> std::time::SystemTime {
+            let when = std::time::SystemTime::now() - Duration::from_secs(seconds);
+            let handle = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            handle.set_times(std::fs::FileTimes::new().set_modified(when)).unwrap();
+            when
+        }
+
+        clear_pcm_key_memo();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("settled.wav");
+
+        write_constant_wav(&path, 1000);
+        let stamp = backdate(&path, 60);
+        let first = pcm_cache_key(&path).unwrap();
+
+        // Same length, DIFFERENT bytes, and the stamp put back exactly as it was: the memo must be
+        // what answers, which is the whole point — the 157 MB re-read never happens.
+        write_constant_wav(&path, 2000);
+        let handle = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        handle.set_times(std::fs::FileTimes::new().set_modified(stamp)).unwrap();
+        drop(handle);
+        assert_eq!(pcm_cache_key(&path).unwrap(), first, "an unchanged (len, mtime) stamp must reuse the key");
+
+        // Move the stamp and the real content hash must come back.
+        backdate(&path, 30);
+        assert_ne!(pcm_cache_key(&path).unwrap(), first, "a changed stamp must re-hash the file");
+        clear_pcm_key_memo();
     }
 
     #[test]

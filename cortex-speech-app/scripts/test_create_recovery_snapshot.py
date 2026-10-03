@@ -897,7 +897,9 @@ def test_schema72_snapshot_counts_training_quarantine_and_preserves_schema71_sha
     tables = ("training_quarantine_holds", "training_quarantine_clearances")
     assert snapshot.evidence_tables_for_schema(71) == snapshot.evidence_tables_for_schema(70)
     assert snapshot.evidence_tables_for_schema(72) == snapshot.evidence_tables_for_schema(71) + tables
-    assert snapshot.evidence_tables_for_schema(73) == snapshot.evidence_tables_for_schema(72)
+    batches = ("review_pool_export_batches", "review_pool_export_batch_members")
+    assert snapshot.evidence_tables_for_schema(73) == snapshot.evidence_tables_for_schema(72) + batches
+    assert snapshot.evidence_tables_for_schema(74) == snapshot.evidence_tables_for_schema(73)
 
 
 def test_schema70_snapshot_binds_supersessions_and_preserves_schema69_shape() -> None:
