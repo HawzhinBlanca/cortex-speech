@@ -1,5 +1,45 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-10-15 — v12 runbook steps 6-9 run: manifest written, first fused GPU-1 load, gate verdict REJECT, canary built
+
+**Owner (verbatim, 2026-10-15):** "yes track the cortex PR too and finish the process". Branch `claude/v12-candidate`
+(PR #132). Commands, hashes and printed results: `docs/V12_CANDIDATE_PLAN_2026-10-08.md`, "Runbook steps 6-9".
+
+- **`feat(deployment)` `10f704e1`:** `write_external_deployment.py` writes the schema-2 `external_offline` manifest
+  and `external_offline_record.json` by hashing the five real input files. v12:
+  `omniasr-7b-external-2e659f9fcda9f7fdca7a9922`, deployment `dae2307fbcd5f0ccb31523030b20212826da6bead0e7a48cea51e6f1df0cf977`
+  in `/home/ai/cortex_v12_candidate/`; the server verifier printed `verified`. **Not registered.**
+- **`feat(promotion-gate)` `e6861382`:** `emit_scorecard_provenance.py` emits schema-2 deployment-bound sidecars.
+- **`fix(7b-server)` `6fbcc92c`:** the first real fused load died after verification: fairseq2 percent-encodes an
+  asset path and never decodes it (`/mnt/f/Kurdish%20Sorani%20Dataset/...`). Assets whose path that round trip
+  changes now load through a safe-named symlink. Test written first; it failed without the fix.
+- **Smoke run (GPU 1, omniasr :8000 paused):** v12 served, client `--health --expected-pointer` passed with
+  `provenanceKind external_offline`, `worker gpu1`; 3 clips transcribed with identity validated on each reply.
+- **Scoring, 480 clips, eval manifest `449cd034…`, one model at a time, 0 SKIP (`scorecard_7b.py` printed):**
+
+  | model | deployment | micro CER [95% CI] | micro WER [95% CI] |
+  |---|---|---|---|
+  | champion `omniasr-7b-legacy-c348ade8a816` | `ae33143e…` | 5.43% [4.75%, 6.17%] | 15.09% [13.38%, 16.86%] |
+  | v12 `omniasr-7b-external-2e659f9fcda9f7fdca7a9922` | `dae2307f…` | 12.31% [11.21%, 13.67%] | 34.06% [32.52%, 35.61%] |
+
+- **Gate (`promotion_gate.py`, deployment binding): `REJECT`** — "CER did not improve (0.0543 -> 0.1231)", "WER did
+  not improve (0.1509 -> 0.3406)", all 9 protected slices regressed in CER and WER. Verdict sha256 `680b260b…`
+  in gitignored `runs/heldout_eval_v12/gate/`. `owner_promote` cannot use it (it requires `JUDGED_PASS`).
+- **Canary:** `v12-promotion-canary-v1`, 8 cases, `suiteSha256 2ec01c06fb0cfa637670f26f88c0dd9034af79200e3619d2452ef0795d5a52bf`.
+- **Found, not fixed:** (1) the registry champion's manifest path now holds the unregistered v6 (`0eecab8e…`); the
+  legacy bytes are in `/home/ai/cortex_champion_model_backup_legacy/`, which is what was scored. (2) nvidia-smi read
+  ~1.1 GB used on GPU 1 with a 7B model loaded, so the server's busy-GPU floor cannot see a co-resident 7B.
+- **Production:** omniasr :8000 restored after every attempt; final `/health` showed
+  `kurdish_omniasr_7b_v12_c750.pt`, `vram_allocated_gb 14.55`.
+
+**Evidence (Windows, normal `target/`):** `cargo test --manifest-path src-tauri/Cargo.toml` lib `2760 passed; 0 failed;
+8 ignored`, every target ok; `cargo clippy ... --all-targets --all-features -- -D warnings` exit 0; `cargo fmt --check`
+clean; `npm run test:python-policies` "150 policy test scripts passed".
+
+**Next (owner):** the v12 deployment is rejected on the library held-out set, so the promotion runbook stops at step 9.
+Rule on whether to (a) stop pursuing v12 for Cortex, or (b) investigate why it trails the registry champion here
+(Cortex's pipeline decode vs omniasr's beam-5 serving path; in one smoke clip v12 wrote the digit 1 where the reference spells the word).
+
 ## 2026-10-15 — v12 Part B steps 3-5: held-out eval set, deployment-hash gate binding, owner-only promotion
 
 **Owner (verbatim, 2026-10-15):** "Approve all: GPU-1-only fix (Part A), fused-model deployments, an honest 'external'

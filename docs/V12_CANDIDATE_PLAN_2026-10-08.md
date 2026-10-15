@@ -1,8 +1,9 @@
 # v12 as a champion CANDIDATE + GPU-1-only device policy (plan, 2026-10-08)
 
 - **Status:** owner approved building the mechanisms (2026-10-15, see the Approved-by lines). Part A and Part B steps
-  1-3 and 5 are implemented on this branch (see its git log). Not done: the GPU scoring of step 3, the canary of step 4,
-  step 6, and every owner ruling below. Nothing is registered or promoted.
+  1-5 are implemented and run on this branch (see its git log and "Runbook steps 6-9, run 2026-10-15" below).
+  **The deployment-bound gate verdict for v12 is `REJECT`** on the library held-out set. Not done: step 6 and every
+  owner ruling below. Nothing is registered or promoted.
 - **Branch:** `claude/v12-candidate` (worktree `D:\cortex-worktrees\v12-candidate`, from `origin/main` `868c4983`).
 - **Owner's direction (2026-10-08):** v12 enters **as a candidate through the normal promotion process**, not as a direct swap ("option a"). Separately, make the 7B service use GPU 1 only.
 - **Rules followed:** `docs/OWNER_CANON.md`, `AGENT_CHARTER.md`, `cortex-speech-app/CLAUDE.md`. Nothing here weakens a canon pin or a gate. Every canon edit below is listed for the **owner to write** as `change canon: <item>`.
@@ -95,8 +96,8 @@ On `868c4983`, five things block a fused, non-flywheel v12 from reaching canary 
   health, the direct transport and the client accept the kind; `registry.rs` registers it as a
   **candidate only**. `refuse_external_offline_promotion` blocks it in `gate_and_promote` and in the
   promotion saga's registry verification; the legacy bootstrap and `promotion_gate.py` (now an explicit
-  `kind == "flywheel"` check) refuse it too. No manifest-writing tool for v12 exists yet, and nothing here
-  registers or promotes v12.
+  `kind == "flywheel"` check) refuse it too. `scripts/write_external_deployment.py` writes the manifest
+  from the real files (it hashes them; no hash is ever an argument); nothing here registers or promotes v12.
 - **Part B step 3a (held-out set):** `scripts/build_heldout_eval_set.py --train-manifest ... --out-dir ...`
   takes human-verdict library clips (`human_decision` accept/edit; the reference is `verdict_transcript`)
   and drops any clip that a given training manifest contains. Text leakage uses omniasr-v11-audit's `canon`
@@ -145,8 +146,64 @@ On `868c4983`, five things block a fused, non-flywheel v12 from reaching canary 
   **Limit:** this is a procedural barrier, not a cryptographic one. An agent with the owner's GitHub
   rights and a TTY could forge all three. Requiring signed commits on the canon line is the upgrade.
 
-## How v12 would be promoted once the owner's canon lines land (runbook; nothing here has been run)
-Only the owner can do steps 1-5. An agent may prepare steps 6-9 but may not run 10.
+## Runbook steps 6-9, run 2026-10-15 (agent; results exactly as the tools printed them)
+- **Step 6, manifest (not registered).** The plan's approval says "nothing registers or promotes v12", so v12 is
+  **not** registered, not even as a candidate. In WSL:
+  `python3 cortex-speech-app/scripts/write_external_deployment.py --checkpoint .../champion_v12_lora64_750_fused/kurdish_omniasr_7b_v12_c750.pt
+  --tokenizer /home/ai/cortex_v12_candidate/omniASR_tokenizer_written_v2.model --parent-checkpoint
+  .../champion_v11_supreme_fused/kurdish_omniasr_7b_v11_champion.pt --training-manifest
+  /mnt/c/Users/Wareen/Desktop/omniasr-v11-audit/data/v12_train.jsonl --evidence
+  /mnt/c/Users/Wareen/Desktop/omniasr-v11-audit/release/kurdish-omniasr-7b-v12/SHA256SUMS --out
+  /home/ai/cortex_v12_candidate/deployment_manifest.json` printed:
+  - `modelVersionId` `omniasr-7b-external-2e659f9fcda9f7fdca7a9922`;
+  - `deploymentSha256` `dae2307fbcd5f0ccb31523030b20212826da6bead0e7a48cea51e6f1df0cf977`, `manifestSha256`
+    `89675a7ad4c0a354d60b608a94a90a483ce20d2ba37b6a2fab4ffdc1b4c7f52a`;
+  - checkpoint `f7b3a5e2…5ff5fb2` (15,610,646,560 B), tokenizer `8aa11a10…08240b1e`, parent (fused v11)
+    `93d8b1da7cbc98878aec75e1ef4c65f0c1f2ba67dd014e2e08f574176d7abfc0`, training manifest
+    `464a31d758519a9e6b74bae2c8ccf1a70af62b50929e1c8ce8839d2f5171c1fc`, evidence (release `SHA256SUMS`, which pins
+    `MODEL_CARD.md` and every eval file; `sha256sum -c` passed) `254b6b27beca3f9571c160b404c255fee7e533b0813f4184de0157afaac7fdd0`.
+  - `cortex_7b_server.py --verify-deployment ... --expected-sha256 dae2307f… --expected-model-id ...` printed
+    `"status": "verified"`, `"provenanceKind": "external_offline"`.
+- **Smoke run (first real fused load), GPU 1, omniasr :8000 paused with a live `MAINTENANCE` PID.**
+  `CORTEX_7B_CHAMPION_POINTER=<scratch pointer> CORTEX_7B_PORT=8898 CORTEX_7B_DEVICES=1 python cortex_7b_server.py`.
+  The first attempt verified every byte, then died: fairseq2 looked for `/mnt/f/Kurdish%20Sorani%20Dataset/...`
+  (fixed in `fix(7b-server)`, test-first). After the fix it served; `cortex_7b_client.py --health
+  --expected-pointer` returned `__HEALTH__` with `modelVersionId omniasr-7b-external-2e659f9fcda9f7fdca7a9922`,
+  `provenanceKind external_offline`, `worker gpu1`, and 3 clips transcribed through the client protocol with the
+  identity validated on every reply.
+- **Step 7, scoring** (`scorecard_7b.py`, `CORTEX_7B_WORKERS=1`, one model loaded at a time; 0 SKIP each). The
+  champion is the **registry** champion `omniasr-7b-legacy-c348ade8a816` (deployment `ae33143e…`), served from its
+  byte-exact copy `/home/ai/cortex_champion_model_backup_legacy/` because `/home/ai/cortex_champion_model/` now holds
+  the unregistered v6 (see the Warning below). Printed:
+  - v12: `micro CER = 12.31%   95% CI [11.21%, 13.67%]   N=480`, `micro WER = 34.06%   95% CI [32.52%, 35.61%]`;
+  - champion: `micro CER = 5.43%   95% CI [4.75%, 6.17%]   N=480`, `micro WER = 15.09%   95% CI [13.38%, 16.86%]`.
+  Sidecars: `emit_scorecard_provenance.py --scorecard ... --role ... --deployment ... --eval-manifest
+  runs/heldout_eval_v12/heldout_eval.tsv` (schema 2, new in `feat(promotion-gate)`).
+- **Step 8, gate.** `promotion_gate.py gate/champion/omni7b_results.tsv gate/v12/omni7b_results.tsv --eval-manifest
+  runs/heldout_eval_v12/heldout_eval.tsv --slices runs/heldout_eval_v12/eval_slices.tsv --champion-deployment
+  /home/ai/cortex_champion_model_backup_legacy/deployment_manifest.json --challenger-deployment
+  /home/ai/cortex_v12_candidate/deployment_manifest.json --out gate/v12_vs_champion_verdict.json` printed
+  **`REJECT`** (exit 1): "CER did not improve (0.0543 -> 0.1231)", "WER did not improve (0.1509 -> 0.3406)", and
+  every one of the 9 protected slices REGRESSED in CER and WER. Verdict sha256
+  `680b260b2d9fe526a3d13ee2c8be6da0c098c924ab282bd811e89d615adcba15`; all files in gitignored
+  `runs/heldout_eval_v12/gate/`.
+- **Step 9, canary.** `build_promotion_canary.py --suite-id v12-promotion-canary-v1` wrote 8 cases to
+  `%APPDATA%\cortex-speech\promotion_canaries\v12-promotion-canary-v1.json`, `suiteSha256 =
+  2ec01c06fb0cfa637670f26f88c0dd9034af79200e3619d2452ef0795d5a52bf`.
+
+> [!WARNING] Measured, not resolved here
+> - **The registry champion's manifest path no longer holds its bytes.** The registry and `champion.json` pin
+>   `omniasr-7b-legacy-c348ade8a816` at `/home/ai/cortex_champion_model/deployment_manifest.json` (`ae33143e…`); that
+>   file is now v6 (`0eecab8e…`, model id `omniasr-7b-champion-v6-ef757e58ee57`), so a pointer-bound start refuses.
+>   The legacy bytes survive in `/home/ai/cortex_champion_model_backup_legacy/`. v6 is not registered and was not scored.
+> - **nvidia-smi does not see the 7B allocations on this rig right now:** GPU 1 read 1139 MiB used with v12 loaded
+>   and 1105 MiB with the champion loaded (while omniasr's torch reports 14.55 GB). The server's "busy GPU 1 refuses"
+>   floor therefore cannot see a co-resident 7B; pausing omniasr by hand remains necessary.
+
+## How v12 would be promoted once the owner's canon lines land (runbook)
+Only the owner can do steps 1-5. An agent may prepare steps 6-9 but may not run 10. Steps 6-9 were run on
+2026-10-15 (above): the verdict is **REJECT**, so step 10 cannot proceed for this v12 deployment
+(`owner_promote` requires `JUDGED_PASS`).
 1. **FLEURS-train ruling:** write `change canon: FLEURS — train split may be used for training; the test
    split stays the frozen eval set`, or rule v12 ineligible (decision 1 below).
 2. **CORDI share-alike ruling:** v11-lineage `next_phase_train` contains CORDI rows. Rule whether training on
@@ -157,10 +214,10 @@ Only the owner can do steps 1-5. An agent may prepare steps 6-9 but may not run 
    production AI model" for this promotion (decision 5).
 5. **Pool timing:** confirm that the current review pool has finished on the legacy champion, or schedule
    the promotion after it (decision 4). Promotion pauses the live pool for good.
-6. Write v12's schema-2 `external_offline` deployment manifest (no tool exists yet), verify it, and register
-   it as a candidate.
+6. Write v12's schema-2 `external_offline` deployment manifest (`write_external_deployment.py`), verify it,
+   and register it as a candidate (registration only after the owner's rulings).
 7. Score the champion and then v12 on GPU 1 over `runs/heldout_eval_v12/heldout_eval.tsv` (`scorecard_7b.py`),
-   then write schema-2 deployment sidecars.
+   then write schema-2 deployment sidecars (`emit_scorecard_provenance.py --deployment`).
 8. Run `promotion_gate.py ... --champion-deployment ... --challenger-deployment ...` where the checkpoint bytes
    are (WSL). It must print `JUDGED_PASS`.
 9. Build the canary suite into `<data_dir>/promotion_canaries/` (`build_promotion_canary.py`).
