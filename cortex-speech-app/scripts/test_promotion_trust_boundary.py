@@ -57,6 +57,21 @@ class PromotionTrustBoundary(unittest.TestCase):
                 f"{path.name} exposes saga admission before backend evidence authorization exists",
             )
 
+    def test_external_offline_is_refused_by_every_automatic_promotion_path(self) -> None:
+        registry = (RUST / "registry.rs").read_text(encoding="utf-8")
+        runtime = (RUST / "champion_promotion_runtime.rs").read_text(encoding="utf-8")
+        for label, body in (
+            ("gate_and_promote", function_body(registry, "pub fn gate_and_promote")),
+            ("saga verify_registered_deployment", function_body(runtime, "fn verify_registered_deployment")),
+        ):
+            self.assertIn(
+                "refuse_external_offline_promotion(",
+                body,
+                f"{label} must refuse an external_offline model until an owner-only entry point exists",
+            )
+        bootstrap = function_body(registry, "pub fn bootstrap_verified_legacy_deployment")
+        self.assertIn("DeploymentProvenance::LegacyBootstrap", bootstrap)
+
     def test_only_production_runtime_mutates_champion_outside_tests(self) -> None:
         offenders: list[str] = []
         for path in RUST.rglob("*.rs"):

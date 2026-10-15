@@ -41,7 +41,16 @@ def _component(root: Path, name: str, raw: bytes) -> dict:
     return {"path": name, "sha256": _sha(raw), "size_bytes": len(raw)}
 
 
+EXTERNAL_EVIDENCE = {
+    "training_manifest_sha256": "a" * 64,
+    "parent_checkpoint_sha256": "b" * 64,
+    "evidence_sha256": "c" * 64,
+}
+
+
 def _provenance(kind: str) -> dict:
+    if kind == "external_offline":
+        return {"kind": "external_offline", "training_provenance": "external_unverified", **EXTERNAL_EVIDENCE}
     if kind == "legacy_bootstrap":
         return {
             "kind": "legacy_bootstrap",
@@ -79,11 +88,10 @@ def _write_manifest(root: Path, provenance_kind: str = "flywheel") -> tuple[Path
     base = _component(root, "base.pt", b"base")
     base["id"] = "omniasr-base-v2"
     provenance = _provenance(provenance_kind)
-    model_id = (
-        f"omniasr-7b-challenger-{provenance['training_run_id'][:24]}"
-        if provenance_kind == "flywheel"
-        else "omniasr-7b-legacy-bootstrap"
-    )
+    model_id = {
+        "flywheel": lambda: f"omniasr-7b-challenger-{provenance['training_run_id'][:24]}",
+        "external_offline": lambda: f"omniasr-7b-external-{_sha(_mod._canonical_json_bytes(EXTERNAL_EVIDENCE))[:24]}",
+    }.get(provenance_kind, lambda: "omniasr-7b-legacy-bootstrap")()
     manifest = {
         "schema": 1,
         "model_id": model_id,
@@ -185,6 +193,39 @@ def test_adapter_deployment_identity_is_unchanged_by_the_fused_shape() -> None:
         assert deployment.manifest["schema"] == 1
     finally:
         temp.cleanup()
+
+
+def test_external_offline_is_explicit_unverified_and_id_derived() -> None:
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        path, manifest = _write_fused_manifest(root, "external_offline")
+        verified = _mod.verify_deployment_manifest(path)
+        assert verified.provenance_kind == "external_offline"
+        assert verified.identity_reply("gpu1")["provenanceKind"] == "external_offline"
+        assert manifest["model_id"].startswith("omniasr-7b-external-") and len(manifest["model_id"]) == 44
+
+        def refused(value: dict, needle: str) -> None:
+            _rewrite_manifest(path, value)
+            try:
+                _mod.verify_deployment_manifest(path)
+            except ValueError as exc:
+                assert needle in str(exc), exc
+            else:
+                raise AssertionError(f"external provenance was accepted: {value['provenance']!r}")
+
+        claims_verified = json.loads(json.dumps(manifest))
+        claims_verified["provenance"]["training_provenance"] = "verified"
+        refused(claims_verified, "external_unverified")
+        forged_id = dict(manifest, model_id="omniasr-7b-external-" + "0" * 24)
+        refused(forged_id, "does not derive")
+        disguised = dict(manifest, model_id="omniasr-7b-challenger-" + manifest["model_id"][-24:])
+        refused(disguised, "does not derive")
+        missing = json.loads(json.dumps(manifest))
+        missing["provenance"].pop("parent_checkpoint_sha256")
+        refused(missing, "keys mismatch")
+        bad_sha = json.loads(json.dumps(manifest))
+        bad_sha["provenance"]["evidence_sha256"] = "C" * 64
+        refused(bad_sha, "evidence is incomplete")
 
 
 def _verified(provenance_kind: str = "flywheel"):
@@ -612,6 +653,7 @@ if __name__ == "__main__":
     test_fused_deployment_binds_exact_checkpoint_and_tokenizer_without_adapter()
     test_fused_and_adapter_shapes_cannot_be_mixed()
     test_adapter_deployment_identity_is_unchanged_by_the_fused_shape()
+    test_external_offline_is_explicit_unverified_and_id_derived()
     test_health_reports_verified_identity_without_invoking_transcription()
     test_health_remains_responsive_while_inference_lock_is_held()
     test_transcript_reply_carries_the_same_verified_identity()

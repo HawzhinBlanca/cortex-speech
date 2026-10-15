@@ -84,6 +84,8 @@ impl ProductionPromotionRuntime {
         {
             return Err(runtime_error("PROMOTION_DEPLOYMENT_IDENTITY_MISMATCH", &identity.model_version_id));
         }
+        crate::registry::refuse_external_offline_promotion(&record.manifest)
+            .map_err(|error| runtime_error("PROMOTION_EXTERNAL_OFFLINE_REFUSED", error))?;
         Ok(())
     }
 

@@ -269,6 +269,16 @@ def test_missing_or_partial_identity_is_rejected() -> None:
             raise AssertionError(f"invalid server identity was accepted: {response!r}")
 
 
+def test_external_offline_identity_is_accepted_and_unknown_kinds_are_not() -> None:
+    assert _client.validate_identity_response(_identity_response(provenanceKind="external_offline"))[0]
+    try:
+        _client.validate_identity_response(_identity_response(provenanceKind="external"))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown provenance kind was accepted")
+
+
 def test_fused_identity_names_exactly_base_and_tokenizer() -> None:
     fused = {"base": "3" * 64, "tokenizer": "6" * 64}
     assert _client.validate_identity_response(_identity_response(componentSha256=fused))[0]
@@ -313,5 +323,6 @@ if __name__ == "__main__":
     test_result_marker_persists_exact_served_identity()
     test_missing_or_partial_identity_is_rejected()
     test_fused_identity_names_exactly_base_and_tokenizer()
+    test_external_offline_identity_is_accepted_and_unknown_kinds_are_not()
     test_busy_replica_is_retried_until_an_identity_bound_reply_arrives()
     print("PASS: champion client deployment identity")

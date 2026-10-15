@@ -737,7 +737,9 @@ fn parse_health_marker(stdout: &str) -> Result<LoadedChampionHealth, String> {
     }
     crate::validation::input::validate_identifier(&health.model_version_id)
         .map_err(|error| format!("champion health model identity is invalid: {error}"))?;
-    if health.worker.trim().is_empty() || !matches!(health.provenance_kind.as_str(), "flywheel" | "legacy_bootstrap") {
+    if health.worker.trim().is_empty()
+        || !matches!(health.provenance_kind.as_str(), "flywheel" | "legacy_bootstrap" | "external_offline")
+    {
         return Err("champion health worker/provenance identity is invalid".into());
     }
     Ok(health)
@@ -1221,6 +1223,15 @@ mod tests {
 
         let half = valid.replace(&format!("\"adapterConfig\":\"{}\",", "e".repeat(64)), "");
         assert!(parse_health_marker(&half).unwrap_err().contains("half of an adapter"));
+    }
+
+    #[test]
+    fn health_parser_accepts_the_external_offline_kind_by_its_exact_name() {
+        let valid = health_json("candidate-1", &"a".repeat(64));
+        let external = valid.replace("\"provenanceKind\":\"flywheel\"", "\"provenanceKind\":\"external_offline\"");
+        assert_eq!(parse_health_marker(&external).unwrap().provenance_kind, "external_offline");
+        let vague = valid.replace("\"provenanceKind\":\"flywheel\"", "\"provenanceKind\":\"external\"");
+        assert!(parse_health_marker(&vague).is_err());
     }
 
     /// Harmless real-process fault injector for the bounded subprocess boundary. This test returns

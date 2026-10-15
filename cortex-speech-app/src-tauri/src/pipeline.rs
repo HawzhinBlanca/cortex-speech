@@ -538,8 +538,10 @@ fn wsl7b_validate_identity(reply: &serde_json::Value) -> AppResult<(String, Stri
     if !is_sha(reply.get("manifestSha256")) {
         return Err(fail("reply has no canonical manifestSha256"));
     }
-    if !matches!(reply.get("provenanceKind").and_then(serde_json::Value::as_str), Some("flywheel" | "legacy_bootstrap"))
-    {
+    if !matches!(
+        reply.get("provenanceKind").and_then(serde_json::Value::as_str),
+        Some("flywheel" | "legacy_bootstrap" | "external_offline")
+    ) {
         return Err(fail("reply has an unexpected provenanceKind"));
     }
     if !reply.get("worker").and_then(serde_json::Value::as_str).is_some_and(|w| !w.trim().is_empty()) {

@@ -280,7 +280,7 @@ def validate_identity_response(response):
         raise ValueError(f"reply has unexpected language {response.get('language')!r}")
     if not _is_sha256(response.get("manifestSha256")):
         raise ValueError("reply has no canonical manifestSha256")
-    if response.get("provenanceKind") not in {"flywheel", "legacy_bootstrap"}:
+    if response.get("provenanceKind") not in {"flywheel", "legacy_bootstrap", "external_offline"}:
         raise ValueError(f"reply has unexpected provenanceKind {response.get('provenanceKind')!r}")
     if not isinstance(response.get("worker"), str) or not response["worker"].strip():
         raise ValueError("reply has no worker identity")

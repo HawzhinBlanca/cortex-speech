@@ -591,6 +591,7 @@ def _write_challenger_run(root: Path) -> tuple[ChallengerRunBinding, Path]:
         "adapter_config": adapter_config,
         "server_compatibility": {"protocol": "cortex-omniasr-adapter", "version": 1},
         "provenance": {
+            "kind": "flywheel",
             "snapshot": {"id": SNAPSHOT, "root_sha256": digest("snapshot-root")},
             "training_run_id": training_run_id,
             "source_evidence": source_evidence,
@@ -641,6 +642,32 @@ def test_run_loader_rehashes_deployment_and_rejects_tamper_or_missing_component(
         _, run_path = _write_challenger_run(root)
         (root / "adapter.safetensors").unlink()
         assert "adapter file is missing" in expect_input_error(lambda: load_challenger_run(run_path))
+
+
+def test_external_offline_deployment_is_never_a_gateable_challenger() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _, run_path = _write_challenger_run(root)
+        deployment_path = root / "deployment_manifest.json"
+        deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+        deployment["provenance"] = {
+            "kind": "external_offline",
+            "training_provenance": "external_unverified",
+            "training_manifest_sha256": digest("v12-training-manifest"),
+            "parent_checkpoint_sha256": digest("v11-fused"),
+            "evidence_sha256": digest("external-evidence"),
+        }
+        deployment.pop("manifestSha256")
+        canonical = json.dumps(deployment, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        deployment["manifestSha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        body = json.dumps(deployment, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
+        deployment_path.write_text(body, encoding="utf-8")
+        record = json.loads(run_path.read_text(encoding="utf-8"))
+        record["deployment_manifest"]["sha256"] = hashlib.sha256(deployment_path.read_bytes()).hexdigest()
+        record["deployment_manifest"]["manifestSha256"] = deployment["manifestSha256"]
+        run_path.write_text(json.dumps(record), encoding="utf-8")
+        message = expect_input_error(lambda: load_challenger_run(run_path))
+        assert "'external_offline' is not a flywheel run" in message, message
 
 
 def test_cli_promotes_bound_evidence_then_detects_scorecard_tamper() -> None:

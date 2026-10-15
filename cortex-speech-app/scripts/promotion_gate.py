@@ -540,6 +540,11 @@ def load_challenger_run(path: Path) -> ChallengerRunBinding:
     provenance = deployment.get("provenance")
     if not isinstance(provenance, dict):
         raise GateInputError("challenger deployment has no provenance object")
+    if provenance.get("kind") != "flywheel":
+        # external_offline / legacy_bootstrap models are never crowned by this automatic gate.
+        raise GateInputError(
+            f"challenger deployment provenance kind {provenance.get('kind')!r} is not a flywheel run"
+        )
     snapshot = provenance.get("snapshot")
     if not isinstance(snapshot, dict) or snapshot.get("id") != snapshot_id:
         raise GateInputError("challenger deployment snapshot differs from its run record")

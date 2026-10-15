@@ -277,7 +277,35 @@ def _verify_provenance(value: object, model_version_id: str) -> str:
         if not _is_sha256(value["measurement_evidence_sha256"]):
             raise ValueError("legacy bootstrap has no measurement evidence SHA-256")
         return kind
+    if kind == "external_offline":
+        # Trained OUTSIDE the Cortex flywheel (e.g. an offline LoRA, then fused). Its training can't be
+        # re-derived here, so it says so explicitly and pins what it can: the training manifest, the
+        # parent checkpoint it was trained from, and the evidence document. Never disguised as flywheel.
+        value = _exact_keys(
+            value,
+            {
+                "kind", "training_provenance", "training_manifest_sha256", "parent_checkpoint_sha256",
+                "evidence_sha256",
+            },
+            "external offline provenance",
+        )
+        if value["training_provenance"] != "external_unverified":
+            raise ValueError("external offline provenance must state training_provenance='external_unverified'")
+        evidence = {key: value[key] for key in EXTERNAL_OFFLINE_EVIDENCE_KEYS}
+        if any(not _is_sha256(item) for item in evidence.values()):
+            raise ValueError("external offline provenance evidence is incomplete")
+        if model_version_id != external_offline_model_id(evidence):
+            raise ValueError("external offline model_id does not derive from its provenance evidence")
+        return kind
     raise ValueError(f"unsupported deployment provenance kind {kind!r}")
+
+
+EXTERNAL_OFFLINE_EVIDENCE_KEYS = ("training_manifest_sha256", "parent_checkpoint_sha256", "evidence_sha256")
+
+
+def external_offline_model_id(evidence: dict) -> str:
+    """omniasr-7b-external-<first 24 hex of sha256(canonical evidence)>, like the flywheel run id."""
+    return f"omniasr-7b-external-{_sha256_bytes(_canonical_json_bytes(evidence))[:24]}"
 
 
 @dataclass(frozen=True)

@@ -96,6 +96,43 @@ pub enum DeploymentProvenance {
     /// reconstructed. It may be bootstrapped once, transparently, but never imported as a new
     /// challenger. This avoids inventing a snapshot/trainer identity that does not exist.
     LegacyBootstrap { measurement_evidence_sha256: String, training_provenance: String },
+    /// Trained outside the Cortex flywheel (an offline LoRA, then fused). Its training cannot be
+    /// re-derived here, so it says `training_provenance: "external_unverified"` and pins the training
+    /// manifest, the parent checkpoint it was trained from, and the evidence document. It may be
+    /// registered as a candidate but no automatic path may promote it.
+    ExternalOffline {
+        training_provenance: String,
+        training_manifest_sha256: String,
+        parent_checkpoint_sha256: String,
+        evidence_sha256: String,
+    },
+}
+
+impl DeploymentProvenance {
+    /// The `kind` tag, exactly as serialized and as the server reports it in `provenanceKind`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Flywheel { .. } => "flywheel",
+            Self::LegacyBootstrap { .. } => "legacy_bootstrap",
+            Self::ExternalOffline { .. } => "external_offline",
+        }
+    }
+}
+
+/// `omniasr-7b-external-<first 24 hex of sha256(canonical evidence)>` — derived exactly as the
+/// Python verifier derives it, so the id cannot be chosen independently of the pinned evidence.
+pub fn external_offline_model_id(
+    training_manifest_sha256: &str,
+    parent_checkpoint_sha256: &str,
+    evidence_sha256: &str,
+) -> String {
+    let evidence = serde_json::json!({
+        "training_manifest_sha256": training_manifest_sha256,
+        "parent_checkpoint_sha256": parent_checkpoint_sha256,
+        "evidence_sha256": evidence_sha256,
+    });
+    let canonical = serde_json::to_vec(&canonical_json(&evidence)).unwrap_or_default();
+    format!("omniasr-7b-external-{}", &hash_bytes(&canonical)[..24])
 }
 
 /// The exact handoff emitted by `train_challenger.py` and consumed by registry + server.
@@ -270,6 +307,30 @@ fn validate_manifest_contract(manifest: &DeploymentManifest) -> AppResult<()> {
                 return Err(AppError::Validation(
                     "legacy bootstrap must pin measurement evidence and explicitly mark training provenance unverifiable"
                         .into(),
+                ));
+            }
+        }
+        DeploymentProvenance::ExternalOffline {
+            training_provenance,
+            training_manifest_sha256,
+            parent_checkpoint_sha256,
+            evidence_sha256,
+        } => {
+            if training_provenance != "external_unverified"
+                || !is_sha256(training_manifest_sha256)
+                || !is_sha256(parent_checkpoint_sha256)
+                || !is_sha256(evidence_sha256)
+            {
+                return Err(AppError::Validation(
+                    "external offline provenance must pin training manifest, parent checkpoint and evidence SHA-256s and state training_provenance 'external_unverified'"
+                        .into(),
+                ));
+            }
+            if manifest.model_id
+                != external_offline_model_id(training_manifest_sha256, parent_checkpoint_sha256, evidence_sha256)
+            {
+                return Err(AppError::Validation(
+                    "external offline model_id does not derive from its provenance evidence".into(),
                 ));
             }
         }
@@ -503,10 +564,7 @@ fn record_from_wsl_reply(
         .map_err(|error| AppError::Validation(format!("WSL deployment verifier returned invalid JSON: {error}")))?;
     let manifest = manifest_from_value(reply.manifest)?;
     validate_manifest_contract(&manifest)?;
-    let provenance_kind = match &manifest.provenance {
-        DeploymentProvenance::Flywheel { .. } => "flywheel",
-        DeploymentProvenance::LegacyBootstrap { .. } => "legacy_bootstrap",
-    };
+    let provenance_kind = manifest.provenance.kind();
     if reply.schema != 1
         || reply.status != "verified"
         || reply.protocol != SERVER_PROTOCOL
@@ -730,6 +788,78 @@ pub(crate) mod tests {
         path
     }
 
+    /// A fused deployment with honest `external_offline` provenance and its derived model id.
+    pub(crate) fn write_test_external_manifest(root: &Path) -> (PathBuf, String) {
+        let path = write_test_fused_manifest(root, "placeholder");
+        let model_id = external_offline_model_id(&"a".repeat(64), &"b".repeat(64), &"c".repeat(64));
+        let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["model_id"] = model_id.clone().into();
+        value["provenance"] = serde_json::json!({
+            "kind": "external_offline",
+            "training_provenance": "external_unverified",
+            "training_manifest_sha256": "a".repeat(64),
+            "parent_checkpoint_sha256": "b".repeat(64),
+            "evidence_sha256": "c".repeat(64),
+        });
+        rewrite_test_manifest(&path, value);
+        (path, model_id)
+    }
+
+    #[test]
+    fn external_offline_provenance_is_explicit_unverified_and_id_derived() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (path, model_id) = write_test_external_manifest(dir.path());
+        // Same derivation as the Python verifier: sha256 of the canonical evidence object.
+        let canonical = br#"{"evidence_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","parent_checkpoint_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","training_manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+        assert_eq!(model_id, format!("omniasr-7b-external-{}", &digest(canonical)[..24]));
+        let verified = verify_deployment_manifest(&path, None).unwrap();
+        assert_eq!(verified.manifest.provenance.kind(), "external_offline");
+
+        let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut claims_verified = original.clone();
+        claims_verified["provenance"]["training_provenance"] = "verified".into();
+        let mut forged_id = original.clone();
+        forged_id["model_id"] = format!("omniasr-7b-external-{}", "0".repeat(24)).into();
+        let mut disguised = original.clone();
+        disguised["model_id"] = model_id.replace("external", "challenger").into();
+        let mut bad_sha = original;
+        bad_sha["provenance"]["evidence_sha256"] = "C".repeat(64).into();
+        for (label, value) in [
+            ("claims verified training", claims_verified),
+            ("forged id", forged_id),
+            ("flywheel-looking id", disguised),
+            ("non-canonical evidence", bad_sha),
+        ] {
+            rewrite_test_manifest(&path, value);
+            assert!(verify_deployment_manifest(&path, None).is_err(), "{label} was accepted");
+        }
+    }
+
+    #[test]
+    fn wsl_verifier_reply_reports_external_offline_kind_exactly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (path, model_id) = write_test_external_manifest(dir.path());
+        let verified = verify_deployment_manifest(&path, None).unwrap();
+        let reply = verifier_reply(&verified);
+        let wsl_path = "/home/ai/run/deployment_manifest.json";
+        assert!(record_from_wsl_reply(
+            &serde_json::to_vec(&reply).unwrap(),
+            wsl_path,
+            &verified.deployment_sha256,
+            &model_id
+        )
+        .is_ok());
+        let mut flywheel_claim = reply;
+        flywheel_claim["provenanceKind"] = "flywheel".into();
+        assert!(record_from_wsl_reply(
+            &serde_json::to_vec(&flywheel_claim).unwrap(),
+            wsl_path,
+            &verified.deployment_sha256,
+            &model_id
+        )
+        .is_err());
+    }
+
     #[test]
     fn fused_deployment_binds_the_exact_checkpoint_and_tokenizer_without_adapter_files() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -868,7 +998,7 @@ pub(crate) mod tests {
                 }),
             },
             "language": "ckb_Arab",
-            "provenanceKind": "flywheel",
+            "provenanceKind": verified.manifest.provenance.kind(),
             "worker": "verifier",
             "manifest": verified.manifest,
         })

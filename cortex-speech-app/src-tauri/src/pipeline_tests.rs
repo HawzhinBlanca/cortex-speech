@@ -1916,6 +1916,10 @@ fn wsl7b_identity_validation_refuses_impostors() {
     missing_component["componentSha256"] = serde_json::json!({"base": sha});
     assert!(wsl7b_validate_identity(&missing_component).is_err(), "a partial component identity is no identity");
 
+    let mut external = good.clone();
+    external["provenanceKind"] = serde_json::json!("external_offline");
+    assert!(wsl7b_validate_identity(&external).is_ok(), "the honest external_offline kind is a known identity");
+
     // A fused (schema-2) deployment has no adapter files: exactly base + tokenizer, nothing in between.
     let mut fused = good.clone();
     fused["componentSha256"] = serde_json::json!({"base": sha, "tokenizer": sha});
