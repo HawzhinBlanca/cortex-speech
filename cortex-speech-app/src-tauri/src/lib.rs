@@ -73,6 +73,7 @@ pub mod media_materialization_worker;
 pub mod migrations;
 pub mod models;
 pub mod normalizer;
+pub mod owner_promotion;
 pub mod pipeline;
 pub mod production_dataset;
 pub mod quality;

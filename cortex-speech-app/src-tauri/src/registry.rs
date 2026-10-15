@@ -304,7 +304,7 @@ pub fn bootstrap_verified_legacy_deployment(
 
 /// The one guard every automatic promotion path calls: an `external_offline` model was trained
 /// outside the flywheel, so no scorecard gate, saga step or bootstrap may crown it. Promoting one is
-/// reserved for an owner-only entry point that does not exist yet (v12 plan, Part B step 5).
+/// reserved for the owner-only entry point `owner_promote` (see `owner_promotion.rs`).
 pub(crate) fn refuse_external_offline_promotion(manifest: &crate::deployment::DeploymentManifest) -> AppResult<()> {
     if matches!(manifest.provenance, DeploymentProvenance::ExternalOffline { .. }) {
         return Err(AppError::Validation(format!(
@@ -313,6 +313,20 @@ pub(crate) fn refuse_external_offline_promotion(manifest: &crate::deployment::De
         )));
     }
     Ok(())
+}
+
+/// The saga's form of the guard. It differs from [`refuse_external_offline_promotion`] only for a job
+/// admitted by `owner_promote`: `owner_authorized` is the candidate a stored, re-hashed owner record
+/// names (`owner_promotion::load_verified_authorization`), and only that exact identity passes.
+pub(crate) fn refuse_external_offline_promotion_unless_owner_authorized(
+    manifest: &crate::deployment::DeploymentManifest,
+    identity: &crate::champion_promotion::ExactDeploymentIdentity,
+    owner_authorized: Option<&crate::champion_promotion::ExactDeploymentIdentity>,
+) -> AppResult<()> {
+    if owner_authorized == Some(identity) && manifest.model_id == identity.model_version_id {
+        return Ok(());
+    }
+    refuse_external_offline_promotion(manifest)
 }
 
 fn verify_registry_deployment(version: &ModelVersion) -> AppResult<VerifiedDeployment> {
@@ -899,6 +913,25 @@ mod tests {
         assert!(refuse_external_offline_promotion(&verified.manifest).is_err());
         let champion = verify_registry_deployment(&get_model_version(&db, "champ").unwrap().unwrap()).unwrap();
         assert!(refuse_external_offline_promotion(&champion.manifest).is_ok(), "flywheel stays promotable");
+
+        // 2b. The saga's form refuses it too unless an owner record names this EXACT identity.
+        let exact = crate::champion_promotion::ExactDeploymentIdentity {
+            model_version_id: model_id.clone(),
+            deployment_sha256: verified.deployment_sha256.clone(),
+        };
+        let other = crate::champion_promotion::ExactDeploymentIdentity {
+            model_version_id: model_id.clone(),
+            deployment_sha256: "f".repeat(64),
+        };
+        let guard = refuse_external_offline_promotion_unless_owner_authorized;
+        assert!(guard(&verified.manifest, &exact, None).is_err(), "no owner record: automatic refusal");
+        assert!(guard(&verified.manifest, &exact, Some(&other)).is_err(), "a record for other bytes");
+        let renamed = crate::champion_promotion::ExactDeploymentIdentity {
+            model_version_id: "omniasr-7b-external-someone-else".into(),
+            deployment_sha256: verified.deployment_sha256.clone(),
+        };
+        assert!(guard(&verified.manifest, &renamed, Some(&renamed)).is_err(), "manifest id must still match");
+        assert!(guard(&verified.manifest, &exact, Some(&exact)).is_ok(), "the owner-authorized exact candidate");
 
         // 3. The one-time legacy bootstrap, even into an empty family.
         let empty = open();
