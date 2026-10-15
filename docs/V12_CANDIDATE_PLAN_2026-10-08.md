@@ -258,3 +258,26 @@ this app, inside hawedit and cortex too", choosing "Approve all" to "Approve bui
 nothing promoted until your canon lines)?": fused-model deployments, an honest `external` provenance kind, a
 promotion gate bound to deployment hashes, and an owner-only promotion command. **Mechanisms only:** the FLEURS-train
 and CORDI share-alike rulings are still pending, so nothing registers or promotes v12.
+
+## Gate result caveat (2026-10-15): the held-out set favours the incumbent drafter
+**Reading-only analysis** of the 480 clips, using a read-only copy of the live library DB (`speech_segments`) and the gate's per-clip distances (`runs/heldout_eval_v12/gate/{champion,v12}/omni7b_results.tsv`).
+- **Who drafted the references:** 473 of 480 were drafted by `omniasr-wsl-7b`, and 7 by `finetuned-mms-ckb`.
+- **Accepted drafts:** `human_decision`: 210 `accept`, 270 `edit`. In all 210 accepts, `verdict_transcript` equals the raw draft, so **44% of the references are the drafting model's own output.**
+
+| Subset | n | Champion CER (exact) | v12 CER (exact) |
+|---|---|---|---|
+| accept (reference = draft) | 210 | 0.34% (177) | 8.20% (8) |
+| edit (human-corrected draft) | 270 | 8.95% (0) | 15.14% (0) |
+
+**Consequences**
+- The REJECT verdict mixes model quality with reference provenance. "Accept" clips measure agreement with the incumbent's own drafts.
+- "Edit" clips keep the draft's wording and colloquial spelling wherever the reviewer left it; examples are Arabic ة/ه, نەوعه and اها.
+- The champion's training provenance is `unverifiable` (legacy_bootstrap). Overlap between its training data and these clips cannot be excluded, and the leakage check covered only the v12/v11 manifests.
+- Even on the edited clips, v12 is worse under Cortex's conventions (15.1 vs 9.0 CER). This is consistent with v12's known weakness on conversational speech: CORDI conversational CER 26.7, against 2–5 on read speech (omniasr-v11-audit `RESEARCH_PLAN.md`).
+
+**Fix the evaluation design before relying on this gate for any external model:**
+- (a) Exclude `accept` clips, or score them separately.
+- (b) Add a reference set transcribed from scratch, not post-edited from a model draft.
+- (c) Report convention-neutral metrics, such as Kurdish character normalization and spacing-neutral CER. The scorecard currently keeps only distances, so it would also need to store hypotheses.
+
+**Recommendation:** do not promote v12 into Cortex. The in-domain route is to fine-tune on Cortex's human-edited library clips, holding out by recording.
