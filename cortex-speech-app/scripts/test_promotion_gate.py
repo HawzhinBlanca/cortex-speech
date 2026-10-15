@@ -889,6 +889,38 @@ def test_deployment_binding_rejects_a_worse_challenger_and_refuses_tampered_byte
         assert any("challenger provenance deployment_sha256 does not match" in r for r in reasons), reasons
 
 
+def test_emitted_deployment_sidecars_are_exactly_what_the_gate_binds() -> None:
+    import emit_scorecard_provenance as emitter
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        args = _deployment_case(root)
+        normalizer = root / "scorecard_7b.py"
+        normalizer.write_bytes(b"normalizer")
+        for role, tsv in (("champion", args[0]), ("challenger", args[1])):
+            Path(f"{tsv}.provenance.json").unlink()
+            deployment = args[args.index(f"--{role}-deployment") + 1]
+            assert emitter.main([
+                "--scorecard", tsv, "--role", role, "--deployment", deployment,
+                "--eval-manifest", str(root / "gold.tsv"), "--normalizer", str(normalizer),
+            ]) == 0
+            sidecar = json.loads(Path(f"{tsv}.provenance.json").read_text(encoding="utf-8"))
+            assert sidecar["schema_version"] == 2 and sidecar["binding"] == "deployment", sidecar
+        assert gate_main(args) == 3, _verdict(root)["reasons"]
+        assert _verdict(root)["verdict"] == "JUDGED_PASS"
+        # A checkpoint whose bytes drifted cannot even get a sidecar.
+        (root / "v12" / "checkpoint.pt").write_bytes(b"fused-v13")
+        try:
+            emitter.main([
+                "--scorecard", args[1], "--role", "challenger", "--deployment",
+                args[args.index("--challenger-deployment") + 1], "--eval-manifest", str(root / "gold.tsv"),
+            ])
+        except SystemExit as error:
+            assert "cannot bind challenger deployment" in str(error), error
+        else:
+            raise AssertionError("a drifted checkpoint was bound")
+
+
 def test_deployment_binding_refuses_the_same_model_and_a_fused_manifest_with_adapters() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
