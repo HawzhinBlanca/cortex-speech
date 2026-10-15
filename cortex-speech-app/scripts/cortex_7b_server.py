@@ -704,6 +704,21 @@ def parse_device_indices() -> list:
     return requested
 
 
+def fairseq2_asset_path(path: Path, alias_dir: Path, name: str) -> Path:
+    """A path fairseq2 can load. fairseq2 turns an asset-card path into ``Path.as_uri()`` and back
+    with ``Path(str(uri)[5:])`` WITHOUT unquoting, so a path that percent-encoding changes (a space,
+    '#', non-ASCII) is looked up under the wrong name. Measured 2026-10-15: the verified v12
+    checkpoint under "/mnt/f/Kurdish Sorani Dataset/" failed to load as ".../Kurdish%20Sorani%20...".
+    Such a path is served through a symlink with a safe name in ``alias_dir``; any other is unchanged."""
+    if path.as_uri() == "file://" + str(path):
+        return path
+    alias = alias_dir / name
+    if alias.as_uri() != "file://" + str(alias):
+        raise ValueError(f"asset alias directory is not URI-safe: {alias_dir}")
+    alias.symlink_to(path)
+    return alias
+
+
 def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None:
     """One full replica: heavy imports, model load, then the proven serial accept loop. Runs in its
     own process per GPU (or inline for single-device/CPU). Everything CUDA lives below this line."""
@@ -759,6 +774,10 @@ def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None
     model_card = deployment.model_card
     print(f"[{tag}] Base checkpoint: {checkpoint_path}", flush=True)
 
+    # ponytail: the alias dir (symlinks only) is left in /tmp for the process lifetime and never cleaned.
+    alias_dir = Path(tempfile.mkdtemp(prefix="cortex7b-assets-"))
+    tokenizer_asset = fairseq2_asset_path(tokenizer_path.resolve(), alias_dir, "tokenizer.model")
+    checkpoint_asset = fairseq2_asset_path(checkpoint_path.resolve(), alias_dir, "checkpoint.pt")
     store = get_asset_store()
     store._metadata_providers = [p for p in store._metadata_providers if getattr(p, "_source", "") != "sorani_custom"]
     provider = load_in_memory_asset_metadata(
@@ -767,13 +786,13 @@ def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None
             {
                 "name": "soranivoice_omniASR_tokenizer_written_v2_local",
                 "tokenizer_family": "char_tokenizer",
-                "tokenizer": str(tokenizer_path.resolve()),
+                "tokenizer": str(tokenizer_asset),
             },
             {
                 "name": model_card,
                 "model_family": "wav2vec2_llama",
                 "model_arch": "7b",
-                "checkpoint": str(checkpoint_path.resolve()),
+                "checkpoint": str(checkpoint_asset),
                 "tokenizer_ref": "soranivoice_omniASR_tokenizer_written_v2_local",
             },
         ],

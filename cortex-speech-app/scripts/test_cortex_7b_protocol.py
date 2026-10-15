@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import tempfile
 import threading
 import time
@@ -638,7 +639,37 @@ def test_busy_or_missing_gpu1_refuses_and_never_seizes() -> None:
         assert _mod.parse_device_indices() == [1]
 
 
+def _fairseq2_file_round_trip(value: str) -> Path:
+    """fairseq2 0.x exactly: AssetCardField.as_uri -> Uri.from_path(Path(v)) = Path.as_uri() (percent-
+    encoded), then LocalAssetDownloadManager._to_path = Path(str(uri)[5:]) WITHOUT unquoting."""
+    return Path(Path(value).as_uri()[5:])
+
+
+def test_asset_paths_survive_fairseq2_file_uri_round_trip() -> None:
+    # Measured 2026-10-15, first real fused load: the v12 checkpoint resolves to
+    # "/mnt/f/Kurdish Sorani Dataset/...", fairseq2 looked for ".../Kurdish%20Sorani%20Dataset/..."
+    # and the worker died after every byte had verified.
+    if os.name == "nt":  # the server and fairseq2 run only inside WSL/Linux; Windows URIs differ
+        print("SKIP test_asset_paths_survive_fairseq2_file_uri_round_trip (POSIX-only)")
+        return
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        spaced = root / "Kurdish Sorani Dataset" / "fused #1.pt"
+        spaced.parent.mkdir()
+        spaced.write_bytes(b"fused")
+        plain = root / "plain.pt"
+        plain.write_bytes(b"plain")
+        assert not _fairseq2_file_round_trip(str(spaced)).exists(), "the fixture must reproduce the bug"
+        alias_dir = root / "aliases"
+        alias_dir.mkdir()
+        safe = _mod.fairseq2_asset_path(spaced, alias_dir, "checkpoint.pt")
+        assert _fairseq2_file_round_trip(str(safe)).read_bytes() == b"fused"
+        assert _fairseq2_file_round_trip(str(safe)).resolve() == spaced.resolve()
+        assert _mod.fairseq2_asset_path(plain, alias_dir, "tokenizer.model") == plain, "no alias when not needed"
+
+
 if __name__ == "__main__":
+    test_asset_paths_survive_fairseq2_file_uri_round_trip()
     test_default_device_is_gpu1_only_and_pins_pci_bus_order()
     test_gpu0_is_refused_even_when_named_explicitly()
     test_busy_or_missing_gpu1_refuses_and_never_seizes()
