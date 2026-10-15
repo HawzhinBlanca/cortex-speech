@@ -21,6 +21,7 @@ from promotion_gate import (  # noqa: E402
     inspect_eval_manifest,
     load_provenance,
     load_challenger_run,
+    load_deployment,
     load_scorecard,
     load_slices,
     main as gate_main,
@@ -745,6 +746,167 @@ def test_cli_promotes_bound_evidence_then_detects_scorecard_tamper() -> None:
         invalid = json.loads(verdict_path.read_text(encoding="utf-8"))
         assert invalid["verdict"] == "INVALID"
         assert invalid["reasons"], "tamper must produce a written, non-vacuous invalid verdict"
+
+
+def _write_deployment(root: Path, *, schema: int, kind: str, checkpoint: bytes) -> Path:
+    """A canonical deployment manifest whose component files exist under ``root``."""
+    root.mkdir(parents=True, exist_ok=True)
+
+    def component(name: str, payload: bytes) -> dict:
+        (root / name).write_bytes(payload)
+        return {"path": name, "sha256": hashlib.sha256(payload).hexdigest(), "size_bytes": len(payload)}
+
+    base = root / "checkpoint.pt"
+    base.write_bytes(checkpoint)
+    provenance = {
+        "flywheel": {"kind": "flywheel", "snapshot": {"id": SNAPSHOT}, "training_run_id": digest("run")},
+        "legacy_bootstrap": {
+            "kind": "legacy_bootstrap",
+            "measurement_evidence_sha256": digest("legacy-evidence"),
+            "training_provenance": "unverifiable",
+        },
+        "external_offline": {
+            "kind": "external_offline",
+            "training_provenance": "external_unverified",
+            "training_manifest_sha256": digest("v12-training-manifest"),
+            "parent_checkpoint_sha256": digest("v11-fused"),
+            "evidence_sha256": digest("external-evidence"),
+        },
+    }[kind]
+    deployment = {
+        "schema": schema,
+        "model_id": f"omniasr-7b-{kind}-{hashlib.sha256(checkpoint).hexdigest()[:8]}",
+        "family": "omniasr-7b",
+        "model_card": "soranivoice_omniASR_LLM_7B_v2_local",
+        "language": "ckb_Arab",
+        "runtime": {"arch": "7b", "vocab_size": 10288, "target_vocab_size": 10288},
+        "base_checkpoint": {
+            "id": f"checkpoint-{kind}",
+            "path": str(base.resolve()),
+            "sha256": hashlib.sha256(checkpoint).hexdigest(),
+            "size_bytes": len(checkpoint),
+        },
+        "tokenizer": component("tokenizer.model", b"shared-tokenizer"),
+        "server_compatibility": {"protocol": "cortex-omniasr-adapter", "version": 1},
+        "provenance": provenance,
+    }
+    if schema == 1:
+        deployment["adapter"] = component("adapter.safetensors", b"adapter-" + checkpoint)
+        deployment["adapter_config"] = component("adapter_config.json", b"adapter-config")
+    deployment["manifestSha256"] = hashlib.sha256(
+        json.dumps(deployment, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    path = root / "deployment_manifest.json"
+    path.write_text(json.dumps(deployment, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n", encoding="utf-8")
+    return path
+
+
+def _deployment_case(root: Path, *, challenger_char: int = 10, challenger_word: int = 2) -> list[str]:
+    """Write a complete deployment-bound evidence set; return the gate CLI arguments."""
+    manifest_path = root / "gold.tsv"
+    manifest_path.write_text("".join(f"clip-{i}.wav\ttruth {i}\n" for i in range(N)), encoding="utf-8")
+    manifest = inspect_eval_manifest(manifest_path)
+    champion_path, challenger_path = root / "champion.tsv", root / "challenger.tsv"
+    champion = _write_scorecard(champion_path, char_dist=20, word_dist=6)
+    challenger = _write_scorecard(challenger_path, char_dist=challenger_char, word_dist=challenger_word)
+    champion_deployment = _write_deployment(root / "incumbent", schema=1, kind="legacy_bootstrap", checkpoint=b"stock-base")
+    challenger_deployment = _write_deployment(root / "v12", schema=2, kind="external_offline", checkpoint=b"fused-v12")
+    for card, card_path, role, deployment_path in (
+        (champion, champion_path, "champion", champion_deployment),
+        (challenger, challenger_path, "challenger", challenger_deployment),
+    ):
+        binding = load_deployment(deployment_path, role)
+        sidecar = {
+            "schema_version": 2,
+            "binding": "deployment",
+            "role": role,
+            "scorecard_sha256": card.sha256,
+            "eval_manifest_sha256": manifest.sha256,
+            "eval_manifest_rows": N,
+            "model_family": "omniasr-7b",
+            "model_id": binding.model_id,
+            "model_sha256": binding.model_sha256,
+            "deployment_sha256": binding.deployment_sha256,
+            "normalizer_id": "cortex-sorani-normalizer-v1",
+            "normalizer_sha256": digest("shared-normalizer"),
+            "norm_basis": BASIS,
+        }
+        Path(f"{card_path}.provenance.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    slices_path = root / "slices.tsv"
+    slices_path.write_text(
+        f"# schema_version=1\n# eval_manifest_sha256={manifest.sha256}\n"
+        f"# eval_manifest_rows={N}\n# min_clips=5\n# library_index_sha256={INDEX_SHA}\n"
+        "slice_name\tclip_index\n" + "".join(f"{name}\t{i}\n" for name in protected_groups() for i in range(N)),
+        encoding="utf-8",
+    )
+    return [
+        str(champion_path), str(challenger_path), "--eval-manifest", str(manifest_path), "--slices", str(slices_path),
+        "--champion-deployment", str(champion_deployment), "--challenger-deployment", str(challenger_deployment),
+        "--out", str(root / "verdict.json"),
+    ]
+
+
+def _verdict(root: Path) -> dict:
+    return json.loads((root / "verdict.json").read_text(encoding="utf-8"))
+
+
+def test_deployment_binding_judges_a_fused_external_model_but_never_promotes_it() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        args = _deployment_case(root)
+        assert gate_main(args) == 3, "a deployment-bound pass must not use the PROMOTE exit code 0"
+        verdict = _verdict(root)
+        assert verdict["verdict"] == "JUDGED_PASS" and verdict["auto_promotable"] is False, verdict["reasons"]
+        assert verdict["binding"] == "deployment"
+        challenger = verdict["identities"]["challenger"]
+        assert challenger["provenance_kind"] == "external_offline"
+        assert challenger["checkpoint_sha256"] == hashlib.sha256(b"fused-v12").hexdigest()
+        manifest_bytes = (root / "v12" / "deployment_manifest.json").read_bytes()
+        assert challenger["deployment_sha256"] == hashlib.sha256(manifest_bytes).hexdigest()
+
+
+def test_deployment_binding_rejects_a_worse_challenger_and_refuses_tampered_bytes() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        assert gate_main(_deployment_case(root, challenger_char=30, challenger_word=9)) == 1
+        assert _verdict(root)["verdict"] == "REJECT"
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        args = _deployment_case(root)
+        (root / "v12" / "checkpoint.pt").write_bytes(b"fused-v13")  # same size, different bytes
+        assert gate_main(args) == 2
+        reasons = _verdict(root)["reasons"]
+        assert any("challenger deployment base_checkpoint file hash differs" in r for r in reasons), reasons
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        args = _deployment_case(root)
+        sidecar_path = root / "challenger.tsv.provenance.json"
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        sidecar["deployment_sha256"] = digest("some-other-manifest")
+        sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+        assert gate_main(args) == 2
+        reasons = _verdict(root)["reasons"]
+        assert any("challenger provenance deployment_sha256 does not match" in r for r in reasons), reasons
+
+
+def test_deployment_binding_refuses_the_same_model_and_a_fused_manifest_with_adapters() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        args = _deployment_case(root)
+        args[args.index("--champion-deployment") + 1] = args[args.index("--challenger-deployment") + 1]
+        assert gate_main(args) == 2
+        assert any("deployment_sha256 are identical" in r for r in _verdict(root)["reasons"])
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        path = _write_deployment(root, schema=2, kind="external_offline", checkpoint=b"fused")
+        deployment = json.loads(path.read_text(encoding="utf-8"))
+        deployment["adapter"] = deployment["tokenizer"]
+        deployment.pop("manifestSha256")
+        deployment["manifestSha256"] = hashlib.sha256(
+            json.dumps(deployment, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        path.write_text(json.dumps(deployment, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+        assert "fused schema 2 forbids both" in expect_input_error(lambda: load_deployment(path, "challenger"))
 
 
 def main() -> int:
