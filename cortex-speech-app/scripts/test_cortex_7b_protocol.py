@@ -442,7 +442,81 @@ def test_verify_only_cli_returns_identity_without_binding_or_loading_ml() -> Non
         assert reply["manifest"] == manifest
 
 
+@contextlib.contextmanager
+def _devices_env(spec, free):
+    """Run parse_device_indices with CORTEX_7B_DEVICES=spec and nvidia-smi mocked to `free`."""
+    saved_env = {key: _mod.os.environ.get(key) for key in ("CORTEX_7B_DEVICES", "CUDA_DEVICE_ORDER")}
+    saved_free = _mod.free_vram_mib
+    calls = []
+
+    def fake_free():
+        calls.append(1)
+        if isinstance(free, Exception):
+            raise free
+        return dict(free)
+
+    try:
+        _mod.os.environ.pop("CUDA_DEVICE_ORDER", None)
+        if spec is None:
+            _mod.os.environ.pop("CORTEX_7B_DEVICES", None)
+        else:
+            _mod.os.environ["CORTEX_7B_DEVICES"] = spec
+        _mod.free_vram_mib = fake_free
+        yield calls
+    finally:
+        _mod.free_vram_mib = saved_free
+        for key, value in saved_env.items():
+            if value is None:
+                _mod.os.environ.pop(key, None)
+            else:
+                _mod.os.environ[key] = value
+
+
+def _refusal(spec, free) -> str:
+    with _devices_env(spec, free):
+        try:
+            _mod.parse_device_indices()
+        except SystemExit as exc:
+            return str(exc)
+    raise AssertionError(f"CORTEX_7B_DEVICES={spec!r} with free={free!r} was not refused")
+
+
+def test_default_device_is_gpu1_only_and_pins_pci_bus_order() -> None:
+    idle = {0: 24000, 1: 24000}
+    for spec in (None, "", "1", " 1 ", "1,1"):
+        with _devices_env(spec, idle) as calls:
+            assert _mod.parse_device_indices() == [1], spec
+            assert _mod.os.environ["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+            assert calls == [1], "the free-VRAM floor must be checked for explicit and default GPU 1"
+    with _devices_env("cpu", idle) as calls:
+        assert _mod.parse_device_indices() == []
+        assert calls == []
+        assert _mod.os.environ["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+
+
+def test_gpu0_is_refused_even_when_named_explicitly() -> None:
+    idle = {0: 24000, 1: 24000}
+    for spec in ("0", "0,1", "1,0", "2", "0, 1"):
+        message = _refusal(spec, idle)
+        assert "GPU 1 only" in message and "GPU 0" in message, message
+    assert "not a GPU index list" in _refusal("gpu1", idle)
+
+
+def test_busy_or_missing_gpu1_refuses_and_never_seizes() -> None:
+    floor = _mod.MIN_FREE_VRAM_MIB
+    for spec in (None, "1"):
+        message = _refusal(spec, {0: 24000, 1: floor - 1})
+        assert "refusing to seize busy GPU(s) [1]" in message, message
+        assert "does not report GPU(s) [1]" in _refusal(spec, {0: 24000})
+        assert "GPU discovery failed" in _refusal(spec, RuntimeError("nvidia-smi exited 9"))
+    with _devices_env(None, {0: 0, 1: floor}):
+        assert _mod.parse_device_indices() == [1]
+
+
 if __name__ == "__main__":
+    test_default_device_is_gpu1_only_and_pins_pci_bus_order()
+    test_gpu0_is_refused_even_when_named_explicitly()
+    test_busy_or_missing_gpu1_refuses_and_never_seizes()
     test_protocol_bounds_input_before_parsing()
     test_protocol_accepts_only_valid_transcription_shapes()
     test_full_composite_and_pointer_identity_are_verified()

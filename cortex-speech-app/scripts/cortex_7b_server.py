@@ -20,7 +20,13 @@ Protocol (newline-delimited JSON, one request per connection):
 Run INSIDE WSL with the champion venv (torch, fairseq2, peft, omnilingual-asr):
   CORTEX_7B_CHAMPION_POINTER=/mnt/c/.../champion.json CORTEX_7B_PORT=8799 python cortex_7b_server.py
 
-Multi-GPU: CORTEX_7B_DEVICES="0,1" (default: every GPU nvidia-smi reports; "cpu" forces CPU)
+Devices: GPU 1 ONLY, never GPU 0 (owner direction 2026-10-15). CORTEX_7B_DEVICES defaults to "1";
+a list naming any other GPU refuses to start, and a GPU 1 with less than MIN_FREE_VRAM_MIB free
+refuses rather than seizes the card. "cpu" forces CPU. CUDA_DEVICE_ORDER=PCI_BUS_ID is set before
+any worker forks so the index means the same card to nvidia-smi and to CUDA.
+
+The multi-replica machinery below is retained for a multi-entry list (ALLOWED_GPU_INDICES is {1}
+today, so the server runs one replica): it
 pre-forks ONE WORKER PROCESS per GPU. Each child pins its card via CUDA_VISIBLE_DEVICES, loads a
 full model replica (~15-17 GB bf16 fits a single 24 GB card), and accept()s on the SHARED listening
 socket — the kernel load-balances connections across children, so N GPUs serve N requests truly in
@@ -560,10 +566,15 @@ def encode_reply(reply: dict) -> bytes:
     return payload
 
 
-# Auto-discovered devices must have at least this much VRAM free, or they are not taken. The 7B
-# replica needs ~19 GiB resident; grabbing a card that training already owns OOMs the training run
-# and then the replica. An EXPLICIT CORTEX_7B_DEVICES list is the owner's word and skips the check.
+# The serving GPU must have at least this much VRAM free, or the server refuses to start. The 7B
+# replica needs ~19 GiB resident; grabbing a card that another workload already owns OOMs that
+# workload and then the replica. The floor applies to an explicit CORTEX_7B_DEVICES list too.
 MIN_FREE_VRAM_MIB = int(os.environ.get("CORTEX_7B_MIN_FREE_VRAM_MIB", "20000"))
+
+# GPU 1 only, never GPU 0 (owner direction 2026-10-08/2026-10-15). Indices are PCI bus order, the
+# same numbering nvidia-smi prints, because parse_device_indices pins CUDA_DEVICE_ORDER=PCI_BUS_ID.
+ALLOWED_GPU_INDICES = frozenset({1})
+DEFAULT_GPU_INDICES = (1,)
 
 # How far BEFORE a requested window the decoder is started, so it has settled by the time the real
 # audio begins. 200 ms is 4x the 50 ms settling measured on a 320 kbps MP3 master (2026-08-20) and
@@ -599,45 +610,56 @@ def parse_device_indices() -> list:
         nvidia-smi launched a champion that "works" at a fraction of the speed while the owner
         believes the GPUs are serving. CPU is now a mode you must ask for by name.
       * auto-discovery took EVERY card unconditionally — including one a training run already
-        owns, OOMing both sides. Auto mode now takes only cards with MIN_FREE_VRAM_MIB free and
-        refuses to start if none qualifies. An explicit CORTEX_7B_DEVICES list is the owner's
-        word and is honoured verbatim, checks and all skipped.
+        owns, OOMing both sides.
+
+    GPU 1 ONLY (owner direction 2026-10-15). The default is [1]; an explicit CORTEX_7B_DEVICES may
+    name only GPUs in ALLOWED_GPU_INDICES, so a list containing 0 refuses to start. The free-VRAM
+    floor applies to every GPU served, explicit or default: a busy GPU 1 means REFUSE, never seize
+    (canon: selecting WSL7B does not grant permission to seize busy GPUs). CUDA_DEVICE_ORDER is
+    pinned to PCI_BUS_ID here, before any worker forks, so CUDA's index 1 is nvidia-smi's GPU 1.
     """
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     spec = os.environ.get("CORTEX_7B_DEVICES", "").strip()
     if spec.lower() == "cpu":
         return []
     if spec:
-        return [int(i) for i in spec.split(",") if i.strip() != ""]
+        try:
+            requested = sorted({int(i) for i in spec.split(",") if i.strip() != ""})
+        except ValueError as exc:
+            raise SystemExit(f"7B server: CORTEX_7B_DEVICES={spec!r} is not a GPU index list or 'cpu'") from exc
+    else:
+        requested = list(DEFAULT_GPU_INDICES)
+    forbidden = [i for i in requested if i not in ALLOWED_GPU_INDICES]
+    if not requested or forbidden:
+        raise SystemExit(
+            f"7B server: refusing CORTEX_7B_DEVICES={spec!r}: the 7B service runs on GPU 1 only and never "
+            f"on GPU 0 (not allowed: {forbidden}). Unset CORTEX_7B_DEVICES, set it to 1, or set it to cpu."
+        )
     try:
         free = free_vram_mib()
     except Exception as exc:
         raise SystemExit(
-            f"7B server: GPU discovery failed ({exc}). Fix nvidia-smi, set CORTEX_7B_DEVICES "
-            f"explicitly, or set CORTEX_7B_DEVICES=cpu to run on CPU deliberately."
+            f"7B server: GPU discovery failed ({exc}). Fix nvidia-smi, or set "
+            f"CORTEX_7B_DEVICES=cpu to run on CPU deliberately."
         ) from exc
-    if not free:
-        raise SystemExit(
-            "7B server: nvidia-smi reports no GPUs. Set CORTEX_7B_DEVICES=cpu to run on CPU deliberately."
-        )
     # Attribution note (measured on this rig 2026-08-20): nvidia-smi run INSIDE WSL does see
     # WSL-side VRAM (two loaded replicas read 6435 MiB free per card), so the floor catches both a
     # host-side training run and an orphaned WSL replica. Windows-side nvidia-smi is the blind one
     # (2026-08-16 pin) — this check runs inside WSL, where the numbers are honest.
-    eligible = sorted(i for i, mib in free.items() if mib >= MIN_FREE_VRAM_MIB)
-    busy = sorted(i for i, mib in free.items() if mib < MIN_FREE_VRAM_MIB)
-    if busy:
-        print(
-            f"devices: skipping GPU(s) {busy} — less than {MIN_FREE_VRAM_MIB} MiB free "
-            f"(another workload owns them); set CORTEX_7B_DEVICES to override",
-            flush=True,
-        )
-    if not eligible:
+    missing = [i for i in requested if i not in free]
+    if missing:
         raise SystemExit(
-            f"7B server: no GPU has {MIN_FREE_VRAM_MIB} MiB free "
-            f"(free now: { {i: f'{m} MiB' for i, m in sorted(free.items())} }). Another workload owns the cards. "
-            f"Set CORTEX_7B_DEVICES to claim specific GPUs anyway, or CORTEX_7B_DEVICES=cpu for CPU."
+            f"7B server: nvidia-smi does not report GPU(s) {missing} (reported: {sorted(free)}). "
+            f"Set CORTEX_7B_DEVICES=cpu to run on CPU deliberately."
         )
-    return eligible
+    busy = [i for i in requested if free[i] < MIN_FREE_VRAM_MIB]
+    if busy:
+        raise SystemExit(
+            f"7B server: refusing to seize busy GPU(s) {busy}: less than {MIN_FREE_VRAM_MIB} MiB free "
+            f"(free now: { {i: f'{free[i]} MiB' for i in requested} }). Another workload owns the card; "
+            f"stop it first, or set CORTEX_7B_DEVICES=cpu for CPU."
+        )
+    return requested
 
 
 def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None:
