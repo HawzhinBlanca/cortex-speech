@@ -1,5 +1,59 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-10-15 — v12 Part B steps 3-5: held-out eval set, deployment-hash gate binding, owner-only promotion
+
+**Owner (verbatim, 2026-10-15):** "Approve all: GPU-1-only fix (Part A), fused-model deployments, an honest 'external'
+provenance kind, a promotion gate bound to deployment hashes, and an owner-only promotion command" and "nothing
+promoted until your canon lines". Branch `claude/v12-candidate`. Details and runbook: `docs/V12_CANDIDATE_PLAN_2026-10-08.md`.
+
+- **Step 3a, held-out set (`b5b60526`).** `scripts/build_heldout_eval_set.py` builds a set from human-verdict library
+  clips and drops any clip in a given training manifest. Text: audited `canon` + difflib ≥ 0.85, with no-miss
+  retrieval. Audio: sha256 of each clip and its source recording against every training audio file.
+- **Step 3a, real run** (read-only copy of the live library DB, library index sha256 `279799ac…`). Training
+  manifests: v12 `v12_train.jsonl` plus the 7 v11-lineage manifests in `audit_common.py` `TRAIN_MANIFESTS`, totalling
+  337,526 rows and 237,847 audio files, none missing.
+  - Input: 2,770 human-decided clips.
+  - Removed: 142 whose source libsndfile cannot read (`.mov`/`.mp4`); 0 text-leaked; 0 audio-leaked; 2,148 pruned by
+    the slice floor of 5.
+  - **Result: 480 clips in 9 slices.** By source 409, 64 and 7; dialect sorani 409, hawleri 71; audio clean 480.
+  - Eval manifest sha256 `449cd034d02ca2b22ec865011631e7ab0858f15154fa304741855cfb81cede96`; output in gitignored
+    `runs/heldout_eval_v12/`.
+  - Sanity check: none of the library corpora appear in any training audio path, and exact text overlap is 0. The
+    detector matched 20/20 training sentences against themselves and 13/13 one-character drifts.
+  - No model scored this set; no CER/WER exists for it.
+- **Step 3b, gate binding (`a12d49ee`).** `promotion_gate.py --champion-deployment/--challenger-deployment` binds both
+  models by manifest file sha, canonical `manifestSha256` and re-hashed components. The shared checks moved verbatim
+  into `_measure`. All 26 reports from the existing suite hash identically before and after
+  (`fb9f35f8…`). A pass is `JUDGED_PASS`, exit 3 and never auto-promotable.
+- **Step 5, owner-only entry point (`3d4f240b`).** `owner_promote` requires all of: a record committed on
+  `origin/main`, the `change canon:` line naming the exact deployment in `OWNER_CANON.md` on `origin/main`, a typed TTY
+  phrase, a matching `JUDGED_PASS` verdict and eval proof, the registry identities, the canary file and the instance
+  lock. It admits the saga job and does not promote. Recovery lifts the `external_offline` refusal only for the
+  record's exact candidate; `gate_and_promote` and the bootstrap still refuse.
+  - Limitation: the barrier is procedural, not cryptographic.
+- **Not done:**
+  - no model loaded, no GPU used, nothing registered, canaried or promoted;
+  - `LOCKED_CHAMPION` and the review pool are untouched;
+  - no v12 deployment-manifest writer;
+  - Part B step 4 (the canary build) not run.
+
+**Evidence (Windows, normal `target/`):**
+- After step 3: `cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features` gave lib `2755 passed;
+  0 failed; 8 ignored`, and every target was ok.
+- After step 4:
+  - the same `cargo test` gave lib `2760 passed; 0 failed; 8 ignored`; `owner_promote` `2 passed`; `soak` and
+    `tauri_integration` `1 passed` each; 47/47 targets ok;
+  - `cargo clippy ... --all-targets --all-features -- -D warnings` exit 0; `cargo fmt --check` clean;
+  - `npm run test:python-policies` gave "149 policy test scripts passed".
+- Two policies failed in an earlier run and both were fixed or explained before the commit:
+  - `test_generated_ipc_bindings`: a concurrent `cargo test` held the DLL lock (an artifact of non-canonical flags);
+  - `test_batch_cli_policy`: `process::exit` in the new bin was fixed to return `ExitCode`.
+- Node checks were not run (no TS changes).
+
+**Next (owner):** see the plan's runbook section "How v12 would be promoted once the owner's canon lines land":
+FLEURS-train ruling, CORDI share-alike ruling, the GPU-1 canon line, the CLAUDE.md model-change exception, and pool
+timing. Then an agent may prepare the v12 manifest, GPU-1 scoring, the gate verdict and the canary.
+
 ## 2026-10-15 — v12 candidate mechanisms: GPU 1 only, fused deployments, external_offline provenance
 
 **Owner (verbatim):** 2026-10-08 "yes do all 3, cortex option a"; 2026-10-15 "no, we wanna make v12 ready for use

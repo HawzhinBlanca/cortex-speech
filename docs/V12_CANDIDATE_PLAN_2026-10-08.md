@@ -1,7 +1,8 @@
 # v12 as a champion CANDIDATE + GPU-1-only device policy (plan, 2026-10-08)
 
-- **Status:** owner approved building the mechanisms (2026-10-15, see the Approved-by lines). Implementation of Part A and
-  Part B steps 1-2 is on this branch (see its git log); Part B steps 3-6 and every owner ruling below remain open.
+- **Status:** owner approved building the mechanisms (2026-10-15, see the Approved-by lines). Part A and Part B steps
+  1-3 and 5 are implemented on this branch (see its git log). Not done: the GPU scoring of step 3, the canary of step 4,
+  step 6, and every owner ruling below. Nothing is registered or promoted.
 - **Branch:** `claude/v12-candidate` (worktree `D:\cortex-worktrees\v12-candidate`, from `origin/main` `868c4983`).
 - **Owner's direction (2026-10-08):** v12 enters **as a candidate through the normal promotion process**, not as a direct swap ("option a"). Separately, make the 7B service use GPU 1 only.
 - **Rules followed:** `docs/OWNER_CANON.md`, `AGENT_CHARTER.md`, `cortex-speech-app/CLAUDE.md`. Nothing here weakens a canon pin or a gate. Every canon edit below is listed for the **owner to write** as `change canon: <item>`.
@@ -96,6 +97,88 @@ On `868c4983`, five things block a fused, non-flywheel v12 from reaching canary 
   promotion saga's registry verification; the legacy bootstrap and `promotion_gate.py` (now an explicit
   `kind == "flywheel"` check) refuse it too. No manifest-writing tool for v12 exists yet, and nothing here
   registers or promotes v12.
+- **Part B step 3a (held-out set):** `scripts/build_heldout_eval_set.py --train-manifest ... --out-dir ...`
+  takes human-verdict library clips (`human_decision` accept/edit; the reference is `verdict_transcript`)
+  and drops any clip that a given training manifest contains. Text leakage uses omniasr-v11-audit's `canon`
+  with spaces removed and `difflib` ratio ≥ 0.85; retrieval is a quick_ratio upper bound, so it never
+  misses a pair. Audio leakage is the sha256 of every clip and of its source recording, checked against every
+  training audio file; a missing training file refuses the build. The tool then prunes slices below 5 until
+  none remain and writes the eval TSV, the gate-bound `eval_slices.tsv` and a proof JSON.
+  **Run 2026-10-15** against a read-only copy of the live library and the v12 manifest plus the 7 v11-lineage
+  manifests in `audit_common.py` `TRAIN_MANIFESTS` (337,526 training rows, 237,847 audio files, none
+  missing). Of 2,770 human-decided clips, 142 had sources libsndfile cannot read (`.mov`/`.mp4`), 0 leaked
+  by text, 0 by audio, and 2,148 sat in groups below the slice floor. That left **480 clips in 9 slices**:
+  - 3 sources, with 409, 64 and 7 clips;
+  - dialect: sorani 409, hawleri 71;
+  - audio: clean 480.
+
+  Eval manifest sha256 `449cd034d02ca2b22ec865011631e7ab0858f15154fa304741855cfb81cede96`. The set is local
+  and gitignored (`runs/heldout_eval_v12/`), because it is voice data. One recording supplies 409 of the
+  480 clips, so the overall CER is dominated by that recording; each recording keeps its own slice.
+- **Part B step 3b (gate binding):** `promotion_gate.py --champion-deployment/--challenger-deployment`
+  binds both models by their deployment manifests:
+  - the manifest file sha256;
+  - the canonical `manifestSha256`;
+  - every component, re-hashed at its stated size.
+
+  It uses the same `_measure` checks as flywheel runs; flywheel reports are byte-identical. A pass is
+  `JUDGED_PASS` (exit 3, `auto_promotable: false`), never `PROMOTE`.
+- **Part B step 5 (owner-only entry point):** `owner_promote` (`src-tauri/src/bin/owner_promote.rs`,
+  `owner_promotion.rs`). Design: the repo has no signing key or owner token, and the one owner-only
+  channel it already has is the canon. A promotion therefore needs:
+  - **(1)** an owner decision record committed byte-identically on the protected `origin/main`;
+  - **(2)** the `change canon:` line it quotes, naming the candidate model id **and** full deployment sha256,
+    present in `docs/OWNER_CANON.md` on `origin/main` (agents may never edit that file);
+  - **(3)** a phrase naming that deployment, typed on an interactive terminal (piped input is refused).
+
+  Then:
+  - It also needs a `JUDGED_PASS` deployment-bound verdict for exactly those identities, on the set that the
+    held-out proof describes; the registry champion as the incumbent; the registered candidate's exact sha;
+    and the canary suite file. It takes the instance lock, so Cortex must be stopped.
+  - It **admits** the durable saga job, with the record's sha256 pinned in the contract, and exits. The next
+    Cortex start runs the saga through startup recovery: DB swap, pointer, restart, exact-identity health,
+    canary, and rollback on any failure.
+  - Recovery lifts the `external_offline` refusal only for the exact candidate named by a stored record
+    that still hashes to the pin. `gate_and_promote`, the bootstrap and every other path still refuse
+    unconditionally.
+
+  **Limit:** this is a procedural barrier, not a cryptographic one. An agent with the owner's GitHub
+  rights and a TTY could forge all three. Requiring signed commits on the canon line is the upgrade.
+
+## How v12 would be promoted once the owner's canon lines land (runbook; nothing here has been run)
+Only the owner can do steps 1-5. An agent may prepare steps 6-9 but may not run 10.
+1. **FLEURS-train ruling:** write `change canon: FLEURS — train split may be used for training; the test
+   split stays the frozen eval set`, or rule v12 ineligible (decision 1 below).
+2. **CORDI share-alike ruling:** v11-lineage `next_phase_train` contains CORDI rows. Rule whether training on
+   a share-alike corpus is acceptable for a promoted model (`AGENT_CHARTER.md` forbids share-alike corpora in
+   a training target).
+3. **GPU-1 canon line:** `change canon: add GPU 1 only`, or confirm that code-only is enough (decision 2).
+4. **Model-change exception:** owner-worded exception to `cortex-speech-app/CLAUDE.md` "Never change the
+   production AI model" for this promotion (decision 5).
+5. **Pool timing:** confirm that the current review pool has finished on the legacy champion, or schedule
+   the promotion after it (decision 4). Promotion pauses the live pool for good.
+6. Write v12's schema-2 `external_offline` deployment manifest (no tool exists yet), verify it, and register
+   it as a candidate.
+7. Score the champion and then v12 on GPU 1 over `runs/heldout_eval_v12/heldout_eval.tsv` (`scorecard_7b.py`),
+   then write schema-2 deployment sidecars.
+8. Run `promotion_gate.py ... --champion-deployment ... --challenger-deployment ...` where the checkpoint bytes
+   are (WSL). It must print `JUDGED_PASS`.
+9. Build the canary suite into `<data_dir>/promotion_canaries/` (`build_promotion_canary.py`).
+10. Owner: write the canon line naming `omniasr-7b-external-<24hex>` and its deployment sha256. Commit a
+    record under `docs/owner_decisions/` through a PR, then run `git fetch origin`. Stop Cortex and run
+    `owner_promote --repo . --authorization docs/owner_decisions/<file>.json --verdict <verdict.json>
+    --eval-proof runs/heldout_eval_v12/heldout_eval.proof.json --canary-suite-id <id> --data-dir <data_dir>`,
+    typing the phrase it prints. Start Cortex. In the same change, step 6 of Part B: update `LOCKED_CHAMPION`
+    and its pin, re-draft the untouched clips, and set up a new pool.
+
+    The record has exactly these fields (unknown fields are refused):
+    ```json
+    {"schema": 1, "decision": "promote_champion", "family": "omniasr-7b",
+     "incumbent": {"modelVersionId": "<champion id>", "deploymentSha256": "<registry sha>"},
+     "candidate": {"modelVersionId": "omniasr-7b-external-<24hex>", "deploymentSha256": "<registry sha>"},
+     "canonLine": "change canon: <text naming the candidate id and its full deployment sha256>",
+     "ownerWords": "<the owner's words>", "date": "YYYY-MM-DD"}
+    ```
 
 ## Owner decisions needed (agents may not make these)
 1. **FLEURS.** Canon line 34 says "never train on it" without naming a split, and v12 trained on the train split. Choose one:
