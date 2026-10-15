@@ -493,7 +493,7 @@ pub fn register_checkpoint(
 ) -> AppResult<String> {
     if family == OMNIASR_7B_FAMILY {
         return Err(AppError::Validation(
-            "OmniASR-7B is a composite deployment (base + adapter + adapter config + tokenizer); import a verified deployment_manifest.json instead of a bare checkpoint"
+            "OmniASR-7B is a composite deployment (base + adapter + adapter config + tokenizer, or a fused checkpoint + tokenizer); import a verified deployment_manifest.json instead of a bare checkpoint"
                 .into(),
         ));
     }

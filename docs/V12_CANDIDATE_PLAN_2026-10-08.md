@@ -78,6 +78,25 @@ On `868c4983`, five things block a fused, non-flywheel v12 from reaching canary 
    - add a new-pool migration or tool;
    - schedule it **after the current review pool finishes**.
 
+## Implemented on this branch (2026-10-15)
+- **Part A:** `parse_device_indices` allows only GPU 1 (default `[1]`), refuses any list naming GPU 0 or
+  another GPU, applies the free-VRAM floor to explicit and default GPU 1 alike (busy or unreported GPU 1
+  refuses, never seizes), and pins `CUDA_DEVICE_ORDER=PCI_BUS_ID` before workers fork. The trainer default
+  is unchanged.
+- **Part B step 1 (fused shape):** chosen form is a **schema-2 manifest**: `base_checkpoint` is the fused
+  `.pt`, the adapter keys are forbidden, and identity is the manifest's exact size + SHA-256 of that `.pt`
+  and the tokenizer (no sidecar file has authority). Schema-1 adapter manifests are unchanged. The worker
+  skips PEFT entirely for schema 2. Health identity is the four components, or exactly `{base, tokenizer}`.
+- **Part B step 2 (`external_offline`):** provenance
+  `{kind, training_provenance: "external_unverified", training_manifest_sha256, parent_checkpoint_sha256,
+  evidence_sha256}`; the model id must equal `omniasr-7b-external-` + the first 24 hex of
+  `sha256(canonical {training_manifest_sha256, parent_checkpoint_sha256, evidence_sha256})`. Both verifiers,
+  health, the direct transport and the client accept the kind; `registry.rs` registers it as a
+  **candidate only**. `refuse_external_offline_promotion` blocks it in `gate_and_promote` and in the
+  promotion saga's registry verification; the legacy bootstrap and `promotion_gate.py` (now an explicit
+  `kind == "flywheel"` check) refuse it too. No manifest-writing tool for v12 exists yet, and nothing here
+  registers or promotes v12.
+
 ## Owner decisions needed (agents may not make these)
 1. **FLEURS.** Canon line 34 says "never train on it" without naming a split, and v12 trained on the train split. Choose one:
    - **a)** write `change canon: FLEURS — train split may be used for training; the test split stays the frozen eval set`;

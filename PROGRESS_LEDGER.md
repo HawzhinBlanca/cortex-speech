@@ -1,5 +1,38 @@
 # Cortex Speech — Progress Ledger
 
+## 2026-10-15 — v12 candidate mechanisms: GPU 1 only, fused deployments, external_offline provenance
+
+**Owner (verbatim):** 2026-10-08 "yes do all 3, cortex option a"; 2026-10-15 "no, we wanna make v12 ready for use
+everywhere, not just wsl and this app, inside hawedit and cortex too", choosing "Approve all" for building the
+mechanisms with "nothing promoted until your canon lines". Plan and approvals: `docs/V12_CANDIDATE_PLAN_2026-10-08.md`.
+Branch `claude/v12-candidate` on `origin/main` `868c4983` (unchanged at fetch, so no rebase was needed).
+
+- **Part A, GPU 1 only (code + tests, not canon).** `cortex_7b_server.py` serves only GPU 1 (default `[1]`), refuses
+  any `CORTEX_7B_DEVICES` list naming GPU 0 or another card, refuses a busy or unreported GPU 1 instead of seizing it,
+  and pins `CUDA_DEVICE_ORDER=PCI_BUS_ID` before forking. A canon pin waits for `change canon: add GPU 1 only`.
+- **Part B step 1, fused deployments.** Deployment schema 2: `base_checkpoint` is the fused `.pt`, adapter keys are
+  forbidden, identity is the manifest's exact size + SHA-256 of the `.pt` and tokenizer. Schema-1 adapter manifests
+  round-trip byte-identically (pinned by a Rust test). The worker never touches PEFT for schema 2.
+- **Part B step 2, `external_offline`.** `training_provenance: "external_unverified"` plus training-manifest, parent
+  checkpoint and evidence SHA-256s; the id derives from them. Registers as a candidate only;
+  `refuse_external_offline_promotion` blocks `gate_and_promote` and the promotion saga, the legacy bootstrap refuses
+  it, and `promotion_gate.py` now requires `kind == "flywheel"`.
+- **Not done here:** no model was loaded, no GPU used, no server started; the fused worker branch is untested
+  against real fairseq2 and needs a GPU-1 smoke run by the owner. Nothing registers or promotes v12 (FLEURS-train
+  and CORDI rulings pending). No metric is claimed.
+
+**Evidence (Windows workstation, normal `target/`):** `cargo test --manifest-path src-tauri/Cargo.toml --all-targets
+--all-features` — baseline on `868c4983`: lib `2745 passed; 0 failed; 8 ignored`; after the external_offline commit:
+lib `2755 passed; 0 failed; 8 ignored`, every other target `ok`. `cargo clippy ... -D warnings` exit 0; `cargo fmt
+--check` clean; `npm run test:python-policies` after the fused-deployment commit: "148 policy test scripts passed".
+Node checks (`npm test`, typecheck, lint) were not run: no `node_modules` in this worktree; the only TS change is a
+doc comment in `src/lib/generated/ipc.ts`, and `test_generated_ipc_bindings.py` reports the bindings current.
+
+**Next (Part B steps 3-5, each its own PR):** a library held-out set of at least 30 clips, at least 5 per slice,
+proven disjoint from the v11 and v12 training manifests; `promotion_gate.py` binding the challenger by deployment
+hashes instead of a flywheel run record; an owner-only promotion entry point that replaces
+`refuse_external_offline_promotion` for an owner-authorized contract.
+
 ## 2026-09-16 — Reviewer reports of downtime, slowness and dead audio: two causes found, one not established
 
 **Owner (verbatim):** "reviewers report down app, slowness, and sometimes doesnt play well, find out whats the
