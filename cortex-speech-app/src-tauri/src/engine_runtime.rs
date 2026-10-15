@@ -665,8 +665,11 @@ pub(crate) fn resolve_client_script(app: &tauri::AppHandle) -> Option<String> {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChampionComponentSha256 {
     pub base: String,
-    pub adapter: String,
-    pub adapter_config: String,
+    /// Absent for a fused (schema-2) deployment, which has no adapter files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_config: Option<String>,
     pub tokenizer: String,
 }
 
@@ -714,14 +717,20 @@ fn parse_health_marker(stdout: &str) -> Result<LoadedChampionHealth, String> {
         }
     }
     let health = health.ok_or_else(|| "champion health client returned no __HEALTH__ line".to_string())?;
+    let components = &health.component_sha256;
+    if components.adapter.is_some() != components.adapter_config.is_some() {
+        return Err("champion health names only half of an adapter (adapter and adapter config go together)".into());
+    }
     for (label, value) in [
-        ("deployment", health.deployment_sha256.as_str()),
-        ("manifest", health.manifest_sha256.as_str()),
-        ("base", health.component_sha256.base.as_str()),
-        ("adapter", health.component_sha256.adapter.as_str()),
-        ("adapter config", health.component_sha256.adapter_config.as_str()),
-        ("tokenizer", health.component_sha256.tokenizer.as_str()),
+        ("deployment", Some(health.deployment_sha256.as_str())),
+        ("manifest", Some(health.manifest_sha256.as_str())),
+        ("base", Some(components.base.as_str())),
+        ("adapter", components.adapter.as_deref()),
+        ("adapter config", components.adapter_config.as_deref()),
+        ("tokenizer", Some(components.tokenizer.as_str())),
     ] {
+        // A fused deployment has no adapter digests; every digest that is present must be canonical.
+        let Some(value) = value else { continue };
         if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
             return Err(format!("champion health {label} identity is not a canonical SHA-256"));
         }
@@ -1195,6 +1204,23 @@ mod tests {
         assert!(parse_health_marker(&format!("{valid}\n{valid}")).is_err(), "two health markers are ambiguous");
         assert!(parse_health_marker("__HEALTH__={\"status\":\"ready\"}").is_err());
         assert!(parse_health_marker("noise only").is_err());
+    }
+
+    #[test]
+    fn health_parser_accepts_a_fused_identity_and_refuses_half_an_adapter() {
+        let adapter = format!("\"adapter\":\"{}\",\"adapterConfig\":\"{}\",", "d".repeat(64), "e".repeat(64));
+        let valid = health_json("fused-1", &"a".repeat(64));
+        let fused = valid.replace(&adapter, "");
+        assert_ne!(fused, valid, "the adapter fixture digests were never removed");
+        let loaded = parse_health_marker(&fused).unwrap();
+        assert!(loaded.component_sha256.adapter.is_none() && loaded.component_sha256.adapter_config.is_none());
+        assert!(loaded.matches(&crate::registry::DeploymentIdentity {
+            model_version_id: "fused-1".into(),
+            deployment_sha256: "a".repeat(64),
+        }));
+
+        let half = valid.replace(&format!("\"adapterConfig\":\"{}\",", "e".repeat(64)), "");
+        assert!(parse_health_marker(&half).unwrap_err().contains("half of an adapter"));
     }
 
     /// Harmless real-process fault injector for the bounded subprocess boundary. This test returns

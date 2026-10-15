@@ -103,6 +103,90 @@ def _write_manifest(root: Path, provenance_kind: str = "flywheel") -> tuple[Path
     return path, json.loads(path.read_text(encoding="utf-8"))
 
 
+def _write_fused_manifest(root: Path, provenance_kind: str = "flywheel") -> tuple[Path, dict]:
+    path, manifest = _write_manifest(root, provenance_kind)
+    for name in ("adapter_model.safetensors", "adapter_config.json"):
+        (root / name).unlink()
+    manifest.pop("adapter")
+    manifest.pop("adapter_config")
+    fused = _component(root, "fused.pt", b"fused-v12-weights")
+    manifest["base_checkpoint"] = {"id": "omniasr-7b-fused-test", **fused}
+    manifest["schema"] = 2
+    _rewrite_manifest(path, manifest)
+    return path, json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_fused_deployment_binds_exact_checkpoint_and_tokenizer_without_adapter() -> None:
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        path, manifest = _write_fused_manifest(root)
+        verified = _mod.verify_deployment_manifest(path, _sha(path.read_bytes()), manifest["model_id"])
+        assert verified.adapter_path is None and verified.adapter_config_path is None
+        assert verified.base_path == (root / "fused.pt").resolve()
+        assert verified.component_sha256 == {
+            "base": _sha(b"fused-v12-weights"),
+            "tokenizer": _sha(b"tokenizer"),
+        }
+        assert set(verified.identity_reply("gpu1")["componentSha256"]) == {"base", "tokenizer"}
+
+        for filename in ("fused.pt", "tokenizer.model"):
+            original = (root / filename).read_bytes()
+            for tampered in (original[:-1] + b"X", original + b"X"):
+                (root / filename).write_bytes(tampered)
+                try:
+                    _mod.verify_deployment_manifest(path)
+                except ValueError as exc:
+                    assert "mismatch" in str(exc), (filename, exc)
+                else:
+                    raise AssertionError(f"tampered fused {filename} was accepted")
+            (root / filename).write_bytes(original)
+
+        # A sidecar SHA256SUMS next to the checkpoint has no authority: only the manifest pins bytes.
+        (root / "SHA256SUMS").write_text("0" * 64 + "  fused.pt\n", encoding="utf-8")
+        assert _mod.verify_deployment_manifest(path).base_path == (root / "fused.pt").resolve()
+
+
+def test_fused_and_adapter_shapes_cannot_be_mixed() -> None:
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        path, manifest = _write_fused_manifest(root)
+        mixed = dict(manifest, adapter=_component(root, "adapter_model.safetensors", b"adapter"))
+        _rewrite_manifest(path, mixed)
+        try:
+            _mod.verify_deployment_manifest(path)
+        except ValueError as exc:
+            assert "extra=['adapter']" in str(exc), exc
+        else:
+            raise AssertionError("a fused manifest carrying an adapter was accepted")
+
+        adapterless_schema1 = dict(manifest, schema=1)
+        _rewrite_manifest(path, adapterless_schema1)
+        try:
+            _mod.verify_deployment_manifest(path)
+        except ValueError as exc:
+            assert "missing=['adapter', 'adapter_config']" in str(exc), exc
+        else:
+            raise AssertionError("an adapter-schema manifest without its adapter was accepted")
+
+        _rewrite_manifest(path, dict(manifest, schema=3))
+        try:
+            _mod.verify_deployment_manifest(path)
+        except ValueError as exc:
+            assert "keys mismatch" in str(exc) or "unsupported deployment schema" in str(exc), exc
+        else:
+            raise AssertionError("an unknown deployment schema was accepted")
+
+
+def test_adapter_deployment_identity_is_unchanged_by_the_fused_shape() -> None:
+    temp, deployment = _verified()
+    try:
+        assert list(deployment.component_sha256) == ["base", "adapter", "adapterConfig", "tokenizer"]
+        assert deployment.adapter_path.name == "adapter_model.safetensors"
+        assert deployment.manifest["schema"] == 1
+    finally:
+        temp.cleanup()
+
+
 def _verified(provenance_kind: str = "flywheel"):
     temp = tempfile.TemporaryDirectory()
     path, _ = _write_manifest(Path(temp.name), provenance_kind)
@@ -525,6 +609,9 @@ if __name__ == "__main__":
     test_flywheel_run_and_model_identity_must_derive_from_source_evidence()
     test_each_behavior_determining_file_is_mandatory_and_hash_checked()
     test_manifest_and_pointer_substitution_are_rejected()
+    test_fused_deployment_binds_exact_checkpoint_and_tokenizer_without_adapter()
+    test_fused_and_adapter_shapes_cannot_be_mixed()
+    test_adapter_deployment_identity_is_unchanged_by_the_fused_shape()
     test_health_reports_verified_identity_without_invoking_transcription()
     test_health_remains_responsive_while_inference_lock_is_held()
     test_transcript_reply_carries_the_same_verified_identity()

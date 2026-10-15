@@ -525,10 +525,11 @@ fn wsl7b_validate_identity(reply: &serde_json::Value) -> AppResult<(String, Stri
     let Some(components) = reply.get("componentSha256").and_then(serde_json::Value::as_object) else {
         return Err(fail("reply has no complete componentSha256 identity"));
     };
-    let expected = ["adapter", "adapterConfig", "base", "tokenizer"];
+    // An adapter deployment names all four components; a fused (schema-2) one exactly base + tokenizer.
     let mut keys: Vec<&str> = components.keys().map(String::as_str).collect();
     keys.sort_unstable();
-    if keys != expected || expected.iter().any(|k| !is_sha(components.get(*k))) {
+    let complete = keys == ["adapter", "adapterConfig", "base", "tokenizer"] || keys == ["base", "tokenizer"];
+    if !complete || keys.iter().any(|k| !is_sha(components.get(*k))) {
         return Err(fail("reply has no complete componentSha256 identity"));
     }
     if reply.get("language").and_then(serde_json::Value::as_str) != Some("ckb_Arab") {

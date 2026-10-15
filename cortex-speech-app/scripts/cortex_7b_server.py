@@ -9,6 +9,8 @@ machine, a bus-factor-1 risk. The server loads only the content-addressed deploy
 ``CORTEX_7B_CHAMPION_POINTER``. The pointer pins an exact manifest; that manifest pins the base,
 LoRA adapter, adapter configuration, tokenizer, runtime shape, and provenance. Every byte is
 verified before the socket binds. There is deliberately no model-directory or base-only fallback.
+A schema-2 FUSED deployment instead pins one merged checkpoint (as base_checkpoint) and the
+tokenizer, each by exact size + SHA-256; it has no adapter files and never goes through PEFT.
 
 Protocol (newline-delimited JSON, one request per connection):
   ->  {"audio_path": "/mnt/c/...wav", "start_ms": 1200, "end_ms": 4800}   (start/end optional)
@@ -60,6 +62,9 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_POINTER_BYTES = 1024 * 1024
 MAX_CONNECTION_THREADS = min(128, max(4, int(os.environ.get("CORTEX_7B_MAX_CONNECTION_THREADS", "32"))))
 DEPLOYMENT_SCHEMA = 1
+# Schema 2 is a FUSED deployment: base_checkpoint is the fused fairseq2 checkpoint itself and there is
+# no adapter or adapter_config. Its identity is the exact size + SHA-256 of that .pt and the tokenizer.
+FUSED_DEPLOYMENT_SCHEMA = 2
 POINTER_SCHEMA = 2
 FAMILY = "omniasr-7b"
 PROTOCOL = "cortex-omniasr-adapter"
@@ -288,8 +293,8 @@ class VerifiedDeployment:
     provenance_kind: str
     base_id: str
     base_path: Path
-    adapter_path: Path
-    adapter_config_path: Path
+    adapter_path: Path | None  # None for a fused (schema 2) deployment
+    adapter_config_path: Path | None
     tokenizer_path: Path
     component_sha256: dict
 
@@ -331,13 +336,16 @@ def verify_deployment_manifest(
                 f"got {deployment_sha256}"
             )
 
+    schema = value.get("schema") if isinstance(value, dict) else None
+    fused = type(schema) is int and schema == FUSED_DEPLOYMENT_SCHEMA
     value = _exact_keys(
         value,
         {
             "schema", "model_id", "family", "model_card", "language", "runtime", "base_checkpoint",
-            "adapter", "adapter_config", "tokenizer", "server_compatibility", "provenance", "manifestSha256",
-        },
-        "deployment manifest",
+            "tokenizer", "server_compatibility", "provenance", "manifestSha256",
+        }
+        | (set() if fused else {"adapter", "adapter_config"}),
+        "fused deployment manifest" if fused else "deployment manifest",
     )
     stated_self_hash = value["manifestSha256"]
     unsigned = dict(value)
@@ -347,7 +355,11 @@ def verify_deployment_manifest(
         raise ValueError(
             f"deployment manifest self-hash mismatch: expected {stated_self_hash!r}, got {actual_self_hash}"
         )
-    if type(value["schema"]) is not int or value["schema"] != DEPLOYMENT_SCHEMA or value["family"] != FAMILY:
+    if (
+        type(value["schema"]) is not int
+        or value["schema"] not in (DEPLOYMENT_SCHEMA, FUSED_DEPLOYMENT_SCHEMA)
+        or value["family"] != FAMILY
+    ):
         raise ValueError("unsupported deployment schema or family")
     model_version_id = _text(value["model_id"], "model_id")
     if expected_model_version_id is not None and model_version_id != expected_model_version_id:
@@ -377,15 +389,22 @@ def verify_deployment_manifest(
     resolved_manifest = Path(manifest_path).resolve(strict=True)
     root = resolved_manifest.parent
     base_path, base_id = _verify_base(root, value["base_checkpoint"])
-    adapter_path = _verify_relative_component(root, value["adapter"], "adapter")
-    adapter_config_path = _verify_relative_component(root, value["adapter_config"], "adapter_config")
+    component_sha256 = {"base": value["base_checkpoint"]["sha256"]}
+    adapter_path = adapter_config_path = None
+    if not fused:
+        adapter_path = _verify_relative_component(root, value["adapter"], "adapter")
+        adapter_config_path = _verify_relative_component(root, value["adapter_config"], "adapter_config")
     tokenizer_path = _verify_relative_component(root, value["tokenizer"], "tokenizer")
-    if adapter_path.name != "adapter_model.safetensors":
-        raise ValueError("adapter must be named adapter_model.safetensors for PEFT loading")
-    if adapter_config_path.name != "adapter_config.json":
-        raise ValueError("adapter_config must be named adapter_config.json for PEFT loading")
-    if adapter_path.parent != adapter_config_path.parent:
-        raise ValueError("adapter and adapter_config must share one PEFT deployment directory")
+    if not fused:
+        if adapter_path.name != "adapter_model.safetensors":
+            raise ValueError("adapter must be named adapter_model.safetensors for PEFT loading")
+        if adapter_config_path.name != "adapter_config.json":
+            raise ValueError("adapter_config must be named adapter_config.json for PEFT loading")
+        if adapter_path.parent != adapter_config_path.parent:
+            raise ValueError("adapter and adapter_config must share one PEFT deployment directory")
+        component_sha256["adapter"] = value["adapter"]["sha256"]
+        component_sha256["adapterConfig"] = value["adapter_config"]["sha256"]
+    component_sha256["tokenizer"] = value["tokenizer"]["sha256"]
 
     return VerifiedDeployment(
         manifest=value,
@@ -402,12 +421,7 @@ def verify_deployment_manifest(
         adapter_path=adapter_path,
         adapter_config_path=adapter_config_path,
         tokenizer_path=tokenizer_path,
-        component_sha256={
-            "base": value["base_checkpoint"]["sha256"],
-            "adapter": value["adapter"]["sha256"],
-            "adapterConfig": value["adapter_config"]["sha256"],
-            "tokenizer": value["tokenizer"]["sha256"],
-        },
+        component_sha256=component_sha256,
     )
 
 
@@ -671,18 +685,21 @@ def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None
     import torch
     import torchaudio
 
-    # These are the exact files the parent hashed before fork. No cache discovery, directory override,
-    # or base-only branch is allowed: a different composition is a different model version.
-    model_dir = deployment.adapter_path.parent
+    # These are the exact files the parent hashed before fork. No cache discovery or directory override
+    # is allowed: a different composition is a different model version. A FUSED deployment (schema 2,
+    # adapter_path None) is not a base-only fallback: its base_checkpoint IS the pinned fused model.
+    fused = deployment.adapter_path is None
+    model_dir = None if fused else deployment.adapter_path.parent
     tokenizer_path = deployment.tokenizer_path
     checkpoint_path = deployment.base_path
     os.environ.setdefault("FAIRSEQ2_USER_ASSET_DIR", str(deployment.manifest_path.parent))
 
     # --- fairseq2 / PEFT-LoRA compatibility patches (verbatim from server.py, the proven recipe) --
     try:
-        from fairseq2.nn.projection import Linear as BaseLinear
-        from peft.tuners.lora import Linear as LoraLinear
-        from peft import PeftModel, LoraConfig
+        if not fused:
+            from fairseq2.nn.projection import Linear as BaseLinear
+            from peft.tuners.lora import Linear as LoraLinear
+            from peft import PeftModel, LoraConfig
         from fairseq2.models.hub import load_model
         from fairseq2.data.tokenizers import load_tokenizer
         from fairseq2.assets import get_asset_store, load_in_memory_asset_metadata
@@ -695,16 +712,17 @@ def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None
         print("Ensure torch, fairseq2, peft, and omnilingual-asr are installed (use the champion venv).")
         os._exit(1)
 
-    BaseLinear.in_features = property(lambda self: self.input_dim)
-    BaseLinear.out_features = property(lambda self: self.output_dim)
+    if not fused:
+        BaseLinear.in_features = property(lambda self: self.input_dim)
+        BaseLinear.out_features = property(lambda self: self.output_dim)
 
-    orig_post_init = LoraConfig.__post_init__
+        orig_post_init = LoraConfig.__post_init__
 
-    def patched_post_init(self):
-        orig_post_init(self)
-        self._register_custom_module({BaseLinear: LoraLinear})
+        def patched_post_init(self):
+            orig_post_init(self)
+            self._register_custom_module({BaseLinear: LoraLinear})
 
-    LoraConfig.__post_init__ = patched_post_init
+        LoraConfig.__post_init__ = patched_post_init
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
@@ -742,10 +760,15 @@ def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None
 
     print(f"[{tag}] Loading base weights (~30 GB, one minute)...", flush=True)
     base_model = load_model(model_card, device=device, dtype=dtype, config=config_custom)
-    print(f"[{tag}] Applying pinned LoRA adapter from {model_dir}...", flush=True)
-    peft_model = PeftModel.from_pretrained(base_model, str(model_dir))
-    pipeline_model = peft_model.base_model.model
-    print(f"[{tag}] LoRA applied.", flush=True)
+    if fused:
+        # The pinned checkpoint already contains the merged weights; PEFT is never imported or applied.
+        pipeline_model = base_model
+        print(f"[{tag}] Fused deployment: no adapter to apply.", flush=True)
+    else:
+        print(f"[{tag}] Applying pinned LoRA adapter from {model_dir}...", flush=True)
+        peft_model = PeftModel.from_pretrained(base_model, str(model_dir))
+        pipeline_model = peft_model.base_model.model
+        print(f"[{tag}] LoRA applied.", flush=True)
 
     tokenizer = load_tokenizer(model_card)
     pipeline = ASRInferencePipeline(
@@ -934,7 +957,7 @@ def main(argv=None) -> int:
     # Deliberately NOT listening yet — see the worker's listen() note.
 
     print("=" * 60, flush=True)
-    print("Loading OmniASR-7B Champion (base + Kurdish LoRA)...", flush=True)
+    print(f"Loading OmniASR-7B Champion ({'fused checkpoint' if deployment.adapter_path is None else 'base + Kurdish LoRA'})...", flush=True)
     if not indices:
         # Hide every GPU BEFORE worker() derives its device from torch.cuda.is_available() —
         # without this, "cpu" printed a CPU banner while silently loading ~16 GB onto GPU 0

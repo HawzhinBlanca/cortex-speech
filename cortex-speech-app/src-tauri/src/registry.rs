@@ -253,8 +253,8 @@ pub fn bootstrap_verified_legacy_deployment(
     if manifest.model_id != LEGACY_MODEL_ID
         || manifest.base_checkpoint.id != "omniASR-LLM-7B-v2"
         || manifest.base_checkpoint.sha256 != LEGACY_BASE_SHA256
-        || manifest.adapter.sha256 != LEGACY_ADAPTER_SHA256
-        || manifest.adapter_config.sha256 != LEGACY_ADAPTER_CONFIG_SHA256
+        || manifest.adapter.as_ref().map(|c| c.sha256.as_str()) != Some(LEGACY_ADAPTER_SHA256)
+        || manifest.adapter_config.as_ref().map(|c| c.sha256.as_str()) != Some(LEGACY_ADAPTER_CONFIG_SHA256)
         || manifest.tokenizer.sha256 != LEGACY_TOKENIZER_SHA256
         || !matches!(
             measurement_evidence_sha256.as_str(),
@@ -797,8 +797,8 @@ mod tests {
         record.manifest.model_id = LEGACY_MODEL_ID.into();
         record.manifest.base_checkpoint.id = "omniASR-LLM-7B-v2".into();
         record.manifest.base_checkpoint.sha256 = LEGACY_BASE_SHA256.into();
-        record.manifest.adapter.sha256 = LEGACY_ADAPTER_SHA256.into();
-        record.manifest.adapter_config.sha256 = LEGACY_ADAPTER_CONFIG_SHA256.into();
+        record.manifest.adapter.as_mut().unwrap().sha256 = LEGACY_ADAPTER_SHA256.into();
+        record.manifest.adapter_config.as_mut().unwrap().sha256 = LEGACY_ADAPTER_CONFIG_SHA256.into();
         record.manifest.tokenizer.sha256 = LEGACY_TOKENIZER_SHA256.into();
         record.manifest.provenance = DeploymentProvenance::LegacyBootstrap {
             measurement_evidence_sha256: LEGACY_MEASUREMENT_EVIDENCE_SHA256.into(),
@@ -823,7 +823,7 @@ mod tests {
     fn legacy_bootstrap_rejects_one_byte_identity_drift_without_writing() {
         let db = open();
         let (_dir, mut record) = test_legacy_record();
-        record.manifest.adapter_config.sha256 = "0".repeat(64);
+        record.manifest.adapter_config.as_mut().unwrap().sha256 = "0".repeat(64);
         assert!(bootstrap_verified_legacy_deployment(&db, &record, "Apache-2.0").is_err());
         assert!(list_model_versions(&db).unwrap().is_empty());
     }

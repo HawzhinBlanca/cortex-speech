@@ -4,6 +4,10 @@
 //! checkpoint, adapter, adapter configuration, tokenizer and runtime shape together. This module
 //! verifies that complete unit before it may enter the registry or be launched by the champion
 //! supervisor.
+//!
+//! Schema 2 is a FUSED deployment: `base_checkpoint` is the merged checkpoint itself and the adapter
+//! fields are absent. It is bound by the exact size + SHA-256 of that checkpoint and the tokenizer;
+//! schema-1 (adapter) manifests are unchanged and still require both adapter components.
 
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
@@ -16,6 +20,7 @@ use std::time::{Duration, Instant};
 pub const OMNIASR_7B_FAMILY: &str = "omniasr-7b";
 pub const OMNIASR_7B_MODEL_CARD: &str = "soranivoice_omniASR_LLM_7B_v2_local";
 pub const DEPLOYMENT_SCHEMA: u32 = 1;
+pub const FUSED_DEPLOYMENT_SCHEMA: u32 = 2;
 pub const SERVER_PROTOCOL: &str = "cortex-omniasr-adapter";
 pub const SERVER_PROTOCOL_VERSION: u32 = 1;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -104,9 +109,12 @@ pub struct DeploymentManifest {
     pub language: String,
     pub provenance: DeploymentProvenance,
     pub base_checkpoint: BaseCheckpointIdentity,
-    pub adapter: DeploymentComponent,
+    /// Present exactly when `schema == DEPLOYMENT_SCHEMA`; absent (never null) for a fused deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<DeploymentComponent>,
     pub tokenizer: DeploymentComponent,
-    pub adapter_config: DeploymentComponent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_config: Option<DeploymentComponent>,
     pub server_compatibility: ServerCompatibility,
     pub runtime: RuntimeIdentity,
     #[serde(rename = "manifestSha256")]
@@ -120,9 +128,10 @@ pub struct VerifiedDeployment {
     pub deployment_sha256: String,
     pub manifest: DeploymentManifest,
     pub base_path: PathBuf,
-    pub adapter_path: PathBuf,
+    /// `None` for a fused deployment.
+    pub adapter_path: Option<PathBuf>,
     pub tokenizer_path: PathBuf,
-    pub adapter_config_path: PathBuf,
+    pub adapter_config_path: Option<PathBuf>,
 }
 
 /// Path-neutral result used by the registry. Local verification additionally returns canonical
@@ -180,9 +189,32 @@ fn canonical_manifest_bytes(value: &serde_json::Value) -> AppResult<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Deserialize a manifest object and refuse anything the typed form would not reproduce exactly
+/// (an explicit `"adapter": null`, for instance), so Rust accepts the same key set the Python
+/// verifier's exact-key check accepts.
+fn manifest_from_value(value: serde_json::Value) -> AppResult<DeploymentManifest> {
+    let manifest: DeploymentManifest = serde_json::from_value(value.clone())
+        .map_err(|error| AppError::Validation(format!("deployment manifest schema is invalid: {error}")))?;
+    let round_trip = serde_json::to_value(&manifest)
+        .map_err(|error| AppError::Other(format!("re-serializing deployment manifest: {error}")))?;
+    if round_trip != value {
+        return Err(AppError::Validation("deployment manifest has fields its schema does not define".into()));
+    }
+    Ok(manifest)
+}
+
 fn validate_manifest_contract(manifest: &DeploymentManifest) -> AppResult<()> {
-    if manifest.schema != DEPLOYMENT_SCHEMA
-        || manifest.family != OMNIASR_7B_FAMILY
+    let adapter_shape_ok = match manifest.schema {
+        DEPLOYMENT_SCHEMA => manifest.adapter.is_some() && manifest.adapter_config.is_some(),
+        FUSED_DEPLOYMENT_SCHEMA => manifest.adapter.is_none() && manifest.adapter_config.is_none(),
+        _ => false,
+    };
+    if !adapter_shape_ok {
+        return Err(AppError::Validation(
+            "deployment schema 1 requires adapter + adapter_config; fused schema 2 forbids both".into(),
+        ));
+    }
+    if manifest.family != OMNIASR_7B_FAMILY
         || manifest.server_compatibility.protocol != SERVER_PROTOCOL
         || manifest.server_compatibility.version != SERVER_PROTOCOL_VERSION
     {
@@ -393,8 +425,7 @@ pub fn verify_deployment_manifest(path: &Path, expected_file_sha256: Option<&str
         .as_object_mut()
         .ok_or_else(|| AppError::Validation("deployment manifest top level must be an object".into()))?;
     value_object.insert("manifestSha256".into(), serde_json::Value::String(stated_self_hash));
-    let manifest: DeploymentManifest = serde_json::from_value(value)
-        .map_err(|error| AppError::Validation(format!("deployment manifest schema is invalid: {error}")))?;
+    let manifest = manifest_from_value(value)?;
 
     validate_manifest_contract(&manifest)?;
 
@@ -403,9 +434,11 @@ pub fn verify_deployment_manifest(path: &Path, expected_file_sha256: Option<&str
         .parent()
         .ok_or_else(|| AppError::Validation("deployment manifest has no parent directory".into()))?;
     let base_path = resolve_base(root, &manifest.base_checkpoint)?;
-    let adapter_path = resolve_component(root, &manifest.adapter, "adapter")?;
+    let adapter_path =
+        manifest.adapter.as_ref().map(|adapter| resolve_component(root, adapter, "adapter")).transpose()?;
     let tokenizer_path = resolve_component(root, &manifest.tokenizer, "tokenizer")?;
-    let adapter_config_path = resolve_component(root, &manifest.adapter_config, "adapter config")?;
+    let adapter_config_path =
+        manifest.adapter_config.as_ref().map(|config| resolve_component(root, config, "adapter config")).transpose()?;
 
     Ok(VerifiedDeployment {
         manifest_path,
@@ -422,8 +455,10 @@ pub fn verify_deployment_manifest(path: &Path, expected_file_sha256: Option<&str
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WslComponentIdentity {
     base: String,
-    adapter: String,
-    adapter_config: String,
+    #[serde(default)]
+    adapter: Option<String>,
+    #[serde(default)]
+    adapter_config: Option<String>,
     tokenizer: String,
 }
 
@@ -442,7 +477,7 @@ struct WslVerificationReply {
     language: String,
     provenance_kind: String,
     worker: String,
-    manifest: DeploymentManifest,
+    manifest: serde_json::Value,
 }
 
 fn validate_absolute_wsl_path(path: &str, label: &str) -> AppResult<()> {
@@ -466,8 +501,9 @@ fn record_from_wsl_reply(
 ) -> AppResult<VerifiedDeploymentRecord> {
     let reply: WslVerificationReply = serde_json::from_slice(stdout)
         .map_err(|error| AppError::Validation(format!("WSL deployment verifier returned invalid JSON: {error}")))?;
-    validate_manifest_contract(&reply.manifest)?;
-    let provenance_kind = match &reply.manifest.provenance {
+    let manifest = manifest_from_value(reply.manifest)?;
+    validate_manifest_contract(&manifest)?;
+    let provenance_kind = match &manifest.provenance {
         DeploymentProvenance::Flywheel { .. } => "flywheel",
         DeploymentProvenance::LegacyBootstrap { .. } => "legacy_bootstrap",
     };
@@ -481,14 +517,15 @@ fn record_from_wsl_reply(
         || reply.provenance_kind != provenance_kind
         || reply.model_version_id != expected_model_id
         || reply.deployment_sha256 != expected_file_sha256
-        || reply.manifest.model_id != reply.model_version_id
-        || reply.manifest.family != reply.family
-        || reply.manifest.language != reply.language
-        || reply.manifest.manifest_sha256 != reply.manifest_sha256
-        || reply.component_sha256.base != reply.manifest.base_checkpoint.sha256
-        || reply.component_sha256.adapter != reply.manifest.adapter.sha256
-        || reply.component_sha256.adapter_config != reply.manifest.adapter_config.sha256
-        || reply.component_sha256.tokenizer != reply.manifest.tokenizer.sha256
+        || manifest.model_id != reply.model_version_id
+        || manifest.family != reply.family
+        || manifest.language != reply.language
+        || manifest.manifest_sha256 != reply.manifest_sha256
+        || reply.component_sha256.base != manifest.base_checkpoint.sha256
+        || reply.component_sha256.adapter.as_deref() != manifest.adapter.as_ref().map(|c| c.sha256.as_str())
+        || reply.component_sha256.adapter_config.as_deref()
+            != manifest.adapter_config.as_ref().map(|c| c.sha256.as_str())
+        || reply.component_sha256.tokenizer != manifest.tokenizer.sha256
     {
         return Err(AppError::Validation(
             "WSL deployment verifier returned an internally inconsistent identity".into(),
@@ -497,7 +534,7 @@ fn record_from_wsl_reply(
     Ok(VerifiedDeploymentRecord {
         manifest_path: manifest_wsl_path.to_string(),
         deployment_sha256: reply.deployment_sha256,
-        manifest: reply.manifest,
+        manifest,
     })
 }
 
@@ -665,6 +702,119 @@ pub(crate) mod tests {
         path
     }
 
+    /// Rewrite `value` as canonical manifest bytes with a fresh semantic self-hash.
+    pub(crate) fn rewrite_test_manifest(path: &Path, mut value: serde_json::Value) {
+        value.as_object_mut().unwrap().remove("manifestSha256");
+        let self_hash = hash_bytes(&serde_json::to_vec(&canonical_json(&value)).unwrap());
+        value.as_object_mut().unwrap().insert("manifestSha256".into(), self_hash.into());
+        std::fs::write(path, canonical_manifest_bytes(&value).unwrap()).unwrap();
+    }
+
+    /// A schema-2 fused deployment: the merged checkpoint is `base_checkpoint`, no adapter files.
+    pub(crate) fn write_test_fused_manifest(root: &Path, model_id: &str) -> PathBuf {
+        let path = write_test_flywheel_manifest(root, model_id);
+        let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("adapter");
+        object.remove("adapter_config");
+        std::fs::remove_file(root.join("adapter_model.safetensors")).unwrap();
+        std::fs::remove_file(root.join("adapter_config.json")).unwrap();
+        let fused = b"fused-weights";
+        std::fs::write(root.join("fused.pt"), fused).unwrap();
+        object.insert("schema".into(), FUSED_DEPLOYMENT_SCHEMA.into());
+        object.insert(
+            "base_checkpoint".into(),
+            serde_json::json!({"id": "fused-1", "path": "fused.pt", "sha256": digest(fused), "size_bytes": fused.len()}),
+        );
+        rewrite_test_manifest(&path, value);
+        path
+    }
+
+    #[test]
+    fn fused_deployment_binds_the_exact_checkpoint_and_tokenizer_without_adapter_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_test_fused_manifest(dir.path(), "fused-1");
+        let file_sha = crate::models::compute_file_sha256(&path).unwrap();
+        let verified = verify_deployment_manifest(&path, Some(&file_sha)).unwrap();
+        assert_eq!(verified.manifest.schema, FUSED_DEPLOYMENT_SCHEMA);
+        assert!(verified.adapter_path.is_none() && verified.adapter_config_path.is_none());
+        assert!(verified.base_path.ends_with("fused.pt"));
+        assert_eq!(verified.manifest.base_checkpoint.sha256, digest(b"fused-weights"));
+
+        for (name, tampered) in [("fused.pt", &b"fused-weightZ"[..]), ("tokenizer.model", &b"tokenizer!"[..])] {
+            let original = std::fs::read(dir.path().join(name)).unwrap();
+            std::fs::write(dir.path().join(name), tampered).unwrap();
+            let error = verify_deployment_manifest(&path, None).unwrap_err().to_string();
+            assert!(error.contains("mismatch"), "tampered {name}: {error}");
+            std::fs::write(dir.path().join(name), original).unwrap();
+        }
+        // A sidecar checksum file next to the checkpoint carries no authority over the manifest.
+        std::fs::write(dir.path().join("SHA256SUMS"), format!("{}  fused.pt\n", "0".repeat(64))).unwrap();
+        assert!(verify_deployment_manifest(&path, Some(&file_sha)).is_ok());
+    }
+
+    #[test]
+    fn fused_and_adapter_shapes_cannot_be_mixed_or_nulled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_test_fused_manifest(dir.path(), "fused-1");
+        let fused: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let adapter = write_component(dir.path(), "adapter_model.safetensors", b"adapter");
+        let mut cases = Vec::new();
+        let mut with_adapter = fused.clone();
+        with_adapter["adapter"] = serde_json::to_value(&adapter).unwrap();
+        cases.push(("fused with an adapter", with_adapter));
+        let mut as_schema1 = fused.clone();
+        as_schema1["schema"] = 1.into();
+        cases.push(("schema 1 without adapters", as_schema1));
+        let mut nulled = fused.clone();
+        nulled["adapter"] = serde_json::Value::Null;
+        cases.push(("explicit null adapter", nulled));
+        let mut schema3 = fused;
+        schema3["schema"] = 3.into();
+        cases.push(("unknown schema", schema3));
+        for (label, value) in cases {
+            rewrite_test_manifest(&path, value);
+            assert!(verify_deployment_manifest(&path, None).is_err(), "{label} was accepted");
+        }
+    }
+
+    #[test]
+    fn adapter_manifest_round_trips_byte_identically() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_test_flywheel_manifest(dir.path(), "challenger-1");
+        let bytes = std::fs::read(&path).unwrap();
+        let verified = verify_deployment_manifest(&path, None).unwrap();
+        let reserialized = canonical_manifest_bytes(&serde_json::to_value(&verified.manifest).unwrap()).unwrap();
+        assert_eq!(reserialized, bytes, "the optional adapter fields changed an adapter manifest's bytes");
+    }
+
+    #[test]
+    fn wsl_verifier_reply_for_a_fused_deployment_is_cross_checked() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_test_fused_manifest(dir.path(), "fused-1");
+        let verified = verify_deployment_manifest(&path, None).unwrap();
+        let reply = verifier_reply(&verified);
+        let wsl_path = "/home/ai/run/deployment_manifest.json";
+        let record = record_from_wsl_reply(
+            &serde_json::to_vec(&reply).unwrap(),
+            wsl_path,
+            &verified.deployment_sha256,
+            "fused-1",
+        )
+        .unwrap();
+        assert!(record.manifest.adapter.is_none());
+
+        let mut claims_adapter = reply;
+        claims_adapter["componentSha256"]["adapter"] = serde_json::Value::String("0".repeat(64));
+        assert!(record_from_wsl_reply(
+            &serde_json::to_vec(&claims_adapter).unwrap(),
+            wsl_path,
+            &verified.deployment_sha256,
+            "fused-1",
+        )
+        .is_err());
+    }
+
     #[test]
     fn verifies_the_complete_composite_identity() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -673,7 +823,7 @@ pub(crate) mod tests {
         let verified = verify_deployment_manifest(&path, Some(&file_sha)).unwrap();
         assert_eq!(verified.manifest.model_id, "challenger-1");
         assert_eq!(verified.deployment_sha256, file_sha);
-        assert!(verified.adapter_path.ends_with("adapter_model.safetensors"));
+        assert!(verified.adapter_path.as_ref().unwrap().ends_with("adapter_model.safetensors"));
     }
 
     #[test]
@@ -705,11 +855,17 @@ pub(crate) mod tests {
             "modelVersionId": verified.manifest.model_id,
             "deploymentSha256": verified.deployment_sha256,
             "manifestSha256": verified.manifest.manifest_sha256,
-            "componentSha256": {
-                "base": verified.manifest.base_checkpoint.sha256,
-                "adapter": verified.manifest.adapter.sha256,
-                "adapterConfig": verified.manifest.adapter_config.sha256,
-                "tokenizer": verified.manifest.tokenizer.sha256,
+            "componentSha256": match (&verified.manifest.adapter, &verified.manifest.adapter_config) {
+                (Some(adapter), Some(config)) => serde_json::json!({
+                    "base": verified.manifest.base_checkpoint.sha256,
+                    "adapter": adapter.sha256,
+                    "adapterConfig": config.sha256,
+                    "tokenizer": verified.manifest.tokenizer.sha256,
+                }),
+                _ => serde_json::json!({
+                    "base": verified.manifest.base_checkpoint.sha256,
+                    "tokenizer": verified.manifest.tokenizer.sha256,
+                }),
             },
             "language": "ckb_Arab",
             "provenanceKind": "flywheel",

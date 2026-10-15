@@ -1915,6 +1915,20 @@ fn wsl7b_identity_validation_refuses_impostors() {
     let mut missing_component = good.clone();
     missing_component["componentSha256"] = serde_json::json!({"base": sha});
     assert!(wsl7b_validate_identity(&missing_component).is_err(), "a partial component identity is no identity");
+
+    // A fused (schema-2) deployment has no adapter files: exactly base + tokenizer, nothing in between.
+    let mut fused = good.clone();
+    fused["componentSha256"] = serde_json::json!({"base": sha, "tokenizer": sha});
+    assert!(wsl7b_validate_identity(&fused).is_ok(), "a fused identity names exactly base + tokenizer");
+    for partial in [
+        serde_json::json!({"base": sha, "adapter": sha, "tokenizer": sha}),
+        serde_json::json!({"base": sha, "adapterConfig": sha, "tokenizer": sha}),
+        serde_json::json!({"base": sha, "tokenizer": "not-a-sha"}),
+    ] {
+        let mut bad = good.clone();
+        bad["componentSha256"] = partial.clone();
+        assert!(wsl7b_validate_identity(&bad).is_err(), "{partial} is no complete identity");
+    }
 }
 
 // ---- Wave-3 coverage: pipeline.rs root helpers, gating, error taxonomy ----
