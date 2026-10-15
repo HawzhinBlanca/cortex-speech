@@ -152,8 +152,8 @@ On `868c4983`, five things block a fused, non-flywheel v12 from reaching canary 
   `python3 cortex-speech-app/scripts/write_external_deployment.py --checkpoint .../champion_v12_lora64_750_fused/kurdish_omniasr_7b_v12_c750.pt
   --tokenizer /home/ai/cortex_v12_candidate/omniASR_tokenizer_written_v2.model --parent-checkpoint
   .../champion_v11_supreme_fused/kurdish_omniasr_7b_v11_champion.pt --training-manifest
-  /mnt/c/Users/Wareen/Desktop/omniasr-v11-audit/data/v12_train.jsonl --evidence
-  /mnt/c/Users/Wareen/Desktop/omniasr-v11-audit/release/kurdish-omniasr-7b-v12/SHA256SUMS --out
+  <omniasr-v11-audit>/data/v12_train.jsonl --evidence
+  <omniasr-v11-audit>/release/kurdish-omniasr-7b-v12/SHA256SUMS --out
   /home/ai/cortex_v12_candidate/deployment_manifest.json` printed:
   - `modelVersionId` `omniasr-7b-external-2e659f9fcda9f7fdca7a9922`;
   - `deploymentSha256` `dae2307fbcd5f0ccb31523030b20212826da6bead0e7a48cea51e6f1df0cf977`, `manifestSha256`
