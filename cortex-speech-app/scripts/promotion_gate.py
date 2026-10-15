@@ -45,6 +45,15 @@ Usage::
 
 Exit 0 = PROMOTE, 1 = REJECT, 2 = INVALID evidence.  Once arguments have parsed, the program writes
 a verdict even when an input is missing, malformed, or tampered.
+
+Deployment binding (a challenger with no flywheel run record, e.g. an ``external_offline`` fused
+model): both models are bound by their deployment manifests instead — the manifest file SHA-256 (the
+registry identity), the canonical ``manifestSha256`` and every component re-hashed at its stated size
+(checkpoint + tokenizer for fused schema 2).  Sidecars use ``schema_version: 2, binding: "deployment"``.
+The measurement checks are the same code as above.  The passing verdict is ``JUDGED_PASS`` (exit 3),
+never ``PROMOTE``: such a model can be judged here and promoted only by the owner-only entry point::
+
+    python scripts/promotion_gate.py CHAMPION.tsv CHALLENGER.tsv --eval-manifest GOLD.tsv       --slices eval_slices.tsv --champion-deployment CHAMPION/deployment_manifest.json       --challenger-deployment CHALLENGER/deployment_manifest.json [--out verdict.json]
 """
 
 from __future__ import annotations
@@ -452,23 +461,24 @@ def _run_relative_file(root: Path, metadata: Any, label: str) -> tuple[Path, str
 
 
 def _deployment_component(
-    deployment: Mapping[str, Any], root: Path, name: str, *, absolute: bool = False
+    deployment: Mapping[str, Any], root: Path, name: str, *, absolute: bool = False,
+    label: str = "challenger deployment",
 ) -> tuple[str, str]:
     value = deployment.get(name)
     if not isinstance(value, dict):
-        raise GateInputError(f"challenger deployment has no {name} component")
+        raise GateInputError(f"{label} has no {name} component")
     raw_path, stated_hash, stated_size = value.get("path"), value.get("sha256"), value.get("size_bytes")
     if not _valid_identity(raw_path):
-        raise GateInputError(f"challenger deployment {name} has no exact path identity")
+        raise GateInputError(f"{label} {name} has no exact path identity")
     if not isinstance(stated_hash, str) or _SHA256_RE.fullmatch(stated_hash) is None:
-        raise GateInputError(f"challenger deployment {name} has no canonical sha256")
+        raise GateInputError(f"{label} {name} has no canonical sha256")
     if not isinstance(stated_size, int) or isinstance(stated_size, bool) or stated_size <= 0:
-        raise GateInputError(f"challenger deployment {name} has no positive size_bytes")
+        raise GateInputError(f"{label} {name} has no positive size_bytes")
     try:
         if absolute:
             raw = Path(raw_path)
             if not raw.is_absolute():
-                raise GateInputError(f"challenger deployment {name} path is not absolute")
+                raise GateInputError(f"{label} {name} path is not absolute")
             path = raw.resolve(strict=True)
         else:
             relative = PurePosixPath(raw_path)
@@ -478,21 +488,21 @@ def _deployment_component(
                 or "\\" in raw_path
                 or any(part in {"", ".", ".."} or ":" in part for part in relative.parts)
             ):
-                raise GateInputError(f"challenger deployment {name} path is not canonical run-relative")
+                raise GateInputError(f"{label} {name} path is not canonical run-relative")
             path = root.joinpath(*relative.parts).resolve(strict=True)
             path.relative_to(root)
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
-        raise GateInputError(f"challenger deployment {name} file is missing or unsafe") from error
+        raise GateInputError(f"{label} {name} file is missing or unsafe") from error
     if not path.is_file():
-        raise GateInputError(f"challenger deployment {name} is not a regular file")
+        raise GateInputError(f"{label} {name} is not a regular file")
     if path.stat().st_size != stated_size:
-        raise GateInputError(f"challenger deployment {name} size differs from deployment manifest")
+        raise GateInputError(f"{label} {name} size differs from deployment manifest")
     actual_hash = sha256_file(path)
     if actual_hash != stated_hash:
-        raise GateInputError(f"challenger deployment {name} file hash differs from deployment manifest")
+        raise GateInputError(f"{label} {name} file hash differs from deployment manifest")
     component_id = value.get("id") if name == "base_checkpoint" else raw_path
     if not _valid_identity(component_id):
-        raise GateInputError(f"challenger deployment {name} has no exact id")
+        raise GateInputError(f"{label} {name} has no exact id")
     return component_id, actual_hash
 
 
@@ -540,6 +550,11 @@ def load_challenger_run(path: Path) -> ChallengerRunBinding:
     provenance = deployment.get("provenance")
     if not isinstance(provenance, dict):
         raise GateInputError("challenger deployment has no provenance object")
+    if provenance.get("kind") != "flywheel":
+        # external_offline / legacy_bootstrap models are never crowned by this automatic gate.
+        raise GateInputError(
+            f"challenger deployment provenance kind {provenance.get('kind')!r} is not a flywheel run"
+        )
     snapshot = provenance.get("snapshot")
     if not isinstance(snapshot, dict) or snapshot.get("id") != snapshot_id:
         raise GateInputError("challenger deployment snapshot differs from its run record")
@@ -612,6 +627,267 @@ def load_challenger_run(path: Path) -> ChallengerRunBinding:
         tokenizer_id=tokenizer_id,
         tokenizer_sha256=tokenizer_hash,
     )
+
+
+@dataclass(frozen=True)
+class DeploymentBinding:
+    """A model bound by its deployment manifest bytes and re-hashed component files alone.
+
+    This is the binding for a challenger with no flywheel run record (an ``external_offline`` model
+    such as v12). It can be JUDGED by :func:`decide_deployment`, never auto-promoted.
+    """
+
+    deployment_sha256: str
+    model_family: str
+    model_id: str
+    model_sha256: str
+    provenance_kind: str
+    checkpoint_id: str
+    checkpoint_sha256: str
+    tokenizer_id: str
+    tokenizer_sha256: str
+
+
+DEPLOYMENT_PROVENANCE_SCHEMA_VERSION = 2
+_DEPLOYMENT_PROVENANCE_FIELDS = (
+    "schema_version",
+    "binding",
+    "role",
+    "scorecard_sha256",
+    "eval_manifest_sha256",
+    "eval_manifest_rows",
+    "model_family",
+    "model_id",
+    "model_sha256",
+    "deployment_sha256",
+    "normalizer_id",
+    "normalizer_sha256",
+    "norm_basis",
+)
+_DEPLOYMENT_SHARED_FIELDS = (
+    "eval_manifest_sha256",
+    "eval_manifest_rows",
+    "model_family",
+    "normalizer_id",
+    "normalizer_sha256",
+    "norm_basis",
+)
+_DEPLOYMENT_KINDS = {"flywheel", "legacy_bootstrap", "external_offline"}
+
+
+def load_deployment(path: Path, role: str) -> DeploymentBinding:
+    """Re-derive a model's identity from its schema-1 or fused schema-2 deployment manifest.
+
+    The manifest file bytes are the registry identity (``deployment_sha256``); the canonical
+    ``manifestSha256`` must match the contents; every component file is re-hashed at its stated size.
+    """
+    label = f"{role} deployment"
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise GateInputError(f"cannot read {label} {path}: {error}") from error
+    deployment = _load_strict_json_object(path, label)
+    semantic_hash = deployment.get("manifestSha256")
+    if not isinstance(semantic_hash, str) or _SHA256_RE.fullmatch(semantic_hash) is None:
+        raise GateInputError(f"{label} has no canonical semantic manifestSha256")
+    semantic_document = dict(deployment)
+    semantic_document.pop("manifestSha256", None)
+    if _canonical_json_sha256(semantic_document) != semantic_hash:
+        raise GateInputError(f"{label} canonical manifestSha256 does not match its contents")
+    schema = deployment.get("schema")
+    if isinstance(schema, bool) or schema not in (1, 2) or deployment.get("family") != CANONICAL_MODEL_FAMILY:
+        raise GateInputError(f"{label} violates the owner OmniASR-7B family lock or has an unknown schema")
+    if deployment.get("model_card") != OWNER_MODEL_CARD:
+        raise GateInputError(f"{label} is not the owner-pinned OmniASR-7B model card")
+    if deployment.get("language") != "ckb_Arab" or deployment.get("runtime") != OWNER_RUNTIME:
+        raise GateInputError(f"{label} language/runtime is not the owner-pinned 7B contract")
+    if deployment.get("server_compatibility") != {"protocol": "cortex-omniasr-adapter", "version": 1}:
+        raise GateInputError(f"{label} has an unsupported serving protocol")
+    model_id = deployment.get("model_id")
+    if not _valid_identity(model_id):
+        raise GateInputError(f"{label} has no exact model_id")
+    provenance = deployment.get("provenance")
+    kind = provenance.get("kind") if isinstance(provenance, dict) else None
+    if kind not in _DEPLOYMENT_KINDS:
+        raise GateInputError(f"{label} has an unknown provenance kind {kind!r}")
+    adapter_keys = {"adapter", "adapter_config"} & set(deployment)
+    if (schema == 1 and adapter_keys != {"adapter", "adapter_config"}) or (schema == 2 and adapter_keys):
+        raise GateInputError(f"{label}: schema 1 requires adapter + adapter_config; fused schema 2 forbids both")
+    root = path.parent.resolve(strict=True)
+    base = deployment.get("base_checkpoint")
+    absolute = isinstance(base, dict) and isinstance(base.get("path"), str) and Path(base["path"]).is_absolute()
+    checkpoint_id, checkpoint_hash = _deployment_component(
+        deployment, root, "base_checkpoint", absolute=absolute, label=label
+    )
+    tokenizer_id, tokenizer_hash = _deployment_component(deployment, root, "tokenizer", label=label)
+    for name in sorted(adapter_keys):
+        _deployment_component(deployment, root, name, label=label)
+    return DeploymentBinding(
+        deployment_sha256=hashlib.sha256(raw).hexdigest(),
+        model_family=CANONICAL_MODEL_FAMILY,
+        model_id=model_id,
+        model_sha256=semantic_hash,
+        provenance_kind=kind,
+        checkpoint_id=checkpoint_id,
+        checkpoint_sha256=checkpoint_hash,
+        tokenizer_id=tokenizer_id,
+        tokenizer_sha256=tokenizer_hash,
+    )
+
+
+def _deployment_provenance_problems(
+    role: str,
+    provenance: Mapping[str, Any],
+    binding: DeploymentBinding,
+    scorecard: Scorecard,
+    eval_manifest_sha256: str,
+    eval_manifest_rows: int,
+) -> list[str]:
+    problems: list[str] = []
+    missing = [field for field in _DEPLOYMENT_PROVENANCE_FIELDS if field not in provenance]
+    if missing:
+        problems.append(f"{role} provenance is missing mandatory field(s) {missing}")
+    expected = {
+        "schema_version": DEPLOYMENT_PROVENANCE_SCHEMA_VERSION,
+        "binding": "deployment",
+        "role": role,
+        "scorecard_sha256": scorecard.sha256,
+        "eval_manifest_sha256": eval_manifest_sha256,
+        "eval_manifest_rows": eval_manifest_rows,
+        "model_family": binding.model_family,
+        "model_id": binding.model_id,
+        "model_sha256": binding.model_sha256,
+        "deployment_sha256": binding.deployment_sha256,
+        "norm_basis": scorecard.norm_basis,
+    }
+    for field, value in expected.items():
+        if provenance.get(field) != value or isinstance(provenance.get(field), bool):
+            problems.append(
+                f"{role} provenance {field} does not match the re-verified deployment/evidence "
+                f"({provenance.get(field)!r} != {value!r})"
+            )
+    if not _valid_identity(provenance.get("normalizer_id")):
+        problems.append(f"{role} provenance normalizer_id must be a non-empty exact identity")
+    normalizer = provenance.get("normalizer_sha256")
+    if not isinstance(normalizer, str) or _SHA256_RE.fullmatch(normalizer) is None:
+        problems.append(f"{role} provenance normalizer_sha256 must be a lowercase SHA-256")
+    return problems
+
+
+def decide_deployment(
+    champion: Scorecard,
+    challenger: Scorecard,
+    champion_provenance: Mapping[str, Any],
+    challenger_provenance: Mapping[str, Any],
+    slice_file: SliceFile,
+    champion_deployment: DeploymentBinding,
+    challenger_deployment: DeploymentBinding,
+    *,
+    eval_manifest_sha256: str,
+    eval_manifest_rows: int,
+) -> dict[str, Any]:
+    """Judge a deployment-bound challenger. The passing verdict is JUDGED_PASS, never PROMOTE.
+
+    A model without a flywheel run record cannot be crowned by this gate: JUDGED_PASS only states
+    that the paired measurement and every protected slice cleared the same thresholds as a flywheel
+    promotion. Promotion needs the owner-only entry point (``owner_promote``).
+    """
+    reasons: list[str] = []
+    verdict = "JUDGED_PASS"
+
+    def refuse(reason: str, *, invalid: bool = False) -> None:
+        nonlocal verdict
+        reasons.append(reason)
+        if invalid:
+            verdict = "INVALID"
+        elif verdict != "INVALID":
+            verdict = "REJECT"
+
+    if not isinstance(eval_manifest_sha256, str) or _SHA256_RE.fullmatch(eval_manifest_sha256) is None:
+        refuse("eval manifest identity must be a lowercase SHA-256", invalid=True)
+    if eval_manifest_rows <= 0:
+        refuse("eval manifest has zero rows", invalid=True)
+    for role, provenance, binding, card in (
+        ("champion", champion_provenance, champion_deployment, champion),
+        ("challenger", challenger_provenance, challenger_deployment, challenger),
+    ):
+        for problem in _deployment_provenance_problems(
+            role, provenance, binding, card, eval_manifest_sha256, eval_manifest_rows
+        ):
+            refuse(problem, invalid=True)
+    for field in _DEPLOYMENT_SHARED_FIELDS:
+        if champion_provenance.get(field) != challenger_provenance.get(field):
+            refuse(
+                f"champion/challenger provenance differs on shared identity {field} "
+                f"({champion_provenance.get(field)!r} vs {challenger_provenance.get(field)!r})",
+                invalid=True,
+            )
+    for field in ("model_id", "model_sha256", "deployment_sha256"):
+        if getattr(champion_deployment, field) == getattr(challenger_deployment, field):
+            refuse(
+                f"champion and challenger {field} are identical — this does not prove a distinct candidate",
+                invalid=True,
+            )
+
+    paired, rates, significance, slice_report = _measure(
+        champion, challenger, slice_file, eval_manifest_sha256, eval_manifest_rows, refuse
+    )
+    champion_cer, challenger_cer = rates["cer"]
+    champion_wer, challenger_wer = rates["wer"]
+    if verdict == "JUDGED_PASS":
+        reasons.append(
+            f"paired CER {champion_cer:.4f} -> {challenger_cer:.4f} and WER "
+            f"{champion_wer:.4f} -> {challenger_wer:.4f} on {len(paired)} exact clips; both significant; "
+            f"{len(slice_report)} protected slice(s) safe; NOT auto-promotable (owner-only promotion)"
+        )
+
+    def identity(binding: DeploymentBinding, provenance: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "scorecard_sha256": provenance.get("scorecard_sha256"),
+            "model_id": binding.model_id,
+            "model_sha256": binding.model_sha256,
+            "deployment_sha256": binding.deployment_sha256,
+            "provenance_kind": binding.provenance_kind,
+            "checkpoint_id": binding.checkpoint_id,
+            "checkpoint_sha256": binding.checkpoint_sha256,
+            "tokenizer_id": binding.tokenizer_id,
+            "tokenizer_sha256": binding.tokenizer_sha256,
+        }
+
+    return {
+        "schema_version": 2,
+        "binding": "deployment",
+        "auto_promotable": False,
+        "verdict": verdict,
+        "paired_clips": len(paired),
+        "champion_cer": champion_cer,
+        "challenger_cer": challenger_cer,
+        "champion_wer": champion_wer,
+        "challenger_wer": challenger_wer,
+        "cer_improvement": champion_cer - challenger_cer if champion_cer is not None and challenger_cer is not None else None,
+        "wer_improvement": champion_wer - challenger_wer if champion_wer is not None and challenger_wer is not None else None,
+        "significance": significance,
+        "mapsswe_p": significance["cer"]["p_value"] if significance["cer"] else None,
+        "norm_basis": champion.norm_basis if champion.norm_basis == challenger.norm_basis else None,
+        "eval_manifest_sha256": eval_manifest_sha256,
+        "eval_manifest_rows": eval_manifest_rows,
+        "model_family": champion_deployment.model_family,
+        "identities": {
+            "champion": identity(champion_deployment, champion_provenance),
+            "challenger": identity(challenger_deployment, challenger_provenance),
+        },
+        "slices_sha256": slice_file.sha256,
+        "slices": slice_report,
+        "thresholds": {
+            "min_paired_clips": MIN_PAIRED_CLIPS,
+            "min_slice_clips": MIN_SLICE_CLIPS,
+            "min_cer_improvement": MIN_CER_IMPROVEMENT,
+            "min_wer_improvement": MIN_WER_IMPROVEMENT,
+            "max_p_value_exclusive": MAX_P_VALUE,
+            "slice_regression_tolerance": SLICE_REGRESSION_TOLERANCE,
+        },
+        "reasons": reasons,
+    }
 
 
 def _provenance_problems(
@@ -842,70 +1118,15 @@ def _run_binding_problems(
     return problems
 
 
-def decide(
+def _measure(
     champion: Scorecard,
     challenger: Scorecard,
-    champion_provenance: Mapping[str, Any],
-    challenger_provenance: Mapping[str, Any],
     slice_file: SliceFile,
-    challenger_run: ChallengerRunBinding,
-    *,
-    expected_snapshot_id: str,
     eval_manifest_sha256: str,
     eval_manifest_rows: int,
-) -> dict[str, Any]:
-    """Pure promotion decision.  Invalid evidence always outranks model-quality rejection."""
-    reasons: list[str] = []
-    verdict = "PROMOTE"
-
-    def refuse(reason: str, *, invalid: bool = False) -> None:
-        nonlocal verdict
-        reasons.append(reason)
-        if invalid:
-            verdict = "INVALID"
-        elif verdict != "INVALID":
-            verdict = "REJECT"
-
-    if not isinstance(expected_snapshot_id, str) or _SHA256_RE.fullmatch(expected_snapshot_id) is None:
-        refuse("expected snapshot_id must be a lowercase SHA-256", invalid=True)
-    if not isinstance(eval_manifest_sha256, str) or _SHA256_RE.fullmatch(eval_manifest_sha256) is None:
-        refuse("eval manifest identity must be a lowercase SHA-256", invalid=True)
-    if eval_manifest_rows <= 0:
-        refuse("eval manifest has zero rows", invalid=True)
-
-    for problem in _provenance_problems(
-        "champion", champion_provenance, champion, expected_snapshot_id, eval_manifest_sha256, eval_manifest_rows
-    ):
-        refuse(problem, invalid=True)
-    for problem in _run_binding_problems(challenger_run, challenger_provenance, expected_snapshot_id):
-        refuse(problem, invalid=True)
-    for problem in _provenance_problems(
-        "challenger", challenger_provenance, challenger, expected_snapshot_id, eval_manifest_sha256, eval_manifest_rows
-    ):
-        refuse(problem, invalid=True)
-
-    for field in _SHARED_IDENTITY_FIELDS:
-        if champion_provenance.get(field) != challenger_provenance.get(field):
-            refuse(
-                f"champion/challenger provenance differs on shared identity {field} "
-                f"({champion_provenance.get(field)!r} vs {challenger_provenance.get(field)!r})",
-                invalid=True,
-            )
-    for field in (
-        "model_id",
-        "model_sha256",
-        "adapter_id",
-        "adapter_sha256",
-        "adapter_config_id",
-        "adapter_config_sha256",
-    ):
-        left, right = champion_provenance.get(field), challenger_provenance.get(field)
-        if left == right:
-            refuse(
-                f"champion and challenger {field} are identical — this does not prove a distinct candidate",
-                invalid=True,
-            )
-
+    refuse: Any,
+) -> tuple[list[int], dict[str, tuple[float | None, float | None]], dict[str, dict[str, Any] | None], list[dict[str, Any]]]:
+    """Pairing, coverage, slices and paired significance — shared by every binding mode."""
     if not champion.norm_basis or not challenger.norm_basis:
         refuse("normalization basis is null — cross-basis equality cannot be established", invalid=True)
     elif champion.norm_basis != challenger.norm_basis:
@@ -1001,6 +1222,77 @@ def decide(
                     f"slice {name!r} {metric} REGRESSED ({before:.4f} -> {after:.4f}, "
                     f"+{after - before:.4f})"
                 )
+
+    return paired, rates, significance, slice_report
+
+
+def decide(
+    champion: Scorecard,
+    challenger: Scorecard,
+    champion_provenance: Mapping[str, Any],
+    challenger_provenance: Mapping[str, Any],
+    slice_file: SliceFile,
+    challenger_run: ChallengerRunBinding,
+    *,
+    expected_snapshot_id: str,
+    eval_manifest_sha256: str,
+    eval_manifest_rows: int,
+) -> dict[str, Any]:
+    """Pure promotion decision.  Invalid evidence always outranks model-quality rejection."""
+    reasons: list[str] = []
+    verdict = "PROMOTE"
+
+    def refuse(reason: str, *, invalid: bool = False) -> None:
+        nonlocal verdict
+        reasons.append(reason)
+        if invalid:
+            verdict = "INVALID"
+        elif verdict != "INVALID":
+            verdict = "REJECT"
+
+    if not isinstance(expected_snapshot_id, str) or _SHA256_RE.fullmatch(expected_snapshot_id) is None:
+        refuse("expected snapshot_id must be a lowercase SHA-256", invalid=True)
+    if not isinstance(eval_manifest_sha256, str) or _SHA256_RE.fullmatch(eval_manifest_sha256) is None:
+        refuse("eval manifest identity must be a lowercase SHA-256", invalid=True)
+    if eval_manifest_rows <= 0:
+        refuse("eval manifest has zero rows", invalid=True)
+
+    for problem in _provenance_problems(
+        "champion", champion_provenance, champion, expected_snapshot_id, eval_manifest_sha256, eval_manifest_rows
+    ):
+        refuse(problem, invalid=True)
+    for problem in _run_binding_problems(challenger_run, challenger_provenance, expected_snapshot_id):
+        refuse(problem, invalid=True)
+    for problem in _provenance_problems(
+        "challenger", challenger_provenance, challenger, expected_snapshot_id, eval_manifest_sha256, eval_manifest_rows
+    ):
+        refuse(problem, invalid=True)
+
+    for field in _SHARED_IDENTITY_FIELDS:
+        if champion_provenance.get(field) != challenger_provenance.get(field):
+            refuse(
+                f"champion/challenger provenance differs on shared identity {field} "
+                f"({champion_provenance.get(field)!r} vs {challenger_provenance.get(field)!r})",
+                invalid=True,
+            )
+    for field in (
+        "model_id",
+        "model_sha256",
+        "adapter_id",
+        "adapter_sha256",
+        "adapter_config_id",
+        "adapter_config_sha256",
+    ):
+        left, right = champion_provenance.get(field), challenger_provenance.get(field)
+        if left == right:
+            refuse(
+                f"champion and challenger {field} are identical — this does not prove a distinct candidate",
+                invalid=True,
+            )
+
+    paired, rates, significance, slice_report = _measure(
+        champion, challenger, slice_file, eval_manifest_sha256, eval_manifest_rows, refuse
+    )
 
     champion_cer, challenger_cer = rates["cer"]
     champion_wer, challenger_wer = rates["wer"]
@@ -1137,7 +1429,69 @@ def _default_provenance(scorecard: Path) -> Path:
     return Path(f"{scorecard}.provenance.json")
 
 
+def main_deployment(argv: Sequence[str]) -> int:
+    """``--challenger-deployment`` mode: judge (never promote) a deployment-bound challenger.
+
+    Exit 3 = JUDGED_PASS, 1 = REJECT, 2 = INVALID. No exit code means "promote": only the owner-only
+    entry point may act on a JUDGED_PASS.
+    """
+    parser = argparse.ArgumentParser(description="Judge a deployment-bound OmniASR-7B challenger (never promotes)")
+    parser.add_argument("champion_tsv", type=Path)
+    parser.add_argument("challenger_tsv", type=Path)
+    parser.add_argument("--eval-manifest", required=True, type=Path)
+    parser.add_argument("--slices", required=True, type=Path)
+    parser.add_argument("--champion-deployment", required=True, type=Path)
+    parser.add_argument("--challenger-deployment", required=True, type=Path)
+    parser.add_argument("--champion-provenance", type=Path)
+    parser.add_argument("--challenger-provenance", type=Path)
+    parser.add_argument("--out", type=Path)
+    args = parser.parse_args(argv)
+
+    out = args.out or args.challenger_tsv.with_name("promotion_verdict.json")
+    champion_provenance_path = args.champion_provenance or _default_provenance(args.champion_tsv)
+    challenger_provenance_path = args.challenger_provenance or _default_provenance(args.challenger_tsv)
+    evidence = {
+        "champion_scorecard": str(args.champion_tsv),
+        "challenger_scorecard": str(args.challenger_tsv),
+        "champion_provenance": str(champion_provenance_path),
+        "challenger_provenance": str(challenger_provenance_path),
+        "eval_manifest": str(args.eval_manifest),
+        "protected_slices": str(args.slices),
+        "champion_deployment": str(args.champion_deployment),
+        "challenger_deployment": str(args.challenger_deployment),
+    }
+    try:
+        manifest = inspect_eval_manifest(args.eval_manifest)
+        report = decide_deployment(
+            load_scorecard(args.champion_tsv),
+            load_scorecard(args.challenger_tsv),
+            load_provenance(champion_provenance_path),
+            load_provenance(challenger_provenance_path),
+            load_slices(args.slices),
+            load_deployment(args.champion_deployment, "champion"),
+            load_deployment(args.challenger_deployment, "challenger"),
+            eval_manifest_sha256=manifest.sha256,
+            eval_manifest_rows=manifest.row_count,
+        )
+    except (GateInputError, OSError) as error:
+        report = {"schema_version": 2, "binding": "deployment", "auto_promotable": False, "verdict": "INVALID",
+                  "paired_clips": 0, "identities": None, "slices": [], "reasons": [str(error)]}
+    report["evidence"] = evidence
+    try:
+        _write_json_atomic(out, report)
+    except OSError as error:
+        print(f"PROMOTION GATE (deployment binding): INVALID — could not durably write verdict {out}: {error}", file=sys.stderr)
+        return 2
+    print(f"PROMOTION GATE (deployment binding, never auto-promotes): {report['verdict']}", flush=True)
+    for reason in report["reasons"]:
+        print(f"  - {reason}", flush=True)
+    print(f"  verdict written to {out}", flush=True)
+    return {"JUDGED_PASS": 3, "REJECT": 1}.get(report["verdict"], 2)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    if "--challenger-deployment" in (sys.argv[1:] if argv is None else argv):
+        return main_deployment(list(sys.argv[1:] if argv is None else argv))
     parser = argparse.ArgumentParser(description="Prove whether an OmniASR-7B challenger may be promoted")
     parser.add_argument("champion_tsv", type=Path)
     parser.add_argument("challenger_tsv", type=Path)

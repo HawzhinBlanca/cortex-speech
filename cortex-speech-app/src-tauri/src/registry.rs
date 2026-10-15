@@ -187,9 +187,11 @@ pub fn sync_champion_pointer(db: &Database, data_dir: &std::path::Path) -> AppRe
     Ok(true)
 }
 
-/// Register a complete, locally verified deployment unit. New challengers must carry flywheel
-/// provenance; the transparent-but-unverifiable legacy form is reserved for the one-time incumbent
-/// bootstrap and can never enter through this path.
+/// Register a complete, locally verified deployment unit as a `candidate`. New challengers carry
+/// flywheel provenance, or the honest `external_offline` kind for a model trained outside the
+/// flywheel; the transparent-but-unverifiable legacy form is reserved for the one-time incumbent
+/// bootstrap and can never enter through this path. Registration never promotes: an external_offline
+/// candidate is refused by every automatic promotion path (see `refuse_external_offline_promotion`).
 pub fn register_verified_deployment(
     db: &Database,
     verified: &VerifiedDeployment,
@@ -205,7 +207,10 @@ pub fn register_verified_deployment_record(
     source: &str,
     license: &str,
 ) -> AppResult<ModelVersion> {
-    if !matches!(verified.manifest.provenance, DeploymentProvenance::Flywheel { .. }) {
+    if !matches!(
+        verified.manifest.provenance,
+        DeploymentProvenance::Flywheel { .. } | DeploymentProvenance::ExternalOffline { .. }
+    ) {
         return Err(AppError::Validation("legacy_bootstrap provenance cannot be registered as a challenger".into()));
     }
     let new = NewModelVersion {
@@ -253,8 +258,8 @@ pub fn bootstrap_verified_legacy_deployment(
     if manifest.model_id != LEGACY_MODEL_ID
         || manifest.base_checkpoint.id != "omniASR-LLM-7B-v2"
         || manifest.base_checkpoint.sha256 != LEGACY_BASE_SHA256
-        || manifest.adapter.sha256 != LEGACY_ADAPTER_SHA256
-        || manifest.adapter_config.sha256 != LEGACY_ADAPTER_CONFIG_SHA256
+        || manifest.adapter.as_ref().map(|c| c.sha256.as_str()) != Some(LEGACY_ADAPTER_SHA256)
+        || manifest.adapter_config.as_ref().map(|c| c.sha256.as_str()) != Some(LEGACY_ADAPTER_CONFIG_SHA256)
         || manifest.tokenizer.sha256 != LEGACY_TOKENIZER_SHA256
         || !matches!(
             measurement_evidence_sha256.as_str(),
@@ -295,6 +300,33 @@ pub fn bootstrap_verified_legacy_deployment(
     get_model_version(db, LEGACY_MODEL_ID)?.ok_or_else(|| {
         AppError::Other("legacy champion was committed but could not be read back from the registry".into())
     })
+}
+
+/// The one guard every automatic promotion path calls: an `external_offline` model was trained
+/// outside the flywheel, so no scorecard gate, saga step or bootstrap may crown it. Promoting one is
+/// reserved for the owner-only entry point `owner_promote` (see `owner_promotion.rs`).
+pub(crate) fn refuse_external_offline_promotion(manifest: &crate::deployment::DeploymentManifest) -> AppResult<()> {
+    if matches!(manifest.provenance, DeploymentProvenance::ExternalOffline { .. }) {
+        return Err(AppError::Validation(format!(
+            "'{}' has external_offline provenance and cannot be promoted by any automatic path",
+            manifest.model_id
+        )));
+    }
+    Ok(())
+}
+
+/// The saga's form of the guard. It differs from [`refuse_external_offline_promotion`] only for a job
+/// admitted by `owner_promote`: `owner_authorized` is the candidate a stored, re-hashed owner record
+/// names (`owner_promotion::load_verified_authorization`), and only that exact identity passes.
+pub(crate) fn refuse_external_offline_promotion_unless_owner_authorized(
+    manifest: &crate::deployment::DeploymentManifest,
+    identity: &crate::champion_promotion::ExactDeploymentIdentity,
+    owner_authorized: Option<&crate::champion_promotion::ExactDeploymentIdentity>,
+) -> AppResult<()> {
+    if owner_authorized == Some(identity) && manifest.model_id == identity.model_version_id {
+        return Ok(());
+    }
+    refuse_external_offline_promotion(manifest)
 }
 
 fn verify_registry_deployment(version: &ModelVersion) -> AppResult<VerifiedDeployment> {
@@ -475,7 +507,7 @@ pub fn register_checkpoint(
 ) -> AppResult<String> {
     if family == OMNIASR_7B_FAMILY {
         return Err(AppError::Validation(
-            "OmniASR-7B is a composite deployment (base + adapter + adapter config + tokenizer); import a verified deployment_manifest.json instead of a bare checkpoint"
+            "OmniASR-7B is a composite deployment (base + adapter + adapter config + tokenizer, or a fused checkpoint + tokenizer); import a verified deployment_manifest.json instead of a bare checkpoint"
                 .into(),
         ));
     }
@@ -717,6 +749,7 @@ pub fn gate_and_promote(
     }
 
     let challenger_deployment = verify_registry_deployment(&challenger)?;
+    refuse_external_offline_promotion(&challenger_deployment.manifest)?;
     if !matches!(challenger_deployment.manifest.provenance, DeploymentProvenance::Flywheel { .. }) {
         return Err(AppError::Validation("promotion gate accepts only a fully traced flywheel challenger".into()));
     }
@@ -797,8 +830,8 @@ mod tests {
         record.manifest.model_id = LEGACY_MODEL_ID.into();
         record.manifest.base_checkpoint.id = "omniASR-LLM-7B-v2".into();
         record.manifest.base_checkpoint.sha256 = LEGACY_BASE_SHA256.into();
-        record.manifest.adapter.sha256 = LEGACY_ADAPTER_SHA256.into();
-        record.manifest.adapter_config.sha256 = LEGACY_ADAPTER_CONFIG_SHA256.into();
+        record.manifest.adapter.as_mut().unwrap().sha256 = LEGACY_ADAPTER_SHA256.into();
+        record.manifest.adapter_config.as_mut().unwrap().sha256 = LEGACY_ADAPTER_CONFIG_SHA256.into();
         record.manifest.tokenizer.sha256 = LEGACY_TOKENIZER_SHA256.into();
         record.manifest.provenance = DeploymentProvenance::LegacyBootstrap {
             measurement_evidence_sha256: LEGACY_MEASUREMENT_EVIDENCE_SHA256.into(),
@@ -823,7 +856,7 @@ mod tests {
     fn legacy_bootstrap_rejects_one_byte_identity_drift_without_writing() {
         let db = open();
         let (_dir, mut record) = test_legacy_record();
-        record.manifest.adapter_config.sha256 = "0".repeat(64);
+        record.manifest.adapter_config.as_mut().unwrap().sha256 = "0".repeat(64);
         assert!(bootstrap_verified_legacy_deployment(&db, &record, "Apache-2.0").is_err());
         assert!(list_model_versions(&db).unwrap().is_empty());
     }
@@ -841,6 +874,69 @@ mod tests {
         let champion = bootstrap_verified_legacy_deployment(&db, &record, "Apache-2.0").unwrap();
         assert_eq!(champion.id, LEGACY_MODEL_ID);
         assert_eq!(list_model_versions(&db).unwrap().len(), 1);
+    }
+
+    fn register_test_external(db: &Database) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let (manifest, model_id) = crate::deployment::tests::write_test_external_manifest(dir.path());
+        let verified = crate::deployment::verify_deployment_manifest(&manifest, None).unwrap();
+        let row = register_verified_deployment(db, &verified, "user-finetuned", "Apache-2.0").unwrap();
+        assert_eq!(row.status, "candidate", "an external_offline model enters only as a candidate");
+        (dir, model_id)
+    }
+
+    #[test]
+    fn external_offline_registers_only_as_a_candidate() {
+        let db = open();
+        let (_dir, model_id) = register_test_external(&db);
+        assert_eq!(get_model_version(&db, &model_id).unwrap().unwrap().status, "candidate");
+        assert!(get_champion(&db, OMNIASR_7B_FAMILY).unwrap().is_none(), "registration never crowns it");
+    }
+
+    /// The owner approved building the external_offline mechanism with "nothing promoted until your
+    /// canon lines". Every automatic path that can crown a model must refuse it.
+    #[test]
+    fn external_offline_cannot_be_promoted_through_any_automatic_path() {
+        // 1. The legacy scorecard gate, even with a winning, correctly paired scorecard.
+        let db = open();
+        let _champion_dir = register_test_flywheel(&db, "champ");
+        promote_to_champion(&db, "champ").unwrap();
+        let (_dir, model_id) = register_test_external(&db);
+        let card = ided(challenger_card(0.10, 0.06, 0.20, 0.10, true, 0.01), &model_id, "champ");
+        let error = gate_and_promote(&db, &model_id, &card, &PromotionPolicy::default()).unwrap_err().to_string();
+        assert!(error.contains("external_offline"), "{error}");
+        assert_eq!(get_champion(&db, OMNIASR_7B_FAMILY).unwrap().unwrap().id, "champ");
+
+        // 2. The durable promotion saga's registry verification calls this exact guard.
+        let row = get_model_version(&db, &model_id).unwrap().unwrap();
+        let verified = verify_registry_deployment(&row).unwrap();
+        assert!(refuse_external_offline_promotion(&verified.manifest).is_err());
+        let champion = verify_registry_deployment(&get_model_version(&db, "champ").unwrap().unwrap()).unwrap();
+        assert!(refuse_external_offline_promotion(&champion.manifest).is_ok(), "flywheel stays promotable");
+
+        // 2b. The saga's form refuses it too unless an owner record names this EXACT identity.
+        let exact = crate::champion_promotion::ExactDeploymentIdentity {
+            model_version_id: model_id.clone(),
+            deployment_sha256: verified.deployment_sha256.clone(),
+        };
+        let other = crate::champion_promotion::ExactDeploymentIdentity {
+            model_version_id: model_id.clone(),
+            deployment_sha256: "f".repeat(64),
+        };
+        let guard = refuse_external_offline_promotion_unless_owner_authorized;
+        assert!(guard(&verified.manifest, &exact, None).is_err(), "no owner record: automatic refusal");
+        assert!(guard(&verified.manifest, &exact, Some(&other)).is_err(), "a record for other bytes");
+        let renamed = crate::champion_promotion::ExactDeploymentIdentity {
+            model_version_id: "omniasr-7b-external-someone-else".into(),
+            deployment_sha256: verified.deployment_sha256.clone(),
+        };
+        assert!(guard(&verified.manifest, &renamed, Some(&renamed)).is_err(), "manifest id must still match");
+        assert!(guard(&verified.manifest, &exact, Some(&exact)).is_ok(), "the owner-authorized exact candidate");
+
+        // 3. The one-time legacy bootstrap, even into an empty family.
+        let empty = open();
+        assert!(bootstrap_verified_legacy_deployment(&empty, &verified.record(), "Apache-2.0").is_err());
+        assert!(list_model_versions(&empty).unwrap().is_empty());
     }
 
     #[test]

@@ -12,8 +12,8 @@
 #                         app regenerates on every start, so helper and app can never disagree)
 #   CORTEX_7B_PYTHON      WSL path to the python with torch/fairseq2/peft/omnilingual-asr
 #   CORTEX_7B_PORT        default 8799
-#   CORTEX_7B_DEVICES     e.g. "0,1" — one model replica per GPU (default: every visible GPU).
-#                         On this rig (2x 3090 Ti) the default loads both cards for ~2x throughput.
+#   CORTEX_7B_DEVICES     GPU 1 only (default "1"; "cpu" forces CPU). Any list naming another GPU,
+#                         including 0, refuses to start, and a busy GPU 1 refuses rather than seizes.
 # The dedicated wsl.exe remains alive for the lifetime of the server. Before READY, the in-WSL guard
 # also requires launcher heartbeats, because Windows PowerShell 5.1 can bypass finally on Ctrl+C.
 $ErrorActionPreference = "Stop"
