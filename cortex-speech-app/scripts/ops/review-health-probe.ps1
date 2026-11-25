@@ -72,9 +72,16 @@ if ($Register) {
         Write-Output "$taskName NOT re-registered: no interpreter at $python (pass -PythonPath)."
         exit 0
     }
-    $template = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -PythonPath "{1}" -LogDirectory "{2}"'
-    $argument = $template -f $PSCommandPath, $python, $logDir
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument
+    $hiddenRunner = Join-Path $PSScriptRoot 'run-hidden.vbs'
+    if (Test-Path -LiteralPath $hiddenRunner) {
+        $template = '//B //Nologo "{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -PythonPath "{2}" -LogDirectory "{3}" -NoPopup'
+        $argument = $template -f $hiddenRunner, $PSCommandPath, $python, $logDir
+        $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument $argument
+    } else {
+        $template = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -PythonPath "{1}" -LogDirectory "{2}" -NoPopup'
+        $argument = $template -f $PSCommandPath, $python, $logDir
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument
+    }
     # Starts within a minute of the deploy rather than at the next half-hour: a release that broke
     # the serving chain should be caught by the first probe after it, not up to 30 minutes later.
     $trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) `

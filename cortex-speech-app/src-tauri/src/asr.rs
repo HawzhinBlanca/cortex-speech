@@ -77,7 +77,15 @@ pub fn detect_optimal_provider(enable_gpu: bool) -> String {
 }
 
 fn which_nvidia_smi() -> bool {
-    std::process::Command::new("nvidia-smi").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    let mut cmd = std::process::Command::new("nvidia-smi");
+    cmd.arg("--version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.output().map(|o| o.status.success()).unwrap_or(false)
 }
 
 pub fn omniasr_model_paths(model_dir: &Path, size: &AsrModelSize) -> (PathBuf, PathBuf) {
@@ -745,14 +753,15 @@ impl WorkerProcess {
     fn spawn(executable: &Path, startup: &WorkerStartup) -> Result<Self, String> {
         let startup_json =
             serde_json::to_string(startup).map_err(|e| format!("serialize ASR worker startup configuration: {e}"))?;
-        let mut child = Command::new(executable)
-            .arg(WORKER_ARG)
-            .arg(startup_json)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| format!("start isolated ASR worker {}: {e}", executable.display()))?;
+        let mut cmd = Command::new(executable);
+        cmd.arg(WORKER_ARG).arg(startup_json).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = cmd.spawn().map_err(|e| format!("start isolated ASR worker {}: {e}", executable.display()))?;
         let input = child.stdin.take().ok_or_else(|| "ASR worker stdin was not piped".to_string())?;
         let stdout = child.stdout.take().ok_or_else(|| "ASR worker stdout was not piped".to_string())?;
         let (sender, responses) = mpsc::channel();

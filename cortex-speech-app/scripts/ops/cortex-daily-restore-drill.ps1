@@ -10,8 +10,14 @@ $dataDir = if ($env:CORTEX_RESTORE_DRILL_DATA_DIR) { $env:CORTEX_RESTORE_DRILL_D
 $logDir = Join-Path $dataDir 'logs'
 
 if ($Register) {
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+    $hiddenRunner = Join-Path $PSScriptRoot 'run-hidden.vbs'
+    if (Test-Path -LiteralPath $hiddenRunner) {
+        $action = New-ScheduledTaskAction -Execute 'wscript.exe' `
+            -Argument "//B //Nologo `"$hiddenRunner`" -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    } else {
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+            -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+    }
     $trigger = New-ScheduledTaskTrigger -Daily -At '03:00'
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
         -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `

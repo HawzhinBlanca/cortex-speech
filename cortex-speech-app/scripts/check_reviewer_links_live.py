@@ -309,6 +309,9 @@ def validate_loopback_base_url(raw: str) -> str:
 
 def discover_funnel_base(port: int) -> str:
     """Resolve the one advertised Funnel HTTPS route that proxies to this Couch port."""
+    run_kwargs: dict[str, object] = {}
+    if sys.platform == "win32":
+        run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     completed = subprocess.run(
         ["tailscale", "funnel", "status", "--json"],
         capture_output=True,
@@ -316,6 +319,7 @@ def discover_funnel_base(port: int) -> str:
         encoding="utf-8",
         timeout=20,
         check=False,
+        **run_kwargs,
     )
     if completed.returncode != 0:
         raise RuntimeError(f"tailscale funnel status failed: {(completed.stderr or completed.stdout).strip()}")
@@ -325,16 +329,31 @@ def discover_funnel_base(port: int) -> str:
         raise RuntimeError(f"tailscale funnel status was not JSON: {error}") from error
 
     allowed = payload.get("AllowFunnel") or {}
+    # Reject any extra Funnel handler that could shadow Couch Review routes (or use ambiguous
+    # normalization/query syntax) while allowing disjoint sibling services (e.g. /dengnoos-asr).
+    reserved_prefixes = ("/api", "/audio", "/media", "/assets", "/icon", "/favicon", "/manifest", "/sw.js", "/index.html")
+
+    def _conflicts_with_couch(mount: object) -> bool:
+        if mount == "/":
+            return False
+        if not isinstance(mount, str) or not mount.startswith("/"):
+            return True
+        lower = mount.lower()
+        if any(bad in lower for bad in ("//", "..", "\\", "?", "#", "%")):
+            return True
+        return any(
+            lower == p or lower.startswith(p + "/") or (p in {"/icon", "/favicon", "/manifest"} and lower.startswith(p))
+            for p in reserved_prefixes
+        )
+
     matches: list[str] = []
     for authority, route in (payload.get("Web") or {}).items():
-        # Tailscale uses a handler map with longest-path routing. Proving only `/` is unsafe: a
-        # more-specific `/api/...` entry can send the real reviewer traffic somewhere else while
-        # the root claim probe still greens. This pilot has one service, so accept exactly one root
-        # handler and require the JSON boolean `true` (not truthy 1/string data).
         if allowed.get(authority) is not True or not isinstance(route, dict):
             continue
         handlers = route.get("Handlers")
-        if not isinstance(handlers, dict) or set(handlers) != {"/"}:
+        if not isinstance(handlers, dict) or "/" not in handlers:
+            continue
+        if any(_conflicts_with_couch(mount) for mount in handlers):
             continue
         root_handler = handlers.get("/")
         if not isinstance(root_handler, dict):

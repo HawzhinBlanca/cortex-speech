@@ -155,6 +155,24 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
                 gate.discover_funnel_base(8737)
         del status["Web"]["review.example.ts.net:443"]["Handlers"]["/api/queue"]
 
+        status["Web"]["review.example.ts.net:443"]["Handlers"]["/dengnoos-asr"] = {
+            "Proxy": "http://127.0.0.1:8010"
+        }
+        completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(status), stderr="")
+        with mock.patch.object(gate.subprocess, "run", return_value=completed):
+            self.assertEqual(gate.discover_funnel_base(8737), "https://review.example.ts.net:443")
+        del status["Web"]["review.example.ts.net:443"]["Handlers"]["/dengnoos-asr"]
+
+        for shadowed in ("//api/queue", "/icon.png", "/manifest.webmanifest", "/foo/../api"):
+            status["Web"]["review.example.ts.net:443"]["Handlers"][shadowed] = {
+                "Proxy": "http://127.0.0.1:9999"
+            }
+            completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(status), stderr="")
+            with mock.patch.object(gate.subprocess, "run", return_value=completed):
+                with self.assertRaisesRegex(RuntimeError, "found 0"):
+                    gate.discover_funnel_base(8737)
+            del status["Web"]["review.example.ts.net:443"]["Handlers"][shadowed]
+
         status["Web"]["review.example.ts.net:443"]["Handlers"]["/"]["Proxy"] = (
             "https+insecure://evil127.0.0.1:8737"
         )
