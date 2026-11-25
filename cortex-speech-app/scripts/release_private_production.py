@@ -1801,7 +1801,7 @@ def deploy(args: argparse.Namespace) -> int:
     write_maintenance(data_dir, str(manifest["releaseId"]))
     journal["phase"] = "maintenance"
     atomic_json(data_dir / JOURNAL_FILE, journal)
-    task_change(LEGACY_WATCHDOG_TASK, False)
+    task_change(LEGACY_WATCHDOG_TASK, False, allow_missing=True)
     task_change(WATCHDOG_TASK, False, allow_missing=True)
 
     try:
