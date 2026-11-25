@@ -7,8 +7,14 @@ $controller = Join-Path $releaseRoot 'scripts\release_private_production.py'
 $dataDir = Join-Path $env:APPDATA 'cortex-speech'
 
 if ($Register) {
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+    $hiddenRunner = Join-Path $PSScriptRoot 'run-hidden.vbs'
+    if (Test-Path -LiteralPath $hiddenRunner) {
+        $action = New-ScheduledTaskAction -Execute 'wscript.exe' `
+            -Argument "//B //Nologo `"$hiddenRunner`" -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    } else {
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+            -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+    }
     # 24 hours, not the original 2: a spent -Once trigger never fires again, and a recovery that
     # keeps failing (funnel down after a power event, python missing at boot) used to burn its
     # whole window in silence and then leave every couch route 503 forever with no further

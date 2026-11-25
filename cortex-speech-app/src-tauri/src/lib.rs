@@ -1308,6 +1308,22 @@ pub fn run() {
             .init();
     }
 
+    // The data dir exists and tracing now has a file sink — let the panic hook write crash dumps there.
+    let _ = CRASH_DIR.set(data_dir.clone());
+
+    let smoke_test = is_headless_mode();
+
+    // Acquire the single-instance lock BEFORE loading ONNX Runtime so duplicate/watchdog starts
+    // fail fast in milliseconds instead of waiting 45s if onnxruntime.dll is missing or slow.
+    let _lock = if smoke_test {
+        None
+    } else {
+        match crate::flock::InstanceLock::try_lock(&data_dir) {
+            Ok(lock) => Some(lock),
+            Err(e) => fatal_app_error(e.to_string()),
+        }
+    };
+
     models::init_ort_dylib_path();
     // Say so AT STARTUP if the runtime cannot load, rather than letting the first transcription
     // freeze with no message. A missing or corrupt onnxruntime library makes `ort` block forever
@@ -1319,21 +1335,7 @@ pub fn run() {
         tracing::error!("{error}");
     }
 
-    // The data dir exists and tracing now has a file sink — let the panic hook write crash dumps there.
-    let _ = CRASH_DIR.set(data_dir.clone());
-
     models::init_user_models_dir(data_dir.join("models"));
-
-    let smoke_test = is_headless_mode();
-
-    let _lock = if smoke_test {
-        None
-    } else {
-        match crate::flock::InstanceLock::try_lock(&data_dir) {
-            Ok(lock) => Some(lock),
-            Err(e) => fatal_app_error(e.to_string()),
-        }
-    };
 
     // A named snapshot restore spans SQLite plus several dataset-coupled files. If a crash or a
     // post-page-swap error left its durable marker, recover that exact transaction synchronously
@@ -1831,13 +1833,28 @@ pub fn run() {
             // champion_supervision_enabled; re-reads the setting every tick.
             crate::engine_runtime::spawn_supervision_loop(app.handle().clone());
 
-            for (label, _window) in app.webview_windows() {
+            let start_in_background = is_background_start(std::env::var("CORTEX_BACKGROUND_START").ok().as_deref());
+            let tray_installed = if !is_headless_mode() {
+                match install_system_tray(app.handle()) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!("Could not initialize system tray icon: {error}");
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            for (label, window) in app.webview_windows() {
                 tracing::info!("Found webview window: {label}");
+                if start_in_background && (!tray_installed || window.hide().is_err()) {
+                    let _ = window.minimize();
+                }
                 // `open_devtools` only exists in debug builds, so in release the binding is
                 // otherwise unused — the underscore keeps the release build warning-clean
                 // while still allowing the debug-only devtools call below.
                 #[cfg(debug_assertions)]
-                _window.open_devtools();
+                window.open_devtools();
             }
 
             if std::env::var("CORTEX_INTEGRATION_TEST").ok().as_deref() == Some("1")
@@ -1909,17 +1926,67 @@ fn is_cdp_remote_debug(webview2_browser_args: Option<&str>) -> bool {
     webview2_browser_args.is_some_and(|v| v.contains("--remote-debugging-port"))
 }
 
+fn is_background_start(env_val: Option<&str>) -> bool {
+    env_val.map(str::trim).is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+fn install_system_tray(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+    use tauri::Manager;
+
+    let show = MenuItem::with_id(app, "tray-show", "Show Cortex", true, None::<&str>)?;
+    let hide = MenuItem::with_id(app, "tray-hide", "Hide to Tray", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &hide, &quit])?;
+
+    let mut builder = TrayIconBuilder::with_id("cortex-tray")
+        .menu(&menu)
+        .tooltip("Cortex Kurdish Speech Processor")
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "tray-show" => {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.unminimize();
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+            "tray-hide" => {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            }
+            "tray-quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                if let Some(w) = tray.app_handle().get_webview_window("main") {
+                    let _ = w.unminimize();
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+        });
+    if let Some(icon) = app.default_window_icon().cloned() {
+        builder = builder.icon(icon);
+    }
+    builder.build(app)?;
+    Ok(())
+}
+
 /// Show a native modal error box for a fatal startup failure (no Tauri/webview exists this early, so
 /// tauri-plugin-dialog cannot be used — this is a raw Win32 MessageBoxW). Best-effort and side-effect
 /// only; the caller exits regardless of the user's click.
 #[cfg(windows)]
 fn show_fatal_message_box(message: &str) {
-    // No human is waiting on a modal when the app is driven headlessly (smoke/integration/audiobook) or
-    // over a CDP/remote-debugging automation session. Popping a topmost modal there blocks the desktop
-    // and hangs the driver's ~90s connect poll (e.g. the InstanceLock fatal fires when the owner's app
-    // is already open and an e2e driver launches a second instance). Suppress it — the eprintln/tracing
-    // above still record the reason. Only a genuine interactive double-click reaches the MessageBox.
-    if is_headless_mode() || is_cdp_remote_debug(std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").ok().as_deref())
+    // No human is waiting on a modal when the app is driven headlessly (smoke/integration/audiobook),
+    // launched in the background by the watchdog, or over a CDP/remote-debugging automation session.
+    // Suppress it — the eprintln/tracing above still record the reason.
+    if is_headless_mode()
+        || is_background_start(std::env::var("CORTEX_BACKGROUND_START").ok().as_deref())
+        || is_cdp_remote_debug(std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").ok().as_deref())
     {
         return;
     }
@@ -2051,6 +2118,14 @@ mod tests {
         assert!(is_cdp_remote_debug(Some("--foo --remote-debugging-port=9222 --bar")), "embedded arg detected");
         assert!(!is_cdp_remote_debug(Some("--disable-gpu")), "unrelated webview2 args do not suppress");
         assert!(!is_cdp_remote_debug(None), "a real interactive launch (no such env) shows the dialog");
+    }
+
+    #[test]
+    fn background_start_env_flag_suppresses_foreground_and_modal() {
+        assert!(is_background_start(Some("1")));
+        assert!(is_background_start(Some("true")));
+        assert!(!is_background_start(Some("0")));
+        assert!(!is_background_start(None));
     }
 
     #[cfg(windows)]

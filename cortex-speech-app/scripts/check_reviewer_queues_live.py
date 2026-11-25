@@ -302,7 +302,17 @@ def active_pool_queue_counts(
         for dialect in allowed_for(roster, reviewer) or []:
             command.extend(["--dialect", dialect])
         try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=180, check=False)
+            run_kwargs: dict[str, object] = {}
+            if sys.platform == "win32":
+                run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+                **run_kwargs,
+            )
             if result.returncode != 0:
                 detail = (result.stderr or result.stdout or "no diagnostic").strip()
                 raise PolicyBroken(f"canonical pool probe failed for {reviewer}: {detail}")

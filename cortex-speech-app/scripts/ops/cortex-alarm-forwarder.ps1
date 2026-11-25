@@ -1,4 +1,4 @@
-﻿# Cortex alarm forwarder -- the single place where every detector's verdict becomes a notification.
+# Cortex alarm forwarder -- the single place where every detector's verdict becomes a notification.
 #
 # WHY THIS EXISTS (2026-08-30 audit): a power loss took the whole review service down for 14.4 hours
 # (2026-08-29 19:11 -> 2026-08-30 09:33) and produced ZERO alerts. Every detector already worked --
@@ -30,6 +30,10 @@
 #
 # PowerShell 5.1. No pipeline-chain operators, no ternaries, every check individually try/caught so
 # one broken source can never hide the others.
+
+param(
+    [switch]$Popup
+)
 
 $ErrorActionPreference = 'Continue'
 
@@ -291,7 +295,9 @@ if ($critical.Count -gt 0) {
         $lines = @("CORTEX ALARMS -- $($nowUtc.ToString('yyyy-MM-dd HH:mm')) UTC") + ($critical | ForEach-Object { "[$($_.Severity)] $($_.Id): $($_.Message)" })
         Set-Content -Path $desktopAlarm -Value ($lines -join [Environment]::NewLine) -Encoding utf8
     } catch {}
-    try { & msg.exe * /TIME:30 "CORTEX: $($critical.Count) critical alarm(s) -- see CORTEX-ALARMS.txt" 2>$null } catch {}
+    if ($Popup) {
+        try { & msg.exe * /TIME:30 "CORTEX: $($critical.Count) critical alarm(s) -- see CORTEX-ALARMS.txt" 2>$null } catch {}
+    }
 } elseif (Test-Path $desktopAlarm) {
     # All-clear: the forwarder removes only its OWN file, never the probe's.
     try { Remove-Item $desktopAlarm -Force } catch {}

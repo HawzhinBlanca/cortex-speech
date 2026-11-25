@@ -28,12 +28,26 @@ $log = Join-Path $logDir 'champion-supervisor.log'
 function Write-Log([string]$message) {
     if ($DryRun) { return }
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    try {
+        if ((Test-Path -LiteralPath $log) -and ((Get-Item -LiteralPath $log).Length -gt 5MB)) {
+            $tail = Get-Content -LiteralPath $log -Tail 2000
+            Set-Content -LiteralPath $log -Value $tail -Encoding utf8
+        }
+    } catch {}
     Add-Content -LiteralPath $log -Value ("{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $message)
 }
 
 if ($Register) {
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+    $hiddenRunner = Join-Path $PSScriptRoot 'run-hidden.vbs'
+    if (Test-Path -LiteralPath $hiddenRunner) {
+        $action = New-ScheduledTaskAction -Execute 'wscript.exe' `
+            -Argument "//B //Nologo `"$hiddenRunner`" -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+        $actionPreview = "wscript.exe //B //Nologo `"$hiddenRunner`" -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    } else {
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+            -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+        $actionPreview = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+    }
     # Same shape as the reviewer watchdog: an at-logon trigger bound to the exact interactive
     # principal (an unscoped AtLogOn means "any user" and needs administrator rights), plus a clock
     # trigger that starts within a minute and repeats every 5 minutes so a registration made after
@@ -50,7 +64,7 @@ if ($Register) {
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     if ($DryRun) {
         Write-Output "DRY RUN: would register '$TaskName' for ${currentPrincipal}: at-logon + every 5 minutes, StartWhenAvailable, no time limit, IgnoreNew."
-        Write-Output "DRY RUN: action = powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+        Write-Output "DRY RUN: action = $actionPreview"
         Write-Output "DRY RUN: nothing registered."
         exit 0
     }
@@ -69,7 +83,16 @@ if ($DryRun) {
     exit 0
 }
 Write-Log "pass: invoking $starter"
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $starter
-$code = $LASTEXITCODE
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = 'powershell.exe'
+$psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$starter`""
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+$proc = New-Object System.Diagnostics.Process
+$proc.StartInfo = $psi
+[void]$proc.Start()
+$proc.WaitForExit()
+$code = $proc.ExitCode
+$proc.Dispose()
 Write-Log "pass: starter exit $code"
 exit $code

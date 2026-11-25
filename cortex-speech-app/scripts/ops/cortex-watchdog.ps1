@@ -322,6 +322,10 @@ function Get-Sha256Utf8Lf([string]$path) {
 function Write-Log([string]$msg) {
     try {
         if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force $logDir | Out-Null }
+        if ((Test-Path -LiteralPath $log) -and ((Get-Item -LiteralPath $log).Length -gt 5MB)) {
+            $tail = Get-Content -LiteralPath $log -Tail 2000
+            Set-Content -LiteralPath $log -Value $tail -Encoding utf8
+        }
         Add-Content -Path $log -Value ("{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg)
     } catch { }
 }
@@ -531,8 +535,14 @@ if ($null -ne $activeRelease) {
 }
 
 if ($Register) {
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+    $hiddenRunner = Join-Path $PSScriptRoot 'run-hidden.vbs'
+    if (Test-Path -LiteralPath $hiddenRunner) {
+        $action = New-ScheduledTaskAction -Execute 'wscript.exe' `
+            -Argument "//B //Nologo `"$hiddenRunner`" -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    } else {
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+            -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+    }
     # Two triggers: at logon (the autostart), and a repeating clock (the healer). Task Scheduler
     # caps a repetition trigger's duration; (New-TimeSpan -Days 3650) is rejected on Win11, so the
     # logon trigger carries an indefinite repetition instead.
@@ -799,5 +809,12 @@ if (-not (Test-Path $exe)) {
     Write-Log "exe missing at $exe - nothing to launch (mid-rebuild?)"
     exit 1
 }
-Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)
-Write-Log "launched $exe"
+# Watchdog launches stay hidden/minimized and suppress startup error popups.
+$prevBg = $env:CORTEX_BACKGROUND_START
+$env:CORTEX_BACKGROUND_START = '1'
+try {
+    Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -WindowStyle Minimized
+} finally {
+    $env:CORTEX_BACKGROUND_START = $prevBg
+}
+Write-Log "launched $exe (background)"

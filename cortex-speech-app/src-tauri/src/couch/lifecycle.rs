@@ -1259,11 +1259,15 @@ pub(super) fn funnel_host(port: u16) -> Option<String> {
             std::thread::spawn(move || {
                 let candidates = ["tailscale", r"C:\Program Files\Tailscale\tailscale.exe"];
                 let output = candidates.iter().find_map(|exe| {
-                    std::process::Command::new(exe)
-                        .args(["serve", "status", "--json"])
-                        .output()
-                        .ok()
-                        .filter(|o| o.status.success())
+                    let mut cmd = std::process::Command::new(exe);
+                    cmd.args(["serve", "status", "--json"]);
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        const CREATE_NO_WINDOW: u32 = 0x08000000;
+                        cmd.creation_flags(CREATE_NO_WINDOW);
+                    }
+                    cmd.output().ok().filter(|o| o.status.success())
                 });
                 let _ = send.send(output);
             });
