@@ -34,8 +34,14 @@ def test_supervisor_mirrors_the_watchdog_registration_shape() -> None:
         ("-ExecutionTimeLimit ([TimeSpan]::Zero)", "a champion launch loads ~17 GB per GPU and may take minutes"),
         ("-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries", "a desktop behind a UPS must keep healing"),
         ("start_7b_server.ps1", "a pass runs the repo's idempotent, identity-bound starter"),
+        ("$null = $proc.Handle", "pin Handle on PowerShell 5.1 so ExitCode is never silently $null"),
+        ("$proc.Dispose()", "dispose child Process handle in finally"),
     ):
         assert needle in text, f"{SUPERVISOR.name}: {why} ({needle!r} missing)"
+    write_log = re.search(r"function Write-Log\b.*?\n\}", text, re.S)
+    assert write_log and re.search(r"try\s*\{.*Add-Content.*\}\s*catch", write_log.group(0), re.S), (
+        f"{SUPERVISOR.name}: Write-Log must guard Add-Content so a transient log lock never aborts supervision"
+    )
     assert text.count("Register-ScheduledTask") == 1, "exactly one registration site, inside the -Register branch"
     register_branch = text[text.index("if ($Register) {"):]
     assert "Register-ScheduledTask" in register_branch, "registration must live inside the -Register branch"

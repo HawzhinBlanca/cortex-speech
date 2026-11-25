@@ -40,6 +40,12 @@ fn parse_args(args: &[String]) -> Result<HashMap<&'static str, String>> {
     }
 }
 
+fn canary_suite_path(data_dir: &Path, suite_id: &str) -> Result<PathBuf> {
+    cortex_speech_app_lib::validation::input::validate_identifier(suite_id)
+        .map_err(|error| format!("invalid --canary-suite-id: {error}"))?;
+    Ok(data_dir.join("promotion_canaries").join(format!("{suite_id}.json")))
+}
+
 fn read(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))
 }
@@ -128,11 +134,14 @@ fn run(args: &[String]) -> Result<String> {
     let candidate = registry::get_model_version(&db, &auth.candidate.model_version_id)
         .map_err(|error| error.to_string())?
         .ok_or("the candidate is not registered")?;
-    if candidate.status != "candidate" || candidate.checkpoint_sha256 != auth.candidate.deployment_sha256 {
+    if candidate.status != "candidate"
+        || candidate.family != OMNIASR_7B_FAMILY
+        || candidate.checkpoint_sha256 != auth.candidate.deployment_sha256
+    {
         return Err("the registered candidate is not the record's exact deployment".into());
     }
     let suite_id = values["--canary-suite-id"].clone();
-    let canary_path = data_dir.join("promotion_canaries").join(format!("{suite_id}.json"));
+    let canary_path = canary_suite_path(&data_dir, &suite_id)?;
     let suite_sha256 = owner::sha256_hex(&read(&canary_path)?);
 
     require_interactive_confirmation(&auth)?;
@@ -244,5 +253,17 @@ mod tests {
         assert!(confirm(false, &mut typed(&phrase), &auth).unwrap_err().contains("interactive terminal"));
         assert!(confirm(true, &mut typed("yes\n"), &auth).unwrap_err().contains("did not match"));
         assert!(confirm(true, &mut typed(&phrase), &auth).is_ok());
+    }
+
+    #[test]
+    fn canary_suite_path_rejects_traversal_and_invalid_ids() {
+        let data_dir = Path::new("data");
+        for bad in ["../escape", "..\\escape", "..", "a/b", ""] {
+            assert!(canary_suite_path(data_dir, bad).is_err(), "expected {bad:?} to be rejected");
+        }
+        assert_eq!(
+            canary_suite_path(data_dir, "canary_v1").unwrap(),
+            data_dir.join("promotion_canaries").join("canary_v1.json")
+        );
     }
 }

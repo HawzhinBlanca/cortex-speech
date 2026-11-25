@@ -27,14 +27,14 @@ $logDir = if ($env:CORTEX_CHAMPION_SUPERVISOR_LOG_DIR) { $env:CORTEX_CHAMPION_SU
 $log = Join-Path $logDir 'champion-supervisor.log'
 function Write-Log([string]$message) {
     if ($DryRun) { return }
-    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
     try {
+        New-Item -ItemType Directory -Force -Path $logDir | Out-Null
         if ((Test-Path -LiteralPath $log) -and ((Get-Item -LiteralPath $log).Length -gt 5MB)) {
             $tail = Get-Content -LiteralPath $log -Tail 2000
             Set-Content -LiteralPath $log -Value $tail -Encoding utf8
         }
+        Add-Content -LiteralPath $log -Value ("{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $message)
     } catch {}
-    Add-Content -LiteralPath $log -Value ("{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $message)
 }
 
 if ($Register) {
@@ -90,9 +90,16 @@ $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 $proc = New-Object System.Diagnostics.Process
 $proc.StartInfo = $psi
-[void]$proc.Start()
-$proc.WaitForExit()
-$code = $proc.ExitCode
-$proc.Dispose()
+try {
+    [void]$proc.Start()
+    # Pin Handle before a fast child exits so PowerShell 5.1 never leaves ExitCode as $null.
+    $null = $proc.Handle
+    $proc.WaitForExit()
+    $proc.Refresh()
+    $code = $proc.ExitCode
+}
+finally {
+    $proc.Dispose()
+}
 Write-Log "pass: starter exit $code"
 exit $code

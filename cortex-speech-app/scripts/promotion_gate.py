@@ -713,6 +713,36 @@ def load_deployment(path: Path, role: str) -> DeploymentBinding:
     adapter_keys = {"adapter", "adapter_config"} & set(deployment)
     if (schema == 1 and adapter_keys != {"adapter", "adapter_config"}) or (schema == 2 and adapter_keys):
         raise GateInputError(f"{label}: schema 1 requires adapter + adapter_config; fused schema 2 forbids both")
+    expected_keys = {
+        "schema",
+        "model_id",
+        "family",
+        "model_card",
+        "language",
+        "runtime",
+        "base_checkpoint",
+        "tokenizer",
+        "server_compatibility",
+        "provenance",
+        "manifestSha256",
+    } | ({"adapter", "adapter_config"} if schema == 1 else set())
+    extra_keys = sorted(set(deployment) - expected_keys)
+    missing_keys = sorted(expected_keys - set(deployment))
+    if missing_keys or extra_keys:
+        raise GateInputError(f"{label} keys mismatch (missing={missing_keys}, extra={extra_keys})")
+    if kind == "external_offline":
+        evidence_keys = ("training_manifest_sha256", "parent_checkpoint_sha256", "evidence_sha256")
+        required_prov = {"kind", "training_provenance", *evidence_keys}
+        if set(provenance) != required_prov:
+            raise GateInputError(f"{label} external_offline provenance keys mismatch")
+        if provenance.get("training_provenance") != "external_unverified":
+            raise GateInputError(f"{label} external_offline must state training_provenance='external_unverified'")
+        evidence = {key: provenance[key] for key in evidence_keys}
+        if any(not isinstance(val, str) or _SHA256_RE.fullmatch(val) is None for val in evidence.values()):
+            raise GateInputError(f"{label} external_offline provenance evidence is incomplete")
+        expected_model_id = f"omniasr-7b-external-{_canonical_json_sha256(evidence)[:24]}"
+        if model_id != expected_model_id:
+            raise GateInputError(f"{label} external_offline model_id does not derive from its provenance evidence")
     root = path.parent.resolve(strict=True)
     base = deployment.get("base_checkpoint")
     absolute = isinstance(base, dict) and isinstance(base.get("path"), str) and Path(base["path"]).is_absolute()

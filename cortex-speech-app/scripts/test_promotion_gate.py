@@ -773,9 +773,21 @@ def _write_deployment(root: Path, *, schema: int, kind: str, checkpoint: bytes) 
             "evidence_sha256": digest("external-evidence"),
         },
     }[kind]
+    if kind == "external_offline":
+        evidence = {
+            k: provenance[k] for k in ("training_manifest_sha256", "parent_checkpoint_sha256", "evidence_sha256")
+        }
+        model_id = (
+            "omniasr-7b-external-"
+            + hashlib.sha256(
+                json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            ).hexdigest()[:24]
+        )
+    else:
+        model_id = f"omniasr-7b-{kind}-{hashlib.sha256(checkpoint).hexdigest()[:8]}"
     deployment = {
         "schema": schema,
-        "model_id": f"omniasr-7b-{kind}-{hashlib.sha256(checkpoint).hexdigest()[:8]}",
+        "model_id": model_id,
         "family": "omniasr-7b",
         "model_card": "soranivoice_omniASR_LLM_7B_v2_local",
         "language": "ckb_Arab",
@@ -939,6 +951,29 @@ def test_deployment_binding_refuses_the_same_model_and_a_fused_manifest_with_ada
         ).hexdigest()
         path.write_text(json.dumps(deployment, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
         assert "fused schema 2 forbids both" in expect_input_error(lambda: load_deployment(path, "challenger"))
+
+
+def test_deployment_loader_enforces_exact_keys_and_external_offline_provenance() -> None:
+    def resign(path: Path, mutate) -> None:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        mutate(doc)
+        doc.pop("manifestSha256", None)
+        doc["manifestSha256"] = hashlib.sha256(
+            json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        path.write_text(json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n", encoding="utf-8")
+
+    for mutate, expected in (
+        (lambda d: d.__setitem__("unexpected", 1), "keys mismatch"),
+        (lambda d: d.__setitem__("model_id", "omniasr-7b-external-000000000000000000000000"), "does not derive"),
+        (lambda d: d["provenance"].__setitem__("training_provenance", "verified"), "external_unverified"),
+        (lambda d: d["provenance"].__setitem__("evidence_sha256", "not-a-sha"), "evidence is incomplete"),
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            path = _write_deployment(Path(directory), schema=2, kind="external_offline", checkpoint=b"fused")
+            resign(path, mutate)
+            message = expect_input_error(lambda: load_deployment(path, "challenger"))
+            assert expected in message, message
 
 
 def main() -> int:

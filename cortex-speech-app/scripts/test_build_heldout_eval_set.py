@@ -66,16 +66,20 @@ def test_retrieval_never_misses_a_pair_the_exact_predicate_accepts() -> None:
 def test_audio_overlap_is_byte_identity_and_missing_training_audio_refuses() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        ours, same, same_size, other = (root / name for name in ("ours.wav", "same.wav", "size.wav", "other.wav"))
+        ours, ours_dup, same, same_size, other = (
+            root / name for name in ("ours.wav", "ours_dup.wav", "same.wav", "size.wav", "other.wav")
+        )
         ours.write_bytes(b"RIFF-clip-bytes")
+        ours_dup.write_bytes(b"RIFF-clip-bytes")
         same.write_bytes(b"RIFF-clip-bytes")
         same_size.write_bytes(b"RIFF-clip-bytez")
         other.write_bytes(b"different length")
         from policy_python import sha256_file
 
-        mine = {str(ours): sha256_file(ours)}
+        mine = {str(ours): sha256_file(ours), str(ours_dup): sha256_file(ours_dup)}
         hits = audio_overlaps(mine, [str(same), str(same_size), str(other)])
-        assert [Path(hit[1]).name for hit in hits] == ["same.wav"]
+        assert sorted(Path(hit[0]).name for hit in hits) == ["ours.wav", "ours_dup.wav"]
+        assert [Path(hit[1]).name for hit in hits] == ["same.wav", "same.wav"]
         assert audio_overlaps(mine, [str(same_size), str(other)]) == []
         try:
             audio_overlaps(mine, [str(root / "gone.wav")])

@@ -181,7 +181,9 @@ def audio_overlaps(ours: Mapping[str, str], training_audio: Sequence[str]) -> li
         by_dir[os.path.dirname(path)].add(os.path.basename(path))
     missing: list[str] = []
     hits: list[tuple[str, str]] = []
-    digest_owner = {digest: path for path, digest in ours.items()}
+    digest_owners: dict[str, list[str]] = defaultdict(list)
+    for path, digest in ours.items():
+        digest_owners[digest].append(path)
     for folder, names in sorted(by_dir.items()):
         try:
             listing = {entry.name: entry for entry in os.scandir(folder or ".")}
@@ -197,7 +199,8 @@ def audio_overlaps(ours: Mapping[str, str], training_audio: Sequence[str]) -> li
             if wanted:
                 digest = sha256_file(Path(entry.path))
                 if digest in wanted:
-                    hits.append((digest_owner[digest], entry.path))
+                    for owner in digest_owners[digest]:
+                        hits.append((owner, entry.path))
     if missing:
         raise SliceBuildError(
             f"{len(missing)} training audio file(s) are missing (first: {missing[:3]}) - audio disjointness "

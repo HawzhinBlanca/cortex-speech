@@ -722,7 +722,9 @@ def fairseq2_asset_path(path: Path, alias_dir: Path, name: str) -> Path:
 def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None:
     """One full replica: heavy imports, model load, then the proven serial accept loop. Runs in its
     own process per GPU (or inline for single-device/CPU). Everything CUDA lives below this line."""
+    import atexit
     import copy
+    import shutil
     import tempfile
 
     import torch
@@ -774,10 +776,20 @@ def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None
     model_card = deployment.model_card
     print(f"[{tag}] Base checkpoint: {checkpoint_path}", flush=True)
 
-    # ponytail: the alias dir (symlinks only) is left in /tmp for the process lifetime and never cleaned.
-    alias_dir = Path(tempfile.mkdtemp(prefix="cortex7b-assets-"))
-    tokenizer_asset = fairseq2_asset_path(tokenizer_path.resolve(), alias_dir, "tokenizer.model")
-    checkpoint_asset = fairseq2_asset_path(checkpoint_path.resolve(), alias_dir, "checkpoint.pt")
+    alias_dir: Path | None = None
+
+    def _asset(path: Path, name: str) -> Path:
+        nonlocal alias_dir
+        resolved = path.resolve()
+        if resolved.as_uri() == "file://" + str(resolved):
+            return resolved
+        if alias_dir is None:
+            alias_dir = Path(tempfile.mkdtemp(prefix="cortex7b-assets-"))
+            atexit.register(shutil.rmtree, alias_dir, True)
+        return fairseq2_asset_path(resolved, alias_dir, name)
+
+    tokenizer_asset = _asset(tokenizer_path, "tokenizer.model")
+    checkpoint_asset = _asset(checkpoint_path, "checkpoint.pt")
     store = get_asset_store()
     store._metadata_providers = [p for p in store._metadata_providers if getattr(p, "_source", "") != "sorani_custom"]
     provider = load_in_memory_asset_metadata(

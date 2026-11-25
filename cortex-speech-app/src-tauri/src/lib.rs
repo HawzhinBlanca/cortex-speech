@@ -1847,8 +1847,18 @@ pub fn run() {
             };
             for (label, window) in app.webview_windows() {
                 tracing::info!("Found webview window: {label}");
-                if start_in_background && (!tray_installed || window.hide().is_err()) {
-                    let _ = window.minimize();
+                if start_in_background {
+                    if tray_installed {
+                        if window.hide().is_err() {
+                            let _ = window.show();
+                            let _ = window.minimize();
+                        }
+                    } else {
+                        let _ = window.show();
+                        let _ = window.minimize();
+                    }
+                } else {
+                    let _ = window.show();
                 }
                 // `open_devtools` only exists in debug builds, so in release the binding is
                 // otherwise unused — the underscore keeps the release build warning-clean
