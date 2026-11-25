@@ -1,8 +1,9 @@
 //! Production adapter for the durable champion-promotion saga.
 //!
-//! This module deliberately exposes recovery only. A renderer-facing admission command is not added:
-//! until promotion evidence is backend-minted and owner-authorized, "no initiation surface" is the
-//! only honest trust boundary. Recovery consumes only the immutable contract already in the job row.
+//! This module deliberately exposes recovery only. A renderer-facing admission command is not added.
+//! The one admission surface is the owner-only `owner_promote` CLI (see `owner_promotion.rs`), which
+//! writes a job and exits; this recovery then runs it. Recovery consumes only the immutable contract
+//! already in the job row.
 
 use crate::champion_promotion::{
     self, CanaryIdentity, ExactDeploymentIdentity, PromotionRuntime, PromotionRuntimeError,
@@ -39,13 +40,20 @@ pub(crate) struct ProductionPromotionRuntime {
     app: tauri::AppHandle,
     db_path: String,
     data_dir: PathBuf,
+    /// The exact candidate an owner record authorizes for this job (only for `owner_promote` jobs).
+    owner_authorized: Option<ExactDeploymentIdentity>,
     _lease: crate::engine_runtime::PromotionLease,
 }
 
 impl ProductionPromotionRuntime {
-    fn new(app: &tauri::AppHandle, db_path: String, data_dir: PathBuf) -> Result<Self, String> {
+    fn new(
+        app: &tauri::AppHandle,
+        db_path: String,
+        data_dir: PathBuf,
+        owner_authorized: Option<ExactDeploymentIdentity>,
+    ) -> Result<Self, String> {
         let lease = crate::engine_runtime::acquire_promotion_lease()?;
-        Ok(Self { app: app.clone(), db_path, data_dir, _lease: lease })
+        Ok(Self { app: app.clone(), db_path, data_dir, owner_authorized, _lease: lease })
     }
 
     fn open_db(&self) -> Result<Database, PromotionRuntimeError> {
@@ -84,6 +92,12 @@ impl ProductionPromotionRuntime {
         {
             return Err(runtime_error("PROMOTION_DEPLOYMENT_IDENTITY_MISMATCH", &identity.model_version_id));
         }
+        crate::registry::refuse_external_offline_promotion_unless_owner_authorized(
+            &record.manifest,
+            identity,
+            self.owner_authorized.as_ref(),
+        )
+        .map_err(|error| runtime_error("PROMOTION_EXTERNAL_OFFLINE_REFUSED", error))?;
         Ok(())
     }
 
@@ -263,7 +277,14 @@ pub(crate) fn recover_running_promotions(
         crate::engine_runtime::set_promotion_recovery_blocked(true);
         return Err(format!("found {} simultaneous running model promotions; refusing ambiguous recovery", jobs.len()));
     }
-    let mut runtime = ProductionPromotionRuntime::new(app, db_path, data_dir)?;
+    // An owner_promote job pins its owner record; only a stored record that still hashes to that pin
+    // and names this exact contract lifts the external_offline refusal. Anything else leaves it in
+    // force, so the saga rolls back instead of crowning the model.
+    let owner_authorized = champion_promotion::decode_payload(&jobs[0].payload_json).ok().and_then(|payload| {
+        let sha = payload.contract.owner_authorization_sha256.as_deref()?;
+        crate::owner_promotion::load_verified_authorization(&data_dir, sha, &payload.contract)
+    });
+    let mut runtime = ProductionPromotionRuntime::new(app, db_path, data_dir, owner_authorized)?;
     let result = champion_promotion::resume_promotion(&mut journal, &mut runtime, &jobs[0].id);
     match result {
         Ok(_) => Ok(1),

@@ -20,6 +20,15 @@ Usage::
       --deployment runs/incumbent/deployment_manifest.json \
       --challenger-run-record runs/challenger_canary_02/challenger_run.json \
       --eval-manifest docs/eval/gold.tsv
+
+Deployment binding (no flywheel run record, e.g. an ``external_offline`` fused challenger): omit
+``--challenger-run-record`` and pass each role's own ``--deployment``. The sidecar is then
+``schema_version: 2, binding: "deployment"``, its identity derived by the gate's own
+``load_deployment`` (manifest file sha256, canonical ``manifestSha256``, re-hashed components)::
+
+    python scripts/emit_scorecard_provenance.py --scorecard v12/omni7b_results.tsv --role challenger
+      --deployment /home/ai/cortex_v12_candidate/deployment_manifest.json
+      --eval-manifest runs/heldout_eval_v12/heldout_eval.tsv
 """
 
 from __future__ import annotations
@@ -113,12 +122,39 @@ def challenger_identities(run_record: Path) -> dict[str, Any]:
     }
 
 
-def main() -> int:
+def deployment_provenance(args: argparse.Namespace, scorecard_sha: str, norm_basis: str) -> dict[str, Any]:
+    """Schema-2 sidecar for ``promotion_gate.py --*-deployment``; identities via the gate's own loader."""
+    binding = gate.load_deployment(args.deployment, args.role)
+    eval_manifest = gate.inspect_eval_manifest(args.eval_manifest)
+    return {
+        "schema_version": gate.DEPLOYMENT_PROVENANCE_SCHEMA_VERSION,
+        "binding": "deployment",
+        "role": args.role,
+        "scorecard_sha256": scorecard_sha,
+        "eval_manifest_sha256": eval_manifest.sha256,
+        "eval_manifest_rows": eval_manifest.row_count,
+        "model_family": binding.model_family,
+        "model_id": binding.model_id,
+        "model_sha256": binding.model_sha256,
+        "deployment_sha256": binding.deployment_sha256,
+        "normalizer_id": f"{args.normalizer.name}:{norm_basis}",
+        "normalizer_sha256": sha256_of(args.normalizer),
+        "norm_basis": norm_basis,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scorecard", required=True, type=Path)
     parser.add_argument("--role", required=True, choices=["champion", "challenger"])
-    parser.add_argument("--deployment", type=Path, help="incumbent deployment manifest (champion role)")
-    parser.add_argument("--challenger-run-record", required=True, type=Path)
+    parser.add_argument(
+        "--deployment",
+        type=Path,
+        help="incumbent deployment manifest (champion role); this role's manifest in deployment binding",
+    )
+    parser.add_argument(
+        "--challenger-run-record", type=Path, help="flywheel run record; omit for deployment binding"
+    )
     parser.add_argument("--eval-manifest", required=True, type=Path)
     parser.add_argument(
         "--normalizer",
@@ -127,9 +163,21 @@ def main() -> int:
         help="the code that produced norm_basis; hashed into normalizer_sha256",
     )
     parser.add_argument("--out", type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     scorecard_sha, norm_basis = scorecard_facts(args.scorecard)
+    out = args.out or args.scorecard.with_name(args.scorecard.name + ".provenance.json")
+    if args.challenger_run_record is None:
+        if not args.deployment:
+            raise SystemExit("deployment binding needs --deployment (this role's deployment manifest)")
+        try:
+            provenance = deployment_provenance(args, scorecard_sha, norm_basis)
+        except gate.GateInputError as error:
+            raise SystemExit(f"cannot bind {args.role} deployment: {error}") from error
+        out.write_bytes(json.dumps(provenance, ensure_ascii=False, indent=2).encode("utf-8") + b"\n")
+        print(f"wrote {args.role} deployment-bound provenance -> {out}", flush=True)
+        return 0
+
     eval_text = args.eval_manifest.read_text(encoding="utf-8")
     eval_rows = len([line for line in eval_text.splitlines() if line.strip()])
 
@@ -166,7 +214,6 @@ def main() -> int:
     if missing:
         raise SystemExit(f"emitted provenance is missing mandatory field(s) {missing}")
 
-    out = args.out or args.scorecard.with_name(args.scorecard.name + ".provenance.json")
     out.write_bytes(json.dumps(provenance, ensure_ascii=False, indent=2).encode("utf-8") + b"\n")
     print(f"wrote {args.role} provenance -> {out}", flush=True)
     return 0

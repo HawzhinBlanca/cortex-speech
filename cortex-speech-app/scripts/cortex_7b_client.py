@@ -267,9 +267,12 @@ def validate_identity_response(response):
     if not _is_sha256(deployment_sha):
         raise ValueError("reply has no canonical deploymentSha256")
     component_sha = response.get("componentSha256")
-    if not isinstance(component_sha, dict) or set(component_sha) != {
-        "base", "adapter", "adapterConfig", "tokenizer"
-    }:
+    # An adapter deployment names all four components; a fused (schema-2) deployment has no adapter
+    # files, so exactly its merged checkpoint ("base") and tokenizer. Nothing in between is complete.
+    if not isinstance(component_sha, dict) or set(component_sha) not in (
+        {"base", "adapter", "adapterConfig", "tokenizer"},
+        {"base", "tokenizer"},
+    ):
         raise ValueError("reply has no complete componentSha256 identity")
     if any(not _is_sha256(value) for value in component_sha.values()):
         raise ValueError("reply contains a non-canonical component SHA-256")
@@ -277,7 +280,7 @@ def validate_identity_response(response):
         raise ValueError(f"reply has unexpected language {response.get('language')!r}")
     if not _is_sha256(response.get("manifestSha256")):
         raise ValueError("reply has no canonical manifestSha256")
-    if response.get("provenanceKind") not in {"flywheel", "legacy_bootstrap"}:
+    if response.get("provenanceKind") not in {"flywheel", "legacy_bootstrap", "external_offline"}:
         raise ValueError(f"reply has unexpected provenanceKind {response.get('provenanceKind')!r}")
     if not isinstance(response.get("worker"), str) or not response["worker"].strip():
         raise ValueError("reply has no worker identity")

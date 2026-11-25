@@ -48,6 +48,11 @@ pub struct PromotionContract {
     pub scorecard_sha256: String,
     pub verdict_sha256: String,
     pub canary: CanaryIdentity,
+    /// SHA-256 of the owner decision record stored by `owner_promote` (see `owner_promotion.rs`).
+    /// Absent for every other contract, and then omitted from the payload so existing journals
+    /// serialize byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_authorization_sha256: Option<String>,
 }
 
 /// Last side effect durably known to have completed. Setters in [`PromotionRuntime`] MUST be
@@ -113,6 +118,9 @@ impl PromotionPayload {
         validate_identity("canary.expectedModel", &self.contract.canary.expected_model)?;
         if self.contract.canary.expected_model != self.contract.candidate {
             return Err(PromotionSagaError::contract("canary expectedModel must equal the exact candidate identity"));
+        }
+        if let Some(sha) = &self.contract.owner_authorization_sha256 {
+            validate_sha("ownerAuthorizationSha256", sha)?;
         }
         if let Some(failure) = &self.failure {
             validate_token("failure.runtimeCode", &failure.runtime_code, 96)?;
@@ -350,6 +358,26 @@ pub fn start_promotion_with_checkpoint<J: PromotionJournal, R: PromotionRuntime,
         return terminal_outcome(&begun.job);
     }
     drive(journal, runtime, checkpoint, job_id, begun.job.payload_json)
+}
+
+/// Admit, without running, an owner-authorized promotion. Only `src/bin/owner_promote.rs` calls this,
+/// after it has verified the owner's committed record, canon line and typed confirmation; the app's
+/// startup recovery then drives the job through [`resume_promotion`] like any interrupted promotion.
+pub fn admit_owner_promotion<J: PromotionJournal>(
+    journal: &mut J,
+    job_id: &str,
+    idempotency_key: &str,
+    contract: PromotionContract,
+) -> Result<PayloadJob, PromotionSagaError> {
+    if contract.owner_authorization_sha256.is_none() {
+        return Err(PromotionSagaError::contract("owner admission requires ownerAuthorizationSha256"));
+    }
+    validate_token("jobId", job_id, 160)?;
+    validate_token("idempotencyKey", idempotency_key, 200)?;
+    let initial_json = encode_payload(&PromotionPayload::prepared(contract.clone())?)?;
+    let begun = journal.begin_running(job_id, idempotency_key, &initial_json)?;
+    validate_begun_job(&begun.job, job_id, idempotency_key, &contract)?;
+    Ok(begun.job)
 }
 
 /// Resume one startup-discovered running promotion. The job itself carries all immutable identity and
@@ -777,7 +805,35 @@ mod tests {
                 suite_sha256: sha('e'),
                 expected_model: candidate,
             },
+            owner_authorization_sha256: None,
         }
+    }
+
+    #[test]
+    fn contracts_without_owner_authorization_serialize_exactly_as_before() {
+        let json = encode_payload(&PromotionPayload::prepared(contract()).unwrap()).unwrap();
+        assert!(!json.contains("ownerAuthorizationSha256"), "{json}");
+        assert_eq!(decode_payload(&json).unwrap().contract, contract());
+    }
+
+    #[test]
+    fn owner_admission_needs_an_authorization_and_only_admits_then_recovery_drives_it() {
+        let mut journal = FakeJournal::default();
+        let refused = admit_owner_promotion(&mut journal, "owner-1", "owner-key-1", contract()).unwrap_err();
+        assert!(refused.detail.contains("ownerAuthorizationSha256"), "{refused}");
+        let mut bad = contract();
+        bad.owner_authorization_sha256 = Some("not-a-sha".into());
+        assert!(admit_owner_promotion(&mut journal, "owner-1", "owner-key-1", bad).is_err());
+
+        let mut authorized = contract();
+        authorized.owner_authorization_sha256 = Some(sha('f'));
+        let job = admit_owner_promotion(&mut journal, "owner-1", "owner-key-1", authorized.clone()).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(decode_payload(&job.payload_json).unwrap().phase, PromotionPhase::Prepared, "admitted, not run");
+
+        let mut runtime = FakeRuntime::new(authorized.clone());
+        let outcome = resume_promotion(&mut journal, &mut runtime, "owner-1").unwrap();
+        assert_eq!(outcome, PromotionOutcome::Promoted { identity: authorized.candidate });
     }
 
     #[derive(Default)]

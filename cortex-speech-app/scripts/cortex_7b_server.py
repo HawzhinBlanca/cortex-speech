@@ -9,6 +9,8 @@ machine, a bus-factor-1 risk. The server loads only the content-addressed deploy
 ``CORTEX_7B_CHAMPION_POINTER``. The pointer pins an exact manifest; that manifest pins the base,
 LoRA adapter, adapter configuration, tokenizer, runtime shape, and provenance. Every byte is
 verified before the socket binds. There is deliberately no model-directory or base-only fallback.
+A schema-2 FUSED deployment instead pins one merged checkpoint (as base_checkpoint) and the
+tokenizer, each by exact size + SHA-256; it has no adapter files and never goes through PEFT.
 
 Protocol (newline-delimited JSON, one request per connection):
   ->  {"audio_path": "/mnt/c/...wav", "start_ms": 1200, "end_ms": 4800}   (start/end optional)
@@ -20,7 +22,13 @@ Protocol (newline-delimited JSON, one request per connection):
 Run INSIDE WSL with the champion venv (torch, fairseq2, peft, omnilingual-asr):
   CORTEX_7B_CHAMPION_POINTER=/mnt/c/.../champion.json CORTEX_7B_PORT=8799 python cortex_7b_server.py
 
-Multi-GPU: CORTEX_7B_DEVICES="0,1" (default: every GPU nvidia-smi reports; "cpu" forces CPU)
+Devices: GPU 1 ONLY, never GPU 0 (owner direction 2026-10-15). CORTEX_7B_DEVICES defaults to "1";
+a list naming any other GPU refuses to start, and a GPU 1 with less than MIN_FREE_VRAM_MIB free
+refuses rather than seizes the card. "cpu" forces CPU. CUDA_DEVICE_ORDER=PCI_BUS_ID is set before
+any worker forks so the index means the same card to nvidia-smi and to CUDA.
+
+The multi-replica machinery below is retained for a multi-entry list (ALLOWED_GPU_INDICES is {1}
+today, so the server runs one replica): it
 pre-forks ONE WORKER PROCESS per GPU. Each child pins its card via CUDA_VISIBLE_DEVICES, loads a
 full model replica (~15-17 GB bf16 fits a single 24 GB card), and accept()s on the SHARED listening
 socket — the kernel load-balances connections across children, so N GPUs serve N requests truly in
@@ -54,6 +62,9 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_POINTER_BYTES = 1024 * 1024
 MAX_CONNECTION_THREADS = min(128, max(4, int(os.environ.get("CORTEX_7B_MAX_CONNECTION_THREADS", "32"))))
 DEPLOYMENT_SCHEMA = 1
+# Schema 2 is a FUSED deployment: base_checkpoint is the fused fairseq2 checkpoint itself and there is
+# no adapter or adapter_config. Its identity is the exact size + SHA-256 of that .pt and the tokenizer.
+FUSED_DEPLOYMENT_SCHEMA = 2
 POINTER_SCHEMA = 2
 FAMILY = "omniasr-7b"
 PROTOCOL = "cortex-omniasr-adapter"
@@ -266,7 +277,35 @@ def _verify_provenance(value: object, model_version_id: str) -> str:
         if not _is_sha256(value["measurement_evidence_sha256"]):
             raise ValueError("legacy bootstrap has no measurement evidence SHA-256")
         return kind
+    if kind == "external_offline":
+        # Trained OUTSIDE the Cortex flywheel (e.g. an offline LoRA, then fused). Its training can't be
+        # re-derived here, so it says so explicitly and pins what it can: the training manifest, the
+        # parent checkpoint it was trained from, and the evidence document. Never disguised as flywheel.
+        value = _exact_keys(
+            value,
+            {
+                "kind", "training_provenance", "training_manifest_sha256", "parent_checkpoint_sha256",
+                "evidence_sha256",
+            },
+            "external offline provenance",
+        )
+        if value["training_provenance"] != "external_unverified":
+            raise ValueError("external offline provenance must state training_provenance='external_unverified'")
+        evidence = {key: value[key] for key in EXTERNAL_OFFLINE_EVIDENCE_KEYS}
+        if any(not _is_sha256(item) for item in evidence.values()):
+            raise ValueError("external offline provenance evidence is incomplete")
+        if model_version_id != external_offline_model_id(evidence):
+            raise ValueError("external offline model_id does not derive from its provenance evidence")
+        return kind
     raise ValueError(f"unsupported deployment provenance kind {kind!r}")
+
+
+EXTERNAL_OFFLINE_EVIDENCE_KEYS = ("training_manifest_sha256", "parent_checkpoint_sha256", "evidence_sha256")
+
+
+def external_offline_model_id(evidence: dict) -> str:
+    """omniasr-7b-external-<first 24 hex of sha256(canonical evidence)>, like the flywheel run id."""
+    return f"omniasr-7b-external-{_sha256_bytes(_canonical_json_bytes(evidence))[:24]}"
 
 
 @dataclass(frozen=True)
@@ -282,8 +321,8 @@ class VerifiedDeployment:
     provenance_kind: str
     base_id: str
     base_path: Path
-    adapter_path: Path
-    adapter_config_path: Path
+    adapter_path: Path | None  # None for a fused (schema 2) deployment
+    adapter_config_path: Path | None
     tokenizer_path: Path
     component_sha256: dict
 
@@ -325,13 +364,16 @@ def verify_deployment_manifest(
                 f"got {deployment_sha256}"
             )
 
+    schema = value.get("schema") if isinstance(value, dict) else None
+    fused = type(schema) is int and schema == FUSED_DEPLOYMENT_SCHEMA
     value = _exact_keys(
         value,
         {
             "schema", "model_id", "family", "model_card", "language", "runtime", "base_checkpoint",
-            "adapter", "adapter_config", "tokenizer", "server_compatibility", "provenance", "manifestSha256",
-        },
-        "deployment manifest",
+            "tokenizer", "server_compatibility", "provenance", "manifestSha256",
+        }
+        | (set() if fused else {"adapter", "adapter_config"}),
+        "fused deployment manifest" if fused else "deployment manifest",
     )
     stated_self_hash = value["manifestSha256"]
     unsigned = dict(value)
@@ -341,7 +383,11 @@ def verify_deployment_manifest(
         raise ValueError(
             f"deployment manifest self-hash mismatch: expected {stated_self_hash!r}, got {actual_self_hash}"
         )
-    if type(value["schema"]) is not int or value["schema"] != DEPLOYMENT_SCHEMA or value["family"] != FAMILY:
+    if (
+        type(value["schema"]) is not int
+        or value["schema"] not in (DEPLOYMENT_SCHEMA, FUSED_DEPLOYMENT_SCHEMA)
+        or value["family"] != FAMILY
+    ):
         raise ValueError("unsupported deployment schema or family")
     model_version_id = _text(value["model_id"], "model_id")
     if expected_model_version_id is not None and model_version_id != expected_model_version_id:
@@ -371,15 +417,22 @@ def verify_deployment_manifest(
     resolved_manifest = Path(manifest_path).resolve(strict=True)
     root = resolved_manifest.parent
     base_path, base_id = _verify_base(root, value["base_checkpoint"])
-    adapter_path = _verify_relative_component(root, value["adapter"], "adapter")
-    adapter_config_path = _verify_relative_component(root, value["adapter_config"], "adapter_config")
+    component_sha256 = {"base": value["base_checkpoint"]["sha256"]}
+    adapter_path = adapter_config_path = None
+    if not fused:
+        adapter_path = _verify_relative_component(root, value["adapter"], "adapter")
+        adapter_config_path = _verify_relative_component(root, value["adapter_config"], "adapter_config")
     tokenizer_path = _verify_relative_component(root, value["tokenizer"], "tokenizer")
-    if adapter_path.name != "adapter_model.safetensors":
-        raise ValueError("adapter must be named adapter_model.safetensors for PEFT loading")
-    if adapter_config_path.name != "adapter_config.json":
-        raise ValueError("adapter_config must be named adapter_config.json for PEFT loading")
-    if adapter_path.parent != adapter_config_path.parent:
-        raise ValueError("adapter and adapter_config must share one PEFT deployment directory")
+    if not fused:
+        if adapter_path.name != "adapter_model.safetensors":
+            raise ValueError("adapter must be named adapter_model.safetensors for PEFT loading")
+        if adapter_config_path.name != "adapter_config.json":
+            raise ValueError("adapter_config must be named adapter_config.json for PEFT loading")
+        if adapter_path.parent != adapter_config_path.parent:
+            raise ValueError("adapter and adapter_config must share one PEFT deployment directory")
+        component_sha256["adapter"] = value["adapter"]["sha256"]
+        component_sha256["adapterConfig"] = value["adapter_config"]["sha256"]
+    component_sha256["tokenizer"] = value["tokenizer"]["sha256"]
 
     return VerifiedDeployment(
         manifest=value,
@@ -396,12 +449,7 @@ def verify_deployment_manifest(
         adapter_path=adapter_path,
         adapter_config_path=adapter_config_path,
         tokenizer_path=tokenizer_path,
-        component_sha256={
-            "base": value["base_checkpoint"]["sha256"],
-            "adapter": value["adapter"]["sha256"],
-            "adapterConfig": value["adapter_config"]["sha256"],
-            "tokenizer": value["tokenizer"]["sha256"],
-        },
+        component_sha256=component_sha256,
     )
 
 
@@ -560,10 +608,15 @@ def encode_reply(reply: dict) -> bytes:
     return payload
 
 
-# Auto-discovered devices must have at least this much VRAM free, or they are not taken. The 7B
-# replica needs ~19 GiB resident; grabbing a card that training already owns OOMs the training run
-# and then the replica. An EXPLICIT CORTEX_7B_DEVICES list is the owner's word and skips the check.
+# The serving GPU must have at least this much VRAM free, or the server refuses to start. The 7B
+# replica needs ~19 GiB resident; grabbing a card that another workload already owns OOMs that
+# workload and then the replica. The floor applies to an explicit CORTEX_7B_DEVICES list too.
 MIN_FREE_VRAM_MIB = int(os.environ.get("CORTEX_7B_MIN_FREE_VRAM_MIB", "20000"))
+
+# GPU 1 only, never GPU 0 (owner direction 2026-10-08/2026-10-15). Indices are PCI bus order, the
+# same numbering nvidia-smi prints, because parse_device_indices pins CUDA_DEVICE_ORDER=PCI_BUS_ID.
+ALLOWED_GPU_INDICES = frozenset({1})
+DEFAULT_GPU_INDICES = (1,)
 
 # How far BEFORE a requested window the decoder is started, so it has settled by the time the real
 # audio begins. 200 ms is 4x the 50 ms settling measured on a 320 kbps MP3 master (2026-08-20) and
@@ -599,45 +652,71 @@ def parse_device_indices() -> list:
         nvidia-smi launched a champion that "works" at a fraction of the speed while the owner
         believes the GPUs are serving. CPU is now a mode you must ask for by name.
       * auto-discovery took EVERY card unconditionally — including one a training run already
-        owns, OOMing both sides. Auto mode now takes only cards with MIN_FREE_VRAM_MIB free and
-        refuses to start if none qualifies. An explicit CORTEX_7B_DEVICES list is the owner's
-        word and is honoured verbatim, checks and all skipped.
+        owns, OOMing both sides.
+
+    GPU 1 ONLY (owner direction 2026-10-15). The default is [1]; an explicit CORTEX_7B_DEVICES may
+    name only GPUs in ALLOWED_GPU_INDICES, so a list containing 0 refuses to start. The free-VRAM
+    floor applies to every GPU served, explicit or default: a busy GPU 1 means REFUSE, never seize
+    (canon: selecting WSL7B does not grant permission to seize busy GPUs). CUDA_DEVICE_ORDER is
+    pinned to PCI_BUS_ID here, before any worker forks, so CUDA's index 1 is nvidia-smi's GPU 1.
     """
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     spec = os.environ.get("CORTEX_7B_DEVICES", "").strip()
     if spec.lower() == "cpu":
         return []
     if spec:
-        return [int(i) for i in spec.split(",") if i.strip() != ""]
+        try:
+            requested = sorted({int(i) for i in spec.split(",") if i.strip() != ""})
+        except ValueError as exc:
+            raise SystemExit(f"7B server: CORTEX_7B_DEVICES={spec!r} is not a GPU index list or 'cpu'") from exc
+    else:
+        requested = list(DEFAULT_GPU_INDICES)
+    forbidden = [i for i in requested if i not in ALLOWED_GPU_INDICES]
+    if not requested or forbidden:
+        raise SystemExit(
+            f"7B server: refusing CORTEX_7B_DEVICES={spec!r}: the 7B service runs on GPU 1 only and never "
+            f"on GPU 0 (not allowed: {forbidden}). Unset CORTEX_7B_DEVICES, set it to 1, or set it to cpu."
+        )
     try:
         free = free_vram_mib()
     except Exception as exc:
         raise SystemExit(
-            f"7B server: GPU discovery failed ({exc}). Fix nvidia-smi, set CORTEX_7B_DEVICES "
-            f"explicitly, or set CORTEX_7B_DEVICES=cpu to run on CPU deliberately."
+            f"7B server: GPU discovery failed ({exc}). Fix nvidia-smi, or set "
+            f"CORTEX_7B_DEVICES=cpu to run on CPU deliberately."
         ) from exc
-    if not free:
-        raise SystemExit(
-            "7B server: nvidia-smi reports no GPUs. Set CORTEX_7B_DEVICES=cpu to run on CPU deliberately."
-        )
     # Attribution note (measured on this rig 2026-08-20): nvidia-smi run INSIDE WSL does see
     # WSL-side VRAM (two loaded replicas read 6435 MiB free per card), so the floor catches both a
     # host-side training run and an orphaned WSL replica. Windows-side nvidia-smi is the blind one
     # (2026-08-16 pin) — this check runs inside WSL, where the numbers are honest.
-    eligible = sorted(i for i, mib in free.items() if mib >= MIN_FREE_VRAM_MIB)
-    busy = sorted(i for i, mib in free.items() if mib < MIN_FREE_VRAM_MIB)
-    if busy:
-        print(
-            f"devices: skipping GPU(s) {busy} — less than {MIN_FREE_VRAM_MIB} MiB free "
-            f"(another workload owns them); set CORTEX_7B_DEVICES to override",
-            flush=True,
-        )
-    if not eligible:
+    missing = [i for i in requested if i not in free]
+    if missing:
         raise SystemExit(
-            f"7B server: no GPU has {MIN_FREE_VRAM_MIB} MiB free "
-            f"(free now: { {i: f'{m} MiB' for i, m in sorted(free.items())} }). Another workload owns the cards. "
-            f"Set CORTEX_7B_DEVICES to claim specific GPUs anyway, or CORTEX_7B_DEVICES=cpu for CPU."
+            f"7B server: nvidia-smi does not report GPU(s) {missing} (reported: {sorted(free)}). "
+            f"Set CORTEX_7B_DEVICES=cpu to run on CPU deliberately."
         )
-    return eligible
+    busy = [i for i in requested if free[i] < MIN_FREE_VRAM_MIB]
+    if busy:
+        raise SystemExit(
+            f"7B server: refusing to seize busy GPU(s) {busy}: less than {MIN_FREE_VRAM_MIB} MiB free "
+            f"(free now: { {i: f'{free[i]} MiB' for i in requested} }). Another workload owns the card; "
+            f"stop it first, or set CORTEX_7B_DEVICES=cpu for CPU."
+        )
+    return requested
+
+
+def fairseq2_asset_path(path: Path, alias_dir: Path, name: str) -> Path:
+    """A path fairseq2 can load. fairseq2 turns an asset-card path into ``Path.as_uri()`` and back
+    with ``Path(str(uri)[5:])`` WITHOUT unquoting, so a path that percent-encoding changes (a space,
+    '#', non-ASCII) is looked up under the wrong name. Measured 2026-10-15: the verified v12
+    checkpoint under "/mnt/f/Kurdish Sorani Dataset/" failed to load as ".../Kurdish%20Sorani%20...".
+    Such a path is served through a symlink with a safe name in ``alias_dir``; any other is unchanged."""
+    if path.as_uri() == "file://" + str(path):
+        return path
+    alias = alias_dir / name
+    if alias.as_uri() != "file://" + str(alias):
+        raise ValueError(f"asset alias directory is not URI-safe: {alias_dir}")
+    alias.symlink_to(path)
+    return alias
 
 
 def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None:
@@ -649,18 +728,21 @@ def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None
     import torch
     import torchaudio
 
-    # These are the exact files the parent hashed before fork. No cache discovery, directory override,
-    # or base-only branch is allowed: a different composition is a different model version.
-    model_dir = deployment.adapter_path.parent
+    # These are the exact files the parent hashed before fork. No cache discovery or directory override
+    # is allowed: a different composition is a different model version. A FUSED deployment (schema 2,
+    # adapter_path None) is not a base-only fallback: its base_checkpoint IS the pinned fused model.
+    fused = deployment.adapter_path is None
+    model_dir = None if fused else deployment.adapter_path.parent
     tokenizer_path = deployment.tokenizer_path
     checkpoint_path = deployment.base_path
     os.environ.setdefault("FAIRSEQ2_USER_ASSET_DIR", str(deployment.manifest_path.parent))
 
     # --- fairseq2 / PEFT-LoRA compatibility patches (verbatim from server.py, the proven recipe) --
     try:
-        from fairseq2.nn.projection import Linear as BaseLinear
-        from peft.tuners.lora import Linear as LoraLinear
-        from peft import PeftModel, LoraConfig
+        if not fused:
+            from fairseq2.nn.projection import Linear as BaseLinear
+            from peft.tuners.lora import Linear as LoraLinear
+            from peft import PeftModel, LoraConfig
         from fairseq2.models.hub import load_model
         from fairseq2.data.tokenizers import load_tokenizer
         from fairseq2.assets import get_asset_store, load_in_memory_asset_metadata
@@ -673,16 +755,17 @@ def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None
         print("Ensure torch, fairseq2, peft, and omnilingual-asr are installed (use the champion venv).")
         os._exit(1)
 
-    BaseLinear.in_features = property(lambda self: self.input_dim)
-    BaseLinear.out_features = property(lambda self: self.output_dim)
+    if not fused:
+        BaseLinear.in_features = property(lambda self: self.input_dim)
+        BaseLinear.out_features = property(lambda self: self.output_dim)
 
-    orig_post_init = LoraConfig.__post_init__
+        orig_post_init = LoraConfig.__post_init__
 
-    def patched_post_init(self):
-        orig_post_init(self)
-        self._register_custom_module({BaseLinear: LoraLinear})
+        def patched_post_init(self):
+            orig_post_init(self)
+            self._register_custom_module({BaseLinear: LoraLinear})
 
-    LoraConfig.__post_init__ = patched_post_init
+        LoraConfig.__post_init__ = patched_post_init
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
@@ -691,6 +774,10 @@ def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None
     model_card = deployment.model_card
     print(f"[{tag}] Base checkpoint: {checkpoint_path}", flush=True)
 
+    # ponytail: the alias dir (symlinks only) is left in /tmp for the process lifetime and never cleaned.
+    alias_dir = Path(tempfile.mkdtemp(prefix="cortex7b-assets-"))
+    tokenizer_asset = fairseq2_asset_path(tokenizer_path.resolve(), alias_dir, "tokenizer.model")
+    checkpoint_asset = fairseq2_asset_path(checkpoint_path.resolve(), alias_dir, "checkpoint.pt")
     store = get_asset_store()
     store._metadata_providers = [p for p in store._metadata_providers if getattr(p, "_source", "") != "sorani_custom"]
     provider = load_in_memory_asset_metadata(
@@ -699,13 +786,13 @@ def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None
             {
                 "name": "soranivoice_omniASR_tokenizer_written_v2_local",
                 "tokenizer_family": "char_tokenizer",
-                "tokenizer": str(tokenizer_path.resolve()),
+                "tokenizer": str(tokenizer_asset),
             },
             {
                 "name": model_card,
                 "model_family": "wav2vec2_llama",
                 "model_arch": "7b",
-                "checkpoint": str(checkpoint_path.resolve()),
+                "checkpoint": str(checkpoint_asset),
                 "tokenizer_ref": "soranivoice_omniASR_tokenizer_written_v2_local",
             },
         ],
@@ -720,10 +807,15 @@ def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None
 
     print(f"[{tag}] Loading base weights (~30 GB, one minute)...", flush=True)
     base_model = load_model(model_card, device=device, dtype=dtype, config=config_custom)
-    print(f"[{tag}] Applying pinned LoRA adapter from {model_dir}...", flush=True)
-    peft_model = PeftModel.from_pretrained(base_model, str(model_dir))
-    pipeline_model = peft_model.base_model.model
-    print(f"[{tag}] LoRA applied.", flush=True)
+    if fused:
+        # The pinned checkpoint already contains the merged weights; PEFT is never imported or applied.
+        pipeline_model = base_model
+        print(f"[{tag}] Fused deployment: no adapter to apply.", flush=True)
+    else:
+        print(f"[{tag}] Applying pinned LoRA adapter from {model_dir}...", flush=True)
+        peft_model = PeftModel.from_pretrained(base_model, str(model_dir))
+        pipeline_model = peft_model.base_model.model
+        print(f"[{tag}] LoRA applied.", flush=True)
 
     tokenizer = load_tokenizer(model_card)
     pipeline = ASRInferencePipeline(
@@ -912,7 +1004,7 @@ def main(argv=None) -> int:
     # Deliberately NOT listening yet — see the worker's listen() note.
 
     print("=" * 60, flush=True)
-    print("Loading OmniASR-7B Champion (base + Kurdish LoRA)...", flush=True)
+    print(f"Loading OmniASR-7B Champion ({'fused checkpoint' if deployment.adapter_path is None else 'base + Kurdish LoRA'})...", flush=True)
     if not indices:
         # Hide every GPU BEFORE worker() derives its device from torch.cuda.is_available() —
         # without this, "cpu" printed a CPU banner while silently loading ~16 GB onto GPU 0

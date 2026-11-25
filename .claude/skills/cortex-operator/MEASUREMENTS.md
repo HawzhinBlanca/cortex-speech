@@ -94,7 +94,7 @@ too: never fabricate a human-only outcome (a native-Sorani verification) to sati
 
 - **ASR engines** (user-selected in Settings; default is the champion):
   - **Champion — OmniASR-LLM-7B-v2 + Kurdish LoRA** (`asr_model_size: WSL7B`). Runs in **WSL**,
-    one process per GPU, shared socket on **`127.0.0.1:8799`**. This is the accurate one. Needs
+    one replica on **GPU 1 only** (never GPU 0), socket on **`127.0.0.1:8799`**. This is the accurate one. Needs
     the server warm.
   - **Bundled — OmniASR-CTC-300M (int8)** — always present, CPU-only, lower quality. The headless
     `batch_processor` fallback uses this; the GUI default does not.
@@ -136,7 +136,8 @@ Your default end-to-end. Narrate briefly, keep the user in the loop, never fabri
 ### b. Preflight
 - **Server warm?** probe a TCP connect to `127.0.0.1:8799`. If down, start it:
   `pwsh scripts/start_7b_server.ps1` (WSL, ~30GB load, wait for READY).
-- **Both GPUs loaded?** `wsl nvidia-smi` — expect a full replica resident per card. VRAM-resident
+- **GPU 1 loaded?** `wsl nvidia-smi` — expect one full replica resident on GPU 1 and none on GPU 0.
+  The server refuses to start if GPU 1 is busy (it never seizes a card). VRAM-resident
   != working; utilization climbs only under load.
 - **Importer binary fresh?** If you'll import headless, confirm `batch_importer.exe` is newer than
   the last change to `pipeline.rs`/`db.rs`/`migrations/`. **A stale binary running old migration
@@ -262,7 +263,7 @@ unless prefixed with an env var. Never hardcode a private user path into a track
 
 **Server (champion 7B)**
 ```
-pwsh cortex-speech-app/scripts/start_7b_server.ps1          # start (WSL, both GPUs, port 8799)
+pwsh cortex-speech-app/scripts/start_7b_server.ps1          # start (WSL, GPU 1 only, port 8799)
 wsl -- pkill -f cortex_7b_server.py                          # stop
 python -c "import socket;s=socket.socket();s.settimeout(3);s.connect(('127.0.0.1',8799))"  # is-warm probe
 ```
@@ -326,7 +327,7 @@ Transcript, Export HF, Export Audio, Local 7B ASR (WSL), Review & Correct, Valid
 | `WebView2 0x8007139F` / blank window in e2e | A stray manual app instance contends on the debug port | Kill all instances, re-run clean. |
 | Save-As dialog filename won't replace | Triple-click didn't select | `Ctrl+A` then type the full path. |
 | Arabic prints as mojibake / `charmap` crash | Windows console is cp1252 | `PYTHONIOENCODING=utf-8`; write to a UTF-8 file and read it. |
-| Champion "loaded" but slow / one GPU idle | VRAM-resident != working; serial work leaves a GPU idle | Fan out batch work to concurrency = #GPUs; watch `nvidia-smi` utilization, not just memory. |
+| Champion "loaded" but slow | VRAM-resident != working; one replica serves one request at a time | Keep concurrency = replica count (1 on GPU 1); watch `nvidia-smi` utilization, not just memory. |
 | Server dies mid-session | A worker OOM/CUDA hiccup | The server degrades gracefully (survivors keep serving); restart to restore full capacity. |
 
 ---

@@ -246,8 +246,8 @@ export const commands = {
 	importModelCheckpoint: (id: string, checkpointPath: string, source: string, license: string, modelCardName: string | null) => typedError<string, CommandErrorV1>(__TAURI_INVOKE("import_model_checkpoint", { id, checkpointPath, source, license, modelCardName })),
 	/**
 	 *  Import a content-addressed OmniASR-7B deployment. Identity comes from the verified manifest,
-	 *  never from renderer-supplied model/card fields, and all four behavior-determining components are
-	 *  hashed before the DB lock is acquired.
+	 *  never from renderer-supplied model/card fields, and every behavior-determining component is
+	 *  hashed before the DB lock is acquired (four for an adapter deployment, two for a fused one).
 	 */
 	importModelDeployment: (manifestPath: string, expectedDeploymentSha256: string, expectedModelId: string, source: string, license: string) => typedError<ModelVersionSummaryV1, CommandErrorV1>(__TAURI_INVOKE("import_model_deployment", { manifestPath, expectedDeploymentSha256, expectedModelId, source, license })),
 	/**

@@ -239,8 +239,8 @@ pub async fn import_model_checkpoint(
 }
 
 /// Import a content-addressed OmniASR-7B deployment. Identity comes from the verified manifest,
-/// never from renderer-supplied model/card fields, and all four behavior-determining components are
-/// hashed before the DB lock is acquired.
+/// never from renderer-supplied model/card fields, and every behavior-determining component is
+/// hashed before the DB lock is acquired (four for an adapter deployment, two for a fused one).
 #[tauri::command]
 #[specta::specta]
 pub async fn import_model_deployment(
