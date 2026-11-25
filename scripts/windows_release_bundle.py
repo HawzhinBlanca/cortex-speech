@@ -307,21 +307,23 @@ def _verify_authenticode(path: Path, expected_thumbprint: str, expected_cert_sha
         raise ReleaseBundleError(f"Authenticode/timestamp verification failed for {path.name}: {detail}")
     script = (
         "$ErrorActionPreference='Stop';"
-        "$s=Get-AuthenticodeSignature -LiteralPath $args[0];"
+        "$s=Get-AuthenticodeSignature -LiteralPath $env:CORTEX_VERIFY_SUBJECT;"
         "if($null -eq $s.SignerCertificate){throw 'missing signer certificate'};"
-        "$sha=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($s.SignerCertificate.RawData));"
+        "$hasher=[Security.Cryptography.SHA256]::Create();"
+        "try{$sha=([BitConverter]::ToString($hasher.ComputeHash($s.SignerCertificate.RawData)) -replace '-','')}finally{$hasher.Dispose()};"
         "[ordered]@{status=[string]$s.Status;thumbprint=[string]$s.SignerCertificate.Thumbprint;"
         "certificateSha256=$sha;timestampSubject=if($s.TimeStamperCertificate)"
         "{[string]$s.TimeStamperCertificate.Subject}else{$null}}"
         "|ConvertTo-Json -Compress"
     )
     observed = subprocess.run(
-        [_powershell_executable(), "-NoProfile", "-NonInteractive", "-Command", script, str(path)],
+        [_powershell_executable(), "-NoProfile", "-NonInteractive", "-Command", script],
         capture_output=True,
         text=True,
         check=False,
         timeout=60,
         shell=False,
+        env={**os.environ, "CORTEX_VERIFY_SUBJECT": str(path)},
     )
     if observed.returncode != 0:
         raise ReleaseBundleError(

@@ -13,7 +13,15 @@
     type: 'edit' | 'verify' | 'delete' | 'import';
   }
 
-  let { showHotkeyOverlay = false } = $props();
+  let {
+    showHotkeyOverlay = false,
+    onUndo,
+    onRedo,
+  }: {
+    showHotkeyOverlay?: boolean;
+    onUndo?: () => void | Promise<void>;
+    onRedo?: () => void | Promise<void>;
+  } = $props();
   let localEdits = $state<EditRecord[]>([]);
   let canUndo = $state(false);
   let canRedo = $state(false);
@@ -44,6 +52,10 @@
 
   async function handleUndo() {
     if (processing) return;
+    if (onUndo) {
+      await onUndo();
+      return;
+    }
     try {
       const result = await historyStore.undo();
       const message = historyMutationMessage($t, result.action, 'undo');
@@ -60,6 +72,10 @@
 
   async function handleRedo() {
     if (processing) return;
+    if (onRedo) {
+      await onRedo();
+      return;
+    }
     try {
       const result = await historyStore.redo();
       const message = historyMutationMessage($t, result.action, 'redo');

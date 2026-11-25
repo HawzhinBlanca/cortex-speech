@@ -1831,21 +1831,10 @@ pub(crate) fn open_jury_db_connection(app_state: &AppState) -> Option<crate::db:
         .and_then(|p| crate::db::Database::open(p.to_string_lossy().as_ref()).ok())
 }
 
-/// Minimal base64 encoder — avoids pulling in a full base64 crate.
-/// Uses the standard alphabet (RFC 4648).
+/// Standard RFC 4648 base64 encoder delegating to the workspace `base64` crate.
 pub fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as usize;
-        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
-        out.push(CHARS[b0 >> 2] as char);
-        out.push(CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char);
-        out.push(if chunk.len() > 1 { CHARS[((b1 & 0xF) << 2) | (b2 >> 6)] as char } else { '=' });
-        out.push(if chunk.len() > 2 { CHARS[b2 & 0x3F] as char } else { '=' });
-    }
-    out
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(data)
 }
 
 #[cfg(test)]

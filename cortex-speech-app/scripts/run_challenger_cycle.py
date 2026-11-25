@@ -33,6 +33,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -43,6 +44,13 @@ from pathlib import Path
 APP = Path(__file__).resolve().parents[1]
 REPO = APP.parent
 SNAPSHOT_RE = re.compile(r"snapshot id\s*:\s*([0-9a-f]{64})")
+
+
+def _win_to_wsl(path: Path) -> str:
+    raw = str(path.resolve()).replace("\\", "/")
+    if len(raw) >= 2 and raw[1] == ":":
+        return f"/mnt/{raw[0].lower()}{raw[2:]}"
+    return raw
 MODEL_CARD = "soranivoice_omniASR_LLM_7B_v2_local"
 
 
@@ -152,22 +160,29 @@ def stage_serve(ctx: dict, args, log) -> tuple[Stage, subprocess.Popen | None]:
         ).encode("utf-8")
         + b"\n"
     )
-    wsl_pointer = "/mnt/" + str(pointer).replace("\\", "/").replace(":", "", 1).lower()[0:1] + \
-        str(pointer).replace("\\", "/")[2:]
+    wsl_pointer = _win_to_wsl(pointer)
+    wsl_server = _win_to_wsl(APP / "scripts" / "cortex_7b_server.py")
     log(f"[3/6] serve: challenger on port {args.challenger_port}, GPU {args.challenger_gpu}")
-    proc = subprocess.Popen(
-        ["wsl", "-e", "bash", "-lc",
-         f"CORTEX_7B_CHAMPION_POINTER={wsl_pointer} CORTEX_7B_PORT={args.challenger_port} "
-         f"CORTEX_7B_DEVICES={args.challenger_gpu} exec {args.wsl_python} "
-         f"/mnt/c{str(APP).replace(chr(92), '/')[2:]}/scripts/cortex_7b_server.py"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    server_log = (pointer.parent / "challenger_server.log").open("w", encoding="utf-8")
+    serve_cmd = (
+        f"CORTEX_7B_CHAMPION_POINTER={shlex.quote(wsl_pointer)} "
+        f"CORTEX_7B_PORT={int(args.challenger_port)} "
+        f"CORTEX_7B_DEVICES={shlex.quote(str(args.challenger_gpu))} "
+        f"exec {shlex.quote(args.wsl_python)} {shlex.quote(wsl_server)}"
     )
+    proc = subprocess.Popen(
+        ["wsl", "-e", "bash", "-lc", serve_cmd],
+        stdout=server_log,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    server_log.close()
     deadline = time.time() + args.serve_timeout
     while time.time() < deadline:
         if proc.poll() is not None:
             return stage.failed("challenger server exited during load"), None
         probe = run(["wsl", "-e", "bash", "-lc",
-                     f"(echo > /dev/tcp/127.0.0.1/{args.challenger_port}) 2>/dev/null && echo UP || echo DOWN"])
+                     f"(echo > /dev/tcp/127.0.0.1/{int(args.challenger_port)}) 2>/dev/null && echo UP || echo DOWN"])
         if "UP" in probe.stdout:
             return stage.ok(f"challenger serving on {args.challenger_port}"), proc
         time.sleep(10)
@@ -180,18 +195,20 @@ def stage_eval(ctx: dict, out_root: Path, args, log) -> Stage:
     if not manifest.is_file():
         return stage.blocked(f"eval manifest not found: {manifest}")
     scorecard = APP / "scripts" / "scorecard_7b.py"
+    wsl_scorecard = _win_to_wsl(scorecard)
     results = {}
     for role, port in (("champion", args.champion_port), ("challenger", args.challenger_port)):
         role_dir = out_root / "eval" / role
         role_dir.mkdir(parents=True, exist_ok=True)
         local = role_dir / manifest.name
         shutil.copyfile(manifest, local)  # identical bytes => one eval identity, separate outputs
-        wsl_manifest = "/mnt/c" + str(local).replace("\\", "/")[2:]
+        wsl_manifest = _win_to_wsl(local)
         log(f"[4/6] eval {role}: port {port}")
-        result = run(["wsl", "-e", "bash", "-lc",
-                      f"CORTEX_7B_PORT={port} CORTEX_7B_WORKERS=1 {args.wsl_python} "
-                      f"/mnt/c{str(scorecard).replace(chr(92), '/')[2:]} {wsl_manifest}"],
-                     timeout=args.eval_timeout)
+        eval_cmd = (
+            f"CORTEX_7B_PORT={int(port)} CORTEX_7B_WORKERS=1 "
+            f"{shlex.quote(args.wsl_python)} {shlex.quote(wsl_scorecard)} {shlex.quote(wsl_manifest)}"
+        )
+        result = run(["wsl", "-e", "bash", "-lc", eval_cmd], timeout=args.eval_timeout)
         produced = role_dir / "omni7b_results.tsv"
         if result.returncode != 0 or not produced.is_file():
             return stage.failed(f"{role} scorecard failed: {(result.stdout or '')[-300:]}")
@@ -262,7 +279,7 @@ def main() -> int:
                         default="verdict")
     args = parser.parse_args()
 
-    out_root = args.out or (REPO / "runs" / f"cycle_{int(os.path.getmtime(APP)) % 100000}")
+    out_root = args.out or (REPO / "runs" / f"cycle_{int(time.time())}")
     out_root.mkdir(parents=True, exist_ok=True)
 
     def log(message: str) -> None:
@@ -292,11 +309,23 @@ def main() -> int:
                             stages.append(stage_verdict(ctx, out_root, log))
     finally:
         if server is not None and server.poll() is None:
-            server.send_signal(signal.SIGTERM)
+            # On Windows, terminating wsl.exe alone can leave the Linux worker holding ~17 GB VRAM.
+            run(
+                [
+                    "wsl", "-e", "bash", "-lc",
+                    f"fuser -k -TERM {int(args.challenger_port)}/tcp 2>/dev/null || "
+                    f"pkill -TERM -f {shlex.quote(f'CORTEX_7B_PORT={int(args.challenger_port)}')} 2>/dev/null || true",
+                ],
+                timeout=30,
+            )
             try:
-                server.wait(timeout=60)
+                server.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                server.kill()
+                server.terminate()
+                try:
+                    server.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    server.kill()
             log("      challenger server stopped")
 
     print()
@@ -316,6 +345,9 @@ def main() -> int:
     if blocked:
         print(f"GATE D: INCOMPLETE — blocked at {blocked[0].name}. Reported, not smoothed over.")
         return 2
+    if args.stop_after in reached:
+        print(f"GATE D: stopped cleanly after {args.stop_after}.")
+        return 0
     return 1
 
 

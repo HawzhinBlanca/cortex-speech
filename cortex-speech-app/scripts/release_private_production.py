@@ -1727,6 +1727,19 @@ def deploy(args: argparse.Namespace) -> int:
     handover_lock = try_acquire_handover_lock(data_dir)
     if handover_lock is None:
         raise ReleaseError("another deploy or recovery process holds the handover lock")
+    try:
+        return _deploy_with_handover_lock(args, data_dir, release_root, db, handover_lock)
+    finally:
+        release_handover_lock(handover_lock)
+
+
+def _deploy_with_handover_lock(
+    args: argparse.Namespace,
+    data_dir: Path,
+    release_root: Path,
+    db: Path,
+    handover_lock: Any,
+) -> int:
     source_schema = database_schema(db)
     if source_schema not in (SUPPORTED_MIGRATION_SOURCES | {EXPECTED_SCHEMA}):
         raise ReleaseError(
@@ -1790,21 +1803,17 @@ def deploy(args: argparse.Namespace) -> int:
         "targetDatabaseSha256": None,
     }
     atomic_json(data_dir / JOURNAL_FILE, journal)
-    # The recovery arm is registered AFTER the journal exists but BEFORE the maintenance marker is
-    # written. The old order (marker first, arm second) left a seconds-wide hard-kill window (power
-    # loss during Register-ScheduledTask) in which reviewers were 503-blocked by the marker while
-    # NO recovery task existed and the still-enabled watchdog faithfully kept the 503-serving old
-    # app alive forever. This order closes it: every possible fire of the arm sees the journal, and
-    # any fire while this process lives defers on the handover lock it holds.
-    recovery = Path(str(manifest["directory"])) / "scripts" / "ops" / "cortex-release-recovery.ps1"
-    powershell_file(recovery, "-Register")
-    write_maintenance(data_dir, str(manifest["releaseId"]))
-    journal["phase"] = "maintenance"
-    atomic_json(data_dir / JOURNAL_FILE, journal)
-    task_change(LEGACY_WATCHDOG_TASK, False, allow_missing=True)
-    task_change(WATCHDOG_TASK, False, allow_missing=True)
-
+    # Open the recovery try-block immediately after writing the journal so any fault during
+    # recovery-task registration, maintenance-marker write, or watchdog disable runs recover().
     try:
+        recovery = Path(str(manifest["directory"])) / "scripts" / "ops" / "cortex-release-recovery.ps1"
+        powershell_file(recovery, "-Register")
+        write_maintenance(data_dir, str(manifest["releaseId"]))
+        journal["phase"] = "maintenance"
+        atomic_json(data_dir / JOURNAL_FILE, journal)
+        task_change(LEGACY_WATCHDOG_TASK, False, allow_missing=True)
+        task_change(WATCHDOG_TASK, False, allow_missing=True)
+
         current_app = Path(str(previous["appExe"])) if previous else fallback_app
         stop_app([current_app] if current_app else [])
         baseline = max_pool_decision_id(db)

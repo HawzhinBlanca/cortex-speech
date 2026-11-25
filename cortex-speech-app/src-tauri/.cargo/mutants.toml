@@ -23,6 +23,7 @@ examine_globs = [
     "src/normalizer.rs",
     "src/normalizer/**/*.rs",
     "src/couch.rs",
+    "src/couch/**/*.rs",
 ]
 
 # --lib only. Integration tests need real ONNX models and a ~90s run; multiplied by hundreds of

@@ -862,6 +862,13 @@ pub(crate) fn run_wsl_segment_transcript_with_script(
 
     let external_script =
         if external_script.starts_with('/') { external_script.to_string() } else { win_path_to_wsl(external_script) };
+    if !external_script.starts_with('/')
+        || external_script.starts_with('-')
+        || !external_script.to_ascii_lowercase().ends_with(".py")
+        || external_script.split('/').any(|part| part == "..")
+    {
+        return Err(AppError::Validation("Invalid external ASR script path".into()));
+    }
     let python =
         std::env::var("CORTEX_7B_PYTHON").unwrap_or_else(|_| "/home/ai/.venv-wsl-whisper/bin/python".to_string());
     let mut cmd = std::process::Command::new("wsl");

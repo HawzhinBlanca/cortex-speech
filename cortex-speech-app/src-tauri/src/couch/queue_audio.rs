@@ -501,12 +501,6 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
         if serving.len() >= serving_limit {
             continue; // keep counting what is left, but hand out no more this round
         }
-        if let Some(pool) = pool_policy.as_ref() {
-            if let Err(error) = pool.verify_audio_available(&id) {
-                tracing::error!("Couch Review pool paused before lease because selected audio is unavailable: {error}");
-                return err_reply(503, "Review is temporarily paused: selected audio is unavailable");
-            }
-        }
         guard.leases.insert(id.clone(), (reviewer.to_string(), now));
         serving.push(id);
     }
@@ -544,6 +538,18 @@ pub(super) fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>
         && guard.session_store.is_some()
         && (!guard.pairing_codes.is_empty() || !guard.reviewers.is_empty());
     drop(guard);
+
+    // Verify selected pool audio OUTSIDE `CouchState` so HDD `stat()` never stalls other
+    // reviewers, and release all tentative leases if any clip is unavailable.
+    if let Some(pool) = pool_policy.as_ref() {
+        for id in &serving {
+            if let Err(error) = pool.verify_audio_available(id) {
+                tracing::error!("Couch Review pool paused before serving because selected audio is unavailable: {error}");
+                release_unserved_leases(state, &serving, reviewer);
+                return err_reply(503, "Review is temporarily paused: selected audio is unavailable");
+            }
+        }
+    }
 
     // Hydrate ONLY what is being served — at most QUEUE_BATCH rows — and do it OUTSIDE the state lock,
     // which the whole-library read never was. `get_segments_by_ids` re-imposes its own global ordering,
@@ -1236,6 +1242,14 @@ pub(super) fn authorize_audio(
                                 )?
                                 .iter()
                                 .any(|pending| pending == id));
+                            }
+                            if !crate::review_pool::reopen_routing::may_review_segment(
+                                db,
+                                data_dir.as_deref(),
+                                id,
+                                reviewer,
+                            )? {
+                                return Ok(false);
                             }
                             crate::review_pool::trust::may_review(db, id, reviewer)
                         })();

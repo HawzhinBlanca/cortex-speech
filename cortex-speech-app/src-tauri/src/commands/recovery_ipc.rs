@@ -193,13 +193,19 @@ pub async fn db_restore(src: String, state: State<'_, AppState>) -> Result<(), C
         .map_err(|error| public_recovery_failure(RecoveryOperation::RestoreBackup, &error))?;
     let database = state.db_runtime();
     let history = state.history_arc_for_restore();
+    let fingerprint = std::sync::Arc::clone(&state.fingerprint);
+    let dedup_readiness = state.dedup_readiness_arc_for_restore();
+    let cache = std::sync::Arc::clone(&state.cache);
     let restore_reservation = run_blocking(move || {
         database.with_restore_writer(&restore_reservation, |writer| {
             restore_with_mandatory_snapshot(&restore_reservation, writer, &data_dir, Path::new(&validated))?;
+            let readiness = crate::rehydrate_dedup_index(writer, &fingerprint);
+            *dedup_readiness.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = readiness;
             Ok(())
         })?;
-        // A cancelled Tauri future detaches spawn_blocking. Clear stale undo history in the same
-        // worker after publication and before the reservation can be dropped.
+        // A cancelled Tauri future detaches spawn_blocking. Clear stale undo history and caches
+        // in the same worker after publication and before the reservation can be dropped.
+        cache.clear();
         history.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
         Ok(restore_reservation)
     })
@@ -305,25 +311,33 @@ async fn restore_db_from_snapshot_inner(name: String, state: State<'_, AppState>
     }
     let (restore_plan, restore_reservation) = {
         let database = state.db_runtime();
+        let history = state.history_arc_for_restore();
+        let fingerprint = std::sync::Arc::clone(&state.fingerprint);
+        let dedup_readiness = state.dedup_readiness_arc_for_restore();
+        let cache = std::sync::Arc::clone(&state.cache);
         let restore_src = src.clone();
         let restore_snapshot_dir = snap_dir.clone();
         let restore_selector = name.clone();
         run_blocking(move || {
             let restore_plan = database.with_restore_writer(&restore_reservation, |writer| {
-                prepare_and_restore_named_transaction(
+                let plan = prepare_and_restore_named_transaction(
                     &restore_reservation,
                     writer,
                     &restore_data_dir,
                     &restore_snapshot_dir,
                     &restore_src,
                     &restore_selector,
-                )
+                )?;
+                let readiness = crate::rehydrate_dedup_index(writer, &fingerprint);
+                *dedup_readiness.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = readiness;
+                Ok(plan)
             })?;
+            cache.clear();
+            history.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
             Ok((restore_plan, restore_reservation))
         })
         .await
     }?;
-    state.lock_history().clear();
     let live_controls = state.lock_settings().clone();
     let restored = install_snapshot_restore_plan(&restore_plan, &data_dir, &live_controls)?;
     *state.lock_settings() = restored.clone();

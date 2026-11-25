@@ -132,7 +132,7 @@ pub(super) fn renew_cookie_checkpoint(
     now: SystemTime,
 ) -> Result<CookieRenewal, String> {
     let _persist = lock_session_persist();
-    let (proposed_session_issued, snapshot, inject_persist_failure) = {
+    let (snapshot, inject_persist_failure) = {
         let guard = lock_state(state);
         if !guard.reviewers.contains_key(token) {
             return Ok(CookieRenewal::Missing);
@@ -149,7 +149,7 @@ pub(super) fn renew_cookie_checkpoint(
         if let Some(snapshot) = snapshot.as_mut() {
             snapshot.sessions = snapshot_sessions_from_maps(&guard.reviewers, &proposed_session_issued);
         }
-        (proposed_session_issued, snapshot, guard.inject_session_persist_failure())
+        (snapshot, guard.inject_session_persist_failure())
     };
     let saved = if inject_persist_failure {
         Err("injected session persistence failure".to_string())
@@ -157,7 +157,12 @@ pub(super) fn renew_cookie_checkpoint(
         snapshot.as_ref().map(save_session_snapshot).unwrap_or(Ok(()))
     };
     saved?;
-    lock_state(state).session_issued = proposed_session_issued;
+    {
+        let mut guard = lock_state(state);
+        if guard.reviewers.contains_key(token) {
+            guard.session_issued.insert(token.to_string(), now);
+        }
+    }
     Ok(CookieRenewal::Renewed)
 }
 

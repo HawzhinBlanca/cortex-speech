@@ -290,7 +290,7 @@ def test_named_snapshot_restore_commits_config_only_after_atomic_required_state_
     commands = _read("commands/recovery_ipc.rs")
     service = _read("restore_service/orchestration.rs")
     body = _fn_body(commands, "pub async fn restore_db_from_snapshot(", span=14_000)
-    history = body.find("state.lock_history().clear();")
+    history = body.find("history.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();")
     install = body.find("install_snapshot_restore_plan(&restore_plan, &data_dir, &live_controls)?")
     runtime = body.find("*state.lock_settings() = restored.clone();")
     completed = body.find(
@@ -489,9 +489,7 @@ def test_desktop_playback_writes_are_generation_bound_and_race_proven() -> None:
 def test_external_writers_share_the_desktop_instance_lock() -> None:
     checks = (
         ("bin/export_pack.rs", "InstanceLock::try_lock", "Database::open_with_retry"),
-        ("bin/realign_segments.rs", "InstanceLock::try_lock", "Database::open("),
         ("bin/backfill_fingerprints.rs", "InstanceLock::try_lock", "Database::open("),
-        ("bin/reject_speaker_change_clips.rs", "InstanceLock::try_lock", "Database::open("),
         ("bin/speaker_change_probe.rs", "InstanceLock::try_lock", "Connection::open_with_flags"),
     )
     for rel, lock_token, open_token in checks:

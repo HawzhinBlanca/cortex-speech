@@ -75,7 +75,11 @@
 
   const accuracy = $derived(readAccuracyRecord(evalRuns));
 
+  let fetchSeq = 0;
+  let disposed = false;
+
   async function fetchStats() {
+    const seq = ++fetchSeq;
     if (!tauriAvailable) {
       stats = buildLocalStats($segments);
       quality = null;
@@ -83,46 +87,43 @@
       loading = false;
       return;
     }
-    loading = true;
+    if (!stats) loading = true;
     errorMessage = null;
     try {
-      [stats, quality] = await Promise.all([api.getDatasetStats(), api.getDatasetQuality()]);
-      try {
-        fingerprintCount = await api.getFingerprintCount();
-      } catch {
-        // Non-essential stat — leave it hidden if the backend call fails.
-      }
-      try {
-        cert = await api.getDatasetCertificate(0.05, 0.95);
-      } catch (err) {
-        console.error('Failed to load conformal certificate', err);
-      }
-      try {
-        audioHealth = await api.getAudioHealth();
-      } catch (err) {
-        console.error('Failed to load audio health', err);
-      }
+      const [nextStats, nextQuality] = await Promise.all([
+        api.getDatasetStats(),
+        api.getDatasetQuality(),
+      ]);
+      if (disposed || seq !== fetchSeq) return;
+      stats = nextStats;
+      quality = nextQuality;
+      const [fpRes, certRes, audioRes, breakdownRes, evalRes] = await Promise.allSettled([
+        api.getFingerprintCount(),
+        api.getDatasetCertificate(0.05, 0.95),
+        api.getAudioHealth(),
+        api.getTrainingGradeBreakdown(),
+        api.listEvalRuns(),
+      ]);
+      if (disposed || seq !== fetchSeq) return;
+      if (fpRes.status === 'fulfilled') fingerprintCount = fpRes.value;
+      if (certRes.status === 'fulfilled') cert = certRes.value;
+      else console.error('Failed to load conformal certificate', certRes.reason);
+      if (audioRes.status === 'fulfilled') audioHealth = audioRes.value;
+      else console.error('Failed to load audio health', audioRes.reason);
       // Both stay NULL on failure, and the verdict renders "unknown" rather than "ready". A readiness
       // headline that defaults to green when its own inputs failed to load is worse than no headline.
-      try {
-        breakdown = await api.getTrainingGradeBreakdown();
-      } catch (err) {
-        console.error('Failed to load training grade breakdown', err);
-      }
-      try {
-        evalRuns = await api.listEvalRuns();
-      } catch (err) {
-        console.error('Failed to load eval runs', err);
-      }
+      if (breakdownRes.status === 'fulfilled') breakdown = breakdownRes.value;
+      else console.error('Failed to load training grade breakdown', breakdownRes.reason);
+      if (evalRes.status === 'fulfilled') evalRuns = evalRes.value;
+      else console.error('Failed to load eval runs', evalRes.reason);
     } catch (e) {
+      if (disposed || seq !== fetchSeq) return;
       errorMessage = formatPublicErrorReference(e) ?? $t('errors.unknown');
       notifications.error($t('stats.failed'), { cause: e });
     } finally {
-      loading = false;
+      if (!disposed && seq === fetchSeq) loading = false;
     }
   }
-
-  function track(..._args: unknown[]) {}
 
   // P3.3: relink missing source audio by pointing at the folder the owner moved it to.
   async function relinkMissingAudio() {
@@ -325,25 +326,50 @@
       // Build-info is a non-essential diagnostic — leave it hidden if the call fails.
       api
         .appGitSha()
-        .then((sha) => (buildSha = sha))
+        .then((sha) => {
+          if (!disposed) buildSha = sha;
+        })
         .catch(() => {});
       api
         .getIntelligenceReport()
-        .then((r) => (intel = r))
+        .then((r) => {
+          if (!disposed) intel = r;
+        })
         .catch(() => {});
     }
+    return () => {
+      disposed = true;
+    };
   });
 
+  // Track only corpus-level changes (add/delete/verify/transcript edits), not row hydration on click.
+  const corpusMutationKey = $derived.by(() => {
+    let verifiedCount = 0;
+    let annotatedCount = 0;
+    let transcribedCount = 0;
+    for (const s of $segments) {
+      if (s.verified) verifiedCount += 1;
+      if (s.annotatedTranscript?.trim()) annotatedCount += 1;
+      if (s.rawTranscript?.trim()) transcribedCount += 1;
+    }
+    return `${$segments.length}:${verifiedCount}:${annotatedCount}:${transcribedCount}`;
+  });
+
+  let lastCorpusKey: string | null = null;
   let fetchDebounceTimer: ReturnType<typeof setTimeout>;
   $effect(() => {
-    track($segments);
+    const key = corpusMutationKey;
+    if (lastCorpusKey === null) {
+      lastCorpusKey = key;
+      return;
+    }
+    if (key === lastCorpusKey) return;
+    lastCorpusKey = key;
     clearTimeout(fetchDebounceTimer);
     fetchDebounceTimer = setTimeout(() => {
       fetchStats();
       fetchInferenceStats();
     }, 500);
-    // Cancel the pending timer on teardown so it can't fire backend fetches / write $state after the
-    // panel unmounts (navigating away within the 500ms debounce).
     return () => clearTimeout(fetchDebounceTimer);
   });
 </script>

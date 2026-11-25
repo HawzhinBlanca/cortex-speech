@@ -405,6 +405,19 @@ describe('StatsDashboard desktop evidence orchestration', () => {
     );
     expect(reloadAppMock).toHaveBeenCalledOnce();
 
+    // Mutate a corpus-level field (add a verified clip) to trigger the debounced stats refresh.
+    segments.update((rows) => [
+      ...rows,
+      {
+        id: 'seg-refresh',
+        audioPath: 'C:/audio/refresh.wav',
+        rawTranscript: 'سڵاو',
+        annotatedTranscript: '',
+        verified: true,
+        durationMs: 1000,
+      } as never,
+    ]);
+
     await waitFor(
       () => {
         expect(

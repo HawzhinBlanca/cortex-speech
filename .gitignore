@@ -155,3 +155,6 @@ runs/
 # release record rather than tracked as source.
 artifacts/
 scratch-target/
+
+# Local private-production release input artifacts.
+release-inputs/

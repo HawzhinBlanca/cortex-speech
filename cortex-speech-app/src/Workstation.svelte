@@ -94,7 +94,7 @@
   let tauriAvailable = $state(false);
   const data = createWorkstationDataController(() => tauriAvailable);
   const view = createWorkstationViewController(requireDesktopRuntime);
-  const session = createWorkstationSessionController(() => tauriAvailable);
+  const session = createWorkstationSessionController(() => tauriAvailable, data.loadSegments);
   const playback = createWorkstationPlaybackController({
     isTauriAvailable: () => tauriAvailable,
     forgetMetadata: metadataCoordinator.forget,
@@ -371,6 +371,8 @@
         {lazyLabels}
         {loadAgentReportPanel}
         {loadStatsDashboard}
+        onUndo={handleUndo}
+        onRedo={handleRedo}
       />
     {/if}
   </div>

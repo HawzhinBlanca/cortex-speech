@@ -1,4 +1,5 @@
 export const REVIEW_OPERATION_TIMEOUT_MS = 15_000;
+export const JURY_PIPELINE_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** Bound a renderer-side operation even when the native bridge never settles its Promise. */
 export function withReviewOperationTimeout<T>(

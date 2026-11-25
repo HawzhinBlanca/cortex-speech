@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -345,6 +346,9 @@ class WindowsReleaseBundleTests(unittest.TestCase):
             self.assertTrue(authority["timestampVerified"])
             self.assertEqual(authority["signerCertificateSha256"], self.cert_sha256)
             self.assertEqual(run.call_args_list[0].args[0][1:6], ["verify", "/pa", "/all", "/v", "/tw"])
+            ps_call = run.call_args_list[1]
+            self.assertEqual(ps_call.kwargs["env"]["CORTEX_VERIFY_SUBJECT"], str(subject))
+            self.assertNotIn(str(subject), ps_call.args[0])
 
             identity["timestampSubject"] = None
             with (
@@ -360,6 +364,27 @@ class WindowsReleaseBundleTests(unittest.TestCase):
                     ],
                 ),
                 self.assertRaisesRegex(self.bundle.ReleaseBundleError, "missing timestamp"),
+            ):
+                self.bundle._verify_authenticode(subject, self.thumbprint, self.cert_sha256)
+
+    def test_authenticode_powershell_snippet_runs_on_windows_powershell(self) -> None:
+        if os.name != "nt":
+            return
+        with tempfile.TemporaryDirectory() as temporary:
+            subject = Path(temporary) / "unsigned subject.exe"
+            subject.write_bytes(b"MZ")
+            signtool_success = subprocess.CompletedProcess([], 0, stdout="verified", stderr="")
+            real_run = subprocess.run
+
+            def fake_signtool_only(cmd, *args, **kwargs):
+                if str(cmd[0]).endswith("signtool.exe"):
+                    return signtool_success
+                return real_run(cmd, *args, **kwargs)
+
+            with (
+                mock.patch.object(self.bundle, "_signtool", return_value=Path("signtool.exe")),
+                mock.patch.object(self.bundle.subprocess, "run", side_effect=fake_signtool_only),
+                self.assertRaisesRegex(self.bundle.ReleaseBundleError, "missing signer certificate"),
             ):
                 self.bundle._verify_authenticode(subject, self.thumbprint, self.cert_sha256)
 

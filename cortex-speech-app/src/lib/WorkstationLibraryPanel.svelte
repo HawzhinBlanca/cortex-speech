@@ -88,7 +88,7 @@
             onclick={() => onBatchTranscribe('empty')}
             disabled={!tauriAvailable ||
               $isProcessing ||
-              $segments.every((segment) => segment.rawTranscript?.trim())}
+              (!$libraryTruncated && $segments.every((segment) => segment.rawTranscript?.trim()))}
             title={tauriAvailable ? $t('batchTranscribe.empty') : $t('desktopRuntimeRequired')}
             >{$t('batchTranscribe.empty')}</button
           >

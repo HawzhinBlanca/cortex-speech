@@ -43,7 +43,7 @@ def test_every_detector_is_wired() -> None:
         ("probe-alert", "REVIEW-PIPELINE-ALERT.txt"),
         ("probe-stale", "review-health.log"),
         ("watchdog-stale", "watchdog.log"),
-        ("watchdog-gaveup", "give-up"),
+        ("watchdog-gaveup", "watchdog-kills.txt"),
         ("cert-review-ready", "reviewReady"),
         ("cert-rights", "rightsComplete"),
         ("cert-disk", "disk.healthy"),
@@ -100,6 +100,10 @@ def test_alarm_hygiene_dedup_heartbeat_and_bounded_log() -> None:
     # host still trips the external service.
     _pin(src, "-and $critical.Count -eq 0", "no heartbeat while critical")
     _pin(src, "5MB", "the forwarder's own log is size-capped, never a disk-pressure source")
+    _pin(src, "if ($webhookDelivered)", "dedup state is persisted only after webhook delivery succeeds")
+    watchdog_src = (REPO_ROOT / "scripts" / "ops" / "cortex-watchdog.ps1").read_text(encoding="utf-8-sig")
+    if "Invoke-WebRequest -Uri $hc" in watchdog_src:
+        raise AssertionError("cortex-watchdog.ps1 must not ping healthcheck.url independently of the alarm forwarder")
     # Campaign PROGRESS is not an alarm: allClipsResolved/finalDatasetReady are legitimately false
     # mid-campaign and must never page anyone.
     for progress_gate in ("allClipsResolved", "finalDatasetReady"):

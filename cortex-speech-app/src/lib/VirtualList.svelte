@@ -34,6 +34,22 @@
   let rows = $derived(dedupeById(items));
   let totalHeight = $derived(rows.length * itemHeight);
 
+  // Compensate scrollTop when paginated head rows are evicted so scrolling past MAX_RESIDENT_SEGMENTS
+  // stays anchored on the visible items instead of pinning at the bottom.
+  let prevRowIds: string[] = [];
+  $effect(() => {
+    const nextIds = rows.map((row) => row.id);
+    if (container && prevRowIds.length > 0 && nextIds.length > 0 && nextIds[0] !== prevRowIds[0]) {
+      const evictedCount = prevRowIds.indexOf(nextIds[0]);
+      if (evictedCount > 0) {
+        const adjusted = Math.max(0, container.scrollTop - evictedCount * itemHeight);
+        container.scrollTop = adjusted;
+        scrollTop = adjusted;
+      }
+    }
+    prevRowIds = nextIds;
+  });
+
   // Clamp scrollTop against the CURRENT content height. When `items` shrinks (e.g. a search filter
   // narrows the list) while scrolled down, the stale scrollTop is only reset by the browser's async
   // scroll-clamp event; until then a raw scrollTop would make startIndex exceed endIndex, yielding an

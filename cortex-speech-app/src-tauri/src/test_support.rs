@@ -38,7 +38,7 @@ pub(crate) fn app_state(data_dir: PathBuf) -> AppState {
         normalizer,
         cache,
         fingerprint,
-        dedup_readiness: crate::DedupReadiness::Ready { rehydrated_recordings: 0 },
+        dedup_readiness: Arc::new(Mutex::new(crate::DedupReadiness::Ready { rehydrated_recordings: 0 })),
         history: Arc::new(Mutex::new(crate::history::HistoryManager::new(10))),
         session: Mutex::new(crate::session::SessionManager::new(data_dir.join("session"))),
         settings: Mutex::new(settings),

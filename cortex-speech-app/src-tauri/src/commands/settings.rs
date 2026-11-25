@@ -50,7 +50,6 @@ const PATCHABLE_SETTINGS_FIELDS: &[&str] = &[
     "llm_endpoint",
     "llm_system_prompt",
     "llm_model",
-    "external_asr_script_path",
     "hf_train_ratio",
     "hf_val_ratio",
     "hf_test_ratio",
@@ -1005,7 +1004,9 @@ mod tests {
             normalizer,
             cache,
             fingerprint,
-            dedup_readiness: crate::DedupReadiness::Ready { rehydrated_recordings: 0 },
+            dedup_readiness: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::DedupReadiness::Ready { rehydrated_recordings: 0 },
+            )),
             history: Arc::new(Mutex::new(crate::history::HistoryManager::new(10))),
             session: Mutex::new(crate::session::SessionManager::new(data_dir.join("session"))),
             settings: Mutex::new(settings),

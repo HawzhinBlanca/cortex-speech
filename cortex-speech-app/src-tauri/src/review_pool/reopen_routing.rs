@@ -119,6 +119,56 @@ pub(crate) fn excludes(
     }
 }
 
+/// Single-segment enforcement for audio streaming and pool decision writes so a hot-reloaded
+/// `review_reopen_routing.json` immediately revokes access even for clips already in a fetched batch.
+pub(crate) fn may_review_segment(
+    db: &Database,
+    data_dir: Option<&Path>,
+    segment_id: &str,
+    reviewer: &str,
+) -> Result<bool, String> {
+    let Some(routing) = data_dir.and_then(load) else {
+        return Ok(true);
+    };
+    let conn = db.connection();
+    if !reopen::supported_on(conn)? {
+        return Ok(true);
+    }
+    let is_reopened: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM current_review_reopen_members_v71 WHERE segment_id=?1)",
+            [segment_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !is_reopened {
+        return Ok(true);
+    }
+    let key = reviewer_key(Some(reviewer));
+    if routing.final_reviewers.contains(&key) {
+        return Ok(true);
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.reviewer FROM current_review_reopen_members_v71 m
+               JOIN review_events e ON e.segment_id=m.segment_id AND e.id<=m.review_event_floor
+              WHERE m.segment_id=?1 AND e.action IN ('accept','edit','reject')
+             UNION
+             SELECT d.reviewer FROM current_review_reopen_members_v71 m
+               JOIN review_pool_decisions d ON d.segment_id=m.segment_id AND d.id<=m.pool_decision_floor
+              WHERE m.segment_id=?1",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt.query_map([segment_id], |row| row.get::<_, String>(0)).map_err(|error| error.to_string())?;
+    for row in rows {
+        let holder = row.map_err(|error| error.to_string())?;
+        if reviewer_key(Some(&holder)) == key {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -346,11 +346,25 @@ impl<R: tauri::Runtime> DurableBatchWorkerGuard<R> {
         if self.history_recorded {
             return Ok(());
         }
-        let token = self
+        let token = match self
             .lease
             .as_ref()
             .ok_or_else(|| crate::error::AppError::Other("durable batch lease is unavailable".into()))?
-            .history_token()?;
+            .history_token()
+        {
+            Ok(token) => token,
+            Err(crate::error::AppError::Validation(msg)) if msg.contains("BATCH_HISTORY_CONFLICT") => {
+                // A concurrent human review/edit after this batch updated a clip makes bulk undo
+                // unavailable, but the batch itself completed safely and must release its gate.
+                tracing::warn!(
+                    operation_id = %self.operation_id,
+                    %msg,
+                    "Batch bulk undo unavailable because a concurrent writer superseded an applied clip"
+                );
+                None
+            }
+            Err(error) => return Err(error),
+        };
         if let Some(token) = token {
             self.with_state(|state| state.lock_history().record_batch_token(token).map(|_| ()))?;
         }

@@ -438,13 +438,26 @@ impl RestoreAdmission {
     }
 
     pub(crate) fn lock<'a, T>(&self, mutex: &'a Mutex<T>) -> LockResult<MutexGuard<'a, T>> {
-        let mut admission = self.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        while self.is_pending() {
-            admission = self.complete.wait(admission).unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            let mut admission = self.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            while self.is_pending() {
+                admission = self.complete.wait(admission).unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            match mutex.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => return Err(poisoned),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    // Drop `admission` before blocking on `mutex` so WAL readers and restore
+                    // checks never stall behind a contended writer.
+                    drop(admission);
+                }
+            }
+            let guard = mutex.lock()?;
+            if !self.is_pending() {
+                return Ok(guard);
+            }
+            drop(guard);
         }
-        let database = mutex.lock();
-        drop(admission);
-        database
     }
 }
 
@@ -777,5 +790,33 @@ mod tests {
 
         let reader = runtime.open_read().unwrap();
         assert!(reader.get_segment_by_id("restored-generation").unwrap().is_some());
+    }
+
+    #[test]
+    fn restore_admission_lock_does_not_block_open_read_while_writer_is_contended() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("contended-lock.db");
+        let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        db.initialize().unwrap();
+        let runtime = DatabaseRuntime::new(db);
+
+        let held_writer = runtime.lock().unwrap();
+        let waiter_runtime = runtime.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            let _guard = waiter_runtime.lock().unwrap();
+            done_tx.send(()).unwrap();
+        });
+        entered_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Even while `waiter` is blocked in `runtime.lock()`, `open_read()` must acquire `admission` immediately.
+        let reader = runtime.open_read().expect("WAL reader must not stall behind a contended writer lock");
+        drop(reader);
+        drop(held_writer);
+        done_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("waiter must acquire writer after release");
+        waiter.join().unwrap();
     }
 }

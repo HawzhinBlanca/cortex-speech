@@ -274,6 +274,17 @@ impl MediaGrantBinding {
     }
 }
 
+/// Cache of verified canonical PCM BLAKE3 hashes for large (>= 1 MiB) immutable audio recordings,
+/// keyed by `(canonical_path, byte_len, modified_nanos)`. Avoids re-decoding 150+ MB files twice
+/// per Couch clip (`finalize` + `decision`) while never caching tiny test fixtures.
+static VERIFIED_SOURCE_PCM_CACHE: std::sync::LazyLock<
+    Mutex<lru::LruCache<(PathBuf, u64, i128), String>>,
+> = std::sync::LazyLock::new(|| {
+    Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(64).expect("non-zero cache capacity")))
+});
+
+const SOURCE_PCM_CACHE_MIN_BYTES: u64 = 1_048_576;
+
 /// Recovery path for an exact finalized receipt after its ephemeral media grant expired or the app
 /// restarted. Freeze the current source first, then walk its decoded PCM and require the durable
 /// imported identity. The returned guard stays alive through the decision commit, closing the
@@ -286,8 +297,33 @@ pub(crate) fn verify_current_source_lease(
     let source_path =
         std::fs::canonicalize(source_path).map_err(|error| format!("Canonicalize current review source: {error}"))?;
     let source_guard = open_immutable_source_guard(&source_path)?;
-    let actual = crate::export_bundle::current_canonical_pcm_blake3(&source_path)
-        .map_err(|error| format!("Verify current review source PCM: {error}"))?;
+    let cache_key = std::fs::metadata(&source_path)
+        .ok()
+        .filter(|meta| meta.len() >= SOURCE_PCM_CACHE_MIN_BYTES)
+        .and_then(|meta| {
+            let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as i128;
+            Some((source_path.clone(), meta.len(), mtime))
+        });
+    let cached = cache_key.as_ref().and_then(|key| {
+        VERIFIED_SOURCE_PCM_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+            .cloned()
+    });
+    let actual = if let Some(hash) = cached.filter(|hash| hash == expected_audio_content_hash) {
+        hash
+    } else {
+        let computed = crate::export_bundle::current_canonical_pcm_blake3(&source_path)
+            .map_err(|error| format!("Verify current review source PCM: {error}"))?;
+        if let Some(key) = cache_key {
+            VERIFIED_SOURCE_PCM_CACHE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .put(key, computed.clone());
+        }
+        computed
+    };
     if actual != expected_audio_content_hash {
         return Err("The imported source bytes changed after playback; reload or restore the recording".to_string());
     }

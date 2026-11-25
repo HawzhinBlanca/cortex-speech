@@ -4,7 +4,7 @@ import * as api from './commands';
 import { formatPublicErrorReference } from './errorText';
 import { autonomyLabelKey, t, type AutonomyLevel, type TranslationKey } from './i18n';
 import { sharedDurableReviewUndo } from './durableReviewUndo.svelte';
-import { withReviewOperationTimeout } from './reviewOperationTimeout';
+import { JURY_PIPELINE_TIMEOUT_MS, withReviewOperationTimeout } from './reviewOperationTimeout';
 import type { ReviewInboxDraftController } from './reviewInboxDraft.svelte';
 import type { ReviewInboxQueueController } from './reviewInboxQueue.svelte';
 import { settings as settingsStore, type AppSettings } from './stores/settingsStore';
@@ -82,6 +82,7 @@ export function createReviewInboxRuntimeController(deps: RuntimeDependencies) {
       const report = await withReviewOperationTimeout(
         api.runJuryPipeline(targetIds),
         'E_JURY_PIPELINE_TIMEOUT',
+        JURY_PIPELINE_TIMEOUT_MS,
       );
       if (!report) throw new Error(get(t)('inbox.error.juryNoResult'));
       if (!sharedDurableReviewUndo.invalidateForNewAction(truthLease)) {

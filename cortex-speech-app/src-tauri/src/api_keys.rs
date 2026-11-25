@@ -58,6 +58,8 @@ impl ApiKeys {
     /// indistinguishable from an intentional clear and could erase the other provider on the next
     /// save. Blank values still count as unset.
     pub fn load(data_dir: &Path) -> Result<Self, String> {
+        // Share the write gate so concurrent `load` never races Windows' two-step replace in `write_key_line`.
+        let _gate = lock_secrets_write();
         let path = data_dir.join(SECRETS_FILE);
         crate::atomic_file::recover_interrupted_replace(&path)
             .map_err(|e| format!("recover interrupted secrets-file replacement: {e}"))?;

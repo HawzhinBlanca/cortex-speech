@@ -399,18 +399,6 @@ export const filteredSegments = derived(
   },
 );
 
-/**
- * Search scope ONLY — no verified-filter, no sort. This is the review queue's documented contract:
- * deriving it from `filteredSegments` (which applies `filterVerified` FIRST) made the "✓ Verified"
- * chip + any search yield a false "All clips reviewed" while unverified matches existed (true-10
- * audit). Review mode owns its own pending-first ordering, so sorting is deliberately absent too.
- */
-export const searchScopedSegments = derived(
-  [segments, searchQuery, searchResults],
-  ([$segments, $searchQuery, $searchResults]) =>
-    applySearchScope($segments, $searchQuery, $searchResults),
-);
-
 export const segmentStats = writable({
   total: 0,
   verified: 0,

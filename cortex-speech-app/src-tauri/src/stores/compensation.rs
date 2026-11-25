@@ -48,7 +48,7 @@ impl CompensationStore {
     }
 
     /// Every ledger payee with their exact earned/settled/outstanding totals under the active
-    /// policy, from one restore-gated read snapshot.
+    /// policy, from one restore-gated read snapshot (`open_read` starts `BEGIN DEFERRED`).
     pub(crate) fn overview(&self) -> AppResult<Vec<ReviewerCompensationOverview>> {
         let database = self.runtime.open_read()?;
         let mut rows = Vec::new();

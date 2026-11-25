@@ -2566,6 +2566,10 @@ describe('ReviewInbox queue loading', () => {
       expect(sharedDurableReviewUndo.state.truthWriteInFlight).toBe(true);
 
       await vi.advanceTimersByTimeAsync(15_000);
+      expect(sharedDurableReviewUndo.state.truthWriteInFlight).toBe(true);
+      expect(sharedDurableReviewUndo.state.truthWriteAmbiguous).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
       expect(sharedDurableReviewUndo.state.truthWriteInFlight).toBe(false);
       expect(sharedDurableReviewUndo.state.truthWriteAmbiguous).toBe(true);
       expect(sharedDurableReviewUndo.state.errorCode).toBe('E_JURY_PIPELINE_TIMEOUT');

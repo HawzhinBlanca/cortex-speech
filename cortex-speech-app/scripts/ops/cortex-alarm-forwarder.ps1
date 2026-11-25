@@ -109,11 +109,14 @@ try {
         if ($age -gt 20) {
             Add-Finding 'watchdog-stale' 'CRITICAL' "watchdog silent for ${age} min (minutely cadence) -- nothing is healing the app"
         }
-        $recent = Get-Content $wdLog -Tail 200 -ErrorAction Stop
-        $gaveUp = $recent | Where-Object { $_ -match 'give-up' } | Select-Object -Last 1
-        if ($null -ne $gaveUp) {
-            # Terminal state: the watchdog stopped healing on purpose and waits for a human.
-            Add-Finding 'watchdog-gaveup' 'CRITICAL' "watchdog reached give-up and has stopped healing: $gaveUp"
+        $killFile = Join-Path $dataDir 'watchdog-kills.txt'
+        if (Test-Path $killFile) {
+            $kills = 0
+            try { $kills = [int]([string](Get-Content -LiteralPath $killFile -TotalCount 1 -ErrorAction Stop)).Trim() } catch { $kills = 0 }
+            if ($kills -ge 3) {
+                # Terminal state: the watchdog stopped healing on purpose and waits for a human.
+                Add-Finding 'watchdog-gaveup' 'CRITICAL' "watchdog reached give-up ($kills consecutive restarts) and has stopped healing"
+            }
         }
     }
 } catch { Add-Finding 'watchdog-stale' 'WARN' "watchdog log unreadable: $($_.Exception.Message)" }
@@ -280,8 +283,6 @@ foreach ($id in @($state.Keys)) {
     }
 }
 
-try { $state | ConvertTo-Json -Depth 4 | Set-Content -Path $stateFile -Encoding utf8 } catch {}
-
 $critical = @($findings | Where-Object { $_.Severity -eq 'CRITICAL' })
 
 if ($findings.Count -eq 0 -and $recovered.Count -eq 0) {
@@ -304,23 +305,32 @@ if ($critical.Count -gt 0) {
 }
 
 # Webhook: plain-text POST, one line per newly-raised or re-raised alarm plus recovery notes.
+$webhookDelivered = $true
 if (Test-Path $webhookFile) {
-    $webhook = (Get-Content $webhookFile -TotalCount 1).Trim()
+    $webhook = ([string](Get-Content -LiteralPath $webhookFile -TotalCount 1 -ErrorAction SilentlyContinue)).Trim()
     $bodyLines = @($toSend | ForEach-Object { "[$($_.Severity)] $($_.Id): $($_.Message)" })
     foreach ($id in $recovered) { $bodyLines += "[RESOLVED] ${id}: condition cleared" }
     if ($bodyLines.Count -gt 0 -and $webhook -match '^https://') {
+        $webhookDelivered = $false
         try {
             Invoke-RestMethod -Method Post -Uri $webhook -Body ($bodyLines -join "`n") -TimeoutSec 20 | Out-Null
             Write-FwdLog "webhook: sent $($bodyLines.Count) line(s)"
+            $webhookDelivered = $true
         } catch { Write-FwdLog "webhook: send FAILED: $($_.Exception.Message)" }
     }
+}
+
+# Persist dedup/recovery state only when webhook delivery succeeded (or no webhook was needed),
+# so a transient network error retries on the next 5-minute tick instead of muting for 6 hours.
+if ($webhookDelivered) {
+    try { $state | ConvertTo-Json -Depth 4 | Set-Content -Path $stateFile -Encoding utf8 } catch {}
 }
 
 # Dead-man heartbeat: silence (host down, forwarder dead, power loss) makes the external service
 # alarm. Deliberately NOT pinged while a critical condition holds, so a degraded-but-up host also
 # trips it.
 if ((Test-Path $healthcheckFile) -and $critical.Count -eq 0) {
-    $ping = (Get-Content $healthcheckFile -TotalCount 1).Trim()
+    $ping = ([string](Get-Content -LiteralPath $healthcheckFile -TotalCount 1 -ErrorAction SilentlyContinue)).Trim()
     if ($ping -match '^https://') {
         try {
             Invoke-RestMethod -Method Get -Uri $ping -TimeoutSec 20 | Out-Null

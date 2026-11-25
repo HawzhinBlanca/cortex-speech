@@ -1176,7 +1176,6 @@ const FRONTEND_PATCH_FIELDS = [
   'llm_endpoint',
   'llm_system_prompt',
   'llm_model',
-  'external_asr_script_path',
   'hf_train_ratio',
   'hf_val_ratio',
   'hf_test_ratio',
@@ -1344,28 +1343,6 @@ export async function updateSettings(
     throw new SettingsWriteError(error, authoritative);
   }
 }
-
-export const ValidationSeverity = {
-  Error: 'Error',
-  Warning: 'Warning',
-} as const;
-
-export const ValidationCategory = {
-  MissingAudio: 'MissingAudio',
-  EmptyTranscript: 'EmptyTranscript',
-  DuplicateFingerprint: 'DuplicateFingerprint',
-  DurationMismatch: 'DurationMismatch',
-  InvalidSpeaker: 'InvalidSpeaker',
-  CorruptAudio: 'CorruptAudio',
-  AnnotationIncomplete: 'AnnotationIncomplete',
-  HighWer: 'HighWer',
-  HighCer: 'HighCer',
-  QualityGateFailed: 'QualityGateFailed',
-  ClippingDetected: 'ClippingDetected',
-  LowRmsVolume: 'LowRmsVolume',
-  AlignmentHeuristic: 'AlignmentHeuristic',
-  Other: 'Other',
-} as const;
 
 export type ValidationSeverityValue = GeneratedIssueSeverity;
 export type ValidationCategoryValue = GeneratedIssueCategory;

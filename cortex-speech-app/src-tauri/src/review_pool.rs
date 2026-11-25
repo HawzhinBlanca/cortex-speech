@@ -1556,8 +1556,9 @@ pub fn record_owner_adjudication(
     with_pool_full_sync(db, || {
         let tx = rusqlite::Transaction::new_unchecked(db.connection(), rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("owner adjudication cannot lock the database: {error}"))?;
-        let reviewers = reviewer_sets_on(&tx)?;
-        let adjudications = owner_adjudications_on(&tx)?;
+        let ids_json = serde_json::to_string(&[input.segment_id]).map_err(|error| error.to_string())?;
+        let reviewers = reviewer_sets_for_ids_on(&tx, Some(&ids_json))?;
+        let adjudications = owner_adjudications_for_ids_on(&tx, Some(&ids_json))?;
         let (resolution, evidence_digest) =
             derive_resolution(input.segment_id, reviewers.get(input.segment_id), adjudications.get(input.segment_id));
         if !matches!(resolution, DerivedResolution::OwnerConflict) {
@@ -1636,8 +1637,9 @@ pub fn record_decision(db: &Database, pool: &ReviewPool, input: &PoolDecisionInp
             .map_err(|error| format!("review pool decision cannot lock the database: {error}"))?;
         require_pool_operation_namespace_on(&tx, input.operation_id, false)?;
         require_unseen_pool_family_on(&tx, input.segment_id, input.reviewer)?;
-        let reviewers = reviewer_sets_on(&tx)?;
-        let adjudications = owner_adjudications_on(&tx)?;
+        let ids_json = serde_json::to_string(&[input.segment_id]).map_err(|error| error.to_string())?;
+        let reviewers = reviewer_sets_for_ids_on(&tx, Some(&ids_json))?;
+        let adjudications = owner_adjudications_for_ids_on(&tx, Some(&ids_json))?;
         let current = reviewers.get(input.segment_id);
         if current.is_some_and(|state| state.seen.contains(&reviewer)) {
             return Err("review pool decision is duplicated for this reviewer".to_string());
@@ -4075,11 +4077,26 @@ mod tests {
     /// and to the named final reviewers; nobody else sees it until two fresh opinions disagree.
     #[test]
     fn reopen_routing_keeps_a_reopened_clip_private_to_its_reviewers_and_the_final_reviewers() {
-        let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
+        let (dir, db, pool) = one_clip_pool("دەقی یەکەم");
         decide(&db, &pool, "Iftikhar", "دەقی یەکەم", "123e4567-e89b-42d3-a456-426614175011", 1);
+        assert!(
+            db.reviewed_audio_ms("Iftikhar").unwrap() > 0,
+            "reviewed_audio_ms must include effective pool decisions"
+        );
         let ids = vec!["clip".to_string()];
         let plan = reopen::prepare(&db, &pool, &ids, "Owner disputes historical Looks Good work", 0).unwrap();
         assert_eq!(reopen::apply(&db, &pool, &plan, 2).unwrap(), 1);
+        assert!(
+            reopen_routing::may_review_segment(&db, Some(dir.path()), "clip", "Roza").unwrap(),
+            "without a routing file audio/decision enforcement stays open"
+        );
+        std::fs::write(dir.path().join(reopen_routing::FILE_NAME), r#"{ "final_reviewers": ["Hawzhin"] }"#).unwrap();
+        assert!(
+            !reopen_routing::may_review_segment(&db, Some(dir.path()), "clip", "Roza").unwrap(),
+            "hot-reloaded routing file immediately blocks non-assigned reviewers on already-served clips"
+        );
+        assert!(reopen_routing::may_review_segment(&db, Some(dir.path()), "clip", "Iftikhar").unwrap());
+        assert!(reopen_routing::may_review_segment(&db, Some(dir.path()), "clip", "Hawzhin").unwrap());
         let routing = reopen_routing::parse(r#"{ "final_reviewers": ["Hawzhin"] }"#).unwrap();
         let none = HashSet::new();
         let hints =

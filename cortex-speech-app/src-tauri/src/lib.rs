@@ -539,7 +539,7 @@ pub struct AppState {
     pub normalizer: Arc<SoraniNormalizer>,
     pub cache: Arc<TranscriptCache>,
     pub fingerprint: Arc<AudioFingerprint>,
-    pub(crate) dedup_readiness: DedupReadiness,
+    pub(crate) dedup_readiness: Arc<Mutex<DedupReadiness>>,
     pub history: HistKeyMgr,
     pub session: Mutex<SessionManager>,
     pub settings: Mutex<AppSettings>,
@@ -677,6 +677,10 @@ impl AppState {
     /// cancelled after SQLite publication, command-local cleanup will never run.
     pub(crate) fn history_arc_for_restore(&self) -> Arc<Mutex<HistoryManager>> {
         Arc::clone(&self.history)
+    }
+
+    pub(crate) fn dedup_readiness_arc_for_restore(&self) -> Arc<Mutex<DedupReadiness>> {
+        Arc::clone(&self.dedup_readiness)
     }
 
     pub(crate) fn lock_session(&self) -> MutexGuard<'_, SessionManager> {
@@ -889,7 +893,7 @@ impl AppState {
     }
 
     pub(crate) fn require_audio_import_ready(&self) -> Result<(), DedupIndexUnavailable> {
-        self.dedup_readiness.require_import_ready()
+        self.dedup_readiness.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).require_import_ready()
     }
 
     /// Admit one recovery-journal operation only while no import worker can be live. The returned
@@ -1380,6 +1384,14 @@ pub fn run() {
             );
             match db.batch_execution_history_token_v1(&status.operation_id) {
                 Ok(token) => token,
+                Err(crate::error::AppError::Validation(msg)) if msg.contains("BATCH_HISTORY_CONFLICT") => {
+                    tracing::warn!(
+                        operation_id = %status.operation_id,
+                        %msg,
+                        "Recovered batch bulk undo unavailable because a clip was superseded after application"
+                    );
+                    None
+                }
                 Err(error) => fatal_app_error(format!(
                     "Recovered batch effects could not be bound to exact Undo authority: {error}"
                 )),
@@ -1559,7 +1571,7 @@ pub fn run() {
             normalizer,
             cache,
             fingerprint,
-            dedup_readiness,
+            dedup_readiness: Arc::new(Mutex::new(dedup_readiness)),
             history: Arc::new(Mutex::new(history)),
             session: Mutex::new(session),
             settings: Mutex::new(settings),
@@ -2209,7 +2221,7 @@ mod tests {
             normalizer,
             cache,
             fingerprint,
-            dedup_readiness: DedupReadiness::Ready { rehydrated_recordings: 0 },
+            dedup_readiness: Arc::new(Mutex::new(DedupReadiness::Ready { rehydrated_recordings: 0 })),
             history: Arc::new(Mutex::new(HistoryManager::new(10))),
             session: Mutex::new(SessionManager::new(data_dir.join("session"))),
             settings: Mutex::new(settings),
@@ -2286,8 +2298,8 @@ mod tests {
         assert_eq!(fingerprint.count(), 0, "a failed inventory read must leave no partially trusted cache");
 
         let dir = tempfile::tempdir().unwrap();
-        let mut state = test_app_state(dir.path().to_path_buf());
-        state.dedup_readiness = readiness;
+        let state = test_app_state(dir.path().to_path_buf());
+        *state.dedup_readiness.lock().unwrap() = readiness;
         assert_eq!(
             state.try_start_import(),
             Err(DEDUP_INDEX_UNAVAILABLE_MESSAGE.to_string()),
@@ -2813,6 +2825,41 @@ mod tests {
                 "redo must not touch the item that was pending when the worker panicked"
             );
         }
+    }
+
+    #[test]
+    fn durable_batch_concurrent_edit_history_conflict_releases_batch_gate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = Arc::new(test_app_state(dir.path().to_path_buf()));
+        let operation_id = uuid::Uuid::from_u128(0x5309).to_string();
+        let segment_ids = vec!["guard-conflict-clip".to_string()];
+        let mut guard = admit_test_normalize_guard(&state, &operation_id, &segment_ids);
+        guard.mark_worker_entered();
+        let page = guard.lease().unwrap().pending_page(None).expect("read pending page");
+        assert!(matches!(
+            guard
+                .lease()
+                .unwrap()
+                .commit_normalization(page[0].ordinal, "normalized-text", "guard-test-v1")
+                .expect("commit normalization"),
+            crate::db::BatchItemCommitOutcomeV1::Applied { .. }
+        ));
+        // Simulate a concurrent human review advancing review_revision after the batch applied this clip.
+        {
+            let db = state.db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments SET annotated_transcript='human', verified=1, review_revision=review_revision+1 WHERE id=?1",
+                    [&segment_ids[0]],
+                )
+                .unwrap();
+        }
+        guard
+            .finish(crate::db::BatchTerminalIntentV1::Succeeded)
+            .expect("BATCH_HISTORY_CONFLICT must degrade bulk undo instead of wedging batch completion");
+        drop(guard);
+        assert_eq!(*state.lock_batch_state(), BatchState::Idle, "batch gate must return to Idle");
+        assert!(!state.lock_history().can_undo(), "superseded batch must not mint a stale bulk undo token");
     }
 
     #[test]

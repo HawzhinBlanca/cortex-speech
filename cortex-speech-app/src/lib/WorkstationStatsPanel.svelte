@@ -16,6 +16,8 @@
     lazyLabels,
     loadAgentReportPanel,
     loadStatsDashboard,
+    onUndo,
+    onRedo,
   }: {
     statsOpen: boolean;
     statsWidth: number;
@@ -31,6 +33,8 @@
     };
     loadAgentReportPanel: () => Promise<unknown>;
     loadStatsDashboard: () => Promise<unknown>;
+    onUndo?: () => void | Promise<void>;
+    onRedo?: () => void | Promise<void>;
   } = $props();
 
   let historyLoadAttempt = $state(0);
@@ -72,7 +76,7 @@
           </p>
         {:then historyModule}
           {@const HistoryPanel = historyModule.default}
-          <HistoryPanel bind:this={historyPanel} {showHotkeyOverlay} />
+          <HistoryPanel bind:this={historyPanel} {showHotkeyOverlay} {onUndo} {onRedo} />
         {:catch cause}
           <div class="card space-y-3 p-4 text-center">
             <p role="alert" class="text-sm text-red-300">{lazyLabels.failedLabel}</p>

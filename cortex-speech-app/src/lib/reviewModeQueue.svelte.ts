@@ -237,9 +237,26 @@ export function createReviewModeQueueController() {
         return null;
       const projectionEpoch = projection.begin();
       state.loadError = null;
-      state.rows = reset ? pageRows : [...state.rows, ...pageRows];
-      state.revisions = reset ? pageRevisions : { ...state.revisions, ...pageRevisions };
-      state.eligibility = reset ? pageEligibility : { ...state.eligibility, ...pageEligibility };
+      const MAX_RESIDENT_ROWS = 600;
+      const mergedRows = reset ? pageRows : [...state.rows, ...pageRows];
+      const trimmedCount = mergedRows.length > MAX_RESIDENT_ROWS ? mergedRows.length - MAX_RESIDENT_ROWS : 0;
+      const nextRows = trimmedCount > 0 ? mergedRows.slice(trimmedCount) : mergedRows;
+      const nextRevisions = reset ? pageRevisions : { ...state.revisions, ...pageRevisions };
+      const nextEligibility = reset ? pageEligibility : { ...state.eligibility, ...pageEligibility };
+      if (trimmedCount > 0) {
+        const retainedIds = new Set(nextRows.map((row) => row.id));
+        for (const id of Object.keys(nextRevisions)) {
+          if (!retainedIds.has(id)) delete nextRevisions[id];
+        }
+        for (const id of Object.keys(nextEligibility)) {
+          if (!retainedIds.has(id)) delete nextEligibility[id];
+        }
+        state.hydratedIds = new Set([...state.hydratedIds].filter((id) => retainedIds.has(id)));
+        state.index = Math.max(0, state.index - trimmedCount);
+      }
+      state.rows = nextRows;
+      state.revisions = nextRevisions;
+      state.eligibility = nextEligibility;
       state.cursor = nextCursor;
       state.focusNarrowed = focusNarrowed;
       if (reset) {

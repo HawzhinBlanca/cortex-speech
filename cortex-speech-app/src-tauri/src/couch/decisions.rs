@@ -627,6 +627,15 @@ pub(super) fn api_pool_decision(
         forget_work_audio_assignment(state, &parsed.id, reviewer);
         return err_reply(403, "this clip is outside your current review pool — reload your queue");
     }
+    let data_dir = lock_state(state).session_store.as_ref().map(|(data_dir, _)| data_dir.clone());
+    match crate::review_pool::reopen_routing::may_review_segment(db, data_dir.as_deref(), &parsed.id, reviewer) {
+        Ok(true) => {}
+        Ok(false) => {
+            forget_work_audio_assignment(state, &parsed.id, reviewer);
+            return err_reply(403, "this reopened clip is restricted to its assigned reviewers — reload your queue");
+        }
+        Err(error) => return err_reply(503, &error),
+    }
     match crate::review_pool::reviewer_already_saw(db, &parsed.id, reviewer) {
         Ok(true) => return err_reply(409, "you already reviewed this clip — reload for another one"),
         Ok(false) => {}
@@ -1008,8 +1017,22 @@ pub(super) fn api_decision_authenticated(
                 // no-op learning key; treating either as an edit would let a formatting-only change
                 // earn the 100% correction rate instead of the authorized 10% accept rate.
                 let submitted_key = crate::normalizer::learning_text_key(&crate::db::to_nfc(&text));
-                let served_text =
-                    if was_served_as_spot_check { prev.raw_transcript.clone() } else { review_text(&prev) };
+                // Mirror `/api/queue`: pool first-pass and blinded campaign clips always serve
+                // `raw_transcript` (unless this is an own-canonical redo on an already-verified clip).
+                let own_canonical_redo = prev.verified
+                    && prev
+                        .reviewed_by
+                        .as_deref()
+                        .is_some_and(|stored| stored.trim().eq_ignore_ascii_case(reviewer.trim()))
+                    && matches!(
+                        prev.human_decision.as_deref(),
+                        Some("accept" | "human_accept" | "edit" | "human_edit")
+                    );
+                let served_raw = was_served_as_spot_check
+                    || (!own_canonical_redo
+                        && (pool_policy.is_some()
+                            || campaign_policy.as_ref().is_some_and(|policy| policy.is_blinded_second_pass())));
+                let served_text = if served_raw { prev.raw_transcript.clone() } else { review_text(&prev) };
                 let served_key = crate::normalizer::learning_text_key(&crate::db::to_nfc(served_text.trim()));
                 let is_edit = submitted_key != served_key;
                 (if is_edit { "edit" } else { "accept" }, Some(text))

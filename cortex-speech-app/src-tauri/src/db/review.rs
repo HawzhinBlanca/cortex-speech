@@ -1661,16 +1661,35 @@ impl Database {
         // COLLATE NOCASE like every money and limit path: the ledger pays one reviewer whose name was
         // typed with different casing as ONE person, so an activity total that split them would
         // disagree with the balance shown beside it on the same screen.
-        Ok(self.conn.query_row(
+        // Include effective pool second/third opinions (v62+) alongside canonical review_events so
+        // remote reviewers see their full judged audio time and never see `correctedMs > reviewedMs`.
+        let has_pool_view: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='view' AND name='effective_review_pool_decisions_v62')",
+            [],
+            |row| row.get(0),
+        )?;
+        let sql = if has_pool_view {
+            "SELECT COALESCE(SUM(d), 0)
+               FROM (SELECT segment_id, MAX(dur) AS d
+                       FROM (SELECT e.segment_id, COALESCE(e.duration_ms, s.duration_ms, 0) AS dur
+                               FROM review_events e
+                               LEFT JOIN speech_segments s ON s.id = e.segment_id
+                              WHERE e.reviewer = ?1 COLLATE NOCASE AND e.action IN ('accept', 'edit', 'reject')
+                             UNION ALL
+                             SELECT p.segment_id, COALESCE(s.duration_ms, 0) AS dur
+                               FROM effective_review_pool_decisions_v62 p
+                               LEFT JOIN speech_segments s ON s.id = p.segment_id
+                              WHERE p.reviewer = ?1 COLLATE NOCASE AND p.action IN ('accept', 'edit', 'reject'))
+                      GROUP BY segment_id)"
+        } else {
             "SELECT COALESCE(SUM(d), 0)
                FROM (SELECT MAX(COALESCE(e.duration_ms, s.duration_ms, 0)) AS d
                        FROM review_events e
                        LEFT JOIN speech_segments s ON s.id = e.segment_id
                       WHERE e.reviewer = ?1 COLLATE NOCASE AND e.action IN ('accept', 'edit', 'reject')
-                      GROUP BY e.segment_id)",
-            params![reviewer],
-            |row| row.get(0),
-        )?)
+                      GROUP BY e.segment_id)"
+        };
+        Ok(self.conn.query_row(sql, params![reviewer], |row| row.get(0))?)
     }
 
     /// Exact money projection under the active immutable policy. Legacy events are intentionally
@@ -1888,10 +1907,13 @@ impl Database {
     pub fn review_compensation_reviewers(&self) -> AppResult<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT reviewer, MAX(id) FROM review_compensation_ledger
-             GROUP BY reviewer COLLATE NOCASE
-             ORDER BY reviewer COLLATE NOCASE",
+              WHERE policy_version = ?1
+              GROUP BY reviewer COLLATE NOCASE
+              ORDER BY reviewer COLLATE NOCASE",
         )?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        let rows = stmt.query_map(params![REVIEW_PAY_POLICY_VERSION], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
         let mut reviewers = Vec::new();
         for row in rows {
             reviewers.push(row?);

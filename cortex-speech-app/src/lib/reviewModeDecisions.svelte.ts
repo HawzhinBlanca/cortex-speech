@@ -398,6 +398,14 @@ export function createReviewModeDecisionController(
 
   async function undoLast() {
     if (state.saving || deps.retranscribing() || deps.aligning()) return;
+    if (durableUndo.state.truthWriteAmbiguous) {
+      notifications.error(get(t)('review.truthWriteUncertainRestart'));
+      return;
+    }
+    if (durableUndo.state.truthWriteInFlight) {
+      notifications.info(get(t)('inbox.disabled.saving'));
+      return;
+    }
     const blockedKey = durableUndo.state.target?.kind === 'decision' ? draftBlockedKey() : null;
     if (blockedKey) {
       notifications.error(get(t)(blockedKey));

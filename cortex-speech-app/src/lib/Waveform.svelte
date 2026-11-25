@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount, onDestroy, untrack } from 'svelte';
   import { t } from './i18n';
   import { drawWaveformCanvas, type WaveformRegion, type WaveformWord } from './waveformRenderer';
 
@@ -93,17 +93,17 @@
 
   function track(..._args: unknown[]) {}
 
-  // Re-draw and re-scale on Zoom changes
+  // Re-scale canvas only when dimensions or zoom change (never on playback ticks or hover moves).
   $effect(() => {
-    track(zoom);
+    track(zoom, containerWidth, height);
     updateCanvasDimensions();
-    draw();
+    untrack(() => draw());
   });
 
   // Data-change effect: redraw when waveform data, regions, or word timestamps change
   $effect(() => {
     track(waveform, regions, wordTimestamps);
-    draw();
+    untrack(() => draw());
   });
 
   // Playback animation loop: only start/stop when `playing` changes
@@ -134,8 +134,8 @@
   // `!playing` guard skips the redundant draw. (currentTime was previously tracked by the data-change
   // effect; splitting out the animation loop dropped it — this restores the paused-seek repaint.)
   $effect(() => {
-    track(currentTime);
-    if (!playing) draw();
+    track(currentTime, hoverTime, selectionStart, selectionEnd);
+    if (!playing) untrack(() => draw());
   });
 
   onDestroy(() => cancelAnimationFrame(animationId));

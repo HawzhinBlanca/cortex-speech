@@ -276,9 +276,13 @@ jobs:
           # flipped comparison there loses a human's work rather than a number"), and this filter
           # never got it. --in-diff then drops every couch mutant, so the one module singled out as
           # most dangerous was the one module this job could not mutate. Found 2026-08-03.
-          git diff --relative "$BASE^" HEAD -- src/couch.rs src/quality/irt.rs src/quality/conformal.rs \
+          DIFF_BASE="$BASE^"
+          if ! git rev-parse --verify --quiet "$DIFF_BASE" >/dev/null; then
+            DIFF_BASE=$(git hash-object -t tree /dev/null)
+          fi
+          git diff --relative "$DIFF_BASE" HEAD -- src/couch.rs 'src/couch/*' src/quality/irt.rs src/quality/conformal.rs \
             src/quality/signal_anomaly.rs 'src/diff/*' src/normalizer.rs 'src/normalizer/*' \
-            > /tmp/core.diff || true
+            > /tmp/core.diff
           if [ ! -s /tmp/core.diff ]; then
             echo "::notice title=Mutation gate idle::No core-module changes in the last 24h."
             exit 0

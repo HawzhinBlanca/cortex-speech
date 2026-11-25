@@ -18,7 +18,10 @@ const VALID_SORT_ORDERS: SortOrder[] = [
   'activeLearning',
 ];
 
-export function createWorkstationSessionController(isTauriAvailable: () => boolean) {
+export function createWorkstationSessionController(
+  isTauriAvailable: () => boolean,
+  reloadSegments?: () => Promise<void>,
+) {
   const query = fromStore(searchQuery);
   const order = fromStore(sortOrder);
   const verifiedFilter = fromStore(filterVerified);
@@ -43,12 +46,29 @@ export function createWorkstationSessionController(isTauriAvailable: () => boole
     try {
       const session = await api.restoreSession();
       if (!session) return;
-      if (session.search_query) searchQuery.set(session.search_query);
-      if (session.sort_order && VALID_SORT_ORDERS.includes(session.sort_order as SortOrder)) {
-        sortOrder.set(session.sort_order as SortOrder);
+      let filtersChanged = false;
+      if (session.search_query && session.search_query !== get(searchQuery)) {
+        searchQuery.set(session.search_query);
+        filtersChanged = true;
       }
-      if (session.filter_verified !== null && session.filter_verified !== undefined) {
+      if (
+        session.sort_order &&
+        VALID_SORT_ORDERS.includes(session.sort_order as SortOrder) &&
+        session.sort_order !== get(sortOrder)
+      ) {
+        sortOrder.set(session.sort_order as SortOrder);
+        filtersChanged = true;
+      }
+      if (
+        session.filter_verified !== null &&
+        session.filter_verified !== undefined &&
+        session.filter_verified !== get(filterVerified)
+      ) {
         filterVerified.set(session.filter_verified);
+        filtersChanged = true;
+      }
+      if (filtersChanged && reloadSegments) {
+        await reloadSegments();
       }
       if (
         session.selected_segment_id &&

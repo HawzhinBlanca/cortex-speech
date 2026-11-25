@@ -908,11 +908,18 @@ impl AppSettings {
         if trimmed.is_empty() {
             return None;
         }
+        let bytes = trimmed.as_bytes();
+        let is_posix_abs = trimmed.starts_with('/');
+        let is_win_abs = bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'/' || bytes[2] == b'\\');
         let looks_like_a_script = trimmed.to_ascii_lowercase().ends_with(".py");
-        let carries_junk = trimmed.contains(['"', '\'', '\n', '\r', '\0']);
-        if !looks_like_a_script || carries_junk {
+        let has_parent_traversal = trimmed.split(['/', '\\']).any(|part| part == "..");
+        let carries_junk = trimmed.starts_with('-') || trimmed.contains(['"', '\'', '\n', '\r', '\0']);
+        if !(is_posix_abs || is_win_abs) || !looks_like_a_script || has_parent_traversal || carries_junk {
             tracing::warn!(
-                "external_asr_script_path is not a usable .py script path ({trimmed:?}); treating the \
+                "external_asr_script_path is not a usable absolute .py script path ({trimmed:?}); treating the \
                  external ASR client as unconfigured"
             );
             return None;
@@ -982,6 +989,9 @@ mod tests {
         // Argument-shaped junk in a path that otherwise looks right.
         assert_eq!(with("/root/client.py\"; echo hi"), None);
         assert_eq!(with("/root/client.py\nmalice.py"), None);
+        assert_eq!(with("-cimport os;os.system('id')#.py"), None);
+        assert_eq!(with("/root/../etc/evil.py"), None);
+        assert_eq!(with("relative/client.py"), None);
     }
 
     #[test]

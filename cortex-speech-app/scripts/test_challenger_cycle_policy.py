@@ -603,6 +603,16 @@ evidence = {
         assert audit_run(record, out) == []
 
 
+def test_run_challenger_cycle_path_and_quoting_safety() -> None:
+    import run_challenger_cycle as cycle
+
+    source = (REPO_ROOT / "scripts" / "run_challenger_cycle.py").read_text(encoding="utf-8")
+    assert "stdout=subprocess.PIPE" not in source, "undrained Popen pipe deadlocks on long server logs"
+    assert "shlex.quote(" in source, "WSL shell arguments must be shlex-quoted"
+    assert "args.stop_after in reached" in source, "--stop-after must return 0 when reached"
+    assert cycle._win_to_wsl(Path(r"D:\data\clip 1.wav")) == "/mnt/d/data/clip 1.wav" or sys.platform != "win32"
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for test in tests:

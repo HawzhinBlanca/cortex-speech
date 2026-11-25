@@ -1318,6 +1318,13 @@ impl Database {
             crate::validation::input::validate_identifier(segment_id).map_err(AppError::Validation)?;
         }
 
+        // Ensure a covering `(job_id, state)` index exists (without bumping schema 73) so
+        // `require_batch_not_hard_stopped_v1` and progress triggers never full-scan JSON rows.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_batch_job_items_v1_job_state ON batch_job_items_v1(job_id, state)",
+            [],
+        )?;
+
         self.conn.execute("SAVEPOINT batch_v1_admit", [])?;
         let admitted = (|| -> AppResult<()> {
             self.reserve_batch_writer()?;
@@ -1567,10 +1574,11 @@ impl Database {
 
     fn advance_batch_progress_v1(&self, operation_id: &str) -> AppResult<()> {
         let (completed, total): (i64, i64) = self.conn.query_row(
-            "SELECT count(*),parent.total
-               FROM batch_job_items_v1 item
-               JOIN jobs parent ON parent.id=item.job_id
-              WHERE item.job_id=?1 AND item.state<>'pending'",
+            "SELECT parent.total - (SELECT count(*) FROM batch_job_items_v1 item
+                                     WHERE item.job_id=?1 AND item.state='pending'),
+                    parent.total
+               FROM jobs parent
+              WHERE parent.id=?1",
             [operation_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;

@@ -691,14 +691,8 @@ if ($alive) {
             Write-Log 'pool certification OK (review-ready)'
         }
     }
-    # Optional dead-man ping: silence at healthchecks.io alerts the owner's phone.
-    $hcFile = Join-Path $dataDir 'healthcheck.url'
-    if ($certHealthy -and (Test-Path $hcFile)) {
-        $hc = (Get-Content $hcFile -TotalCount 1).Trim()
-        if ($hc -match '^https://') {
-            try { Invoke-WebRequest -Uri $hc -UseBasicParsing -TimeoutSec 10 | Out-Null } catch {}
-        }
-    }
+    # Dead-man healthcheck.url pings belong solely to cortex-alarm-forwarder.ps1 so critical
+    # outages (expired links, failed backups/drills, stranded handovers) silence the monitor.
     exit 0
 }
 
@@ -777,10 +771,12 @@ if (-not (Test-Path $session)) {
         exit 0
     }
     $kills = 0
-    if (Test-Path $killCountFile) { $kills = [int]((Get-Content $killCountFile -TotalCount 1).Trim()) }
+    if (Test-Path $killCountFile) {
+        try { $kills = [int]([string](Get-Content -LiteralPath $killCountFile -TotalCount 1 -ErrorAction Stop)).Trim() } catch { $kills = 0 }
+    }
     if ($kills -ge $maxConsecutiveKills) {
         Report 'give-up (kill cap reached)'
-        Write-Log "port still dead after $kills forced restarts - NOT killing again; couch cannot start (port taken, or the library moved). Owner action needed."
+        Write-Log "give-up: port still dead after $kills forced restarts - NOT killing again; couch cannot start (port taken, or the library moved). Owner action needed."
         exit 1
     }
     Report "kill-and-relaunch (attempt $($kills + 1)/$maxConsecutiveKills)"
